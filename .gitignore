@@ -1,0 +1,61 @@
+# Build directories
+/build/
+/build-*/
+/cmake-build-*/
+/out/
+/dist/
+.cache/
+.venv/
+
+# C++ build artifacts
+*.a
+*.dylib
+*.so
+*.obj
+*.o
+*.ilk
+*.pdb
+*.pch
+*.exe
+*.dll
+*.lib
+*.exp
+*.tmp
+*.log
+
+# CMake
+/compile_commands.json
+CMakeFiles/
+CMakeCache.txt
+CMakeScripts/
+Testing/
+cmake_install.cmake
+CTestTestfile.cmake
+DartConfiguration.tcl
+install_manifest.txt
+Makefile
+
+# Ninja
+.ninja_deps
+.ninja_log
+build.ninja
+rules.ninja
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Agentic AI
+.claude/
+*.codex
+.codex
+.codex/
+AGENTS.md
+
+# results, group constants
+*.h5
+*.pdf
+*.png

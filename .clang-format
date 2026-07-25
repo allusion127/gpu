@@ -1,0 +1,20 @@
+---
+BasedOnStyle: LLVM
+AccessModifierOffset: -4
+ColumnLimit: 0
+CompactNamespaces: true
+IndentWidth: 4
+PointerAlignment: Left
+UseTab: Never
+AllowShortFunctionsOnASingleLine: 'All'
+AlignConsecutiveAssignments : 'Consecutive'
+AlignConsecutiveDeclarations : 'Consecutive'
+AlignConsecutiveMacros: 'Consecutive'
+AlignArrayOfStructures : 'Right'
+AllowShortBlocksOnASingleLine: 'Always'
+AllowShortIfStatementsOnASingleLine: 'WithoutElse'
+AllowShortLoopsOnASingleLine: true
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortLambdasOnASingleLine: 'All'
+AllowShortEnumsOnASingleLine: true
+IndentPPDirectives: 'BeforeHash'
