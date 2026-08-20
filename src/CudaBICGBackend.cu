@@ -867,7 +867,11 @@ public:
         sl.host_cc   = host_cc;
         sl.host_phi  = host_phi;
         sl.host_src  = host_src;
-        sl.push_diag = !mirrorMatches(sl.diag_mirror, host_diag, matrix_count);
+        // diag is rewritten every outer (Wielandt) and every CMFD sweep
+        // (updls), so its mirror can never match: skip the 4n-double memcmp
+        // here and the 4n-double shadow copy on the launcher's critical path,
+        // and just upload it every time -- which is what happened anyway.
+        sl.push_diag = true;
         sl.push_cc   = !mirrorMatches(sl.cc_mirror, host_cc, coupling_count);
         sl.push_phi  = !mirrorMatches(sl.phi_mirror, host_phi, static_cast<size_t>(n));
     }
@@ -892,10 +896,15 @@ public:
             Slot&     sl = slot[static_cast<size_t>(m)];
 
             // diag really does change every outer (the Wielandt shift rewrites
-            // it), so it is mirrored only for symmetry; cc and phi are the ones
-            // that drop out.
-            pushOrSkip(diag + m * mat_stride(), sl.host_diag, matrix_count,
-                       sl.push_diag, sl.diag_mirror);
+            // it), so it is not mirrored at all (see stageSlot); cc and phi are
+            // the ones whose mirrors drop uploads.
+            {
+                const size_t bytes = matrix_count * sizeof(double);
+                CUDA_CHECK(cudaMemcpyAsync(diag + m * mat_stride(), sl.host_diag,
+                                           bytes, cudaMemcpyHostToDevice, stream));
+                ++telemetry.bulk_h2d_calls_during_iteration;
+                telemetry.bulk_h2d_bytes_during_iteration += bytes;
+            }
             pushOrSkip(cc + m * cpl_stride(), sl.host_cc, coupling_count,
                        sl.push_cc, sl.cc_mirror);
             pushOrSkip(phi + m * vec_stride(), sl.host_phi, static_cast<size_t>(n),
@@ -1104,13 +1113,11 @@ public:
 
         bool nonfinite = false;
         for (int i = 0; i < count; ++i) {
-            const int m  = active_slots[i];
-            Slot&     sl = slot[static_cast<size_t>(m)];
-            // Host and device now agree on the flux.  Record it so the next
-            // stage() can skip the upload if nothing on the CPU side touches it.
-            sl.phi_mirror.shadow.assign(sl.out_phi, sl.out_phi + n);
-            sl.phi_mirror.valid = true;
-
+            const int m = active_slots[i];
+            // The flux mirror is NOT recorded here: count*n double copies on
+            // the launcher's critical path kept `launching` set while the next
+            // batch starved.  Each participant adopts its own mirror on its own
+            // thread on the way out of solve() -- see adoptFluxMirror().
             telemetry.cmfd_gpu_calls += host_status[m].flux_gen;
             telemetry.bicg_restarts += host_status[m].material_gen;
             telemetry.bicg_early_convergence_exits += host_status[m].operator_gen;
@@ -1118,6 +1125,16 @@ public:
         }
         if (nonfinite)
             throw std::runtime_error("CUDA BiCGSTAB detected a non-finite value");
+    }
+
+    /// Host and device agree on slot m's flux once its batch drained; record
+    /// it so the next stage() can skip the upload.  Runs on the OWNING
+    /// instance's thread after batch completion, never on the launcher's
+    /// critical path, and never on a failed batch (the flux is undefined).
+    void adoptFluxMirror(int m) {
+        Slot& sl = slot[static_cast<size_t>(m)];
+        sl.phi_mirror.shadow.assign(sl.out_phi, sl.out_phi + n);
+        sl.phi_mirror.valid = true;
     }
 
     int           slots;
@@ -1265,6 +1282,13 @@ public:
     unsigned long long      open_batch = 0;  // index of that batch
     unsigned long long      completed  = 0;  // number of batches fully executed
     bool                    launching  = false;
+    /// True only while a launcher sits in the linger wait below.  The
+    /// per-arrival broadcast exists solely for that launcher; every other
+    /// waiter blocks on completed/launching/open_batch, none of which an
+    /// arrival changes.  Gating the notify on this flag turns 200k+ broadcasts
+    /// per M64 run (each waking ~40 pinned threads into one mutex convoy)
+    /// into zero when no linger budget is set.
+    bool                    lingering  = false;
     long                    wait_us    = 0;
     bool                    wait_auto  = false;
     long                    wait_max_us = 2000;
@@ -1376,12 +1400,15 @@ void CudaBatchArena::solve(int m, double* out_phi) {
     a.have_arrival  = true;
     const unsigned long long my_batch = a.open_batch;
     a.pending.push_back(m);
-    a.cv.notify_all();   // a lingering launcher may have been waiting for us
+    if (a.lingering)
+        a.cv.notify_all();   // a lingering launcher is waiting for arrivals
 
     while (true) {
         if (a.completed > my_batch) {
             // Somebody else ran our batch; out_phi already holds the answer.
             if (a.failed_batch == my_batch) throw std::runtime_error(a.failed_message);
+            lock.unlock();
+            a.core.adoptFluxMirror(m); // own slot, own thread -- no lock needed
             return;
         }
         if (a.launching || a.open_batch != my_batch) {
@@ -1421,9 +1448,11 @@ void CudaBatchArena::solve(int m, double* out_phi) {
         if (linger_us > 0 && static_cast<int>(a.pending.size()) < a.inUseCount()) {
             const auto deadline =
                 wait_start + std::chrono::microseconds(linger_us);
+            a.lingering = true;
             while (static_cast<int>(a.pending.size()) < a.inUseCount() &&
                    a.cv.wait_until(lock, deadline) != std::cv_status::timeout) {
             }
+            a.lingering = false;
         }
         if (linger_us > 0) {
             const double waited_us = static_cast<double>(
@@ -1494,6 +1523,7 @@ void CudaBatchArena::solve(int m, double* out_phi) {
         a.cv.notify_all();
 
         if (failed) throw std::runtime_error(message);
+        a.core.adoptFluxMirror(m); // the launcher is a participant too
         return;
     }
 }
