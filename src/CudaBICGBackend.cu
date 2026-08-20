@@ -857,6 +857,7 @@ public:
         int           nmax          = -1;
         double*       out_phi       = nullptr;
         bool          in_use        = false;
+        bool          nonfinite     = false; ///< device flagged THIS slot's flux
 
         // ---- sweep-mode staging (RASBERY_GPU_CMFD_SWEEP) ----
         const double* host_chif  = nullptr;
@@ -1524,7 +1525,6 @@ public:
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaGetLastError());
 
-        bool nonfinite = false;
         for (int i = 0; i < count; ++i) {
             const int m = active_slots[i];
             // The flux mirror is NOT recorded here: count*n double copies on
@@ -1534,10 +1534,14 @@ public:
             telemetry.cmfd_gpu_calls += host_status[m].flux_gen;
             telemetry.bicg_restarts += host_status[m].material_gen;
             telemetry.bicg_early_convergence_exits += host_status[m].operator_gen;
-            if ((host_status[m].flags & NONFINITE_DETECTED) != 0) nonfinite = true;
+            // A non-finite flux is THAT instance's failure, not the batch's:
+            // recorded per slot here, thrown from the owning thread on its way
+            // out of solve().  The old batch-fatal throw took every batch-mate
+            // down with the diverging deck, which turned one bad candidate in
+            // a GA screen into a build-dependent set of collateral failures.
+            slot[static_cast<size_t>(m)].nonfinite =
+                (host_status[m].flags & NONFINITE_DETECTED) != 0;
         }
-        if (nonfinite)
-            throw std::runtime_error("CUDA BiCGSTAB detected a non-finite value");
     }
 
     /// Host and device agree on slot m's flux once its batch drained; record
@@ -1894,6 +1898,8 @@ void CudaBatchArena::solveCommon(int m, double* out_phi, int kind) {
             if (a.failed_batch[kind] == my_batch)
                 throw std::runtime_error(a.failed_message[kind]);
             lock.unlock();
+            if (a.core.slot[static_cast<size_t>(m)].nonfinite)
+                throw std::runtime_error("CUDA BiCGSTAB detected a non-finite value");
             a.core.adoptFluxMirror(m); // own slot, own thread -- no lock needed
             return;
         }
@@ -2026,6 +2032,8 @@ void CudaBatchArena::solveCommon(int m, double* out_phi, int kind) {
         a.cv.notify_all();
 
         if (failed) throw std::runtime_error(message);
+        if (a.core.slot[static_cast<size_t>(m)].nonfinite)
+            throw std::runtime_error("CUDA BiCGSTAB detected a non-finite value");
         a.core.adoptFluxMirror(m); // the launcher is a participant too
         return;
     }
