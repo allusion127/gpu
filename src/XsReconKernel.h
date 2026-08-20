@@ -50,6 +50,9 @@ constexpr int T_XSTF = 0, T_XSDF = 1, T_XSAF = 2, T_XSFF = 3, T_XSNF = 4,
               T_XS3N = 10;
 
 // ReconstructNode's scalar pass covers XSTF..XS3N minus the derived XSDF/XSRF.
+// Host-side only (harness): device code cannot take the address of a
+// namespace-scope constexpr array, so xsreconSolveNode carries its own local
+// copy -- keep the two lists identical.
 constexpr int ACTIVE_XT[9] = {T_XSTF, T_XSAF, T_XSFF, T_XSNF, T_XSKF,
                               T_XSSF, T_FYLD, T_XS2N, T_XS3N};
 
@@ -164,8 +167,12 @@ RASBERY_XSR_HD inline int xsreconSolveNode(const BatchView& v, int l,
     // (f) ReconstructNode, verbatim: iso-ascending accumulation per element.
     // The CPU version re-reads _iden from memory here; rows 3..5 of the local
     // copy hold exactly the values just stored, so the operands are the same.
+    // Local mirror of ACTIVE_XT: device code cannot reference the
+    // namespace-scope array's storage.
+    const int active_xt[9] = {T_XSTF, T_XSAF, T_XSFF, T_XSNF, T_XSKF,
+                              T_XSSF, T_FYLD, T_XS2N, T_XS3N};
     for (int a = 0; a < 9; ++a) {
-        const int     xt  = ACTIVE_XT[a];
+        const int     xt  = active_xt[a];
         const double* lmp = v.lmp[xt];
         const double* mic = v.mic[xt];
         double*       dst = v.xs[xt];
