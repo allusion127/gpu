@@ -2,6 +2,9 @@
 
 #include "Importer.h"
 #include "XSTiming.h"
+#include "XsReconKernel.h"
+
+#include <mutex>
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -15,6 +18,25 @@
 
 using namespace rasbery;
 using namespace Chiffon;
+
+// XsReconKernel.h mirrors these library constants instead of including the
+// HDF5-bearing Model.h; a drift here must fail the build, not the physics.
+static_assert(XSTF == xsrecon::T_XSTF && XSDF == xsrecon::T_XSDF &&
+              XSAF == xsrecon::T_XSAF && XSFF == xsrecon::T_XSFF &&
+              XSNF == xsrecon::T_XSNF && XSKF == xsrecon::T_XSKF &&
+              XSSF == xsrecon::T_XSSF && XSRF == xsrecon::T_XSRF &&
+              FYLD == xsrecon::T_FYLD && XS2N == xsrecon::T_XS2N &&
+              XS3N == xsrecon::T_XS3N,
+              "XSTYPE order drifted from XsReconKernel.h");
+static_assert(Isotope::isotopeIds.size() == static_cast<size_t>(xsrecon::NISO) &&
+              static_cast<int>(Isotope::iI135) == xsrecon::I135 &&
+              static_cast<int>(Isotope::iXe135) == xsrecon::XE135 &&
+              static_cast<int>(Isotope::iXe135m) == xsrecon::XE135M &&
+              static_cast<int>(Isotope::iAcFirst) == xsrecon::AC_FIRST &&
+              static_cast<int>(Isotope::iAcLast) == xsrecon::AC_LAST,
+              "isotope registry drifted from XsReconKernel.h");
+static_assert(N_XS_SCALAR == xsrecon::NXS,
+              "scalar XS slot count drifted from XsReconKernel.h");
 
 namespace {
 constexpr double WATER_NUMBER_DENSITY       = 0.033427699;
@@ -984,6 +1006,7 @@ void XSSet::Update() {
     }
 
     Reconstruct();
+    ++_micx_generation; // full rebuild; see the note in UpdateFlatXS
 }
 
 // Pre-compute node lookup and burnup-interpolated reference XS.
@@ -2316,6 +2339,10 @@ void XSSet::UpdateFlatXS(const XSUpdateOptions& options) {
             UpdateUnroddedNodeXS(l);
         }
     }
+
+    // Even a partial pass may have rebuilt _micx/_lmpx rows; the device copy
+    // re-uploads whole, which is conservative but never stale.
+    ++_micx_generation;
 }
 
 double XSSet::FineRodThermalFluenceAverage(int l, int ctype) const {
@@ -2948,6 +2975,64 @@ static void ApplyXeEquilibrium(milk::Vector<double>& iden, const std::vector<dou
     iden[iXe135m] = brItoXe135m * lambdaI * Ieq / lambdaXem;
 }
 
+bool XSSet::TryUpdateEquilibriumXenonGpu(double power, double relax, double& max_change) {
+    using namespace Isotope;
+
+    // The kernel fixes NG/NISO at compile time (registers, full unroll); a
+    // deck outside those dimensions falls back before touching the device.
+    if (_g.ng() != xsrecon::NG || static_cast<int>(niso) != xsrecon::NISO)
+        return false;
+
+    if (!_xsrecon_backend)
+        _xsrecon_backend = std::make_unique<XsReconBackend>();
+    if (!_xsrecon_backend->available()) {
+        static std::once_flag warn_once;
+        std::call_once(warn_once, [this] {
+            std::cerr << "[RASBERY][WARN][xsrecon] RASBERY_GPU_XSRECON set but device "
+                         "path unavailable ("
+                      << _xsrecon_backend->status() << ") -- CPU loop\n";
+        });
+        return false;
+    }
+
+    const int nxyz = _g.nxyz();
+    if (_fuel_nodes.empty()) {
+        for (int l = 0; l < nxyz; ++l)
+            if (_g.IsFuel(l))
+                _fuel_nodes.push_back(l);
+        if (_fuel_nodes.empty())
+            return false; // no fuel: the CPU loop is an equally empty pass
+    }
+
+    std::array<double, xsrecon::NISO> dep_i135{}, dep_xe135{};
+    for (int j = 0; j < xsrecon::NISO; ++j) {
+        dep_i135[static_cast<size_t>(j)]  = depTrans(iI135, static_cast<size_t>(j));
+        dep_xe135[static_cast<size_t>(j)] = depTrans(iXe135, static_cast<size_t>(j));
+    }
+
+    xsrecon::BatchView v{};
+    for (int xt = 0; xt < xsrecon::NXS; ++xt) {
+        const auto t = static_cast<XSTYPE>(xt);
+        v.mic[xt]    = _micx[t].data();
+        v.lmp[xt]    = _lmpx[t].data();
+        v.xs[xt]     = _xs[t].data();
+    }
+    v.mic_ssm     = _micx.xssm.data();
+    v.lmp_ssm     = _lmpx.xssm.data();
+    v.xs_ssm      = _xs.xssm.data();
+    v.iden        = _iden.data();
+    v.phif        = _g.Phif();
+    v.fuel        = _fuel_nodes.data();
+    v.n_fuel      = static_cast<int>(_fuel_nodes.size());
+    v.nxyz        = nxyz;
+    v.norm_factor = NormFactor(power);
+    v.relax       = relax;
+    v.dep_i135    = dep_i135.data();
+    v.dep_xe135   = dep_xe135.data();
+
+    return _xsrecon_backend->solve(v, _micx_generation, &max_change);
+}
+
 double XSSet::UpdateEquilibriumXenon(double power, double relax) {
     using namespace Isotope;
 
@@ -2956,6 +3041,13 @@ double XSSet::UpdateEquilibriumXenon(double power, double relax) {
 
     xsphase::Scope eqxe_scope(xsphase::tallies().eqxe,
                               static_cast<std::uint64_t>(_g.nxyz()));
+
+    if (rasberyGpuXsReconEnabled()) {
+        double gpu_max = 0.0;
+        if (TryUpdateEquilibriumXenonGpu(power, relax, gpu_max))
+            return gpu_max;
+        // any failure falls through to the unchanged CPU loop
+    }
 
     const int    ng          = _g.ng();
     const int    nxyz        = _g.nxyz();

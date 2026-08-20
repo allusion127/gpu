@@ -1,4 +1,5 @@
 #pragma once
+#include "CudaXsReconBackend.h"
 #include "Geometry.h"
 #include "Model.h"
 
@@ -6,6 +7,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -164,6 +166,17 @@ private:
     XSArraySet           _micx; // current node microscopic XS after branch/rod updates
     XSArraySet           _lmpx; // current node lumped XS after branch/rod updates
     milk::Vector<double> _iden; // current node isotope densities
+
+    // Equilibrium-Xe device backend (RASBERY_GPU_XSRECON, default off).  The
+    // generation counter advances whenever a host path rebuilds _micx/_lmpx
+    // (UpdateFlatXS / Update), so the backend re-uploads its resident copy
+    // only when the host actually mutated it; between rebuilds a whole
+    // Xe<->flux cascade reuses the device copy.  Rod cusping blends _xs only,
+    // never _micx/_lmpx, so it needs no bump (and the Xe reconstruct
+    // overwrites the blended _xs of fuel nodes identically on both paths).
+    std::unique_ptr<XsReconBackend> _xsrecon_backend;
+    std::vector<int>                _fuel_nodes;      // built once; geometry-fixed
+    unsigned long long              _micx_generation = 1;
 
     // Flat branch delta storage
     // Pre-flattened reference XS (burnup-interpolated, SoA layout)
@@ -387,6 +400,11 @@ public:
     // convergence tolerance on its own and declare a convergence that never
     // happened.
     double UpdateEquilibriumXenon(double power, double relax = 1.0);
+
+    /// Device arm of UpdateEquilibriumXenon (XsReconKernel.h), attempted only
+    /// when RASBERY_GPU_XSRECON is set.  Returns false on any unavailability,
+    /// in which case the caller runs the unchanged CPU loop.
+    bool TryUpdateEquilibriumXenonGpu(double power, double relax, double& max_change);
 
     void PredictorStep(double dt, double power, bool xe_transient);
     void CorrectorStep(double dt, double power, bool xe_transient);

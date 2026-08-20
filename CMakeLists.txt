@@ -38,10 +38,17 @@ file(GLOB RASBERY_SOURCES CONFIGURE_DEPENDS
 if (RASBERY_ENABLE_CUDA)
     list(REMOVE_ITEM RASBERY_SOURCES
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaBICGBackendStub.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaXsReconBackendStub.cpp"
     )
     list(APPEND RASBERY_SOURCES
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaBICGBackend.cu"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaXsReconBackend.cu"
     )
+    # The xsrecon kernel's contract is bit-identical reproduction of the host
+    # loop; nvcc must not contract a*b+c into fma where the host compiler did
+    # not.  Scoped to this one file so the CMFD backend keeps its flags.
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/CudaXsReconBackend.cu"
+            PROPERTIES COMPILE_OPTIONS "--fmad=false")
 endif ()
 
 add_executable(RASBERY ${RASBERY_SOURCES})
@@ -91,3 +98,27 @@ endif ()
 
 # Runtime paths
 target_compile_definitions(RASBERY PRIVATE DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+
+# Tests
+#
+# The xsrecon consistency harness scores the shared host/device node function
+# (XsReconKernel.h) against a verbatim quotation of the CPU loop, on synthetic
+# arrays.  It includes nothing but that header, so it builds anywhere -- no
+# HDF5, no CUDA.  -march=native mirrors the RASBERY release flags so the host
+# compiler makes the same contraction choices it makes in the real build.
+option(RASBERY_ENABLE_TESTS "Build the standalone consistency harnesses." OFF)
+
+if (RASBERY_ENABLE_TESTS)
+    enable_testing()
+
+    add_executable(rasbery_xsrecon_consistency
+            "${CMAKE_CURRENT_SOURCE_DIR}/test/xsrecon_consistency_test.cpp")
+    target_compile_features(rasbery_xsrecon_consistency PRIVATE cxx_std_20)
+    target_include_directories(rasbery_xsrecon_consistency PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    if (NOT MSVC)
+        target_compile_options(rasbery_xsrecon_consistency PRIVATE -march=native)
+    endif ()
+
+    add_test(NAME xsrecon_consistency COMMAND rasbery_xsrecon_consistency 4096)
+endif ()

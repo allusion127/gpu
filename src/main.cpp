@@ -2,6 +2,7 @@
 #include "Exporter.h"
 #include "Importer.h"
 
+#include "CudaXsReconBackend.h"
 #include "Driver.h"
 #include "XSTiming.h"
 #include "plog/Appenders/ConsoleAppender.h"
@@ -362,6 +363,11 @@ int main(int argc, char* argv[]) {
         }
 
         rasbery::rasberyReleaseBatchArena();
+        // Receipt for the xsrecon device path: a zero here means it never ran,
+        // whatever the flag said, and an A/B built on it is void (G0).
+        if (rasbery::rasberyGpuXsReconEnabled())
+            std::cout << "[RASBERY][XSRECON][GPU] {\"nodes_solved\":"
+                      << rasbery::rasberyGpuXsReconNodes() << "}" << std::endl;
         rasbery::xsphase::report(std::cout);
         const auto hdf5_stats = Chiffon::GetHdf5LockStats();
         std::cout << "[RASBERY][HDF5][LOCK] {\"acquires\":"
@@ -387,6 +393,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    if (rasbery::rasberyGpuXsReconEnabled())
+        std::cout << "[RASBERY][XSRECON][GPU] {\"nodes_solved\":"
+                  << rasbery::rasberyGpuXsReconNodes() << "}" << std::endl;
     rasbery::xsphase::report(std::cout);
     const auto hdf5_stats = Chiffon::GetHdf5LockStats();
     std::cout << "[RASBERY][HDF5][LOCK] {\"acquires\":"
