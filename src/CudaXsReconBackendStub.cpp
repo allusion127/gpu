@@ -24,6 +24,8 @@ bool XsReconBackend::solve(const xsrecon::BatchView&, unsigned long long, double
 
 unsigned long long XsReconBackend::nodesSolved() { return 0; }
 
+void XsReconBackend::pinHost(const void*, size_t) {}
+
 bool rasberyGpuXsReconEnabled() { return false; }
 
 unsigned long long rasberyGpuXsReconNodes() { return 0; }

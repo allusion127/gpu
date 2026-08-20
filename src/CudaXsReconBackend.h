@@ -63,6 +63,10 @@ public:
     /// said -- the G0 validity receipt.
     static unsigned long long nodesSolved();
 
+    /// Page-lock a host buffer this backend will repeatedly memcpy (same
+    /// contract as CudaBatchArena::pinHost: idempotent, never unregistered).
+    static void pinHost(const void* p, size_t bytes);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> _impl;

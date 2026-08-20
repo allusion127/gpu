@@ -3088,6 +3088,26 @@ bool XSSet::TryUpdateEquilibriumXenonGpu(double power, double relax, double& max
             return false; // no fuel: the CPU loop is an equally empty pass
     }
 
+    // Page-lock the host arrays every call memcpys (~6 MB/call, thousands of
+    // calls per case); pageable async copies block, pinned ones stream.
+    if (!_xsrecon_pinned) {
+        const size_t ngn = static_cast<size_t>(_g.ng()) * nxyz;
+        const size_t ssn = static_cast<size_t>(_g.ng()) * _g.ng() * nxyz;
+        for (int xt = 0; xt < xsrecon::NXS; ++xt) {
+            const auto t = static_cast<XSTYPE>(xt);
+            XsReconBackend::pinHost(_micx[t].data(), xsrecon::NISO * ngn * sizeof(double));
+            XsReconBackend::pinHost(_lmpx[t].data(), ngn * sizeof(double));
+            XsReconBackend::pinHost(_xs[t].data(), ngn * sizeof(double));
+        }
+        XsReconBackend::pinHost(_micx.xssm.data(), xsrecon::NISO * ssn * sizeof(double));
+        XsReconBackend::pinHost(_lmpx.xssm.data(), ssn * sizeof(double));
+        XsReconBackend::pinHost(_xs.xssm.data(), ssn * sizeof(double));
+        XsReconBackend::pinHost(_iden.data(),
+                                static_cast<size_t>(xsrecon::NISO) * nxyz * sizeof(double));
+        XsReconBackend::pinHost(_g.Phif(), ngn * sizeof(double));
+        _xsrecon_pinned = true;
+    }
+
     std::array<double, xsrecon::NISO> dep_i135{}, dep_xe135{};
     for (int j = 0; j < xsrecon::NISO; ++j) {
         dep_i135[static_cast<size_t>(j)]  = depTrans(iI135, static_cast<size_t>(j));

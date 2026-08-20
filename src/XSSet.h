@@ -177,6 +177,7 @@ private:
     std::unique_ptr<XsReconBackend> _xsrecon_backend;
     std::vector<int>                _fuel_nodes;      // built once; geometry-fixed
     unsigned long long              _micx_generation = 1;
+    bool                            _xsrecon_pinned  = false;
 
     // Flat branch delta storage
     // Pre-flattened reference XS (burnup-interpolated, SoA layout)

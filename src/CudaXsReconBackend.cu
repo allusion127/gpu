@@ -281,6 +281,13 @@ unsigned long long XsReconBackend::nodesSolved() {
     return g_nodes_solved.load(std::memory_order_relaxed);
 }
 
+void XsReconBackend::pinHost(const void* p, size_t bytes) {
+    if (p == nullptr || bytes == 0) return;
+    const cudaError_t rc =
+        cudaHostRegister(const_cast<void*>(p), bytes, cudaHostRegisterDefault);
+    if (rc != cudaSuccess) cudaGetLastError(); // already registered / exotic host
+}
+
 bool rasberyGpuXsReconEnabled() {
     static const bool on = envFlagEnabled("RASBERY_GPU_XSRECON");
     return on;
