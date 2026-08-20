@@ -75,6 +75,24 @@ RASBERY_XSR_HD inline double xsrFma(double a, double b, double c) {
 #endif
 }
 
+/// Separately-ROUNDED product, immune to contraction into a following add on
+/// both compilers: the device TU is built with --fmad=false, and the host
+/// build pins the rounding with an optimization barrier so -ffp-contract=fast
+/// cannot re-fuse it (gcc fuses across single-use temporaries, so a named
+/// variable alone is not a barrier).
+RASBERY_XSR_HD inline double xsrMul(double a, double b) {
+#if defined(__CUDA_ARCH__)
+    return a * b;
+#elif defined(__GNUC__)
+    double p = a * b;
+    asm volatile("" : "+x"(p));
+    return p;
+#else
+    volatile double p = a * b;
+    return p;
+#endif
+}
+
 /// Pointer view of one instance's SoA state.  The kernel sees only this view:
 /// when any of these arrays becomes device-resident (or device-produced), the
 /// pointers are repointed and the body below does not change.  Scalar slot i
@@ -119,6 +137,9 @@ RASBERY_XSR_HD inline int xsreconSolveNode(const BatchView& v, int l,
         return 0;
 
     // (b) condense the micro XS to one group; snapshot the densities.
+    // Form pinned by the production capture (tools: xsrecon_form_probe):
+    // gcc compiles this accumulation UNFUSED in XSSet.cpp, so each product is
+    // rounded before the add.
     const double invflux = 1.0 / raw_sumflux;
     double       cond[NISO * NXS];
     double       iden[NISO];
@@ -126,7 +147,7 @@ RASBERY_XSR_HD inline int xsreconSolveNode(const BatchView& v, int l,
         for (int xt = 0; xt < NXS; ++xt) {
             double sum = 0.0;
             for (int ig = 0; ig < NG; ++ig)
-                sum = xsrFma(v.mic[xt][(iso * NG + ig) * nxyz + l], absflux[ig], sum);
+                sum += xsrMul(v.mic[xt][(iso * NG + ig) * nxyz + l], absflux[ig]);
             cond[iso * NXS + xt] = sum * invflux;
         }
         iden[iso] = v.iden[iso * nxyz + l];
@@ -136,7 +157,11 @@ RASBERY_XSR_HD inline int xsreconSolveNode(const BatchView& v, int l,
     // raw_sumflux * 1.0e-24 is bit-identical to it.
     const double sumflux = raw_sumflux * 1.0e-24;
 
-    // (c) ApplyXeEquilibrium, verbatim.
+    // (c) ApplyXeEquilibrium.  Forms pinned by the production capture: the
+    // fissSource accumulations are UNFUSED, while gcc fused BOTH sides of the
+    // Xeeq quotient -- the numerator lambdaI*Ieq+fissSourceXe, and the
+    // denominator ACROSS the sigaXe temporary as fma(cond, sumflux, lambdaXe),
+    // which is why no separately-rounded sigaXe exists here.
     const double old_i   = iden[I135];
     const double old_xe  = iden[XE135];
     const double old_xem = iden[XE135M];
@@ -145,12 +170,12 @@ RASBERY_XSR_HD inline int xsreconSolveNode(const BatchView& v, int l,
         for (int j = AC_FIRST; j <= AC_LAST; ++j) {
             double xsff  = cond[j * NXS + T_XSFF];
             double fRate = iden[j] * xsff * sumflux;
-            fissSourceI += fRate * v.dep_i135[j];
-            fissSourceXe += fRate * v.dep_xe135[j];
+            fissSourceI += xsrMul(fRate, v.dep_i135[j]);
+            fissSourceXe += xsrMul(fRate, v.dep_xe135[j]);
         }
-        double sigaXe = cond[XE135 * NXS + T_XSAF] * sumflux;
-        double Ieq    = fissSourceI / LAMBDA_I;
-        double Xeeq   = xsrFma(LAMBDA_I, Ieq, fissSourceXe) / (LAMBDA_XE + sigaXe);
+        double Ieq  = fissSourceI / LAMBDA_I;
+        double Xeeq = xsrFma(LAMBDA_I, Ieq, fissSourceXe) /
+                      xsrFma(cond[XE135 * NXS + T_XSAF], sumflux, LAMBDA_XE);
 
         iden[I135]   = Ieq;
         iden[XE135]  = Xeeq;

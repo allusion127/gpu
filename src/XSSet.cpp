@@ -4,6 +4,9 @@
 #include "XSTiming.h"
 #include "XsReconKernel.h"
 
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <algorithm>
 #include <array>
@@ -2975,6 +2978,87 @@ static void ApplyXeEquilibrium(milk::Vector<double>& iden, const std::vector<dou
     iden[iXe135m] = brItoXe135m * lambdaI * Ieq / lambdaXem;
 }
 
+// Divergence probe for the xsrecon A/B, behind RASBERY_XSRECON_DEBUG_HASH:
+// one FNV-1a line per equilibrium-Xe call over everything the call writes
+// (_xs incl. scatter, the three Xe-chain _iden rows, max_change).  Diffing the
+// two arms' streams pinpoints the first call whose outputs differ, which a
+// 6-digit console trace cannot.
+static void xsreconDebugHash(const XSArraySet& xs, const milk::Vector<double>& iden,
+                             int ng, int nxyz, double max_change) {
+    static const bool on = std::getenv("RASBERY_XSRECON_DEBUG_HASH") != nullptr;
+    if (!on)
+        return;
+    auto mix = [](const double* p, size_t n, std::uint64_t s) {
+        for (size_t i = 0; i < n; ++i) {
+            std::uint64_t b;
+            std::memcpy(&b, &p[i], sizeof b);
+            s = (s ^ b) * 1099511628211ULL;
+        }
+        return s;
+    };
+    const size_t  ngn  = static_cast<size_t>(ng) * static_cast<size_t>(nxyz);
+    const std::uint64_t seed = 1469598103934665603ULL;
+    static int    call = 0;
+    ++call;
+    for (int xt = XSTF; xt <= XS3N; ++xt)
+        std::fprintf(stderr, "[XSRECON][HASH] call=%d xs%d=%016llx\n", call, xt,
+                     static_cast<unsigned long long>(
+                         mix(xs[static_cast<XSTYPE>(xt)].data(), ngn, seed)));
+    std::fprintf(stderr, "[XSRECON][HASH] call=%d ssm=%016llx\n", call,
+                 static_cast<unsigned long long>(
+                     mix(xs.xssm.data(), static_cast<size_t>(ng) * ng * nxyz, seed)));
+    std::fprintf(stderr, "[XSRECON][HASH] call=%d iden=%016llx\n", call,
+                 static_cast<unsigned long long>(
+                     mix(iden.data() + static_cast<size_t>(Isotope::iI135) * nxyz,
+                         3 * static_cast<size_t>(nxyz), seed)));
+    std::fprintf(stderr, "[XSRECON][HASH] call=%d max=%016llx\n", call,
+                 static_cast<unsigned long long>(mix(&max_change, 1, seed)));
+}
+
+// Capture for offline replay (RASBERY_XSRECON_DUMP=<path>): the first Xe
+// call's full inputs before the loop and outputs after it, raw doubles.  A
+// replay tool applies the shared kernel body to the captured inputs and
+// reports elementwise ULP against the captured outputs -- production data,
+// production codegen, no synthetic-coverage gap.
+static void xsreconDumpArrays(const char* path, Geometry& g,
+                              const XSArraySet& micx, const XSArraySet& lmpx,
+                              const XSArraySet& xs, const milk::Vector<double>& iden,
+                              double norm_factor, double relax) {
+    using namespace Isotope;
+    std::FILE* f = std::fopen(path, "wb");
+    if (!f)
+        return;
+    const int ng = g.ng(), nxyz = g.nxyz();
+    std::int64_t hdr[2] = {ng, nxyz};
+    std::fwrite(hdr, sizeof hdr[0], 2, f);
+    std::fwrite(&norm_factor, sizeof(double), 1, f);
+    std::fwrite(&relax, sizeof(double), 1, f);
+    std::vector<char> isf(static_cast<size_t>(nxyz));
+    for (int l = 0; l < nxyz; ++l)
+        isf[static_cast<size_t>(l)] = g.IsFuel(l) ? 1 : 0;
+    std::fwrite(isf.data(), 1, isf.size(), f);
+    std::vector<double> dep(2 * niso);
+    for (size_t j = 0; j < niso; ++j) {
+        dep[j]        = depTrans(iI135, j);
+        dep[niso + j] = depTrans(iXe135, j);
+    }
+    std::fwrite(dep.data(), sizeof(double), dep.size(), f);
+    const size_t ngn = static_cast<size_t>(ng) * nxyz;
+    for (int xt = XSTF; xt <= XS3N; ++xt)
+        std::fwrite(micx[static_cast<XSTYPE>(xt)].data(), sizeof(double),
+                    niso * ngn, f);
+    std::fwrite(micx.xssm.data(), sizeof(double), niso * static_cast<size_t>(ng) * ng * nxyz, f);
+    for (int xt = XSTF; xt <= XS3N; ++xt)
+        std::fwrite(lmpx[static_cast<XSTYPE>(xt)].data(), sizeof(double), ngn, f);
+    std::fwrite(lmpx.xssm.data(), sizeof(double), static_cast<size_t>(ng) * ng * nxyz, f);
+    for (int xt = XSTF; xt <= XS3N; ++xt)
+        std::fwrite(xs[static_cast<XSTYPE>(xt)].data(), sizeof(double), ngn, f);
+    std::fwrite(xs.xssm.data(), sizeof(double), static_cast<size_t>(ng) * ng * nxyz, f);
+    std::fwrite(iden.data(), sizeof(double), niso * static_cast<size_t>(nxyz), f);
+    std::fwrite(g.Phif(), sizeof(double), static_cast<size_t>(nxyz) * ng, f);
+    std::fclose(f);
+}
+
 bool XSSet::TryUpdateEquilibriumXenonGpu(double power, double relax, double& max_change) {
     using namespace Isotope;
 
@@ -3044,9 +3128,20 @@ double XSSet::UpdateEquilibriumXenon(double power, double relax) {
 
     if (rasberyGpuXsReconEnabled()) {
         double gpu_max = 0.0;
-        if (TryUpdateEquilibriumXenonGpu(power, relax, gpu_max))
+        if (TryUpdateEquilibriumXenonGpu(power, relax, gpu_max)) {
+            xsreconDebugHash(_xs, _iden, _g.ng(), _g.nxyz(), gpu_max);
             return gpu_max;
+        }
         // any failure falls through to the unchanged CPU loop
+    }
+
+    static const char* dump_path = std::getenv("RASBERY_XSRECON_DUMP");
+    static bool        dump_done = false;
+    const bool         dump_this = (dump_path != nullptr && !dump_done);
+    if (dump_this) {
+        dump_done = true;
+        xsreconDumpArrays((std::string(dump_path) + ".in").c_str(), _g, _micx,
+                          _lmpx, _xs, _iden, NormFactor(power), relax);
     }
 
     const int    ng          = _g.ng();
@@ -3141,6 +3236,20 @@ double XSSet::UpdateEquilibriumXenon(double power, double relax) {
             }
         }
     }
+    if (dump_this) {
+        std::FILE* f = std::fopen((std::string(dump_path) + ".out").c_str(), "wb");
+        if (f) {
+            const size_t ngn = static_cast<size_t>(ng) * nxyz;
+            for (int xt = XSTF; xt <= XS3N; ++xt)
+                std::fwrite(_xs[static_cast<XSTYPE>(xt)].data(), sizeof(double), ngn, f);
+            std::fwrite(_xs.xssm.data(), sizeof(double),
+                        static_cast<size_t>(ng) * ng * nxyz, f);
+            std::fwrite(_iden.data(), sizeof(double), niso * static_cast<size_t>(nxyz), f);
+            std::fwrite(&max_change, sizeof(double), 1, f);
+            std::fclose(f);
+        }
+    }
+    xsreconDebugHash(_xs, _iden, ng, nxyz, max_change);
     return max_change;
 }
 

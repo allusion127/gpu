@@ -34,7 +34,7 @@ int main(int argc, char** argv) {
         seed ^= 0xD1B54A32D192ED03ULL;
 
         const double norm_factor = 3.1415926e-13;
-        const double ref_max     = referenceLoop(ref_a.view(norm_factor, relax));
+        const double ref_max     = referenceLoop(ref_a.view(norm_factor, relax), ref_a.is_fuel);
 
         rasbery::XsReconBackend backend;
         if (!backend.available()) {

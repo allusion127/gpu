@@ -31,6 +31,7 @@ struct Arrays {
     std::vector<double> mic[xsr::NXS], lmp[xsr::NXS], xs[xsr::NXS];
     std::vector<double> mic_ssm, lmp_ssm, xs_ssm, iden, phif;
     std::vector<int>    fuel;
+    std::vector<char>   is_fuel;
     std::vector<double> dep_i135, dep_xe135;
 
     xsr::BatchView view(double norm_factor, double relax) {
@@ -86,10 +87,12 @@ Arrays makeArrays(int nxyz) {
         for (std::size_t l = 0; l < nx; ++l)
             a.iden[static_cast<std::size_t>(iso) * nx + l] *= 1.0e-41;
 
+    a.is_fuel.assign(static_cast<std::size_t>(nxyz), 0);
     for (int l = 0; l < nxyz; ++l) {
         const double r = urand();
         if (r < 0.65) {
             a.fuel.push_back(l); // fuel node
+            a.is_fuel[static_cast<std::size_t>(l)] = 1;
             if (r < 0.02)        // a few fuel nodes with zero flux (skip guard)
                 for (int ig = 0; ig < xsr::NG; ++ig)
                     a.phif[static_cast<std::size_t>(l) * xsr::NG + ig] = 0.0;
@@ -104,128 +107,194 @@ Arrays makeArrays(int nxyz) {
     return a;
 }
 
+// refApplyXeEquilibrium reads these like production reads the global depTrans.
+inline const double* g_dep_i135_ref  = nullptr;
+inline const double* g_dep_xe135_ref = nullptr;
+
 // --------------------------------------------------------------------------
-// Reference: quoted from src/XSSet.cpp.  Do not "improve" -- keep the loop
-// shapes and expression forms exactly as the production file has them.
+// Reference: quoted from src/XSSet.cpp with its OpenMP structure, and with
+// every contraction-sensitive expression PINNED to the form production gcc
+// actually emitted -- mined from a real capture by xsrecon_form_probe
+// (condense and fissSource unfused; both sides of the Xeeq quotient fused,
+// the denominator across the sigaXe temporary; reconstruct fused).  Quoting
+// the source alone is NOT enough: gcc contracts the same statements
+// differently in different translation units, which this harness proved the
+// hard way.  refMulR pins an unfused rounding; std::fma pins a fused one.
 // --------------------------------------------------------------------------
-double referenceLoop(const xsr::BatchView& v) {
-    const int nxyz   = v.nxyz;
-    const int ng     = xsr::NG;
-    const int niso   = xsr::NISO;
+
+// Separately-rounded product the harness compiler cannot re-fuse.
+inline double refMulR(double a, double b) {
+#if defined(__GNUC__)
+    double p = a * b;
+    asm volatile("" : "+x"(p));
+    return p;
+#else
+    volatile double p = a * b;
+    return p;
+#endif
+}
+
+// FluxScale, quoted.
+static double refFluxScale(const double* flux, int ng) {
+    double sum = 0.0;
+    for (int ig = 0; ig < ng; ++ig)
+        sum += flux[ig];
+    return sum * 1.0e-24;
+}
+
+// ApplyXeEquilibrium, quoted (milk::Vector -> std::vector, depTrans -> the
+// globals above are the only edits).
+static void refApplyXeEquilibrium(std::vector<double>& iden,
+                                  const std::vector<double>& cond, double sumflux) {
+    constexpr double lambdaI     = 2.930607e-05;
+    constexpr double lambdaXe    = 2.106574e-05;
+    constexpr double lambdaXem   = 7.555561e-04;
+    constexpr double brItoXe135m = 1.650900e-01;
+
+    double fissSourceI = 0.0, fissSourceXe = 0.0;
+    for (size_t j = xsr::AC_FIRST; j <= xsr::AC_LAST; ++j) {
+        double xsff  = cond[j * xsr::NXS + xsr::T_XSFF];
+        double fRate = iden[j] * xsff * sumflux;
+        fissSourceI += refMulR(fRate, g_dep_i135_ref[j]);
+        fissSourceXe += refMulR(fRate, g_dep_xe135_ref[j]);
+    }
+
+    double Ieq  = fissSourceI / lambdaI;
+    double Xeeq = std::fma(lambdaI, Ieq, fissSourceXe) /
+                  std::fma(cond[xsr::XE135 * xsr::NXS + xsr::T_XSAF], sumflux, lambdaXe);
+
+    iden[xsr::I135]   = Ieq;
+    iden[xsr::XE135]  = Xeeq;
+    iden[xsr::XE135M] = brItoXe135m * lambdaI * Ieq / lambdaXem;
+}
+
+// ReconstructNode, quoted (member access -> BatchView is the only edit).
+static void refReconstructNode(const xsr::BatchView& v, size_t l) {
+    const int    ng   = xsr::NG;
+    const int    nxyz = v.nxyz;
+    const size_t niso = xsr::NISO;
+
+    for (int xt = xsr::T_XSTF; xt <= xsr::T_XS3N; ++xt) {
+        if (xt == xsr::T_XSDF || xt == xsr::T_XSRF) continue;
+        double*       dst = v.xs[xt];
+        const double* lmp = v.lmp[xt];
+        const double* mic = v.mic[xt];
+
+        for (int ig = 0; ig < ng; ++ig) {
+            double val = lmp[ig * nxyz + l];
+            for (size_t iso = 0; iso < niso; ++iso)
+                val = std::fma(mic[(iso * ng + ig) * nxyz + l],
+                               v.iden[iso * nxyz + l], val);
+            dst[ig * nxyz + l] = val;
+        }
+    }
+
+    for (int igs = 0; igs < ng; ++igs) {
+        for (int ige = 0; ige < ng; ++ige) {
+            double val = v.lmp_ssm[(igs * ng + ige) * nxyz + l];
+            for (size_t iso = 0; iso < niso; ++iso)
+                val = std::fma(v.mic_ssm[(iso * ng * ng + igs * ng + ige) * nxyz + l],
+                               v.iden[iso * nxyz + l], val);
+            v.xs_ssm[(igs * ng + ige) * nxyz + l] = val;
+        }
+    }
+
+    for (int ig = 0; ig < ng; ++ig) {
+        double tr = v.xs[xsr::T_XSTF][ig * nxyz + l];
+        v.xs[xsr::T_XSDF][ig * nxyz + l] =
+            (tr > 1.0e-30) ? 0.333333333333333 / tr : 0.0;
+    }
+
+    for (int igs = 0; igs < ng; ++igs) {
+        double rf = v.xs[xsr::T_XSAF][igs * nxyz + l];
+        for (int ige = 0; ige < ng; ++ige)
+            rf += v.xs_ssm[(igs * ng + ige) * nxyz + l];
+        v.xs[xsr::T_XSRF][igs * nxyz + l] = rf;
+    }
+}
+
+double referenceLoop(const xsr::BatchView& v, const std::vector<char>& is_fuel) {
+    const int    ng   = xsr::NG;
+    const int    nxyz = v.nxyz;
+    const size_t niso = xsr::NISO;
     double max_change = 0.0;
 
-    std::vector<double> abs_flux_tls(static_cast<std::size_t>(ng));
-    std::vector<double> condensed(static_cast<std::size_t>(niso) * xsr::NXS, 0.0);
-    std::vector<double> wsiden(static_cast<std::size_t>(niso));
+    g_dep_i135_ref  = v.dep_i135;
+    g_dep_xe135_ref = v.dep_xe135;
 
-    for (int i = 0; i < v.n_fuel; ++i) {
-        const int l = v.fuel[i];
+#pragma omp parallel if (nxyz > 64) reduction(max : max_change)
+    {
+        static thread_local std::vector<double> ws_condensed;
+        static thread_local std::vector<double> ws_iden;
+        static thread_local std::vector<double> abs_flux_tls;
 
-        double raw_sumflux = 0.0;
-        for (int ig = 0; ig < ng; ++ig) {
-            abs_flux_tls[static_cast<size_t>(ig)] =
-                v.phif[l * ng + ig] * v.norm_factor;
-            raw_sumflux += abs_flux_tls[static_cast<size_t>(ig)];
-        }
-        if (raw_sumflux <= 0.0)
-            continue;
+        if (ws_iden.size() != niso)
+            ws_iden.resize(niso);
+        if (abs_flux_tls.size() != static_cast<size_t>(ng))
+            abs_flux_tls.resize(static_cast<size_t>(ng));
+        if (ws_condensed.size() < niso * xsr::NXS)
+            ws_condensed.resize(niso * xsr::NXS, 0.0);
 
-        const double invflux = 1.0 / raw_sumflux;
-        for (size_t iso = 0; iso < static_cast<size_t>(niso); ++iso) {
-            double* dst = condensed.data() + iso * xsr::NXS;
-            for (size_t xt = 0; xt < static_cast<size_t>(xsr::NXS); ++xt) {
-                double sum = 0.0;
-                for (int ig = 0; ig < ng; ++ig) {
-                    const size_t off =
-                        (iso * static_cast<size_t>(ng) + static_cast<size_t>(ig)) *
-                            static_cast<size_t>(nxyz) +
-                        static_cast<size_t>(l);
-                    sum += v.mic[xt][off] * abs_flux_tls[static_cast<size_t>(ig)];
-                }
-                dst[xt] = sum * invflux;
-            }
-            wsiden[iso] = v.iden[iso * static_cast<size_t>(nxyz) +
-                                 static_cast<size_t>(l)];
-        }
+        const double* mic_ptrs[xsr::NXS] = {
+            v.mic[0], v.mic[1], v.mic[2], v.mic[3], v.mic[4], v.mic[5],
+            v.mic[6], v.mic[7], v.mic[8], v.mic[9], v.mic[10]};
 
-        // FluxScale
-        double sumflux = 0.0;
-        for (int ig = 0; ig < ng; ++ig)
-            sumflux += abs_flux_tls[static_cast<size_t>(ig)];
-        sumflux *= 1.0e-24;
+#pragma omp for schedule(dynamic, 8)
+        for (int l = 0; l < nxyz; ++l) {
+            if (!is_fuel[static_cast<size_t>(l)])
+                continue;
 
-        const double old_i   = wsiden[xsr::I135];
-        const double old_xe  = wsiden[xsr::XE135];
-        const double old_xem = wsiden[xsr::XE135M];
-        // ApplyXeEquilibrium
-        {
-            constexpr double lambdaI     = 2.930607e-05;
-            constexpr double lambdaXe    = 2.106574e-05;
-            constexpr double lambdaXem   = 7.555561e-04;
-            constexpr double brItoXe135m = 1.650900e-01;
-
-            double fissSourceI = 0.0, fissSourceXe = 0.0;
-            for (size_t j = xsr::AC_FIRST; j <= xsr::AC_LAST; ++j) {
-                double xsff  = condensed[j * xsr::NXS + xsr::T_XSFF];
-                double fRate = wsiden[j] * xsff * sumflux;
-                fissSourceI += fRate * v.dep_i135[j];
-                fissSourceXe += fRate * v.dep_xe135[j];
-            }
-            double sigaXe = condensed[xsr::XE135 * xsr::NXS + xsr::T_XSAF] * sumflux;
-            double Ieq    = fissSourceI / lambdaI;
-            double Xeeq   = (lambdaI * Ieq + fissSourceXe) / (lambdaXe + sigaXe);
-
-            wsiden[xsr::I135]   = Ieq;
-            wsiden[xsr::XE135]  = Xeeq;
-            wsiden[xsr::XE135M] = brItoXe135m * lambdaI * Ieq / lambdaXem;
-        }
-        const double new_xe = wsiden[xsr::XE135];
-        const double scale  = std::max(std::abs(new_xe), 1.0e-30);
-        max_change          = std::max(max_change, std::abs(new_xe - old_xe) / scale);
-
-        if (v.relax < 1.0) {
-            wsiden[xsr::I135]   = old_i + v.relax * (wsiden[xsr::I135] - old_i);
-            wsiden[xsr::XE135]  = old_xe + v.relax * (wsiden[xsr::XE135] - old_xe);
-            wsiden[xsr::XE135M] = old_xem + v.relax * (wsiden[xsr::XE135M] - old_xem);
-        }
-
-        v.iden[xsr::I135 * static_cast<size_t>(nxyz) + static_cast<size_t>(l)] =
-            wsiden[xsr::I135];
-        v.iden[xsr::XE135 * static_cast<size_t>(nxyz) + static_cast<size_t>(l)] =
-            wsiden[xsr::XE135];
-        v.iden[xsr::XE135M * static_cast<size_t>(nxyz) + static_cast<size_t>(l)] =
-            wsiden[xsr::XE135M];
-
-        // ReconstructNode(l)
-        for (int a = 0; a < 9; ++a) {
-            const int xt = xsr::ACTIVE_XT[a];
+            double raw_sumflux = 0.0;
             for (int ig = 0; ig < ng; ++ig) {
-                double val = v.lmp[xt][ig * nxyz + l];
-                for (size_t iso = 0; iso < static_cast<size_t>(niso); ++iso)
-                    val += v.mic[xt][(iso * ng + ig) * nxyz + l] *
-                           v.iden[iso * static_cast<size_t>(nxyz) + static_cast<size_t>(l)];
-                v.xs[xt][ig * nxyz + l] = val;
+                abs_flux_tls[static_cast<size_t>(ig)] =
+                    v.phif[l * ng + ig] * v.norm_factor;
+                raw_sumflux += abs_flux_tls[static_cast<size_t>(ig)];
             }
-        }
-        for (int igs = 0; igs < ng; ++igs) {
-            for (int ige = 0; ige < ng; ++ige) {
-                double val = v.lmp_ssm[(igs * ng + ige) * nxyz + l];
-                for (size_t iso = 0; iso < static_cast<size_t>(niso); ++iso)
-                    val += v.mic_ssm[(iso * ng * ng + igs * ng + ige) * nxyz + l] *
-                           v.iden[iso * static_cast<size_t>(nxyz) + static_cast<size_t>(l)];
-                v.xs_ssm[(igs * ng + ige) * nxyz + l] = val;
+            if (raw_sumflux <= 0.0)
+                continue;
+
+            const double invflux = 1.0 / raw_sumflux;
+            for (size_t iso = 0; iso < niso; ++iso) {
+                double* dst = ws_condensed.data() + iso * xsr::NXS;
+                for (size_t xt = 0; xt < static_cast<size_t>(xsr::NXS); ++xt) {
+                    double sum = 0.0;
+                    for (int ig = 0; ig < ng; ++ig) {
+                        const size_t off =
+                            (iso * static_cast<size_t>(ng) + static_cast<size_t>(ig)) *
+                                static_cast<size_t>(nxyz) +
+                            static_cast<size_t>(l);
+                        sum += refMulR(mic_ptrs[xt][off],
+                                       abs_flux_tls[static_cast<size_t>(ig)]);
+                    }
+                    dst[xt] = sum * invflux;
+                }
+                ws_iden[iso] = v.iden[iso * static_cast<size_t>(nxyz) +
+                                      static_cast<size_t>(l)];
             }
-        }
-        for (int ig = 0; ig < ng; ++ig) {
-            double tr               = v.xs[xsr::T_XSTF][ig * nxyz + l];
-            v.xs[xsr::T_XSDF][ig * nxyz + l] =
-                (tr > 1.0e-30) ? 0.333333333333333 / tr : 0.0;
-        }
-        for (int igs = 0; igs < ng; ++igs) {
-            double rf = v.xs[xsr::T_XSAF][igs * nxyz + l];
-            for (int ige = 0; ige < ng; ++ige)
-                rf += v.xs_ssm[(igs * ng + ige) * nxyz + l];
-            v.xs[xsr::T_XSRF][igs * nxyz + l] = rf;
+
+            const double old_i   = ws_iden[xsr::I135];
+            const double old_xe  = ws_iden[xsr::XE135];
+            const double old_xem = ws_iden[xsr::XE135M];
+            refApplyXeEquilibrium(ws_iden, ws_condensed,
+                                  refFluxScale(abs_flux_tls.data(), ng));
+            const double new_xe = ws_iden[xsr::XE135];
+            const double scale  = std::max(std::abs(new_xe), 1.0e-30);
+            max_change          = std::max(max_change, std::abs(new_xe - old_xe) / scale);
+
+            if (v.relax < 1.0) {
+                ws_iden[xsr::I135]   = std::fma(v.relax, ws_iden[xsr::I135] - old_i, old_i);
+                ws_iden[xsr::XE135]  = std::fma(v.relax, ws_iden[xsr::XE135] - old_xe, old_xe);
+                ws_iden[xsr::XE135M] = std::fma(v.relax, ws_iden[xsr::XE135M] - old_xem, old_xem);
+            }
+
+            v.iden[xsr::I135 * static_cast<size_t>(nxyz) + static_cast<size_t>(l)] =
+                ws_iden[xsr::I135];
+            v.iden[xsr::XE135 * static_cast<size_t>(nxyz) + static_cast<size_t>(l)] =
+                ws_iden[xsr::XE135];
+            v.iden[xsr::XE135M * static_cast<size_t>(nxyz) + static_cast<size_t>(l)] =
+                ws_iden[xsr::XE135M];
+
+            refReconstructNode(v, static_cast<size_t>(l));
         }
     }
     return max_change;
