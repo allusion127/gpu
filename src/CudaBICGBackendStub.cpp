@@ -62,6 +62,15 @@ void CudaBatchArena::setInner(int, int, double) {
 void CudaBatchArena::solve(int, double*) {
     throw std::runtime_error(_impl->status);
 }
+void CudaBatchArena::stageSweeps(int, const CmfdSweepIO&) {
+    throw std::runtime_error(_impl->status);
+}
+void CudaBatchArena::solveSweeps(int, double*, CmfdSweepIO&) {
+    throw std::runtime_error(_impl->status);
+}
+void CudaBatchArena::solveCommon(int, double*, int) {
+    throw std::runtime_error(_impl->status);
+}
 void CudaBatchArena::reportBatchOccupancy(const char*) const {}
 
 namespace {

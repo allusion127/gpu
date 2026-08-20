@@ -48,6 +48,14 @@ protected:
     /// @brief the unshifted diagonal matrix
     std::vector<double> _udiag;
 
+    /// @brief group-major chif/xsnf and node volumes, materialized once per
+    /// drive() for the device-resident sweep path (RASBERY_GPU_CMFD_SWEEP)
+    std::vector<double> _sweep_chif, _sweep_xsnf, _sweep_vol;
+
+    /// @brief the device-resident sweep loop; true when it owned the whole
+    /// drive, false when the caller must run the host loop from scratch
+    bool driveDeviceSweeps(double& eigv, double* flux, double& errl2);
+
 public:
     BICGCMFD(Geometry& g, XSSet& x);
 

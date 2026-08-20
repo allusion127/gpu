@@ -318,6 +318,13 @@ void BICGSolver::synchronizeCudaFlux(double* phi) {
     if (_use_cuda) _cuda->synchronize(phi);
 }
 
+bool BICGSolver::driveSweepsCuda(double* phi, CudaBatchArena::CmfdSweepIO& io) {
+    if (_arena == nullptr || _batch_slot < 0 || !_arena->available()) return false;
+    _arena->stageSweeps(_batch_slot, io);
+    _arena->solveSweeps(_batch_slot, phi, io);
+    return true;
+}
+
 void BICGSolver::axb(double* diag, double* cc, double* phi, double* aphi) {
     const int ng   = _g.ng();
     const int ng2  = _g.ng2();

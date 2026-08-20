@@ -216,6 +216,111 @@ void BICGCMFD::updpsi(const double* flux) {
     }
 }
 
+// The device-resident sweep loop (RASBERY_GPU_CMFD_SWEEP).  One graph launch
+// runs up to the remaining sweep budget; the loop below only spins again for
+// the negative-flux retry pathology or the degenerate-gamma hand-back, both
+// of which the plain host loop also treats as exceptional.  Delegation only
+// happens in the Wielandt regime (the caller checks the warm-up), so the
+// Rayleigh branch here is the gamma-degenerate fallback, not the schedule.
+bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
+    const int nxyz = _g.nxyz();
+    const int ng   = _g.ng();
+    _sweep_chif.resize(static_cast<size_t>(ng) * nxyz);
+    _sweep_xsnf.resize(static_cast<size_t>(ng) * nxyz);
+    _sweep_vol.resize(static_cast<size_t>(nxyz));
+    for (int l = 0; l < nxyz; ++l) {
+        _sweep_vol[static_cast<size_t>(l)] = _g.vol(l);
+        for (int ig = 0; ig < ng; ++ig) {
+            _sweep_chif[static_cast<size_t>(ig) * nxyz + l] = _x.chif(ig, l);
+            _sweep_xsnf[static_cast<size_t>(ig) * nxyz + l] = _x.xsnf(ig, l);
+        }
+    }
+
+    double reigv  = 1. / eigv;
+    double reigvs = (_eshift != 0.0) ? 1. / (eigv + _eshift) : 0.0;
+    int    iout = 0, icmfd = 0;
+
+    while (iout < _ncmfd) {
+        // Stage this outer's operator exactly as a host sweep would; the
+        // device builds src itself, so _src rides along unused.
+        double r20 = 0.0;
+        _ls->reset(_diag, _cc, flux, _src, r20);
+        _ls->solveInner(_nmaxbicg, _epsbicg);
+
+        CudaBatchArena::CmfdSweepIO io;
+        io.chif         = _sweep_chif.data();
+        io.xsnf         = _sweep_xsnf.data();
+        io.vol          = _sweep_vol.data();
+        io.udiag        = _udiag.data();
+        io.psi          = _psi;
+        io.eigv         = eigv;
+        io.reigv        = reigv;
+        io.reigvs       = reigvs;
+        io.errl2        = errl2;
+        io.epsl2        = _epsl2;
+        io.eshift       = _eshift;
+        io.sweep_budget = _ncmfd - iout;
+        io.icmfd_budget = 20 * _ncmfd;
+        io.icmfd_done   = icmfd;
+        io.ngxyz        = _g.ngxyz();
+
+        if (!_ls->driveSweepsCuda(flux, io))
+            return false; // nothing ran; the caller's host loop takes over
+
+        const int attempts = io.icmfd_done - icmfd;
+        icmfd              = io.icmfd_done;
+        iout += io.sweeps_done;
+        _wiel_sweep += attempts;
+        iter += attempts;
+        eigv   = io.eigv;
+        reigv  = io.reigv;
+        reigvs = io.reigvs;
+        errl2  = io.errl2;
+
+        if (io.state == 1 || io.state == 3) return true; // converged / budget spent
+
+        if (io.state == 2) {
+            // Degenerate gamma: the device ran this sweep's source/BiCG/psi
+            // update and exported the wiel sums; finish the sweep with the
+            // Rayleigh branch of wiel, then keep looping.  psi already holds
+            // the NEW fission source, exactly as it does at this point of the
+            // host wiel.
+            double sumf = 0;
+            double summ = 0;
+            for (int l = 0; l < nxyz; ++l) {
+                for (int ig2 = 0; ig2 < ng; ++ig2) {
+                    double ab = CMFD::axb(ig2, l, flux);
+                    summ      = summ + ab;
+                }
+                sumf += psi(l);
+                summ += psi(l) * reigvs;
+            }
+            eigv  = sumf / summ;
+            reigv = 1 / eigv;
+            const double err_scale = (io.gammad > 0.0) ? io.gammad : io.gamman;
+            errl2 = (err_scale > 0.0) ? sqrt(abs(io.err_acc / err_scale)) : 0.0;
+            double eigvs = eigv + _eshift; // Wielandt regime: icy >= 0
+            reigvs       = (_eshift != 0.0) ? 1. / eigvs : 0.0;
+
+            if (_eshift != 0.0) {
+                updls(reigvs);
+                _ls->facilu(_diag, _cc);
+            }
+            int negative = 0;
+            for (int l = 0; l < nxyz; ++l)
+                for (int ig2 = 0; ig2 < ng; ++ig2)
+                    if (flux(ig2, l) < 0) ++negative;
+            if (negative == _g.ngxyz()) negative = 0;
+            if (!(negative != 0 && icmfd < 20 * _ncmfd)) ++iout;
+            if (errl2 < _epsl2) return true;
+            continue;
+        }
+        // state 0: the launch unroll was spent on retries; go again with the
+        // remaining budget.
+    }
+    return true;
+}
+
 void BICGCMFD::drive(double& eigv, double* flux, double& errl2) {
 
     int    icmfd  = 0;
@@ -249,6 +354,19 @@ void BICGCMFD::drive(double& eigv, double* flux, double& errl2) {
         g_cmfd_dump.write(chif_mat.data(), chif_mat.size());
         g_cmfd_dump.write(xsnf_mat.data(), xsnf_mat.size());
         g_cmfd_dump.write(vol_mat.data(), vol_mat.size());
+    }
+
+    // Device-resident sweeps, once the Wielandt regime is reached (the warm-up
+    // and its Rayleigh schedule stay on the host, so the device never needs
+    // the icy < 0 branch).  A false return means nothing ran on the device and
+    // the pristine host loop below takes over.
+    static const bool sweep_dev = [] {
+        const char* v = std::getenv("RASBERY_GPU_CMFD_SWEEP");
+        return v != nullptr && std::string(v) != "0";
+    }();
+    if (sweep_dev && !cap && _ls->usingCuda() && _g.ng() == 2 &&
+        _wiel_sweep >= WIELANDT_WARMUP_SWEEPS) {
+        if (driveDeviceSweeps(eigv, flux, errl2)) return;
     }
 
     int negative = 0;

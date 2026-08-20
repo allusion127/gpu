@@ -135,6 +135,12 @@ public:
     /// Copy the resident CUDA flux to the host at a CMFD observation boundary.
     void synchronizeCudaFlux(double* phi);
 
+    /// Run a device-resident CMFD sweep batch (RASBERY_GPU_CMFD_SWEEP).
+    /// Requires the batch arena; returns false when unavailable so the caller
+    /// keeps the host sweep loop.  reset()/solveInner() must have staged this
+    /// outer's operator and inner budget first, exactly as for solve().
+    bool driveSweepsCuda(double* phi, CudaBatchArena::CmfdSweepIO& io);
+
     /// @brief calculate Axb in the BICGStab calculation
     /// @param diag the diagonal matrix
     /// @param cc the coupling coefficient

@@ -41,8 +41,31 @@ enum ScalarSlot : int {
     kR20,
     /// _epsbicg, pushed down from the host whenever setIterLim changes it.
     kEps,
+    // ---- device-resident CMFD sweep state (RASBERY_GPU_CMFD_SWEEP) ----
+    // Kept contiguous from kSweepFirst so the host stages/harvests the whole
+    // block with one memcpy without touching the BiCG slots above.
+    kEigv,        ///< current eigenvalue
+    kReigv,       ///< 1/eigv
+    kReigvs,      ///< shifted 1/(eigv+eshift), 0 when unshifted
+    kErrl2,       ///< fission-source change of the last sweep
+    kEpsl2,       ///< sweep convergence criterion
+    kEshift,      ///< Wielandt shift
+    kReigvdel,    ///< reigv - reigvs, refreshed at each sweep start
+    kSweepBudget, ///< iout slots remaining for this drive()
+    kSweepsDone,  ///< iout advances made on the device
+    kIcmfdBudget, ///< 20*ncmfd, the negative-flux retry cap
+    kIcmfdDone,   ///< sweep attempts including retries (host value at entry)
+    kNegative,    ///< negative flux entries of the last sweep
+    kSweepState,  ///< 0 running, 1 converged, 2 needs-host wiel, 3 budget spent
+    kGammaD,      ///< wiel sums exported for the needs-host fallback
+    kGammaN,
+    kErrAcc,
+    kNgxyz,       ///< ng*nxyz, for the all-negative reset rule
     kScalarCount
 };
+
+constexpr int kSweepFirst = kEigv;
+constexpr int kSweepCount = kScalarCount - kSweepFirst;
 
 /// Device-side tallies harvested once per outer instead of once per iteration.
 enum CounterSlot : int {
@@ -264,14 +287,18 @@ __global__ void initialize_solver_state(double* scalars,
                                         std::uint32_t* flags,
                                         std::uint32_t* halt,
                                         std::uint32_t* counters,
-                                        const std::uint32_t* __restrict__ active) {
+                                        const std::uint32_t* __restrict__ active,
+                                        const std::uint32_t* __restrict__ sweep_halt) {
     if (threadIdx.x != 0) return;
     const int m = static_cast<int>(blockIdx.y);
 
     // The one place the participation mask enters the device: every later
     // kernel only ever consults `halt`, exactly as it did before batching.
-    halt[m] = (active[m] != 0u) ? 0u : 1u;
-    if (active[m] == 0u) return;
+    // A raised sweep_halt (device-resident CMFD sweeps that converged, ran
+    // out of budget, or handed back to the host) masks the slot the same way
+    // non-participation does; it is all-zero outside the sweep path.
+    halt[m] = (active[m] != 0u && sweep_halt[m] == 0u) ? 0u : 1u;
+    if (halt[m] != 0u) return;
 
     double*        sm = scalars + static_cast<long long>(m) * kScalarCount;
     std::uint32_t* cm = counters + static_cast<long long>(m) * kCounterSlots;
@@ -573,6 +600,208 @@ __global__ void finalize_status(const double* scalars,
 }
 
 // ---------------------------------------------------------------------------
+// Device-resident CMFD sweep (RASBERY_GPU_CMFD_SWEEP).
+//
+// One graph launch runs up to `unroll` Wielandt sweeps -- source rebuild,
+// BiCGSTAB inner (the existing enqueue_outer sequence), the wiel eigenvalue
+// update, updls and the negative-flux bookkeeping -- with a per-slot
+// `sweep_halt` playing the role the host `break`/retry logic played, exactly
+// as `halt` does for the BiCG inner loop.
+//
+// Every contraction-ambiguous expression uses the form MINED from the
+// production host build by test/cmfd_form_probe.cpp (capture:
+// RASBERY_CMFD_DUMP).  gcc's pattern on this code: in `a*b + c*d` it rounds
+// the SECOND product and fuses the FIRST into the add; the wiel accumulations
+// are unfused; the updls subtract is fused.  On the device, fma() forces the
+// fused sites and __dmul_rn() pins the unfused ones regardless of this TU's
+// -fmad setting, so the kernels below cannot drift when compiler flags do.
+// ---------------------------------------------------------------------------
+
+__global__ void cmfd_sweep_begin(double* scalars, std::uint32_t* sweep_halt) {
+    if (threadIdx.x != 0) return;
+    const int m = static_cast<int>(blockIdx.y);
+    if (sweep_halt[m] != 0u) return;
+    double* sm    = scalars + static_cast<long long>(m) * kScalarCount;
+    sm[kReigvdel] = sm[kReigv] - sm[kReigvs];
+    sm[kNegative] = 0.0;
+    sm[kIcmfdDone] += 1.0; // host ++icmfd at the top of each pass
+}
+
+/// src(ig,l) = chif(ig,l) * (psi(l) * reigvdel) -- two bare multiplies, no
+/// contraction ambiguity.  chif/xsnf are group-major [ig*nxyz+l], src/flux are
+/// node-major [l*ng+ig], psi/vol are [l]; all strides mirror the host arrays.
+__global__ void cmfd_src_build(const int nxyz,
+                               const long long vec_stride,
+                               const long long node_stride,
+                               const double* __restrict__ chif,
+                               const double* __restrict__ psi,
+                               double* __restrict__ src,
+                               const double* __restrict__ scalars,
+                               const std::uint32_t* __restrict__ sweep_halt) {
+    const int m = static_cast<int>(blockIdx.y);
+    if (sweep_halt[m] != 0u) return;
+    const int l = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (l >= nxyz) return;
+    const double fs =
+        psi[m * node_stride + l] *
+        scalars[static_cast<long long>(m) * kScalarCount + kReigvdel];
+    const double* cm = chif + m * vec_stride;
+    double*       sv = src + m * vec_stride;
+    sv[l * 2 + 0]    = cm[l] * fs;
+    sv[l * 2 + 1]    = cm[nxyz + l] * fs;
+}
+
+/// The wiel node work, split for speed WITHOUT changing a single rounding:
+/// the mined accumulation forms are UNFUSED, so each addend the host folds in
+/// (round(err1*err1), round(psid*pv), round(pv*pv)) is an ordinary rounded
+/// double -- computing those addends in parallel and then folding the stored
+/// values in the same l-ascending order is bit-for-bit the host's serial
+/// loop, while turning a one-thread stride-gather walk into a coalesced
+/// parallel pass plus a cache-friendly sequential sum.
+__global__ void cmfd_wiel_terms(const int nxyz,
+                                const long long vec_stride,
+                                const long long node_stride,
+                                const double* __restrict__ phi,
+                                double* __restrict__ psi,
+                                const double* __restrict__ xsnf,
+                                const double* __restrict__ vol,
+                                double* __restrict__ terms_ab, ///< [slot][2*nxyz]: err1^2, psid*pv
+                                double* __restrict__ terms_c,  ///< [slot][>=nxyz]: pv*pv
+                                const std::uint32_t* __restrict__ sweep_halt) {
+    const int m = static_cast<int>(blockIdx.y);
+    if (sweep_halt[m] != 0u) return;
+    const int l = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (l >= nxyz) return;
+    const double* f    = phi + m * vec_stride;
+    const double* x0   = xsnf + m * vec_stride;
+    const double* x1   = x0 + nxyz;
+    double*       ps   = psi + m * node_stride;
+    const double  psid = ps[l];
+    double        pv   = fma(x0[l], f[l * 2 + 0], __dmul_rn(x1[l], f[l * 2 + 1]));
+    pv                 = pv * vol[m * node_stride + l];
+    const double err1  = pv - psid;
+    double*      ta    = terms_ab + m * vec_stride;
+    ta[l]              = __dmul_rn(err1, err1);
+    ta[nxyz + l]       = __dmul_rn(psid, pv);
+    terms_c[m * vec_stride + l] = __dmul_rn(pv, pv);
+    ps[l]              = pv;
+}
+
+/// The serial l-ascending fold of the stored addends, plus the eigenvalue
+/// update.  One thread per slot; slots in parallel on gridDim.y.  The
+/// warm-up (icy < 0) and Rayleigh branches never run here: the host only
+/// delegates once the Wielandt regime is reached, and a degenerate gamma
+/// hands the sweep back to the host with the sums exported.
+__global__ void cmfd_wiel_finalize(const int nxyz,
+                                   const long long vec_stride,
+                                   const double* __restrict__ terms_ab,
+                                   const double* __restrict__ terms_c,
+                                   double* scalars,
+                                   std::uint32_t* sweep_halt) {
+    if (threadIdx.x != 0) return;
+    const int m = static_cast<int>(blockIdx.y);
+    if (sweep_halt[m] != 0u) return;
+    const double* ta = terms_ab + m * vec_stride;
+    const double* tc = terms_c + m * vec_stride;
+    double err = 0.0, gammad = 0.0, gamman = 0.0;
+    for (int l = 0; l < nxyz; ++l) {
+        err    = err + ta[l];
+        gammad = gammad + ta[nxyz + l];
+        gamman = gamman + tc[l];
+    }
+    double* sm  = scalars + static_cast<long long>(m) * kScalarCount;
+    sm[kErrAcc] = err;
+    sm[kGammaD] = gammad;
+    sm[kGammaN] = gamman;
+    if (!((gammad > 0.0) && (gamman > 0.0))) {
+        sm[kSweepState] = 2.0; // host finishes this sweep with the Rayleigh path
+        sweep_halt[m]   = 1u;
+        return;
+    }
+    const double gamma = gammad / gamman;
+    const double den   = fma(sm[kReigv], gamma, __dmul_rn(1.0 - gamma, sm[kReigvs]));
+    const double eigv  = 1.0 / den;
+    sm[kEigv]          = eigv;
+    sm[kReigv]         = 1.0 / eigv;
+    const double err_scale = (gammad > 0.0) ? gammad : gamman;
+    sm[kErrl2] = (err_scale > 0.0) ? sqrt(fabs(err / err_scale)) : 0.0;
+    double eigvs = eigv, reigvs = 0.0;
+    eigvs += sm[kEshift]; // icy >= 0 by the delegation contract
+    if (sm[kEshift] != 0.0) reigvs = 1.0 / eigvs;
+    sm[kReigvs] = reigvs;
+}
+
+/// diag = udiag - chif*xsnf*reigvs*vol, with the mined fused subtract.
+__global__ void cmfd_updls(const int nxyz,
+                           const long long vec_stride,
+                           const long long node_stride,
+                           const long long mat_stride,
+                           const double* __restrict__ chif,
+                           const double* __restrict__ xsnf,
+                           const double* __restrict__ vol,
+                           const double* __restrict__ udiag,
+                           double* __restrict__ diag,
+                           const double* __restrict__ scalars,
+                           const std::uint32_t* __restrict__ sweep_halt) {
+    const int m = static_cast<int>(blockIdx.y);
+    if (sweep_halt[m] != 0u) return;
+    const double* sm = scalars + static_cast<long long>(m) * kScalarCount;
+    if (sm[kEshift] == 0.0) return;
+    const int l = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (l >= nxyz) return;
+    const double  reigvs = sm[kReigvs];
+    const double  vl     = vol[m * node_stride + l];
+    const double* cm     = chif + m * vec_stride;
+    const double* xm     = xsnf + m * vec_stride;
+    const double* um     = udiag + m * mat_stride;
+    double*       dm     = diag + m * mat_stride;
+    for (int ige = 0; ige < 2; ++ige)
+        for (int igs = 0; igs < 2; ++igs) {
+            const double c2 =
+                __dmul_rn(__dmul_rn(cm[ige * nxyz + l], xm[igs * nxyz + l]), reigvs);
+            const long long idx = static_cast<long long>(l) * 4 + ige * 2 + igs;
+            dm[idx]             = fma(-c2, vl, um[idx]);
+        }
+}
+
+/// Negative-flux census.  An integer-valued count in a double accumulates
+/// exactly in any order, so a parallel atomic matches the host's serial scan.
+__global__ void cmfd_negative_scan(const int n,
+                                   const long long vec_stride,
+                                   const double* __restrict__ phi,
+                                   double* scalars,
+                                   const std::uint32_t* __restrict__ sweep_halt) {
+    const int m = static_cast<int>(blockIdx.y);
+    if (sweep_halt[m] != 0u) return;
+    const int i = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (phi[m * vec_stride + i] < 0.0)
+        atomicAdd(&scalars[static_cast<long long>(m) * kScalarCount + kNegative], 1.0);
+}
+
+/// The host loop's control tail: the all-negative reset, the retry rule that
+/// refuses to count a negative-flux sweep against iout, and the exit tests.
+__global__ void cmfd_sweep_end(double* scalars, std::uint32_t* sweep_halt) {
+    if (threadIdx.x != 0) return;
+    const int m = static_cast<int>(blockIdx.y);
+    if (sweep_halt[m] != 0u) return;
+    double* sm  = scalars + static_cast<long long>(m) * kScalarCount;
+    double  neg = sm[kNegative];
+    if (neg == sm[kNgxyz]) neg = 0.0;
+    const bool retry = (neg != 0.0) && (sm[kIcmfdDone] < sm[kIcmfdBudget]);
+    if (!retry) sm[kSweepsDone] += 1.0;
+    if (sm[kErrl2] < sm[kEpsl2]) {
+        sm[kSweepState] = 1.0;
+        sweep_halt[m]   = 1u;
+        return;
+    }
+    if (sm[kSweepsDone] >= sm[kSweepBudget]) {
+        sm[kSweepState] = 3.0;
+        sweep_halt[m]   = 1u;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BatchCore -- the device side of both execution modes.
 //
 // `slots` is 1 for a plain single-instance run and M for the batch mode; the
@@ -628,6 +857,18 @@ public:
         int           nmax          = -1;
         double*       out_phi       = nullptr;
         bool          in_use        = false;
+
+        // ---- sweep-mode staging (RASBERY_GPU_CMFD_SWEEP) ----
+        const double* host_chif  = nullptr;
+        const double* host_xsnf  = nullptr;
+        const double* host_vol   = nullptr;
+        const double* host_udiag = nullptr;
+        double*       host_psi   = nullptr; ///< in/out
+        MirroredUpload chif_mirror;
+        MirroredUpload vol_mirror;
+        double        sweep_in[kSweepCount]  = {};
+        double        sweep_out[kSweepCount] = {};
+        int           sweep_unroll           = 0;
     };
 
     explicit BatchCore(Geometry& geometry, int slot_count)
@@ -748,6 +989,13 @@ public:
             allocate(reinterpret_cast<void**>(&device_counters),
                      S * kCounterSlots * sizeof(std::uint32_t));
             allocate(reinterpret_cast<void**>(&device_status), S * sizeof(DeviceSolveStatus));
+            allocate(reinterpret_cast<void**>(&xs_chif), vec_bytes);
+            allocate(reinterpret_cast<void**>(&xs_xsnf), vec_bytes);
+            allocate(reinterpret_cast<void**>(&node_vol), S * static_cast<size_t>(nxyz) * sizeof(double));
+            allocate(reinterpret_cast<void**>(&udiag_dev), S * matrix_count * sizeof(double));
+            allocate(reinterpret_cast<void**>(&psi_dev), S * static_cast<size_t>(nxyz) * sizeof(double));
+            allocate(reinterpret_cast<void**>(&sweep_halt), S * sizeof(std::uint32_t));
+            CUDA_CHECK(cudaMemset(sweep_halt, 0, S * sizeof(std::uint32_t)));
             CUDA_CHECK(cudaMemset(device_halt, 0, S * sizeof(std::uint32_t)));
             CUDA_CHECK(cudaMemset(device_active, 0, S * sizeof(std::uint32_t)));
             CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&host_status),
@@ -802,6 +1050,16 @@ public:
         cudaFree(device_active);
         cudaFree(device_counters);
         cudaFree(device_status);
+        if (sweep_graph_exec != nullptr) cudaGraphExecDestroy(sweep_graph_exec);
+        sweep_graph_exec = nullptr;
+        cudaFree(xs_chif);
+        cudaFree(xs_xsnf);
+        cudaFree(node_vol);
+        cudaFree(udiag_dev);
+        cudaFree(psi_dev);
+        cudaFree(sweep_halt);
+        xs_chif = xs_xsnf = node_vol = udiag_dev = psi_dev = nullptr;
+        sweep_halt = nullptr;
         if (host_status != nullptr) cudaFreeHost(host_status);
         host_status = nullptr;
         if (host_active != nullptr) cudaFreeHost(host_active);
@@ -1013,7 +1271,8 @@ public:
     /// operands in the same order.
     void enqueue_outer(int nmax) {
         initialize_solver_state<<<scalar_grid(), 1, 0, stream>>>(
-            scalars, device_flags, device_halt, device_counters, device_active);
+            scalars, device_flags, device_halt, device_counters, device_active,
+            sweep_halt);
         invert_two_group_blocks<<<node_grid(), block_size, 0, stream>>>(
             nxyz, mat_stride(), diag, dinv, device_halt);
         matvec_two_group<<<node_grid(), block_size, 0, stream>>>(
@@ -1087,6 +1346,160 @@ public:
         }
         CUDA_CHECK(cudaGraphLaunch(graph_exec, stream));
         ++telemetry.graph_launches;
+    }
+
+    // -----------------------------------------------------------------------
+    // Device-resident CMFD sweeps (RASBERY_GPU_CMFD_SWEEP)
+    // -----------------------------------------------------------------------
+
+    /// One launch = up to `unroll` full Wielandt sweeps.  Each sweep is the
+    /// exact host sequence -- source rebuild, the whole BiCGSTAB inner
+    /// (enqueue_outer, whose state reset doubles as the per-sweep halt
+    /// refresh), wiel, updls, the negative census and the control tail --
+    /// with sweep_halt carrying the host loop's break/retry decisions.
+    void enqueue_sweeps(int nmax, int unroll) {
+        for (int sweep = 0; sweep < unroll; ++sweep) {
+            cmfd_sweep_begin<<<scalar_grid(), 1, 0, stream>>>(scalars, sweep_halt);
+            cmfd_src_build<<<node_grid(), block_size, 0, stream>>>(
+                nxyz, vec_stride(), node_stride(), xs_chif, psi_dev, src, scalars,
+                sweep_halt);
+            enqueue_outer(nmax);
+            // ax/s are BiCG scratch, dead between the inner loop and the next
+            // sweep's initial residual; they carry the wiel addends here.
+            cmfd_wiel_terms<<<node_grid(), block_size, 0, stream>>>(
+                nxyz, vec_stride(), node_stride(), phi, psi_dev, xs_xsnf, node_vol,
+                ax, s, sweep_halt);
+            cmfd_wiel_finalize<<<scalar_grid(), 1, 0, stream>>>(
+                nxyz, vec_stride(), ax, s, scalars, sweep_halt);
+            cmfd_updls<<<node_grid(), block_size, 0, stream>>>(
+                nxyz, vec_stride(), node_stride(), mat_stride(), xs_chif, xs_xsnf,
+                node_vol, udiag_dev, diag, scalars, sweep_halt);
+            cmfd_negative_scan<<<vector_grid(), block_size, 0, stream>>>(
+                n, vec_stride(), phi, scalars, sweep_halt);
+            cmfd_sweep_end<<<scalar_grid(), 1, 0, stream>>>(scalars, sweep_halt);
+        }
+    }
+
+    /// Graph-cached counterpart of launch_outer for the sweep sequence.
+    void launch_sweeps(int nmax, int unroll) {
+        if (!use_graph) {
+            enqueue_sweeps(nmax, unroll);
+            return;
+        }
+        if (sweep_graph_exec == nullptr || sweep_graph_nmax != nmax ||
+            sweep_graph_unroll != unroll) {
+            if (sweep_graph_exec != nullptr) {
+                CUDA_CHECK(cudaGraphExecDestroy(sweep_graph_exec));
+                sweep_graph_exec = nullptr;
+                ++telemetry.graph_reinstantiations;
+            }
+            cudaGraph_t graph = nullptr;
+            cudaError_t rc = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
+            if (rc == cudaSuccess) {
+                enqueue_sweeps(nmax, unroll);
+                rc = cudaStreamEndCapture(stream, &graph);
+            }
+            if (rc == cudaSuccess)
+                rc = cudaGraphInstantiate(&sweep_graph_exec, graph, 0ull);
+            if (graph != nullptr) cudaGraphDestroy(graph);
+            if (rc != cudaSuccess) {
+                // Same fallback contract as launch_outer: nothing ran during a
+                // failed capture, so the direct enqueue below is the first and
+                // only execution.
+                cudaGetLastError();
+                sweep_graph_exec = nullptr;
+                use_graph        = false;
+                ++telemetry.graph_fallbacks;
+                enqueue_sweeps(nmax, unroll);
+                return;
+            }
+            sweep_graph_nmax   = nmax;
+            sweep_graph_unroll = unroll;
+        }
+        CUDA_CHECK(cudaGraphLaunch(sweep_graph_exec, stream));
+        ++telemetry.graph_launches;
+    }
+
+    /// H2D for one sweep batch.  chif/vol mirror away their (rare/never)
+    /// changes; xsnf, udiag, psi and the sweep scalars are new every drive.
+    /// The per-slot sweep_halt starts at 0 for participants, 1 for everyone
+    /// else -- and is restored to all-zero by finishSweeps so the plain solve
+    /// path never sees a stale mask.
+    void issueSweepUploads(const int* active_slots, int count) {
+        std::memset(host_active, 0, static_cast<size_t>(slots) * sizeof(std::uint32_t));
+        for (int i = 0; i < count; ++i) host_active[active_slots[i]] = 1u;
+        CUDA_CHECK(cudaMemcpyAsync(device_active, host_active,
+                                   static_cast<size_t>(slots) * sizeof(std::uint32_t),
+                                   cudaMemcpyHostToDevice, stream));
+        // participants: sweep_halt = 0; everyone else: 1 (masks their slots
+        // inside every sweep kernel AND the inner reset).
+        for (int m = 0; m < slots; ++m) host_active[m] = host_active[m] ? 0u : 1u;
+        CUDA_CHECK(cudaMemcpyAsync(sweep_halt, host_active,
+                                   static_cast<size_t>(slots) * sizeof(std::uint32_t),
+                                   cudaMemcpyHostToDevice, stream));
+
+        for (int i = 0; i < count; ++i) {
+            const int m  = active_slots[i];
+            Slot&     sl = slot[static_cast<size_t>(m)];
+
+            pushOrSkip(xs_chif + m * vec_stride(), sl.host_chif,
+                       static_cast<size_t>(n), sl.chif_mirror.valid
+                           ? !mirrorMatches(sl.chif_mirror, sl.host_chif,
+                                            static_cast<size_t>(n))
+                           : true,
+                       sl.chif_mirror);
+            pushOrSkip(node_vol + m * node_stride(), sl.host_vol,
+                       static_cast<size_t>(nxyz), sl.vol_mirror.valid
+                           ? !mirrorMatches(sl.vol_mirror, sl.host_vol,
+                                            static_cast<size_t>(nxyz))
+                           : true,
+                       sl.vol_mirror);
+            auto push = [&](double* dst, const double* src_host, size_t cnt) {
+                CUDA_CHECK(cudaMemcpyAsync(dst, src_host, cnt * sizeof(double),
+                                           cudaMemcpyHostToDevice, stream));
+                ++telemetry.bulk_h2d_calls_during_iteration;
+                telemetry.bulk_h2d_bytes_during_iteration += cnt * sizeof(double);
+            };
+            push(xs_xsnf + m * vec_stride(), sl.host_xsnf, static_cast<size_t>(n));
+            push(udiag_dev + m * mat_stride(), sl.host_udiag, matrix_count);
+            push(psi_dev + m * node_stride(), sl.host_psi, static_cast<size_t>(nxyz));
+            push(diag + m * mat_stride(), sl.host_diag, matrix_count);
+            pushOrSkip(cc + m * cpl_stride(), sl.host_cc, coupling_count, sl.push_cc,
+                       sl.cc_mirror);
+            pushOrSkip(phi + m * vec_stride(), sl.host_phi, static_cast<size_t>(n),
+                       sl.push_phi, sl.phi_mirror);
+            CUDA_CHECK(cudaMemcpyAsync(
+                scalars + static_cast<long long>(m) * kScalarCount + kSweepFirst,
+                sl.sweep_in, kSweepCount * sizeof(double), cudaMemcpyHostToDevice,
+                stream));
+            if (!(sl.eps == sl.eps_on_device)) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    scalars + static_cast<long long>(m) * kScalarCount + kEps, &sl.eps,
+                    sizeof(double), cudaMemcpyHostToDevice, stream));
+                sl.eps_on_device = sl.eps;
+            }
+            sl.phi_mirror.valid = false;
+        }
+    }
+
+    /// D2H after the sweep graph: flux (issueFluxDownloads), psi and the sweep
+    /// scalar block per participant, then the sweep_halt restore.
+    void issueSweepDownloads(const int* active_slots, int count) {
+        for (int i = 0; i < count; ++i) {
+            const int m  = active_slots[i];
+            Slot&     sl = slot[static_cast<size_t>(m)];
+            CUDA_CHECK(cudaMemcpyAsync(sl.host_psi, psi_dev + m * node_stride(),
+                                       static_cast<size_t>(nxyz) * sizeof(double),
+                                       cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                sl.sweep_out,
+                scalars + static_cast<long long>(m) * kScalarCount + kSweepFirst,
+                kSweepCount * sizeof(double), cudaMemcpyDeviceToHost, stream));
+            ++telemetry.bulk_d2h_calls_during_iteration;
+        }
+        CUDA_CHECK(cudaMemsetAsync(sweep_halt, 0,
+                                   static_cast<size_t>(slots) * sizeof(std::uint32_t),
+                                   stream));
     }
 
     /// Queue the flux D2H for every participant.
@@ -1169,6 +1582,19 @@ public:
     bool          use_graph = true;
     cudaGraphExec_t graph_exec = nullptr;
     int           graph_nmax = -1;
+
+    // ---- device-resident CMFD sweep state (RASBERY_GPU_CMFD_SWEEP) ----
+    double*        xs_chif    = nullptr; ///< [slot][ig*nxyz+l]
+    double*        xs_xsnf    = nullptr; ///< [slot][ig*nxyz+l]
+    double*        node_vol   = nullptr; ///< [slot][l]
+    double*        udiag_dev  = nullptr; ///< [slot][l*ng2+ige*ng+igs]
+    double*        psi_dev    = nullptr; ///< [slot][l]
+    std::uint32_t* sweep_halt = nullptr; ///< all-zero outside the sweep path
+    cudaGraphExec_t sweep_graph_exec = nullptr;
+    int             sweep_graph_nmax = -1;
+    int             sweep_graph_unroll = -1;
+
+    long long node_stride() const { return static_cast<long long>(nxyz); }
 };
 
 } // namespace
@@ -1278,9 +1704,14 @@ public:
     // ---------------------------------------------------------------------
     std::mutex              mutex;
     std::condition_variable cv;
-    std::vector<int>        pending;    // registered for the batch not yet launched
-    unsigned long long      open_batch = 0;  // index of that batch
-    unsigned long long      completed  = 0;  // number of batches fully executed
+    // Two rendezvous domains sharing one launcher election: kind 0 is the
+    // plain per-sweep solve, kind 1 the device-resident multi-sweep launch
+    // (RASBERY_GPU_CMFD_SWEEP).  A batch never mixes kinds -- they need
+    // different graphs -- but both kinds' passengers sleep on the one cv and
+    // either kind's thread may be elected to launch its own kind next.
+    std::vector<int>        pending[2];      // registered, not yet launched
+    unsigned long long      open_batch[2] = {0, 0};
+    unsigned long long      completed[2]  = {0, 0};
     bool                    launching  = false;
     /// True only while a launcher sits in the linger wait below.  The
     /// per-arrival broadcast exists solely for that launcher; every other
@@ -1304,8 +1735,8 @@ public:
     std::vector<unsigned long long> width_histogram;
     /// Batch index whose launch threw, so its passengers report the same fatal
     /// condition the launcher did instead of carrying on with a stale flux.
-    unsigned long long      failed_batch = ~0ull;
-    std::string             failed_message;
+    unsigned long long      failed_batch[2] = {~0ull, ~0ull};
+    std::string             failed_message[2];
 
     [[nodiscard]] int inUseCount() const {
         int c = 0;
@@ -1374,7 +1805,54 @@ void CudaBatchArena::setInner(int m, int nmax, double eps) {
     sl.eps  = eps;
 }
 
-void CudaBatchArena::solve(int m, double* out_phi) {
+void CudaBatchArena::solve(int m, double* out_phi) { solveCommon(m, out_phi, 0); }
+
+void CudaBatchArena::stageSweeps(int m, const CmfdSweepIO& io) {
+    auto& sl      = _impl->core.slot[static_cast<size_t>(m)];
+    sl.host_chif  = io.chif;
+    sl.host_xsnf  = io.xsnf;
+    sl.host_vol   = io.vol;
+    sl.host_udiag = io.udiag;
+    sl.host_psi   = io.psi;
+    double* in    = sl.sweep_in;
+    in[kEigv - kSweepFirst]        = io.eigv;
+    in[kReigv - kSweepFirst]       = io.reigv;
+    in[kReigvs - kSweepFirst]      = io.reigvs;
+    in[kErrl2 - kSweepFirst]       = io.errl2;
+    in[kEpsl2 - kSweepFirst]       = io.epsl2;
+    in[kEshift - kSweepFirst]      = io.eshift;
+    in[kReigvdel - kSweepFirst]    = 0.0;
+    in[kSweepBudget - kSweepFirst] = static_cast<double>(io.sweep_budget);
+    in[kSweepsDone - kSweepFirst]  = 0.0;
+    in[kIcmfdBudget - kSweepFirst] = static_cast<double>(io.icmfd_budget);
+    in[kIcmfdDone - kSweepFirst]   = static_cast<double>(io.icmfd_done);
+    in[kNegative - kSweepFirst]    = 0.0;
+    in[kSweepState - kSweepFirst]  = 0.0;
+    in[kGammaD - kSweepFirst]      = 0.0;
+    in[kGammaN - kSweepFirst]      = 0.0;
+    in[kErrAcc - kSweepFirst]      = 0.0;
+    in[kNgxyz - kSweepFirst]       = static_cast<double>(io.ngxyz);
+    sl.sweep_unroll                = io.sweep_budget;
+}
+
+void CudaBatchArena::solveSweeps(int m, double* out_phi, CmfdSweepIO& io) {
+    solveCommon(m, out_phi, 1);
+    const auto&   sl  = _impl->core.slot[static_cast<size_t>(m)];
+    const double* out = sl.sweep_out;
+    io.eigv          = out[kEigv - kSweepFirst];
+    io.reigv         = out[kReigv - kSweepFirst];
+    io.reigvs        = out[kReigvs - kSweepFirst];
+    io.errl2         = out[kErrl2 - kSweepFirst];
+    io.sweeps_done   = static_cast<int>(out[kSweepsDone - kSweepFirst]);
+    io.icmfd_done    = static_cast<int>(out[kIcmfdDone - kSweepFirst]);
+    io.state         = static_cast<int>(out[kSweepState - kSweepFirst]);
+    io.negative_last = static_cast<int>(out[kNegative - kSweepFirst]);
+    io.gammad        = out[kGammaD - kSweepFirst];
+    io.gamman        = out[kGammaN - kSweepFirst];
+    io.err_acc       = out[kErrAcc - kSweepFirst];
+}
+
+void CudaBatchArena::solveCommon(int m, double* out_phi, int kind) {
     if (!_impl->core.available) throw std::runtime_error(_impl->core.status);
     if (out_phi == nullptr)
         throw std::invalid_argument("CUDA BiCGSTAB solve requires a host flux buffer");
@@ -1398,20 +1876,21 @@ void CudaBatchArena::solve(int m, double* out_phi) {
     }
     a.last_arrival  = arrival_now;
     a.have_arrival  = true;
-    const unsigned long long my_batch = a.open_batch;
-    a.pending.push_back(m);
+    const unsigned long long my_batch = a.open_batch[kind];
+    a.pending[kind].push_back(m);
     if (a.lingering)
         a.cv.notify_all();   // a lingering launcher is waiting for arrivals
 
     while (true) {
-        if (a.completed > my_batch) {
+        if (a.completed[kind] > my_batch) {
             // Somebody else ran our batch; out_phi already holds the answer.
-            if (a.failed_batch == my_batch) throw std::runtime_error(a.failed_message);
+            if (a.failed_batch[kind] == my_batch)
+                throw std::runtime_error(a.failed_message[kind]);
             lock.unlock();
             a.core.adoptFluxMirror(m); // own slot, own thread -- no lock needed
             return;
         }
-        if (a.launching || a.open_batch != my_batch) {
+        if (a.launching || a.open_batch[kind] != my_batch) {
             a.cv.wait(lock);
             continue;
         }
@@ -1445,11 +1924,11 @@ void CudaBatchArena::solve(int m, double* out_phi) {
         }
         a.last_wait_budget_us = linger_us;
         const auto wait_start = std::chrono::steady_clock::now();
-        if (linger_us > 0 && static_cast<int>(a.pending.size()) < a.inUseCount()) {
+        if (linger_us > 0 && static_cast<int>(a.pending[kind].size()) < a.inUseCount()) {
             const auto deadline =
                 wait_start + std::chrono::microseconds(linger_us);
             a.lingering = true;
-            while (static_cast<int>(a.pending.size()) < a.inUseCount() &&
+            while (static_cast<int>(a.pending[kind].size()) < a.inUseCount() &&
                    a.cv.wait_until(lock, deadline) != std::cv_status::timeout) {
             }
             a.lingering = false;
@@ -1465,15 +1944,17 @@ void CudaBatchArena::solve(int m, double* out_phi) {
         }
 
         std::vector<int> participants;
-        participants.swap(a.pending);
-        ++a.open_batch;            // arrivals from here on join the next batch
+        participants.swap(a.pending[kind]);
+        ++a.open_batch[kind];      // arrivals from here on join the next batch
         std::sort(participants.begin(), participants.end());
 
         int         nmax    = -1;
+        int         unroll  = 0;
         bool        failed  = false;
         std::string message;
         for (int slot_id : participants) {
-            const int slot_nmax = a.core.slot[static_cast<size_t>(slot_id)].nmax;
+            const auto& sl        = a.core.slot[static_cast<size_t>(slot_id)];
+            const int   slot_nmax = sl.nmax;
             if (nmax < 0) {
                 nmax = slot_nmax;
             } else if (nmax != slot_nmax) {
@@ -1483,6 +1964,7 @@ void CudaBatchArena::solve(int m, double* out_phi) {
                 message = "batch mode requires a uniform inner BiCGSTAB budget across "
                           "instances (RASBERY_BICG_NMAX must not differ between decks)";
             }
+            if (kind == 1) unroll = std::max(unroll, sl.sweep_unroll);
         }
 
         // The device work runs *unlocked* on purpose: this is the window in
@@ -1490,11 +1972,25 @@ void CudaBatchArena::solve(int m, double* out_phi) {
         lock.unlock();
         if (!failed && !participants.empty()) {
             try {
-                a.core.issueUploads(participants.data(), static_cast<int>(participants.size()));
-                a.core.launch_outer(nmax);
-                a.core.issueFluxDownloads(participants.data(),
-                                          static_cast<int>(participants.size()));
-                a.core.drain(participants.data(), static_cast<int>(participants.size()));
+                if (kind == 0) {
+                    a.core.issueUploads(participants.data(),
+                                        static_cast<int>(participants.size()));
+                    a.core.launch_outer(nmax);
+                    a.core.issueFluxDownloads(participants.data(),
+                                              static_cast<int>(participants.size()));
+                    a.core.drain(participants.data(),
+                                 static_cast<int>(participants.size()));
+                } else {
+                    a.core.issueSweepUploads(participants.data(),
+                                             static_cast<int>(participants.size()));
+                    a.core.launch_sweeps(nmax, unroll);
+                    a.core.issueFluxDownloads(participants.data(),
+                                              static_cast<int>(participants.size()));
+                    a.core.issueSweepDownloads(participants.data(),
+                                               static_cast<int>(participants.size()));
+                    a.core.drain(participants.data(),
+                                 static_cast<int>(participants.size()));
+                }
             } catch (const std::exception& error) {
                 failed  = true;
                 message = error.what();
@@ -1502,10 +1998,10 @@ void CudaBatchArena::solve(int m, double* out_phi) {
         }
         lock.lock();
         a.launching = false;
-        a.completed = my_batch + 1;
+        a.completed[kind] = my_batch + 1;
         if (failed) {
-            a.failed_batch   = my_batch;
-            a.failed_message = message;
+            a.failed_batch[kind]   = my_batch;
+            a.failed_message[kind] = message;
         } else if (!participants.empty()) {
             // Counted here, not before the launch.  These three feed
             // BATCH_OCCUPANCY, whose whole job is to answer "how wide are the

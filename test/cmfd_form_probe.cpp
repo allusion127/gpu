@@ -96,38 +96,54 @@ int main(int argc, char** argv) {
     std::printf("sweeps captured: %zu (eshift=%g)\n", sweeps.size(), eshift);
 
     // ---- wiel: psi pair-sum form (p), and the three accumulations (e,d,n).
-    // p0: fma(xsnf1,f1, xsnf0*f0)   p1: rounded products, plain add
-    for (int p = 0; p < 2; ++p) {
-        size_t ok_psi = 0, tot_psi = 0;
+    // p0: fma(xsnf1,f1, xsnf0*f0)  p1: rounded products, plain add
+    // p2: fma(xsnf0,f0, xsnf1*f1)  -- gcc may evaluate/fuse either operand
+    static const char* kPsiName[3] = {"fma2nd", "plain", "fma1st"};
+    for (int p = 0; p < 3; ++p) {
+        size_t ok_psi = 0, tot_psi = 0, first_bad = static_cast<size_t>(-1),
+               last_bad = 0, tail_bad = 0;
         for (const Sweep& sw : sweeps)
             for (size_t l = 0; l < nx; ++l) {
-                double prod0 = xsnf[l] * sw.flux[l * 2 + 0];
-                double pv    = p ? opaque(prod0) + opaque(xsnf[nx + l] * sw.flux[l * 2 + 1])
-                                 : std::fma(xsnf[nx + l], sw.flux[l * 2 + 1], prod0);
-                pv           = pv * vol[l];
+                double pv;
+                if (p == 0)
+                    pv = std::fma(xsnf[nx + l], sw.flux[l * 2 + 1],
+                                  opaque(xsnf[l] * sw.flux[l * 2 + 0]));
+                else if (p == 1)
+                    pv = opaque(xsnf[l] * sw.flux[l * 2 + 0]) +
+                         opaque(xsnf[nx + l] * sw.flux[l * 2 + 1]);
+                else
+                    pv = std::fma(xsnf[l], sw.flux[l * 2 + 0],
+                                  opaque(xsnf[nx + l] * sw.flux[l * 2 + 1]));
+                pv = pv * vol[l];
                 ++tot_psi;
-                if (!std::memcmp(&pv, &sw.psi_out[l], 8)) ++ok_psi;
+                if (!std::memcmp(&pv, &sw.psi_out[l], 8)) {
+                    ++ok_psi;
+                } else {
+                    if (first_bad == static_cast<size_t>(-1)) first_bad = l;
+                    last_bad = l;
+                    if (l >= nx - 8) ++tail_bad;
+                }
             }
-        std::printf("psi form %s : %zu/%zu\n", p ? "plain" : "fma2nd", ok_psi, tot_psi);
+        std::printf("psi form %s : %zu/%zu  first_bad=%zd last_bad=%zu tail8=%zu\n",
+                    kPsiName[p], ok_psi, tot_psi, static_cast<long>(first_bad),
+                    last_bad, tail_bad);
     }
 
     // Accumulations + eigenvalue update.  e/d/n: fused or plain; u: the
     // eigv denominator reigv*gamma + (1-gamma)*reigvs, second product fused
     // into the add (u=1) or rounded then added (u=0).
-    for (int pf = 0; pf < 2; ++pf)
-        for (int e = 0; e < 2; ++e)
+    for (int pf = 2; pf < 3; ++pf) // psi form settled: fma1st
+        for (int e = 0; e < 1; ++e)     // errl2 settled: plain
             for (int d = 0; d < 2; ++d)
                 for (int n = 0; n < 2; ++n)
-                    for (int u = 0; u < 2; ++u) {
+                    for (int u = 0; u < 3; ++u) {
                         size_t ok_e = 0, ok_g = 0, tot = 0;
                         for (const Sweep& sw : sweeps) {
                             double err = 0, gammad = 0, gamman = 0;
                             for (size_t l = 0; l < nx; ++l) {
-                                double psid  = sw.psi_in[l];
-                                double prod0 = xsnf[l] * sw.flux[l * 2 + 0];
-                                double pv =
-                                    pf ? opaque(prod0) + opaque(xsnf[nx + l] * sw.flux[l * 2 + 1])
-                                       : std::fma(xsnf[nx + l], sw.flux[l * 2 + 1], prod0);
+                                double psid = sw.psi_in[l];
+                                double pv   = std::fma(xsnf[l], sw.flux[l * 2 + 0],
+                                                       opaque(xsnf[nx + l] * sw.flux[l * 2 + 1]));
                                 pv          = pv * vol[l];
                                 double err1 = pv - psid;
                                 err         = mac(e, err1, err1, err);
@@ -138,15 +154,32 @@ int main(int argc, char** argv) {
                             const bool usable = (gammad > 0.0) && (gamman > 0.0);
                             if (sw.icy < 0 || !usable) continue; // fallback branch: skip
                             double gamma = gammad / gamman;
-                            double den =
-                                u ? std::fma((1 - gamma), sw.reigvs_in, sw.reigv_in * gamma)
-                                  : opaque(sw.reigv_in * gamma) +
-                                        opaque((1 - gamma) * sw.reigvs_in);
+                            double den;
+                            if (u == 0)
+                                den = opaque(sw.reigv_in * gamma) +
+                                      opaque((1 - gamma) * sw.reigvs_in);
+                            else if (u == 1)
+                                den = std::fma((1 - gamma), sw.reigvs_in,
+                                               opaque(sw.reigv_in * gamma));
+                            else
+                                den = std::fma(sw.reigv_in, gamma,
+                                               opaque((1 - gamma) * sw.reigvs_in));
                             double eigv      = 1 / den;
                             double err_scale = (gammad > 0.0) ? gammad : gamman;
                             double errl2 =
                                 (err_scale > 0.0) ? sqrt(std::abs(err / err_scale)) : 0.0;
-                            if (!std::memcmp(&eigv, &sw.eigv_out, 8)) ++ok_e;
+                            if (!std::memcmp(&eigv, &sw.eigv_out, 8)) {
+                                ++ok_e;
+                            } else if (d == 0 && n == 0 && u == 2) {
+                                std::int64_t ba, bb;
+                                std::memcpy(&ba, &eigv, 8);
+                                std::memcpy(&bb, &sw.eigv_out, 8);
+                                std::printf("  eigv miss: got=%.17g prod=%.17g ulp=%lld "
+                                            "(gamma=%.17g gd=%.17g gn=%.17g)\n",
+                                            eigv, sw.eigv_out,
+                                            static_cast<long long>(bb - ba), gamma,
+                                            gammad, gamman);
+                            }
                             if (!std::memcmp(&errl2, &sw.errl2_out, 8)) ++ok_g;
                         }
                         if (ok_e || ok_g)

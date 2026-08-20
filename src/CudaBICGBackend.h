@@ -178,10 +178,45 @@ public:
     /// all of them; the rest sleep on a condition variable.
     void solve(int slot, double* phi);
 
+    /// Host<->device contract of one device-resident CMFD sweep run
+    /// (RASBERY_GPU_CMFD_SWEEP).  Inputs describe the state at delegation;
+    /// outputs return the sweep loop's results.  `state`: 1 converged, 2 the
+    /// wiel gamma degenerated and the host must finish the current sweep with
+    /// the Rayleigh branch (gammad/gamman/err_acc carry the exported sums),
+    /// 3 the sweep budget was spent, 0 only the launch unroll ran out.
+    struct CmfdSweepIO {
+        const double* chif  = nullptr; ///< [ig*nxyz+l]
+        const double* xsnf  = nullptr; ///< [ig*nxyz+l]
+        const double* vol   = nullptr; ///< [l]
+        const double* udiag = nullptr; ///< [l*ng2+ige*ng+igs]
+        double*       psi   = nullptr; ///< [l], in/out
+        double eigv = 0, reigv = 0, reigvs = 0, errl2 = 0;
+        double epsl2 = 0, eshift = 0;
+        int    sweep_budget = 0, icmfd_budget = 0, icmfd_done = 0, ngxyz = 0;
+        // outputs
+        int    sweeps_done = 0, state = 0, negative_last = 0;
+        double gammad = 0, gamman = 0, err_acc = 0;
+    };
+
+    /// Record one drive()'s sweep inputs for @p slot.  No CUDA call, no lock.
+    void stageSweeps(int slot, const CmfdSweepIO& io);
+
+    /// Rendezvous + one multi-sweep graph launch + drain; same batching
+    /// contract as solve() but in its own rendezvous domain (a batch never
+    /// mixes plain solves with sweep runs -- the graphs differ).
+    void solveSweeps(int slot, double* phi, CmfdSweepIO& io);
+
     /// One JSON line of how full the batches actually were.  The batch mode is
     /// only worth its complexity when the mean width is close to the slot
     /// count, so this is the number to read first when the speed-up disappoints.
     void reportBatchOccupancy(const char* tag) const;
+
+private:
+    /// Shared rendezvous body of solve()/solveSweeps(); kind selects the
+    /// batch domain and the launch sequence.
+    void solveCommon(int slot, double* phi, int kind);
+
+public:
 };
 
 // ---------------------------------------------------------------------------
