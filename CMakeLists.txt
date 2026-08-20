@@ -121,4 +121,27 @@ if (RASBERY_ENABLE_TESTS)
     endif ()
 
     add_test(NAME xsrecon_consistency COMMAND rasbery_xsrecon_consistency 4096)
+
+    # Device arm of the same gate: nvcc's floating point vs g++'s, elementwise
+    # on one call.  This is what the full-deck A/B cannot localize.
+    if (RASBERY_ENABLE_CUDA)
+        add_executable(rasbery_xsrecon_device_consistency
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/xsrecon_device_consistency_test.cpp"
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaXsReconBackend.cu")
+        target_compile_features(rasbery_xsrecon_device_consistency PRIVATE cxx_std_20)
+        target_include_directories(rasbery_xsrecon_device_consistency PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(rasbery_xsrecon_device_consistency PRIVATE CUDA::cudart)
+        set_target_properties(rasbery_xsrecon_device_consistency PROPERTIES
+                CUDA_STANDARD 17
+                CUDA_STANDARD_REQUIRED YES
+                CUDA_ARCHITECTURES "${RASBERY_CUDA_ARCHITECTURES}"
+                CUDA_SEPARABLE_COMPILATION ON)
+        if (NOT MSVC)
+            target_compile_options(rasbery_xsrecon_device_consistency PRIVATE
+                    $<$<COMPILE_LANGUAGE:CXX>:-march=native>)
+        endif ()
+        add_test(NAME xsrecon_device_consistency
+                COMMAND rasbery_xsrecon_device_consistency 4096)
+    endif ()
 endif ()

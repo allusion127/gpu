@@ -12,10 +12,13 @@
 //    ReconstructNode; no reassociation, no tree reduction over iso;
 //  - the `relax < 1.0` guard is kept rather than fused into
 //    1.0*(a-b)+b, per the comment at the damped update in XSSet.cpp;
-//  - the device translation unit must be compiled with -fmad=false so nvcc
-//    cannot contract a*b+c differently from the host compiler.  If the host
-//    compiler's own contraction choices differ, the consistency harness
-//    reports the exact elementwise deviation instead of hiding it.
+//  - contraction is EXPLICIT: gcc at -O3 (-ffp-contract=fast) fuses a*b+c
+//    into fma at every multiply-add in this body, so those spots are written
+//    as xsrFma() -- a hardware FMA on both compilers -- and the device TU is
+//    compiled with --fmad=false so nvcc cannot fuse anything else on its own.
+//    The host harness (vs the verbatim -O3 reference) verifies each choice:
+//    if gcc did NOT contract a spot written as xsrFma, the harness reports
+//    the exact elementwise deviation instead of hiding it.
 //
 // This header must stay compilable by both g++ and nvcc: no STL containers,
 // no exceptions, no allocation.  (Same rule and same reason as
@@ -61,6 +64,16 @@ constexpr double LAMBDA_I       = 2.930607e-05;
 constexpr double LAMBDA_XE      = 2.106574e-05;
 constexpr double LAMBDA_XEM     = 7.555561e-04;
 constexpr double BR_I_TO_XE135M = 1.650900e-01;
+
+/// Single-rounding a*b+c on both compilers: vfmadd on the host (gcc emits it
+/// for std::fma when the ISA has FMA), DFMA on the device.
+RASBERY_XSR_HD inline double xsrFma(double a, double b, double c) {
+#if defined(__CUDA_ARCH__)
+    return fma(a, b, c);
+#else
+    return std::fma(a, b, c);
+#endif
+}
 
 /// Pointer view of one instance's SoA state.  The kernel sees only this view:
 /// when any of these arrays becomes device-resident (or device-produced), the
@@ -113,7 +126,7 @@ RASBERY_XSR_HD inline int xsreconSolveNode(const BatchView& v, int l,
         for (int xt = 0; xt < NXS; ++xt) {
             double sum = 0.0;
             for (int ig = 0; ig < NG; ++ig)
-                sum += v.mic[xt][(iso * NG + ig) * nxyz + l] * absflux[ig];
+                sum = xsrFma(v.mic[xt][(iso * NG + ig) * nxyz + l], absflux[ig], sum);
             cond[iso * NXS + xt] = sum * invflux;
         }
         iden[iso] = v.iden[iso * nxyz + l];
@@ -137,7 +150,7 @@ RASBERY_XSR_HD inline int xsreconSolveNode(const BatchView& v, int l,
         }
         double sigaXe = cond[XE135 * NXS + T_XSAF] * sumflux;
         double Ieq    = fissSourceI / LAMBDA_I;
-        double Xeeq   = (LAMBDA_I * Ieq + fissSourceXe) / (LAMBDA_XE + sigaXe);
+        double Xeeq   = xsrFma(LAMBDA_I, Ieq, fissSourceXe) / (LAMBDA_XE + sigaXe);
 
         iden[I135]   = Ieq;
         iden[XE135]  = Xeeq;
@@ -154,9 +167,9 @@ RASBERY_XSR_HD inline int xsreconSolveNode(const BatchView& v, int l,
     // x <- x + relax*(F(x) - x).  The guard keeps the undamped case
     // arithmetically identical instead of relying on 1.0*(a-b)+b == a.
     if (v.relax < 1.0) {
-        iden[I135]   = old_i + v.relax * (iden[I135] - old_i);
-        iden[XE135]  = old_xe + v.relax * (iden[XE135] - old_xe);
-        iden[XE135M] = old_xem + v.relax * (iden[XE135M] - old_xem);
+        iden[I135]   = xsrFma(v.relax, iden[I135] - old_i, old_i);
+        iden[XE135]  = xsrFma(v.relax, iden[XE135] - old_xe, old_xe);
+        iden[XE135M] = xsrFma(v.relax, iden[XE135M] - old_xem, old_xem);
     }
 
     // (e) only the Xe-chain rows change in the global density array.
@@ -179,7 +192,7 @@ RASBERY_XSR_HD inline int xsreconSolveNode(const BatchView& v, int l,
         for (int ig = 0; ig < NG; ++ig) {
             double val = lmp[ig * nxyz + l];
             for (int iso = 0; iso < NISO; ++iso)
-                val += mic[(iso * NG + ig) * nxyz + l] * iden[iso];
+                val = xsrFma(mic[(iso * NG + ig) * nxyz + l], iden[iso], val);
             dst[ig * nxyz + l] = val;
         }
     }
@@ -188,8 +201,8 @@ RASBERY_XSR_HD inline int xsreconSolveNode(const BatchView& v, int l,
         for (int ige = 0; ige < NG; ++ige) {
             double val = v.lmp_ssm[(igs * NG + ige) * nxyz + l];
             for (int iso = 0; iso < NISO; ++iso)
-                val += v.mic_ssm[(iso * NG * NG + igs * NG + ige) * nxyz + l] *
-                       iden[iso];
+                val = xsrFma(v.mic_ssm[(iso * NG * NG + igs * NG + ige) * nxyz + l],
+                             iden[iso], val);
             v.xs_ssm[(igs * NG + ige) * nxyz + l] = val;
         }
     }
