@@ -3,10 +3,10 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <cstdlib>
 #include <filesystem>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -18,6 +18,9 @@
 #include "nlohmann/json.hpp"
 
 namespace Chiffon {
+
+inline constexpr char HDF_VERSION[] = "3.0.0";
+inline constexpr double SPECTRAL_LOG_DENSITY_FLOOR = 1.0e-12;
 
 /// @brief Global isotope registry, chain definitions, and depletion matrices.
 namespace Isotope {
@@ -85,148 +88,233 @@ inline milk::Matrix<double> depDecay;
 /// Transmutation topology (niso × niso).
 inline milk::Matrix<double> depTrans;
 
-/// @brief Initialize isotope indices and load depletion matrices.
-/// @param isotopeDataDir Directory containing dep_decay.csv and dep_trans.csv.
-inline void Initialize(const std::filesystem::path& isotopeDataDir) {
+/// @brief Serialises every write to the four globals above.
+///
+/// The registry is process-global but is (re)built by each XSSet as it loads
+/// its cross-section library. That is harmless while one solver owns the
+/// process and fatal once several instances run as threads in one process
+/// (--batch-mode): two concurrent `iidx.clear()` + `emplace` sequences corrupt
+/// the map's heap blocks and the run dies inside malloc() a fraction of a
+/// second after start. The content rebuilt is canonical -- byte-identical on
+/// every call, and validated against `isotopeIds` before it is written -- so
+/// serialising the write costs nothing measurable and changes no result.
+inline std::mutex registryMutex;
+
+/// @brief Rebuild the isotope index map. Caller must hold registryMutex.
+inline void RebuildIndexLocked() {
     iidx.clear();
     niso = isotopeIds.size();
     for (size_t i = 0; i < isotopeIds.size(); ++i)
         iidx.emplace(isotopeIds[i], i);
+}
+
+/// @brief Initialize isotope indices and load depletion matrices.
+/// @param isotopeDataDir Directory containing dep_decay.csv and dep_trans.csv.
+inline void Initialize(const std::filesystem::path& isotopeDataDir) {
+    std::lock_guard<std::mutex> guard(registryMutex);
+    RebuildIndexLocked();
 
     const std::vector<std::string> labels(isotopeIds.begin(), isotopeIds.end());
     depDecay = milk::LabeledMatrixFromCSV(isotopeDataDir / "dep_decay.csv", labels, labels);
     depTrans = milk::LabeledMatrixFromCSV(isotopeDataDir / "dep_trans.csv", labels, labels);
 }
+
+/// @brief Load the depletion matrices once, whichever instance gets there first.
+///
+/// The previous form -- take the lock, test `depDecay.size()`, *drop the lock*,
+/// then call Initialize() -- is the textbook broken double-checked lock. The
+/// window between the two critical sections is exactly what the lock was there
+/// to close: in --batch-mode every instance can observe size()==0, all of them
+/// fall through, and Initialize() then re-runs LabeledMatrixFromCSV() and
+/// reassigns depDecay/depTrans once per instance. Each rebuild is serialised and
+/// canonical, so nothing was ever *observed* torn -- but only because no reader
+/// happens to touch the matrices during startup. That is an accident of
+/// scheduling, not a guarantee, and the "replaces a check-then-act race" comment
+/// claimed otherwise.
+///
+/// std::call_once gives the real guarantee: exactly one thread runs the
+/// initialiser, every other caller blocks until it has completed, and that
+/// completion synchronises-with their return, so the matrices they go on to read
+/// are fully published.
+///
+/// main() calls Isotope::Initialize() directly before any solver is constructed
+/// (src/main.cpp). That call is load-bearing: it is what populates the matrices
+/// for the single-instance path, and it does not set this flag -- hence the
+/// size() test inside the initialiser, without which the first XSSet would redo
+/// the CSV load for nothing. The test is safe here because it runs inside
+/// call_once (single-threaded by construction) and main()'s Initialize
+/// happens-before any thread that could reach this point.
+inline void EnsureInitialized(const std::filesystem::path& isotopeDataDir) {
+    static std::once_flag initialised;
+    std::call_once(initialised, [&isotopeDataDir] {
+        if (depDecay.size() == 0)
+            Initialize(isotopeDataDir);
+    });
+}
 } // namespace Isotope
 
-/// @brief Sentinel "isotope" ids marking special history-vector coordinates (near SIZE_MAX).
-/// @note Only ROD_FLU is evaluated by the RASBERY runtime (XSSet::ApplyHistoryDeltasToNode);
-/// the remaining synthetic coordinates are honored only during CHIFFON fitting
-/// (Interpolator::PointDensity) and evaluate to 0 at query time.
-namespace Hv {
-enum : size_t {
-    ROD_DEPL      = std::numeric_limits<size_t>::max() - 8,  ///< explicit rod-depletion factor
-    LOG_XE        = std::numeric_limits<size_t>::max() - 10, ///< log Xe-135 density
-    LOG_PU        = std::numeric_limits<size_t>::max() - 7,  ///< log Pu-239 density
-    LOG_U_PU      = std::numeric_limits<size_t>::max() - 9,  ///< log U-238/Pu-239 ratio
-    TOT_BURN      = std::numeric_limits<size_t>::max() - 11, ///< total fuel burnup
-    CUR_ROD_FRAC  = std::numeric_limits<size_t>::max() - 12, ///< current local rod insertion fraction
-    FUEL_ROD_FLU  = std::numeric_limits<size_t>::max() - 6,  ///< fuel exposure under rodded spectrum
-    ROD_BURN_FRAC = std::numeric_limits<size_t>::max() - 5,  ///< rodded fraction of burnup
-    FUEL_ROD_BURN = std::numeric_limits<size_t>::max() - 4,  ///< fuel burnup under rodded spectrum
-    ROD_BURN      = std::numeric_limits<size_t>::max() - 3,  ///< rod-material burnup
-    ROD_FLU       = std::numeric_limits<size_t>::max() - 2,  ///< rod-material fluence
-    FAST_THERM    = std::numeric_limits<size_t>::max() - 1,  ///< fast-to-thermal flux ratio
-    THERM_FRAC    = std::numeric_limits<size_t>::max()       ///< thermal flux fraction
+/// @brief Composition coordinate used by one spectral-history term.
+enum class SpectralCoordinate : int {
+    Density    = 0,
+    LogDensity = 1,
+    /// @brief PROBE: square root of the density.
+    SqrtDensity = 5,
+    /// @brief PROBE: ratio of a resonance absorber's thermal cross section to a
+    /// 1/v absorber's, evaluated on the base+branch state. A dimensionless
+    /// stand-in for the intra-group spectrum shape.
+    SpectralIndex = 7,
+    /// @brief PROBE: the spectral index times the isotope's deviation from the
+    /// reference inventory — the composition x spectrum cross term. Vanishes at
+    /// nominal composition, so it cannot encroach on the branch layer.
+    SpectralIndexInteraction = 8,
+    /// @brief PROBE: density weighted by the thermal share of the flux.
+    ThermalWeighted = 2,
+    /// @brief PROBE: density weighted by the fast share of the flux.
+    FastWeighted = 3,
+    /// @brief PROBE: log(psi_th/psi_fast) times the density deviation. Vanishes
+    /// when the composition sits on the reference, so it cannot absorb the
+    /// branch layer's own condition dependence.
+    FluxRatioInteraction = 4,
+    /// @brief PROBE: log of one isotope's relative depletion divided by
+    /// another's, both measured against the burnup reference. Isotopes that
+    /// live in different pins (Gd in the Gd rods, Pu/U in the fuel rods) burn
+    /// at rates set by the *spatial* flux distribution, so their relative rate
+    /// carries information about the isotope profile p_i(r) that the node
+    /// average N_i throws away. A linear combination of the two deviations
+    /// cannot represent this ratio.
+    RelativeBurnRatio = 9,
+    /// @brief PROBE: (branch coordinate - its reference) x (density - reference
+    /// density), one enumerator per condition axis. Both factors are centered, so
+    /// the column is exactly zero at the reference condition AND at the reference
+    /// composition: it can impersonate neither the branch layer nor a plain
+    /// composition column, and fires only where both deviate. This is the term
+    /// that lets the history correction tilt a branch slope.
+    /// The values start at 12 because 6/10/11 were briefly written by an
+    /// experimental build with different semantics; reusing them would let such a
+    /// library load and apply the coefficient to the wrong axis.
+    BppmInteraction = 12,
+    TfulInteraction = 13,
+    DmodInteraction = 14,
+    /// @brief PROBE: squared centered log deviation, (log N - log N_ref)^2. A
+    /// monotone transform of N adds nothing a linear fit cannot already reach
+    /// through N itself; only curvature does. This asks whether the response is
+    /// actually linear in log N or still bends.
+    LogDeviationSquared = 15,
+    /// @brief PROBE: N_a / (N_a + N_partner). Genuinely bivariate, but its
+    /// first-order expansion already lives in the two density columns, so only
+    /// its curvature is new information.
+    FissileFraction = 16,
+    /// @brief PROBE: N_ref / N. Narrow-resonance asymptotics motivate an inverse
+    /// dependence; around the reference it is mostly another quadratic, and it
+    /// gives extreme leverage to rows where the inventory is nearly exhausted.
+    InverseRatio = 17,
+    /// @brief PROBE: (N / N_ref)^(1/3). For a burnable absorber consumed by a
+    /// receding front the absorbing interface scales as a power of the remaining
+    /// inventory; the exponent is geometry-dependent and not derived here.
+    CubeRootRatio = 18,
+    /// @brief PROBE: N / (1 + N/N_ref), a saturating form for the fission-product
+    /// poisons whose equilibrium concentration is a rational function of flux.
+    SaturatingRatio = 19,
+    /// @brief PROBE: (branch coordinate - its reference) x control-rod fluence,
+    /// one enumerator per condition axis. The rodded branch tables are built from
+    /// a fresh rod and evaluated on a burned one; this lets the condition slope
+    /// depend on how burned the rod is. Zero at the reference condition, so it
+    /// cannot disturb the fresh-rod branch, and zero with the rod withdrawn.
+    BppmRodAge = 20,
+    TfulRodAge = 21,
+    DmodRodAge = 22,
 };
-/// @brief Scale rod fluence [n/cm2] to an O(1) coordinate for vector fitting.
-inline constexpr double ROD_FLU_SCALE = 1.0e-22;
-} // namespace Hv
 
-inline double hvRodFluCoord(double fluence) {
-    return std::isfinite(fluence) ? fluence * Hv::ROD_FLU_SCALE : 0.0;
+/// @brief The condition axis a rod-age cross term rides on, or -1. Same axis
+/// numbering as BranchAxisOf.
+[[nodiscard]] inline int RodAgeAxisOf(SpectralCoordinate coordinate) {
+    switch (coordinate) {
+    case SpectralCoordinate::BppmRodAge: return 0;
+    case SpectralCoordinate::TfulRodAge: return 1;
+    case SpectralCoordinate::DmodRodAge: return 2;
+    default: return -1;
+    }
 }
 
-inline double hvLogIso(double density) {
-    return std::log(std::max(density, 1.0e-30));
+/// @brief Rod fluence is O(1e21); scale it so the design column is O(1) before the
+/// fit's own column normalisation, and so the stored coefficient stays readable.
+inline constexpr double ROD_AGE_SCALE = 1.0e-21;
+
+/// @brief Evaluate one of the reference-ratio coordinate forms.
+/// @param coordinate Which form; anything else returns the saturating form.
+/// @param now Node or sample density, already floored away from zero.
+/// @param ref Reference-inventory density at the same burnup, likewise floored.
+/// @return The coordinate value.
+/// Lives here rather than in the fitter so the Chiffon fit and the RASBERY
+/// runtime evaluate one expression, not two that can drift apart.
+[[nodiscard]] inline double RatioFormOf(SpectralCoordinate coordinate,
+                                        double now, double ref) {
+    if (coordinate == SpectralCoordinate::LogDeviationSquared) {
+        const double d = std::log(now / ref);
+        return d * d;
+    }
+    if (coordinate == SpectralCoordinate::InverseRatio)
+        return ref / now;
+    if (coordinate == SpectralCoordinate::CubeRootRatio)
+        return std::cbrt(now / ref);
+    return now / (1.0 + now / ref);
 }
 
-inline double hvLogRatio(double numerator, double denominator) {
-    return hvLogIso(numerator) -
-           hvLogIso(denominator);
+/// @brief Whether a serialized integer names a coordinate this build implements.
+/// An explicit list, not a range: unassigned values must be rejected at load
+/// rather than falling through to plain density.
+[[nodiscard]] inline bool IsKnownSpectralCoordinate(int value) {
+    switch (static_cast<SpectralCoordinate>(value)) {
+    case SpectralCoordinate::Density:
+    case SpectralCoordinate::LogDensity:
+    case SpectralCoordinate::ThermalWeighted:
+    case SpectralCoordinate::FastWeighted:
+    case SpectralCoordinate::FluxRatioInteraction:
+    case SpectralCoordinate::SqrtDensity:
+    case SpectralCoordinate::SpectralIndex:
+    case SpectralCoordinate::SpectralIndexInteraction:
+    case SpectralCoordinate::RelativeBurnRatio:
+    case SpectralCoordinate::BppmInteraction:
+    case SpectralCoordinate::TfulInteraction:
+    case SpectralCoordinate::DmodInteraction:
+    case SpectralCoordinate::LogDeviationSquared:
+    case SpectralCoordinate::FissileFraction:
+    case SpectralCoordinate::InverseRatio:
+    case SpectralCoordinate::CubeRootRatio:
+    case SpectralCoordinate::SaturatingRatio:
+    case SpectralCoordinate::BppmRodAge:
+    case SpectralCoordinate::TfulRodAge:
+    case SpectralCoordinate::DmodRodAge:
+        return true;
+    }
+    return false;
 }
 
-inline double hvBurnCoord(double burnupKey) {
-    return std::isfinite(burnupKey) ? burnupKey * 1.0e-3 : 0.0;
+/// @brief The condition axis a cross term rides on, or -1 if the coordinate is
+/// not one of the three centered branch interactions. Matches the branch order
+/// used by the runtime scalar-branch table.
+[[nodiscard]] inline int BranchAxisOf(SpectralCoordinate coordinate) {
+    switch (coordinate) {
+    case SpectralCoordinate::BppmInteraction: return 0;
+    case SpectralCoordinate::TfulInteraction: return 1;
+    case SpectralCoordinate::DmodInteraction: return 2;
+    default: return -1;
+    }
 }
 
-inline double hvRoddedBurnFrac(double roddedBurnupKey, double totalBurnupKey) {
-    if (!std::isfinite(roddedBurnupKey) || !std::isfinite(totalBurnupKey) || totalBurnupKey <= 0.0)
-        return 0.0;
-    return std::clamp(roddedBurnupKey / totalBurnupKey, 0.0, 1.0);
-}
-
-/// @brief Correction-kind tags stored in HistoryDeltaCorrection::kind.
-/// Values are fixed for HDF backward-read compatibility. CTYPE_INDEP_VEC (ctype-independent
-/// IISC vector) and RHST_UNIT (rod-history residual vector) are the only kinds the RASBERY
-/// runtime applies (see XSSet::ApplyHistoryDeltasToNode). VEC is the legacy ctype-keyed
-/// spectral vector: it is still fit, classified as IISC, and serialized, but the current
-/// runtime apply path skips it, so an applied IISC block must set ctype_independent.
-namespace Hk {
-enum : int {
-    VEC             = 4,
-    RHST_UNIT       = 7,
-    CTYPE_INDEP_VEC = 26
+/// @brief One isotope coordinate in the spectral-history regression basis.
+struct SpectralTerm {
+    size_t             isotope   = 0;
+    SpectralCoordinate coordinate = SpectralCoordinate::Density;
+    /// @brief Second isotope for two-isotope coordinates; unused (SIZE_MAX)
+    /// otherwise.
+    size_t partner = static_cast<size_t>(-1);
+    bool operator==(const SpectralTerm&) const = default;
 };
-} // namespace Hk
 
-inline double hvFastThermRatio(double fastFlux, double thermalFlux) {
-    if (!std::isfinite(fastFlux) || !std::isfinite(thermalFlux) || thermalFlux <= 1.0e-30)
-        return 0.0;
-    return std::max(0.0, fastFlux) / std::max(thermalFlux, 1.0e-30);
-}
-
-inline double hvThermFluxFrac(double fastFlux, double thermalFlux) {
-    if (!std::isfinite(fastFlux) || !std::isfinite(thermalFlux))
-        return 0.0;
-    const double fast    = std::max(0.0, fastFlux);
-    const double thermal = std::max(0.0, thermalFlux);
-    const double total   = fast + thermal;
-    return total > 1.0e-30 ? thermal / total : 0.0;
-}
-
-inline double hvFastThermRatio(const std::vector<double>& flux) {
-    return flux.size() >= 2 ? hvFastThermRatio(flux[0], flux[1]) : 0.0;
-}
-
-inline double hvThermFluxFrac(const std::vector<double>& flux) {
-    return flux.size() >= 2 ? hvThermFluxFrac(flux[0], flux[1]) : 0.0;
-}
-
-inline bool IsHistoryVectorSpecial(size_t iso) {
-    return iso == Hv::ROD_DEPL ||
-           iso == Hv::LOG_XE ||
-           iso == Hv::LOG_PU ||
-           iso == Hv::LOG_U_PU ||
-           iso == Hv::TOT_BURN ||
-           iso == Hv::CUR_ROD_FRAC ||
-           iso == Hv::FUEL_ROD_FLU ||
-           iso == Hv::ROD_BURN_FRAC ||
-           iso == Hv::FUEL_ROD_BURN ||
-           iso == Hv::ROD_BURN ||
-           iso == Hv::ROD_FLU ||
-           iso == Hv::FAST_THERM ||
-           iso == Hv::THERM_FRAC;
-}
-
-/// @brief Surface and corner direction indices for discontinuity factors.
-namespace Direction {
-constexpr int SOUTH = 0;
-constexpr int EAST  = 1;
-constexpr int NORTH = 2;
-constexpr int WEST  = 3;
-
-constexpr int SW = 1;
-constexpr int SE = 2;
-constexpr int NE = 3;
-constexpr int NW = 4;
-} // namespace Direction
+using SpectralBasis = std::vector<SpectralTerm>;
 
 using namespace Isotope;
-using namespace Direction;
-
-/// @brief Return the flat pin index for an (i, j) pin position.
-/// @param i Pin x-index.
-/// @param j Pin y-index.
-/// @param npin Number of pins per assembly side.
-inline size_t pidx(size_t i, size_t j, size_t npin) { return j * npin + i; }
-
-/// @brief Return the flat pin/group index for an (i, j) pin and energy group.
-/// @param g Energy group index.
-/// @param i Pin x-index.
-/// @param j Pin y-index.
-/// @param npin Number of pins per assembly side.
-inline size_t pidg(size_t g, size_t i, size_t j, size_t npin) { return g * npin * npin + j * npin + i; }
 
 /// @brief Cross-section reaction type indices within each energy group.
 enum XSTYPE { XSTF, // Transport
@@ -244,66 +332,16 @@ enum XSTYPE { XSTF, // Transport
 };
 
 /// @brief Branch perturbation types in the parameterized cross-section library.
-enum BRANCHTYPE { REFR, // Reference (base depletion)
-                  BPPM, // Boron concentration
-                  TFUL, // Fuel temperature
-                  DMOD, // Moderator density
-                  TMOD, // Moderator temperature
-                  SPCT, // Spectral history correction
-                  RHST, // Rod-history correction
-                  RDEP  // Rod-material depletion correction
+enum BRANCHTYPE : int {
+    REFR            = 0, // Reference (base depletion)
+    BPPM            = 1, // Boron concentration
+    TFUL            = 2, // Fuel temperature
+    DMOD            = 3, // Moderator density
+    TMOD            = 4, // Moderator temperature
+    SPECTRAL_HISTORY = 5, // Spectral-history input
+    ROD_HISTORY     = 6, // Rodded depletion history input
+    COMBO           = 8  // Multi-axis instantaneous branch (validation-only)
 };
-
-/// @brief Human-readable correction components used by the current delta-sum path.
-enum class CorrectionComponent {
-    REFERENCE,
-    BPPM,
-    TFUEL,
-    DMOD,
-    TMOD,
-    ROD_DEPLETION,
-    IISC,
-    IISC_RHST,
-    UNKNOWN
-};
-
-inline CorrectionComponent CorrectionComponentFromBranch(BRANCHTYPE branchType) {
-    if (branchType == BRANCHTYPE::BPPM) return CorrectionComponent::BPPM;
-    if (branchType == BRANCHTYPE::TFUL) return CorrectionComponent::TFUEL;
-    if (branchType == BRANCHTYPE::DMOD) return CorrectionComponent::DMOD;
-    if (branchType == BRANCHTYPE::TMOD) return CorrectionComponent::TMOD;
-    if (branchType == BRANCHTYPE::RDEP) return CorrectionComponent::ROD_DEPLETION;
-    if (branchType == BRANCHTYPE::REFR) return CorrectionComponent::REFERENCE;
-    return CorrectionComponent::UNKNOWN;
-}
-
-inline CorrectionComponent CorrectionComponentFromHistoryKind(int kind) {
-    if (kind == Hk::RHST_UNIT)
-        return CorrectionComponent::IISC_RHST;
-    if (kind == Hk::CTYPE_INDEP_VEC || kind == Hk::VEC)
-        return CorrectionComponent::IISC;
-    return CorrectionComponent::UNKNOWN;
-}
-
-inline CorrectionComponent CorrectionComponentFromBranchAndKind(BRANCHTYPE branchType, int kind) {
-    if (branchType == BRANCHTYPE::SPCT || branchType == BRANCHTYPE::RHST)
-        return CorrectionComponentFromHistoryKind(kind);
-    return CorrectionComponentFromBranch(branchType);
-}
-
-inline const char* CorrectionComponentName(CorrectionComponent component) {
-    switch (component) {
-    case CorrectionComponent::REFERENCE: return "reference";
-    case CorrectionComponent::BPPM: return "bppm";
-    case CorrectionComponent::TFUEL: return "tfuel";
-    case CorrectionComponent::DMOD: return "dmod";
-    case CorrectionComponent::TMOD: return "tmod";
-    case CorrectionComponent::ROD_DEPLETION: return "rod_depletion";
-    case CorrectionComponent::IISC: return "iisc";
-    case CorrectionComponent::IISC_RHST: return "iisc_rhst";
-    default: return "unknown";
-    }
-}
 
 class CrossSection;
 class DeltaCrossSection;
@@ -319,34 +357,18 @@ using Branch = std::unordered_map<int, std::map<int, std::vector<size_t>>>;
 /// @brief Branch delta map: control-rod type -> burnup key -> fitted XS delta.
 using BranchDelta = std::unordered_map<int, std::map<int, DeltaCrossSection>>;
 
-/// @brief Settings and fitted deltas for spectral or rod-history corrections.
-struct HistoryDeltaCorrection {
-    /// @brief Fitted correction deltas keyed by correction ctype and burnup.
-    BranchDelta delta;
-    /// @brief Branch family that owns this correction.
-    BRANCHTYPE branch_type = BRANCHTYPE::SPCT;
-    /// @brief Legacy HDF kind. New code should classify this through CorrectionComponentFromHistoryKind().
-    int kind = 4;
-    /// @brief Serialized assembly-data-field tag (HDF `state_fields`); kept for on-disk
-    /// compatibility and metadata equality only, not read by any correction at query time.
-    int state_field = 9; // AD_TMOD
-    /// @brief Isotope indices used by vector corrections; special ids mean fuel/rod fluence.
-    std::vector<size_t> vector_isotopes;
-    /// @brief Powers applied to vector_isotopes in the correction variable.
-    std::vector<int> vector_powers;
+using BurnupDelta = std::map<int, DeltaCrossSection>;
+
+/// @brief One ctype-independent spectral-history correction term.
+struct SpectralHistoryCorrection {
+    BurnupDelta delta;
+    SpectralTerm term;
+    /// @brief PROBE: scale this term by the node rod fraction.
+    bool rod_scaled = false;
 };
 
 /// @brief Reference point index map: control-rod type -> burnup key -> point index.
 using Reference = std::unordered_map<int, std::map<int, size_t>>;
-
-/// @brief Return a copy of a string with leading and trailing whitespace removed.
-/// @param s Input string.
-inline std::string trim(const std::string& s) {
-    size_t start = s.find_first_not_of(" \t\n\r\f\v");
-    if (start == std::string::npos) return "";
-    size_t end = s.find_last_not_of(" \t\n\r\f\v");
-    return s.substr(start, end - start + 1);
-}
 
 /// @brief Multigroup cross-section container with macroscopic, microscopic, and lumped terms.
 class CrossSection {
@@ -416,9 +438,6 @@ public:
     /// @brief Add another cross-section container in place.
     /// @param other Cross-section container to add.
     CrossSection& operator+=(const CrossSection& other) {
-        if (_ngrp != other._ngrp) {
-            throw std::runtime_error("CrossSection energy group mismatch.");
-        }
         _macx += other._macx;
         _micx += other._micx;
         _lmpx += other._lmpx;
@@ -436,9 +455,6 @@ public:
     /// @brief Subtract another cross-section container in place.
     /// @param other Cross-section container to subtract.
     CrossSection& operator-=(const CrossSection& other) {
-        if (_ngrp != other._ngrp) {
-            throw std::runtime_error("CrossSection energy group mismatch.");
-        }
         _macx -= other._macx;
         _micx -= other._micx;
         _lmpx -= other._lmpx;
@@ -518,24 +534,6 @@ public:
     /// @brief Set lumped XS entries to zero.
     void ClearLumped() {
         _lmpx.fill(0.0);
-    }
-
-    /// @brief Reconstruct macroscopic XS from microscopic XS and isotope densities.
-    /// @param iden Isotope number densities in global isotope order.
-    /// @param includeLumped Include the lumped remainder before adding microscopic terms.
-    void ReconstructMacroscopicFromMicroscopic(const milk::Vector<double>& iden,
-                                               bool                        includeLumped = true) {
-        if (iden.size() != niso)
-            throw std::runtime_error("CrossSection: isotope density vector size mismatch.");
-
-        const size_t n = _nmem;
-        if (includeLumped)
-            milk::copy(n, _lmpx.data(), 1, _macx.data(), 1);
-        else
-            _macx.fill(0.0);
-
-        for (size_t i = 0; i < niso; ++i)
-            milk::addScaled(n, iden[i], &_micx[i * _nmem], 1, _macx.data(), 1);
     }
 
     // Macroscopic XS accessors (original from lattice code)
@@ -775,7 +773,8 @@ public:
     BRANCHTYPE _btyp;                 ///< Branch type represented by this point.
     int        _ctyp;                 ///< Control-rod type.
     int        _trajectory_ctyp;      ///< Control-rod type of the depletion trajectory.
-    bool       _trajectory_reference; ///< Main point of a rod-history depletion set.
+    bool       _trajectory_reference; ///< Fresh-absorber member of a rod-depletion pair.
+    bool       _nondepleted = false;  ///< Frozen-absorber (RODNONDEPL) counterfactual point.
     double     _fuel_rod_fluence;     ///< Fuel exposure under rodded spectrum [n/cm2].
     double     _rod_fluence;          ///< Rod-material fluence coordinate [n/cm2].
 
@@ -869,6 +868,8 @@ class Model {
 private:
     int         _id   = 0;
     std::string _name = "NULL";
+    int         _history_partner = -1;
+    std::string _history_partner_name;
 
 public:
     /// @brief Return the mutable model ID.
@@ -879,58 +880,41 @@ public:
     std::string& name() { return _name; }
     /// @brief Return the model name.
     const std::string& name() const { return _name; }
+    /// @brief Index of the rodded-depletion partner model, or -1 when this model
+    /// carries no depletion-history blend.
+    int& history_partner() { return _history_partner; }
+    /// @brief Index of the rodded-depletion partner model (-1 when absent).
+    [[nodiscard]] const int& history_partner() const { return _history_partner; }
+    /// @brief Name of the rodded-depletion partner, resolved to an index after
+    /// every model has been read.
+    std::string& history_partner_name() { return _history_partner_name; }
+    /// @brief Name of the rodded-depletion partner model.
+    [[nodiscard]] const std::string& history_partner_name() const {
+        return _history_partner_name;
+    }
 
 private:
     std::vector<DepletionPoint> _dpts;               ///< Database of depletion points.
     Branch                      _bppm_dpts;          ///< Boron branch point indices by ctype and burnup.
     Branch                      _tful_dpts;          ///< Fuel-temperature branch point indices by ctype and burnup.
-    Branch                      _tmod_dpts;          ///< Moderator-temperature branch point indices by ctype and burnup.
     Branch                      _dmod_dpts;          ///< Moderator-density branch point indices by ctype and burnup.
-    std::vector<DepletionPoint> _spct_dpts;          ///< Extra HGC state points used for SPCT corrections.
-    std::vector<DepletionPoint> _rhst_dpts;          ///< Rod-in history points used for RHST corrections.
+    std::vector<DepletionPoint> _spectral_history_dpts; ///< Spectral-history input points.
+    std::vector<DepletionPoint> _rod_history_dpts;   ///< Rodded depletion history points.
     std::vector<DepletionPoint> _rod_depletion_dpts; ///< Rod fluence points used for rod-material depletion.
 public:
     /// @brief Return all base branch depletion points.
     const std::vector<DepletionPoint>& Dpts() const { return _dpts; }
     /// @brief Return spectral history correction points.
-    const std::vector<DepletionPoint>& SpctDpts() const { return _spct_dpts; }
-    /// @brief Return rod-history correction points.
-    const std::vector<DepletionPoint>& RhstDpts() const { return _rhst_dpts; }
-    /// @brief Return rod-material depletion points.
-    const std::vector<DepletionPoint>& RodDepletionDpts() const { return _rod_depletion_dpts; }
+    const std::vector<DepletionPoint>& SpectralHistoryDpts() const {
+        return _spectral_history_dpts;
+    }
+    /// @brief Return rodded depletion history points.
+    const std::vector<DepletionPoint>& RodHistoryDpts() const {
+        return _rod_history_dpts;
+    }
 
     /// @brief Return the number of base branch depletion points.
     int NumPoints() const { return _dpts.size(); }
-
-    /// @brief Return mutable boron branch point map.
-    Branch& BppmDpts() { return _bppm_dpts; }
-    /// @brief Return mutable boron branch burnup map for a control-rod type.
-    /// @param cType Control-rod type.
-    std::map<int, std::vector<size_t>>& BppmDpts(const int cType) { return _bppm_dpts[cType]; }
-    /// @brief Return mutable boron branch point indices for a control-rod type and burnup.
-    /// @param cType Control-rod type.
-    /// @param burnup Integer burnup map key.
-    std::vector<size_t>& BppmDpts(const int cType, const int burnup) { return _bppm_dpts[cType][burnup]; }
-
-    /// @brief Return mutable fuel-temperature branch point map.
-    Branch& TfulDpts() { return _tful_dpts; }
-    /// @brief Return mutable fuel-temperature branch burnup map for a control-rod type.
-    /// @param cType Control-rod type.
-    std::map<int, std::vector<size_t>>& TfulDpts(const int cType) { return _tful_dpts[cType]; }
-    /// @brief Return mutable fuel-temperature branch point indices for a control-rod type and burnup.
-    /// @param cType Control-rod type.
-    /// @param burnup Integer burnup map key.
-    std::vector<size_t>& TfulDpts(const int cType, const int burnup) { return _tful_dpts[cType][burnup]; }
-
-    /// @brief Return mutable moderator-density branch point map.
-    Branch& DmodDpts() { return _dmod_dpts; }
-    /// @brief Return mutable moderator-density branch burnup map for a control-rod type.
-    /// @param cType Control-rod type.
-    std::map<int, std::vector<size_t>>& DmodDpts(const int cType) { return _dmod_dpts[cType]; }
-    /// @brief Return mutable moderator-density branch point indices for a control-rod type and burnup.
-    /// @param cType Control-rod type.
-    /// @param burnup Integer burnup map key.
-    std::vector<size_t>& DmodDpts(const int cType, const int burnup) { return _dmod_dpts[cType][burnup]; }
 
 public:
     /// @brief Construct a model with the default name.
@@ -953,11 +937,14 @@ public:
     Reference   _refr_dpts;          ///< Reference depletion point indices by ctype and burnup.
     BranchDelta _bppm_delt;          ///< Boron branch delta XS by ctype and burnup.
     BranchDelta _tful_delt;          ///< Fuel-temperature branch delta XS by ctype and burnup.
-    BranchDelta _tmod_delt;          ///< Moderator-temperature branch delta XS by ctype and burnup.
     BranchDelta _dmod_delt;          ///< Moderator-density branch delta XS by ctype and burnup.
-    BranchDelta _rod_depletion_delt; ///< Rod-material delta XS by ctype at fluence key 0.
-    /// @brief Spectral and rod-history correction deltas.
-    std::vector<HistoryDeltaCorrection> _history_deltas;
+    BranchDelta _rod_depletion_delt; ///< Rod-material delta XS by ctype and thermal fluence.
+    /// Rod-age branch residual curves over rod fluence, per axis
+    /// (0 = bppm as B-10eq density x1e12, 1 = sqrt(Tfuel) x1e6, 2 = dmod x1e9);
+    /// int key = quantized branch coordinate.
+    std::array<BranchDelta, 3> _rod_depletion_branch;
+    /// @brief Ctype-independent spectral-history correction terms.
+    std::vector<SpectralHistoryCorrection> _spectral_history;
 
     /// @brief Create a depletion point and register it in the matching branch map.
     /// @param ngrp Number of energy groups.
@@ -978,9 +965,8 @@ public:
             _tful_dpts[cType][burn].push_back(idx);
         else if (bType == BRANCHTYPE::DMOD)
             _dmod_dpts[cType][burn].push_back(idx);
-        else if (bType == BRANCHTYPE::TMOD)
-            _tmod_dpts[cType][burn].push_back(idx);
-        else
+        else if (bType != BRANCHTYPE::TMOD &&
+                 bType != BRANCHTYPE::COMBO)
             _refr_dpts[cType][burn] = idx;
         return _dpts.back();
     }
@@ -1011,24 +997,65 @@ public:
     /// @param burnup Integer burnup map key.
     const DepletionPoint& GetDepletionPoint(const int cType, const int burnup) const { return _dpts[_refr_dpts.at(cType).at(burnup)]; }
 
-    /// @brief Return the branch point map for a branch type.
+    /// @brief Return the branch point map for a fitted scalar branch type.
     /// @param bType Branch type selector.
     Branch& GetBranch(const BRANCHTYPE bType) {
         if (bType == BRANCHTYPE::BPPM) return _bppm_dpts;
         if (bType == BRANCHTYPE::TFUL) return _tful_dpts;
         if (bType == BRANCHTYPE::DMOD) return _dmod_dpts;
-        if (bType == BRANCHTYPE::TMOD) return _tmod_dpts;
-        return _bppm_dpts;
+        throw std::logic_error("GetBranch: unsupported branch type.");
     }
 
-    /// @brief Return the const branch point map for a branch type.
+    /// @brief Return the branch point map for a fitted scalar branch type.
     /// @param bType Branch type selector.
     const Branch& GetBranch(const BRANCHTYPE bType) const {
         if (bType == BRANCHTYPE::BPPM) return _bppm_dpts;
         if (bType == BRANCHTYPE::TFUL) return _tful_dpts;
         if (bType == BRANCHTYPE::DMOD) return _dmod_dpts;
-        if (bType == BRANCHTYPE::TMOD) return _tmod_dpts;
-        return _bppm_dpts;
+        throw std::logic_error("GetBranch: unsupported branch type.");
+    }
+
+    /// @brief Apply a burnup-interpolated scalar branch delta in place.
+    /// @param xs Cross-section state to correct in place.
+    /// @param delta Caller-owned scratch CrossSection.
+    /// @param branch Scalar branch delta table.
+    /// @param cType Control-rod type.
+    /// @param burnup Integer burnup map key.
+    /// @param x Scalar branch coordinate.
+    void ApplyScalarBranchDelta(CrossSection& xs, CrossSection& delta,
+                                const BranchDelta& branch,
+                                int cType, int burnup, double x) const {
+        auto cIt = branch.find(cType);
+        if (cIt == branch.end() || cIt->second.empty())
+            return;
+        const auto& m  = cIt->second;
+        auto        hi = m.lower_bound(burnup);
+        auto        lo = hi;
+        if (hi == m.end()) {
+            lo = std::prev(m.end());
+            hi = lo;
+        } else if (hi == m.begin()) {
+            lo = hi;
+        } else if (hi->first != burnup) {
+            lo = std::prev(hi);
+        }
+
+        auto applyOne = [&](const DeltaCrossSection& dxs, double burnupScale) {
+            if (burnupScale == 0.0)
+                return;
+            dxs.DeltaInto(x, delta);
+            delta *= burnupScale;
+            xs += delta;
+        };
+
+        if (lo != hi && hi->first != lo->first) {
+            const double frac = static_cast<double>(burnup - lo->first) /
+                                static_cast<double>(hi->first - lo->first);
+            applyOne(lo->second, 1.0 - frac);
+            applyOne(hi->second, frac);
+        } else {
+            applyOne(lo->second, 1.0);
+        }
     }
 
     /// @brief Fill reference XS, isotope density, state data, and optional flux at a burnup.
@@ -1068,8 +1095,8 @@ public:
             return;
 
         const double rawBurn = burnup / 1000.0;
-        const double denom   = hiDpt._data[AD_BURN] - loDpt._data[AD_BURN];
-        const double frac    = std::abs(denom) > 0.0 ? (rawBurn - loDpt._data[AD_BURN]) / denom : 0.0;
+        const double frac    = (rawBurn - loDpt._data[AD_BURN]) /
+                            (hiDpt._data[AD_BURN] - loDpt._data[AD_BURN]);
 
         xs.addScaled(hiDpt._xs, frac);
         xs.addScaled(loDpt._xs, -frac);
@@ -1093,7 +1120,8 @@ public:
     /// @param tfuel Fuel temperature in K.
     /// @param dmod Moderator density in g/cm^3.
     void FillCrossSection(CrossSection& xs, milk::Vector<double>& iden, CrossSection& delta,
-                          int cType, int burnup, double bppm, double tfuel, double dmod) const {
+                          int cType, int burnup, double bppm, double tfuel,
+                          double dmod) const {
         auto& refrMap = _refr_dpts.at(cType);
 
         // 1. Find reference depletion point
@@ -1133,64 +1161,13 @@ public:
         double nO   = nH2O;
         double nB   = dmod * loDpt._data[AD_WVFR] * bppm * 5.5707678E-8;
 
-        if (_bppm_delt.contains(cType) && !_bppm_delt.at(cType).empty()) {
-            const auto& m  = _bppm_delt.at(cType);
-            auto        it = m.lower_bound(burnup);
-            it             = (it == m.end()) ? std::prev(it) : it;
-            it->second.DeltaInto(nB, delta);
-            xs += delta;
-        }
-        if (_tful_delt.contains(cType) && !_tful_delt.at(cType).empty()) {
-            const auto& m  = _tful_delt.at(cType);
-            auto        it = m.lower_bound(burnup);
-            it             = (it == m.end()) ? std::prev(it) : it;
-            it->second.DeltaInto(sqrt(tfuel), delta);
-            xs += delta;
-        }
-        if (_dmod_delt.contains(cType) && !_dmod_delt.at(cType).empty()) {
-            const auto& m  = _dmod_delt.at(cType);
-            auto        it = m.lower_bound(burnup);
-            it             = (it == m.end()) ? std::prev(it) : it;
-            it->second.DeltaInto(dmod, delta);
-            xs += delta;
-        }
+        ApplyScalarBranchDelta(xs, delta, _bppm_delt, cType, burnup, nB);
+        ApplyScalarBranchDelta(xs, delta, _tful_delt, cType, burnup, sqrt(tfuel));
+        ApplyScalarBranchDelta(xs, delta, _dmod_delt, cType, burnup, dmod);
 
         iden[iH1]  = nH;
         iden[iO16] = nO;
         iden[iB10] = nB;
-    }
-
-    /// @brief Fill reference average flux at a burnup by reference interpolation.
-    /// @param flux Output average flux by energy group.
-    /// @param cType Control-rod type.
-    /// @param burnup Integer burnup map key.
-    void FillReferenceFlux(std::vector<double>& flux, int cType, int burnup) const {
-        flux.clear();
-        auto mapIt = _refr_dpts.find(cType);
-        if (mapIt == _refr_dpts.end() || mapIt->second.empty())
-            return;
-
-        const auto& refrMap = mapIt->second;
-        auto        refrHi  = refrMap.lower_bound(burnup);
-        auto        refrLo  = refrHi;
-        if (refrHi == refrMap.end()) {
-            refrLo = std::prev(refrMap.end());
-            refrHi = refrLo;
-        } else if (refrHi == refrMap.begin()) {
-            refrLo = refrMap.begin();
-        } else {
-            refrLo = std::prev(refrHi);
-        }
-
-        const DepletionPoint& loDpt = _dpts[refrLo->second];
-        const DepletionPoint& hiDpt = _dpts[refrHi->second];
-        flux                        = loDpt._aflx;
-        if (refrLo != refrHi && hiDpt.burnKey() != loDpt.burnKey()) {
-            const double frac = static_cast<double>(burnup - loDpt.burnKey()) /
-                                static_cast<double>(hiDpt.burnKey() - loDpt.burnKey());
-            for (size_t i = 0; i < flux.size() && i < hiDpt._aflx.size(); ++i)
-                flux[i] += (hiDpt._aflx[i] - flux[i]) * frac;
-        }
     }
 
     /// @brief Return branch-corrected XS using thread-local workspaces.
@@ -1209,27 +1186,109 @@ public:
         return ws_xs;
     }
 
-    /// @brief Apply ctype-specific rod-material depletion delta at a fluence point.
+    /// @brief Nominal rod-material fluence [n/cm2] of the ctype reference trajectory at a burnup.
+    /// Rodded reference points carry reconstructed fluence; other references return zero.
+    [[nodiscard]] double ReferenceRodFluence(int cType, int burnup) const {
+        auto it = _refr_dpts.find(cType);
+        if (it == _refr_dpts.end() || it->second.empty())
+            return 0.0;
+        const auto& bmap = it->second;
+        auto        hi   = bmap.lower_bound(burnup);
+        auto        lo   = hi;
+        if (hi == bmap.end()) {
+            lo = std::prev(bmap.end());
+            hi = lo;
+        } else if (hi == bmap.begin()) {
+            lo = bmap.begin();
+        } else if (hi->first != burnup) {
+            lo = std::prev(hi);
+        }
+        const double fLo = _dpts[lo->second]._rod_fluence;
+        const double fHi = _dpts[hi->second]._rod_fluence;
+        if (!std::isfinite(fLo) || !std::isfinite(fHi))
+            return 0.0;
+        if (lo == hi || hi->first == lo->first)
+            return std::max(0.0, fLo);
+        const double frac = static_cast<double>(burnup - lo->first) /
+                            static_cast<double>(hi->first - lo->first);
+        return std::max(0.0, fLo + frac * (fHi - fLo));
+    }
+
+    /// @brief Apply the relative rod-material depletion correction.
     /// @param xs Cross-section state to correct in place.
-    /// @param delta Caller-owned scratch CrossSection.
-    /// @param cType Rod control type.
-    /// @param fluence Integrated scalar flux [n/cm2].
-    void ApplyRodDepletion(CrossSection& xs, CrossSection& delta, int cType, double fluence) const {
-        if (cType <= 0 || fluence <= 0.0)
+    /// @param delta Caller-owned scratch cross section.
+    /// @param cType Control-rod type.
+    /// @param fluence Integrated thermal flux [n/cm2].
+    void ApplyRodDepletion(
+        CrossSection& xs, CrossSection& delta, int cType,
+        double fluence, int burnup, double uBppm,
+        double uTful, double uDmod) const {
+        if (cType <= 0)
             return;
-        auto ctypeIt = _rod_depletion_delt.find(cType);
-        if (ctypeIt == _rod_depletion_delt.end() || ctypeIt->second.empty())
+        const auto ctypeIt = _rod_depletion_delt.find(cType);
+        if (ctypeIt == _rod_depletion_delt.end())
+            return;
+        const auto curve = ctypeIt->second.find(0);
+        if (curve == ctypeIt->second.end())
             return;
 
-        const auto& bmap = ctypeIt->second;
-        const auto  it   = bmap.begin();
-        double      x    = fluence;
-        if (it->second.knots().size() >= 2) {
-            const auto& knots = it->second.knots();
-            x                 = std::clamp(x, knots.front(), knots.back());
-        }
-        it->second.DeltaInto(x, delta);
+        const double referenceFluence =
+            ReferenceRodFluence(cType, burnup);
+        if (fluence <= 0.0 && referenceFluence <= 0.0)
+            return;
+
+        curve->second.DeltaInto(std::max(fluence, 0.0), delta);
         xs += delta;
+        if (referenceFluence > 0.0) {
+            curve->second.DeltaInto(referenceFluence, delta);
+            xs -= delta;
+        }
+        ApplyRodDepletionBranchResiduals(
+            xs, delta, cType, fluence, uBppm, uTful, uDmod);
+    }
+
+    /// Condition dependence of the rod-age worth. Each axis stores
+    /// residual-vs-fluence curves at the pair decks' branch displacements (zero at the
+    /// nominal knot); the node's displacement interpolates linearly between knot curves.
+    void ApplyRodDepletionBranchResiduals(CrossSection& xs, CrossSection& delta, int cType,
+                                          double fluence, double uBppm, double uTful,
+                                          double uDmod) const {
+        static constexpr double kUScale[3] = {1.0e12, 1.0e6, 1.0e9};
+        const double            u[3]       = {uBppm, uTful, uDmod};
+        for (int a = 0; a < 3; ++a) {
+            if (u[a] < 0.0)
+                continue;
+            auto cIt = _rod_depletion_branch[a].find(cType);
+            if (cIt == _rod_depletion_branch[a].end() || cIt->second.size() < 2)
+                continue;
+            const auto&  m   = cIt->second;
+            const double key = u[a] * kUScale[a];
+            auto         hi  = m.lower_bound(static_cast<int>(std::llround(key)));
+            auto         lo  = hi;
+            if (hi == m.end()) {
+                lo = std::prev(m.end());
+                hi = lo;
+            } else if (hi == m.begin()) {
+                lo = hi;
+            } else {
+                lo = std::prev(hi);
+            }
+            auto applyOne = [&](const DeltaCrossSection& dxs, double w, double x) {
+                if (w == 0.0)
+                    return;
+                dxs.DeltaInto(std::max(x, 0.0), delta);
+                delta *= w;
+                xs += delta;
+            };
+            if (lo != hi && hi->first != lo->first) {
+                const double frac = (key - lo->first) /
+                                    static_cast<double>(hi->first - lo->first);
+                applyOne(lo->second, 1.0 - frac, fluence);
+                applyOne(hi->second, frac, fluence);
+            } else {
+                applyOne(lo->second, 1.0, fluence);
+            }
+        }
     }
 };
 } // namespace Chiffon

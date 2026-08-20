@@ -1,17 +1,21 @@
 #pragma once
 
 #include "Model.h"
+#include "Interpolator.h"
+#include "Hdf5Guard.h"
 
-#include <format>
+#include <algorithm>
+#include <string>
+#include <vector>
+#include "CompatFormat.h"
 
 namespace Chiffon {
 // Serializes Model objects to CHIFFON HDF5 format
 class Exporter {
 public:
-    static constexpr const char* HdfVersion() { return "2.4.0"; }
-
     // Save all models to CHIFFON HDF5: metadata (isotope registry), depletion points, branches, deltas
     static void SaveHDF(const std::string& filename, const std::vector<Model>& models) {
+        Hdf5Guard hdf5_guard;
         try {
             HighFive::File file(filename, HighFive::File::Overwrite);
 
@@ -19,7 +23,7 @@ public:
             auto metaGroup = file.createGroup("Metadata");
 
             // Version information for compatibility checking
-            metaGroup.createDataSet("version", std::string(HdfVersion()));
+            metaGroup.createDataSet("version", std::string(HDF_VERSION));
             metaGroup.createDataSet("format", std::string("CHIFFON_HDF5"));
 
             // Isotope registry
@@ -38,6 +42,28 @@ public:
             metaGroup.createDataSet("niso", niso);
             metaGroup.createDataSet("num_models", models.size());
 
+            // Branches the fit dropped because their abscissa never moved.
+            //
+            // Interpolator warns about these on stderr once per (model, branch)
+            // pair, which is exactly as durable as the terminal it scrolled
+            // past.  The library it produced then looks like any other library
+            // that simply has no boron/fuel-temperature/density response, and
+            // months later nobody can say whether a flat branch was physics or
+            // a missing DeCART EDIT/isotope entry.  Written as "model/branch"
+            // strings, newline-joined so an empty list is still a well-formed
+            // dataset; "" therefore means "nothing was dropped", while an
+            // absent dataset means "written by a build that did not record it".
+            {
+                const std::vector<std::string> dropped = SnapshotDegenerateBranchLog();
+                std::string joined;
+                for (size_t i = 0; i < dropped.size(); ++i) {
+                    if (i) joined += '\n';
+                    joined += dropped[i];
+                }
+                metaGroup.createDataSet("degenerate_branches", joined);
+                metaGroup.createDataSet("degenerate_branch_count", dropped.size());
+            }
+
             // Models group
             auto modelsGroup = file.createGroup("Models");
 
@@ -49,72 +75,34 @@ public:
                 modelGroup.createDataSet("id", model._id);
                 modelGroup.createDataSet("name", model._name);
                 modelGroup.createDataSet("num_dpts", model._dpts.size());
+                // -1 when the fuel carries no rodded-depletion twin; absent in
+                // libraries written before the blend existed.
+                modelGroup.createDataSet("history_partner", model.history_partner());
 
                 // Depletion points
-                SaveDepletionPoints(modelGroup, model._dpts, false);
+                SaveDepletionPoints(modelGroup, model._dpts);
 
-                // Branch indices
+                // Branch indices (only the reference map is read back; branch-point
+                // maps are fit-time-only state and are not serialized).
                 SaveBranch(modelGroup, "refr_dpts", model._refr_dpts);
-                SaveBranchMap(modelGroup, "bppm_dpts", model._bppm_dpts);
-                SaveBranchMap(modelGroup, "tful_dpts", model._tful_dpts);
-                SaveBranchMap(modelGroup, "tmod_dpts", model._tmod_dpts);
-                SaveBranchMap(modelGroup, "dmod_dpts", model._dmod_dpts);
 
-                // Delta cross-sections
                 SaveBranchDelta(modelGroup, "bppm_delt", model._bppm_delt);
                 SaveBranchDelta(modelGroup, "tful_delt", model._tful_delt);
-                SaveBranchDelta(modelGroup, "tmod_delt", model._tmod_delt);
                 SaveBranchDelta(modelGroup, "dmod_delt", model._dmod_delt);
                 SaveBranchDelta(modelGroup, "rod_depletion_delt", model._rod_depletion_delt);
-                SaveBranchCorrections(modelGroup, model);
+                if (!model._rod_depletion_branch[0].empty())
+                    SaveBranchDelta(modelGroup, "rod_depletion_branch_bppm", model._rod_depletion_branch[0]);
+                if (!model._rod_depletion_branch[1].empty())
+                    SaveBranchDelta(modelGroup, "rod_depletion_branch_tful", model._rod_depletion_branch[1]);
+                if (!model._rod_depletion_branch[2].empty())
+                    SaveBranchDelta(modelGroup, "rod_depletion_branch_dmod", model._rod_depletion_branch[2]);
+                SaveSpectralHistory(modelGroup, model._spectral_history);
             }
 
             file.flush();
 
-        } catch (const HighFive::Exception& e) {
-            throw std::runtime_error(std::format("Failed to save HDF5 file '{}': {}", filename, e.what()));
         } catch (const std::exception& e) {
             throw std::runtime_error(std::format("Failed to save HDF5 file '{}': {}", filename, e.what()));
-        }
-    }
-
-    // Utility: Get HDF5 file metadata without loading full data
-    static void PrintHDF5Info(const std::string& filename) {
-        try {
-            HighFive::File file(filename, HighFive::File::ReadOnly);
-
-            auto metaGroup = file.getGroup("Metadata");
-
-            std::string version, format;
-            size_t      niso, num_models;
-
-            if (metaGroup.exist("version")) {
-                metaGroup.getDataSet("version").read(version);
-                std::cout << "Version: " << version << std::endl;
-            }
-            if (metaGroup.exist("format")) {
-                metaGroup.getDataSet("format").read(format);
-                std::cout << "Format: " << format << std::endl;
-            }
-
-            metaGroup.getDataSet("niso").read(niso);
-            metaGroup.getDataSet("num_models").read(num_models);
-
-            std::cout << "Number of isotopes: " << niso << std::endl;
-            std::cout << "Number of models: " << num_models << std::endl;
-
-            auto modelsGroup = file.getGroup("Models");
-            for (size_t m = 0; m < num_models; ++m) {
-                auto        modelGroup = modelsGroup.getGroup("Model_" + std::to_string(m));
-                std::string name;
-                size_t      num_dpts;
-                modelGroup.getDataSet("name").read(name);
-                modelGroup.getDataSet("num_dpts").read(num_dpts);
-                std::cout << "  Model[" << m << "]: " << name << " (" << num_dpts << " depletion points)" << std::endl;
-            }
-
-        } catch (const std::exception& e) {
-            std::cerr << "Failed to read HDF5 info: " << e.what() << std::endl;
         }
     }
 
@@ -181,16 +169,19 @@ private:
         parent.createDataSet("xs_micx", xs_micx);
     }
 
-    static void SaveDepletionPoints(HighFive::Group& parent, const std::vector<DepletionPoint>& dpts,
-                                    bool include_branch_heavy) {
+    static void SaveDepletionPoints(
+        HighFive::Group& parent,
+        const std::vector<DepletionPoint>& dpts) {
         auto                               group = parent.createGroup("DepletionPoints");
         std::vector<int>                   meta;
         std::vector<double>                data;
+        std::vector<double>                rod_fluence;
         std::vector<size_t>                heavy_indices;
         std::vector<const DepletionPoint*> heavy_dpts;
 
         meta.reserve(dpts.size() * 4);
         data.reserve(dpts.size() * AD_SIZE);
+        rod_fluence.reserve(dpts.size());
 
         for (size_t idx = 0; idx < dpts.size(); ++idx) {
             const auto& dpt = dpts[idx];
@@ -200,8 +191,9 @@ private:
             meta.push_back(static_cast<int>(dpt._btyp));
             meta.push_back(dpt._ctyp);
             data.insert(data.end(), dpt._data.begin(), dpt._data.end());
+            rod_fluence.push_back(dpt._rod_fluence);
 
-            if (dpt._btyp == BRANCHTYPE::REFR || include_branch_heavy) {
+            if (dpt._btyp == BRANCHTYPE::REFR) {
                 heavy_indices.push_back(idx);
                 heavy_dpts.push_back(&dpt);
             }
@@ -210,6 +202,8 @@ private:
         group.createDataSet("layout", std::string(DepletionLayout()));
         group.createDataSet("meta", meta);
         group.createDataSet("data", data);
+        // Rodded references retain their reconstructed rod fluence.
+        group.createDataSet("rod_fluence", rod_fluence);
         group.createDataSet("heavy_indices", heavy_indices);
 
         SaveMemberField(group, "aflx", heavy_dpts, &DepletionPoint::_aflx);
@@ -226,8 +220,15 @@ private:
         auto                group = parent.createGroup(name);
         std::vector<int>    cTypes, burnups;
         std::vector<size_t> indices;
-
-        for (const auto& [cType, buMap] : ref) {
+        std::vector<int>    orderedTypes;
+        orderedTypes.reserve(ref.size());
+        for (const auto& [cType, burnupMap] : ref) {
+            (void)burnupMap;
+            orderedTypes.push_back(cType);
+        }
+        std::sort(orderedTypes.begin(), orderedTypes.end());
+        for (const int cType : orderedTypes) {
+            const auto& buMap = ref.at(cType);
             for (const auto& [bu, idx] : buMap) {
                 cTypes.push_back(cType);
                 burnups.push_back(bu);
@@ -240,199 +241,152 @@ private:
         group.createDataSet("indices", indices);
     }
 
-    static void SaveBranchMap(HighFive::Group& parent, const std::string& name, const Branch& branch) {
-        // Flatten: instead of creating a group per entry, store as parallel arrays
-        // cTypes[i], burnups[i] are the keys; offsets[i] is start index into indices_flat
-        // offsets has size num_entries+1 (last element = total size of indices_flat)
-        auto                group = parent.createGroup(name);
-        std::vector<int>    cTypes, burnups;
-        std::vector<size_t> offsets;
-        std::vector<size_t> indices_flat;
+    struct DeltaPayload {
+        std::vector<size_t> dxsMeta;
+        std::vector<double> knots;
+        std::vector<size_t> knotOffsets = {0};
+        std::vector<size_t> xsMeta;
+        std::vector<double> macroscopic;
+        std::vector<double> lumped;
+        std::vector<double> microscopic;
+    };
 
-        offsets.push_back(0);
-        for (const auto& [cType, buMap] : branch) {
-            for (const auto& [bu, idxVec] : buMap) {
+    static DeltaPayload PackDeltas(
+        const std::vector<const DeltaCrossSection*>& deltas) {
+        DeltaPayload payload;
+        payload.dxsMeta.reserve(deltas.size() * 4);
+
+        size_t coefficientCount = 0;
+        size_t knotCount        = 0;
+        size_t macroscopicCount = 0;
+        size_t lumpedCount      = 0;
+        size_t microscopicCount = 0;
+        for (const DeltaCrossSection* delta : deltas) {
+            coefficientCount += delta->_nord;
+            knotCount += delta->_knots.size();
+            for (size_t i = 0; i < delta->_nord; ++i) {
+                macroscopicCount += delta->_u[i]._macx.size();
+                lumpedCount += delta->_u[i]._lmpx.size();
+                microscopicCount += delta->_u[i]._micx.size();
+            }
+        }
+
+        payload.xsMeta.reserve(coefficientCount * 3);
+        payload.knots.reserve(knotCount);
+        payload.macroscopic.reserve(macroscopicCount);
+        payload.lumped.reserve(lumpedCount);
+        payload.microscopic.reserve(microscopicCount);
+
+        for (const DeltaCrossSection* delta : deltas) {
+            payload.dxsMeta.push_back(delta->_ngrp);
+            payload.dxsMeta.push_back(delta->_nord);
+            payload.dxsMeta.push_back(static_cast<size_t>(delta->_mode));
+            payload.dxsMeta.push_back(delta->_ncoeff);
+            payload.knots.insert(
+                payload.knots.end(), delta->_knots.begin(),
+                delta->_knots.end());
+            payload.knotOffsets.push_back(payload.knots.size());
+
+            for (size_t i = 0; i < delta->_nord; ++i) {
+                const CrossSection& coefficient = delta->_u[i];
+                payload.xsMeta.push_back(coefficient._ngrp);
+                payload.xsMeta.push_back(coefficient._ndat);
+                payload.xsMeta.push_back(coefficient._nmem);
+                AppendFlat(payload.macroscopic, coefficient._macx);
+                AppendFlat(payload.lumped, coefficient._lmpx);
+                AppendFlat(payload.microscopic, coefficient._micx);
+            }
+        }
+        return payload;
+    }
+
+    static void SaveDeltaPayload(
+        HighFive::Group& group,
+        const std::vector<const DeltaCrossSection*>& deltas) {
+        DeltaPayload payload = PackDeltas(deltas);
+        group.createDataSet("num_entries", deltas.size());
+        group.createDataSet("dxs_meta", payload.dxsMeta);
+        group.createDataSet("knots_flat", payload.knots);
+        group.createDataSet("knots_offsets", payload.knotOffsets);
+        group.createDataSet("xs_meta", payload.xsMeta);
+        group.createDataSet("all_macx", payload.macroscopic);
+        group.createDataSet("all_lmpx", payload.lumped);
+        group.createDataSet("all_micx", payload.microscopic);
+    }
+
+    static void SaveBranchDelta(
+        HighFive::Group& parent, const std::string& name,
+        const BranchDelta& delta) {
+        auto                                  group = parent.createGroup(name);
+        std::vector<int>                      cTypes;
+        std::vector<int>                      burnups;
+        std::vector<const DeltaCrossSection*> entries;
+        std::vector<int>                      orderedTypes;
+        orderedTypes.reserve(delta.size());
+        for (const auto& [cType, burnupMap] : delta) {
+            (void)burnupMap;
+            orderedTypes.push_back(cType);
+        }
+        std::sort(orderedTypes.begin(), orderedTypes.end());
+        for (const int cType : orderedTypes) {
+            const auto& burnupMap = delta.at(cType);
+            for (const auto& [burnup, crossSection] : burnupMap) {
                 cTypes.push_back(cType);
-                burnups.push_back(bu);
-                indices_flat.insert(indices_flat.end(), idxVec.begin(), idxVec.end());
-                offsets.push_back(indices_flat.size());
+                burnups.push_back(burnup);
+                entries.push_back(&crossSection);
             }
         }
 
         group.createDataSet("cTypes", cTypes);
         group.createDataSet("burnups", burnups);
-        group.createDataSet("offsets", offsets);
-        group.createDataSet("indices_flat", indices_flat);
+        SaveDeltaPayload(group, entries);
     }
 
-    // Save BranchDelta as bulk flat arrays: DXS meta, knots, and concatenated XS coefficient data
-    static void SaveBranchDelta(HighFive::Group& parent, const std::string& name, const BranchDelta& delta) {
-        // Flatten: store keys as parallel arrays and all DeltaCrossSection data compactly.
-        // For each entry we store the DXS metadata + flattened coefficient XS data.
-        auto             group = parent.createGroup(name);
-        std::vector<int> cTypes, burnups;
-
-        struct DxsEntry {
-            int                      cType;
-            int                      burnup;
-            const DeltaCrossSection* dxs;
-        };
-        std::vector<DxsEntry> entries;
-
-        for (const auto& [cType, buMap] : delta) {
-            for (const auto& [bu, deltaXS] : buMap) {
-                entries.push_back({cType, bu, &deltaXS});
-            }
+    static void SaveBurnupDelta(
+        HighFive::Group& parent, const std::string& name,
+        const BurnupDelta& delta) {
+        auto                                  group = parent.createGroup(name);
+        std::vector<int>                      burnups;
+        std::vector<const DeltaCrossSection*> entries;
+        burnups.reserve(delta.size());
+        entries.reserve(delta.size());
+        for (const auto& [burnup, crossSection] : delta) {
+            burnups.push_back(burnup);
+            entries.push_back(&crossSection);
         }
 
-        size_t numEntries = entries.size();
-
-        // Per-entry metadata: {ngrp, nord, mode, ncoeff} as flat array of size numEntries*4
-        std::vector<size_t> dxs_meta;
-        dxs_meta.reserve(numEntries * 4);
-
-        // Per-entry knots: stored as flat array with offsets
-        std::vector<double> knots_flat;
-        std::vector<size_t> knots_offsets;
-        knots_offsets.push_back(0);
-
-        // Per-entry XS metadata: for each coefficient, {ngrp, ndat, nmem} stored flat
-        // Total coefficients across all entries
-        size_t totalCoeffs = 0;
-        for (const auto& entry : entries) {
-            totalCoeffs += entry.dxs->_nord;
-        }
-
-        // XS meta: totalCoeffs * 3 values
-        std::vector<size_t> xs_meta;
-        xs_meta.reserve(totalCoeffs * 3);
-
-        // Pass 1: compute total sizes for reserve (avoid reallocation)
-        size_t total_macx = 0, total_lmpx = 0, total_micx = 0, total_knots = 0;
-        for (const auto& entry : entries) {
-            const auto& dxs = *entry.dxs;
-            total_knots += dxs._knots.size();
-            for (size_t i = 0; i < dxs._nord; ++i) {
-                const CrossSection& xs = dxs._u[i];
-                total_macx += xs._macx.size();
-                total_lmpx += xs._lmpx.size();
-                total_micx += xs._micx.size();
-            }
-        }
-
-        std::vector<double> all_macx, all_lmpx, all_rmcx, all_micx;
-        all_macx.reserve(total_macx);
-        all_lmpx.reserve(total_lmpx);
-        all_micx.reserve(total_micx);
-        knots_flat.reserve(total_knots);
-
-        // Pass 2: fill metadata + append XS data directly from raw pointers (no toVector)
-        for (const auto& entry : entries) {
-            const auto& dxs = *entry.dxs;
-            cTypes.push_back(entry.cType);
-            burnups.push_back(entry.burnup);
-
-            dxs_meta.push_back(dxs._ngrp);
-            dxs_meta.push_back(dxs._nord);
-            dxs_meta.push_back(static_cast<size_t>(dxs._mode));
-            dxs_meta.push_back(dxs._ncoeff);
-
-            knots_flat.insert(knots_flat.end(), dxs._knots.begin(), dxs._knots.end());
-            knots_offsets.push_back(knots_flat.size());
-
-            for (size_t i = 0; i < dxs._nord; ++i) {
-                const CrossSection& xs = dxs._u[i];
-                xs_meta.push_back(xs._ngrp);
-                xs_meta.push_back(xs._ndat);
-                xs_meta.push_back(xs._nmem);
-
-                AppendFlat(all_macx, xs._macx);
-                AppendFlat(all_lmpx, xs._lmpx);
-                // rmcx is reconstructed at runtime in the SoA layer.
-                AppendFlat(all_micx, xs._micx);
-            }
-        }
-
-        group.createDataSet("num_entries", numEntries);
-        group.createDataSet("cTypes", cTypes);
         group.createDataSet("burnups", burnups);
-        group.createDataSet("dxs_meta", dxs_meta);
-        group.createDataSet("knots_flat", knots_flat);
-        group.createDataSet("knots_offsets", knots_offsets);
-        group.createDataSet("xs_meta", xs_meta);
-        group.createDataSet("all_macx", all_macx);
-        group.createDataSet("all_lmpx", all_lmpx);
-        group.createDataSet("all_rmcx", all_rmcx);
-        group.createDataSet("all_micx", all_micx);
+        SaveDeltaPayload(group, entries);
     }
 
-    static void SaveBranchCorrections(HighFive::Group& parent, const Model& model) {
-        auto group = parent.createGroup("branch_deltas");
+    static void SaveSpectralHistory(
+        HighFive::Group& parent,
+        const std::vector<SpectralHistoryCorrection>& corrections) {
+        auto group = parent.createGroup("spectral_history");
+        std::vector<size_t> isotopes;
+        std::vector<int>    coordinates;
+        std::vector<size_t> partners;
+        std::vector<int>    rodScaled;
+        isotopes.reserve(corrections.size());
+        coordinates.reserve(corrections.size());
+        partners.reserve(corrections.size());
+        rodScaled.reserve(corrections.size());
 
-        struct Entry {
-            BRANCHTYPE                 branch_type;
-            int                        kind;
-            int                        state_field;
-            const std::vector<size_t>* vector_isotopes;
-            const std::vector<int>*    vector_powers;
-            const BranchDelta*         delta;
-        };
-
-        std::vector<Entry> entries;
-        if (!model._bppm_delt.empty())
-            entries.push_back({BRANCHTYPE::BPPM, 0, 0, nullptr, nullptr, &model._bppm_delt});
-        if (!model._tful_delt.empty())
-            entries.push_back({BRANCHTYPE::TFUL, 0, 0, nullptr, nullptr, &model._tful_delt});
-        if (!model._tmod_delt.empty())
-            entries.push_back({BRANCHTYPE::TMOD, 0, 0, nullptr, nullptr, &model._tmod_delt});
-        if (!model._dmod_delt.empty())
-            entries.push_back({BRANCHTYPE::DMOD, 0, 0, nullptr, nullptr, &model._dmod_delt});
-
-        for (const auto& history : model._history_deltas) {
-            entries.push_back({history.branch_type, history.kind, history.state_field,
-                               &history.vector_isotopes, &history.vector_powers,
-                               &history.delta});
+        for (size_t i = 0; i < corrections.size(); ++i) {
+            isotopes.push_back(corrections[i].term.isotope);
+            partners.push_back(corrections[i].term.partner);
+            coordinates.push_back(
+                static_cast<int>(corrections[i].term.coordinate));
+            rodScaled.push_back(corrections[i].rod_scaled ? 1 : 0);
+            SaveBurnupDelta(
+                group, "term_" + std::to_string(i),
+                corrections[i].delta);
         }
-
-        std::vector<int>         branch_types, kinds, state_fields;
-        std::vector<std::string> component_names;
-        std::vector<size_t>      vector_isotopes_flat, vector_offsets;
-        std::vector<int>         vector_powers_flat;
-        vector_offsets.push_back(0);
-
-        branch_types.reserve(entries.size());
-        kinds.reserve(entries.size());
-        state_fields.reserve(entries.size());
-        component_names.reserve(entries.size());
-
-        for (const auto& entry : entries) {
-            branch_types.push_back(static_cast<int>(entry.branch_type));
-            kinds.push_back(entry.kind);
-            state_fields.push_back(entry.state_field);
-            component_names.emplace_back(
-                CorrectionComponentName(CorrectionComponentFromBranchAndKind(entry.branch_type, entry.kind)));
-            if (entry.vector_isotopes != nullptr) {
-                vector_isotopes_flat.insert(vector_isotopes_flat.end(),
-                                            entry.vector_isotopes->begin(), entry.vector_isotopes->end());
-            }
-            if (entry.vector_powers != nullptr) {
-                vector_powers_flat.insert(vector_powers_flat.end(),
-                                          entry.vector_powers->begin(), entry.vector_powers->end());
-            }
-            vector_offsets.push_back(vector_isotopes_flat.size());
-        }
-
-        group.createDataSet("num_branch_deltas", entries.size());
-        group.createDataSet("branch_types", branch_types);
-        group.createDataSet("kinds", kinds);
-        group.createDataSet("component_names", component_names);
-        group.createDataSet("state_fields", state_fields);
-        group.createDataSet("vector_isotopes_flat", vector_isotopes_flat);
-        group.createDataSet("vector_powers_flat", vector_powers_flat);
-        group.createDataSet("vector_offsets", vector_offsets);
-
-        for (size_t i = 0; i < entries.size(); ++i)
-            SaveBranchDelta(group, "delta_" + std::to_string(i), *entries[i].delta);
+        group.createDataSet("num_terms", corrections.size());
+        group.createDataSet("isotopes", isotopes);
+        group.createDataSet("coordinates", coordinates);
+        group.createDataSet("partners", partners);
+        group.createDataSet("rod_scaled", rodScaled);
     }
 };
 } // namespace Chiffon

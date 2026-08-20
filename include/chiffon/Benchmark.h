@@ -1,9 +1,11 @@
 #pragma once
 
+#include "Importer.h"
 #include "Model.h"
 #include <algorithm>
 #include <cctype>
-#include <format>
+#include "CompatFormat.h"
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -13,9 +15,6 @@ namespace Chiffon {
 
 class Benchmark {
 private:
-    static constexpr XSTYPE      fields[]     = {XSTF, XSDF, XSAF, XSNF, XSSF};
-    static constexpr const char* fieldNames[] = {"XSTF", "XSDF", "XSAF", "XSNF", "XSSF"};
-
     /// Reconstruct one XS value: lmpx + sum(micx * iden)
     static double Recon(const CrossSection& xs, const milk::Vector<double>& iden, int ig, XSTYPE xt) {
         double val = xs.lmpxs(ig, xt);
@@ -24,269 +23,170 @@ private:
         return val;
     }
 
-    static void PrintHeader(const char* refLabel, const char* cmpLabel) {
-        std::string hdr = std::format("{:<8} {:<8} {:<8} {:<8} {:<5} ", "BURN", "BPPM", "TFUL", "DMOD", "GRP");
-        for (const auto& name : fieldNames)
-            hdr += std::format("{:<11} {:<11} {:<11} ",
-                               std::format("{}({})", name, refLabel),
-                               std::format("{}({})", name, cmpLabel), "ERR(%)");
-        std::cout << hdr << "\n";
-    }
-
-    static std::string FormatRow(int bu, double bppm, double tful, double dmod, size_t ig,
-                                 auto getRef, auto getCmp) {
-        std::string out = std::format("{:<8} {:<8.1f} {:<8.1f} {:<8.6f} {:<5} ", bu, bppm, tful, dmod, ig);
-        for (auto xt : fields) {
-            double ref = getRef(ig, xt);
-            double cmp = getCmp(ig, xt);
-            double err = (std::abs(ref) > 1e-30) ? 100.0 * (cmp - ref) / ref : 0.0;
-            out += std::format("{:<11.4e} {:<11.4e} {:<11.4f} ", ref, cmp, err);
-        }
-        return out;
-    }
-
-    static std::string NormalizeName(std::string name) {
-        name.erase(std::remove_if(name.begin(), name.end(),
-                                  [](unsigned char c) { return std::isspace(c) || c == '-' || c == '_'; }),
-                   name.end());
-        std::transform(name.begin(), name.end(), name.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-        return name;
-    }
-
-    static const char* IsotopeName(size_t iso) {
-        return iso < isotopeIds.size() ? isotopeIds[iso] : "UNKNOWN";
-    }
-
-    static const char* XSTypeName(XSTYPE xsType) {
-        switch (xsType) {
-        case XSTF: return "XSTF";
-        case XSDF: return "XSDF";
-        case XSAF: return "XSAF";
-        case XSFF: return "XSFF";
-        case XSNF: return "XSNF";
-        case XSKF: return "XSKF";
-        case XSSF: return "XSSF";
-        case XSRF: return "XSRF";
-        case XS2N: return "XS2N";
-        case XS3N: return "XS3N";
-        default: return "UNKNOWN";
-        }
-    }
-
-    /// Sweep one branch variable and print self-check rows.
-    static void SweepBranch(const Model& model, BRANCHTYPE btyp, AssemblyDataIndex adIdx,
-                            double step, double baseBppm, double baseTful, double baseDmod, size_t ngrp) {
-        for (size_t ig = 0; ig < ngrp; ++ig) {
-            for (const auto& [crType, buMap] : model.GetBranch(btyp)) {
-                for (const auto& [bu, idxList] : buMap) {
-                    std::vector<double> vals;
-                    for (auto idx : idxList)
-                        vals.push_back(model.GetDepletionPoint(idx)._data[adIdx]);
-                    std::sort(vals.begin(), vals.end());
-                    for (double v = vals.front(); v <= vals.back(); v += step) {
-                        double bppm = baseBppm, tful = baseTful, dmod = baseDmod;
-                        if (btyp == BPPM)
-                            bppm = v;
-                        else if (btyp == TFUL)
-                            tful = v;
-                        else if (btyp == DMOD)
-                            dmod = v;
-                        milk::Vector<double> iden;
-                        auto                 xs = model.GetCrossSection(crType, bu, bppm, tful, dmod, &iden);
-                        std::cout << FormatRow(bu, bppm, tful, dmod, ig, [&](int g, XSTYPE t) { return xs.maxs(g, t); }, [&](int g, XSTYPE t) { return Recon(xs, iden, g, t); }) << "\n";
-                    }
-                }
-            }
-        }
-    }
-
-    /// Print validation rows for one branch type.
-    static void ValidateBranch(const Model& fine, const Model& coarse, BRANCHTYPE btyp, size_t ngrp,
-                               bool compact) {
-        for (size_t ig = 0; ig < ngrp; ++ig) {
-            for (const auto& branchEntry : fine.GetBranch(btyp)) {
-                const int   cr    = branchEntry.first;
-                const auto& buMap = branchEntry.second;
-                if (compact && !buMap.empty()) {
-                    const int edgeCount = buMap.size() > 1 ? 2 : 1;
-                    for (int edge = 0; edge < edgeCount; ++edge) {
-                        const auto buIt = edge == 0 ? buMap.begin() : std::prev(buMap.end());
-                        for (auto idx : buIt->second) {
-                            const auto&          dpt = fine.GetDepletionPoint(idx);
-                            milk::Vector<double> ciden;
-                            auto                 cxs = coarse.GetCrossSection(cr, buIt->first,
-                                                                              dpt._data[AD_BPPM], dpt._data[AD_TFUL],
-                                                                              dpt._data[AD_DMOD], &ciden);
-                            std::cout << FormatRow(buIt->first, dpt._data[AD_BPPM], dpt._data[AD_TFUL], dpt._data[AD_DMOD], ig, [&](int g, XSTYPE t) { return dpt._xs.maxs(g, t); }, [&](int g, XSTYPE t) { return Recon(cxs, ciden, g, t); }) << "\n";
-                        }
-                    }
-                    continue;
-                }
-                for (const auto& [bu, idxList] : buMap) {
-                    for (auto idx : idxList) {
-                        const auto&          dpt = fine.GetDepletionPoint(idx);
-                        milk::Vector<double> ciden;
-                        auto                 cxs = coarse.GetCrossSection(cr, bu,
-                                                                          dpt._data[AD_BPPM], dpt._data[AD_TFUL], dpt._data[AD_DMOD], &ciden);
-                        std::cout << FormatRow(bu, dpt._data[AD_BPPM], dpt._data[AD_TFUL], dpt._data[AD_DMOD], ig, [&](int g, XSTYPE t) { return dpt._xs.maxs(g, t); }, [&](int g, XSTYPE t) { return Recon(cxs, ciden, g, t); }) << "\n";
-                    }
-                }
-            }
-        }
-    }
-
 public:
-    struct ExtraIsotopeXSDumpSpec {
-        bool                apply = false;
-        std::string         fuel;
-        size_t              isotope           = 0;
-        int                 ctype             = 0;
-        int                 burnup            = 0;
-        int                 burnup_tolerance  = 0;
-        int                 group             = -1;
-        double              reference_density = std::numeric_limits<double>::quiet_NaN();
-        std::vector<XSTYPE> xs_types          = {XSAF};
-    };
+    // Offline statistics export (friend of Importer): load each HGC with the production
+    // loader, reconstruct its rod-material fluence, and write ONE CSV row per depletion
+    // point with the perturbation tag (file stem), state scalars, rod coordinates, and all
+    // node-average isotope densities. Used by the isotope correlation / VIF study; keeps the
+    // main classes free of any export code. ZZAAAM isotope IDs are the density column names.
+    static void DumpIsotopeStates(const std::vector<std::string>& hgcPaths,
+                                  const std::string&              outCsv) {
+        std::ofstream os(outCsv);
+        if (!os) {
+            std::cerr << "[isodump] cannot open " << outCsv << std::endl;
+            return;
+        }
+        os << "tag,ctype,btyp,traj_ctyp,traj_ref,burnup,pden,tmod,tful,dmod,bppm,keff,kinf,"
+           << "tot_flux,rod_fluence,fuel_rod_fluence,macro_abs_rate";
+        for (size_t iso = 0; iso < niso; ++iso)  // node-average isotope densities
+            os << "," << Isotope::isotopeIds[iso];
+        for (size_t iso = 0; iso < niso; ++iso)  // 1-group flux-weighted absorption CONTRIBUTION n*sigma_a
+            os << ",ac_" << Isotope::isotopeIds[iso];
+        os << "\n";
+        os << std::scientific;
 
-    static XSTYPE ParseXSTypeName(const std::string& name, XSTYPE fallback = XSAF) {
-        const std::string key = NormalizeName(name);
-        if (key == "XSTF" || key == "TRANSPORT") return XSTF;
-        if (key == "XSDF" || key == "DIFFUSION" || key == "D") return XSDF;
-        if (key == "XSAF" || key == "ABSORPTION" || key == "ABS") return XSAF;
-        if (key == "XSFF" || key == "FISSION" || key == "FIS") return XSFF;
-        if (key == "XSNF" || key == "NUFISSION" || key == "NUFIS") return XSNF;
-        if (key == "XSKF" || key == "KAPPAFISSION" || key == "KAPPAFIS") return XSKF;
-        if (key == "XSSF" || key == "SCATTER" || key == "SCATTERING") return XSSF;
-        if (key == "XSRF" || key == "REMOVAL") return XSRF;
-        if (key == "XS2N" || key == "N2N") return XS2N;
-        if (key == "XS3N" || key == "N3N") return XS3N;
-        return fallback;
+        for (const std::string& path : hgcPaths) {
+            std::string stem = path;
+            if (auto s = stem.find_last_of("/\\"); s != std::string::npos) stem = stem.substr(s + 1);
+            if (auto d = stem.rfind("_0101.HGC"); d != std::string::npos) stem = stem.substr(0, d);
+
+            Importer imp;
+            Model    m("isodump");
+            try {
+                imp.ReadHGC(m, path);
+            } catch (const std::exception& e) {
+                std::cerr << "[isodump][skip] " << stem << " : " << e.what() << std::endl;
+                continue;
+            }
+            const std::map<int, double> fluence = Importer::ReconstructFluenceFromHGC(m);
+
+            for (const DepletionPoint& dpt : m.Dpts()) {
+                if (!dpt._xs.has_micx())
+                    continue;
+                double totFlux = 0.0;
+                for (double f : dpt._aflx) totFlux += f;
+                // node-average macroscopic absorption reaction rate sum_g (Sigma_a,g * phi_g),
+                // reconstructed from micro XS x densities (an explicit rod-history exposure axis).
+                double macroAbs = 0.0;
+                for (size_t ig = 0; ig < dpt._ngrp; ++ig) {
+                    const double phi = ig < dpt._aflx.size() ? dpt._aflx[ig] : 0.0;
+                    macroAbs += Recon(dpt._xs, dpt._iden, static_cast<int>(ig), XSAF) * phi;
+                }
+                const double rodFlu = Importer::InterpolateRodFluence(dpt, fluence);
+                os << stem << "," << dpt._ctyp << "," << static_cast<int>(dpt._btyp) << ","
+                   << dpt._trajectory_ctyp << "," << (dpt._trajectory_reference ? 1 : 0) << ","
+                   << dpt._data[AD_BURN] << "," << dpt._data[AD_PDEN] << "," << dpt._data[AD_TMOD] << ","
+                   << dpt._data[AD_TFUL] << "," << dpt._data[AD_DMOD] << "," << dpt._data[AD_BPPM] << ","
+                   << dpt._data[AD_KEFF] << "," << dpt._data[AD_KINF] << "," << totFlux << ","
+                   << rodFlu << "," << dpt._fuel_rod_fluence << "," << macroAbs;
+                for (size_t iso = 0; iso < niso; ++iso)
+                    os << "," << dpt._iden[iso];
+                // per-isotope 1-group flux-weighted absorption contribution c_i = n_i * <sigma_a,i>_phi,
+                // i.e. each isotope's share of the macroscopic absorption (reactivity-weighted importance).
+                for (size_t iso = 0; iso < niso; ++iso) {
+                    double num = 0.0, den = 0.0;
+                    for (size_t ig = 0; ig < dpt._ngrp; ++ig) {
+                        const double phi = ig < dpt._aflx.size() ? dpt._aflx[ig] : 0.0;
+                        num += dpt._xs.mixs(static_cast<int>(iso), static_cast<int>(ig), XSAF) * phi;
+                        den += phi;
+                    }
+                    os << "," << (den > 0.0 ? dpt._iden[iso] * num / den : 0.0);
+                }
+                os << "\n";
+            }
+            os.flush();
+            std::cout << "[isodump] " << stem << "  (" << m.Dpts().size() << " pts)" << std::endl;
+        }
+        std::cout << "[isodump] wrote " << outCsv << std::endl;
     }
 
-    static void DumpExtraIsotopeXS(const Model& model, const ExtraIsotopeXSDumpSpec& spec) {
-        if (!spec.apply)
-            return;
-        if (spec.isotope >= niso) {
-            std::cout << "[Benchmark][extra isotope xs] skip: isotope index out of range\n";
-            return;
-        }
-        if (model.SpctDpts().empty()) {
-            std::cout << std::format("[Benchmark][extra isotope xs] model={} has no extra depletion points\n",
-                                     model.name());
-            return;
-        }
-
-        CrossSection                refXs;
-        milk::Vector<double>        refIden;
-        std::array<double, AD_SIZE> refData = {};
-        std::vector<double>         refFlux;
-        try {
-            model.FillReferenceState(refXs, refIden, refData, &refFlux, spec.ctype, spec.burnup);
-        } catch (const std::exception& e) {
-            std::cout << std::format("[Benchmark][extra isotope xs] model={} reference lookup failed: {}\n",
-                                     model.name(), e.what());
+    /// Tidy CSV dump for interpolation-validation plots at burnup 0, control type 0.
+    /// For each branch axis (BPPM / TFUL / DMOD) three series are written:
+    ///   source=fine   : dense reference branch points  (the "truth")
+    ///   source=coarse : sparse branch points used for the fit (the fit nodes)
+    ///   source=interp : coarse.GetCrossSection() swept across the axis (CHIFFON interpolation)
+    /// Columns: branch,source,group,xval,xstype,value  (value = macroscopic XS).
+    /// NOTE: TMOD is intentionally absent - the test assemblies carry no TMOD branch and
+    /// GetCrossSection() does not interpolate a moderator-temperature axis (only BPPM/TFUL/DMOD).
+    static void ValidateCSV(const Model& fine, const Model& coarse, const std::string& outPath) {
+        std::ofstream os(outPath);
+        if (!os) {
+            std::cerr << "[validate] cannot open " << outPath << "\n";
             return;
         }
+        os << "branch,source,group,xval,xstype,value\n";
+        os << std::scientific;
 
-        const double refDensity   = std::isfinite(spec.reference_density)
-                                        ? spec.reference_density
-                                        : refIden[spec.isotope];
-        const int    firstGroup   = spec.group >= 0 ? spec.group : 0;
-        const int    lastGroup    = spec.group >= 0 ? spec.group + 1 : static_cast<int>(refXs.ngrp());
-        const double densityDenom = std::abs(refDensity) + 1.0e-30;
+        const size_t NGRP  = coarse.GetDepletionPoint(0, 0)._ngrp;
+        const auto&  refC  = coarse.GetDepletionPoint(0, 0);
+        const double bppm0 = refC._data[AD_BPPM];
+        const double tful0 = refC._data[AD_TFUL];
+        const double dmod0 = refC._data[AD_DMOD];
 
-        std::cout << std::format(
-            "[Benchmark][extra isotope xs] model={} isotope={}({}) ctype={} reference_burnup={} reference_density={:.8e}\n",
-            model.name(), IsotopeName(spec.isotope), spec.isotope, spec.ctype, spec.burnup, refDensity);
-        std::cout << "model,source,ctype,burnup,group,xs_type,isotope,isotope_index,"
-                     "reference_burnup,reference_density,density,delta_density,relative_delta_density,"
-                     "extra_macro_xs,ref_macro_xs,delta_macro_xs,extra_micro_xs,ref_micro_xs,delta_micro_xs\n";
+        const XSTYPE      xss[] = {XSAF, XSNF, XSSF};
+        const char* const xsn[] = {"XSAF", "XSNF", "XSSF"};
 
-        int printed = 0;
-        for (const auto& dpt : model.SpctDpts()) {
-            if (dpt._btyp != REFR || dpt._ctyp != spec.ctype)
-                continue;
-            const int bu = dpt.burnKey();
-            if (std::abs(bu - spec.burnup) > spec.burnup_tolerance)
-                continue;
-            if (dpt._iden.size() <= spec.isotope)
-                continue;
+        struct Axis {
+            BRANCHTYPE        btyp;
+            AssemblyDataIndex ad;
+            const char*       name;
+        };
+        const Axis axes[] = {{BPPM, AD_BPPM, "BPPM"}, {TFUL, AD_TFUL, "TFUL"}, {DMOD, AD_DMOD, "DMOD"}};
 
-            const double density      = dpt._iden[spec.isotope];
-            const double deltaDensity = density - refDensity;
-            const double relDensity   = deltaDensity / densityDenom;
+        auto emit = [&](const char* branch, const char* src, double xval, const CrossSection& xs) {
+            for (size_t ig = 0; ig < NGRP; ++ig)
+                for (int k = 0; k < 3; ++k)
+                    os << branch << ',' << src << ',' << ig << ',' << xval << ','
+                       << xsn[k] << ',' << xs.maxs(static_cast<int>(ig), xss[k]) << '\n';
+        };
 
-            for (int ig = firstGroup; ig < lastGroup; ++ig) {
-                if (ig < 0 || ig >= static_cast<int>(dpt._xs.ngrp()))
-                    continue;
-                for (XSTYPE xsType : spec.xs_types) {
-                    const double extraMacro = dpt._xs.maxs(ig, xsType);
-                    const double refMacro   = refXs.maxs(ig, xsType);
-                    const double extraMicro = dpt._xs.has_micx()
-                                                  ? dpt._xs.mixs(static_cast<int>(spec.isotope), ig, xsType)
-                                                  : std::numeric_limits<double>::quiet_NaN();
-                    const double refMicro   = refXs.has_micx()
-                                                  ? refXs.mixs(static_cast<int>(spec.isotope), ig, xsType)
-                                                  : std::numeric_limits<double>::quiet_NaN();
-                    std::cout << std::format(
-                        "{},{},{},{},{},{},{},{},{},{:.8e},{:.8e},{:.8e},{:.8e},"
-                        "{:.8e},{:.8e},{:.8e},{:.8e},{:.8e},{:.8e}\n",
-                        model.name(), "extra", dpt._ctyp, bu, ig, XSTypeName(xsType),
-                        IsotopeName(spec.isotope), spec.isotope, spec.burnup,
-                        refDensity, density, deltaDensity, relDensity,
-                        extraMacro, refMacro, extraMacro - refMacro,
-                        extraMicro, refMicro, extraMicro - refMicro);
-                    ++printed;
+        const std::pair<const Model*, const char*> srcs[] = {{&fine, "fine"}, {&coarse, "coarse"}};
+
+        for (const Axis& ax : axes) {
+            // fine + coarse branch nodes at control type 0, burnup key 0 (plus the reference node).
+            for (const auto& [mp, src] : srcs) {
+                const Model& m   = *mp;
+                const auto&  ref = m.GetDepletionPoint(0, 0);
+                emit(ax.name, src, ref._data[ax.ad], ref._xs);
+                const auto& br    = m.GetBranch(ax.btyp);
+                const auto  brIt  = br.find(0);
+                if (brIt == br.end()) continue;
+                const auto buIt = brIt->second.find(0);
+                if (buIt == brIt->second.end()) continue;
+                for (size_t idx : buIt->second) {
+                    const auto& dpt = m.GetDepletionPoint(idx);
+                    emit(ax.name, src, dpt._data[ax.ad], dpt._xs);
                 }
             }
-        }
 
-        if (printed == 0) {
-            std::cout << std::format(
-                "[Benchmark][extra isotope xs] no matching extra points: model={} ctype={} burnup={} tolerance={}\n",
-                model.name(), spec.ctype, spec.burnup, spec.burnup_tolerance);
-        }
-    }
-
-    /// Self-check: macx (original) vs lmpx+micx*iden (reconstructed from interpolation)
-    static void Verificate(const Model& model, int cType = 0) {
-        std::cout << " [Benchmark] Model Interpolation Verification \n";
-
-        const size_t NGRP  = model.GetDepletionPoint(0, 0)._ngrp;
-        const double bppm0 = model.GetDepletionPoint(0, 0)._data[AD_BPPM];
-        const double tful0 = model.GetDepletionPoint(0, 0)._data[AD_TFUL];
-        const double dmod0 = model.GetDepletionPoint(0, 0)._data[AD_DMOD];
-
-        PrintHeader("MAC", "REC");
-
-        // Burnup sweep
-        for (size_t ig = 0; ig < NGRP; ++ig) {
-            for (int bu = 0; bu < 60000; bu += 500) {
-                milk::Vector<double> iden;
-                auto                 xs = model.GetCrossSection(cType, bu, bppm0, tful0, dmod0, &iden);
-                std::cout << FormatRow(bu, bppm0, tful0, dmod0, ig, [&](int g, XSTYPE t) { return xs.maxs(g, t); }, [&](int g, XSTYPE t) { return Recon(xs, iden, g, t); }) << "\n";
+            // interp sweep: vary this axis across the fine range, hold the others at reference.
+            double      lo   = refC._data[ax.ad];
+            double      hi   = refC._data[ax.ad];
+            const auto& fbr  = fine.GetBranch(ax.btyp);
+            const auto  fbIt = fbr.find(0);
+            if (fbIt != fbr.end()) {
+                const auto buIt = fbIt->second.find(0);
+                if (buIt != fbIt->second.end())
+                    for (size_t idx : buIt->second) {
+                        const double v = fine.GetDepletionPoint(idx)._data[ax.ad];
+                        lo             = std::min(lo, v);
+                        hi             = std::max(hi, v);
+                    }
+            }
+            const int N = 81;
+            for (int i = 0; i < N; ++i) {
+                const double xval = (hi > lo) ? lo + (hi - lo) * i / (N - 1) : lo;
+                double       bppm = bppm0, tful = tful0, dmod = dmod0;
+                if (ax.btyp == BPPM)
+                    bppm = xval;
+                else if (ax.btyp == TFUL)
+                    tful = xval;
+                else
+                    dmod = xval;
+                emit(ax.name, "interp", xval, coarse.GetCrossSection(0, 0, bppm, tful, dmod));
             }
         }
-
-        SweepBranch(model, BRANCHTYPE::BPPM, AD_BPPM, 100.0, bppm0, tful0, dmod0, NGRP);
-        SweepBranch(model, BRANCHTYPE::TFUL, AD_TFUL, 100.0, bppm0, tful0, dmod0, NGRP);
-        SweepBranch(model, BRANCHTYPE::DMOD, AD_DMOD, 0.05, bppm0, tful0, dmod0, NGRP);
-    }
-
-    /// Cross-model: fine macx vs coarse reconstructed
-    static void Validate(const Model& fine, const Model& coarse, bool compact = false) {
-        std::cout << " [Benchmark] Model Interpolation Validation \n";
-
-        const size_t NGRP = coarse.GetDepletionPoint(0, 0)._ngrp;
-        PrintHeader("fine", "cors");
-
-        std::cout << "================ BPPM VALIDATION ================\n";
-        ValidateBranch(fine, coarse, BPPM, NGRP, compact);
-        std::cout << "================ TFUEL VALIDATION ================\n";
-        ValidateBranch(fine, coarse, TFUL, NGRP, compact);
-        std::cout << "================ DMOD VALIDATION ================\n";
-        ValidateBranch(fine, coarse, DMOD, NGRP, compact);
+        std::cout << "[validate] wrote " << outPath << " (NGRP=" << NGRP << ")\n";
     }
 };
 } // namespace Chiffon
