@@ -1,9 +1,42 @@
 #include "BICGCMFD.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+
 #define flux(ig, l)  (flux[(l) * _g.ng() + ig])
 #define aflux(ig, l) (aflux[(l) * _g.ng() + ig])
 
 using namespace rasbery;
+
+namespace {
+// Capture for the device-sweep port (RASBERY_CMFD_DUMP=<prefix>): the first
+// post-warmup drive() call's entry state plus a record after every sweep.
+// The offline form probe replays these to mine the contraction forms gcc
+// actually emitted for wiel/updls -- same methodology, same reason as
+// RASBERY_XSRECON_DUMP (quoting source does not pin contraction).
+struct CmfdDump {
+    std::FILE* f       = nullptr;
+    bool       armed   = false;
+    bool       done    = false;
+    CmfdDump() {
+        armed = std::getenv("RASBERY_CMFD_DUMP") != nullptr;
+    }
+    void openEntry() {
+        const char* p = std::getenv("RASBERY_CMFD_DUMP");
+        f             = std::fopen((std::string(p) + ".cmfd").c_str(), "wb");
+    }
+    void write(const double* p, size_t n) {
+        if (f) std::fwrite(p, sizeof(double), n, f);
+    }
+    void close() {
+        if (f) std::fclose(f);
+        f    = nullptr;
+        done = true;
+    }
+};
+CmfdDump g_cmfd_dump;
+} // namespace
 
 BICGCMFD::BICGCMFD(Geometry& g, XSSet& x)
     : CMFD(g, x),
@@ -191,6 +224,33 @@ void BICGCMFD::drive(double& eigv, double* flux, double& errl2) {
 
     if (_eshift != 0.0) reigvs = 1. / (eigv + _eshift);
 
+    // One-shot capture of the first fully post-warmup drive (every sweep in
+    // the Wielandt regime), for the offline form probe.
+    const bool cap = g_cmfd_dump.armed && !g_cmfd_dump.done &&
+                     (_wiel_sweep >= WIELANDT_WARMUP_SWEEPS);
+    if (cap) {
+        g_cmfd_dump.openEntry();
+        const double hdr[8] = {static_cast<double>(_g.ng()), static_cast<double>(_g.nxyz()),
+                               static_cast<double>(_g.ng2()), static_cast<double>(_ncmfd),
+                               eigv, reigvs, _eshift, _epsl2};
+        g_cmfd_dump.write(hdr, 8);
+        g_cmfd_dump.write(_psi, static_cast<size_t>(_g.nxyz()));
+        g_cmfd_dump.write(_udiag.data(), static_cast<size_t>(_g.ng2()) * _g.nxyz());
+        std::vector<double> chif_mat(static_cast<size_t>(_g.ng()) * _g.nxyz());
+        std::vector<double> xsnf_mat(static_cast<size_t>(_g.ng()) * _g.nxyz());
+        std::vector<double> vol_mat(static_cast<size_t>(_g.nxyz()));
+        for (int l = 0; l < _g.nxyz(); ++l) {
+            vol_mat[static_cast<size_t>(l)] = _g.vol(l);
+            for (int ig = 0; ig < _g.ng(); ++ig) {
+                chif_mat[static_cast<size_t>(ig) * _g.nxyz() + l] = _x.chif(ig, l);
+                xsnf_mat[static_cast<size_t>(ig) * _g.nxyz() + l] = _x.xsnf(ig, l);
+            }
+        }
+        g_cmfd_dump.write(chif_mat.data(), chif_mat.size());
+        g_cmfd_dump.write(xsnf_mat.data(), xsnf_mat.size());
+        g_cmfd_dump.write(vol_mat.data(), vol_mat.size());
+    }
+
     int negative = 0;
     int iout     = 0;
     for (; iout < _ncmfd; ++iout) {
@@ -246,6 +306,15 @@ void BICGCMFD::drive(double& eigv, double* flux, double& errl2) {
         // The CPU Wielandt/nodal stages observe it once at this boundary.
         _ls->synchronizeCudaFlux(flux);
 
+        if (cap) {
+            // Everything the wiel/updls of THIS sweep consumes, before it runs.
+            const double pre[4] = {reigv, reigvs, eigv,
+                                   static_cast<double>(_wiel_sweep - WIELANDT_WARMUP_SWEEPS)};
+            g_cmfd_dump.write(pre, 4);
+            g_cmfd_dump.write(flux, static_cast<size_t>(_g.ng()) * _g.nxyz());
+            g_cmfd_dump.write(_psi, static_cast<size_t>(_g.nxyz()));
+        }
+
         // wielandt shift
         wiel(_wiel_sweep - WIELANDT_WARMUP_SWEEPS, flux, reigvs, eigv, reigv, errl2);
 
@@ -273,8 +342,18 @@ void BICGCMFD::drive(double& eigv, double* flux, double& errl2) {
 
         PLOG(plog::debug) << "IOUT : " << iter << ", EIGV : " << eigv << ", ERRL2 : " << errl2 << ", NEGATIVE : " << negative;
 
+        if (cap) {
+            // Everything this sweep produced.
+            const double post[5] = {eigv, reigv, reigvs, errl2,
+                                    static_cast<double>(negative)};
+            g_cmfd_dump.write(post, 5);
+            g_cmfd_dump.write(_psi, static_cast<size_t>(_g.nxyz()));
+            g_cmfd_dump.write(_diag, static_cast<size_t>(_g.ng2()) * _g.nxyz());
+        }
+
         if (errl2 < _epsl2) break;
     }
+    if (cap) g_cmfd_dump.close();
 }
 
 void BICGCMFD::resetIteration() {
