@@ -45,21 +45,24 @@ def main():
     ref = ref[:n]
     pred = pred[:n]
 
-    rel = [(p - r) / r * 1.0e5 for p, r in zip(pred, ref)]
+    # The project comparison convention is signed absolute delta-k in pcm:
+    #     delta_k_pcm = (k_calc - k_reference) * 1e5
+    # Keep relative delta-k/k only as a secondary diagnostic.
     raw = [(p - r) * 1.0e5 for p, r in zip(pred, ref)]
+    rel = [(p - r) / r * 1.0e5 for p, r in zip(pred, ref)]
     rho = [(p - r) / (p * r) * 1.0e5 for p, r in zip(pred, ref)]
 
     title = f"{args.label} " if args.label else ""
     print(f"{title}n={n}")
     for name, values in [
-        ("delta_k_over_k_ref_x1e5", rel),
-        ("delta_k_x1e5", raw),
+        ("delta_k_pcm", raw),
+        ("relative_delta_k_over_k_ref_x1e5_secondary", rel),
         ("reactivity_pcm", rho),
     ]:
         bias, rms, max_abs = stats(values)
         print(f"  {name}: bias={bias:+.1f} RMS={rms:.1f} max={max_abs:.1f}")
-    print("  burnup,ref,calc,delta_k_over_k_ref_x1e5")
-    for bu, r, p, e in zip(burns, ref, pred, rel):
+    print("  burnup,ref,calc,delta_k_pcm")
+    for bu, r, p, e in zip(burns, ref, pred, raw):
         print(f"  {bu:g},{r:.6f},{p:.6f},{e:+.1f}")
 
 

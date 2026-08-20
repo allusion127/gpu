@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# rasberry-masi -- run a MASTER card deck through RASBERY in one step.
+#
+#   rasberry-masi deck.inp --xs lib.h5 -o out.h5 [--fold quarter] [--tfuel 900]
+#
+# Translates the deck with tools/master2rasi.py and hands the resulting case
+# JSON to the RASBERY binary.  The deck is never modified: everything RASBERY
+# needs that a MASTER card cannot express is passed on the command line (or read
+# from "!RASI ..." comment lines, which MASTER itself discards as comments).
+#
+# Environment:
+#   RASBERY_BIN     path to the RASBERY executable (default: search the repo)
+#   MASI_PYTHON     python interpreter (default: python3; h5py enables
+#                   cross-section model-name verification)
+#   RASBERY_OMP_THREADS   thread count passed through to RASBERY
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo="$(dirname "$here")"
+python_bin="${MASI_PYTHON:-python3}"
+
+usage() {
+    sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    cat <<'EOF'
+
+Options
+  --xs FILE          CHIFFON cross-section library (.h5)          [required]
+  -o, --output FILE  RASBERY output HDF5                          [required]
+  --fold MODE        none | quarter                               [none]
+  --tfuel K          fixed fuel temperature, K
+  --json FILE        keep the generated case JSON here
+                     (default: alongside the output, <output>.case.json)
+  --check            run the compatibility report only, then exit
+  --dry-run          translate but do not run RASBERY
+  --allow-assumptions
+                     accept a translation that needed a physical default the
+                     deck does not state (without it, master2rasi exits 3 and
+                     this wrapper stops before the solve)
+  --                 pass every remaining argument to master2rasi.py
+
+Exit codes (propagated from master2rasi.py)
+  0  translated (and, unless --dry-run, solved)
+  1  the deck was refused
+  2  wrapper usage error
+  3  translated, but only by assuming something the deck does not state
+EOF
+}
+
+deck="" ; xs="" ; out="" ; fold="" ; tfuel="" ; json="" ; check=0 ; dry=0
+allow_assume=0
+extra=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --xs)      xs="$2"; shift 2 ;;
+        -o|--output) out="$2"; shift 2 ;;
+        --fold)    fold="$2"; shift 2 ;;
+        --tfuel)   tfuel="$2"; shift 2 ;;
+        --json)    json="$2"; shift 2 ;;
+        --check)   check=1; shift ;;
+        --dry-run) dry=1; shift ;;
+        --allow-assumptions) allow_assume=1; shift ;;
+        --)        shift; extra+=("$@"); break ;;
+        -*)        echo "rasberry-masi: unknown option '$1' (use -- to forward options)" >&2
+                   exit 2 ;;
+        *)         if [[ -z "$deck" ]]; then deck="$1"; else
+                       echo "rasberry-masi: unexpected argument '$1'" >&2; exit 2
+                   fi
+                   shift ;;
+    esac
+done
+
+[[ -n "$deck" ]] || { usage >&2; exit 2; }
+[[ -f "$deck" ]] || { echo "rasberry-masi: no such deck: $deck" >&2; exit 2; }
+
+conv=("$python_bin" "$here/master2rasi.py" "$deck")
+[[ -n "$xs"    ]] && conv+=(--xs "$(cd "$(dirname "$xs")" && pwd)/$(basename "$xs")")
+[[ -n "$fold"  ]] && conv+=(--fold "$fold")
+[[ -n "$tfuel" ]] && conv+=(--tfuel "$tfuel")
+(( allow_assume )) && conv+=(--allow-assumptions)
+((${#extra[@]})) && conv+=("${extra[@]}")
+
+# --- compatibility report only -------------------------------------------
+if (( check )); then
+    exec "${conv[@]}" --check
+fi
+
+[[ -n "$out" ]] || { echo "rasberry-masi: -o/--output is required" >&2; exit 2; }
+[[ -n "$json" ]] || json="${out%.h5}.case.json"
+
+# --- locate RASBERY -------------------------------------------------------
+bin="${RASBERY_BIN:-}"
+if [[ -z "$bin" ]]; then
+    for cand in "$repo/build-nocuda/RASBERY" "$repo/build/RASBERY" \
+                "$repo/build-Release/RASBERY"; do
+        [[ -x "$cand" ]] && { bin="$cand"; break; }
+    done
+fi
+if (( ! dry )) && [[ -z "$bin" || ! -x "$bin" ]]; then
+    echo "rasberry-masi: RASBERY binary not found; set RASBERY_BIN" >&2
+    exit 2
+fi
+
+# --- translate ------------------------------------------------------------
+echo "[rasberry-masi] translating $deck -> $json"
+# `set -e` would abort here with the translator's status, but silently: exit 3
+# ("translated only by assuming X") needs its own explanation, and it must not
+# be mistaken for a clean run by a caller that only checks for non-zero.
+conv_rc=0
+"${conv[@]}" -o "$json" || conv_rc=$?
+if (( conv_rc != 0 )); then
+    if (( conv_rc == 3 )); then
+        echo "rasberry-masi: the translation needed assumption(s) the deck does not" >&2
+        echo "               state (listed above).  The case JSON was written to"     >&2
+        echo "               $json, but the solve is not run until you accept them"   >&2
+        echo "               with --allow-assumptions."                               >&2
+    fi
+    exit "$conv_rc"
+fi
+
+if (( dry )); then
+    echo "[rasberry-masi] --dry-run: stopping before the solve"
+    exit 0
+fi
+
+# --- run ------------------------------------------------------------------
+# RASBERY re-execs itself to set these before libgomp starts; setting them here
+# avoids the re-exec and is required for sane CPU scaling.
+export OMP_WAIT_POLICY="${OMP_WAIT_POLICY:-PASSIVE}"
+export GOMP_SPINCOUNT="${GOMP_SPINCOUNT:-0}"
+
+json_abs="$(cd "$(dirname "$json")" && pwd)/$(basename "$json")"
+out_dir="$(dirname "$out")"; mkdir -p "$out_dir"
+out_abs="$(cd "$out_dir" && pwd)/$(basename "$out")"
+
+echo "[rasberry-masi] running $bin"
+exec "$bin" --rasi "$json_abs" --raso "$out_abs"
