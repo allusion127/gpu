@@ -1,0 +1,111 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "RASBERY: configure",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "-S", "${workspaceFolder}",
+                "-B", "${workspaceFolder}/build-Debug",
+                "-G", "Ninja",
+                "-DCMAKE_BUILD_TYPE=Debug",
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "RASBERY: build",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/build-Debug",
+                "--target",
+                "RASBERY"
+            ],
+            "dependsOn": [
+                "RASBERY: configure"
+            ],
+            "dependsOrder": "sequence",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        },
+        {
+            "label": "RASBERY: configure (Release)",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "-S", "${workspaceFolder}",
+                "-B", "${workspaceFolder}/build-Release",
+                "-G", "Ninja",
+                "-DCMAKE_BUILD_TYPE=Release",
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "RASBERY: build (Release)",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/build-Release",
+                "--target",
+                "RASBERY"
+            ],
+            "dependsOn": [
+                "RASBERY: configure (Release)"
+            ],
+            "dependsOrder": "sequence",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ]
+        },
+        {
+            "label": "RASBERY: run",
+            "type": "shell",
+            "command": "${workspaceFolder}/build-Debug/RASBERY",
+            "args": [],
+            "dependsOn": [
+                "RASBERY: build"
+            ],
+            "dependsOrder": "sequence",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "RASBERY: run (Release)",
+            "type": "shell",
+            "command": "${workspaceFolder}/build-Release/RASBERY",
+            "args": [],
+            "dependsOn": [
+                "RASBERY: build (Release)"
+            ],
+            "dependsOrder": "sequence",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        }
+    ]
+}

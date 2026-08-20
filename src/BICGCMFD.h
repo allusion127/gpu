@@ -19,17 +19,31 @@ protected:
     /// @brief Nodal object
     std::unique_ptr<Nodal> _nodal;
 
-    /// @brief the number of iterations
+    /// @brief total number of CMFD sweeps since the last resetIteration(); diagnostic only
     int iter;
+
+    /// @brief Number of CMFD sweeps since the last resetIteration(), used ONLY to decide
+    /// when the Wielandt extrapolation may take over from the Rayleigh-quotient warm-up.
+    ///
+    /// This used to be `iter` itself, which made a diagnostic counter silently steer the
+    /// eigenvalue update: any caller that read, reset, or reused `iter` for reporting
+    /// would have changed the Wielandt activation point. The two are now separate
+    /// variables with the same reset point, so the numerical schedule is unchanged but
+    /// no longer coupled to the reporting counter.
+    int _wiel_sweep;
+
+    /// @brief number of warm-up sweeps solved with the Rayleigh quotient before the
+    /// Wielandt extrapolation is allowed to drive the eigenvalue
+    static constexpr int WIELANDT_WARMUP_SWEEPS = 5;
 
     /// @brief the maximum number of bicg iteration (inner iteration)
     int _nmaxbicg;
 
     /// @brief the convergence criterion of bicg iteration (inner iteration)
-    float _epsbicg;
+    double _epsbicg;
 
     /// @brief the Wielandt shift value in CMFD acceleration
-    float _eshift;
+    double _eshift;
 
     /// @brief the unshifted diagonal matrix
     std::vector<double> _udiag;
@@ -44,7 +58,7 @@ public:
     /// @brief set the iteration limit for BICGCMFD
     /// @param maxls maximum number of iteration in BICG calculation
     /// @param epsls convergence criterion in BICG calculation
-    void setIterLim(int maxls, float epsls);
+    void setIterLim(int maxls, double epsls);
 
     /// @brief update d_tilde for CMFD
     void upddtil() override;
@@ -71,18 +85,12 @@ public:
     /// @param errl2 the L2 norm of the error
     void drive(double& eigv, double* flux, double& errl2) override;
 
-    /// @brief perform the nodal calculation and update the net current
-    /// @param eigv the eigenvalue
-    /// @param flux the flux
-    /// @param jnet the net current
-    /// @param phis the surface flux
-    void updnodal(double& eigv, double* flux, double* jnet, double* phis);
 
     /// @brief reset the iteration count
     void resetIteration();
 
     /// @brief set the Wielandt shift value
-    void setEshift(float eshift0);
+    void setEshift(double eshift0);
 
     /// @brief update linear system of CMFD with Wielandt shift value
     /// @param reigvs the reciprocal of shifted eigenvalue
@@ -97,16 +105,7 @@ public:
     /// @param reigvs the reciprocal of shifted eigenvalue
     void updls(const int& l, const double& reigvs);
 
-    /// @brief calculate Axb for CMFD
-    /// @param flux the flux
-    /// @param aflux the result of Axb
-    void axb(double* flux, double* aflux);
 
-    /// @brief calculate residual error for CMFD
-    /// @param reigv the reciprocal of eigenvalue
-    /// @param reigvs the reciprocal of shifted eigenvalue
-    /// @param flux the flux
-    double residual(const double& reigv, const double& reigvs, const double* flux);
 
     /// @brief perform the Wielandt shift to accelerate CMFD calculation
     /// @param icy the iteration count
@@ -126,7 +125,7 @@ public:
     };
 
     /// @brief the Wielandt shift value
-    float& eshift() {
+    double& eshift() {
         return _eshift;
     };
 };

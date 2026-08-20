@@ -34,3 +34,18 @@ python -m pip install -r Viewer/requirements.txt
 
 ## How to test
 use ./test/Tests.txt
+
+## CUDA CMFD backend
+
+Configure with `-DRASBERY_ENABLE_CUDA=ON` and set `RASBERY_GPU=1` at
+runtime. A requested but unavailable CUDA backend fails closed.
+
+The CMFD BiCGSTAB vectors remain device-resident during the inner iteration.
+Each iteration reads one 64-byte `DeviceSolveStatus`; the full flux is copied
+at the CPU Wielandt/nodal observation boundary. At shutdown, the executable
+prints one machine-readable `[RASBERY][CUDA][BACKEND_COUNTERS]` JSON record.
+
+Tuning controls:
+
+- `RASBERY_GPU_BLOCK_SIZE`: `64`, `128`, `192`, or `256` (default `256`)
+- `RASBERY_GPU_RB_SWEEPS`: non-negative red/black block sweep count

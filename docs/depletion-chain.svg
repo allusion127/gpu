@@ -1,0 +1,253 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1660" height="1210" viewBox="0 0 1660 1210">
+  <defs>
+    <marker id="arrow-cap"   markerWidth="4.2" markerHeight="4.2" refX="3.8" refY="2.1" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L4.2,2.1 L0,4.2 Z" fill="#1f2937"/></marker>
+    <marker id="arrow-decay" markerWidth="4.2" markerHeight="4.2" refX="3.8" refY="2.1" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L4.2,2.1 L0,4.2 Z" fill="#dc2626"/></marker>
+    <marker id="arrow-fp"    markerWidth="4.2" markerHeight="4.2" refX="3.8" refY="2.1" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L4.2,2.1 L0,4.2 Z" fill="#2563eb"/></marker>
+    <marker id="arrow-n2n"   markerWidth="4.2" markerHeight="4.2" refX="3.8" refY="2.1" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L4.2,2.1 L0,4.2 Z" fill="#16a34a"/></marker>
+    <marker id="arrow-loss"  markerWidth="4.2" markerHeight="4.2" refX="3.8" refY="2.1" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L4.2,2.1 L0,4.2 Z" fill="#6b7280"/></marker>
+  </defs>
+  <style>
+    .title    { font: 700 26px Arial, sans-serif; fill:#111827; }
+    .subtitle { font: 13px Arial, sans-serif; fill:#4b5563; }
+    .rowlabel { font: 700 24px Arial, sans-serif; fill:#374151; }
+    .nodebox  { fill:#ffffff; stroke:#1f4e79; stroke-width:2.1; rx:3; }
+    .isoname  { font-family: Arial, sans-serif; font-weight:700; fill:#111827; text-anchor:middle; dominant-baseline:middle; }
+    .lambda   { font-family: Arial, sans-serif; fill:#4b5563; text-anchor:middle; dominant-baseline:middle; }
+    .edge-cap   { fill:none; stroke:#1f2937; stroke-width:1.9; marker-end:url(#arrow-cap);   stroke-linecap:square; stroke-linejoin:miter; }
+    .edge-decay      { fill:none; stroke:#dc2626; stroke-width:1.8; marker-end:url(#arrow-decay); stroke-linecap:square; stroke-linejoin:miter; }
+    .edge-decay-feed { fill:none; stroke:#dc2626; stroke-width:1.8; stroke-linecap:square; stroke-linejoin:miter; }
+    .edge-fp    { fill:none; stroke:#2563eb; stroke-width:1.7; stroke-dasharray:7 5; marker-end:url(#arrow-fp);  stroke-linecap:butt; }
+    .edge-n2n   { fill:none; stroke:#16a34a; stroke-width:1.8; stroke-dasharray:6 4; marker-end:url(#arrow-n2n); stroke-linecap:butt; }
+    .edge-loss  { fill:none; stroke:#6b7280; stroke-width:1.6; stroke-dasharray:4 4; marker-end:url(#arrow-loss); stroke-linecap:butt; }
+    .legend { font: 13px Arial, sans-serif; fill:#111827; }
+    .note   { font: 12px Arial, sans-serif; fill:#4b5563; }
+    .ratio-halo { font: 700 11px Arial, sans-serif; fill:none; stroke:#ffffff; stroke-width:4px; stroke-linejoin:round; text-anchor:middle; dominant-baseline:middle; }
+    .ratio-fill { font: 700 11px Arial, sans-serif; text-anchor:middle; dominant-baseline:middle; }
+  </style>
+  <rect x="0" y="0" width="1660" height="1210" fill="#ffffff"/>
+
+  <text class="title" x="32" y="38">Rasbery Depletion Chain</text>
+  <text class="subtitle" x="32" y="60">Built from dep_decay.csv, dep_trans.csv, and XSSet::BuildTransitionMatrix. Arrow labels are intentionally omitted except selected branching ratios.</text>
+
+  <!-- legend -->
+  <path class="edge-cap"   d="M 32,86 L 86,86"/>     <text class="legend" x="98"  y="91">Capture / transmutation</text>
+  <path class="edge-decay" d="M 270,86 L 324,86"/>   <text class="legend" x="336" y="91">Decay</text>
+  <path class="edge-fp"    d="M 405,86 L 459,86"/>   <text class="legend" x="471" y="91">Fission product</text>
+  <path class="edge-n2n"   d="M 585,86 L 639,86"/>   <text class="legend" x="651" y="91">XSSet (n,2n)</text>
+  <path class="edge-loss"  d="M 760,86 L 814,86"/>   <text class="legend" x="826" y="91">Loss</text>
+
+  <!-- section titles & row labels -->
+  <text class="title" x="32" y="120">Actinide</text>
+  <text class="rowlabel" x="35" y="156">Cm</text>
+  <text class="rowlabel" x="35" y="276">Am</text>
+  <text class="rowlabel" x="35" y="396">Pu</text>
+  <text class="rowlabel" x="35" y="516">Np</text>
+  <text class="rowlabel" x="35" y="636">U</text>
+
+  <text class="title" x="32" y="710">Nd / Pm / Sm</text>
+  <text class="rowlabel" x="35"  y="773">Nd</text>
+  <text class="rowlabel" x="35"  y="918">Pm</text>
+  <text class="rowlabel" x="35"  y="1093">Sm</text>
+
+  <text class="title" x="1100" y="710">I / Xe</text>
+
+  <!-- edges -->
+  <path class="edge-cap" d="M 154.0,630.0 L 196.0,630.0"/>
+<path class="edge-cap" d="M 284.0,630.0 L 326.0,630.0"/>
+<path class="edge-cap" d="M 674.0,510.0 L 716.0,510.0"/>
+<path class="edge-cap" d="M 674.0,390.0 L 716.0,390.0"/>
+<path class="edge-cap" d="M 804.0,390.0 L 846.0,390.0"/>
+<path class="edge-cap" d="M 934.0,390.0 L 976.0,390.0"/>
+<path class="edge-cap" d="M 1064.0,390.0 L 1106.0,390.0"/>
+<path class="edge-cap" d="M 1194.0,390.0 L 1236.0,390.0"/>
+<path class="edge-cap" d="M 1324.0,270.0 L 1366.0,270.0"/>
+<path class="edge-cap" d="M 1194.0,150.0 L 1236.0,150.0"/>
+<path class="edge-cap" d="M 1324.0,150.0 L 1366.0,150.0"/>
+<path class="edge-cap" d="M 1454.0,150.0 L 1496.0,150.0"/>
+<path class="edge-cap" d="M 414.0,630 L 435.0,630 L 435.0,510 L 456.0,510"/>
+<path class="edge-cap" d="M 630,605.0 L 630,565 L 760,565 L 760,535.0"/>
+<path class="edge-cap" d="M 520,485.0 L 520,476 L 630,476 L 630,415.0"/>
+<path class="edge-cap" d="M 780,485.0 L 780,476 L 890,476 L 890,415.0"/>
+<path class="edge-cap" d="M 1020,295.0 L 1020,318 L 1106.0,318"/>
+<path class="edge-cap" d="M 1172,293.0 L 1172,282 L 1236.0,282"/>
+<path class="edge-cap" d="M 1194.0,222 L 1216.0,222 L 1216.0,258 L 1236.0,258"/>
+<path class="edge-cap" d="M 1280,245.0 L 1280,200 L 1410,200 L 1410,175.0"/>
+<path class="edge-decay" d="M 650,485.0 L 650,415.0"/>
+<path class="edge-decay" d="M 780,485.0 L 780,415.0"/>
+<path class="edge-decay" d="M 1006,365.0 L 1006,295.0"/>
+<path class="edge-decay" d="M 1266,365.0 L 1266,295.0"/>
+<path class="edge-decay" d="M 1136,247.0 L 1136,293.0"/>
+<path class="edge-decay" d="M 1136,343.0 L 1136,365.0"/>
+<path class="edge-decay" d="M 1292,175.0 L 1292,245.0"/>
+<path class="edge-decay" d="M 1398,245.0 L 1398,175.0"/>
+<path class="edge-decay" d="M 1194.0,318 L 1214.0,318 L 1214.0,150 L 1194.0,150"/>
+<path class="edge-decay" d="M 1150,125.0 L 1150,119 L 630,119 L 630,365.0"/>
+<path class="edge-decay" d="M 1280,125.0 L 1280,112 L 760,112 L 760,365.0"/>
+<path class="edge-decay" d="M 1410,125.0 L 1410,105 L 890,105 L 890,365.0"/>
+<path class="edge-decay" d="M 1540,125.0 L 1540,98 L 1020,98 L 1020,365.0"/>
+<path class="edge-decay" d="M 615,415.0 L 615,422 L 110,422 L 110,605.0"/>
+<path class="edge-decay" d="M 745,415.0 L 745,430 L 240,430 L 240,605.0"/>
+<path class="edge-decay" d="M 875,415.0 L 875,438 L 370,438 L 370,605.0"/>
+<path class="edge-decay" d="M 1135,415.0 L 1135,468 L 565,468 L 565,630 L 586.0,630"/>
+<path class="edge-decay" d="M 976.0,270 L 945.0,270 L 945.0,446 L 480,446 L 480,485.0"/>
+<path class="edge-decay" d="M 1106.0,222 L 1075.0,222 L 1075.0,454 L 610,454 L 610,485.0"/>
+<path class="edge-decay" d="M 1236.0,270 L 1205.0,270 L 1205.0,462 L 740,462 L 740,485.0"/>
+<path class="edge-n2n" d="M 258,655.0 L 258,680 L 128,680 L 128,655.0"/>
+<path class="edge-n2n" d="M 648,655.0 L 648,680 L 518,680 L 518,535.0"/>
+<path class="edge-cap" d="M 225.0,765.0 L 335.0,765.0"/>
+<path class="edge-cap" d="M 445.0,765.0 L 555.0,765.0"/>
+<path class="edge-cap" d="M 225.0,905 L 275.0,905 L 275.0,845 L 335.0,845"/>
+<path class="edge-cap" d="M 225.0,915 L 275.0,915 L 275.0,975 L 335.0,975"/>
+<path class="edge-cap" d="M 445.0,838 L 480.0,838 L 480.0,900 L 555.0,900"/>
+<path class="edge-cap" d="M 445.0,975 L 480.0,975 L 480.0,920 L 555.0,920"/>
+<path class="edge-cap" d="M 225.0,1085 L 335.0,1085"/>
+<path class="edge-cap" d="M 445.0,1085 L 555.0,1085"/>
+<path class="edge-decay" d="M 170.0,795.0 L 170.0,880.0"/>
+<path class="edge-decay" d="M 610.0,795.0 L 610.0,880.0"/>
+<path class="edge-decay" d="M 170.0,940.0 L 170.0,1055.0"/>
+<path class="edge-decay" d="M 412,945.0 L 412,875.0"/>
+<path class="edge-decay" d="M 390,1005.0 L 390,1055.0"/>
+<path class="edge-decay-feed" d="M 445.0,852 L 465.0,852 L 465.0,1030 L 390,1030"/>
+<path class="edge-decay" d="M 610,940.0 L 610,1055.0"/>
+<path class="edge-fp" d="M 37.0,765 L 115.0,765"/>
+<path class="edge-fp" d="M 477.0,910 L 555.0,910"/>
+<path class="edge-decay" d="M 1228.0,805 L 1320.0,805 L 1320.0,745 L 1417.0,745"/>
+<path class="edge-decay" d="M 1228.0,825 L 1320.0,825 L 1320.0,895 L 1417.0,895"/>
+<path class="edge-decay" d="M 1460,768.0 L 1460,872.0"/>
+<path class="edge-cap" d="M 1185,792.0 L 1185,762.0 L 1452,762.0 L 1452,722.0"/>
+<path class="edge-cap" d="M 1185,838.0 L 1185,870.0 L 1468,870.0 L 1468,918.0"/>
+<path class="edge-decay" d="M 1503.0,887 L 1595,887"/>
+<path class="edge-loss" d="M 1503.0,903 L 1525,903 L 1525,835 L 1595,835"/>
+<path class="edge-fp" d="M 1064.0,815 L 1142.0,815"/>
+<path class="edge-fp" d="M 1357.0,731 L 1417.0,731"/>
+<path class="edge-fp" d="M 1357.0,909 L 1417.0,909"/>
+
+  <!-- branching-ratio labels (halo + fill, double-text for renderer compat) -->
+  <text class="ratio-halo" x="1218" y="235">0.173</text>
+<text class="ratio-fill" x="1218" y="235" fill="#b91c1c">0.173</text>
+<text class="ratio-halo" x="1156" y="360">0.827</text>
+<text class="ratio-fill" x="1156" y="360" fill="#b91c1c">0.827</text>
+<text class="ratio-halo" x="285.0" y="893">0.528</text>
+<text class="ratio-fill" x="285.0" y="893" fill="#111827">0.528</text>
+<text class="ratio-halo" x="285.0" y="933">0.472</text>
+<text class="ratio-fill" x="285.0" y="933" fill="#111827">0.472</text>
+<text class="ratio-halo" x="426" y="910">0.042</text>
+<text class="ratio-fill" x="426" y="910" fill="#b91c1c">0.042</text>
+<text class="ratio-halo" x="373" y="1018">0.958</text>
+<text class="ratio-fill" x="373" y="1018" fill="#b91c1c">0.958</text>
+<text class="ratio-halo" x="1326.0" y="800">0.165</text>
+<text class="ratio-fill" x="1326.0" y="800" fill="#b91c1c">0.165</text>
+<text class="ratio-halo" x="1326.0" y="850">0.835</text>
+<text class="ratio-fill" x="1326.0" y="850" fill="#b91c1c">0.835</text>
+
+  <!-- nodes -->
+  <rect class="nodebox" x="66.0" y="605.0" width="88" height="50"/>
+<text class="isoname" style="font-size:17.5px" x="110" y="626">U-234</text>
+<text class="lambda"  style="font-size:9.5px"  x="110" y="648">λ = 8.947e-14</text>
+<rect class="nodebox" x="196.0" y="605.0" width="88" height="50"/>
+<text class="isoname" style="font-size:17.5px" x="240" y="626">U-235</text>
+<text class="lambda"  style="font-size:9.5px"  x="240" y="648">λ = 3.121e-17</text>
+<rect class="nodebox" x="326.0" y="605.0" width="88" height="50"/>
+<text class="isoname" style="font-size:17.5px" x="370" y="626">U-236</text>
+<text class="lambda"  style="font-size:9.5px"  x="370" y="648">λ = 9.379e-16</text>
+<rect class="nodebox" x="586.0" y="605.0" width="88" height="50"/>
+<text class="isoname" style="font-size:17.5px" x="630" y="626">U-238</text>
+<text class="lambda"  style="font-size:9.5px"  x="630" y="648">λ = 4.916e-18</text>
+<rect class="nodebox" x="456.0" y="485.0" width="88" height="50"/>
+<text class="isoname" style="font-size:17.5px" x="500" y="506">Np-237</text>
+<text class="lambda"  style="font-size:9.5px"  x="500" y="528">λ = 1.024e-14</text>
+<rect class="nodebox" x="586.0" y="485.0" width="88" height="50"/>
+<text class="isoname" style="font-size:17.5px" x="630" y="506">Np-238</text>
+<text class="lambda"  style="font-size:9.5px"  x="630" y="528">λ = 3.790e-06</text>
+<rect class="nodebox" x="716.0" y="485.0" width="88" height="50"/>
+<text class="isoname" style="font-size:17.5px" x="760" y="506">Np-239</text>
+<text class="lambda"  style="font-size:9.5px"  x="760" y="528">λ = 3.405e-06</text>
+<rect class="nodebox" x="586.0" y="365.0" width="88" height="50"/>
+<text class="isoname" style="font-size:17.5px" x="630" y="386">Pu-238</text>
+<text class="lambda"  style="font-size:9.5px"  x="630" y="408">λ = 2.505e-10</text>
+<rect class="nodebox" x="716.0" y="365.0" width="88" height="50"/>
+<text class="isoname" style="font-size:17.5px" x="760" y="386">Pu-239</text>
+<text class="lambda"  style="font-size:9.5px"  x="760" y="408">λ = 9.110e-13</text>
+<rect class="nodebox" x="846.0" y="365.0" width="88" height="50"/>
+<text class="isoname" style="font-size:17.5px" x="890" y="386">Pu-240</text>
+<text class="lambda"  style="font-size:9.5px"  x="890" y="408">λ = 3.348e-12</text>
+<rect class="nodebox" x="976.0" y="365.0" width="88" height="50"/>
+<text class="isoname" style="font-size:17.5px" x="1020" y="386">Pu-241</text>
+<text class="lambda"  style="font-size:9.5px"  x="1020" y="408">λ = 1.537e-09</text>
+<rect class="nodebox" x="1106.0" y="365.0" width="88" height="50"/>
+<text class="isoname" style="font-size:17.5px" x="1150" y="386">Pu-242</text>
+<text class="lambda"  style="font-size:9.5px"  x="1150" y="408">λ = 5.881e-14</text>
+<rect class="nodebox" x="1236.0" y="365.0" width="88" height="50"/>
+<text class="isoname" style="font-size:17.5px" x="1280" y="386">Pu-243</text>
+<text class="lambda"  style="font-size:9.5px"  x="1280" y="408">λ = 3.885e-05</text>
+<rect class="nodebox" x="976.0" y="245.0" width="88" height="50"/>
+<text class="isoname" style="font-size:17.5px" x="1020" y="266">Am-241</text>
+<text class="lambda"  style="font-size:9.5px"  x="1020" y="288">λ = 5.077e-11</text>
+<rect class="nodebox" x="1106.0" y="197.0" width="88" height="50"/>
+<text class="isoname" style="font-size:17.5px" x="1150" y="218">Am-242m</text>
+<text class="lambda"  style="font-size:9.5px"  x="1150" y="240">λ = 1.558e-10</text>
+<rect class="nodebox" x="1106.0" y="293.0" width="88" height="50"/>
+<text class="isoname" style="font-size:17.5px" x="1150" y="314">Am-242</text>
+<text class="lambda"  style="font-size:9.5px"  x="1150" y="336">λ = 1.202e-05</text>
+<rect class="nodebox" x="1236.0" y="245.0" width="88" height="50"/>
+<text class="isoname" style="font-size:17.5px" x="1280" y="266">Am-243</text>
+<text class="lambda"  style="font-size:9.5px"  x="1280" y="288">λ = 2.980e-12</text>
+<rect class="nodebox" x="1366.0" y="245.0" width="88" height="50"/>
+<text class="isoname" style="font-size:17.5px" x="1410" y="266">Am-244</text>
+<text class="lambda"  style="font-size:9.5px"  x="1410" y="288">λ = 1.906e-05</text>
+<rect class="nodebox" x="1106.0" y="125.0" width="88" height="50"/>
+<text class="isoname" style="font-size:17.5px" x="1150" y="146">Cm-242</text>
+<text class="lambda"  style="font-size:9.5px"  x="1150" y="168">λ = 4.924e-08</text>
+<rect class="nodebox" x="1236.0" y="125.0" width="88" height="50"/>
+<text class="isoname" style="font-size:17.5px" x="1280" y="146">Cm-243</text>
+<text class="lambda"  style="font-size:9.5px"  x="1280" y="168">λ = 7.548e-10</text>
+<rect class="nodebox" x="1366.0" y="125.0" width="88" height="50"/>
+<text class="isoname" style="font-size:17.5px" x="1410" y="146">Cm-244</text>
+<text class="lambda"  style="font-size:9.5px"  x="1410" y="168">λ = 1.213e-09</text>
+<rect class="nodebox" x="1496.0" y="125.0" width="88" height="50"/>
+<text class="isoname" style="font-size:17.5px" x="1540" y="146">Cm-245</text>
+<text class="lambda"  style="font-size:9.5px"  x="1540" y="168">λ = 2.584e-12</text>
+  <rect class="nodebox" x="115.0" y="735.0" width="110" height="60"/>
+<text class="isoname" style="font-size:18px" x="170" y="761">Nd-147</text>
+<text class="lambda"  style="font-size:10.5px" x="170" y="783">λ = 7.307e-07</text>
+<rect class="nodebox" x="335.0" y="735.0" width="110" height="60"/>
+<text class="isoname" style="font-size:18px" x="390" y="761">Nd-148</text>
+<text class="lambda"  style="font-size:10.5px" x="390" y="783">λ = 0</text>
+<rect class="nodebox" x="555.0" y="735.0" width="110" height="60"/>
+<text class="isoname" style="font-size:18px" x="610" y="761">Nd-149</text>
+<text class="lambda"  style="font-size:10.5px" x="610" y="783">λ = 1.114e-04</text>
+<rect class="nodebox" x="115.0" y="880.0" width="110" height="60"/>
+<text class="isoname" style="font-size:18px" x="170" y="906">Pm-147</text>
+<text class="lambda"  style="font-size:10.5px" x="170" y="928">λ = 8.373e-09</text>
+<rect class="nodebox" x="335.0" y="815.0" width="110" height="60"/>
+<text class="isoname" style="font-size:18px" x="390" y="841">Pm-148</text>
+<text class="lambda"  style="font-size:10.5px" x="390" y="863">λ = 1.495e-06</text>
+<rect class="nodebox" x="335.0" y="945.0" width="110" height="60"/>
+<text class="isoname" style="font-size:18px" x="390" y="971">Pm-148m</text>
+<text class="lambda"  style="font-size:10.5px" x="390" y="993">λ = 1.943e-07</text>
+<rect class="nodebox" x="555.0" y="880.0" width="110" height="60"/>
+<text class="isoname" style="font-size:18px" x="610" y="906">Pm-149</text>
+<text class="lambda"  style="font-size:10.5px" x="610" y="928">λ = 3.627e-06</text>
+<rect class="nodebox" x="115.0" y="1055.0" width="110" height="60"/>
+<text class="isoname" style="font-size:18px" x="170" y="1081">Sm-147</text>
+<text class="lambda"  style="font-size:10.5px" x="170" y="1103">λ = 2.072e-19</text>
+<rect class="nodebox" x="335.0" y="1055.0" width="110" height="60"/>
+<text class="isoname" style="font-size:18px" x="390" y="1081">Sm-148</text>
+<text class="lambda"  style="font-size:10.5px" x="390" y="1103">λ = 3.138e-24</text>
+<rect class="nodebox" x="555.0" y="1055.0" width="110" height="60"/>
+<text class="isoname" style="font-size:18px" x="610" y="1081">Sm-149</text>
+<text class="lambda"  style="font-size:10.5px" x="610" y="1103">λ = 0</text>
+  <rect class="nodebox" x="1142.0" y="792.0" width="86" height="46"/>
+<text class="isoname" style="font-size:15.5px" x="1185" y="811">I-135</text>
+<text class="lambda"  style="font-size:9.2px"  x="1185" y="833">λ = 2.931e-05</text>
+<rect class="nodebox" x="1417.0" y="722.0" width="86" height="46"/>
+<text class="isoname" style="font-size:15.5px" x="1460" y="741">Xe-135m</text>
+<text class="lambda"  style="font-size:9.2px"  x="1460" y="763">λ = 7.556e-04</text>
+<rect class="nodebox" x="1417.0" y="872.0" width="86" height="46"/>
+<text class="isoname" style="font-size:15.5px" x="1460" y="891">Xe-135</text>
+<text class="lambda"  style="font-size:9.2px"  x="1460" y="913">λ = 2.107e-05</text>
+
+  <!-- footnotes -->
+  <text class="note" x="1100" y="1050">Xe equilibrium overwrite remains in XSSet when xe_transient is false.</text>
+  <text class="note" x="32" y="1198">Black: capture / transmutation (with implicit β where needed).  Red: decay branches.  Blue dashed: fission-product feed.  Green dashed: (n,2n).  Grey dashed: loss.</text>
+</svg>

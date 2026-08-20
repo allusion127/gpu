@@ -6,6 +6,8 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <map>
@@ -75,13 +77,21 @@ static const int NG2 = 2;
 
 static const int NPTM = 3;
 
-static const float HAW   = 1.0079;
-static const float OAW   = 15.994915;
-static const float H2OAW = 18.010715;
+// Atomic/molecular weights and Avogadro's number for the number-density relation
+// N = rho * AVOG / AW.  Held as float they carried only ~7 significant digits into what is
+// otherwise an all-double chain, so any future caller would inherit a ~1e-7 relative bias on
+// every boron / moderator number density -- systematic, not round-off, because the same
+// rounded literal is reused for every node.  Verified: as of this commit none of the six has
+// a call site anywhere in the tree, so widening them changes no result today.  They are kept
+// (rather than deleted) because they are the declared constants for a relation the solver
+// still needs; this makes them safe to pick up.
+static const double HAW   = 1.0079;
+static const double OAW   = 15.994915;
+static const double H2OAW = 18.010715;
 
-static const float AVOG  = 0.6022045;
-static const float B10AW = 10.012937;
-static const float B11AW = 11.009305;
+static const double AVOG  = 0.6022045;
+static const double B10AW = 10.012937;
+static const double B11AW = 11.009305;
 
 static const int TF_POINT = 20;
 

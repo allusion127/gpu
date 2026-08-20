@@ -10,21 +10,35 @@ BICGCMFD::BICGCMFD(Geometry& g, XSSet& x)
       _ls(std::make_unique<BICGSolver>(_g)),
       _nodal(nullptr),
       _udiag(static_cast<size_t>(_g.ng2()) * static_cast<size_t>(_g.nxyz())) {
+    // Inner BiCGSTAB budget. The defaults are the historical ones; the two
+    // overrides exist so the pair can be A/B-ed against outer-iteration count
+    // and k_eff without a rebuild. On the GPU the inner loop is one graph
+    // launch, so a deeper, tighter inner solve amortises the launch latency
+    // that a 2-iteration loop cannot.
     _epsbicg  = 0.1;
     _nmaxbicg = 3;
+    if (const char* nmax_env = std::getenv("RASBERY_BICG_NMAX")) {
+        const int requested = std::atoi(nmax_env);
+        if (requested > 0) _nmaxbicg = requested;
+    }
+    if (const char* eps_env = std::getenv("RASBERY_BICG_EPS")) {
+        const double requested = std::atof(eps_env);
+        if (requested > 0.0) _epsbicg = requested;
+    }
 
-    _eshift = 0.04;
-    iter    = 0;
+    _eshift     = 0.04;
+    iter        = 0;
+    _wiel_sweep = 0;
 }
 
-void BICGCMFD::setIterLim(int maxls, float epsls) {
+void BICGCMFD::setIterLim(int maxls, double epsls) {
     _nmaxbicg = maxls;
     _epsbicg  = epsls;
 }
 
 BICGCMFD::~BICGCMFD() = default;
 
-void BICGCMFD::setEshift(float eshift) {
+void BICGCMFD::setEshift(double eshift) {
     _eshift = eshift;
 }
 
@@ -48,7 +62,16 @@ void BICGCMFD::wiel(const int& icy, const double* flux, double& reigvs, double& 
     errl2 = err;
 
     // compute new eigenvalue
-    if (icy < 0 || gammad < 0 || gamman < 0) {
+    //
+    // The Wielandt update needs gamma = gammad/gamman with gammad = <psi_old,psi_new>.
+    // On the first call after a state reset psi_old is identically zero, so gammad is
+    // exactly 0: gamma becomes 0 and the shift extrapolation degenerates (and the
+    // errl2 normalisation below divides by zero). gamman is a sum of squares and can
+    // never be negative, so the old `gamman < 0` test was dead code; what actually
+    // needs guarding is gamman == 0 (null fission source). Both degenerate cases now
+    // fall back to the Rayleigh-quotient branch, which is well defined there.
+    const bool gamma_usable = (gammad > 0.0) && (gamman > 0.0);
+    if (icy < 0 || !gamma_usable) {
         double sumf = 0;
         double summ = 0;
         for (int l = 0; l < _g.nxyz(); l++) {
@@ -66,7 +89,14 @@ void BICGCMFD::wiel(const int& icy, const double* flux, double& reigvs, double& 
     }
     reigv = 1 / eigv;
 
-    errl2 = sqrt(abs(errl2 / gammad));
+    // Normalise the fission-source change by the fission-source norm. gammad is the
+    // natural scale but is 0 on the first call (see above) and can turn negative when
+    // the iterate flips sign; fall back to gamman = ||psi_new||^2, which is positive
+    // whenever there is any fission source at all. Without this, errl2 came out as
+    // inf/NaN on the first sweep and the outer loop's `errl2 < _epsl2` test was
+    // evaluating a NaN comparison.
+    const double err_scale = (gammad > 0.0) ? gammad : gamman;
+    errl2                  = (err_scale > 0.0) ? sqrt(abs(errl2 / err_scale)) : 0.0;
 
     double eigvs = eigv;
     reigvs       = 0;
@@ -75,30 +105,6 @@ void BICGCMFD::wiel(const int& icy, const double* flux, double& reigvs, double& 
         eigvs += _eshift;
         if (_eshift != 0.0) reigvs = 1. / eigvs;
     }
-}
-
-double BICGCMFD::residual(const double& reigv, const double& reigvs, const double* flux) {
-
-    double reigvdel = reigv - reigvs;
-
-    double r    = 0.0;
-    double psi2 = 0.0;
-
-    for (int l = 0; l < _g.nxyz(); ++l) {
-        double fs = psi(l) * reigvdel;
-
-        for (int ig = 0; ig < _g.ng(); ++ig) {
-            double ab = CMFD::axb(ig, l, flux);
-
-            double err = _x.chif(ig, l) * fs - ab;
-            r += err * err;
-
-            double ps = _x.chif(ig, l) * psi(l);
-            psi2 += ps * ps;
-        }
-    }
-
-    return sqrt(r / psi2);
 }
 
 void BICGCMFD::upddtil() {
@@ -177,15 +183,6 @@ void BICGCMFD::updpsi(const double* flux) {
     }
 }
 
-void BICGCMFD::axb(double* flux, double* aflux) {
-
-    for (int l = 0; l < _g.nxyz(); ++l) {
-        for (int ig = 0; ig < _g.ng(); ++ig) {
-            aflux(ig, l) = CMFD::axb(ig, l, flux);
-        }
-    }
-}
-
 void BICGCMFD::drive(double& eigv, double* flux, double& errl2) {
 
     int    icmfd  = 0;
@@ -198,6 +195,7 @@ void BICGCMFD::drive(double& eigv, double* flux, double& errl2) {
     int iout     = 0;
     for (; iout < _ncmfd; ++iout) {
         ++iter;
+        ++_wiel_sweep;
         ++icmfd;
         double reigvdel = reigv - reigvs;
 
@@ -208,21 +206,48 @@ void BICGCMFD::drive(double& eigv, double* flux, double& errl2) {
             }
         }
 
+        // r20 is the reference residual norm ||b - A*phi0|| for this outer and must
+        // stay fixed for the whole inner loop. The first solve used to pass r20 as
+        // BOTH the reference (3rd arg) and the output residual (5th arg), so the
+        // reference was overwritten by the first iteration's residual and every
+        // subsequent relative test was measured against a moving denominator.
         double r20 = 0.0;
         _ls->reset(_diag, _cc, flux, _src, r20);
-        _ls->solve(_diag, _cc, r20, flux, r20);
 
-        double r2 = 0.0;
-        for (int iin = 0; iin < _nmaxbicg; ++iin) {
-            // solve linear system A*phi = src
+        if (_ls->usingCuda()) {
+            // The device runs the identical loop -- one unconditional iteration
+            // then up to _nmaxbicg more, each followed by the same relative test
+            // against the same frozen r20 -- but without reporting to the host
+            // in between, so the whole thing is one CUDA graph launch instead of
+            // a per-iteration status copy plus stream drain.
+            _ls->solveInner(_nmaxbicg, _epsbicg);
+        } else {
+            double r2 = r20;
             _ls->solve(_diag, _cc, r20, flux, r2);
-            PLOG(plog::debug) << iin << "-th Inner Solver Error " << r2;
-            if (r2 / r20 < _epsbicg) break;
-            if (r2 < 1.E-6 && iin > 2) break;
+
+            for (int iin = 0; iin < _nmaxbicg; ++iin) {
+                // solve linear system A*phi = src
+                _ls->solve(_diag, _cc, r20, flux, r2);
+                PLOG(plog::debug) << iin << "-th Inner Solver Error " << r2;
+                // One relative exit, measured against the fixed reference r20.  The companion
+                // `if (r2 < 1.E-6 && iin > 2) break;` is gone: since fix4 un-aliased r20 from r2,
+                // r2 is the true absolute residual ||b - A*phi||, so a fixed absolute threshold
+                // tested the source normalisation (core size / power level) rather than
+                // convergence -- it would fire immediately on a small or lightly-normalised
+                // problem and never on a large one.  It was also unreachable at the default
+                // _nmaxbicg = 3, where iin never exceeds 2.  The degenerate r20 == 0 case (the
+                // entry flux already satisfies the linear system exactly) now exits explicitly
+                // instead of being caught by that absolute floor.
+                if (r20 <= 0.0 || r2 / r20 < _epsbicg) break;
+            }
         }
 
+        // Keep the bulk flux resident through all BiCGSTAB inner iterations.
+        // The CPU Wielandt/nodal stages observe it once at this boundary.
+        _ls->synchronizeCudaFlux(flux);
+
         // wielandt shift
-        wiel(iter - 5, flux, reigvs, eigv, reigv, errl2);
+        wiel(_wiel_sweep - WIELANDT_WARMUP_SWEEPS, flux, reigvs, eigv, reigv, errl2);
 
         if (_eshift != 0.0) {
             updls(reigvs);
@@ -253,15 +278,7 @@ void BICGCMFD::drive(double& eigv, double* flux, double& errl2) {
 }
 
 void BICGCMFD::resetIteration() {
-    iter = 0;
+    iter        = 0;
+    _wiel_sweep = 0;
 }
 
-void BICGCMFD::updnodal(double& eigv, double* flux, double* jnet, double* phis) {
-    if (_nodal == nullptr)
-        _nodal = std::make_unique<Nodal>(_g, _x);
-
-    updjnet(flux, jnet);
-    _nodal->reset(1. / eigv, jnet, flux, phis);
-    _nodal->drive();
-    upddhat(flux, jnet);
-}

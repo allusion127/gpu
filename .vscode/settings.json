@@ -1,0 +1,26 @@
+{
+  "cmake.generator": "Ninja",
+  "cmake.buildDirectory": "${workspaceFolder}/build-${buildType}",
+  "cmake.configureOnOpen": false,
+  "cmake.copyCompileCommands": "${workspaceFolder}/compile_commands.json",
+  "cmake.configureSettings": {
+    "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+  },
+  "C_Cpp.intelliSenseEngine": "default",
+  "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+  "C_Cpp.default.compileCommands": "${workspaceFolder}/compile_commands.json",
+  "C_Cpp.default.compilerPath": "/usr/bin/clang++",
+  "C_Cpp.default.cppStandard": "c++23",
+  "C_Cpp.default.intelliSenseMode": "linux-clang-x64",
+  "editor.inlayHints.enabled": "off",
+  "clangd.inlayHints.enable": false,
+  "C_Cpp.formatting": "clangFormat",
+  "C_Cpp.clang_format_path": "/usr/bin/clang-format",
+  "C_Cpp.clang_format_style": "file",
+  "[c]": {
+    "editor.defaultFormatter": "ms-vscode.cpptools"
+  },
+  "[cpp]": {
+    "editor.defaultFormatter": "ms-vscode.cpptools"
+  }
+}

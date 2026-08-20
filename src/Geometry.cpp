@@ -136,6 +136,24 @@ void Geometry::Initialize(const GeometryInput& in) {
     _symang = in.symang;
     _symdiv = in.symdiv;
     _part   = _symang / 360.0;
+
+    // A quarter core can be folded onto the full core in two inequivalent ways,
+    // and "mirror" selects between them.
+    //
+    //   mirror: true  -- MIRROR (reflective) fold. The west and north boundaries
+    //                    reflect onto themselves (the zero-albedo self-mapping in
+    //                    the neighbour build below) and IO::ApplyShuffle completes
+    //                    symmetry-cut assemblies by mirror reflection.
+    //   mirror: false -- 90-degree ROTATIONAL fold (MASTER's %GEN_DIM nsym=1). The
+    //                    first node row and the first node column are stitched to
+    //                    each other: the north face of node (i,0) IS the west face
+    //                    of node (0,i), seen from the other side of a 90-degree
+    //                    rotation about the core centre.
+    //
+    // The two agree only when the quadrant loading is diagonally symmetric;
+    // otherwise they describe different cores. See rotationalFold() below.
+    const bool rotfold = (_symang == 90 && !_symopt);
+
     _albedo = new double[LR * NDIRMAX];
     std::copy_n(in.albedo.data(), LR * NDIRMAX, _albedo);
 
@@ -176,13 +194,22 @@ void Geometry::Initialize(const GeometryInput& in) {
 
     std::vector<int> v_nys(_nx), v_nye(_nx);
     for (int i = 0; i < _nx; i++) {
-        int iys = 0, iye = 0;
-        for (size_t row = 0; row < v_nxs.size(); row++) {
-            if (i < v_nxs[row]) iys++;
-            if (i < v_nxe[row]) iye++;
+        // A column can have void rows at both its north and south ends in a
+        // full-core ragged map. Counting rows with i<nxs/i<nxe conflates the
+        // two ends and can make [nys,nye) include cells whose ijtol is -1.
+        // Derive the actual first/last occupied row from the row intervals.
+        int first = _ny;
+        int last  = -1;
+        for (int row = 0; row < static_cast<int>(v_nxs.size()); row++) {
+            if (v_nxs[row] <= i && i < v_nxe[row]) {
+                first = std::min(first, row);
+                last  = std::max(last, row);
+            }
         }
-        v_nys[i] = iys;
-        v_nye[i] = iye;
+        if (last < first)
+            throw std::runtime_error("Geometry: empty fine-mesh column in core map.");
+        v_nys[i] = first;
+        v_nye[i] = last + 1;
     }
 
     // Copy row/column start-end into member arrays
@@ -231,6 +258,65 @@ void Geometry::Initialize(const GeometryInput& in) {
         if (_neibrb[l * NEWS + EAST] < 0 && _albedo[XDIR * LR + RIGHT] < EPS) _neibrb[l * NEWS + EAST] = l;
         if (_neibrb[l * NEWS + NORTH] < 0 && _albedo[YDIR * LR + LEFT] < EPS) _neibrb[l * NEWS + NORTH] = l;
         if (_neibrb[l * NEWS + SOUTH] < 0 && _albedo[YDIR * LR + RIGHT] < EPS) _neibrb[l * NEWS + SOUTH] = l;
+    }
+
+    // 90-degree rotational fold: stitch the first node row to the first node column.
+    //
+    // The quadrant is the region x >= 0, y >= 0 with the core centre at the corner
+    // of node (0,0); x runs east, y runs south.  The C4 rotation R: (x,y) -> (-y,x)
+    // carries the modelled quadrant onto its neighbour, and its inverse carries the
+    // ghost strip west of column 0 onto node row 0:
+    //
+    //      west ghost of node (0,j)  ==  R^-1 image of node (j,0)
+    //      north ghost of node (i,0) ==  R    image of node (0,i)
+    //
+    // so the WEST neighbour of (0,j) is (j,0) and the NORTH neighbour of (j,0) is
+    // (0,j) -- one mutual link per centreline index, degenerating to self-coupling
+    // at (0,0), whose west face is its own north face rotated.
+    //
+    // Nothing else in the geometry has to change.  The surface tables below already
+    // carry a per-side direction and sign (idirlr/sgnlr) and already give the row's
+    // west-boundary surface idirlr(LEFT)=YDIR,sgnlr(LEFT)=MINUS and the column's
+    // north-boundary surface idirlr(LEFT)=XDIR,sgnlr(LEFT)=MINUS -- which are
+    // exactly the rotational partner's direction and orientation (the partner's
+    // local axis is anti-parallel to this surface's axis).  They pick their left
+    // node up from neib(WEST/NORTH,...), so stitching _neibr is enough for the
+    // surfaces, for CMFD's coupling (CMFD::setls indexes cc by direction slot, and
+    // a stitched slot still holds exactly one neighbour) and for the nodal
+    // transverse leakage (Nodal::caltrlcff12 already reads the neighbour's
+    // direction from idirlr(LEFT,lsl) rather than assuming its own).
+    //
+    // _neibrb is left on the reflective closure on purpose: it feeds only PPR's
+    // 3x3 pin-reconstruction stencil, which has no way to express a rotated
+    // neighbour (its flags encode reversal, not a direction swap).  Mirror closure
+    // there is the existing behaviour and keeps the boundary surface flux correct;
+    // the far diagonal cells of the stencil stay approximate.  Pin reconstruction
+    // under the rotational fold is tracked separately.
+    if (rotfold) {
+        if (std::abs(in.hx - in.hy) > 1.0E-9 * std::max(1.0, std::abs(in.hx)))
+            throw std::runtime_error(
+                "Geometry: the 90-degree rotational quarter-core fold maps the x axis onto "
+                "the y axis, so it needs a square assembly pitch (hx == hy).");
+        if (_albedo[XDIR * LR + LEFT] >= EPS || _albedo[YDIR * LR + LEFT] >= EPS)
+            throw std::runtime_error(
+                "Geometry: under the 90-degree rotational quarter-core fold the west and "
+                "north faces are interior surfaces, not boundaries, so a non-zero west or "
+                "north albedo cannot be honoured. Declare them 0.0.");
+
+        const int nline = std::max(_nx, _ny);
+        for (int t = 0; t < nline; t++) {
+            // node (0,t): column 0 of row t.  node (t,0): column t of row 0.
+            const int lcol = (t < _ny && v_nxs[t] == 0 && v_nxe[t] > 0) ? loc_ijtol[t * _nx + 0] : -1;
+            const int lrow = (t < _nx && v_nxs[0] <= t && t < v_nxe[0]) ? loc_ijtol[0 * _nx + t] : -1;
+            if ((lcol < 0) != (lrow < 0))
+                throw std::runtime_error(
+                    "Geometry: the 90-degree rotational quarter-core fold needs the core map to "
+                    "be diagonally consistent, but node (0," + std::to_string(t) + ") and node (" +
+                    std::to_string(t) + ",0) do not both exist.");
+            if (lcol < 0) continue;
+            _neibr[lcol * NEWS + WEST]  = lrow;
+            _neibr[lrow * NEWS + NORTH] = lcol;
+        }
     }
 
     // hmesh: fine-mesh sizes per direction

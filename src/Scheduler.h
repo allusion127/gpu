@@ -42,6 +42,16 @@ enum class ScheduleType {
     ROD         // insert or move the rod
 };
 
+/// @brief How a critical search terminated.  Published to the result file so a step whose
+/// rod position / boron was accepted without meeting the search tolerance is identifiable
+/// downstream instead of being indistinguishable from a converged one.
+enum class SearchExit {
+    NONE          = 0, // no critical search on this step
+    CONVERGED     = 1, // |k_eff - target| < search tolerance at the accepted point
+    BEST_FALLBACK = 2, // not converged; fell back to the best observed trial point
+    UNCONVERGED   = 3  // not converged and no better observed point was available
+};
+
 struct SearchMemory {
     bool   has_boron_secant  = false;
     double boron_secant_dkdx = 0.0;
@@ -65,6 +75,9 @@ inline constexpr double kSearchLow        = 0.0;
 inline constexpr double kSearchHigh       = 1.0;
 inline constexpr double kSlopeFreezeThres = 0.01;
 inline constexpr double kMinSecantDenom   = 1.0e-12;
+// Rod-step span below which a sign-change bracket is indistinguishable from rod-cusping
+// k_eff noise: bisecting it cannot resolve the root, it only re-proposes the same point.
+inline constexpr double kBracketMinSpan   = 1.0e-6;
 inline constexpr double kBoronProbe       = 50.0;
 inline constexpr double kRodProbe         = 0.25;
 
@@ -96,6 +109,7 @@ struct Schedule {
     double              outlet_temp        = 600.0;  // coolant outlet temperature [K]
     double              mass_flow_rate     = 1000.0; // coolant mass flux [kg/s/m^2]
     bool                use_mass_flow_rate = false;  // true when mass flow rate is explicitly provided
+    double              fuel_temp_rise_scale = 1.0;  // multiplier on tabulated Tfuel-Tcoolant
     std::vector<double> th_profile_power;            // rated power percent breakpoints for TH temperature profiles
     std::vector<double> th_inlet_profile;            // inlet temperature at th_profile_power breakpoints [K]
     std::vector<double> th_outlet_profile;           // outlet temperature at th_profile_power breakpoints [K]
@@ -128,6 +142,7 @@ struct Schedule {
     double     search_hi           = kSearchHigh;
     double     slope_freeze_thres  = kSlopeFreezeThres;
     double     min_secant_denom    = kMinSecantDenom; // Minimum |Δx| or |Δk_eff| for secant update
+    double     bracket_min_span    = kBracketMinSpan; // Below this a bracket is noise, not a root
     double     search_boron_probe  = kBoronProbe;     // Probe step for bootstrapping boron search [ppm]
     double     search_rod_probe    = kRodProbe;       // Probe step for bootstrapping rod search [rod-step]
 
@@ -153,6 +168,12 @@ struct Schedule {
     double search_bracket_lo_residual       = 0.0;
     double search_bracket_hi_x              = 0.0;
     double search_bracket_hi_residual       = 0.0;
+
+    // Termination bookkeeping for the critical search (published to the result file).
+    int    search_exit_status = static_cast<int>(SearchExit::NONE);
+    double search_exit_dk     = 0.0; // |k_eff - target| actually accepted
+    double search_exit_tol    = 0.0; // tolerance that dk was judged against
+    int    search_stall_count = 0;   // flux limit-cycle events survived during this solve
 
     // OUTPUT parameters
     // 1. Calculation options
@@ -235,6 +256,7 @@ struct Schedule {
         search_bracket_lo_residual       = 0.0;
         search_bracket_hi_x              = 0.0;
         search_bracket_hi_residual       = 0.0;
+        ResetSearchExitStatus();
     }
 
     void ApplyTHProfile() {
@@ -295,6 +317,7 @@ struct Schedule {
         geometry.mass_flow_rate()     = mass_flow_rate;
         geometry.use_mass_flow_rate() = use_mass_flow_rate;
         geometry.rated_power()        = rated_power;
+        geometry.fuel_temp_rise_scale() = fuel_temp_rise_scale;
     }
 
     void StartCriticalSearch(SearchMemory& memory, double current_bppm, double rod_max_step) {
@@ -309,6 +332,29 @@ struct Schedule {
             search_current_x                 = std::clamp(memory.has_rod_secant ? memory.rod_secant_x : 1.0,
                                           0.0, rod_max_step);
         }
+    }
+
+    // Drop everything learned about k_eff(x) while keeping the current trial point and the
+    // carried secant slope.  Used when a schedule step re-enters the search after the material
+    // state moved (Xe / T-H / depletion): the old trial residuals were measured on a different
+    // problem, so a bracket or best-point inherited from them is not just stale but actively
+    // misleading -- a bracket that survived a restart could pin the search onto a rod position
+    // it had already left (CY02 step 10: bracket collapsed to [1.808854, 1.808854], every
+    // proposal bisected back onto it, 40+ wasted trials ending 14.8 pcm off critical).
+    void ResetSearchTrials() {
+        search_has_prev    = false;
+        search_has_bracket = false;
+        search_has_best    = false;
+        search_iteration   = 0;
+        search_best_x        = 0.0;
+        search_best_residual = 0.0;
+    }
+
+    void ResetSearchExitStatus() {
+        search_exit_status = static_cast<int>(SearchExit::NONE);
+        search_exit_dk     = 0.0;
+        search_exit_tol    = 0.0;
+        search_stall_count = 0;
     }
 
     [[nodiscard]] double searchResidual(double eigv) const {
@@ -364,6 +410,21 @@ struct Schedule {
             std::swap(search_bracket_lo_x, search_bracket_hi_x);
             std::swap(search_bracket_lo_residual, search_bracket_hi_residual);
         }
+
+        // Restore the defining invariant: a usable bracket has positive span and endpoint
+        // residuals of opposite sign.  Endpoint replacement above is driven by residuals
+        // re-measured at the same rod position across T/H sub-iterations, so a sign flip
+        // inside the k_eff noise band can drag both endpoints onto the same point.  Such a
+        // bracket carries no information and would trap bisection there forever, so drop it
+        // and let the search re-establish one.
+        if (search_bracket_hi_x - search_bracket_lo_x <= 0.0 ||
+            search_bracket_lo_residual * search_bracket_hi_residual >= 0.0)
+            search_has_bracket = false;
+    }
+
+    [[nodiscard]] bool   hasRodBracket() const { return search_has_bracket; }
+    [[nodiscard]] double rodBracketSpan() const {
+        return search_has_bracket ? (search_bracket_hi_x - search_bracket_lo_x) : 0.0;
     }
 
     [[nodiscard]] bool rodBracketNarrowEnough(double k_residual, double keff_tolerance) const {
@@ -384,6 +445,7 @@ struct Schedule {
         bool        clamp_carry       = false;   // restrict carried secant to current_x +-1
         bool        enforce_rod_clamp = false;   // clamp to [0, rod_max_step] and detect a stuck point
         double      rod_max_step      = 0.0;
+        bool        use_bracket       = false;   // fall back to bisection inside a known sign-change bracket
     };
 
     // Shared secant / carry-secant / probe / bracket logic for both critical searches.
@@ -411,12 +473,47 @@ struct Schedule {
         } else {
             const double dx = search_current_x - search_prev_x;
             const double dk = eigv - search_prev_eigv;
-            if (std::abs(dx) < min_secant_denom || std::abs(dk) < min_secant_denom)
+
+            bool secant_ok = std::abs(dx) >= min_secant_denom && std::abs(dk) >= min_secant_denom;
+            if (secant_ok) {
+                *params.secant_dkdx = dk / dx;
+                *params.has_secant  = std::isfinite(*params.secant_dkdx);
+                next_x              = search_current_x - search_relaxation * k_residual * dx / dk;
+                method              = "secant";
+                secant_ok           = std::isfinite(next_x);
+            }
+
+            // Secant/bisection hybrid.  UpdateRodBracket() maintains a sign-change bracket
+            // [lo, hi] that used to be recorded and then never consulted: the proposal was
+            // always the raw secant.  Two consecutive trials separated by less than the
+            // rod-cusping k_eff noise give a badly conditioned slope, so the secant regularly
+            // leaves the bracket (CY02 step 1: bracket [2.1034, 2.1845], proposal 2.2159) or
+            // fails outright, and the caller then treated that as "cannot bracket" and
+            // accepted whatever point it happened to be standing on.  Once the root is known
+            // to be bracketed, reject any proposal that leaves the interval and take the
+            // guaranteed-progress midpoint instead.
+            if (params.use_bracket && search_has_bracket) {
+                const double lo = search_bracket_lo_x;
+                const double hi = search_bracket_hi_x;
+                if (!secant_ok || next_x < lo || next_x > hi) {
+                    const double mid = 0.5 * (lo + hi);
+                    // Only bisect while the midpoint is a genuinely new point.  Once the
+                    // bracket has narrowed to the rod-position resolution the remaining
+                    // k_eff spread is cusping noise, not a resolvable root, and bisecting
+                    // further just re-proposes the point we are standing on.
+                    if (hi - lo > bracket_min_span &&
+                        std::abs(mid - search_current_x) > bracket_min_span) {
+                        method    = secant_ok ? "bisection(secant-left-bracket)"
+                                              : "bisection(secant-failed)";
+                        next_x    = mid;
+                        secant_ok = true;
+                    } else {
+                        search_has_bracket = false; // exhausted: fall back to the raw secant
+                    }
+                }
+            }
+            if (!secant_ok)
                 return false;
-            *params.secant_dkdx = dk / dx;
-            *params.has_secant  = std::isfinite(*params.secant_dkdx);
-            next_x              = search_current_x - search_relaxation * k_residual * dx / dk;
-            method              = "secant";
         }
         if (params.enforce_rod_clamp)
             next_x = std::clamp(next_x, 0.0, params.rod_max_step);
@@ -441,6 +538,7 @@ struct Schedule {
             params.clamp_carry       = true;
             params.enforce_rod_clamp = true;
             params.rod_max_step      = rod_max_step;
+            params.use_bracket       = true;
             return AdvanceSecantSearch(eigv, k_residual, params, next_x, method,
                                        rod_bracket_not_found);
         }
@@ -496,12 +594,15 @@ public:
 
     void SetDefaultTH(const double pressure = 0.0, const double inlet_temp = 0.0,
                       const double outlet_temp = 0.0, const double flow_rate = 0.0,
-                      const bool use_flow_rate = false) {
+                      const bool use_flow_rate = false,
+                      const double fuel_temp_rise_scale = 1.0) {
         if (pressure > 0.0) default_schedule.pressure = pressure;
         if (inlet_temp > 0.0) default_schedule.inlet_temp = inlet_temp;
         if (outlet_temp > 0.0) default_schedule.outlet_temp = outlet_temp;
         if (flow_rate > 0.0) default_schedule.mass_flow_rate = flow_rate;
         default_schedule.use_mass_flow_rate = use_flow_rate && default_schedule.mass_flow_rate > 0.0;
+        if (fuel_temp_rise_scale > 0.0)
+            default_schedule.fuel_temp_rise_scale = fuel_temp_rise_scale;
     }
 
     void SetDefaultTHProfile(const std::vector<double>& power,

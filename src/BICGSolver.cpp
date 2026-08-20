@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <iostream>
 
 #define diag(igs, ige, l)   diag[(l) * _g.ng2() + (ige) * _g.ng() + (igs)]
 #define cc(lr, idir, ig, l) cc[(l) * _g.ng() * NDIRMAX * LR + (ig) * NDIRMAX * LR + (idir) * LR + (lr)]
@@ -21,7 +23,8 @@
 using namespace rasbery;
 
 BICGSolver::BICGSolver(Geometry& g)
-    : _g(g), _diag_ptr(nullptr) {
+    : _g(g), _diag_ptr(nullptr), _cuda(nullptr), _use_cuda(false),
+      _arena(nullptr), _batch_slot(-1) {
     const size_t nv = static_cast<size_t>(_g.ng()) * _g.nxyz();
     const size_t nm = static_cast<size_t>(_g.ng2()) * _g.nxyz();
 
@@ -38,9 +41,76 @@ BICGSolver::BICGSolver(Geometry& g)
     // SSOR preconditioner
     _dinv.assign(nm, 0.0);
     _ssor_tmp.assign(nv, 0.0);
+
+    // Batch mode wins over the per-instance backend: the arena *is* the CUDA
+    // backend for every instance in the batch, and a private one would take a
+    // second copy of the operator onto the device for nothing.
+    //
+    // RASBERY_BATCH_CPU=1 keeps the instance-parallel host orchestration but
+    // solves CMFD on the CPU.  It exists as the control experiment for the
+    // batch mode -- "is this the arena or is this the rest of RASBERY?" -- and
+    // doubles as an in-process multi-instance runner on machines with no GPU.
+    if (rasberyBatchWidth() > 0 && std::getenv("RASBERY_BATCH_CPU") == nullptr) {
+        _arena      = rasberyBatchArena(_g);
+        _batch_slot = _arena->acquireSlot();
+        if (_batch_slot < 0)
+            throw std::runtime_error(
+                "batch mode: no free instance slot (more concurrent instances than --batch-mode M)");
+        _use_cuda = true;
+        return;
+    }
+
+    const char* gpu_env = std::getenv("RASBERY_GPU");
+    if (gpu_env != nullptr && std::string(gpu_env) != "0") {
+        _cuda = std::make_unique<CudaBICGBackend>(_g);
+        if (!_cuda->available())
+            throw std::runtime_error("RASBERY_GPU requested but unavailable: " + _cuda->status());
+        _use_cuda = true;
+        std::cout << "[RASBERY][CUDA] CMFD BiCGSTAB backend: " << _cuda->status() << std::endl;
+    }
 }
 
-BICGSolver::~BICGSolver() = default;
+BICGSolver::~BICGSolver() {
+    if (_arena != nullptr) {
+        // Counters are reported once for the whole arena at teardown, not once
+        // per instance: they are shared device-side tallies.
+        _arena->releaseSlot(_batch_slot);
+        _batch_slot = -1;
+        _arena      = nullptr;
+        return;
+    }
+    if (!_cuda) return;
+    const BackendCounters c = _cuda->counters();
+    std::cout
+        << "[RASBERY][CUDA][BACKEND_COUNTERS] {"
+        << "\"xs_gpu_calls\":" << c.xs_gpu_calls << ','
+        << "\"xs_cpu_fallbacks\":" << c.xs_cpu_fallbacks << ','
+        << "\"cmfd_gpu_calls\":" << c.cmfd_gpu_calls << ','
+        << "\"cmfd_cpu_fallbacks\":" << c.cmfd_cpu_fallbacks << ','
+        << "\"bicg_early_convergence_exits\":"
+        << c.bicg_early_convergence_exits << ','
+        << "\"bicg_restarts\":" << c.bicg_restarts << ','
+        << "\"nodal_gpu_calls\":" << c.nodal_gpu_calls << ','
+        << "\"nodal_cpu_fallbacks\":" << c.nodal_cpu_fallbacks << ','
+        << "\"th_gpu_calls\":" << c.th_gpu_calls << ','
+        << "\"depletion_gpu_calls\":" << c.depletion_gpu_calls << ','
+        << "\"bulk_h2d_calls_during_iteration\":"
+        << c.bulk_h2d_calls_during_iteration << ','
+        << "\"bulk_h2d_skipped_during_iteration\":"
+        << c.bulk_h2d_skipped_during_iteration << ','
+        << "\"bulk_h2d_bytes_during_iteration\":"
+        << c.bulk_h2d_bytes_during_iteration << ','
+        << "\"bulk_d2h_calls_during_iteration\":"
+        << c.bulk_d2h_calls_during_iteration << ','
+        << "\"status_d2h_calls_during_iteration\":"
+        << c.status_d2h_calls_during_iteration << ','
+        << "\"stream_sync_calls_during_iteration\":"
+        << c.stream_sync_calls_during_iteration << ','
+        << "\"graph_launches\":" << c.graph_launches << ','
+        << "\"graph_reinstantiations\":" << c.graph_reinstantiations << ','
+        << "\"graph_fallbacks\":" << c.graph_fallbacks
+        << "}" << std::endl;
+}
 
 // ============================================================
 // Reset: compute initial residual r = b - A*x
@@ -57,6 +127,18 @@ double BICGSolver::reset(const int& ig, const int& l, double* diag, double* cc, 
 }
 
 void BICGSolver::reset(double* diag, double* cc, double* phi, double* src, double& r20) {
+    if (_use_cuda) {
+        // Uploads only. r20 stays on the device, where the inner loop now
+        // tests against it; the host has no use for it and fetching it would
+        // cost the very pipeline drain this path exists to remove.
+        if (_arena != nullptr)
+            _arena->stage(_batch_slot, diag, cc, phi, src);
+        else
+            _cuda->reset(diag, cc, phi, src);
+        r20 = 0.0;
+        return;
+    }
+
     _calpha = 1;
     _crho   = 1;
     _comega = 1;
@@ -75,6 +157,7 @@ void BICGSolver::reset(double* diag, double* cc, double* phi, double* src, doubl
 
 void BICGSolver::facilu(double* diag, double* cc) {
     _diag_ptr      = diag;
+    if (_use_cuda) return;
     const int nxyz = _g.nxyz();
 
     // Precompute inverse of 2x2 diagonal blocks
@@ -152,6 +235,21 @@ void BICGSolver::minv(double* cc, double* b, double* x) {
 // BiCGSTAB Iteration
 // ============================================================
 
+void BICGSolver::solveInner(int nmax, double eps) {
+    if (!_use_cuda)
+        throw std::logic_error("BICGSolver::solveInner is the CUDA-resident inner loop");
+    if (_arena != nullptr) {
+        // In batch mode nothing is launched yet: the arena needs the flux
+        // pointer too, and that only arrives at the observation boundary
+        // (synchronizeCudaFlux), which is the very next statement in the
+        // caller.  Recording the budget here keeps the call sequence -- and so
+        // the CPU-side control flow -- identical to the single-instance path.
+        _arena->setInner(_batch_slot, nmax, eps);
+        return;
+    }
+    _cuda->solveInner(nmax, eps);
+}
+
 void BICGSolver::solve(double* diag, double* cc, double& r20, double* phi, double& r2) {
     int n = _g.nxyz() * _g.ng();
 
@@ -170,6 +268,11 @@ void BICGSolver::solve(double* diag, double* cc, double& r20, double* phi, doubl
     double r0v = milk::dot(static_cast<size_t>(n), _vr0.data(), 1, _vv.data(), 1);
 
     if (abs(r0v) < 1.E-10) {
+        // BiCGSTAB breakdown: phi is not advanced this call. Publish the residual
+        // that actually corresponds to the current phi, otherwise the caller keeps
+        // testing whatever r2 happened to hold before (typically 0 on the first
+        // inner iteration, which reads as "converged").
+        r2 = sqrt(milk::dot(static_cast<size_t>(n), _vr.data(), 1, _vr.data(), 1));
         return;
     }
 
@@ -195,31 +298,58 @@ void BICGSolver::solve(double* diag, double* cc, double& r20, double* phi, doubl
         _vr[i] = _vs[i] - _comega * _vt[i];
     }
 
-    if (r20 != 0.0) {
-        r2 = sqrt(ptt) / r20;
+    // True residual of the updated iterate: r = s - omega*t, which is exactly the
+    // _vr just written above. The previous form used sqrt(ptt) = ||A*M^-1*s||,
+    // which is not a residual at all -- it is the norm of a matrix-vector product
+    // and can stay large while the iterate is already converged (or, with a
+    // badly scaled operator, shrink while the residual does not). It was also
+    // pre-divided by r20 even though the caller divides by r20 again, so the
+    // effective test was ||t|| / ||r0||^2 -- tolerance that silently tracks the
+    // problem scaling. r2 is now the plain absolute residual norm; the single
+    // relative test lives in the caller.
+    r2 = sqrt(milk::dot(static_cast<size_t>(n), _vr.data(), 1, _vr.data(), 1));
+}
+
+void BICGSolver::synchronizeCudaFlux(double* phi) {
+    if (_arena != nullptr) {
+        _arena->solve(_batch_slot, phi);
+        return;
     }
+    if (_use_cuda) _cuda->synchronize(phi);
 }
 
 void BICGSolver::axb(double* diag, double* cc, double* phi, double* aphi) {
-    const int    ng   = _g.ng();
-    const int    ng2  = _g.ng2();
-    const int    nxyz = _g.nxyz();
-    const int    ncc  = ng * NDIRMAX * LR;
+    const int ng   = _g.ng();
+    const int ng2  = _g.ng2();
+    const int nxyz = _g.nxyz();
+    const int ncc  = ng * NDIRMAX * LR;
+
+    // Geometry topology never changes after Initialize: build the compressed per-node
+    // neighbor lists once instead of re-resolving _g.neib on every matvec call.
+    if (_neib_count.empty()) {
+        _neib_count.assign(static_cast<size_t>(nxyz), 0);
+        _neib_node.assign(static_cast<size_t>(nxyz) * NDIRMAX * LR, 0);
+        _neib_slot.assign(static_cast<size_t>(nxyz) * NDIRMAX * LR, 0);
+        for (int l = 0; l < nxyz; ++l) {
+            int nn = 0;
+            for (int idir = 0; idir < NDIRMAX; ++idir)
+                for (int lr = 0; lr < LR; ++lr) {
+                    const int neighbor = _g.neib(lr, idir, l);
+                    if (neighbor != -1) {
+                        _neib_node[static_cast<size_t>(l) * NDIRMAX * LR + nn] = neighbor;
+                        _neib_slot[static_cast<size_t>(l) * NDIRMAX * LR + nn] = idir * LR + lr;
+                        ++nn;
+                    }
+                }
+            _neib_count[static_cast<size_t>(l)] = nn;
+        }
+    }
+
 #pragma omp parallel for schedule(static) if (nxyz > rasbery_omp_gate)
     for (int l = 0; l < nxyz; ++l) {
-        // Neighbor topology is identical for all groups; resolve it once per node.
-        int       nln[NDIRMAX * LR];
-        int       nslot[NDIRMAX * LR];
-        int       nn = 0;
-        for (int idir = 0; idir < NDIRMAX; ++idir)
-            for (int lr = 0; lr < LR; ++lr) {
-                const int neighbor = _g.neib(lr, idir, l);
-                if (neighbor != -1) {
-                    nln[nn]   = neighbor;
-                    nslot[nn] = idir * LR + lr;
-                    ++nn;
-                }
-            }
+        const int     nn     = _neib_count[static_cast<size_t>(l)];
+        const int*    nln    = _neib_node.data() + static_cast<size_t>(l) * NDIRMAX * LR;
+        const int*    nslot  = _neib_slot.data() + static_cast<size_t>(l) * NDIRMAX * LR;
         const double* diag_l = diag + static_cast<size_t>(l) * ng2;
         const double* cc_l   = cc + static_cast<size_t>(l) * ncc;
         const double* phi_l  = phi + static_cast<size_t>(l) * ng;

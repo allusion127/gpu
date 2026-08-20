@@ -56,6 +56,30 @@ __pycache__/
 AGENTS.md
 
 # results, group constants
+# `*.pngbuild/` was one line: a typo that fused `*.png` and `build/` into a
+# pattern matching nothing, so neither was ever ignored.
 *.h5
 *.pdf
 *.png
+build/
+build-*/
+
+# Phase 4 (IISC activation): bulk lattice data and harness-generated outputs
+/test/CrossSections/5_IISC/
+/test/legacy/
+/test/9-1_IISC/**/XS/
+/test/9-1_IISC/**/_runs/
+/test/9-1_IISC/**/plot/
+/test/9-1_IISC/**/*.png
+
+# Benchmark fixture corpus.  test/ is ~3.9 GB of CHIFFON libraries, HGC/BRCH
+# tables and recorded .out/.sum baselines distributed out of band; the
+# consolidated snapshot excludes it for the same reason.  Only C++ contract
+# tests that live beside the fixtures are tracked.
+/test/**
+!/test/*.cpp
+!/test/*.h
+!/test/.gitignore
+
+# Local scratch left by review passes (not an artifact of the build).
+/.cleanup_findings.txt

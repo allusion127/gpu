@@ -1,1 +1,25 @@
+# Repository default, unchanged: vendored trees (highfive/, plog/, nlohmann/,
+# include/Database/) keep LF normalization so this file does not rewrite
+# hundreds of files nobody hashes.
 * text=auto eol=lf
+
+# Byte-exact storage for the authoritative solver source.  Later patterns win.
+#
+# The 40x optimization ledger and the consolidated snapshot pin SHA-256 of the
+# *working-tree* bytes, which are CRLF on this machine:
+#
+#   src/XSSet.cpp                           0305496D...C4D9FD5
+#   tools/test_xe_reconstruct_fast_path.py  9735468F...2BF6E41
+#
+# Under `* text=auto eol=lf` git stores LF and checks out LF, so a clone on
+# Linux (the GPU238 build host) would hand the compiler different bytes and
+# every pinned hash in the ledger would miss.  `-text` disables end-of-line
+# conversion for these paths so a clone reproduces the hashed artifact exactly.
+/CMakeLists.txt         -text
+/src/**                 -text
+/include/chiffon/**     -text
+/include/CompatFormat.h -text
+/include/milk.h         -text
+/tools/**               -text
+/test/*.cpp             -text
+/test/*.h               -text

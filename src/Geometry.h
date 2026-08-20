@@ -9,8 +9,31 @@ namespace rasbery {
 
 /// Node-count threshold above which the per-node solver loops (Nodal, BiCGSTAB matvec, and the
 /// node-reduction loops in XSSet/PPR) run with OpenMP. Below it the fork/join overhead dominates,
-/// so they stay serial. Set once at startup from RASBERY_OMP_GATE (default 1024); see main.cpp.
+/// so they stay serial. Set once at startup from RASBERY_OMP_GATE (default 256); see main.cpp.
 extern int rasbery_omp_gate;
+
+/// Thread-count-independent chunking used by the deterministic node reductions.
+///
+/// `reduction(+:)` combines per-thread partials in an order OpenMP is free to
+/// choose, so a sum over the same data changes in the last bits when
+/// OMP_NUM_THREADS changes. These helpers instead cut the index range into a
+/// FIXED number of chunks (a function of the range length only), let threads
+/// compute the chunk partials in any order, and then add the partials back in
+/// ascending chunk index. The result is bitwise reproducible for any thread
+/// count, while keeping the parallelism.
+constexpr int RASBERY_DET_CHUNK_TARGET = 256;
+
+inline int rasbery_det_chunks(int n) {
+    if (n <= 1) return 1;
+    return (n < RASBERY_DET_CHUNK_TARGET) ? n : RASBERY_DET_CHUNK_TARGET;
+}
+
+/// First index of chunk `c` in a `nchunk`-way even split of [0, n).
+inline int rasbery_det_chunk_begin(int n, int nchunk, int c) {
+    if (c >= nchunk) return n;
+    const long long nn = n;
+    return static_cast<int>((nn * c) / nchunk);
+}
 
 /// @brief Raw input parameters extracted from the JSON deck for Geometry initialization.
 struct GeometryInput {
@@ -89,6 +112,7 @@ private:
     double _outlet_temp        = 600.0; // coolant outlet temperature [K]
     double _mass_flow_rate     = 1.0;   // coolant mass flux [kg/s/m^2]
     double _rated_power        = 1.0;   // rated thermal power [MW]
+    double _fuel_temp_rise_scale = 1.0; // multiplier on tabulated Tfuel-Tcoolant
     bool   _use_mass_flow_rate = false; // use input flow instead of outlet-derived flow
     double _part;                       // geometry fraction (1.0 full, 0.25 quarter)
     double _hzcore;                     // active core axial height [cm]
@@ -263,6 +287,10 @@ public:
     /// @brief Rated thermal power [MW]
     inline double&                     rated_power() { return _rated_power; }
     [[nodiscard]] inline const double& rated_power() const { return _rated_power; }
+
+    /// @brief Scale applied to the tabulated fuel-to-coolant temperature rise
+    inline double& fuel_temp_rise_scale() { return _fuel_temp_rise_scale; }
+    [[nodiscard]] inline const double& fuel_temp_rise_scale() const { return _fuel_temp_rise_scale; }
 
     /// @brief Albedo boundary condition for a given direction and side
     inline double& albedo(int side, int dir) { return _albedo[dir * LR + side]; }

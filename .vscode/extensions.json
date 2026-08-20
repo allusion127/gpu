@@ -1,0 +1,13 @@
+{
+  "recommendations": [
+    "openai.chatgpt",
+    "ms-vscode.cpptools",
+    "ms-vscode.cmake-tools",
+    "ms-python.python",
+    "h5web.vscode-h5web",
+    "ReprEng.csv"
+  ],
+  "unwantedRecommendations": [
+    "llvm-vs-code-extensions.vscode-clangd"
+  ]
+}

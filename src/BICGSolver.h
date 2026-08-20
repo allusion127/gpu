@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Geometry.h"
+#include "CudaBICGBackend.h"
 #include "milk.h"
 
 namespace rasbery {
@@ -54,11 +55,28 @@ private:
     /// @brief SSOR: inverse of 2x2 diagonal blocks [nxyz * ng2]
     milk::Vector<double> _dinv;
 
+    /// @brief Compressed per-node neighbor lists for the matvec; geometry-static,
+    /// built lazily on the first axb call.
+    std::vector<int> _neib_count;
+    std::vector<int> _neib_node;
+    std::vector<int> _neib_slot;
+
     /// @brief SSOR: forward sweep workspace [nxyz * ng]
     milk::Vector<double> _ssor_tmp;
 
     /// @brief Pointer to current diagonal (saved from facilu)
     double* _diag_ptr;
+
+    /// Optional CUDA-resident block-Jacobi BiCGSTAB backend.
+    std::unique_ptr<CudaBICGBackend> _cuda;
+    bool                             _use_cuda;
+
+    /// Multi-instance batch mode: instead of owning a private backend, this
+    /// solver holds one slot of the process-wide arena and its CMFD solves
+    /// ride along with the other instances' solves in one grid.  `_arena` and
+    /// `_cuda` are mutually exclusive.
+    CudaBatchArena* _arena;
+    int             _batch_slot;
 
 public:
     /// @brief Construct a new BICGStab object
@@ -104,6 +122,19 @@ public:
     /// @param r2 the final residual
     void solve(double* diag, double* cc, double& r20, double* phi, double& r2);
 
+    /// @brief Run the whole inner BiCGSTAB loop on the device (CUDA path only)
+    ///
+    /// Enqueues 1 + @p nmax iterations whose relative exit test
+    /// ||r||/||r0|| < @p eps is evaluated on the GPU, so the loop costs one
+    /// graph launch and no host round trip. The CPU path keeps driving the
+    /// same loop from solve() in the caller.
+    /// @param nmax the extra iteration budget (_nmaxbicg)
+    /// @param eps the relative residual tolerance (_epsbicg)
+    void solveInner(int nmax, double eps);
+
+    /// Copy the resident CUDA flux to the host at a CMFD observation boundary.
+    void synchronizeCudaFlux(double* phi);
+
     /// @brief calculate Axb in the BICGStab calculation
     /// @param diag the diagonal matrix
     /// @param cc the coupling coefficient
@@ -119,5 +150,10 @@ public:
     /// @param cc the coupling coefficient
     /// @param phi the flux
     double axb(const int& ig, const int& l, double* diag, double* cc, double* phi);
+
+    [[nodiscard]] bool usingCuda() const { return _use_cuda; }
+    [[nodiscard]] BackendCounters cudaCounters() const {
+        return _cuda ? _cuda->counters() : BackendCounters{};
+    }
 };
 }

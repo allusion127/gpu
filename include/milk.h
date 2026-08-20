@@ -119,9 +119,6 @@ inline void copy(const T* src, T* dst, std::size_t count) {
 
 template <typename T>
 inline void axpy(std::size_t count, T alpha, const T* x, int incx, T* y, int incy) {
-    if (incx <= 0 || incy <= 0) {
-        throw std::invalid_argument("milk: BLAS increments must be positive");
-    }
     for (std::size_t index = 0; index < count; ++index) {
         y[index * static_cast<std::size_t>(incy)] += alpha * x[index * static_cast<std::size_t>(incx)];
     }
@@ -129,9 +126,6 @@ inline void axpy(std::size_t count, T alpha, const T* x, int incx, T* y, int inc
 
 template <typename T>
 inline void copy_strided(std::size_t count, const T* src, int incx, T* dst, int incy) {
-    if (incx <= 0 || incy <= 0) {
-        throw std::invalid_argument("milk: BLAS increments must be positive");
-    }
     for (std::size_t index = 0; index < count; ++index) {
         dst[index * static_cast<std::size_t>(incy)] = src[index * static_cast<std::size_t>(incx)];
     }
@@ -139,10 +133,6 @@ inline void copy_strided(std::size_t count, const T* src, int incx, T* dst, int 
 
 template <typename T>
 inline T dot(const T* lhs, int incx, const T* rhs, int incy, std::size_t size) {
-    if (incx <= 0 || incy <= 0) {
-        throw std::invalid_argument("milk: BLAS increments must be positive");
-    }
-
     T sum = T{};
     for (std::size_t index = 0; index < size; ++index) {
         sum += lhs[index * static_cast<std::size_t>(incx)] * rhs[index * static_cast<std::size_t>(incy)];
@@ -934,6 +924,99 @@ public:
         return max_sum;
     }
 
+    /// @brief Moore-Penrose pseudo-inverse via one-sided Jacobi SVD.
+    /// Robust to rank-deficient / collinear / badly-scaled columns: one-sided Jacobi computes the
+    /// SVD to high relative accuracy even when column norms span many orders (so no per-column
+    /// pre-scaling is needed), and singular values below `rcond * sigma_max` are treated as zero,
+    /// giving the minimum-norm least-squares solution. For an (m x n) matrix A returns A^+ (n x m);
+    /// the least-squares solution of A x = b is x = A^+ b.
+    /// @param rcond Relative singular-value cutoff for numerical rank (default 1e-12).
+    /// @param maxRank when >= 0, keep only the `maxRank` largest singular
+    /// values regardless of `rcond`. A fixed rank holds the model complexity
+    /// constant across fits; a relative threshold lets it vary with the
+    /// spectrum, which shows up as terms switching on and off between keys.
+    [[nodiscard]] Matrix pseudoInverse(double rcond = 1.0e-12, int maxRank = -1) const
+        requires std::floating_point<T> {
+        // Orthogonalize columns, so work on the tall orientation (m >= n) and transpose the
+        // result for wide inputs: A^+ = (A^T)^{+T}.
+        const bool wide = _rows < _cols;
+        Matrix      a   = wide ? transpose() : *this; // m x n, m >= n
+        const std::size_t m = a.rows(), n = a.cols();
+        Matrix v = identity(n);
+        if (m == 0 || n == 0)
+            return Matrix(_cols, _rows);
+
+        // One-sided Jacobi sweeps: right-rotate column pairs (p, q) to mutual orthogonality.
+        for (int sweep = 0; sweep < 60; ++sweep) {
+            double off = 0.0;
+            for (std::size_t p = 0; p < n; ++p) {
+                for (std::size_t q = p + 1; q < n; ++q) {
+                    double app = 0.0, aqq = 0.0, apq = 0.0;
+                    for (std::size_t i = 0; i < m; ++i) {
+                        const double aip = a(i, p), aiq = a(i, q);
+                        app += aip * aip;
+                        aqq += aiq * aiq;
+                        apq += aip * aiq;
+                    }
+                    if (app * aqq > 0.0)
+                        off = std::max(off, std::abs(apq) / std::sqrt(app * aqq));
+                    if (std::abs(apq) <= 1.0e-300)
+                        continue;
+                    const double tau = (aqq - app) / (2.0 * apq);
+                    const double t   = (tau >= 0.0 ? 1.0 : -1.0) / (std::abs(tau) + std::sqrt(1.0 + tau * tau));
+                    const double cs  = 1.0 / std::sqrt(1.0 + t * t);
+                    const double sn  = cs * t;
+                    for (std::size_t i = 0; i < m; ++i) {
+                        const double aip = a(i, p), aiq = a(i, q);
+                        a(i, p) = static_cast<T>(cs * aip - sn * aiq);
+                        a(i, q) = static_cast<T>(sn * aip + cs * aiq);
+                    }
+                    for (std::size_t i = 0; i < n; ++i) {
+                        const double vip = v(i, p), viq = v(i, q);
+                        v(i, p) = static_cast<T>(cs * vip - sn * viq);
+                        v(i, q) = static_cast<T>(sn * vip + cs * viq);
+                    }
+                }
+            }
+            if (off < 1.0e-15)
+                break;
+        }
+
+        // Column norms of the rotated matrix are the singular values; its columns are sigma_j * U_j.
+        std::vector<double> sigma(n, 0.0);
+        double              smax = 0.0;
+        for (std::size_t j = 0; j < n; ++j) {
+            double s2 = 0.0;
+            for (std::size_t i = 0; i < m; ++i)
+                s2 += static_cast<double>(a(i, j)) * static_cast<double>(a(i, j));
+            sigma[j] = std::sqrt(s2);
+            smax     = std::max(smax, sigma[j]);
+        }
+        double cutoff = rcond * smax;
+        if (maxRank >= 0) {
+            std::vector<double> sorted(sigma);
+            std::sort(sorted.begin(), sorted.end(), std::greater<double>());
+            const std::size_t keep = static_cast<std::size_t>(maxRank);
+            cutoff = keep == 0                 ? std::numeric_limits<double>::infinity()
+                     : keep >= sorted.size()   ? -1.0
+                                               : sorted[keep];
+        }
+
+        // A^+ = V Sigma^+ U^T, with U_j = a_col_j / sigma_j, dropping sigma_j <= cutoff:
+        //   A^+(k,i) = sum_j  V(k,j) * a(i,j) / sigma_j^2   over kept j.
+        Matrix pinv(n, m);
+        for (std::size_t k = 0; k < n; ++k) {
+            for (std::size_t i = 0; i < m; ++i) {
+                double acc = 0.0;
+                for (std::size_t j = 0; j < n; ++j)
+                    if (sigma[j] > cutoff && std::isfinite(cutoff))
+                        acc += static_cast<double>(v(k, j)) * static_cast<double>(a(i, j)) / (sigma[j] * sigma[j]);
+                pinv(k, i) = static_cast<T>(acc);
+            }
+        }
+        return wide ? pinv.transpose() : pinv;
+    }
+
     /// @brief Return the inverse of a square matrix.
     [[nodiscard]] Matrix inverse() const
         requires std::floating_point<T>;
@@ -1411,13 +1494,17 @@ struct CramWorkspace {
     void resize(std::size_t size) {
         base_cols.resize(size);
         base_vals.resize(size);
+        base_diag.resize(size);
+        pole_diag.resize(size);
         rhs.resize(size);
         x.resize(size);
         accum.resize(size);
     }
 
-    std::vector<std::vector<std::size_t>> base_cols;
-    std::vector<std::vector<complex_t>>   base_vals;
+    std::vector<std::vector<std::size_t>> base_cols; ///< off-diagonal column indices per row
+    std::vector<std::vector<complex_t>>   base_vals; ///< off-diagonal values per row
+    std::vector<complex_t>                base_diag; ///< diagonal entry per row (pole-independent)
+    std::vector<complex_t>                pole_diag; ///< base_diag - theta[pole] per row, rebuilt per pole
     std::vector<complex_t>                rhs;
     std::vector<complex_t>                x;
     std::vector<complex_t>                accum;
@@ -1588,14 +1675,23 @@ public:
         workspace.resize(n);
         std::fill(workspace.accum.begin(), workspace.accum.end(), complex_t{0.0, 0.0});
 
+        // Split the diagonal from the off-diagonal sparse row data once: the diagonal is
+        // Gauss-Seidel-invariant per pole, so each sweep multiplies by a precomputed
+        // reciprocal instead of rescanning the row and dividing (complex division is the
+        // single hottest depletion libcall).
         for (std::size_t row = first; row < n; ++row) {
             auto& row_cols = workspace.base_cols[row];
             auto& row_vals = workspace.base_vals[row];
             row_cols.clear();
             row_vals.clear();
+            workspace.base_diag[row] = complex_t{0.0, 0.0};
             for (std::size_t col = first; col < n; ++col) {
                 const double value = static_cast<double>(A(row, col));
                 if (value == 0.0) continue;
+                if (col == row) {
+                    workspace.base_diag[row] = complex_t{matrix_sgn * value * dt, 0.0};
+                    continue;
+                }
                 row_cols.push_back(col);
                 row_vals.emplace_back(matrix_sgn * value * dt, 0.0);
             }
@@ -1604,15 +1700,11 @@ public:
         for (std::size_t pole = 0; pole < pole_count; ++pole) {
             double rhs_norm = 0.0;
             for (std::size_t row = first; row < n; ++row) {
-                complex_t   diag = -theta[pole];
-                const auto& cols = workspace.base_cols[row];
-                const auto& vals = workspace.base_vals[row];
-                for (std::size_t i = 0; i < cols.size(); ++i)
-                    if (cols[i] == row) diag += vals[i];
-
+                const complex_t diag = workspace.base_diag[row] - theta[pole];
                 if (detail::magnitude(diag) <= diag_tol) {
                     throw std::runtime_error("milk: CRAM Gauss-Seidel zero diagonal");
                 }
+                workspace.pole_diag[row] = diag;
 
                 workspace.rhs[row] = complex_t(static_cast<double>(N[row]), 0.0) * alpha[pole];
                 workspace.x[row]   = workspace.rhs[row] / diag;
@@ -1623,30 +1715,19 @@ public:
             bool converged = false;
             for (int iter = 0; iter < max_iter; ++iter) {
                 for (std::size_t row = first; row < n; ++row) {
-                    complex_t diag = -theta[pole];
-                    complex_t sum  = workspace.rhs[row];
+                    complex_t sum = workspace.rhs[row];
 
                     const auto& cols = workspace.base_cols[row];
                     const auto& vals = workspace.base_vals[row];
-                    for (std::size_t i = 0; i < cols.size(); ++i) {
-                        const std::size_t col = cols[i];
-                        if (col == row)
-                            diag += vals[i];
-                        else
-                            sum -= vals[i] * workspace.x[col];
-                    }
+                    for (std::size_t i = 0; i < cols.size(); ++i)
+                        sum -= vals[i] * workspace.x[cols[i]];
 
-                    if (detail::magnitude(diag) <= diag_tol) {
-                        throw std::runtime_error("milk: CRAM Gauss-Seidel zero diagonal");
-                    }
-
-                    const complex_t new_value = sum / diag;
-                    workspace.x[row]          = new_value;
+                    workspace.x[row] = sum / workspace.pole_diag[row];
                 }
 
                 double max_residual = 0.0;
                 for (std::size_t row = first; row < n; ++row) {
-                    complex_t ax = -theta[pole] * workspace.x[row];
+                    complex_t ax = (workspace.base_diag[row] - theta[pole]) * workspace.x[row];
 
                     const auto& cols = workspace.base_cols[row];
                     const auto& vals = workspace.base_vals[row];
