@@ -3,6 +3,7 @@
 #include "Importer.h"
 
 #include "Driver.h"
+#include "XSTiming.h"
 #include "plog/Appenders/ConsoleAppender.h"
 #include "plog/Formatters/TxtFormatter.h"
 #include "plog/Init.h"
@@ -361,6 +362,7 @@ int main(int argc, char* argv[]) {
         }
 
         rasbery::rasberyReleaseBatchArena();
+        rasbery::xsphase::report(std::cout);
         const auto hdf5_stats = Chiffon::GetHdf5LockStats();
         std::cout << "[RASBERY][HDF5][LOCK] {\"acquires\":"
                   << hdf5_stats.acquisitions << ",\"wait_ms\":"
@@ -385,6 +387,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    rasbery::xsphase::report(std::cout);
     const auto hdf5_stats = Chiffon::GetHdf5LockStats();
     std::cout << "[RASBERY][HDF5][LOCK] {\"acquires\":"
               << hdf5_stats.acquisitions << ",\"wait_ms\":"

@@ -1,6 +1,7 @@
 #include "XSSet.h"
 
 #include "Importer.h"
+#include "XSTiming.h"
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -2295,6 +2296,8 @@ void XSSet::UpdateFlatXS(const XSUpdateOptions& options) {
     const int  nxyz       = _g.nxyz();
     const bool all_nodes  = options.nodes.empty();
     const int  node_count = all_nodes ? nxyz : static_cast<int>(options.nodes.size());
+    xsphase::Scope flatxs_scope(xsphase::tallies().flatxs,
+                                static_cast<std::uint64_t>(node_count));
     _boron_dmod_average   = FuelVolumeAverageDmod(_g);
 
     // Rodded nodes cost far more than unrodded ones (two full Chiffon fills + rod
@@ -2304,10 +2307,12 @@ void XSSet::UpdateFlatXS(const XSUpdateOptions& options) {
         const int l = all_nodes ? i : options.nodes[i];
 
         if (UsesRodXS(l)) {
+            xsphase::Scope rod_scope(xsphase::tallies().flatxs_rodded, 1);
             FillRodNodeXS(l);
             ApplySpectralHistoryToNode(l);
             ReconstructNode(static_cast<size_t>(l));
         } else {
+            xsphase::Scope unrod_scope(xsphase::tallies().flatxs_unrodded, 1);
             UpdateUnroddedNodeXS(l);
         }
     }
@@ -2846,6 +2851,8 @@ double XSSet::NodeHeavyMetalMassGrams(int l) const {
 // Burnup update
 
 void XSSet::UpdateBurnup(double dt, double power) {
+    xsphase::Scope burnup_scope(xsphase::tallies().update_burnup,
+                                static_cast<std::uint64_t>(_g.nxyz()));
     const int     ng   = _g.ng();
     const int     nxyz = _g.nxyz();
     double* const flux = _g.Phif();
@@ -2947,6 +2954,9 @@ double XSSet::UpdateEquilibriumXenon(double power, double relax) {
     if (depDecay.size() == 0 || power <= 0.0)
         return 0.0;
 
+    xsphase::Scope eqxe_scope(xsphase::tallies().eqxe,
+                              static_cast<std::uint64_t>(_g.nxyz()));
+
     const int    ng          = _g.ng();
     const int    nxyz        = _g.nxyz();
     const size_t niso        = Isotope::niso;
@@ -2984,6 +2994,7 @@ double XSSet::UpdateEquilibriumXenon(double power, double relax) {
                 continue;
 
             const double invflux = 1.0 / raw_sumflux;
+            xsphase::Scope condense_scope(xsphase::tallies().eqxe_condense, 1);
             for (size_t iso = 0; iso < niso; ++iso) {
                 double* dst = ws_tls.condensed.data() + iso * N_XS_SCALAR;
                 for (size_t xt = 0; xt < N_XS_SCALAR; ++xt) {
@@ -3027,10 +3038,15 @@ double XSSet::UpdateEquilibriumXenon(double power, double relax) {
             _iden[iXe135m * static_cast<size_t>(nxyz) + static_cast<size_t>(l)] =
                 ws_tls.iden[iXe135m];
 
+            condense_scope.stop();
+
             // Only fuel-node Xe-chain densities changed.  Reconstruct this
             // node while its data is hot instead of opening a second
             // all-node pass after the equilibrium update.
-            ReconstructNode(static_cast<size_t>(l));
+            {
+                xsphase::Scope recon_scope(xsphase::tallies().eqxe_recon, 1);
+                ReconstructNode(static_cast<size_t>(l));
+            }
         }
     }
     return max_change;
@@ -3645,6 +3661,8 @@ void XSSet::SetRod(const std::map<std::string, double>& insertions) {
 }
 
 void XSSet::SetBoron(double bppm) {
+    xsphase::Scope boron_scope(xsphase::tallies().set_boron,
+                               static_cast<std::uint64_t>(_g.nxyz()));
     const int nxyz = _g.nxyz();
 
     for (int l = 0; l < nxyz; ++l)
@@ -3914,6 +3932,8 @@ void XSSet::NormalizeFluxSign() {
 }
 
 double XSSet::UpdateTH(double power_rate) {
+    xsphase::Scope th_scope(xsphase::tallies().update_th,
+                            static_cast<std::uint64_t>(_g.nxyz()));
     const int ng         = _g.ng();
     const int nxyz       = _g.nxyz();
     auto&     node_power = _node_power_scratch;
