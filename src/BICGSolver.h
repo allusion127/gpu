@@ -158,6 +158,7 @@ public:
     double axb(const int& ig, const int& l, double* diag, double* cc, double* phi);
 
     [[nodiscard]] bool usingCuda() const { return _use_cuda; }
+    [[nodiscard]] CudaBatchArena* arena() const { return _arena; }
     [[nodiscard]] BackendCounters cudaCounters() const {
         return _cuda ? _cuda->counters() : BackendCounters{};
     }

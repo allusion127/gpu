@@ -62,6 +62,7 @@ void CudaBatchArena::setInner(int, int, double) {
 void CudaBatchArena::solve(int, double*) {
     throw std::runtime_error(_impl->status);
 }
+void CudaBatchArena::pinHost(const void*, size_t) const {}
 void CudaBatchArena::stageSweeps(int, const CmfdSweepIO&) {
     throw std::runtime_error(_impl->status);
 }

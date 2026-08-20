@@ -236,6 +236,25 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
         }
     }
 
+    // Page-lock every buffer the sweep launcher memcpys, once per instance:
+    // pageable async copies stage through the driver ON the launcher's
+    // critical path, pinned ones run at bus speed and actually overlap.
+    if (!_sweep_pinned && _ls->arena() != nullptr) {
+        auto*        ar   = _ls->arena();
+        const size_t nd   = static_cast<size_t>(nxyz);
+        const size_t nn   = static_cast<size_t>(_g.ngxyz());
+        ar->pinHost(_diag, static_cast<size_t>(_g.ng2()) * nd * sizeof(double));
+        ar->pinHost(_cc, static_cast<size_t>(ng) * NEWSBT * nd * sizeof(double));
+        ar->pinHost(_src, nn * sizeof(double));
+        ar->pinHost(_psi, nd * sizeof(double));
+        ar->pinHost(flux, nn * sizeof(double));
+        ar->pinHost(_udiag.data(), _udiag.size() * sizeof(double));
+        ar->pinHost(_sweep_chif.data(), _sweep_chif.size() * sizeof(double));
+        ar->pinHost(_sweep_xsnf.data(), _sweep_xsnf.size() * sizeof(double));
+        ar->pinHost(_sweep_vol.data(), _sweep_vol.size() * sizeof(double));
+        _sweep_pinned = true;
+    }
+
     double reigv  = 1. / eigv;
     double reigvs = (_eshift != 0.0) ? 1. / (eigv + _eshift) : 0.0;
     int    iout = 0, icmfd = 0;

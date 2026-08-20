@@ -1807,6 +1807,13 @@ void CudaBatchArena::setInner(int m, int nmax, double eps) {
 
 void CudaBatchArena::solve(int m, double* out_phi) { solveCommon(m, out_phi, 0); }
 
+void CudaBatchArena::pinHost(const void* p, size_t bytes) const {
+    if (p == nullptr || bytes == 0) return;
+    const cudaError_t rc =
+        cudaHostRegister(const_cast<void*>(p), bytes, cudaHostRegisterDefault);
+    if (rc != cudaSuccess) cudaGetLastError(); // already registered / exotic host
+}
+
 void CudaBatchArena::stageSweeps(int m, const CmfdSweepIO& io) {
     auto& sl      = _impl->core.slot[static_cast<size_t>(m)];
     sl.host_chif  = io.chif;

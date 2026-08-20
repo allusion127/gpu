@@ -52,6 +52,9 @@ protected:
     /// drive() for the device-resident sweep path (RASBERY_GPU_CMFD_SWEEP)
     std::vector<double> _sweep_chif, _sweep_xsnf, _sweep_vol;
 
+    /// @brief one-shot page-locking of the buffers the sweep path uploads
+    bool _sweep_pinned = false;
+
     /// @brief the device-resident sweep loop; true when it owned the whole
     /// drive, false when the caller must run the host loop from scratch
     bool driveDeviceSweeps(double& eigv, double* flux, double& errl2);

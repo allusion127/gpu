@@ -198,6 +198,13 @@ public:
         double gammad = 0, gamman = 0, err_acc = 0;
     };
 
+    /// Page-lock a host buffer the arena will repeatedly memcpy.  Pageable
+    /// cudaMemcpyAsync stages through the driver and blocks the launcher;
+    /// pinned transfers run at bus speed and genuinely overlap.  Idempotent
+    /// (an already-registered range is left alone); never unregistered --
+    /// callers pin long-lived per-instance buffers once.
+    void pinHost(const void* p, size_t bytes) const;
+
     /// Record one drive()'s sweep inputs for @p slot.  No CUDA call, no lock.
     void stageSweeps(int slot, const CmfdSweepIO& io);
 
