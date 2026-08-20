@@ -4,6 +4,7 @@
 #include "highfive/highfive.hpp"
 
 #include "Model.h"
+#include "Hdf5Guard.h"
 
 #include <string>
 #include <vector>
@@ -57,9 +58,10 @@ private:
 
 public:
     IO(Geometry& g, XSSet& xs, Scheduler& sched);
-    ~IO() = default;
+    ~IO();
 
     const std::string& input_dir() const { return _input_dir; }
+    const std::string& xs_path() const { return _xs_path; }
     const std::string& restart_path() const { return _restart_path; }
     bool has_restart() const { return !_restart_path.empty(); }
     double restart_efpd() const { return _restart_efpd; }

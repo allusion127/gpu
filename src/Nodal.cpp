@@ -47,6 +47,10 @@ Nodal::Nodal(Geometry& g, XSSet& xs)
     _m264    = new double[_nxyz * NDIRMAX * _ng];
     _diagDI  = new double[_nxyz * NDIRMAX * _ng];
     _diagD   = new double[_nxyz * NDIRMAX * _ng];
+    _constant_xsrf = new double[_nxyz * _ng];
+    _constant_xsdf = new double[_nxyz * _ng];
+    std::fill_n(_constant_xsrf, _nxyz * _ng, std::numeric_limits<double>::quiet_NaN());
+    std::fill_n(_constant_xsdf, _nxyz * _ng, std::numeric_limits<double>::quiet_NaN());
     _dsncff2 = new double[_nxyz * NDIRMAX * _ng];
     _dsncff4 = new double[_nxyz * NDIRMAX * _ng];
     _dsncff6 = new double[_nxyz * NDIRMAX * _ng];
@@ -59,53 +63,42 @@ Nodal::Nodal(Geometry& g, XSSet& xs)
 }
 
 Nodal::~Nodal() {
-    if (_trlcff0 != nullptr)
-        delete[] _trlcff0;
-    if (_trlcff1 != nullptr)
-        delete[] _trlcff1;
-    if (_trlcff2 != nullptr)
-        delete[] _trlcff2;
-    if (_eta1 != nullptr)
-        delete[] _eta1;
-    if (_eta2 != nullptr)
-        delete[] _eta2;
-    if (_m260 != nullptr)
-        delete[] _m260;
-    if (_m251 != nullptr)
-        delete[] _m251;
-    if (_m253 != nullptr)
-        delete[] _m253;
-    if (_m262 != nullptr)
-        delete[] _m262;
-    if (_m264 != nullptr)
-        delete[] _m264;
-    if (_diagDI != nullptr)
-        delete[] _diagDI;
-    if (_diagD != nullptr)
-        delete[] _diagD;
-    if (_dsncff2 != nullptr)
-        delete[] _dsncff2;
-    if (_dsncff4 != nullptr)
-        delete[] _dsncff4;
-    if (_dsncff6 != nullptr)
-        delete[] _dsncff6;
-    if (_mu != nullptr)
-        delete[] _mu;
-    if (_tau != nullptr)
-        delete[] _tau;
-    if (_matM != nullptr)
-        delete[] _matM;
-    if (_matMI != nullptr)
-        delete[] _matMI;
-    if (_matMs != nullptr)
-        delete[] _matMs;
-    if (_matMf != nullptr)
-        delete[] _matMf;
+    delete[] _trlcff0;
+    delete[] _trlcff1;
+    delete[] _trlcff2;
+    delete[] _eta1;
+    delete[] _eta2;
+    delete[] _m260;
+    delete[] _m251;
+    delete[] _m253;
+    delete[] _m262;
+    delete[] _m264;
+    delete[] _diagDI;
+    delete[] _diagD;
+    delete[] _constant_xsrf;
+    delete[] _constant_xsdf;
+    delete[] _dsncff2;
+    delete[] _dsncff4;
+    delete[] _dsncff6;
+    delete[] _mu;
+    delete[] _tau;
+    delete[] _matM;
+    delete[] _matMI;
+    delete[] _matMs;
+    delete[] _matMf;
 }
 
 void Nodal::updateConstant(const int& lk) {
+    const int lkg0 = lk * _ng;
+    bool unchanged = true;
+    for (int ig = 0; ig < _ng; ++ig) {
+        unchanged = unchanged &&
+                    _constant_xsrf[lkg0 + ig] == xs.xsrf(ig, lk) &&
+                    _constant_xsdf[lkg0 + ig] == xs.xsdf(ig, lk);
+    }
+    if (unchanged) return;
+
     int lkd0 = lk * NDIRMAX;
-    int lkg0 = lk * _ng;
 
     for (int idir = 0; idir < NDIRMAX; idir++) {
         int lkd = lkd0 + idir;
@@ -154,6 +147,11 @@ void Nodal::updateConstant(const int& lk) {
             diagD(ig, lkd)  = 4 * xs.xsdf(ig, lk) / (_g.hmesh(idir, lk) * _g.hmesh(idir, lk));
             diagDI(ig, lkd) = 1.0 / diagD(ig, lkd);
         }
+    }
+
+    for (int ig = 0; ig < _ng; ++ig) {
+        _constant_xsrf[lkg0 + ig] = xs.xsrf(ig, lk);
+        _constant_xsdf[lkg0 + ig] = xs.xsdf(ig, lk);
     }
 }
 
@@ -371,7 +369,7 @@ void Nodal::calculateJnet(const int& ls) {
     }
 }
 
-void Nodal::calculateJnet1n(const int& ls, const int& lr, const float& alb) {
+void Nodal::calculateJnet1n(const int& ls, const int& lr, const double& alb) {
     int lk   = _g.lklr(lr, ls);
     int idir = _g.idirlr(lr, ls);
     // int sgn = sgnlr[lsfclr + lr];
@@ -507,20 +505,18 @@ void Nodal::calculateJnet2n(const int& ls) {
     int lkdl  = lkl * NDIRMAX + idirl;
     int lkdr  = lkr * NDIRMAX + idirr;
 
-    double adf[2][LR], diagDj[2][LR], tempz[2][2], tempzI[2][2], zeta1[2][2], zeta2[2], bfc[2], mat1g[2][2];
+    double diagDj[2][LR], tempz[2][2], tempzI[2][2], zeta1[2][2], zeta2[2], bfc[2], mat1g[2][2];
 
     for (int ig = 0; ig < _ng; ig++) {
-        adf[ig][LEFT]     = xs.xsadf(ig, lkl);
-        adf[ig][RIGHT]    = xs.xsadf(ig, lkr);
         diagDj[ig][LEFT]  = 0.5 * _g.hmesh(idirl, lkl) * diagD(ig, lkdl);
         diagDj[ig][RIGHT] = 0.5 * _g.hmesh(idirr, lkr) * diagD(ig, lkdr);
     }
 
     // zeta1 = (mur + I + taur)_inv * (mul + I + taul)
-    tempz[0][0] = (mu(0, 0, lkdr) + tau(0, 0, lkdr) + 1) * 1;
-    tempz[1][0] = (mu(1, 0, lkdr) + tau(1, 0, lkdr)) * 1;
-    tempz[0][1] = (mu(0, 1, lkdr) + tau(0, 1, lkdr)) * 1;
-    tempz[1][1] = (mu(1, 1, lkdr) + tau(1, 1, lkdr) + 1) * 1;
+    tempz[0][0] = mu(0, 0, lkdr) + tau(0, 0, lkdr) + 1;
+    tempz[1][0] = mu(1, 0, lkdr) + tau(1, 0, lkdr);
+    tempz[0][1] = mu(0, 1, lkdr) + tau(0, 1, lkdr);
+    tempz[1][1] = mu(1, 1, lkdr) + tau(1, 1, lkdr) + 1;
 
     double rdet  = 1 / (tempz[0][0] * tempz[1][1] - tempz[1][0] * tempz[0][1]);
     tempzI[0][0] = rdet * tempz[1][1];
@@ -528,10 +524,10 @@ void Nodal::calculateJnet2n(const int& ls) {
     tempzI[0][1] = -rdet * tempz[0][1];
     tempzI[1][1] = rdet * tempz[0][0];
 
-    tempz[0][0] = (mu(0, 0, lkdl) + tau(0, 0, lkdl) + 1) * 1;
-    tempz[1][0] = (mu(1, 0, lkdl) + tau(1, 0, lkdl)) * 1;
-    tempz[0][1] = (mu(0, 1, lkdl) + tau(0, 1, lkdl)) * 1;
-    tempz[1][1] = (mu(1, 1, lkdl) + tau(1, 1, lkdl) + 1) * 1;
+    tempz[0][0] = mu(0, 0, lkdl) + tau(0, 0, lkdl) + 1;
+    tempz[1][0] = mu(1, 0, lkdl) + tau(1, 0, lkdl);
+    tempz[0][1] = mu(0, 1, lkdl) + tau(0, 1, lkdl);
+    tempz[1][1] = mu(1, 1, lkdl) + tau(1, 1, lkdl) + 1;
 
     zeta1[0][0] = tempzI[0][0] * tempz[0][0] + tempzI[1][0] * tempz[0][1];
     zeta1[1][0] = tempzI[0][0] * tempz[1][0] + tempzI[1][0] * tempz[1][1];
@@ -539,7 +535,7 @@ void Nodal::calculateJnet2n(const int& ls) {
     zeta1[1][1] = tempzI[0][1] * tempz[1][0] + tempzI[1][1] * tempz[1][1];
 
     for (int ig = 0; ig < _ng; ig++) {
-        bfc[ig] = adf[ig][RIGHT] * (dsncff2(ig, lkdr) + dsncff4(ig, lkdr) + dsncff6(ig, lkdr) + flux(ig, lkr) + matMI(0, ig, lkr) * sgnr * trlcff1(0, lkdr) + matMI(1, ig, lkr) * sgnr * trlcff1(1, lkdr)) + adf[ig][LEFT] * (-dsncff2(ig, lkdl) - dsncff4(ig, lkdl) - dsncff6(ig, lkdl) - flux(ig, lkl) + matMI(0, ig, lkl) * sgnl * trlcff1(0, lkdl) + matMI(1, ig, lkl) * sgnl * trlcff1(1, lkdl));
+        bfc[ig] = (dsncff2(ig, lkdr) + dsncff4(ig, lkdr) + dsncff6(ig, lkdr) + flux(ig, lkr) + matMI(0, ig, lkr) * sgnr * trlcff1(0, lkdr) + matMI(1, ig, lkr) * sgnr * trlcff1(1, lkdr)) + (-dsncff2(ig, lkdl) - dsncff4(ig, lkdl) - dsncff6(ig, lkdl) - flux(ig, lkl) + matMI(0, ig, lkl) * sgnl * trlcff1(0, lkdl) + matMI(1, ig, lkl) * sgnl * trlcff1(1, lkdl));
     }
 
     for (int ig = 0; ig < _ng; ig++) {

@@ -3,9 +3,13 @@
 #include "Importer.h"
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
+#include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 
 using namespace rasbery;
@@ -17,6 +21,10 @@ constexpr double BORON_DENSITY_FACTOR       = 5.5707678E-8;
 constexpr int    OMP_THRESHOLD              = 64;
 constexpr bool   USE_AVERAGE_DMOD_FOR_BORON = false;
 constexpr int    CRAM_ORDER                 = 8;
+
+// Stored scalar XS types: all but the derived XSDF/XSRF (rebuilt from transport/scatter).
+constexpr int ACTIVE_XT[] = {XSTF, XSAF, XSFF, XSNF, XSKF, XSSF, FYLD, XS2N, XS3N};
+constexpr int N_ACTIVE_XT = static_cast<int>(std::size(ACTIVE_XT));
 
 // Locate a ctype in a per-node ctype list; -1 if absent.
 int findCtype(const std::vector<int>& ctypes, int ctype) {
@@ -88,6 +96,15 @@ size_t countDeltaCoefficients(const Chiffon::BranchDelta& bd) {
     return coeff_count;
 }
 
+size_t countDeltaCoefficients(const Chiffon::BurnupDelta& delta) {
+    size_t count = 0;
+    for (const auto& [burnup, crossSection] : delta) {
+        (void)burnup;
+        count += crossSection.nord();
+    }
+    return count;
+}
+
 double FuelVolumeAverageDmod(Geometry& geometry) {
     const int nxyz = geometry.nxyz();
 
@@ -105,25 +122,6 @@ double FuelVolumeAverageDmod(Geometry& geometry) {
 
     if (volume_sum > 0.0) return weighted_sum / volume_sum;
     return (nxyz > 0) ? geometry.dmod(0) : 0.0;
-}
-
-double FuelVolumeAverageTmod(Geometry& geometry) {
-    const int nxyz = geometry.nxyz();
-
-    double weighted_sum = 0.0;
-    double volume_sum   = 0.0;
-    for (int l = 0; l < nxyz; ++l) {
-        if (!geometry.IsFuel(l)) continue;
-
-        const double volume = geometry.vol(l);
-        if (volume <= 1.0e-20) continue;
-
-        weighted_sum += geometry.tmod(l) * volume;
-        volume_sum += volume;
-    }
-
-    if (volume_sum > 0.0) return weighted_sum / volume_sum;
-    return (nxyz > 0) ? geometry.tmod(0) : 0.0;
 }
 
 double BoronDmod(Geometry& geometry, double average_dmod, int l) {
@@ -222,23 +220,13 @@ void XSArraySet::fill(double value) {
 milk::Vector<double>& XSArraySet::operator[](Chiffon::XSTYPE xt) {
     if (xt == Chiffon::XSSM)
         return xssm;
-
-    const auto index = static_cast<size_t>(xt);
-    auto       xs    = ScalarXS(*this);
-    if (index < xs.size())
-        return *xs[index];
-    throw std::out_of_range("XSArraySet: invalid scalar XS type");
+    return *ScalarXS(*this)[static_cast<size_t>(xt)];
 }
 
 const milk::Vector<double>& XSArraySet::operator[](Chiffon::XSTYPE xt) const {
     if (xt == Chiffon::XSSM)
         return xssm;
-
-    const auto index = static_cast<size_t>(xt);
-    auto       xs    = ScalarXS(*this);
-    if (index < xs.size())
-        return *xs[index];
-    throw std::out_of_range("XSArraySet: invalid scalar XS type");
+    return *ScalarXS(*this)[static_cast<size_t>(xt)];
 }
 
 namespace rasbery {
@@ -311,10 +299,12 @@ void XSSet::FlattenReferenceCrossSection(size_t flat, const Chiffon::DepletionPo
     // 3. Copy isotope densities and scalar depletion-state data.
     for (size_t iso = 0; iso < niso; ++iso)
         _lib_iden[flat * niso + iso] = dpt._iden[iso];
-    _lib_burn[flat] = dpt._data[AD_BURN];
-    _lib_wvfr[flat] = dpt._data[AD_WVFR];
-    _lib_tmod[flat] = dpt._data[AD_TMOD];
-    _lib_dmod[flat] = dpt._data[AD_DMOD];
+    _lib_burn[flat]         = dpt._data[AD_BURN];
+    _lib_wvfr[flat]         = dpt._data[AD_WVFR];
+    _lib_ref_branch_x[flat] = {
+        (Isotope::iB10 < dpt._iden.size()) ? dpt._iden[Isotope::iB10] : 0.0,
+        std::sqrt(dpt._data[AD_TFUL]),
+        dpt._data[AD_DMOD]};
 
     // 4. Copy the average flux and normalize the fission spectrum.
     const size_t flux_count = std::min(ng, dpt._aflx.size());
@@ -415,12 +405,32 @@ void XSSet::FlattenBranchDelta(const Chiffon::BranchDelta& bd, size_t mi, int br
     delta_slot_idx += _brch_ctyp[mi][branch].size() * _brch_ctyp_stride[mi][branch];
 }
 
-static void LoadNodeIden(const milk::Vector<double>& soa, int nxyz, int l, milk::Vector<double>& iden) {
-    const size_t niso = Chiffon::Isotope::niso;
-    if (iden.size() != niso)
-        iden.assign(niso, 0.0);
-    for (size_t iso = 0; iso < niso; ++iso)
-        iden[iso] = soa[iso * static_cast<size_t>(nxyz) + static_cast<size_t>(l)];
+void XSSet::FlattenSpectralHistory(
+    const Chiffon::SpectralHistoryCorrection& correction,
+    SpectralHistoryInfo& info, size_t& delta_slot_idx,
+    size_t& coeff_idx, size_t& knot_offset) {
+    info.term       = correction.term;
+    info.delta_base = delta_slot_idx;
+    info.burnups    = burnKeys(correction.delta);
+    info.rod_scaled = correction.rod_scaled;
+
+    for (const int burnup : info.burnups) {
+        const auto& delta = correction.delta.at(burnup);
+        auto&       flat  = _lib_deltas[delta_slot_idx++];
+        flat.nord         = static_cast<int>(delta.nord());
+        flat.mode =
+            delta.mode() == Chiffon::SPLINE_MODE ? 1 : 0;
+        flat.ncoeff      = static_cast<int>(delta.ncoeff());
+        flat.coeff_base  = static_cast<int>(coeff_idx);
+        flat.knot_offset = static_cast<int>(knot_offset);
+        flat.knot_count  = static_cast<int>(delta.knots().size());
+
+        _lib_knots.insert(
+            _lib_knots.end(), delta.knots().begin(), delta.knots().end());
+        knot_offset += delta.knots().size();
+        FlattenDeltaCrossSection(coeff_idx, delta);
+        coeff_idx += flat.nord;
+    }
 }
 
 // Lifetime
@@ -469,8 +479,11 @@ void XSSet::SetAxialRodDivision(int division) {
                               static_cast<size_t>(_g.nz()) *
                               static_cast<size_t>(_axial_rod_division);
     _fine_rod_type.assign(fine_count, 0);
-    _fine_rod_fluence.assign(fine_count, 0.0);
-    _fine_rod_fluence_bos.assign(fine_count, 0.0);
+    _fine_rod_thermal_fluence.assign(fine_count, 0.0);
+    _pu_prev.assign(static_cast<size_t>(_g.nxyz()), -1.0);
+    _pu_gain_tot.assign(static_cast<size_t>(_g.nxyz()), 0.0);
+    _pu_gain_rod.assign(static_cast<size_t>(_g.nxyz()), 0.0);
+    _fine_rod_thermal_fluence_bos.assign(fine_count, 0.0);
     RebuildFineRodOccupancy();
 }
 
@@ -483,14 +496,10 @@ void XSSet::Initialize(const std::string& xs_path) {
     _comp.assign(nxyz, 0);
     _asmb.assign(nxyza, 0);
     _ctyp.assign(nxyz, 0);
-    _history_ctyp.assign(nxyz, 0);
-    _rodded_fluence.assign(nxyz, 0.0);
     _burn.assign(nxyz, 0);
     _external_iden.assign(nxyz, 0);
 
     _burn_bos.resize(nxyz);
-    _history_ctyp_bos.resize(nxyz);
-    _rodded_fluence_bos.resize(nxyz);
     _flux_bos = milk::Vector<double>(static_cast<size_t>(nxyz * _g.ng()));
 
     _node_power_scratch.assign(nxyz, 0.0);
@@ -501,8 +510,8 @@ void XSSet::Initialize(const std::string& xs_path) {
     _fine_rod_type.assign(static_cast<size_t>(_g.nxy()) * static_cast<size_t>(nz) *
                               static_cast<size_t>(_axial_rod_division),
                           0);
-    _fine_rod_fluence.assign(_fine_rod_type.size(), 0.0);
-    _fine_rod_fluence_bos.assign(_fine_rod_type.size(), 0.0);
+    _fine_rod_thermal_fluence.assign(_fine_rod_type.size(), 0.0);
+    _fine_rod_thermal_fluence_bos.assign(_fine_rod_type.size(), 0.0);
 
     // Load T/H property tables
     LoadTHTables();
@@ -511,15 +520,18 @@ void XSSet::Initialize(const std::string& xs_path) {
     Importer importer;
     _models = importer.LoadHDF(xs_path);
 
-    // Load unified depletion matrices from CSV if not already loaded from HDF5
-    if (Isotope::depDecay.size() == 0) {
+    // Load unified depletion matrices from CSV if not already loaded from HDF5.
+    // EnsureInitialized replaces the bare `if (depDecay.size() == 0)` check:
+    // that was a check-then-act on a process global, so two instances starting
+    // together could both enter and assign the matrices concurrently.
+    {
 #ifdef DATA_DIR
         const auto chainDir = std::filesystem::path(DATA_DIR) / "include" / "Database";
 #else
         const auto chainDir = std::filesystem::path("include") / "Database";
 #endif
         if (std::filesystem::exists(chainDir / "dep_decay.csv"))
-            Isotope::Initialize(chainDir);
+            Isotope::EnsureInitialized(chainDir);
     }
 
     const size_t niso = Isotope::niso;
@@ -541,10 +553,7 @@ void XSSet::Initialize(const std::string& xs_path) {
     _ref_micx.allocate(micn, mism);
     _ref_iden.assign(niso * nxyz, 0.0);
     _ref_wvfr.assign(nxyz, 0.0);
-    _ref_tmod.assign(nxyz, 0.0);
-    _ref_dmod.assign(nxyz, 0.0);
     _node_wvfr.assign(nxyz, 0.0);
-    _ref_flux.assign(static_cast<size_t>(ng) * nxyz, 0.0);
     _ref_chix.assign(static_cast<size_t>(ng) * nxyz, 0.0);
     _simd_ready = false;
 
@@ -576,10 +585,9 @@ void XSSet::Initialize(const std::string& xs_path) {
                 const std::string& asmb = batch.at(core[row][col])[nz - 1 - z];
                 int                lka  = _g.ijtola(static_cast<int>(col), static_cast<int>(row)) + nxya * z;
 
-                if (lka < 0 || lka >= _g.nxyza()) {
-                    PLOG_ERROR << "Assembly index out of range (lka=" << lka << ").";
-                    continue;
-                }
+                if (lka < 0 || lka >= _g.nxyza())
+                    throw std::runtime_error(std::format(
+                        "XSSet: assembly index out of range (lka={}, core row={}, col={})", lka, row, col));
 
                 _asmb[lka] = modelIndexMap.at(asmb);
 
@@ -605,10 +613,6 @@ void XSSet::Initialize(const std::string& xs_path) {
     // 3. Flatten model data into library-wide SoA storage.
     {
         const size_t nmodels = _models.size();
-        _lib_ngrp            = ng;
-        _lib_ndat            = XSSM + ng;
-        _lib_nmem            = _lib_ndat * ng;
-        _lib_niso            = niso;
 
         // Count totals across all models
         size_t total_dpts  = 0;
@@ -622,15 +626,11 @@ void XSSet::Initialize(const std::string& xs_path) {
             total_coeff += countDeltaCoefficients(m._bppm_delt);
             total_coeff += countDeltaCoefficients(m._tful_delt);
             total_coeff += countDeltaCoefficients(m._dmod_delt);
-            for (const auto& history : m._history_deltas) {
-                total_delta += countDeltaSlots(history.delta);
-                total_coeff += countDeltaCoefficients(history.delta);
+            for (const auto& correction : m._spectral_history) {
+                total_delta += correction.delta.size();
+                total_coeff += countDeltaCoefficients(correction.delta);
             }
         }
-
-        _lib_ndpt        = total_dpts;
-        _lib_ndelta      = total_delta;
-        _lib_total_coeff = total_coeff;
 
         // Allocate flat arrays
         _lib_lmpx.allocate(total_dpts * ng, total_dpts * ng * ng);
@@ -638,8 +638,7 @@ void XSSet::Initialize(const std::string& xs_path) {
         _lib_iden.assign(total_dpts * niso, 0.0);
         _lib_burn.assign(total_dpts, 0.0);
         _lib_wvfr.assign(total_dpts, 0.0);
-        _lib_tmod.assign(total_dpts, 0.0);
-        _lib_dmod.assign(total_dpts, 0.0);
+        _lib_ref_branch_x.assign(total_dpts, {});
         _lib_flux.assign(total_dpts * ng, 0.0);
         _lib_chix.assign(total_dpts * ng, 0.0);
         _lib_coeff_lmpx.allocate(total_coeff * ng, total_coeff * ng * ng);
@@ -652,31 +651,28 @@ void XSSet::Initialize(const std::string& xs_path) {
         _refr_burn_stride.resize(nmodels, 1);
         _refr_ctyp.resize(nmodels);
         _refr_burn.resize(nmodels);
-        _num_delta_branches = BRANCH_HISTORY_BASE;
-        for (const auto& m : _models)
-            _num_delta_branches = std::max(_num_delta_branches, BRANCH_HISTORY_BASE + m._history_deltas.size());
-        _brch_base.assign(nmodels, std::vector<size_t>(_num_delta_branches, 0));
-        _brch_ctyp_stride.assign(nmodels, std::vector<size_t>(_num_delta_branches, 0));
-        _brch_burn_stride.assign(nmodels, std::vector<size_t>(_num_delta_branches, 1));
-        _brch_ctyp.assign(nmodels, std::vector<std::vector<int>>(_num_delta_branches));
-        _brch_burn.assign(nmodels, std::vector<std::vector<std::vector<int>>>(_num_delta_branches));
+        _brch_base.assign(
+            nmodels, std::vector<size_t>(NUM_SCALAR_BRANCHES, 0));
+        _brch_ctyp_stride.assign(
+            nmodels, std::vector<size_t>(NUM_SCALAR_BRANCHES, 0));
+        _brch_burn_stride.assign(
+            nmodels, std::vector<size_t>(NUM_SCALAR_BRANCHES, 1));
+        _brch_ctyp.assign(
+            nmodels,
+            std::vector<std::vector<int>>(NUM_SCALAR_BRANCHES));
+        _brch_burn.assign(
+            nmodels,
+            std::vector<std::vector<std::vector<int>>>(
+                NUM_SCALAR_BRANCHES));
         _lib_model_volu.resize(nmodels, 1.0);
         _lib_model_hmas.resize(nmodels, 1.0);
-        _lib_history_corrections.assign(nmodels, {});
+        _lib_spectral_history.assign(nmodels, {});
 
         // Flatten reference depletion points in model/ctype/burn stride order.
         size_t dpt_idx = 0;
         for (size_t mi = 0; mi < nmodels; ++mi) {
             const auto& m    = _models[mi];
             const auto& dpts = m.Dpts();
-            _lib_history_corrections[mi].reserve(m._history_deltas.size());
-            for (const auto& history : m._history_deltas) {
-                _lib_history_corrections[mi].push_back(
-                    HistoryCorrectionInfo{history.branch_type,
-                                          Chiffon::CorrectionComponentFromHistoryKind(history.kind),
-                                          history.kind, history.state_field,
-                                          history.vector_isotopes, history.vector_powers});
-            }
 
             _refr_base[mi] = dpt_idx;
             if (m._refr_dpts.empty())
@@ -720,17 +716,99 @@ void XSSet::Initialize(const std::string& xs_path) {
             FlattenBranchDelta(_models[mi]._bppm_delt, mi, BRANCH_BPPM, delta_slot_idx, coeff_idx, knot_offset);
             FlattenBranchDelta(_models[mi]._tful_delt, mi, BRANCH_TFUL, delta_slot_idx, coeff_idx, knot_offset);
             FlattenBranchDelta(_models[mi]._dmod_delt, mi, BRANCH_DMOD, delta_slot_idx, coeff_idx, knot_offset);
-            for (size_t h = 0; h < _models[mi]._history_deltas.size(); ++h) {
-                FlattenBranchDelta(_models[mi]._history_deltas[h].delta, mi,
-                                   static_cast<int>(BRANCH_HISTORY_BASE + h), delta_slot_idx, coeff_idx, knot_offset);
+            auto& history = _lib_spectral_history[mi];
+            history.resize(_models[mi]._spectral_history.size());
+            for (size_t h = 0;
+                 h < _models[mi]._spectral_history.size(); ++h) {
+                FlattenSpectralHistory(
+                    _models[mi]._spectral_history[h], history[h],
+                    delta_slot_idx, coeff_idx, knot_offset);
             }
         }
 
         _node_refr_lo.assign(nxyz, -1);
         _node_refr_hi.assign(nxyz, -1);
-        _node_delta_lo.assign(_num_delta_branches, std::vector<int>(nxyz, -1));
-        _node_delta_hi.assign(_num_delta_branches, std::vector<int>(nxyz, -1));
-        _node_delta_frac.assign(_num_delta_branches, std::vector<double>(nxyz, 0.0));
+        _node_delta_lo.assign(
+            NUM_SCALAR_BRANCHES, std::vector<int>(nxyz, -1));
+        _node_delta_hi.assign(
+            NUM_SCALAR_BRANCHES, std::vector<int>(nxyz, -1));
+        _node_delta_frac.assign(
+            NUM_SCALAR_BRANCHES, std::vector<double>(nxyz, 0.0));
+
+        // Gd lookup axis selection: burnup (default, historical) or effective Gd number density
+        // (MASTER/PROLOG `BP01 MICRO` + IOPT(1)=1 equivalent).
+        _gd_neff_axis = false;
+        if (const char* env = std::getenv("RASBERY_GD_AXIS")) {
+            std::string mode(env);
+            std::transform(mode.begin(), mode.end(), mode.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            _gd_neff_axis = (mode == "neff" || mode == "nd" || mode == "1");
+        }
+
+        // The N_eff axis reads sigma_a,Gd by inverting N_table(Bu), so that trajectory has to
+        // be strictly decreasing or the inverse map does not exist.  Assert it here, on load,
+        // for every reference row -- not at the point of use.  PrecomputeBranchCoefficients
+        // can only compare the two endpoints of a row it is already walking, and when that
+        // test fails it has nothing to do but keep the burnup bracket: the node would then
+        // read sigma at a burnup with no relation to its Gd inventory, quietly.  A library
+        // whose lumped-Gd trajectory is not invertible has to be rejected, loudly, once.
+        //
+        // Rows with N_eff == 0 throughout carry no Gd (reflectors, non-BP fuels); zero is not
+        // strictly decreasing, and the axis never indexes them, so they are exempt.
+        for (size_t mi = 0; mi < nmodels; ++mi) {
+            for (size_t ci = 0; ci < _refr_ctyp[mi].size(); ++ci) {
+                const auto&         keys = _refr_burn[mi][ci];
+                std::vector<double> n_table(keys.size(), 0.0);
+                for (size_t bi = 0; bi < keys.size(); ++bi) {
+                    const size_t flat = _refr_base[mi] + ci * _refr_ctyp_stride[mi] +
+                                        bi * _refr_burn_stride[mi];
+                    n_table[bi] = _lib_iden[flat * niso + Isotope::iGd];
+                }
+                if (std::all_of(n_table.begin(), n_table.end(),
+                                [](double v) { return v == 0.0; }))
+                    continue;
+                for (size_t bi = 1; bi < n_table.size(); ++bi)
+                    if (!(n_table[bi] < n_table[bi - 1]))
+                        throw std::runtime_error(std::format(
+                            "model '{}' (ctype {}): lumped-Gd N_eff(Bu) is not strictly "
+                            "decreasing at burnup {} (index {}): {:.6e} -> {:.6e} -- the "
+                            "N_eff axis inverse map is invalid for this library.",
+                            _models[mi].name(), _refr_ctyp[mi][ci], keys[bi], bi,
+                            n_table[bi - 1], n_table[bi]));
+            }
+        }
+
+        _node_gd_lo.assign(nxyz, -1);
+        _node_gd_hi.assign(nxyz, -1);
+        _node_gd_frac.assign(nxyz, 0.0);
+
+        _lib_history_partner.assign(_models.size(), -1);
+        for (size_t mi = 0; mi < _models.size(); ++mi) {
+            const int p = _models[mi].history_partner();
+            if (p >= 0 && static_cast<size_t>(p) < _models.size() &&
+                static_cast<size_t>(p) != mi)
+                _lib_history_partner[mi] = p;
+        }
+        _node_hw.assign(nxyz, 0.0);
+        _node_refr_lo_p.assign(nxyz, -1);
+        _node_refr_hi_p.assign(nxyz, -1);
+        _node_delta_lo_p.assign(
+            NUM_SCALAR_BRANCHES, std::vector<int>(nxyz, -1));
+        _node_delta_hi_p.assign(
+            NUM_SCALAR_BRANCHES, std::vector<int>(nxyz, -1));
+        _node_delta_frac_p.assign(
+            NUM_SCALAR_BRANCHES, std::vector<double>(nxyz, 0.0));
+
+        // Boundary validation: every model referenced by a node must carry a non-empty
+        // unrodded reference burn table (PrecomputeBranchCoefficients relies on this).
+        for (int l = 0; l < nxyz; ++l) {
+            const size_t mi = _comp[l];
+            const int    ci = findCtype(_refr_ctyp[mi], 0);
+            if (ci < 0 || _refr_burn[mi][ci].empty())
+                throw std::runtime_error("XSSet: model lacks an unrodded reference depletion table");
+        }
+
+        RebuildUsesRodCache();
     }
 }
 
@@ -740,81 +818,94 @@ void XSSet::Reconstruct() {
     const int    ng   = _g.ng();
     const size_t niso = Isotope::niso;
 
-    // 1. Rebuild scalar macroscopic XS from lumped and microscopic terms.
-    for (int xt = XSTF; xt <= XS3N; ++xt) {
-        if (xt == XSDF || xt == XSRF) continue;
-        auto        xtype = static_cast<XSTYPE>(xt);
-        auto&       dst   = _xs[xtype];
-        const auto& lmp   = _lmpx[xtype];
-        const auto& mic   = _micx[xtype];
+    // Every step is element-wise in l, so slicing the node axis across threads keeps each
+    // element's accumulation order identical to the serial loop (bit-identical), while the
+    // ~20 MB streaming pass no longer runs on one thread with the others parked.
+    auto reconstructSlice = [&](int ls, int le) {
+        const size_t len = static_cast<size_t>(le - ls);
 
-        // dst = lmpx (copy)
-        CopyDoubles(static_cast<size_t>(ng) * static_cast<size_t>(nxyz), lmp.data(), dst.data());
+        // 1. Rebuild scalar macroscopic XS from lumped and microscopic terms.
+        for (int xt = XSTF; xt <= XS3N; ++xt) {
+            if (xt == XSDF || xt == XSRF) continue;
+            auto        xtype = static_cast<XSTYPE>(xt);
+            auto&       dst   = _xs[xtype];
+            const auto& lmp   = _lmpx[xtype];
+            const auto& mic   = _micx[xtype];
 
-        // dst += Σ_iso (micx[iso] * iden[iso]).
-        // iden varies by node, so each isotope/group block is an element-wise stride-1 loop.
-        for (size_t iso = 0; iso < niso; ++iso) {
-            for (int ig = 0; ig < ng; ++ig) {
-                const double* mic_ptr  = mic.data() + (iso * ng + ig) * nxyz;
-                const double* iden_ptr = _iden.data() + iso * nxyz;
-                double*       dst_ptr  = dst.data() + ig * nxyz;
+            for (int ig = 0; ig < ng; ++ig)
+                CopyDoubles(len, lmp.data() + ig * nxyz + ls, dst.data() + ig * nxyz + ls);
 
-#pragma omp simd
-                for (int l = 0; l < nxyz; ++l)
-                    dst_ptr[l] += mic_ptr[l] * iden_ptr[l];
-            }
-        }
-    }
-
-    // 2. Rebuild the scattering matrix with the same SoA accumulation pattern.
-    {
-        auto&       dst = _xs.xssm;
-        const auto& lmp = _lmpx.xssm;
-        const auto& mic = _micx.xssm;
-        CopyDoubles(static_cast<size_t>(ng) * static_cast<size_t>(ng) * static_cast<size_t>(nxyz),
-                    lmp.data(), dst.data());
-
-        for (size_t iso = 0; iso < niso; ++iso) {
-            for (int igs = 0; igs < ng; ++igs) {
-                for (int ige = 0; ige < ng; ++ige) {
-                    const double* mic_ptr  = mic.data() + (iso * ng * ng + igs * ng + ige) * nxyz;
-                    const double* iden_ptr = _iden.data() + iso * nxyz;
-                    double*       dst_ptr  = dst.data() + (igs * ng + ige) * nxyz;
+            // dst += Σ_iso (micx[iso] * iden[iso]).
+            // iden varies by node, so each isotope/group block is an element-wise stride-1 loop.
+            for (size_t iso = 0; iso < niso; ++iso) {
+                for (int ig = 0; ig < ng; ++ig) {
+                    const double* mic_ptr  = mic.data() + (iso * ng + ig) * nxyz + ls;
+                    const double* iden_ptr = _iden.data() + iso * nxyz + ls;
+                    double*       dst_ptr  = dst.data() + ig * nxyz + ls;
 
 #pragma omp simd
-                    for (int l = 0; l < nxyz; ++l)
+                    for (size_t l = 0; l < len; ++l)
                         dst_ptr[l] += mic_ptr[l] * iden_ptr[l];
                 }
             }
         }
-    }
 
-    // 3. Derive diffusion coefficients from the transport cross section.
-    for (int ig = 0; ig < ng; ++ig) {
-        double* xstf_ptr = _xs.xstf.data() + ig * nxyz;
-        double* xsdf_ptr = _xs.xsdf.data() + ig * nxyz;
+        // 2. Rebuild the scattering matrix with the same SoA accumulation pattern.
+        {
+            auto&       dst = _xs.xssm;
+            const auto& lmp = _lmpx.xssm;
+            const auto& mic = _micx.xssm;
+            for (int sm = 0; sm < ng * ng; ++sm)
+                CopyDoubles(len, lmp.data() + sm * nxyz + ls, dst.data() + sm * nxyz + ls);
+
+            for (size_t iso = 0; iso < niso; ++iso) {
+                for (int igs = 0; igs < ng; ++igs) {
+                    for (int ige = 0; ige < ng; ++ige) {
+                        const double* mic_ptr  = mic.data() + (iso * ng * ng + igs * ng + ige) * nxyz + ls;
+                        const double* iden_ptr = _iden.data() + iso * nxyz + ls;
+                        double*       dst_ptr  = dst.data() + (igs * ng + ige) * nxyz + ls;
+
 #pragma omp simd
-        for (int l = 0; l < nxyz; ++l) {
-            double tr   = xstf_ptr[l];
-            xsdf_ptr[l] = (tr > 1.0e-30) ? 0.333333333333333 / tr : 0.0;
+                        for (size_t l = 0; l < len; ++l)
+                            dst_ptr[l] += mic_ptr[l] * iden_ptr[l];
+                    }
+                }
+            }
         }
-    }
 
-    // 4. Recompute removal as absorption plus outgoing scattering.
-    for (int igs = 0; igs < ng; ++igs) {
-        double*       xsrf_ptr = _xs.xsrf.data() + igs * nxyz;
-        const double* xsaf_ptr = _xs.xsaf.data() + igs * nxyz;
+        // 3. Derive diffusion coefficients from the transport cross section.
+        for (int ig = 0; ig < ng; ++ig) {
+            double* xstf_ptr = _xs.xstf.data() + ig * nxyz + ls;
+            double* xsdf_ptr = _xs.xsdf.data() + ig * nxyz + ls;
 #pragma omp simd
-        for (int l = 0; l < nxyz; ++l)
-            xsrf_ptr[l] = xsaf_ptr[l];
-
-        for (int ige = 0; ige < ng; ++ige) {
-            const double* sm_ptr = _xs.xssm.data() + (igs * ng + ige) * nxyz;
-#pragma omp simd
-            for (int l = 0; l < nxyz; ++l)
-                xsrf_ptr[l] += sm_ptr[l];
+            for (size_t l = 0; l < len; ++l) {
+                double tr   = xstf_ptr[l];
+                xsdf_ptr[l] = (tr > 1.0e-30) ? 0.333333333333333 / tr : 0.0;
+            }
         }
-    }
+
+        // 4. Recompute removal as absorption plus outgoing scattering.
+        for (int igs = 0; igs < ng; ++igs) {
+            double*       xsrf_ptr = _xs.xsrf.data() + igs * nxyz + ls;
+            const double* xsaf_ptr = _xs.xsaf.data() + igs * nxyz + ls;
+#pragma omp simd
+            for (size_t l = 0; l < len; ++l)
+                xsrf_ptr[l] = xsaf_ptr[l];
+
+            for (int ige = 0; ige < ng; ++ige) {
+                const double* sm_ptr = _xs.xssm.data() + (igs * ng + ige) * nxyz + ls;
+#pragma omp simd
+                for (size_t l = 0; l < len; ++l)
+                    xsrf_ptr[l] += sm_ptr[l];
+            }
+        }
+    };
+
+    constexpr int RECON_BLOCK = 512;
+    const int     nblk        = (nxyz + RECON_BLOCK - 1) / RECON_BLOCK;
+#pragma omp parallel for schedule(static) if (nxyz > OMP_THRESHOLD)
+    for (int b = 0; b < nblk; ++b)
+        reconstructSlice(b * RECON_BLOCK, std::min(nxyz, (b + 1) * RECON_BLOCK));
 }
 
 void XSSet::ReconstructNode(size_t l) {
@@ -896,34 +987,157 @@ void XSSet::Update() {
 
 // Pre-compute node lookup and burnup-interpolated reference XS.
 
+double XSSet::ReferenceIden(size_t mi, int ctype, int burn, size_t iso) const {
+    if (iso >= Isotope::niso || mi >= _refr_ctyp.size())
+        return 0.0;
+    const int ci = findCtype(_refr_ctyp[mi], ctype);
+    if (ci < 0)
+        return 0.0;
+    const auto& burns = _refr_burn[mi][ci];
+    const int   lo    = findLoBurn(burns, burn);
+    const int   hi    = findHiBurn(burns, burn);
+    if (lo < 0 || hi < 0)
+        return 0.0;
+    const size_t base = _refr_base[mi] + static_cast<size_t>(ci) * _refr_ctyp_stride[mi];
+    const size_t lb   = base + static_cast<size_t>(lo) * _refr_burn_stride[mi];
+    const size_t hb   = base + static_cast<size_t>(hi) * _refr_burn_stride[mi];
+    double       v    = _lib_iden[lb * Isotope::niso + iso];
+    if (lb != hb && _lib_burn[hb] != _lib_burn[lb]) {
+        const double f = (static_cast<double>(burn) / 1000.0 - _lib_burn[lb]) /
+                         (_lib_burn[hb] - _lib_burn[lb]);
+        v += f * (_lib_iden[hb * Isotope::niso + iso] - v);
+    }
+    return v;
+}
+
+void XSSet::BuildHistoryBlend(int l, size_t mi) {
+    _node_hw[l]        = 0.0;
+    _node_refr_lo_p[l] = -1;
+    _node_refr_hi_p[l] = -1;
+    for (size_t b = 0; b < NUM_SCALAR_BRANCHES; ++b) {
+        _node_delta_lo_p[b][l]   = -1;
+        _node_delta_hi_p[b][l]   = -1;
+        _node_delta_frac_p[b][l] = 0.0;
+    }
+    const int partner = mi < _lib_history_partner.size() ? _lib_history_partner[mi] : -1;
+    if (partner < 0)
+        return;
+    const size_t pi = static_cast<size_t>(partner);
+
+    // PROBE: pin the weight to a constant so the required w can be recovered by
+    // scanning k(w) against the reference. Negative (default) = measure it.
+    static const double fixw = [] {
+        const char* env = std::getenv("RASBERY_HB_FIXW");
+        return env != nullptr ? std::atof(env) : -1.0;
+    }();
+
+    const int refr_ci = findCtype(_refr_ctyp[pi], 0);
+    if (refr_ci < 0 || _refr_burn[pi][refr_ci].empty())
+        return;
+    const auto& refr_burn  = _refr_burn[pi][refr_ci];
+    const int   refr_lo_bi = findLoBurn(refr_burn, _burn[l]);
+    const int   refr_hi_bi = findHiBurn(refr_burn, _burn[l]);
+    if (refr_lo_bi < 0 || refr_hi_bi < 0)
+        return;
+    const size_t refr_base = _refr_base[pi] + static_cast<size_t>(refr_ci) * _refr_ctyp_stride[pi];
+    _node_refr_lo_p[l] =
+        static_cast<int>(refr_base + static_cast<size_t>(refr_lo_bi) * _refr_burn_stride[pi]);
+    _node_refr_hi_p[l] =
+        static_cast<int>(refr_base + static_cast<size_t>(refr_hi_bi) * _refr_burn_stride[pi]);
+
+    for (size_t b = 0; b < NUM_SCALAR_BRANCHES; ++b) {
+        const int brch_ci = findCtype(_brch_ctyp[pi][b], 0);
+        if (brch_ci < 0)
+            continue;
+        const auto& brch_burn  = _brch_burn[pi][b][brch_ci];
+        const int   brch_lo_bi = findLoBurn(brch_burn, _burn[l]);
+        const int   brch_hi_bi = findHiBurn(brch_burn, _burn[l]);
+        if (brch_lo_bi < 0 || brch_hi_bi < 0)
+            continue;
+        const size_t brch_base = _brch_base[pi][b] +
+                                 static_cast<size_t>(brch_ci) * _brch_ctyp_stride[pi][b];
+        _node_delta_lo_p[b][l] =
+            static_cast<int>(brch_base + static_cast<size_t>(brch_lo_bi) * _brch_burn_stride[pi][b]);
+        _node_delta_hi_p[b][l] =
+            static_cast<int>(brch_base + static_cast<size_t>(brch_hi_bi) * _brch_burn_stride[pi][b]);
+        _node_delta_frac_p[b][l] =
+            (brch_lo_bi == brch_hi_bi)
+                ? 0.0
+                : static_cast<double>(_burn[l] - brch_burn[brch_lo_bi]) /
+                      static_cast<double>(brch_burn[brch_hi_bi] - brch_burn[brch_lo_bi]);
+    }
+
+    // Weight: the node's U235-vs-Pu239 balance, measured from the unrodded
+    // reference and normalized by the partner's rod-in reference at the same
+    // burnup. Both endpoints come from the library, so nothing extra is carried
+    // across a restart -- the fuel's own inventory is the clock.
+    if (fixw >= 0.0) {
+        _node_hw[l] = std::clamp(fixw, 0.0, 1.0);
+        return;
+    }
+
+    // Every endpoint is guarded for finiteness: a NaN would slip through the
+    // ordinary comparisons and reach applyDelta as a NaN scale.
+    const double fl = Chiffon::SPECTRAL_LOG_DENSITY_FLOOR;
+    const double ru = ReferenceIden(mi, 0, _burn[l], Isotope::iU235);
+    const double rp = ReferenceIden(mi, 0, _burn[l], Isotope::iPu239);
+    const double su = ReferenceIden(pi, 1, _burn[l], Isotope::iU235);
+    const double sp = ReferenceIden(pi, 1, _burn[l], Isotope::iPu239);
+    if (!std::isfinite(ru) || !std::isfinite(rp) || !std::isfinite(su) ||
+        !std::isfinite(sp) || ru <= fl || rp <= fl || su <= fl || sp <= fl)
+        return;
+    const double span = std::log(su / ru) - std::log(sp / rp);
+    if (!std::isfinite(span) || std::abs(span) < 1.0e-6)
+        return;
+
+    const size_t stride  = static_cast<size_t>(_g.nxyz());
+    const size_t node    = static_cast<size_t>(l);
+    const double raw_nu  = _iden[Isotope::iU235 * stride + node];
+    const double raw_np  = _iden[Isotope::iPu239 * stride + node];
+    if (!std::isfinite(raw_nu) || !std::isfinite(raw_np))
+        return;
+    const double rr    = std::log(std::max(raw_nu, fl) / ru) -
+                      std::log(std::max(raw_np, fl) / rp);
+    const double ratio = rr / span;
+    if (!std::isfinite(ratio))
+        return;
+    // PROBE: shape of the approach to the rodded library. 1.0 is the linear
+    // reading of the composition coordinate; >1 delays it, <1 hastens it.
+    static const double gamma = [] {
+        const char* env = std::getenv("RASBERY_HB_GAMMA");
+        const double v = env != nullptr ? std::atof(env) : 1.0;
+        return (v > 0.05 && v < 20.0) ? v : 1.0;
+    }();
+    const double clamped = std::clamp(ratio, 0.0, 1.0);
+    _node_hw[l] = gamma == 1.0 ? clamped : std::pow(clamped, gamma);
+}
+
 void XSSet::PrecomputeBranchCoefficients() {
     const int    nxyz = _g.nxyz();
     const int    ng   = _g.ng();
     const size_t niso = Isotope::niso;
 
     // 1. Build the per-node index table used by the hot update loop.
+    // The unrodded reference tables are validated once at Initialize, so the
+    // ctype/burn lookups here cannot fail.
     for (int l = 0; l < nxyz; ++l) {
         const size_t mi     = _comp[l];
         const int    eff_ct = 0;
 
         // Reference depletion points (lo/hi burnup bracket)
-        const int refr_ci = findCtype(_refr_ctyp[mi], eff_ct);
-        if (refr_ci < 0)
-            throw std::runtime_error("XSSet: missing unrodded reference depletion table");
+        const int   refr_ci    = findCtype(_refr_ctyp[mi], eff_ct);
         const auto& refr_burn  = _refr_burn[mi][refr_ci];
         const int   refr_lo_bi = findLoBurn(refr_burn, _burn[l]);
         const int   refr_hi_bi = findHiBurn(refr_burn, _burn[l]);
-        if (refr_lo_bi < 0 || refr_hi_bi < 0)
-            throw std::runtime_error("XSSet: empty unrodded reference burn table");
-        _node_refr_lo[l] = static_cast<int>(_refr_base[mi] +
-                                            static_cast<size_t>(refr_ci) * _refr_ctyp_stride[mi] +
-                                            static_cast<size_t>(refr_lo_bi) * _refr_burn_stride[mi]);
-        _node_refr_hi[l] = static_cast<int>(_refr_base[mi] +
-                                            static_cast<size_t>(refr_ci) * _refr_ctyp_stride[mi] +
-                                            static_cast<size_t>(refr_hi_bi) * _refr_burn_stride[mi]);
+        _node_refr_lo[l]       = static_cast<int>(_refr_base[mi] +
+                                                  static_cast<size_t>(refr_ci) * _refr_ctyp_stride[mi] +
+                                                  static_cast<size_t>(refr_lo_bi) * _refr_burn_stride[mi]);
+        _node_refr_hi[l]       = static_cast<int>(_refr_base[mi] +
+                                                  static_cast<size_t>(refr_ci) * _refr_ctyp_stride[mi] +
+                                                  static_cast<size_t>(refr_hi_bi) * _refr_burn_stride[mi]);
 
         // Delta polynomial entries per branch
-        for (size_t b = 0; b < _num_delta_branches; ++b) {
+        for (size_t b = 0; b < NUM_SCALAR_BRANCHES; ++b) {
             const int brch_ci = findCtype(_brch_ctyp[mi][b], eff_ct);
             if (brch_ci < 0) {
                 _node_delta_lo[b][l]   = -1;
@@ -953,6 +1167,58 @@ void XSSet::PrecomputeBranchCoefficients() {
                     : static_cast<double>(_burn[l] - brch_burn[brch_lo_bi]) /
                           static_cast<double>(brch_burn[brch_hi_bi] - brch_burn[brch_lo_bi]);
         }
+
+        // Gd effective number density axis: locate the bracket on the library N_eff trajectory.
+        if (_gd_neff_axis) {
+            _node_gd_lo[l]   = _node_refr_lo[l];
+            _node_gd_hi[l]   = _node_refr_hi[l];
+            _node_gd_frac[l] = 0.0;
+
+            const size_t nbp   = refr_burn.size();
+            const double n_now = _iden[Isotope::iGd * nxyz + l];
+            if (nbp >= 2 && n_now > 0.0) {
+                auto flat_id = [&](size_t bi) {
+                    return _refr_base[mi] + static_cast<size_t>(refr_ci) * _refr_ctyp_stride[mi] +
+                           bi * _refr_burn_stride[mi];
+                };
+                auto neff_at = [&](size_t bi) { return _lib_iden[flat_id(bi) * niso + Isotope::iGd]; };
+
+                // n0 > 0 says this model's reference row carries Gd at all -- an applicability
+                // test, not a failure path.  For any such row Initialize() has already asserted
+                // strict decrease, so the bracket below always exists and na > nb.  There is no
+                // fallback here, because a library that could need one never gets this far.
+                const double n0 = neff_at(0);
+                const double nl = neff_at(nbp - 1);
+                if (n0 > 0.0) {
+                    size_t bi = 0;
+                    if (n_now >= n0) {
+                        bi = 0; // fresher than the table start -> clamp to the first interval
+                    } else if (n_now <= nl) {
+                        bi = nbp - 2; // more depleted than the table end -> clamp to the last interval
+                    } else {
+                        // n_now is bracketed; N_eff is monotonically decreasing with burnup.
+                        size_t lo = 0, hi = nbp - 1;
+                        while (hi - lo > 1) {
+                            const size_t mid = (lo + hi) / 2;
+                            if (neff_at(mid) > n_now)
+                                lo = mid;
+                            else
+                                hi = mid;
+                        }
+                        bi = lo;
+                    }
+                    const double na = neff_at(bi);
+                    const double nb = neff_at(bi + 1);
+                    // Clamp instead of extrapolating (same convention as the burnup axis).
+                    const double f = std::min(1.0, std::max(0.0, (na - n_now) / (na - nb)));
+                    _node_gd_lo[l]   = static_cast<int>(flat_id(bi));
+                    _node_gd_hi[l]   = static_cast<int>(flat_id(bi + 1));
+                    _node_gd_frac[l] = f;
+                }
+            }
+        }
+
+        BuildHistoryBlend(l, mi);
     }
 
     // 2. Scatter reference data from the flat library cache into node SoA buffers.
@@ -960,8 +1226,6 @@ void XSSet::PrecomputeBranchCoefficients() {
     _ref_lmpx.fill(0.0);
     _ref_micx.fill(0.0);
     _ref_iden.fill(0.0);
-    std::fill(_ref_tmod.begin(), _ref_tmod.end(), 0.0);
-    std::fill(_ref_dmod.begin(), _ref_dmod.end(), 0.0);
 
     // Cache XSArraySet data pointers to avoid switch dispatch inside the loop
     const auto    lib_lmpx_ptrs = ScalarData(_lib_lmpx);
@@ -971,9 +1235,6 @@ void XSSet::PrecomputeBranchCoefficients() {
     const double* lib_iden      = _lib_iden.data();
     const double* lib_burn      = _lib_burn.data();
     const double* lib_wvfr      = _lib_wvfr.data();
-    const double* lib_tmod      = _lib_tmod.data();
-    const double* lib_dmod      = _lib_dmod.data();
-    const double* lib_flux      = _lib_flux.data();
     const double* lib_chix      = _lib_chix.data();
     auto          ref_lmpx      = ScalarXS(_ref_lmpx);
     auto          ref_micx      = ScalarXS(_ref_micx);
@@ -983,90 +1244,143 @@ void XSSet::PrecomputeBranchCoefficients() {
         const int lo = _node_refr_lo[l];
         const int hi = _node_refr_hi[l];
 
-        // Scatter reference lumped XS from the flat cache.
+        // Single fused pass: val = lib[lo] (+ f*(lib[hi]-lib[lo]) between burnup brackets),
+        // written once. Same operation sequence as scatter-then-interpolate, kept in a register.
+        const bool   interp = (lo != hi);
+        const double f      = interp ? (_burn[l] / 1000.0 - lib_burn[lo]) / (lib_burn[hi] - lib_burn[lo]) : 0.0;
+
+        // Depletion-history blend: the same gather on the rodded twin, mixed in
+        // by weight. w is 0 (and lo_p < 0) whenever the fuel declares no twin,
+        // so the arithmetic below collapses to the single-library case.
+        const double w      = _node_hw.empty() ? 0.0 : _node_hw[l];
+        const int    lo_p   = _node_refr_lo_p.empty() ? -1 : _node_refr_lo_p[l];
+        const int    hi_p   = _node_refr_hi_p.empty() ? -1 : _node_refr_hi_p[l];
+        const bool   blend  = (w > 0.0 && lo_p >= 0 && hi_p >= 0);
+        const bool   interp_p = blend && (lo_p != hi_p);
+        const double span_p = interp_p ? lib_burn[hi_p] - lib_burn[lo_p] : 0.0;
+        const double f_p =
+            (interp_p && std::abs(span_p) > 1.0e-30)
+                ? (_burn[l] / 1000.0 - lib_burn[lo_p]) / span_p
+                : 0.0;
+        const double wu     = blend ? 1.0 - w : 1.0;
+
+        auto mix = [&](double primary, double partner) {
+            return blend ? wu * primary + w * partner : primary;
+        };
+
+        // Reference lumped XS from the flat cache.
         for (int ig = 0; ig < ng; ++ig) {
             size_t dst_off = ig * nxyz + l;
-            size_t src_off = lo * ng + ig;
+            size_t lo_off  = lo * ng + ig;
+            size_t hi_off  = hi * ng + ig;
             for (int xt = 0; xt < static_cast<int>(N_XS_SCALAR); ++xt) {
                 if (xt == XSDF || xt == XSRF) continue;
-                (*ref_lmpx[xt])[dst_off] = lib_lmpx_ptrs[xt][src_off];
+                double val = lib_lmpx_ptrs[xt][lo_off];
+                if (interp) val += f * (lib_lmpx_ptrs[xt][hi_off] - lib_lmpx_ptrs[xt][lo_off]);
+                double valp = 0.0;
+                if (blend) {
+                    valp = lib_lmpx_ptrs[xt][lo_p * ng + ig];
+                    if (interp_p)
+                        valp += f_p * (lib_lmpx_ptrs[xt][hi_p * ng + ig] - valp);
+                }
+                (*ref_lmpx[xt])[dst_off] = mix(val, valp);
             }
-            for (int ige = 0; ige < ng; ++ige)
-                _ref_lmpx.xssm[(ig * ng + ige) * nxyz + l] = lib_lmpx_sm[lo * ng * ng + ig * ng + ige];
+            for (int ige = 0; ige < ng; ++ige) {
+                double val = lib_lmpx_sm[lo * ng * ng + ig * ng + ige];
+                if (interp)
+                    val += f * (lib_lmpx_sm[hi * ng * ng + ig * ng + ige] - lib_lmpx_sm[lo * ng * ng + ig * ng + ige]);
+                double valp = 0.0;
+                if (blend) {
+                    valp = lib_lmpx_sm[lo_p * ng * ng + ig * ng + ige];
+                    if (interp_p)
+                        valp += f_p * (lib_lmpx_sm[hi_p * ng * ng + ig * ng + ige] - valp);
+                }
+                _ref_lmpx.xssm[(ig * ng + ige) * nxyz + l] = mix(val, valp);
+            }
         }
 
-        // Scatter reference microscopic XS from the flat cache.
+        // Reference microscopic XS from the flat cache.
         for (size_t iso = 0; iso < niso; ++iso) {
             for (int ig = 0; ig < ng; ++ig) {
                 size_t dst_off = (iso * ng + ig) * nxyz + l;
-                size_t src_off = (static_cast<size_t>(lo) * niso + iso) * ng + ig;
+                size_t lo_off  = (static_cast<size_t>(lo) * niso + iso) * ng + ig;
+                size_t hi_off  = (static_cast<size_t>(hi) * niso + iso) * ng + ig;
                 for (int xt = 0; xt < static_cast<int>(N_XS_SCALAR); ++xt) {
                     if (xt == XSDF || xt == XSRF) continue;
-                    (*ref_micx[xt])[dst_off] = lib_micx_ptrs[xt][src_off];
+                    double val = lib_micx_ptrs[xt][lo_off];
+                    if (interp) val += f * (lib_micx_ptrs[xt][hi_off] - lib_micx_ptrs[xt][lo_off]);
+                    double valp = 0.0;
+                    if (blend) {
+                        valp = lib_micx_ptrs[xt][(static_cast<size_t>(lo_p) * niso + iso) * ng + ig];
+                        if (interp_p)
+                            valp += f_p * (lib_micx_ptrs[xt][(static_cast<size_t>(hi_p) * niso + iso) * ng + ig] - valp);
+                    }
+                    (*ref_micx[xt])[dst_off] = mix(val, valp);
                 }
-                for (int ige = 0; ige < ng; ++ige)
-                    _ref_micx.xssm[(iso * ng * ng + ig * ng + ige) * nxyz + l] =
-                        lib_micx_sm[(static_cast<size_t>(lo) * niso + iso) * ng * ng + ig * ng + ige];
+                for (int ige = 0; ige < ng; ++ige) {
+                    const size_t sm_lo = (static_cast<size_t>(lo) * niso + iso) * ng * ng + ig * ng + ige;
+                    const size_t sm_hi = (static_cast<size_t>(hi) * niso + iso) * ng * ng + ig * ng + ige;
+                    double       val   = lib_micx_sm[sm_lo];
+                    if (interp) val += f * (lib_micx_sm[sm_hi] - lib_micx_sm[sm_lo]);
+                    double valp = 0.0;
+                    if (blend) {
+                        const size_t p_lo = (static_cast<size_t>(lo_p) * niso + iso) * ng * ng + ig * ng + ige;
+                        const size_t p_hi = (static_cast<size_t>(hi_p) * niso + iso) * ng * ng + ig * ng + ige;
+                        valp              = lib_micx_sm[p_lo];
+                        if (interp_p) valp += f_p * (lib_micx_sm[p_hi] - valp);
+                    }
+                    _ref_micx.xssm[(iso * ng * ng + ig * ng + ige) * nxyz + l] = mix(val, valp);
+                }
             }
         }
 
-        // Scatter reference isotope densities.
-        for (size_t i = 0; i < niso; ++i)
-            _ref_iden[i * nxyz + l] = lib_iden[lo * niso + i];
+        // Reference isotope densities and water fraction stay on the unrodded
+        // trajectory. They define the coordinate the blend weight is measured
+        // in, so blending them would feed the weight back into itself.
+        for (size_t i = 0; i < niso; ++i) {
+            double val = lib_iden[lo * niso + i];
+            if (interp) val += f * (lib_iden[hi * niso + i] - lib_iden[lo * niso + i]);
+            _ref_iden[i * nxyz + l] = val;
+        }
 
         _ref_wvfr[l]  = lib_wvfr[lo];
-        _ref_tmod[l]  = lib_tmod[lo];
-        _ref_dmod[l]  = lib_dmod[lo];
         _node_wvfr[l] = _ref_wvfr[l];
 
         for (int ig = 0; ig < ng; ++ig) {
-            _ref_flux[static_cast<size_t>(ig) * nxyz + l] = lib_flux[lo * ng + ig];
-            _ref_chix[static_cast<size_t>(ig) * nxyz + l] = lib_chix[lo * ng + ig];
+            double chix_val = lib_chix[lo * ng + ig];
+            if (interp)
+                chix_val += f * (lib_chix[hi * ng + ig] - lib_chix[lo * ng + ig]);
+            double chix_p = 0.0;
+            if (blend) {
+                chix_p = lib_chix[lo_p * ng + ig];
+                if (interp_p) chix_p += f_p * (lib_chix[hi_p * ng + ig] - chix_p);
+            }
+            _ref_chix[static_cast<size_t>(ig) * nxyz + l] = mix(chix_val, chix_p);
         }
 
-        // Interpolate between burnup brackets when the node sits between two reference points.
-        if (lo != hi) {
-            const double f = (_burn[l] / 1000.0 - lib_burn[lo]) / (lib_burn[hi] - lib_burn[lo]);
-
+        // Gd axis override: re-evaluate the lumped-Gd microscopic XS on the effective number
+        // density axis. Everything else (including the Gd reference density itself, which is only
+        // used to initialise fresh nodes) stays on the burnup axis.
+        if (_gd_neff_axis && _node_gd_lo[l] >= 0) {
+            const int    glo = _node_gd_lo[l];
+            const int    ghi = _node_gd_hi[l];
+            const double gf  = _node_gd_frac[l];
+            const size_t iso = Isotope::iGd;
             for (int ig = 0; ig < ng; ++ig) {
-                size_t dst_off = ig * nxyz + l;
-                size_t lo_off  = lo * ng + ig;
-                size_t hi_off  = hi * ng + ig;
+                const size_t dst_off = (iso * ng + ig) * nxyz + l;
+                const size_t lo_off  = (static_cast<size_t>(glo) * niso + iso) * ng + ig;
+                const size_t hi_off  = (static_cast<size_t>(ghi) * niso + iso) * ng + ig;
                 for (int xt = 0; xt < static_cast<int>(N_XS_SCALAR); ++xt) {
                     if (xt == XSDF || xt == XSRF) continue;
-                    (*ref_lmpx[xt])[dst_off] += f * (lib_lmpx_ptrs[xt][hi_off] - lib_lmpx_ptrs[xt][lo_off]);
+                    (*ref_micx[xt])[dst_off] =
+                        lib_micx_ptrs[xt][lo_off] + gf * (lib_micx_ptrs[xt][hi_off] - lib_micx_ptrs[xt][lo_off]);
                 }
-                for (int ige = 0; ige < ng; ++ige)
-                    _ref_lmpx.xssm[(ig * ng + ige) * nxyz + l] +=
-                        f * (lib_lmpx_sm[hi * ng * ng + ig * ng + ige] - lib_lmpx_sm[lo * ng * ng + ig * ng + ige]);
-            }
-
-            for (size_t iso = 0; iso < niso; ++iso) {
-                for (int ig = 0; ig < ng; ++ig) {
-                    size_t dst_off = (iso * ng + ig) * nxyz + l;
-                    size_t lo_off  = (static_cast<size_t>(lo) * niso + iso) * ng + ig;
-                    size_t hi_off  = (static_cast<size_t>(hi) * niso + iso) * ng + ig;
-                    for (int xt = 0; xt < static_cast<int>(N_XS_SCALAR); ++xt) {
-                        if (xt == XSDF || xt == XSRF) continue;
-                        (*ref_micx[xt])[dst_off] += f * (lib_micx_ptrs[xt][hi_off] - lib_micx_ptrs[xt][lo_off]);
-                    }
-                    for (int ige = 0; ige < ng; ++ige)
-                        _ref_micx.xssm[(iso * ng * ng + ig * ng + ige) * nxyz + l] +=
-                            f * (lib_micx_sm[(static_cast<size_t>(hi) * niso + iso) * ng * ng + ig * ng + ige] -
-                                 lib_micx_sm[(static_cast<size_t>(lo) * niso + iso) * ng * ng + ig * ng + ige]);
+                for (int ige = 0; ige < ng; ++ige) {
+                    const size_t sm_lo = (static_cast<size_t>(glo) * niso + iso) * ng * ng + ig * ng + ige;
+                    const size_t sm_hi = (static_cast<size_t>(ghi) * niso + iso) * ng * ng + ig * ng + ige;
+                    _ref_micx.xssm[(iso * ng * ng + ig * ng + ige) * nxyz + l] =
+                        lib_micx_sm[sm_lo] + gf * (lib_micx_sm[sm_hi] - lib_micx_sm[sm_lo]);
                 }
-            }
-
-            for (size_t i = 0; i < niso; ++i)
-                _ref_iden[i * nxyz + l] += f * (lib_iden[hi * niso + i] - lib_iden[lo * niso + i]);
-            _ref_tmod[l] += f * (lib_tmod[hi] - lib_tmod[lo]);
-            _ref_dmod[l] += f * (lib_dmod[hi] - lib_dmod[lo]);
-
-            for (int ig = 0; ig < ng; ++ig) {
-                _ref_flux[static_cast<size_t>(ig) * nxyz + l] +=
-                    f * (lib_flux[hi * ng + ig] - lib_flux[lo * ng + ig]);
-                _ref_chix[static_cast<size_t>(ig) * nxyz + l] +=
-                    f * (lib_chix[hi * ng + ig] - lib_chix[lo * ng + ig]);
             }
         }
     }
@@ -1084,65 +1398,33 @@ void XSSet::PrecomputeBranchCoefficients() {
 
 // Flat XS update helpers.
 
-bool XSSet::UsesRodXS(int l) const {
-    if (_g.rod_fraction(l) <= EPS) return false;
+// Rod occupancy only changes in SetRod, so the per-node answer is cached there and the
+// hot paths (UpdateFlatXS / history deltas / depletion) read a flat byte instead of
+// re-scanning segments and probing the model's reference map per call.
+void XSSet::RebuildUsesRodCache() {
+    const int nxyz = _g.nxyz();
+    _node_uses_rod.assign(static_cast<size_t>(nxyz), 0);
+    for (int l = 0; l < nxyz; ++l) {
+        if (_g.rod_fraction(l) <= EPS) continue;
 
-    const auto& model = _models[_comp[l]];
-    if (_rod_node_segment_offset.size() == static_cast<size_t>(_g.nxyz() + 1)) {
-        const int begin = _rod_node_segment_offset[static_cast<size_t>(l)];
-        const int end   = _rod_node_segment_offset[static_cast<size_t>(l + 1)];
+        const auto& model = _models[_comp[l]];
+        const int   begin = _rod_node_segment_offset[static_cast<size_t>(l)];
+        const int   end   = _rod_node_segment_offset[static_cast<size_t>(l + 1)];
         for (int i = begin; i < end; ++i) {
             const int ctype = _rod_node_segment_ctype[static_cast<size_t>(i)];
-            if (ctype != 0 && model._refr_dpts.count(ctype) != 0)
-                return true;
-        }
-        return false;
-    }
-
-    const int ctype = _ctyp[l];
-    return ctype != 0 && model._refr_dpts.count(ctype) != 0;
-}
-
-void XSSet::RestoreReferenceNode(int l) {
-    const int    nxyz = _g.nxyz();
-    const int    ng   = _g.ng();
-    const size_t niso = Isotope::niso;
-
-    _node_wvfr[l] = _ref_wvfr[l];
-
-    auto ref_lmpx = ScalarXS(_ref_lmpx);
-    auto ref_micx = ScalarXS(_ref_micx);
-    auto lmpx     = ScalarXS(_lmpx);
-    auto micx     = ScalarXS(_micx);
-
-    for (int ig = 0; ig < ng; ++ig) {
-        const size_t off = ig * nxyz + l;
-        for (size_t xt = 0; xt < N_XS_SCALAR; ++xt) {
-            if (xt == XSDF || xt == XSRF) continue;
-            (*lmpx[xt])[off] = (*ref_lmpx[xt])[off];
-        }
-        for (int ige = 0; ige < ng; ++ige) {
-            const size_t sm_off = (ig * ng + ige) * nxyz + l;
-            _lmpx.xssm[sm_off]  = _ref_lmpx.xssm[sm_off];
-        }
-    }
-
-    for (size_t iso = 0; iso < niso; ++iso) {
-        for (int ig = 0; ig < ng; ++ig) {
-            const size_t off = (iso * ng + ig) * nxyz + l;
-            for (size_t xt = 0; xt < N_XS_SCALAR; ++xt) {
-                if (xt == XSDF || xt == XSRF) continue;
-                (*micx[xt])[off] = (*ref_micx[xt])[off];
-            }
-            for (int ige = 0; ige < ng; ++ige) {
-                const size_t sm_off = (iso * ng * ng + ig * ng + ige) * nxyz + l;
-                _micx.xssm[sm_off]  = _ref_micx.xssm[sm_off];
+            if (ctype != 0 && model._refr_dpts.count(ctype) != 0) {
+                _node_uses_rod[static_cast<size_t>(l)] = 1;
+                break;
             }
         }
     }
 }
 
-void XSSet::ApplyBranchDeltaIdToNode(int l, int did, double x, double scale, bool clamp_x) {
+bool XSSet::UsesRodXS(int l) const {
+    return _node_uses_rod[static_cast<size_t>(l)] != 0;
+}
+
+void XSSet::ApplyBranchDeltaIdToNode(int l, int did, double x, double scale) {
     if (did < 0 || scale == 0.0) return;
 
     const int    nxyz = _g.nxyz();
@@ -1152,12 +1434,6 @@ void XSSet::ApplyBranchDeltaIdToNode(int l, int did, double x, double scale, boo
     const auto& dinfo = _lib_deltas[did];
     int         base  = dinfo.coeff_base;
     int         nord  = dinfo.nord;
-
-    if (clamp_x && dinfo.knot_count >= 2) {
-        const double xmin = _lib_knots[dinfo.knot_offset];
-        const double xmax = _lib_knots[dinfo.knot_offset + dinfo.knot_count - 1];
-        x                 = std::clamp(x, xmin, xmax);
-    }
 
     double xloc = x;
 
@@ -1231,119 +1507,476 @@ void XSSet::ApplyBranchDeltaIdToNode(int l, int did, double x, double scale, boo
     }
 }
 
-void XSSet::ApplyBranchDeltaToNode(int l, int branch, double x, double scale) {
-    if (branch < 0 || static_cast<size_t>(branch) >= _node_delta_lo.size()) return;
-    const int lo = _node_delta_lo[branch][l];
-    if (lo < 0 || scale == 0.0) return;
+void XSSet::ResolveSpectralHistoryDeltas(
+    int l, std::vector<DeltaApplication>& out,
+    const double* micWork, size_t requestedModel, double weight) const {
+    out.clear();
+    if (weight == 0.0)
+        return;
 
-    const int    hi      = _node_delta_hi[branch][l];
-    const double f       = _node_delta_frac[branch][l];
-    const bool   clamp_x = branch >= BRANCH_HISTORY_BASE;
-    ApplyBranchDeltaIdToNode(l, lo, x, scale * (1.0 - f), clamp_x);
-    if (hi != lo)
-        ApplyBranchDeltaIdToNode(l, hi, x, scale * f, clamp_x);
-}
+    const size_t modelIndex =
+        requestedModel == static_cast<size_t>(-1) ? _comp[l] : requestedModel;
+    const size_t stride     = static_cast<size_t>(_g.nxyz());
+    const size_t node       = static_cast<size_t>(l);
+    const int    burn       = _burn[l];
+    const int currentCtype  = UsesRodXS(l) ? _ctyp[l] : 0;
+    const int ctypeIndex =
+        findCtype(_refr_ctyp[modelIndex], currentCtype);
+    if (ctypeIndex < 0)
+        return;
 
-void XSSet::ApplyHistoryDeltasToNode(int l) {
-    const size_t mi = _comp[l];
-    if (mi >= _lib_history_corrections.size()) return;
+    const auto& referenceBurnups =
+        _refr_burn[modelIndex][ctypeIndex];
+    const size_t referenceBase =
+        _refr_base[modelIndex] +
+        static_cast<size_t>(ctypeIndex) *
+            _refr_ctyp_stride[modelIndex];
 
-    // Resolve the lo/hi burnup-bracketed delta-surface indices for a (branch, ctype) pair.
-    auto resolveDelta = [&](int branch, int ctype, int burn_key, int& lo, int& hi, double& frac) {
-        if (branch < 0 || static_cast<size_t>(branch) >= _brch_ctyp[mi].size())
-            return false;
-        const int brch_ci = findCtype(_brch_ctyp[mi][branch], ctype);
-        if (brch_ci < 0)
-            return false;
-        const auto& burns = _brch_burn[mi][branch][brch_ci];
-        const int   lo_bi = findLoBurn(burns, burn_key);
-        const int   hi_bi = findHiBurn(burns, burn_key);
-        if (lo_bi < 0 || hi_bi < 0)
-            return false;
-        lo   = static_cast<int>(_brch_base[mi][branch] +
-                                static_cast<size_t>(brch_ci) * _brch_ctyp_stride[mi][branch] +
-                                static_cast<size_t>(lo_bi) * _brch_burn_stride[mi][branch]);
-        hi   = static_cast<int>(_brch_base[mi][branch] +
-                                static_cast<size_t>(brch_ci) * _brch_ctyp_stride[mi][branch] +
-                                static_cast<size_t>(hi_bi) * _brch_burn_stride[mi][branch]);
-        frac = (lo_bi == hi_bi) ? 0.0
-                                : static_cast<double>(burn_key - burns[lo_bi]) /
-                                      static_cast<double>(burns[hi_bi] - burns[lo_bi]);
-        return true;
-    };
+    const int ctypeIndex0 = findCtype(_refr_ctyp[modelIndex], 0);
+    const size_t referenceBase0 =
+        _refr_base[modelIndex] +
+        static_cast<size_t>(ctypeIndex0 < 0 ? ctypeIndex : ctypeIndex0) *
+            _refr_ctyp_stride[modelIndex];
 
-    const int    current_ctype    = UsesRodXS(l) ? _ctyp[l] : 0;
-    const int    trajectory_ctype = (l < static_cast<int>(_history_ctyp.size())) ? _history_ctyp[l] : 0;
-    const size_t stride           = static_cast<size_t>(_g.nxyz());
-    const size_t node             = static_cast<size_t>(l);
-
-    // Indicator-vector coordinate at the current node state and at the reference state.
-    // rod_fluence is the only synthetic coordinate; every other entry is a real isotope density.
-    auto histCur = [&](size_t iso) -> double {
-        if (iso == Chiffon::Hv::ROD_FLU)
-            return Chiffon::hvRodFluCoord(FineRodFluenceAverage(l, current_ctype));
-        const size_t idx = iso * stride + node;
-        return idx < _iden.size() ? _iden[idx] : 0.0;
-    };
-    auto histRef = [&](size_t iso) -> double {
-        if (iso == Chiffon::Hv::ROD_FLU)
+    // Reference inventory on the *unrodded* ctype-0 trajectory, independent of
+    // the node's current rod state.
+    auto referenceDensity0 = [&](size_t isotope, int burnup) {
+        if (isotope >= Isotope::niso)
             return 0.0;
-        const size_t idx = iso * stride + node;
-        return idx < _ref_iden.size() ? _ref_iden[idx] : 0.0;
+        const auto& burns = _refr_burn[modelIndex][ctypeIndex0 < 0 ? ctypeIndex : ctypeIndex0];
+        const int   lo    = findLoBurn(burns, burnup);
+        const int   hi    = findHiBurn(burns, burnup);
+        if (lo < 0 || hi < 0)
+            return 0.0;
+        const size_t lb = referenceBase0 + static_cast<size_t>(lo) * _refr_burn_stride[modelIndex];
+        const size_t hb = referenceBase0 + static_cast<size_t>(hi) * _refr_burn_stride[modelIndex];
+        double       v  = _lib_iden[lb * Isotope::niso + isotope];
+        if (lb != hb && _lib_burn[hb] != _lib_burn[lb]) {
+            const double f = (static_cast<double>(burnup) / 1000.0 - _lib_burn[lb]) /
+                             (_lib_burn[hb] - _lib_burn[lb]);
+            v += f * (_lib_iden[hb * Isotope::niso + isotope] - v);
+        }
+        return v;
     };
 
-    const int   delta_burn  = _burn[l];
-    const auto& corrections = _lib_history_corrections[mi];
-    for (size_t h = 0; h < corrections.size(); ++h) {
-        const auto& history = corrections[h];
-        const int   branch  = static_cast<int>(BRANCH_HISTORY_BASE + h);
+    auto burnRatioCoordinate = [&](const Chiffon::SpectralTerm& term, int burnup) {
+        const size_t b = term.partner;
+        if (b >= Isotope::niso)
+            return 0.0;
+        const double fl = Chiffon::SPECTRAL_LOG_DENSITY_FLOOR;
+        const double na = std::max(_iden[term.isotope * stride + node], fl);
+        const double nb = std::max(_iden[b * stride + node], fl);
+        const double ra = std::max(referenceDensity0(term.isotope, burnup), fl);
+        const double rb = std::max(referenceDensity0(b, burnup), fl);
+        return std::log(na / ra) - std::log(nb / rb);
+    };
 
-        // Only the two runtime IISC kinds are applied here: CTYPE_INDEP_VEC is a
-        // ctype-independent surface applied to every node, and RHST_UNIT is a current-ctype
-        // surface applied only where the fuel carries rodded history. A ctype-keyed IISC
-        // surface (legacy Hk::VEC, emitted when ctype_independent is false) is NOT handled by
-        // this path and falls through the else below, so an applied IISC must be ctype-independent.
-        int storage_ctype = 0;
-        if (history.kind == Chiffon::Hk::CTYPE_INDEP_VEC) {
-            storage_ctype = 0;
-        } else if (history.kind == Chiffon::Hk::RHST_UNIT) {
-            if (trajectory_ctype <= 0) continue;
-            storage_ctype = current_ctype;
-        } else {
-            continue;
+    auto fissileFraction = [&](const Chiffon::SpectralTerm& term) {
+        const size_t b = term.partner;
+        if (b >= Isotope::niso)
+            return 0.0;
+        const double na = std::max(0.0, _iden[term.isotope * stride + node]);
+        const double sum = na + std::max(0.0, _iden[b * stride + node]);
+        return sum > 1.0e-300 ? na / sum : 0.0;
+    };
+
+    auto referenceDensity = [&](size_t isotope, int burnup) {
+        if (isotope >= Isotope::niso)
+            return 0.0;
+
+        const int loIndex = findLoBurn(referenceBurnups, burnup);
+        const int hiIndex = findHiBurn(referenceBurnups, burnup);
+        if (loIndex < 0 || hiIndex < 0)
+            return 0.0;
+
+        const size_t lo =
+            referenceBase +
+            static_cast<size_t>(loIndex) *
+                _refr_burn_stride[modelIndex];
+        const size_t hi =
+            referenceBase +
+            static_cast<size_t>(hiIndex) *
+                _refr_burn_stride[modelIndex];
+
+        double value =
+            _lib_iden[lo * Isotope::niso + isotope];
+        if (lo != hi && _lib_burn[hi] != _lib_burn[lo]) {
+            const double fraction =
+                (static_cast<double>(burnup) / 1000.0 -
+                 _lib_burn[lo]) /
+                (_lib_burn[hi] - _lib_burn[lo]);
+            value +=
+                fraction *
+                (_lib_iden[hi * Isotope::niso + isotope] -
+                 _lib_iden[lo * Isotope::niso + isotope]);
         }
+        return value;
+    };
 
-        int    lo = -1, hi = -1;
-        double frac = 0.0;
-        if (!resolveDelta(branch, storage_ctype, delta_burn, lo, hi, frac))
-            continue;
+    // Condition the reference depletion ran at, on the same three coordinates the
+    // scalar branch tables use. Centering the cross term on it keeps the column
+    // exactly zero wherever the node sits on the reference condition.
+    auto referenceCondition = [&](int axis, int burnup) {
+        const int loIndex = findLoBurn(referenceBurnups, burnup);
+        const int hiIndex = findHiBurn(referenceBurnups, burnup);
+        if (loIndex < 0 || hiIndex < 0)
+            return 0.0;
+        const size_t lo = referenceBase +
+                          static_cast<size_t>(loIndex) *
+                              _refr_burn_stride[modelIndex];
+        const size_t hi = referenceBase +
+                          static_cast<size_t>(hiIndex) *
+                              _refr_burn_stride[modelIndex];
+        const size_t a = static_cast<size_t>(axis);
+        double value   = _lib_ref_branch_x[lo][a];
+        if (lo != hi && _lib_burn[hi] != _lib_burn[lo]) {
+            const double fraction =
+                (static_cast<double>(burnup) / 1000.0 - _lib_burn[lo]) /
+                (_lib_burn[hi] - _lib_burn[lo]);
+            value += fraction * (_lib_ref_branch_x[hi][a] - value);
+        }
+        return value;
+    };
 
-        const double x = Interpolator::EvalVectorTermFromAccessors(
-            history.vector_isotopes, history.vector_powers, histCur, histRef);
-        ApplyBranchDeltaIdToNode(l, lo, x, 1.0 - frac, true);
-        if (hi != lo)
-            ApplyBranchDeltaIdToNode(l, hi, x, frac, true);
-    }
-}
-
-void XSSet::ApplyBranchDeltasToNode(int l) {
-    // Unrodded nodes use the ordinary delta chain:
-    // base XS + BPPM + TFUEL + DMOD + IISC/RHST history deltas.
-    const double boron_dmod                  = BoronDmod(_g, _boron_dmod_average, l);
-    const double x_vals[BRANCH_HISTORY_BASE] = {
-        boron_dmod * _node_wvfr[l] * _g.bppm(l) * BORON_DENSITY_FACTOR,
+    // The node's own value on those same three coordinates, matching the
+    // `x_vals` table in UpdateUnroddedNodeXS exactly.
+    const double nodeBranchX[NUM_SCALAR_BRANCHES] = {
+        BoronDmod(_g, _boron_dmod_average, l) * _node_wvfr[node] *
+            _g.bppm(l) * BORON_DENSITY_FACTOR,
         std::sqrt(_g.tful(l)),
         _g.dmod(l)};
 
-    for (int branch = 0; branch < BRANCH_HISTORY_BASE; ++branch)
-        ApplyBranchDeltaToNode(l, branch, x_vals[branch], 1.0);
-    ApplyHistoryDeltasToNode(l);
+    for (const auto& correction :
+         _lib_spectral_history[modelIndex]) {
+        const auto& burnups = correction.burnups;
+        const int loIndex = findLoBurn(burnups, burn);
+        const int hiIndex = findHiBurn(burnups, burn);
+        if (loIndex < 0 || hiIndex < 0)
+            continue;
+
+        const bool logarithmic =
+            correction.term.coordinate ==
+            Chiffon::SpectralCoordinate::LogDensity;
+        const bool rooted =
+            correction.term.coordinate ==
+            Chiffon::SpectralCoordinate::SqrtDensity;
+        const bool thermalWeighted =
+            correction.term.coordinate ==
+            Chiffon::SpectralCoordinate::ThermalWeighted;
+        const bool fastWeighted =
+            correction.term.coordinate ==
+            Chiffon::SpectralCoordinate::FastWeighted;
+        const bool ratioInteraction =
+            correction.term.coordinate ==
+            Chiffon::SpectralCoordinate::FluxRatioInteraction;
+        const bool burnRatio =
+            correction.term.coordinate ==
+            Chiffon::SpectralCoordinate::RelativeBurnRatio;
+        const bool spectralIndex =
+            correction.term.coordinate ==
+            Chiffon::SpectralCoordinate::SpectralIndex;
+        const bool spectralCross =
+            correction.term.coordinate ==
+            Chiffon::SpectralCoordinate::SpectralIndexInteraction;
+        // Centered condition x composition cross term: zero on the reference
+        // condition and zero on the reference composition, so it tilts a branch
+        // slope without being able to stand in for either layer.
+        const int branchAxis =
+            Chiffon::BranchAxisOf(correction.term.coordinate);
+        const Chiffon::SpectralCoordinate coord = correction.term.coordinate;
+        const bool ratioForm =
+            coord == Chiffon::SpectralCoordinate::LogDeviationSquared ||
+            coord == Chiffon::SpectralCoordinate::InverseRatio ||
+            coord == Chiffon::SpectralCoordinate::CubeRootRatio ||
+            coord == Chiffon::SpectralCoordinate::SaturatingRatio;
+        const bool fissile =
+            coord == Chiffon::SpectralCoordinate::FissileFraction;
+        // Rod exposure of this node, on the same rod-material fluence the rod
+        // depletion layer uses. Zero with the rod out, which is where this term
+        // is meant to be silent anyway.
+        const int rodAgeAxis = Chiffon::RodAgeAxisOf(coord);
+        const bool fluxWeighted = thermalWeighted || fastWeighted ||
+                                  ratioInteraction || spectralIndex ||
+                                  spectralCross || branchAxis >= 0 ||
+                                  ratioForm || fissile || rodAgeAxis >= 0;
+        const double density =
+            _iden[correction.term.isotope * stride + node];
+        const double fl = Chiffon::SPECTRAL_LOG_DENSITY_FLOOR;
+        const double coordinate =
+            burnRatio
+                ? burnRatioCoordinate(correction.term, burn)
+                : rodAgeAxis >= 0
+                ? (nodeBranchX[rodAgeAxis] -
+                   referenceCondition(rodAgeAxis, burn)) *
+                      FineRodThermalFluenceAverage(l, currentCtype) *
+                      Chiffon::ROD_AGE_SCALE
+                : fissile
+                ? fissileFraction(correction.term)
+                : ratioForm
+                ? Chiffon::RatioFormOf(
+                      coord, std::max(density, fl),
+                      std::max(referenceDensity(correction.term.isotope, burn),
+                               fl))
+                : branchAxis >= 0
+                ? (nodeBranchX[branchAxis] -
+                   referenceCondition(branchAxis, burn)) *
+                      (density - referenceDensity(correction.term.isotope, burn))
+                : spectralCross
+                ? NodeSpectralIndex(l, micWork) *
+                      (density - referenceDensity(correction.term.isotope, burn))
+                : spectralIndex
+                ? NodeSpectralIndex(l, micWork)
+                : ratioInteraction
+                ? std::log(std::max(NodeFluxShare(l, true), 1.0e-30) /
+                           std::max(NodeFluxShare(l, false), 1.0e-30)) *
+                      (density - referenceDensity(correction.term.isotope, burn))
+                : fluxWeighted
+                ? NodeFluxShare(l, thermalWeighted) *
+                      std::max(0.0, density)
+                : rooted
+                ? std::sqrt(std::max(0.0, density))
+                : (logarithmic
+                       ? std::log(std::max(
+                             density, Chiffon::SPECTRAL_LOG_DENSITY_FLOOR))
+                       : std::max(0.0, density));
+        const double fraction =
+            loIndex == hiIndex
+                ? 0.0
+                : static_cast<double>(burn - burnups[loIndex]) /
+                      static_cast<double>(
+                          burnups[hiIndex] - burnups[loIndex]);
+
+        auto keyCoordinate = [&](int keyBurnup) {
+            if (loIndex == hiIndex || fluxWeighted)
+                return coordinate;
+
+            const double referenceNow =
+                referenceDensity(
+                    correction.term.isotope, burn);
+            const double referenceAtKey =
+                referenceDensity(
+                    correction.term.isotope, keyBurnup);
+            if (logarithmic) {
+                return coordinate -
+                       std::log(std::max(
+                           referenceNow,
+                           Chiffon::SPECTRAL_LOG_DENSITY_FLOOR)) +
+                       std::log(std::max(
+                           referenceAtKey,
+                           Chiffon::SPECTRAL_LOG_DENSITY_FLOOR));
+            }
+            if (rooted) {
+                return coordinate -
+                       std::sqrt(std::max(0.0, referenceNow)) +
+                       std::sqrt(std::max(0.0, referenceAtKey));
+            }
+            return coordinate - referenceNow + referenceAtKey;
+        };
+
+        // Rod-state increment terms carry the instantaneous rod fraction.
+        const double rodWeight =
+            correction.rod_scaled ? RodBlendWeight(l) : 1.0;
+        if (rodWeight == 0.0)
+            continue;
+
+        const int loDelta =
+            static_cast<int>(
+                correction.delta_base +
+                static_cast<size_t>(loIndex));
+        out.push_back(
+            {loDelta, keyCoordinate(burnups[loIndex]),
+             weight * rodWeight * (1.0 - fraction),
+             static_cast<int>(correction.term.isotope)});
+        if (hiIndex != loIndex) {
+            const int hiDelta =
+                static_cast<int>(
+                    correction.delta_base +
+                    static_cast<size_t>(hiIndex));
+            out.push_back(
+                {hiDelta, keyCoordinate(burnups[hiIndex]),
+                 weight * rodWeight * fraction,
+                 static_cast<int>(correction.term.isotope)});
+        }
+    }
+}
+
+// PROBE: which weight blends the rodded surface in. "frod" is the
+// instantaneous spectrum state, "pu" the share of Pu that accrued while rodded.
+double XSSet::RodBlendWeight(int l) const {
+    static const int mode = [] {
+        const char* env = std::getenv("CHIFFON_PROBE_BLEND");
+        if (env == nullptr) return 0;
+        const std::string v(env);
+        if (v == "pu") return 1;
+        if (v == "both") return 2;
+        return 0;
+    }();
+    const double f = _g.rod_fraction(l);
+    if (mode == 0) return f;
+    const double p = RoddedPuFraction(l);
+    return mode == 1 ? p : f * p;
+}
+
+// PROBE: the node's base+branch thermal cross sections are already in place
+// when the spectral-history terms are resolved (FillRodNodeXS /
+// UpdateUnroddedNodeXS run first, ReconstructNode after), so this reads the
+// pre-correction state and is not self-referential.
+double XSSet::NodeSpectralIndex(int l, const double* micWork) const {
+    const int    ng  = _g.ng();
+    const int    ith = ng - 1;
+    // `_micx` still holds the previous step's corrected state at the point the
+    // history terms are resolved, so reading it here would feed the correction
+    // back into its own coordinate. The workspace is the base+branch state.
+    const double num =
+        micWork != nullptr
+            ? micWork[Isotope::iPu239 * ng + ith]
+            : micx(XSAF, Isotope::iPu239, ith, l);
+    const double den =
+        micWork != nullptr
+            ? micWork[Isotope::iB10 * ng + ith]
+            : micx(XSAF, Isotope::iB10, ith, l);
+    if (!(std::abs(den) > 1.0e-30))
+        return 0.0;
+    // Centre on the unbranched base state (`_ref_micx`), matching the fit side:
+    // the coordinate is the spectrum *deviation*, zero at nominal conditions.
+    const double bnum = refMicx(XSAF, Isotope::iPu239, ith, l);
+    const double bden = refMicx(XSAF, Isotope::iB10, ith, l);
+    if (!(std::abs(bden) > 1.0e-30))
+        return 0.0;
+    const double now  = num / den;
+    const double base = bnum / bden;
+    return (now > 1.0e-30 && base > 1.0e-30) ? std::log(now / base) : 0.0;
+}
+
+double XSSet::NodeFluxShare(int l, bool thermal) const {
+    const int     ng  = _g.ng();
+    const double* phi = _g.Phif();
+    double        tot = 0.0;
+    for (int ig = 0; ig < ng; ++ig)
+        tot += phi[static_cast<size_t>(l) * ng + ig];
+    if (!(tot > 0.0))
+        return 0.0;
+    const int ig = thermal ? ng - 1 : 0;
+    return phi[static_cast<size_t>(l) * ng + ig] / tot;
+}
+
+void XSSet::ApplySpectralHistoryToNode(int l) {
+    static thread_local std::vector<DeltaApplication> deltas;
+    const double hw = _node_hw.empty() ? 0.0 : _node_hw[l];
+    ResolveSpectralHistoryDeltas(l, deltas, nullptr,
+                                 static_cast<size_t>(-1), 1.0 - hw);
+    for (const auto& d : deltas)
+        ApplyBranchDeltaIdToNode(l, d.did, d.x, d.scale);
+    if (hw <= 0.0)
+        return;
+    const int partner =
+        _lib_history_partner.empty() ? -1 : _lib_history_partner[_comp[l]];
+    if (partner < 0)
+        return;
+    ResolveSpectralHistoryDeltas(l, deltas, nullptr,
+                                 static_cast<size_t>(partner), hw);
+    for (const auto& d : deltas)
+        ApplyBranchDeltaIdToNode(l, d.did, d.x, d.scale);
+}
+
+// Accumulate the few-group MACRO contribution of a fitted delta surface.
+// Scatter and the derived XSDF/XSRF channels are not reported here.
+void XSSet::AccumulateDeltaMacro(int l, int did, double x, double scale,
+                                 std::vector<double>& scalar) const {
+    // The descending Horner reduction below MUST match ApplyBranchDeltaIdToNode's lumped loop
+    // bit-for-bit (same order: val = val*xloc + cdata[(base+p)*ng+ig]); reassociating / fma /
+    // power-precompute would break the term_contrib == live-XS contract.
+    if (did < 0 || scale == 0.0) return;
+
+    const int    ng    = _g.ng();
+    const int    nxyz  = _g.nxyz();
+    const size_t niso  = Isotope::niso;
+    const auto&  dinfo = _lib_deltas[did];
+    int          base  = dinfo.coeff_base;
+    int          nord  = dinfo.nord;
+    double       xloc  = x;
+    if (dinfo.mode == 1) {
+        const int nintervals = dinfo.nord / dinfo.ncoeff;
+        int       interval   = nintervals - 1;
+        for (int i = 0; i < nintervals - 1; ++i) {
+            if (x < _lib_knots[dinfo.knot_offset + i + 1]) {
+                interval = i;
+                break;
+            }
+        }
+        xloc = x - _lib_knots[dinfo.knot_offset + interval];
+        base += interval * dinfo.ncoeff;
+        nord = dinfo.ncoeff;
+    }
+
+    const auto coeff_lmpx = ScalarData(_lib_coeff_lmpx);
+    for (int ig = 0; ig < ng; ++ig) {
+        for (int xt = 0; xt < static_cast<int>(N_XS_SCALAR); ++xt) {
+            if (xt == XSDF || xt == XSRF) continue;
+            const double* cdata = coeff_lmpx[xt];
+            double        val   = cdata[(base + nord - 1) * ng + ig];
+            for (int p = nord - 2; p >= 0; --p)
+                val = val * xloc + cdata[(base + p) * ng + ig];
+            scalar[xt * ng + ig] += scale * val;
+        }
+    }
+
+    if (!_lib_has_coeff_micx)
+        return;
+
+    const auto   coeff_micx          = ScalarData(_lib_coeff_micx);
+    const size_t scalar_stride       = niso * static_cast<size_t>(ng);
+    auto         densityForMacroFold = [&](size_t iso) {
+        if (!UsesRodXS(l) && (iso == Isotope::iH1 || iso == Isotope::iO16 || iso == Isotope::iB10)) {
+            const double nH2O       = _g.dmod(l) * _node_wvfr[l] * WATER_NUMBER_DENSITY;
+            const double boron_dmod = BoronDmod(_g, _boron_dmod_average, l);
+            if (iso == Isotope::iH1) return 2.0 * nH2O;
+            if (iso == Isotope::iO16) return nH2O;
+            return boron_dmod * _node_wvfr[l] * _g.bppm(l) * BORON_DENSITY_FACTOR;
+        }
+        return _iden[iso * nxyz + l];
+    };
+
+    for (size_t iso = 0; iso < niso; ++iso) {
+        const double ndens = densityForMacroFold(iso);
+        for (int ig = 0; ig < ng; ++ig) {
+            const size_t elem = iso * static_cast<size_t>(ng) + static_cast<size_t>(ig);
+            for (int xt = 0; xt < static_cast<int>(N_XS_SCALAR); ++xt) {
+                if (xt == XSDF || xt == XSRF) continue;
+                const double* cdata = coeff_micx[xt];
+                double        val   = cdata[(base + nord - 1) * scalar_stride + elem];
+                for (int p = nord - 2; p >= 0; --p)
+                    val = val * xloc + cdata[(base + p) * scalar_stride + elem];
+                scalar[xt * ng + ig] += scale * val * ndens;
+            }
+        }
+    }
+}
+
+// Resolve per-isotope spectral-history contributions for diagnostics.
+// Scattering contributions are omitted from this compact report.
+void XSSet::ResolveTermContributions(int l, std::vector<TermContribution>& out) const {
+    out.clear();
+    std::vector<DeltaApplication> deltas;
+    ResolveSpectralHistoryDeltas(l, deltas);
+
+    const size_t scalar_len = N_XS_SCALAR * static_cast<size_t>(_g.ng());
+    for (const auto& d : deltas) {
+        auto it = std::find_if(out.begin(), out.end(), [&](const TermContribution& t) {
+            return t.iso == d.iso;
+        });
+        if (it == out.end()) {
+            out.push_back({d.iso, std::vector<double>(scalar_len, 0.0)});
+            it = std::prev(out.end());
+        }
+        AccumulateDeltaMacro(l, d.did, d.x, d.scale, it->scalar);
+    }
 }
 
 void XSSet::FillRodNodeXS(int l) {
     // Rodded nodes start from the rodded reference surface and apply explicit
-    // rod-material depletion before IISC/RHST history deltas are added by the
-    // caller. Fine rod fluence is rod-material state, not fuel history memory.
+    // rod-material depletion before spectral-history deltas are added. Fine rod
+    // fluence is rod-material state, not fuel history memory.
     const int    nxyz  = _g.nxyz();
     const size_t ng    = static_cast<size_t>(_g.ng());
     const size_t niso  = Isotope::niso;
@@ -1352,69 +1985,70 @@ void XSSet::FillRodNodeXS(int l) {
     static thread_local CrossSection         tls_xs, tls_delta, tls_xs2;
     static thread_local milk::Vector<double> tls_iden, tls_iden2;
 
-    int begin = 0;
-    int end   = 0;
-    if (_rod_node_segment_offset.size() == static_cast<size_t>(nxyz + 1)) {
-        begin = _rod_node_segment_offset[static_cast<size_t>(l)];
-        end   = _rod_node_segment_offset[static_cast<size_t>(l + 1)];
+    // Depletion-history blend on the base+branch state. RDPL stays on the
+    // primary library: it is rod-material burnout, not fuel history.
+    const int    partner = _lib_history_partner.empty()
+                               ? -1
+                               : _lib_history_partner[_comp[l]];
+    const double hw      = (partner >= 0 && !_node_hw.empty()) ? _node_hw[l] : 0.0;
+    static thread_local CrossSection         tls_xsp;
+    static thread_local milk::Vector<double> tls_idenp;
+    // Only the cross sections blend; `iden` stays on the unrodded trajectory
+    // because the blend weight is measured against it.
+    //
+    // RDPL is applied to the PRIMARY side only. It carries a fresh rod toward a
+    // burned one, and the partner library was itself depleted with the rod in,
+    // so its base already holds that burnout -- adding RDPL there double-counts.
+    auto fill = [&](CrossSection& xs, milk::Vector<double>& iden, int ctype,
+                    double fluence, bool rodded) {
+        model.FillCrossSection(xs, iden, tls_delta, ctype, _burn[l],
+                               _g.bppm(l), _g.tful(l), _g.dmod(l));
+        if (rodded)
+            model.ApplyRodDepletion(xs, tls_delta, ctype, fluence, _burn[l],
+                                    iden[Chiffon::Isotope::iB10],
+                                    std::sqrt(_g.tful(l)), _g.dmod(l));
+        if (hw <= 0.0)
+            return;
+        _models[static_cast<size_t>(partner)].FillCrossSection(
+            tls_xsp, tls_idenp, tls_delta, ctype, _burn[l], _g.bppm(l),
+            _g.tful(l), _g.dmod(l));
+        xs *= (1.0 - hw);
+        tls_xsp *= hw;
+        xs += tls_xsp;
+    };
+
+    const int begin = _rod_node_segment_offset[static_cast<size_t>(l)];
+    const int end   = _rod_node_segment_offset[static_cast<size_t>(l + 1)];
+
+    double rodded_frac = 0.0;
+    for (int i = begin; i < end; ++i)
+        rodded_frac += _rod_node_segment_fraction[static_cast<size_t>(i)];
+    rodded_frac = std::clamp(rodded_frac, 0.0, 1.0);
+
+    bool   has_xs        = false;
+    double unrodded_frac = std::max(0.0, 1.0 - rodded_frac);
+    if (unrodded_frac > EPS) {
+        fill(tls_xs, tls_iden, 0, 0.0, false);
+        tls_xs *= unrodded_frac;
+        has_xs = true;
     }
 
-    if (begin < end) {
-        double rodded_frac = 0.0;
-        for (int i = begin; i < end; ++i)
-            rodded_frac += _rod_node_segment_fraction[static_cast<size_t>(i)];
-        rodded_frac = std::clamp(rodded_frac, 0.0, 1.0);
+    for (int i = begin; i < end; ++i) {
+        const double frac = _rod_node_segment_fraction[static_cast<size_t>(i)];
+        if (frac <= EPS) continue;
 
-        bool   has_xs        = false;
-        double unrodded_frac = std::max(0.0, 1.0 - rodded_frac);
-        if (unrodded_frac > EPS) {
-            model.FillCrossSection(tls_xs, tls_iden, tls_delta,
-                                   0, _burn[l], _g.bppm(l), _g.tful(l), _g.dmod(l));
-            tls_xs *= unrodded_frac;
+        const int    input_ctype = _rod_node_segment_ctype[static_cast<size_t>(i)];
+        const int    solve_ctype = (input_ctype != 0 && model._refr_dpts.count(input_ctype) != 0)
+                                       ? input_ctype
+                                       : 0;
+        const double fluence =
+            FineRodThermalFluenceAverage(l, input_ctype);
+        if (!has_xs) {
+            fill(tls_xs, tls_iden, solve_ctype, fluence, true);
+            tls_xs *= frac;
             has_xs = true;
-        }
-
-        for (int i = begin; i < end; ++i) {
-            const double frac = _rod_node_segment_fraction[static_cast<size_t>(i)];
-            if (frac <= EPS) continue;
-
-            const int    input_ctype = _rod_node_segment_ctype[static_cast<size_t>(i)];
-            const int    solve_ctype = (input_ctype != 0 && model._refr_dpts.count(input_ctype) != 0)
-                                           ? input_ctype
-                                           : 0;
-            const double fluence     = FineRodFluenceAverage(l, input_ctype);
-            if (!has_xs) {
-                model.FillCrossSection(tls_xs, tls_iden, tls_delta,
-                                       solve_ctype, _burn[l], _g.bppm(l), _g.tful(l), _g.dmod(l));
-                model.ApplyRodDepletion(tls_xs, tls_delta, solve_ctype, fluence);
-                tls_xs *= frac;
-                has_xs = true;
-            } else {
-                model.FillCrossSection(tls_xs2, tls_iden2, tls_delta,
-                                       solve_ctype, _burn[l], _g.bppm(l), _g.tful(l), _g.dmod(l));
-                model.ApplyRodDepletion(tls_xs2, tls_delta, solve_ctype, fluence);
-                tls_xs2 *= frac;
-                tls_xs += tls_xs2;
-            }
-        }
-
-        if (!has_xs)
-            model.FillCrossSection(tls_xs, tls_iden, tls_delta,
-                                   0, _burn[l], _g.bppm(l), _g.tful(l), _g.dmod(l));
-    } else {
-        const int    ctype   = _ctyp[l];
-        const double frac    = _g.rod_fraction(l);
-        const double fluence = FineRodFluenceAverage(l, ctype);
-        model.FillCrossSection(tls_xs, tls_iden, tls_delta,
-                               (frac >= 1.0 - EPS) ? ctype : 0,
-                               _burn[l], _g.bppm(l), _g.tful(l), _g.dmod(l));
-        if (frac >= 1.0 - EPS)
-            model.ApplyRodDepletion(tls_xs, tls_delta, ctype, fluence);
-        if (frac < 1.0 - EPS) {
-            model.FillCrossSection(tls_xs2, tls_iden2, tls_delta,
-                                   ctype, _burn[l], _g.bppm(l), _g.tful(l), _g.dmod(l));
-            model.ApplyRodDepletion(tls_xs2, tls_delta, ctype, fluence);
-            tls_xs *= (1.0 - frac);
+        } else {
+            fill(tls_xs2, tls_iden2, solve_ctype, fluence, true);
             tls_xs2 *= frac;
             tls_xs += tls_xs2;
         }
@@ -1441,105 +2075,250 @@ void XSSet::RefreshLightIsotopes(int l) {
 
 // Update flat XS arrays using pre-computed coefficients.
 
+// Per-node update through a node-local contiguous workspace: gather the burnup-interpolated
+// reference once, apply every fitted delta surface with stride-1 reads AND writes (the SoA
+// destination stride is nxyz*8B, so the former per-delta read-modify-write touched a distinct
+// cache line per element), then scatter back and rebuild this node's macroscopic XS in one pass.
+void XSSet::UpdateUnroddedNodeXS(int l) {
+    const int    nxyz = _g.nxyz();
+    const int    ng   = _g.ng();
+    const size_t niso = Isotope::niso;
+
+    // Workspace layout: [active-xt lmpx | lmpx sm | active-xt micx | micx sm].
+    const size_t nlsm    = static_cast<size_t>(ng) * ng;
+    const size_t nmic    = niso * static_cast<size_t>(ng);
+    const size_t nmsm    = niso * nlsm;
+    const size_t off_lsm = static_cast<size_t>(N_ACTIVE_XT) * ng;
+    const size_t off_mic = off_lsm + nlsm;
+    const size_t off_msm = off_mic + static_cast<size_t>(N_ACTIVE_XT) * nmic;
+    const size_t total   = off_msm + nmsm;
+
+    static thread_local std::vector<double> buf;
+    if (buf.size() != total) buf.resize(total);
+    double* bl  = buf.data();           // lmpx scalars [t*ng + ig]
+    double* bls = buf.data() + off_lsm; // lmpx scatter [ig*ng + ige]
+    double* bm  = buf.data() + off_mic; // micx scalars [t*nmic + iso*ng + ig]
+    double* bms = buf.data() + off_msm; // micx scatter [iso*ng*ng + ig*ng + ige]
+
+    const auto ref_lmpx = ScalarData(_ref_lmpx);
+    const auto ref_micx = ScalarData(_ref_micx);
+    auto       lmpx     = ScalarXS(_lmpx);
+    auto       micx     = ScalarXS(_micx);
+    auto       xs       = ScalarXS(_xs);
+
+    _node_wvfr[l] = _ref_wvfr[l];
+
+    // 1. Gather the reference state into the workspace.
+    for (int t = 0; t < N_ACTIVE_XT; ++t) {
+        const double* src = ref_lmpx[ACTIVE_XT[t]];
+        for (int ig = 0; ig < ng; ++ig)
+            bl[t * ng + ig] = src[static_cast<size_t>(ig) * nxyz + l];
+    }
+    for (size_t sm = 0; sm < nlsm; ++sm)
+        bls[sm] = _ref_lmpx.xssm[sm * nxyz + l];
+    for (int t = 0; t < N_ACTIVE_XT; ++t) {
+        const double* src = ref_micx[ACTIVE_XT[t]];
+        double*       dst = bm + static_cast<size_t>(t) * nmic;
+        for (size_t e = 0; e < nmic; ++e)
+            dst[e] = src[e * nxyz + l];
+    }
+    for (size_t e = 0; e < nmsm; ++e)
+        bms[e] = _ref_micx.xssm[e * nxyz + l];
+
+    // 2. Delta applicator: Horner per element, coefficient reads and accumulation
+    //    writes both stride-1 in the element direction.
+    const auto    coeff_lmpx    = ScalarData(_lib_coeff_lmpx);
+    const auto    coeff_micx    = ScalarData(_lib_coeff_micx);
+    const double* coeff_lmpx_sm = _lib_coeff_lmpx.xssm.data();
+    const double* coeff_micx_sm = _lib_coeff_micx.xssm.data();
+
+    auto applyDelta = [&](int did, double x, double scale) {
+        if (did < 0 || scale == 0.0) return;
+
+        const auto& dinfo = _lib_deltas[did];
+        int         base  = dinfo.coeff_base;
+        int         nord  = dinfo.nord;
+        double      xloc  = x;
+        if (dinfo.mode == 1) {
+            const int nintervals = dinfo.nord / dinfo.ncoeff;
+            int       interval   = nintervals - 1;
+            for (int i = 0; i < nintervals - 1; ++i) {
+                if (x < _lib_knots[dinfo.knot_offset + i + 1]) {
+                    interval = i;
+                    break;
+                }
+            }
+            xloc = x - _lib_knots[dinfo.knot_offset + interval];
+            base += interval * dinfo.ncoeff;
+            nord = dinfo.ncoeff;
+        }
+
+        for (int t = 0; t < N_ACTIVE_XT; ++t) {
+            const double* cdata = coeff_lmpx[ACTIVE_XT[t]];
+            double*       dst   = bl + static_cast<size_t>(t) * ng;
+            for (int e = 0; e < ng; ++e) {
+                double val = cdata[(base + nord - 1) * ng + e];
+                for (int p = nord - 2; p >= 0; --p)
+                    val = val * xloc + cdata[(base + p) * ng + e];
+                dst[e] += scale * val;
+            }
+        }
+        for (size_t e = 0; e < nlsm; ++e) {
+            double val = coeff_lmpx_sm[(base + nord - 1) * nlsm + e];
+            for (int p = nord - 2; p >= 0; --p)
+                val = val * xloc + coeff_lmpx_sm[(base + p) * nlsm + e];
+            bls[e] += scale * val;
+        }
+
+        if (!_lib_has_coeff_micx) return;
+        for (int t = 0; t < N_ACTIVE_XT; ++t) {
+            const double* cdata = coeff_micx[ACTIVE_XT[t]];
+            double*       dst   = bm + static_cast<size_t>(t) * nmic;
+#pragma omp simd
+            for (size_t e = 0; e < nmic; ++e) {
+                double val = cdata[(base + nord - 1) * nmic + e];
+                for (int p = nord - 2; p >= 0; --p)
+                    val = val * xloc + cdata[(base + p) * nmic + e];
+                dst[e] += scale * val;
+            }
+        }
+#pragma omp simd
+        for (size_t e = 0; e < nmsm; ++e) {
+            double val = coeff_micx_sm[(base + nord - 1) * nmsm + e];
+            for (int p = nord - 2; p >= 0; --p)
+                val = val * xloc + coeff_micx_sm[(base + p) * nmsm + e];
+            bms[e] += scale * val;
+        }
+    };
+
+    // Apply scalar branches before the spectral-history terms.
+    const double boron_dmod                  = BoronDmod(_g, _boron_dmod_average, l);
+    const double x_vals[NUM_SCALAR_BRANCHES] = {
+        boron_dmod * _node_wvfr[l] * _g.bppm(l) * BORON_DENSITY_FACTOR,
+        std::sqrt(_g.tful(l)),
+        _g.dmod(l)};
+    // Depletion-history blend: each library contributes its own branch and
+    // spectral-history surfaces, weighted. wu is 1 and w is 0 without a twin.
+    const double hw = _node_hw.empty() ? 0.0 : _node_hw[l];
+    const double wu = 1.0 - hw;
+    for (int branch = 0; branch < NUM_SCALAR_BRANCHES; ++branch) {
+        const int lo = _node_delta_lo[branch][l];
+        if (lo >= 0 && wu > 0.0) {
+            const int    hi = _node_delta_hi[branch][l];
+            const double f  = _node_delta_frac[branch][l];
+            applyDelta(lo, x_vals[branch], wu * (1.0 - f));
+            if (hi != lo)
+                applyDelta(hi, x_vals[branch], wu * f);
+        }
+        if (hw <= 0.0 || _node_delta_lo_p.empty()) continue;
+        const int lo_p = _node_delta_lo_p[branch][l];
+        if (lo_p < 0) continue;
+        const int    hi_p = _node_delta_hi_p[branch][l];
+        const double f_p  = _node_delta_frac_p[branch][l];
+        applyDelta(lo_p, x_vals[branch], hw * (1.0 - f_p));
+        if (hi_p != lo_p)
+            applyDelta(hi_p, x_vals[branch], hw * f_p);
+    }
+
+    static thread_local std::vector<DeltaApplication> history;
+    ResolveSpectralHistoryDeltas(l, history, bm + nmic,
+                                 static_cast<size_t>(-1), wu);
+    for (const auto& d : history)
+        applyDelta(d.did, d.x, d.scale);
+    if (hw > 0.0) {
+        const int partner = _lib_history_partner.empty()
+                                ? -1
+                                : _lib_history_partner[_comp[l]];
+        if (partner >= 0) {
+            ResolveSpectralHistoryDeltas(l, history, bm + nmic,
+                                         static_cast<size_t>(partner), hw);
+            for (const auto& d : history)
+                applyDelta(d.did, d.x, d.scale);
+        }
+    }
+
+    RefreshLightIsotopes(l);
+
+    // 4. Scatter the workspace back to the SoA arrays (one strided pass).
+    for (int t = 0; t < N_ACTIVE_XT; ++t) {
+        double* dst = lmpx[ACTIVE_XT[t]]->data();
+        for (int ig = 0; ig < ng; ++ig)
+            dst[static_cast<size_t>(ig) * nxyz + l] = bl[t * ng + ig];
+    }
+    for (size_t sm = 0; sm < nlsm; ++sm)
+        _lmpx.xssm[sm * nxyz + l] = bls[sm];
+    for (int t = 0; t < N_ACTIVE_XT; ++t) {
+        double*       dst = micx[ACTIVE_XT[t]]->data();
+        const double* src = bm + static_cast<size_t>(t) * nmic;
+        for (size_t e = 0; e < nmic; ++e)
+            dst[e * nxyz + l] = src[e];
+    }
+    for (size_t e = 0; e < nmsm; ++e)
+        _micx.xssm[e * nxyz + l] = bms[e];
+
+    // 5. Rebuild this node's macroscopic XS from the workspace
+    //    (same per-element isotope order as ReconstructNode).
+    for (int t = 0; t < N_ACTIVE_XT; ++t) {
+        const double* mt = bm + static_cast<size_t>(t) * nmic;
+        for (int ig = 0; ig < ng; ++ig) {
+            double val = bl[t * ng + ig];
+            for (size_t iso = 0; iso < niso; ++iso)
+                val += mt[iso * ng + ig] * _iden[iso * nxyz + l];
+            (*xs[ACTIVE_XT[t]])[static_cast<size_t>(ig) * nxyz + l] = val;
+        }
+    }
+    for (int igs = 0; igs < ng; ++igs) {
+        for (int ige = 0; ige < ng; ++ige) {
+            double val = bls[igs * ng + ige];
+            for (size_t iso = 0; iso < niso; ++iso)
+                val += bms[iso * nlsm + igs * ng + ige] * _iden[iso * nxyz + l];
+            _xs.xssm[(static_cast<size_t>(igs) * ng + ige) * nxyz + l] = val;
+        }
+    }
+    for (int ig = 0; ig < ng; ++ig) {
+        const double tr                              = _xs.xstf[static_cast<size_t>(ig) * nxyz + l];
+        _xs.xsdf[static_cast<size_t>(ig) * nxyz + l] = (tr > 1.0e-30) ? 0.333333333333333 / tr : 0.0;
+
+        double rf = _xs.xsaf[static_cast<size_t>(ig) * nxyz + l];
+        for (int ige = 0; ige < ng; ++ige)
+            rf += _xs.xssm[(static_cast<size_t>(ig) * ng + ige) * nxyz + l];
+        _xs.xsrf[static_cast<size_t>(ig) * nxyz + l] = rf;
+    }
+}
+
 void XSSet::UpdateFlatXS(const XSUpdateOptions& options) {
     if (!_simd_ready) {
         Update();
         return;
     }
 
-    const int    nxyz       = _g.nxyz();
-    const int    ng         = _g.ng();
-    const size_t niso       = Isotope::niso;
-    const bool   all_nodes  = options.nodes.empty();
-    const int    node_count = all_nodes ? nxyz : static_cast<int>(options.nodes.size());
-    _boron_dmod_average     = FuelVolumeAverageDmod(_g);
-    _history_dmod_average   = _boron_dmod_average;
-    _history_tmod_average   = FuelVolumeAverageTmod(_g);
+    const int  nxyz       = _g.nxyz();
+    const bool all_nodes  = options.nodes.empty();
+    const int  node_count = all_nodes ? nxyz : static_cast<int>(options.nodes.size());
+    _boron_dmod_average   = FuelVolumeAverageDmod(_g);
 
-    if (options.restore_reference && all_nodes) {
-        const size_t ngn  = static_cast<size_t>(ng) * static_cast<size_t>(nxyz);
-        const size_t smsz = static_cast<size_t>(ng) * static_cast<size_t>(ng) * static_cast<size_t>(nxyz);
-
-        std::copy(_ref_wvfr.begin(), _ref_wvfr.end(), _node_wvfr.begin());
-
-        auto ref_lmpx = ScalarXS(_ref_lmpx);
-        auto ref_micx = ScalarXS(_ref_micx);
-        auto lmpx     = ScalarXS(_lmpx);
-        auto micx     = ScalarXS(_micx);
-        for (size_t xt = 0; xt < N_XS_SCALAR; ++xt) {
-            if (xt == XSDF || xt == XSRF) continue;
-            CopyDoubles(ngn, ref_lmpx[xt]->data(), lmpx[xt]->data());
-            CopyDoubles(niso * ngn, ref_micx[xt]->data(), micx[xt]->data());
-        }
-        CopyDoubles(smsz, _ref_lmpx.xssm.data(), _lmpx.xssm.data());
-        CopyDoubles(niso * smsz, _ref_micx.xssm.data(), _micx.xssm.data());
-    }
-
-#pragma omp parallel for schedule(static) if (node_count > OMP_THRESHOLD)
+    // Rodded nodes cost far more than unrodded ones (two full Chiffon fills + rod
+    // depletion), so dynamic chunks keep the rod-bank threads from straggling.
+#pragma omp parallel for schedule(dynamic, 16) if (node_count > OMP_THRESHOLD)
     for (int i = 0; i < node_count; ++i) {
         const int l = all_nodes ? i : options.nodes[i];
 
-        if (options.boron_difference) {
-            if (UsesRodXS(l)) {
-                FillRodNodeXS(l);
-                ApplyHistoryDeltasToNode(l);
-            } else {
-                const double old_bppm   = (static_cast<size_t>(l) < options.old_bppm.size())
-                                              ? options.old_bppm[l]
-                                              : _g.bppm(l);
-                const double boron_dmod = BoronDmod(_g, _boron_dmod_average, l);
-                const double old_x      = boron_dmod * _node_wvfr[l] * old_bppm * BORON_DENSITY_FACTOR;
-                const double new_x      = boron_dmod * _node_wvfr[l] * _g.bppm(l) * BORON_DENSITY_FACTOR;
-                ApplyBranchDeltaToNode(l, BRANCH_BPPM, old_x, -1.0);
-                ApplyBranchDeltaToNode(l, BRANCH_BPPM, new_x, 1.0);
-                RefreshLightIsotopes(l);
-            }
-            continue;
-        }
-
-        if (options.restore_reference && !all_nodes)
-            RestoreReferenceNode(l);
-
         if (UsesRodXS(l)) {
             FillRodNodeXS(l);
-            ApplyHistoryDeltasToNode(l);
+            ApplySpectralHistoryToNode(l);
+            ReconstructNode(static_cast<size_t>(l));
         } else {
-            if (options.apply_bppm && options.apply_tful && options.apply_dmod) {
-                ApplyBranchDeltasToNode(l);
-            } else {
-                if (options.apply_bppm) {
-                    const double boron_dmod = BoronDmod(_g, _boron_dmod_average, l);
-                    const double x          = boron_dmod * _node_wvfr[l] * _g.bppm(l) * BORON_DENSITY_FACTOR;
-                    ApplyBranchDeltaToNode(l, BRANCH_BPPM, x, 1.0);
-                }
-                if (options.apply_tful)
-                    ApplyBranchDeltaToNode(l, BRANCH_TFUL, std::sqrt(_g.tful(l)), 1.0);
-                if (options.apply_dmod)
-                    ApplyBranchDeltaToNode(l, BRANCH_DMOD, _g.dmod(l), 1.0);
-                ApplyHistoryDeltasToNode(l);
-            }
-            RefreshLightIsotopes(l);
+            UpdateUnroddedNodeXS(l);
         }
-    }
-
-    if (all_nodes) {
-        Reconstruct();
-    } else {
-#pragma omp parallel for schedule(static) if (node_count > OMP_THRESHOLD)
-        for (int i = 0; i < node_count; ++i)
-            ReconstructNode(static_cast<size_t>(options.nodes[i]));
     }
 }
 
-double XSSet::FineRodFluenceAverage(int l, int ctype) const {
-    if (ctype <= 0 || _fine_rod_type.empty() || _fine_rod_fluence.empty())
+double XSSet::FineRodThermalFluenceAverage(int l, int ctype) const {
+    if (ctype <= 0 || _fine_rod_type.empty())
         return 0.0;
 
-    const int nxy = _g.nxy();
-    const int div = std::max(1, _axial_rod_division);
-    if (nxy <= 0 || l < 0 || l >= _g.nxyz())
-        return 0.0;
-
+    const int nxy  = _g.nxy();
+    const int div  = std::max(1, _axial_rod_division);
     const int k    = l / nxy;
     const int l2d  = l % nxy;
     double    sum  = 0.0;
@@ -1549,16 +2328,13 @@ double XSSet::FineRodFluenceAverage(int l, int ctype) const {
     // requested ctype that overlap this coarse node.
     for (int m = 0; m < div; ++m) {
         const int idx = (k * div + m) * nxy + l2d;
-        if (idx < 0 || idx >= static_cast<int>(_fine_rod_type.size()) ||
-            idx >= static_cast<int>(_fine_rod_fluence.size()))
-            continue;
         if (_fine_rod_type[static_cast<size_t>(idx)] != ctype)
             continue;
         // Count a cell as rodded for fluence purposes when it is at least half rodded,
         // matching the historical center-in-rod criterion (frac > 0.5).
         if (_fine_rod_frac[static_cast<size_t>(idx)] < 0.5)
             continue;
-        sum += _fine_rod_fluence[static_cast<size_t>(idx)];
+        sum += _fine_rod_thermal_fluence[static_cast<size_t>(idx)];
         ++nrod;
     }
     return nrod > 0 ? sum / static_cast<double>(nrod) : 0.0;
@@ -1578,7 +2354,10 @@ void XSSet::FillCuspingMacroXS(int l, int ctype, double fluence,
     static thread_local milk::Vector<double> tls_iden;
     model.FillCrossSection(tls_xs, tls_iden, tls_delta,
                            solve_ctp, _burn[l], _g.bppm(l), _g.tful(l), _g.dmod(l));
-    model.ApplyRodDepletion(tls_xs, tls_delta, solve_ctp, fluence);
+    model.ApplyRodDepletion(
+        tls_xs, tls_delta, solve_ctp, fluence, _burn[l],
+        tls_iden[Chiffon::Isotope::iB10],
+        std::sqrt(_g.tful(l)), _g.dmod(l));
 
     for (int ig = 0; ig < ng; ++ig) {
         for (int xt = 0; xt < static_cast<int>(N_XS_SCALAR); ++xt)
@@ -1671,7 +2450,9 @@ void XSSet::ApplyRodCuspingStencil(int tip_l, double reigv,
         coarse_scalar[c].resize(coarse_ctypes[c].size());
         coarse_scatter[c].resize(coarse_ctypes[c].size());
         for (int s = 0; s < static_cast<int>(coarse_ctypes[c].size()); ++s) {
-            const double fluence = FineRodFluenceAverage(coarse_l[c], coarse_ctypes[c][s]);
+            const double fluence =
+                FineRodThermalFluenceAverage(
+                    coarse_l[c], coarse_ctypes[c][s]);
             FillCuspingMacroXS(coarse_l[c], coarse_ctypes[c][s], fluence,
                                coarse_scalar[c][s], coarse_scatter[c][s]);
         }
@@ -1802,14 +2583,15 @@ void XSSet::ApplyRodCuspingStencil(int tip_l, double reigv,
         }
     }
 
-    if (!SolveDenseLinearSystem(a, rhs, matrix_size))
-        return;
-
     double max_flux = 0.0;
-    for (double v : rhs)
-        max_flux = std::max(max_flux, v);
-    if (max_flux <= 0.0 || !std::isfinite(max_flux))
+    if (SolveDenseLinearSystem(a, rhs, matrix_size))
+        for (double v : rhs)
+            max_flux = std::max(max_flux, v);
+    if (max_flux <= 0.0 || !std::isfinite(max_flux)) {
+        // Singular/degenerate fine-mesh solve: skip the cusp correction for this tip node.
+        PLOG_ERROR << "rod cusping: singular fine-mesh solve at node " << tip_l << ", cusp skipped";
         return;
+    }
     const double flux_floor = max_flux * 1.0e-12;
 
     // The fine-mesh FDM flux is used ONLY to update the cross-section weighting factor (alpha,
@@ -1919,7 +2701,7 @@ void XSSet::ResetCuspingNodesToBase(const std::vector<int>& nodes) {
         sig[3] = _g.dmod(l);
         sig[4] = _g.rod_fraction(l);
         sig[5] = static_cast<double>(_ctyp[l]);
-        sig[6] = FineRodFluenceAverage(l, _ctyp[l]);
+        sig[6] = FineRodThermalFluenceAverage(l, _ctyp[l]);
     };
 
     std::vector<int> miss;
@@ -2015,11 +2797,28 @@ double XSSet::NormFactor(double power, const XSArraySet& xs_arr, const double* f
     const int ng   = _g.ng();
     const int nxyz = _g.nxyz();
 
+    // Deterministic reduction: the node range is cut into a fixed number of
+    // chunks that does NOT depend on the thread count, each chunk is summed
+    // serially, and the partials are accumulated in ascending chunk order.
+    // This makes reaction_sum bitwise identical for any OMP_NUM_THREADS,
+    // unlike `reduction(+:)` whose combine order follows the scheduler.
+    const int           nchunk = rasbery_det_chunks(nxyz);
+    std::vector<double> partial(static_cast<size_t>(nchunk), 0.0);
+
+#pragma omp parallel for schedule(dynamic) if (nxyz > rasbery_omp_gate)
+    for (int c = 0; c < nchunk; ++c) {
+        const int lb  = rasbery_det_chunk_begin(nxyz, nchunk, c);
+        const int le  = rasbery_det_chunk_begin(nxyz, nchunk, c + 1);
+        double    acc = 0.0;
+        for (int l = lb; l < le; ++l)
+            for (int ig = 0; ig < ng; ++ig)
+                acc += xs_arr.xskf[ig * nxyz + l] * flux[l * ng + ig] * _g.vol(l);
+        partial[static_cast<size_t>(c)] = acc;
+    }
+
     double reaction_sum = 0.0;
-#pragma omp parallel for reduction(+ : reaction_sum) schedule(static) if (nxyz > rasbery_omp_gate)
-    for (int l = 0; l < nxyz; ++l)
-        for (int ig = 0; ig < ng; ++ig)
-            reaction_sum += xs_arr.xskf[ig * nxyz + l] * flux[l * ng + ig] * _g.vol(l);
+    for (int c = 0; c < nchunk; ++c)
+        reaction_sum += partial[static_cast<size_t>(c)];
 
     return 1.0e6 * power / reaction_sum;
 }
@@ -2037,15 +2836,10 @@ double XSSet::CoreHeavyMetalMassKg() const {
 }
 
 double XSSet::NodeHeavyMetalMassGrams(int l) const {
-    if (l < 0 || l >= _g.nxyz() || !_g.IsFuel(l))
+    if (!_g.IsFuel(l))
         return 0.0;
 
     const size_t mi = _comp[l];
-    if (mi >= _lib_model_volu.size() || mi >= _lib_model_hmas.size())
-        return 0.0;
-    if (_lib_model_volu[mi] <= 0.0)
-        return 0.0;
-
     return (_g.vol(l) / _lib_model_volu[mi]) * _lib_model_hmas[mi];
 }
 
@@ -2060,24 +2854,14 @@ void XSSet::UpdateBurnup(double dt, double power) {
 
 #pragma omp parallel for schedule(static) if (nxyz > rasbery_omp_gate)
     for (int l = 0; l < nxyz; ++l) {
-        double burn       = 0.0;
-        double scalarFlux = 0.0;
-        for (int ig = 0; ig < ng; ++ig) {
-            const double normalizedFlux = flux[l * ng + ig] * norm_factor;
-            burn += _xs.xskf[ig * nxyz + l] * normalizedFlux * _g.vol(l) * dt;
-            scalarFlux += normalizedFlux;
-        }
+        double burn = 0.0;
+        for (int ig = 0; ig < ng; ++ig)
+            burn += _xs.xskf[ig * nxyz + l] * flux[l * ng + ig] * norm_factor * _g.vol(l) * dt;
 
         if (burn >= 1.0e-10) {
             const double dfac               = 8.64e7 * (_g.vol(l) / _lib_model_volu[_comp[l]]) * _lib_model_hmas[_comp[l]];
             const double burn_key_increment = burn / dfac * 1000.0;
             _burn[l] += static_cast<int>(burn_key_increment + 0.5);
-            const bool   currentRod  = UsesRodXS(l);
-            const double rodFraction = currentRod ? std::clamp(_g.rod_fraction(l), 0.0, 1.0) : 0.0;
-            if (currentRod)
-                _history_ctyp[l] = _ctyp[l];
-            if (currentRod && rodFraction > 0.0 && scalarFlux > 0.0 && std::isfinite(scalarFlux))
-                _rodded_fluence[l] += scalarFlux * dt * rodFraction;
         }
     }
 
@@ -2157,6 +2941,101 @@ static void ApplyXeEquilibrium(milk::Vector<double>& iden, const std::vector<dou
     iden[iXe135m] = brItoXe135m * lambdaI * Ieq / lambdaXem;
 }
 
+double XSSet::UpdateEquilibriumXenon(double power, double relax) {
+    using namespace Isotope;
+
+    if (depDecay.size() == 0 || power <= 0.0)
+        return 0.0;
+
+    const int    ng          = _g.ng();
+    const int    nxyz        = _g.nxyz();
+    const size_t niso        = Isotope::niso;
+    const double norm_factor = NormFactor(power);
+    double       max_change  = 0.0;
+
+#pragma omp parallel if (nxyz > OMP_THRESHOLD) reduction(max : max_change)
+    {
+        static thread_local DepletionWorkspace  ws_tls;
+        static thread_local std::vector<double> abs_flux_tls;
+
+        ws_tls.ensure(niso);
+        if (abs_flux_tls.size() != static_cast<size_t>(ng))
+            abs_flux_tls.resize(static_cast<size_t>(ng));
+        if (ws_tls.condensed.size() < niso * N_XS_SCALAR)
+            ws_tls.condensed.resize(niso * N_XS_SCALAR, 0.0);
+
+        const double* mic_ptrs[N_XS_SCALAR] = {
+            _micx.xstf.data(), _micx.xsdf.data(), _micx.xsaf.data(), _micx.xsff.data(),
+            _micx.xsnf.data(), _micx.xskf.data(), _micx.xssf.data(), _micx.xsrf.data(),
+            _micx.fyld.data(), _micx.xs2n.data(), _micx.xs3n.data()};
+
+#pragma omp for schedule(dynamic, 8)
+        for (int l = 0; l < nxyz; ++l) {
+            if (!_g.IsFuel(l))
+                continue;
+
+            double raw_sumflux = 0.0;
+            for (int ig = 0; ig < ng; ++ig) {
+                abs_flux_tls[static_cast<size_t>(ig)] =
+                    _g.Phif()[l * ng + ig] * norm_factor;
+                raw_sumflux += abs_flux_tls[static_cast<size_t>(ig)];
+            }
+            if (raw_sumflux <= 0.0)
+                continue;
+
+            const double invflux = 1.0 / raw_sumflux;
+            for (size_t iso = 0; iso < niso; ++iso) {
+                double* dst = ws_tls.condensed.data() + iso * N_XS_SCALAR;
+                for (size_t xt = 0; xt < N_XS_SCALAR; ++xt) {
+                    double sum = 0.0;
+                    for (int ig = 0; ig < ng; ++ig) {
+                        const size_t off =
+                            (iso * static_cast<size_t>(ng) + static_cast<size_t>(ig)) *
+                                static_cast<size_t>(nxyz) +
+                            static_cast<size_t>(l);
+                        sum += mic_ptrs[xt][off] * abs_flux_tls[static_cast<size_t>(ig)];
+                    }
+                    dst[xt] = sum * invflux;
+                }
+                ws_tls.iden[iso] = _iden[iso * static_cast<size_t>(nxyz) +
+                                         static_cast<size_t>(l)];
+            }
+
+            const double old_i   = ws_tls.iden[iI135];
+            const double old_xe  = ws_tls.iden[iXe135];
+            const double old_xem = ws_tls.iden[iXe135m];
+            ApplyXeEquilibrium(ws_tls.iden, ws_tls.condensed,
+                               FluxScale(abs_flux_tls.data(), ng));
+            const double new_xe = ws_tls.iden[iXe135];
+            const double scale  = std::max(std::abs(new_xe), 1.0e-30);
+            // Measured on the RAW step, before damping -- see the header.
+            max_change          = std::max(max_change, std::abs(new_xe - old_xe) / scale);
+
+            // x <- x + relax*(F(x) - x).  Same fixed point, damped path.  The
+            // `relax < 1.0` guard keeps the undamped case arithmetically
+            // identical to what it was rather than relying on 1.0*(a-b)+b == a.
+            if (relax < 1.0) {
+                ws_tls.iden[iI135]   = old_i + relax * (ws_tls.iden[iI135] - old_i);
+                ws_tls.iden[iXe135]  = old_xe + relax * (ws_tls.iden[iXe135] - old_xe);
+                ws_tls.iden[iXe135m] = old_xem + relax * (ws_tls.iden[iXe135m] - old_xem);
+            }
+
+            _iden[iI135 * static_cast<size_t>(nxyz) + static_cast<size_t>(l)] =
+                ws_tls.iden[iI135];
+            _iden[iXe135 * static_cast<size_t>(nxyz) + static_cast<size_t>(l)] =
+                ws_tls.iden[iXe135];
+            _iden[iXe135m * static_cast<size_t>(nxyz) + static_cast<size_t>(l)] =
+                ws_tls.iden[iXe135m];
+
+            // Only fuel-node Xe-chain densities changed.  Reconstruct this
+            // node while its data is hot instead of opening a second
+            // all-node pass after the equilibrium update.
+            ReconstructNode(static_cast<size_t>(l));
+        }
+    }
+    return max_change;
+}
+
 void XSSet::DepleteNode(DepletionWorkspace& ws, size_t l,
                         const double* abs_flux, size_t ngrp, double dt, bool xe_transient) {
     using namespace Isotope;
@@ -2199,7 +3078,7 @@ void XSSet::DepleteNode(DepletionWorkspace& ws, size_t l,
         }
     }
 
-    double sumflux = FluxScale(abs_flux, static_cast<int>(ngrp));
+    const double sumflux = FluxScale(abs_flux, static_cast<int>(ngrp));
 
     // Load full isotope density vector from SoA
     for (size_t i = 0; i < niso; ++i)
@@ -2244,40 +3123,43 @@ void XSSet::Deplete(double dt, double power, bool xe_transient) {
     }
 }
 
-void XSSet::DecayIsotopeDensityFlat(std::vector<double>& iden_flat,
-                                    int nxyz, double cooling_days, int substeps) const {
+void XSSet::DecayIsotopeDensityFlat(
+    std::vector<double>& idenFlat, int nxyz, double coolingDays,
+    int substeps) const {
     using namespace Isotope;
-    const size_t niso = Isotope::niso;
-    if (cooling_days <= 0.0 || nxyz <= 0 || niso == 0 || depDecay.size() == 0)
+    const size_t isotopeCount = Isotope::niso;
+    if (coolingDays <= 0.0 || nxyz <= 0 || isotopeCount == 0 ||
+        depDecay.size() == 0)
         return;
-    if (iden_flat.size() < static_cast<size_t>(nxyz) * niso)
-        throw std::runtime_error("XSSet: restart isotope density size is smaller than nxyz*niso.");
+    if (idenFlat.size() < static_cast<size_t>(nxyz) * isotopeCount)
+        throw std::runtime_error(
+            "XSSet: restart isotope density is smaller than nxyz*niso.");
 
-    const int    ndecay = std::max(1, substeps);
-    const double dt     = cooling_days * 86400.0 / static_cast<double>(ndecay);
+    const int    decaySteps = std::max(1, substeps);
+    const double dt =
+        coolingDays * 86400.0 / static_cast<double>(decaySteps);
 
 #pragma omp parallel if (nxyz > OMP_THRESHOLD)
     {
-        static thread_local DepletionWorkspace ws_tls;
-        ws_tls.ensure(niso);
+        static thread_local DepletionWorkspace workspace;
+        workspace.ensure(isotopeCount);
 
 #pragma omp for schedule(dynamic, 8)
         for (int l = 0; l < nxyz; ++l) {
-            const auto off = static_cast<size_t>(l) * niso;
-            for (size_t iso = 0; iso < niso; ++iso)
-                ws_tls.iden[iso] = iden_flat[off + iso];
+            const size_t offset = static_cast<size_t>(l) * isotopeCount;
+            for (size_t isotope = 0; isotope < isotopeCount; ++isotope)
+                workspace.iden[isotope] = idenFlat[offset + isotope];
 
-            for (int isub = 0; isub < ndecay; ++isub)
-                milk::Solver<double>::solveBatemanCRAM(depDecay, ws_tls.iden, dt, ws_tls.iden,
-                                                       ws_tls.cram, CRAM_ORDER, iI135);
+            for (int step = 0; step < decaySteps; ++step)
+                milk::Solver<double>::solveBatemanCRAM(
+                    depDecay, workspace.iden, dt, workspace.iden,
+                    workspace.cram, CRAM_ORDER, iI135);
 
-            for (size_t iso = iI135; iso < niso; ++iso)
-                iden_flat[off + iso] = ws_tls.iden[iso];
+            for (size_t isotope = iI135; isotope < isotopeCount; ++isotope)
+                idenFlat[offset + isotope] = workspace.iden[isotope];
         }
     }
 }
-
-// Predictor / Corrector
 
 void XSSet::PredictorStep(double dt, double power, bool xe_transient) {
     const int    nxyz            = _g.nxyz();
@@ -2302,9 +3184,7 @@ void XSSet::PredictorStep(double dt, double power, bool xe_transient) {
 
     CopyDoubles(isotope_size, _iden.data(), _iden_bos.data());
     std::copy(_burn.begin(), _burn.begin() + nxyz, _burn_bos.begin());
-    std::copy(_history_ctyp.begin(), _history_ctyp.begin() + nxyz, _history_ctyp_bos.begin());
-    std::copy(_rodded_fluence.begin(), _rodded_fluence.begin() + nxyz, _rodded_fluence_bos.begin());
-    _fine_rod_fluence_bos = _fine_rod_fluence;
+    _fine_rod_thermal_fluence_bos = _fine_rod_thermal_fluence;
     CopyDoubles(scalar_size, _g.Phif(), _flux_bos.data());
 
     // Apply the beginning-of-step operator A_1 to obtain the predictor inventory N^P.
@@ -2319,7 +3199,7 @@ void XSSet::PredictorStep(double dt, double power, bool xe_transient) {
 void XSSet::CorrectorStep(double dt, double power, bool xe_transient) {
     using namespace Isotope;
 
-    // Predictor-corrector flavour.  Default: RASBERY's midpoint scheme -- build one
+    // Predictor-corrector flavour.  Default: CELI/RASBERY midpoint scheme -- build one
     // transition matrix from the BOS/EOS *rate* average and do a single CRAM solve from
     // the BOS inventory.  RASBERY_PC_MODE=decart selects DeCART2D's Eq. (6.20) instead:
     // the corrector solves with EOS rates only, and the final inventory is the average of
@@ -2360,13 +3240,13 @@ void XSSet::CorrectorStep(double dt, double power, bool xe_transient) {
             double burn = 0.0;
             for (int ig = 0; ig < ng; ++ig)
                 corrected_flux_tls[ig] = pcDensityAverage
-                    ? eos_flux[l * ng + ig] * eos_norm
-                    : 0.5 * (_flux_bos[l * ng + ig] * bos_norm + eos_flux[l * ng + ig] * eos_norm);
+                                             ? eos_flux[l * ng + ig] * eos_norm
+                                             : 0.5 * (_flux_bos[l * ng + ig] * bos_norm + eos_flux[l * ng + ig] * eos_norm);
 
             for (int ig = 0; ig < ng; ++ig) {
                 const double sigma_corrected = pcDensityAverage
-                    ? _xs.xskf[ig * nxyz + l]
-                    : 0.5 * (_xs_bos.xskf[ig * nxyz + l] + _xs.xskf[ig * nxyz + l]);
+                                                   ? _xs.xskf[ig * nxyz + l]
+                                                   : 0.5 * (_xs_bos.xskf[ig * nxyz + l] + _xs.xskf[ig * nxyz + l]);
                 burn += sigma_corrected * corrected_flux_tls[ig] * _g.vol(l) * dt;
             }
 
@@ -2389,14 +3269,13 @@ void XSSet::CorrectorStep(double dt, double power, bool xe_transient) {
                                                nxyz_size +
                                            node;
                         const double sigma_corrected = pcDensityAverage
-                            ? eos_ptrs[xt][off]
-                            : 0.5 * (bos_ptrs[xt][off] + eos_ptrs[xt][off]);
+                                                           ? eos_ptrs[xt][off]
+                                                           : 0.5 * (bos_ptrs[xt][off] + eos_ptrs[xt][off]);
                         sum += sigma_corrected * corrected_flux_tls[ig];
                     }
                     dst[xt] = sum * invflux;
                 }
             }
-
             for (size_t i = 0; i < niso; ++i)
                 ws_tls.iden[i] = _iden_bos[i * nxyz_size + node];
 
@@ -2416,25 +3295,17 @@ void XSSet::CorrectorStep(double dt, double power, bool xe_transient) {
                     pcDensityAverage ? 0.5 * (_iden[i * nxyz_size + node] + n_corr) : n_corr;
             }
 
-            _burn[l]           = _burn_bos[l];
-            _history_ctyp[l]   = _history_ctyp_bos[l];
-            _rodded_fluence[l] = _rodded_fluence_bos[l];
+            _burn[l] = _burn_bos[l];
             if (burn >= 1.0e-10) {
                 const double dfac               = 8.64e7 * (_g.vol(l) / _lib_model_volu[_comp[l]]) * _lib_model_hmas[_comp[l]];
                 const double burn_key_increment = burn / dfac * 1000.0;
                 _burn[l] += static_cast<int>(burn_key_increment + 0.5);
-                const bool   currentRod  = UsesRodXS(l);
-                const double rodFraction = currentRod ? std::clamp(_g.rod_fraction(l), 0.0, 1.0) : 0.0;
-                if (currentRod)
-                    _history_ctyp[l] = _ctyp[l];
-                if (currentRod && rodFraction > 0.0 && raw_sumflux > 0.0 && std::isfinite(raw_sumflux))
-                    _rodded_fluence[l] += raw_sumflux * dt * rodFraction;
             }
         }
     }
 
     // Rebuild XS on the corrected EOS composition and burnup.
-    _fine_rod_fluence = _fine_rod_fluence_bos;
+    _fine_rod_thermal_fluence = _fine_rod_thermal_fluence_bos;
     DepleteRodMaterials(dt, power, true);
     PrecomputeBranchCoefficients();
     UpdateFlatXS();
@@ -2454,8 +3325,8 @@ void XSSet::RebuildFineRodOccupancy() {
     if (_fine_rod_type.size() != expected_size) {
         _fine_rod_type.assign(expected_size, 0);
         _fine_rod_frac.assign(expected_size, 0.0);
-        _fine_rod_fluence.assign(expected_size, 0.0);
-        _fine_rod_fluence_bos.assign(expected_size, 0.0);
+        _fine_rod_thermal_fluence.assign(expected_size, 0.0);
+        _fine_rod_thermal_fluence_bos.assign(expected_size, 0.0);
     }
     if (_fine_rod_type.empty()) return;
     if (_fine_rod_frac.size() != _fine_rod_type.size())
@@ -2507,20 +3378,45 @@ void XSSet::RebuildFineRodOccupancy() {
     }
 }
 
+void XSSet::AccumulatePuHistory() {
+    const int    nxyz = _g.nxyz();
+    const size_t iso  = Isotope::iPu239;
+    if (_pu_prev.size() != static_cast<size_t>(nxyz))
+        _pu_prev.assign(static_cast<size_t>(nxyz), -1.0);
+    if (_pu_gain_tot.size() != static_cast<size_t>(nxyz)) {
+        _pu_gain_tot.assign(static_cast<size_t>(nxyz), 0.0);
+        _pu_gain_rod.assign(static_cast<size_t>(nxyz), 0.0);
+    }
+    for (int l = 0; l < nxyz; ++l) {
+        const double now = _iden[iso * static_cast<size_t>(nxyz) + l];
+        const double was = _pu_prev[l];
+        if (was >= 0.0) {
+            const double gain = now - was;
+            if (gain > 0.0) {
+                _pu_gain_tot[l] += gain;
+                _pu_gain_rod[l] += gain * _g.rod_fraction(l);
+            }
+        }
+        _pu_prev[l] = now;
+    }
+}
+
+double XSSet::RoddedPuFraction(int l) const {
+    if (_pu_gain_tot.size() <= static_cast<size_t>(l))
+        return 0.0;
+    const double tot = _pu_gain_tot[l];
+    return tot > 0.0 ? std::clamp(_pu_gain_rod[l] / tot, 0.0, 1.0) : 0.0;
+}
+
 void XSSet::DepleteRodMaterials(double dt, double power, bool corrected_flux) {
+    AccumulatePuHistory();
     if (dt <= 0.0 || power <= 0.0 || _fine_rod_type.empty())
         return;
 
-    const int    nxy = _g.nxy();
-    const int    nz  = _g.nz();
-    const int    ng  = _g.ng();
-    const int    div = std::max(1, _axial_rod_division);
-    const size_t expected_size =
-        static_cast<size_t>(nxy) * static_cast<size_t>(nz) * static_cast<size_t>(div);
-    if (_fine_rod_fluence.size() != expected_size)
-        _fine_rod_fluence.assign(expected_size, 0.0);
-    if (_fine_rod_type.size() != expected_size)
-        return;
+    const int    nxy           = _g.nxy();
+    const int    ng            = _g.ng();
+    const int    div           = std::max(1, _axial_rod_division);
+    const size_t expected_size = _fine_rod_type.size();
 
     const double eos_norm = NormFactor(power);
     double       bos_norm = 0.0;
@@ -2539,22 +3435,16 @@ void XSSet::DepleteRodMaterials(double dt, double power, bool corrected_flux) {
         const int l2d        = idx - fine_axial * nxy;
         const int k          = fine_axial / div;
         const int l          = k * nxy + l2d;
-        if (l < 0 || l >= _g.nxyz())
-            continue;
 
-        double scalar_flux = 0.0;
-        for (int ig = 0; ig < ng; ++ig) {
-            const size_t flux_idx = static_cast<size_t>(l) * static_cast<size_t>(ng) +
-                                    static_cast<size_t>(ig);
-            if (corrected_flux) {
-                scalar_flux += 0.5 * (_flux_bos[flux_idx] * bos_norm +
-                                      _g.Phif()[flux_idx] * eos_norm);
-            } else {
-                scalar_flux += _g.Phif()[flux_idx] * eos_norm;
-            }
-        }
-        if (scalar_flux > 0.0 && std::isfinite(scalar_flux))
-            _fine_rod_fluence[static_cast<size_t>(idx)] += scalar_flux * dt;
+        const size_t th_idx = static_cast<size_t>(l) * static_cast<size_t>(ng) +
+                              static_cast<size_t>(ng - 1);
+        const double th_flux = corrected_flux
+                                   ? 0.5 * (_flux_bos[th_idx] * bos_norm +
+                                            _g.Phif()[th_idx] * eos_norm)
+                                   : _g.Phif()[th_idx] * eos_norm;
+        if (th_flux > 0.0)
+            _fine_rod_thermal_fluence[static_cast<size_t>(idx)] +=
+                th_flux * dt;
     }
 }
 
@@ -2568,9 +3458,8 @@ void XSSet::SetRod(const std::map<std::string, double>& insertions) {
     const std::vector<int>    old_segment_offset   = _rod_node_segment_offset;
     const std::vector<int>    old_segment_ctype    = _rod_node_segment_ctype;
     const std::vector<double> old_segment_fraction = _rod_node_segment_fraction;
-
-    auto& old_fraction = _old_rod_fraction_scratch;
-    auto& old_ctyp     = _old_rod_ctyp_scratch;
+    auto&                     old_fraction         = _old_rod_fraction_scratch;
+    auto&                     old_ctyp             = _old_rod_ctyp_scratch;
     old_fraction.resize(nxyz);
     old_ctyp.resize(nxyz);
     for (int lk = 0; lk < nxyz; ++lk) {
@@ -2745,6 +3634,7 @@ void XSSet::SetRod(const std::map<std::string, double>& insertions) {
     }
 
     RebuildFineRodOccupancy();
+    RebuildUsesRodCache();
 
     if (dirty_nodes.empty()) return;
 
@@ -2856,6 +3746,19 @@ void XSSet::SolveTH(const double* node_power, const int* burnup, double power_ra
     const int    kbc              = _g.kbc();
     const int    kec              = _g.kec();
 
+    // Water-property table ceiling.  milk::Table::Get() CLAMPS a query that runs off
+    // the tabulated enthalpy axis, so a channel driven past the table simply freezes
+    // at the last knot and leaves no other trace.  That is a silent failure: the
+    // coolant properties of the hottest nodes stop responding to power, and every
+    // quantity fed from them (moderator density, and through it the boron worth and
+    // the whole radial power shape) is quietly wrong.  Count the nodes that land
+    // outside and say so.  Everything below is read-only -- the solve is untouched.
+    const double h_table_max =
+        _mod_t_table.y_axis[_mod_t_table.y_axis.size() - 1];
+    int          n_over      = 0;
+    double       worst_h     = 0.0;
+    int          worst_node  = -1;
+
     for (int l = 0; l < nxy; ++l) {
         double h_cur = inlet_h;
 
@@ -2878,52 +3781,47 @@ void XSSet::SolveTH(const double* node_power, const int* burnup, double power_ra
             const double dh    = P_node / (flow_per_channel * _g.hmesh(XDIR, l) * _g.hmesh(YDIR, l));
             const double h_out = h_cur + dh;
             const double h_avg = 0.5 * (h_cur + h_out);
+            if (h_avg > h_table_max) {
+                ++n_over;
+                if (h_avg > worst_h) {
+                    worst_h    = h_avg;
+                    worst_node = lk;
+                }
+            }
             _g.tmod(lk)        = GetTmod(h_avg, pressure);
             _g.dmod(lk)        = GetDmod(h_avg, pressure);
             const double lpd   = 1000.0 * P_node / (62.0 * _g.hz(k));
             const double bu    = burnup[lk] / 1000.0;
-            _g.tful(lk)        = _g.tmod(lk) + GetTfuel(bu, lpd);
+            _g.tful(lk)        = _g.tmod(lk) +
+                                 _g.fuel_temp_rise_scale() * GetTfuel(bu, lpd);
             h_cur              = h_out;
         }
 
         // Top reflector
         for (int k = kec; k < nz; ++k) {
             const int lk = l + k * nxy;
+            if (k == kec && h_cur > h_table_max) {
+                ++n_over;
+                if (h_cur > worst_h) {
+                    worst_h    = h_cur;
+                    worst_node = lk;
+                }
+            }
             _g.tmod(lk)  = GetTmod(h_cur, pressure);
             _g.dmod(lk)  = GetDmod(h_cur, pressure);
         }
     }
-}
 
-void XSSet::RemoveUpscattering() {
-    const int ng   = _g.ng();
-    const int nxyz = _g.nxyz();
-
-    for (int igs = 0; igs < ng; ++igs) {
-        for (int ige = igs + 1; ige < ng; ++ige) {
-#pragma omp parallel for schedule(static) if (nxyz > rasbery_omp_gate)
-            for (int l = 0; l < nxyz; ++l) {
-                const size_t upscat_idx = (ige * ng + igs) * nxyz + l;
-                double       upscat     = _xs.xssm[upscat_idx];
-                if (upscat != 0.0) {
-                    const double phi_src = _g.Phif()[l * ng + ige];
-                    const double phi_dst = _g.Phif()[l * ng + igs];
-                    if (phi_dst > 1.0e-24)
-                        _xs.xssm[(igs * ng + ige) * nxyz + l] -= upscat * (phi_src / phi_dst);
-                    _xs.xssm[upscat_idx] = 0.0;
-                }
-            }
-        }
-    }
-
-    for (int igs = 0; igs < ng; ++igs) {
-#pragma omp parallel for schedule(static) if (nxyz > rasbery_omp_gate)
-        for (int l = 0; l < nxyz; ++l) {
-            double outgoing = 0.0;
-            for (int ige = 0; ige < ng; ++ige)
-                outgoing += _xs.xssm[(igs * ng + ige) * nxyz + l];
-            _xs.xsrf[igs * nxyz + l] = _xs.xsaf[igs * nxyz + l] + outgoing;
-        }
+    if (n_over > 0) {
+        std::cerr << std::format(
+            "[RASBERY][WARN][th] {} of {} nodes ran off the water-property table "
+            "(enthalpy axis ends at {:.1f} kJ/kg); their coolant temperature and "
+            "density are CLAMPED at the table edge and no longer respond to power. "
+            "Worst {:.1f} kJ/kg at node {} (excess {:.1f}). The single-phase "
+            "closed-channel model is outside its range here -- check the radial "
+            "peaking against the core flow.\n",
+            n_over, nxyz, h_table_max, worst_h, worst_node,
+            worst_h - h_table_max);
     }
 }
 
@@ -2948,8 +3846,8 @@ void XSSet::InitXS(double bppm, double tful, double tmod, double pres,
     for (int l = 0; l < nxyz; ++l) {
         const auto&          model = _models[_comp[l]];
         milk::Vector<double> lib_iden;
-        auto                 xs_obj = model.GetCrossSection(0, _burn[l], _g.bppm(l), _g.tful(l),
-                                                            _g.dmod(l), &lib_iden);
+        auto                 xs_obj = model.GetCrossSection(
+            0, _burn[l], _g.bppm(l), _g.tful(l), _g.dmod(l), &lib_iden);
 
         const bool preserve_external_iden =
             l < static_cast<int>(_external_iden.size()) && _external_iden[l];
@@ -3049,9 +3947,9 @@ double XSSet::UpdateTH(double power_rate) {
         tful_old.assign(nxyz, 0.0);
     std::vector<double> tmod_old(static_cast<size_t>(nxyz)), dmod_old(static_cast<size_t>(nxyz));
     for (int lk = 0; lk < nxyz; ++lk) {
-        tful_old[lk]                        = _g.tful(lk);
-        tmod_old[static_cast<size_t>(lk)]   = _g.tmod(lk);
-        dmod_old[static_cast<size_t>(lk)]   = _g.dmod(lk);
+        tful_old[lk]                      = _g.tful(lk);
+        tmod_old[static_cast<size_t>(lk)] = _g.tmod(lk);
+        dmod_old[static_cast<size_t>(lk)] = _g.dmod(lk);
     }
 
     SolveTH(node_power.data(), _burn.data(), power_rate);

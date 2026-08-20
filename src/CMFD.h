@@ -39,6 +39,22 @@ protected:
     /// @brief criterion for convergence
     double _epsl2;
 
+    /// @brief number of dhat updates skipped because |fsum| fell below the floor
+    long long _dhat_fsum_guard = 0;
+
+    /// @brief number of dhat updates damped by the |dhat| <= |dtil| clamp
+    long long _dhat_clamped = 0;
+
+    /// @brief total number of dhat updates attempted
+    long long _dhat_total = 0;
+
+    /// @brief largest pre-clamp |dhat|/|dtil| ratio observed
+    double _dhat_ratio_max = 0.0;
+
+    /// @brief whether the |dhat| <= |dtil| envelope is enforced (RASBERY_DHAT_CLAMP=1)
+    /// or only counted. Off by default: see the rationale in CMFD::upddhat.
+    bool _dhat_clamp_enabled = false;
+
 public:
     CMFD(Geometry& g, XSSet& x);
 
@@ -106,6 +122,9 @@ public:
 
     /// @brief reset nonlinear current correction after an imposed state change
     void resetDhat();
+
+    /// @brief emit a one-line summary of the dhat guard/clamp statistics to stderr
+    void reportDhatGuardStats(const char* tag = "") const;
 
     /// @brief d_tilde for CMFD
     /// @param ig group index

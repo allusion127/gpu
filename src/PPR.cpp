@@ -136,11 +136,16 @@ void PPR::buildStencil(int lk, int idx[3][3], bool xrev[3][3], bool yrev[3][3]) 
     nb[0][2] = (nb[1][2] >= 0) ? _g.neibrb(WEST, nb[1][2]) : -1;
     nb[2][2] = (nb[1][2] >= 0) ? _g.neibrb(EAST, nb[1][2]) : -1;
 
-    // Reflection flags: compare neibr vs neibrb
-    bool xr_w = (_g.neibr(WEST, l2d) != _g.neibrb(WEST, l2d));
-    bool xr_e = (_g.neibr(EAST, l2d) != _g.neibrb(EAST, l2d));
-    bool yr_n = (_g.neibr(NORTH, l2d) != _g.neibrb(NORTH, l2d));
-    bool yr_s = (_g.neibr(SOUTH, l2d) != _g.neibrb(SOUTH, l2d));
+    // Reflection flags: neibrb closes a zero-albedo boundary by mapping the node
+    // onto itself, so "the closure neighbour is me" is exactly "this face is
+    // reflective".  This used to be written as (neibr != neibrb), which reads the
+    // same today but stops being equivalent once neibr carries a real neighbour
+    // across a symmetry line (the 90-degree rotational fold stitches node (0,0)'s
+    // west face to its own north face, making neibr == l2d legitimately).
+    bool xr_w = (_g.neibrb(WEST, l2d) == l2d);
+    bool xr_e = (_g.neibrb(EAST, l2d) == l2d);
+    bool yr_n = (_g.neibrb(NORTH, l2d) == l2d);
+    bool yr_s = (_g.neibrb(SOUTH, l2d) == l2d);
 
     const bool x_reflection[3] = {xr_w, false, xr_e};
     const bool y_reflection[3] = {yr_n, false, yr_s};
@@ -814,20 +819,41 @@ void PPR::reconstructPinPower(bool use_quadrature, bool reconstruct_flux) {
     // This keeps the node-wise power distribution on the same 1.0-based scale as
     // the nodal output, and pin-wise variation comes only from the reconstructed
     // pin factor (homogeneous pin power × gmap).
+    // Deterministic reduction (see rasbery_det_chunks in Geometry.h): fixed
+    // chunking + ordered accumulation of the partials, so the normalisation
+    // constant -- and therefore every pin power written out -- is bitwise
+    // identical for any OMP_NUM_THREADS.
+    const int           nchunk_ppr = rasbery_det_chunks(_nxyz);
+    std::vector<double> pw_partial(static_cast<size_t>(nchunk_ppr), 0.0);
+    std::vector<double> vol_partial(static_cast<size_t>(nchunk_ppr), 0.0);
+
+#pragma omp parallel for schedule(dynamic) if (_nxyz > rasbery_omp_gate)
+    for (int c = 0; c < nchunk_ppr; ++c) {
+        const int lb   = rasbery_det_chunk_begin(_nxyz, nchunk_ppr, c);
+        const int le   = rasbery_det_chunk_begin(_nxyz, nchunk_ppr, c + 1);
+        double    apw  = 0.0;
+        double    avol = 0.0;
+        for (int lk = lb; lk < le; ++lk) {
+            if (!_g.IsFuel(lk)) continue;
+            const double vol = _g.vol(lk);
+            if (vol <= 1.0e-20) continue;
+
+            double node_power = 0.0;
+            for (int g = 0; g < ng; ++g)
+                node_power += _xs.xskf(g, lk) * _phif[lk * ng + g];
+
+            apw += node_power * vol;
+            avol += vol;
+        }
+        pw_partial[static_cast<size_t>(c)]  = apw;
+        vol_partial[static_cast<size_t>(c)] = avol;
+    }
+
     double nodal_power_sum = 0.0;
     double fuel_vol_sum    = 0.0;
-#pragma omp parallel for reduction(+ : nodal_power_sum, fuel_vol_sum) schedule(static) if (_nxyz > rasbery_omp_gate)
-    for (int lk = 0; lk < _nxyz; ++lk) {
-        if (!_g.IsFuel(lk)) continue;
-        const double vol = _g.vol(lk);
-        if (vol <= 1.0e-20) continue;
-
-        double node_power = 0.0;
-        for (int g = 0; g < ng; ++g)
-            node_power += _xs.xskf(g, lk) * _phif[lk * ng + g];
-
-        nodal_power_sum += node_power * vol;
-        fuel_vol_sum += vol;
+    for (int c = 0; c < nchunk_ppr; ++c) {
+        nodal_power_sum += pw_partial[static_cast<size_t>(c)];
+        fuel_vol_sum += vol_partial[static_cast<size_t>(c)];
     }
 
     const double avg_nodal_power = (fuel_vol_sum > 1.0e-30) ? nodal_power_sum / fuel_vol_sum : 1.0;

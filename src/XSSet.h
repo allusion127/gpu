@@ -39,30 +39,18 @@ struct RodGroup {
 
 // Flat XS update control. Empty nodes means "all nodes".
 struct XSUpdateOptions {
-    std::vector<int>    nodes;
-    std::vector<double> old_bppm; // used only when boron_difference is true
-    bool                restore_reference = true;
-    bool                apply_bppm        = true;
-    bool                apply_tful        = true;
-    bool                apply_dmod        = true;
-    bool                boron_difference  = false;
+    std::vector<int> nodes;
 };
 
 struct AxialTransverseLeakageView {
-    const double* c0 = nullptr;
-    const double* c1 = nullptr;
-    const double* c2 = nullptr;
-
-    [[nodiscard]] bool valid() const { return c0 != nullptr && c1 != nullptr && c2 != nullptr; }
+    const double* c0;
+    const double* c1;
+    const double* c2;
 
     [[nodiscard]] double value(int lk, int ig, int ng, double zeta) const {
-        if (!valid())
-            return 0.0;
-
         const size_t idx = static_cast<size_t>((lk * NDIRMAX + ZDIR) * ng + ig);
         const double p2  = 0.5 * (3.0 * zeta * zeta - 1.0);
-        const double val = c0[idx] + c1[idx] * zeta + c2[idx] * p2;
-        return std::isfinite(val) ? val : 0.0;
+        return c0[idx] + c1[idx] * zeta + c2[idx] * p2;
     }
 };
 
@@ -85,7 +73,10 @@ private:
 
     std::vector<Chiffon::Model> _models;
 
-    static constexpr int BRANCH_BPPM = 0, BRANCH_TFUL = 1, BRANCH_DMOD = 2, BRANCH_HISTORY_BASE = 3;
+    static constexpr int BRANCH_BPPM = 0;
+    static constexpr int BRANCH_TFUL = 1;
+    static constexpr int BRANCH_DMOD = 2;
+    static constexpr int NUM_SCALAR_BRANCHES = 3;
 
     struct DeltaInfo {
         int nord        = 0;
@@ -96,18 +87,14 @@ private:
         int knot_count  = 0;
     };
 
-    struct HistoryCorrectionInfo {
-        Chiffon::BRANCHTYPE          branch_type = Chiffon::BRANCHTYPE::SPCT;
-        Chiffon::CorrectionComponent component   = Chiffon::CorrectionComponent::UNKNOWN;
-        int                          kind        = 0;
-        int                          state_field = Chiffon::AD_TMOD;
-        std::vector<size_t>          vector_isotopes;
-        std::vector<int>             vector_powers;
+    struct SpectralHistoryInfo {
+        Chiffon::SpectralTerm term;
+        size_t                delta_base = 0;
+        std::vector<int>      burnups;
+        bool                  rod_scaled = false;
     };
 
-    size_t _lib_ngrp = 0, _lib_ndat = 0, _lib_nmem = 0, _lib_niso = 0; // library dimensions
-    size_t _lib_ndpt = 0, _lib_ndelta = 0, _lib_total_coeff = 0;       // flat table sizes
-    bool   _lib_has_coeff_micx = false;                                // any delta has microscopic XS
+    bool _lib_has_coeff_micx = false; // any delta has microscopic XS
 
     std::vector<size_t>                        _refr_base;        // model -> first reference flat id
     std::vector<size_t>                        _refr_ctyp_stride; // model -> flat ids per reference ctype row
@@ -115,22 +102,20 @@ private:
     std::vector<std::vector<int>>              _refr_ctyp;        // model -> ordered reference ctype list
     std::vector<std::vector<std::vector<int>>> _refr_burn;        // model -> ctype -> burn keys
 
-    size_t                                                  _num_delta_branches = BRANCH_HISTORY_BASE;
     std::vector<std::vector<size_t>>                        _brch_base;        // model, branch -> first delta id
     std::vector<std::vector<size_t>>                        _brch_ctyp_stride; // model, branch -> ids per ctype row
     std::vector<std::vector<size_t>>                        _brch_burn_stride; // model, branch -> id step per burn point
     std::vector<std::vector<std::vector<int>>>              _brch_ctyp;        // model, branch -> ctype list
     std::vector<std::vector<std::vector<std::vector<int>>>> _brch_burn;        // model, branch, ctype -> burn keys
 
-    XSArraySet           _lib_lmpx; // library reference lumped XS, indexed by depletion point
-    XSArraySet           _lib_micx; // library reference microscopic XS, indexed by depletion point
-    milk::Vector<double> _lib_iden; // library reference isotope densities
-    std::vector<double>  _lib_burn; // library reference burnup in GWd/THM
-    std::vector<double>  _lib_wvfr; // library reference water volume fraction
-    std::vector<double>  _lib_tmod; // library reference average moderator temperature
-    std::vector<double>  _lib_dmod; // library reference average moderator density
-    std::vector<double>  _lib_flux; // library reference average flux [dpt*ng + ig]
-    std::vector<double>  _lib_chix; // library reference fission spectrum [dpt*ng + ig]
+    XSArraySet                         _lib_lmpx;         // library reference lumped XS, indexed by depletion point
+    XSArraySet                         _lib_micx;         // library reference microscopic XS, indexed by depletion point
+    milk::Vector<double>               _lib_iden;         // library reference isotope densities
+    std::vector<double>                _lib_burn;         // library reference burnup in GWd/THM
+    std::vector<double>                _lib_wvfr;         // library reference water volume fraction
+    std::vector<std::array<double, 3>> _lib_ref_branch_x; // reference bppm/tful/dmod coordinates
+    std::vector<double>                _lib_flux;         // library reference average flux [dpt*ng + ig]
+    std::vector<double>                _lib_chix;         // library reference fission spectrum [dpt*ng + ig]
 
     XSArraySet                                      _lib_coeff_lmpx; // branch delta coefficients for lumped XS
     XSArraySet                                      _lib_coeff_micx; // branch delta coefficients for microscopic XS
@@ -138,7 +123,7 @@ private:
     std::vector<double>                             _lib_knots;      // concatenated spline knots for branch deltas
     std::vector<double>                             _lib_model_volu; // model reference volume for burnup normalization
     std::vector<double>                             _lib_model_hmas; // model heavy metal mass for burnup normalization
-    std::vector<std::vector<HistoryCorrectionInfo>> _lib_history_corrections;
+    std::vector<std::vector<SpectralHistoryInfo>> _lib_spectral_history;
 
     // Node-wise data
     std::vector<int>                 _node_refr_lo;    // node -> lower reference depletion point id
@@ -147,13 +132,32 @@ private:
     std::vector<std::vector<int>>    _node_delta_hi;   // branch, node -> upper burnup delta id
     std::vector<std::vector<double>> _node_delta_frac; // branch, node -> burnup interpolation fraction
 
-    std::vector<size_t> _asmb;           // assembly index of each node
-    std::vector<size_t> _comp;           // composition index of each node
-    std::vector<int>    _burn;           // burnof of each node
-    std::vector<int>    _ctyp;           // control rod type of each node
-    std::vector<int>    _history_ctyp;   // depletion trajectory ctype; IISC-RHST runtime only gates on its nonzero-ness (the surface is keyed on the current ctype)
-    std::vector<double> _rodded_fluence; // node-level rod-history trajectory fluence [n/cm2]
-    std::vector<char>   _external_iden;  // to preserve restart/shuffle isotope densities after InitXS
+    // Gd effective-number-density lookup axis (MASTER/PROLOG `BP01 MICRO` equivalent).
+    // When enabled, the lumped-Gd (virtual isotope "640000") microscopic XS is interpolated on
+    // the effective Gd number density N_eff = sum_i w_i N_i instead of on burnup.
+    bool                _gd_neff_axis = false; // RASBERY_GD_AXIS=neff enables it
+    std::vector<int>    _node_gd_lo;           // node -> lower reference point flat id on the N_eff axis
+    std::vector<int>    _node_gd_hi;           // node -> upper reference point flat id on the N_eff axis
+    std::vector<double> _node_gd_frac;         // node -> N_eff interpolation fraction
+
+    // Depletion-history blend. A fuel may declare a rodded-depletion twin; the
+    // node then reads a weighted mix of the two libraries, the weight being how
+    // far its own U235/Pu239 balance has been driven toward the rodded
+    // trajectory. Everything here is inert (partner < 0, weight 0) unless the
+    // library carries the twin, so single-library runs are untouched.
+    std::vector<int>                 _lib_history_partner; // model -> partner model index (-1 none)
+    std::vector<double>              _node_hw;             // node -> blend weight in [0,1]
+    std::vector<int>                 _node_refr_lo_p;      // node -> partner lower reference id
+    std::vector<int>                 _node_refr_hi_p;      // node -> partner upper reference id
+    std::vector<std::vector<int>>    _node_delta_lo_p;     // branch, node -> partner lower delta id
+    std::vector<std::vector<int>>    _node_delta_hi_p;     // branch, node -> partner upper delta id
+    std::vector<std::vector<double>> _node_delta_frac_p;   // branch, node -> partner burnup fraction
+
+    std::vector<size_t> _asmb;          // assembly index of each node
+    std::vector<size_t> _comp;          // composition index of each node
+    std::vector<int>    _burn;          // burnup key of each node
+    std::vector<int>    _ctyp;          // control rod type of each node
+    std::vector<char>   _external_iden; // to preserve restart/shuffle isotope densities after InitXS
 
     // Live node-wise SoA cross-section storage.
     XSArraySet           _xs;   // current macroscopic XS after isotope reconstruction
@@ -167,15 +171,10 @@ private:
     XSArraySet           _ref_micx;  // [(iso*ng+ig)*nxyz + l]
     milk::Vector<double> _ref_iden;  // [niso*nxyz] (non-H/B/O isotopes)
     std::vector<double>  _ref_wvfr;  // unrodded AD_WVFR per node
-    std::vector<double>  _ref_tmod;  // burnup-interpolated reference average moderator temperature
-    std::vector<double>  _ref_dmod;  // burnup-interpolated reference average moderator density
     std::vector<double>  _node_wvfr; // live AD_WVFR per node
-    std::vector<double>  _ref_flux;  // burnup-interpolated reference flux per node [ig*nxyz + l]
     std::vector<double>  _ref_chix;  // burnup-interpolated fission spectrum per node [ig*nxyz + l]
-    double               _boron_dmod_average   = 0.0;
-    double               _history_tmod_average = 0.0;
-    double               _history_dmod_average = 0.0;
-    double               _current_power_rate   = 1.0;
+    double               _boron_dmod_average = 0.0;
+    double               _current_power_rate = 1.0;
 
     bool _simd_ready = false;
 
@@ -184,8 +183,6 @@ private:
     XSArraySet           _micx_bos;
     milk::Vector<double> _iden_bos;
     std::vector<int>     _burn_bos;
-    std::vector<int>     _history_ctyp_bos;
-    std::vector<double>  _rodded_fluence_bos;
     milk::Vector<double> _flux_bos;
 
     std::vector<double> _node_power_scratch;
@@ -194,17 +191,23 @@ private:
     std::vector<double> _old_rod_fraction_scratch;
     std::vector<int>    _old_rod_ctyp_scratch;
     std::vector<int>    _dirty_nodes_scratch;
-    std::vector<double> _old_bppm_scratch;
     std::vector<int>    _rod_cusping_nodes_scratch;
-    int                 _axial_rod_division     = 10;
-    double              _rod_cusping_relaxation = 1.0; // 1.0 = full PARCS flux-weighted cusp; <1 dilutes (see ApplyRodCusping)
-    double              _th_relaxation          = 0.85; // T/H feedback under-relaxation: damps temperature oscillation, ~30% fewer outer iters (RASBERY_TH_RELAX overrides)
+    int                 _axial_rod_division             = 10;
+    double              _rod_cusping_relaxation         = 1.0;  // 1.0 = full PARCS flux-weighted cusp; <1 dilutes (see ApplyRodCusping)
+    double              _th_relaxation                  = 0.85; // T/H feedback under-relaxation: damps temperature oscillation, ~30% fewer outer iters (RASBERY_TH_RELAX overrides)
     std::vector<int>    _fine_rod_type;
     std::vector<double> _fine_rod_frac; // rodded fraction of each fine cell (0..1); <1 only at the tip cell
-    std::vector<double> _fine_rod_fluence;
-    std::vector<double> _fine_rod_fluence_bos;
+    // PROBE: cumulative Pu239 gain, split by how much of it accrued while the
+    // node was rodded. The ratio is a history weight; the instantaneous rod
+    // fraction is a spectrum weight, and the two differ only in transitions.
+    std::vector<double> _pu_prev;
+    std::vector<double> _pu_gain_tot;
+    std::vector<double> _pu_gain_rod;
+    std::vector<double> _fine_rod_thermal_fluence;
+    std::vector<double> _fine_rod_thermal_fluence_bos;
     std::vector<int>    _rod_node_segment_offset;
     std::vector<int>    _rod_node_segment_ctype;
+    std::vector<char>   _node_uses_rod; // cached UsesRodXS answer, rebuilt in Initialize/SetRod
 
     // Cusping resets the touched nodes to their base (pre-cusping) flat XS every outer iteration so
     // the relaxation blend is stable. That base is a deterministic function of (bppm, tful, dmod,
@@ -236,24 +239,70 @@ private:
 
     [[nodiscard]] double NormFactor(double power, const XSArraySet& xs_arr, const double* flux) const;
 
-    void                 unpackXS(const Chiffon::CrossSection& xs, size_t l, size_t ngrp, size_t nxyz, size_t niso_count);
-    void                 FlattenReferenceCrossSection(size_t flat, const Chiffon::DepletionPoint& dpt);
-    void                 FlattenDeltaCrossSection(size_t coeff_base, const Chiffon::DeltaCrossSection& dxs);
-    void                 FlattenBranchDelta(const Chiffon::BranchDelta& bd, size_t mi, int branch,
-                                            size_t& delta_slot_idx, size_t& coeff_idx, size_t& knot_offset);
-    [[nodiscard]] bool   UsesRodXS(int l) const;
-    void                 RestoreReferenceNode(int l);
-    void                 ApplyBranchDeltaIdToNode(int l, int did, double x, double scale, bool clamp_x = false);
-    void                 ApplyBranchDeltaToNode(int l, int branch, double x, double scale);
-    void                 ApplyHistoryDeltasToNode(int l);
-    void                 ApplyBranchDeltasToNode(int l);
+    void               unpackXS(const Chiffon::CrossSection& xs, size_t l, size_t ngrp, size_t nxyz, size_t niso_count);
+    void               FlattenReferenceCrossSection(size_t flat, const Chiffon::DepletionPoint& dpt);
+    void               FlattenDeltaCrossSection(size_t coeff_base, const Chiffon::DeltaCrossSection& dxs);
+    void               FlattenBranchDelta(const Chiffon::BranchDelta& bd, size_t mi, int branch,
+                                          size_t& delta_slot_idx, size_t& coeff_idx, size_t& knot_offset);
+    void               FlattenSpectralHistory(
+        const Chiffon::SpectralHistoryCorrection& correction,
+        SpectralHistoryInfo& info, size_t& delta_slot_idx,
+        size_t& coeff_idx, size_t& knot_offset);
+    void               RebuildUsesRodCache();
+    [[nodiscard]] bool UsesRodXS(int l) const;
+    /// @brief One fitted spectral-history surface to apply.
+    struct DeltaApplication {
+        int    did;
+        double x;
+        double scale;
+        int    iso;
+    };
+    /// @brief Ratio of resonance to 1/v thermal absorption on the node's
+    /// pre-correction cross sections; a stand-in for the intra-group spectrum.
+    /// @param micWork when non-null, the node's XSAF microscopic workspace
+    /// block laid out [iso*ng+ig]; supplies the base+branch state that is not
+    /// yet scattered back into `_micx`. Falls back to `_micx` when null.
+    [[nodiscard]] double NodeSpectralIndex(
+        int l, const double* micWork = nullptr) const;
+
+    /// @brief Share of the node flux in the fast (ig=0) or thermal (last) group.
+    [[nodiscard]] double NodeFluxShare(int l, bool thermal) const;
+
+    /// @brief Collect the spectral-history delta applications for one node.
+    /// @param modelIndex Library to resolve against; SIZE_MAX uses the node's own.
+    /// @param weight Extra factor on every returned scale, for the history blend.
+    void ResolveSpectralHistoryDeltas(
+        int l, std::vector<DeltaApplication>& out,
+        const double* micWork = nullptr,
+        size_t modelIndex = static_cast<size_t>(-1), double weight = 1.0) const;
+    /// @brief Blend weight toward the rodded-depletion twin, 0 when there is none.
+    [[nodiscard]] double HistoryBlendWeight(int l) const {
+        return _node_hw.empty() ? 0.0 : _node_hw[static_cast<size_t>(l)];
+    }
+    /// @brief Interpolate one isotope density on a model's ctype reference trajectory.
+    /// @param mi Model index. @param ctype Rod state (0 = out). @param burn Burnup key.
+    /// @param iso Isotope index. @return Density [1/barn-cm], 0 when unavailable.
+    [[nodiscard]] double ReferenceIden(size_t mi, int ctype, int burn, size_t iso) const;
+    /// @brief Fill node `l`'s partner brackets and depletion-history blend weight.
+    ///
+    /// The weight is how far the node's own U235-vs-Pu239 balance has been driven
+    /// from the unrodded reference toward the partner's rod-in reference, clamped
+    /// to [0,1] so a node outside the two trajectories takes one of them whole.
+    void BuildHistoryBlend(int l, size_t mi);
+    void UpdateUnroddedNodeXS(int l);
+    void ApplyBranchDeltaIdToNode(int l, int did, double x, double scale);
+    /// @brief Accumulate the few-group MACRO delta-sigma [barn] of fitted surface `did` at scaled
+    /// indicator coordinate `x` into `scalar`, laid out [N_XS_SCALAR][ng] (xt-major).
+    /// Microscopic coefficients are folded through node densities.
+    void                 AccumulateDeltaMacro(int l, int did, double x, double scale,
+                                              std::vector<double>& scalar) const;
+    void                 ApplySpectralHistoryToNode(int l);
     void                 FillRodNodeXS(int l);
     void                 RefreshLightIsotopes(int l);
     void                 Reconstruct();
     void                 ReconstructNode(size_t l);
     [[nodiscard]] int    RodCTypeAtDistance(const RodGroup& group, double distance_from_tip) const;
     [[nodiscard]] double RodTotalLength(const RodGroup& group) const;
-    [[nodiscard]] double FineRodFluenceAverage(int l, int ctype) const;
     void                 FillCuspingMacroXS(int l, int ctype, double fluence,
                                             std::vector<double>& scalar,
                                             std::vector<double>& scatter) const;
@@ -262,6 +311,9 @@ private:
                                                 std::vector<int>&                 touched_nodes);
     void                 RebuildFineRodOccupancy();
     void                 DepleteRodMaterials(double dt, double power, bool corrected_flux);
+    void                 AccumulatePuHistory();
+    [[nodiscard]] double RoddedPuFraction(int l) const;
+    [[nodiscard]] double RodBlendWeight(int l) const;
 
     // T/H steady-state solve (moved from THSolver)
     void SolveTH(const double* node_power, const int* burnup, double power_rate);
@@ -278,6 +330,14 @@ public:
 
     void Initialize(const std::string& xs_path);
     void Update();
+
+    /// @brief Few-group macroscopic contribution of one spectral-history term.
+    struct TermContribution {
+        int                 iso;
+        std::vector<double> scalar;
+    };
+    /// @brief Per-term spectral-history contributions applied at a node.
+    void ResolveTermContributions(int l, std::vector<TermContribution>& out) const;
     void PrecomputeBranchCoefficients();
     void UpdateFlatXS(const XSUpdateOptions& options = XSUpdateOptions{});
     void UpdateBurnup(double dt, double power);
@@ -287,11 +347,19 @@ public:
     [[nodiscard]] double GetHmod(double temperature_k, double pressure_mpa) const { return _mod_h_table.Get(pressure_mpa, temperature_k); }
     [[nodiscard]] double GetTmod(double enthalpy_kJ, double pressure_mpa) const { return _mod_t_table.Get(pressure_mpa, enthalpy_kJ); }
     [[nodiscard]] double GetDmod(double enthalpy_kJ, double pressure_mpa) const { return _mod_rho_table.Get(pressure_mpa, enthalpy_kJ); }
-    [[nodiscard]] double GetTfuel(double burnup, double LPD) const { return _tf_table.Get(LPD, burnup); }
+    [[nodiscard]] double GetTfuel(double burnup, double LPD) const {
+        // tf.csv starts at 50 W/cm.  Table::Get clamps below that knot,
+        // which leaves a non-zero ~80 K fuel rise as local power tends to
+        // zero and distorts the axial power shape.  The conduction solution
+        // is linear to first order at low heat rate, so continue the first
+        // tabulated point to the physical origin.
+        constexpr double first_lpd = 50.0;
+        const double     safe_lpd  = std::max(0.0, LPD);
+        const double rise = _tf_table.Get(std::max(first_lpd, safe_lpd), burnup);
+        return safe_lpd < first_lpd ? rise * safe_lpd / first_lpd : rise;
+    }
 
     [[nodiscard]] double pressure() const { return _g.pressure(); }
-
-    void RemoveUpscattering();
 
     void InitXS(double bppm, double tful, double tmod, double pres,
                 double dmod = 0.0, bool overwrite_th = true);
@@ -300,9 +368,25 @@ public:
     // Applies T/H feedback; returns the max relative Doppler (fuel) temperature change delta_Dop
     // used as the T/H convergence metric.
     double UpdateTH(double power_rate);
-    void UpdateDerivative(double delta_bppm, double delta_tful, double delta_tmod, double delta_dmod);
-    void ResetFluxAndCurrents(double flux_value = 1.0);
-    void NormalizeFluxSign();
+    void   UpdateDerivative(double delta_bppm, double delta_tful, double delta_tmod, double delta_dmod);
+    void   ResetFluxAndCurrents(double flux_value = 1.0);
+    void   NormalizeFluxSign();
+
+    // Recompute the BOC/equilibrium I-135/Xe-135 inventory from the current
+    // power-normalized flux and rebuild macroscopic cross sections.
+    //
+    // `relax` damps the APPLIED update: x <- x + relax*(F(x) - x).  That has
+    // exactly the fixed points of x = F(x), so the converged inventory is
+    // unchanged; only the path to it is damped.  The undamped Xe<->flux map
+    // limit-cycles on some cores (see the oscillation detector in Driver.h).
+    // relax == 1.0 is the original update, bit for bit.
+    //
+    // Returns the maximum RAW relative Xe-135 density change over fuel nodes --
+    // |F(x) - x| / |F(x)|, measured before the damping is applied.  Reporting
+    // the damped step instead would let a small relax push the change under the
+    // convergence tolerance on its own and declare a convergence that never
+    // happened.
+    double UpdateEquilibriumXenon(double power, double relax = 1.0);
 
     void PredictorStep(double dt, double power, bool xe_transient);
     void CorrectorStep(double dt, double power, bool xe_transient);
@@ -333,30 +417,27 @@ public:
     int&                     burn(const int& l) { return _burn[l]; }
     [[nodiscard]] int*       burn_data() { return _burn.data(); }
     [[nodiscard]] const int* burn_data() const { return _burn.data(); }
-
-    [[nodiscard]] int                        ctyp(const int& l) const { return _ctyp[l]; }
-    int&                                     ctyp(const int& l) { return _ctyp[l]; }
-    [[nodiscard]] int                        history_ctyp(const int& l) const { return _history_ctyp[l]; }
-    int&                                     history_ctyp(const int& l) { return _history_ctyp[l]; }
-    [[nodiscard]] int*                       history_ctyp_data() { return _history_ctyp.data(); }
-    [[nodiscard]] const int*                 history_ctyp_data() const { return _history_ctyp.data(); }
-    [[nodiscard]] double                     rodded_fluence(const int& l) const { return _rodded_fluence[l]; }
-    double&                                  rodded_fluence(const int& l) { return _rodded_fluence[l]; }
-    [[nodiscard]] double*                    rodded_fluence_data() { return _rodded_fluence.data(); }
-    [[nodiscard]] const double*              rodded_fluence_data() const { return _rodded_fluence.data(); }
-    [[nodiscard]] std::vector<double>&       fine_rod_fluence_data() { return _fine_rod_fluence; }
-    [[nodiscard]] const std::vector<double>& fine_rod_fluence_data() const { return _fine_rod_fluence; }
+    [[nodiscard]] int ctyp(const int& l) const { return _ctyp[l]; }
+    int&              ctyp(const int& l) { return _ctyp[l]; }
+    /// @brief Mean thermal fluence of the active fine-mesh rod cells [n/cm2].
+    [[nodiscard]] double FineRodThermalFluenceAverage(int l, int ctype) const;
+    [[nodiscard]] std::vector<double>& fine_rod_thermal_fluence_data() {
+        return _fine_rod_thermal_fluence;
+    }
+    [[nodiscard]] const std::vector<double>& fine_rod_thermal_fluence_data() const {
+        return _fine_rod_thermal_fluence;
+    }
 
     std::map<std::string, RodGroup>&                     rod_groups() { return _rod_groups; }
     [[nodiscard]] const std::map<std::string, RodGroup>& rod_groups() const { return _rod_groups; }
 
-    void              SetRod(const std::map<std::string, double>& insertions);
-    void              SetBoron(double bppm);
-    void              SetRod(double step);
-    void              SetAxialRodDivision(int division);
-    [[nodiscard]] int axial_rod_division() const { return _axial_rod_division; }
+    void                 SetRod(const std::map<std::string, double>& insertions);
+    void                 SetBoron(double bppm);
+    void                 SetRod(double step);
+    void                 SetAxialRodDivision(int division);
+    [[nodiscard]] int    axial_rod_division() const { return _axial_rod_division; }
     [[nodiscard]] double rod_cusping_relaxation() const { return _rod_cusping_relaxation; }
-    bool              ApplyRodCusping(double eigv, const AxialTransverseLeakageView& leakage = {});
+    bool                 ApplyRodCusping(double eigv, const AxialTransverseLeakageView& leakage = {});
 
     // Rod profile matrix interface
     void                 BuildRodProfileMatrix(const std::map<std::string, std::vector<double>>& profiles);
@@ -364,7 +445,6 @@ public:
 
     std::vector<Chiffon::Model>&                     models() { return _models; }
     [[nodiscard]] const std::vector<Chiffon::Model>& models() const { return _models; }
-    [[nodiscard]] double                             xsadf(const int&, const int&) const { return 1.0; }
 
     // Macroscopic XS accessors
     [[nodiscard]] double xsnf(const int& ig, const int& l) const { return _xs.xsnf[ig * _g.nxyz() + l]; }

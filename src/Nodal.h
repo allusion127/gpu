@@ -80,6 +80,13 @@ private:
     /// @brief variable in FENM method (see the paper : https://doi.org/10.1080/18811248.2008.9711467)
     double* _diagD;
 
+    /// Last material inputs used by updateConstant().  Nodal::drive() is called
+    /// repeatedly while the flux converges, but these coefficients only change
+    /// when removal/diffusion XS changes.  Keeping a per-node bit-exact shadow
+    /// avoids recomputing exp/sinh/cosh-derived constants on unchanged outers.
+    double* _constant_xsrf;
+    double* _constant_xsdf;
+
     /// @brief variable in FENM method (see the paper : https://doi.org/10.1080/18811248.2008.9711467)
     double* _matM;
 
@@ -166,7 +173,7 @@ public:
     /// @param ls the surface index
     /// @param lr the left or right surface
     /// @param alb the albedo boundary condition
-    void calculateJnet1n(const int& ls, const int& lr, const float& alb);
+    void calculateJnet1n(const int& ls, const int& lr, const double& alb);
 
     /// @brief update the net current at the interior surface
     void calculateJnet2n(const int& ls);

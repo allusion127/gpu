@@ -14,6 +14,9 @@ CMFD::CMFD(Geometry& g, XSSet& x)
     _cc    = new double[_g.nxyz() * _g.ng() * NEWSBT]{};
     _src   = new double[_g.nxyz() * _g.ng()]{};
     _psi   = new double[_g.nxyz()]{};
+
+    if (const char* c = std::getenv("RASBERY_DHAT_CLAMP"))
+        _dhat_clamp_enabled = (std::atoi(c) != 0);
 }
 
 CMFD::~CMFD() {
@@ -35,7 +38,7 @@ void CMFD::upddtil(const int& ls) {
     int idirl = _g.idirlr(LEFT, ls);
     int idirr = _g.idirlr(RIGHT, ls);
 
-    float betal, betar;
+    double betal, betar;
 
     for (int ig = 0; ig < _g.ng(); ig++) {
         if (ll < 0) {
@@ -69,13 +72,71 @@ void CMFD::upddhat(const int& ls, double* flux, double* jnet) {
             fsum  = flux(ig, lr) + flux(ig, ll);
         }
         double jnet_fdm = -dtil(ig, ls) * (fdiff);
-        dhat(ig, ls)    = (jnet_fdm - jnet(ig, ls)) / (fsum);
+
+        // Guard 1: fsum is a sum of (nominally positive) fluxes, but during the
+        // early outers it can collapse toward zero or go negative, which turns
+        // the division into a spike that poisons the coupling coefficients.
+        // Scale the floor to dtil so the test is dimensionally consistent.
+        ++_dhat_total;
+        const double dtl   = dtil(ig, ls);
+        const double floor = 1.0e-12 * std::max(1.0, std::abs(dtl));
+        if (!(std::abs(fsum) > floor) || !std::isfinite(fsum)) {
+            ++_dhat_fsum_guard;
+            dhat(ig, ls) = 0.0;
+            continue;
+        }
+
+        double dh = (jnet_fdm - jnet(ig, ls)) / fsum;
+        if (!std::isfinite(dh)) {
+            ++_dhat_fsum_guard;
+            dhat(ig, ls) = 0.0;
+            continue;
+        }
+
+        // Diagnostic 2: |dhat| > |dtil| makes one of the two CMFD coupling
+        // coefficients change sign, which breaks diagonal dominance and is the
+        // classic source of oscillating/negative CMFD flux.
+        //
+        // Measured on i-SMR CY01 this fires on 2.72% of all surface/group updates
+        // with max|dhat/dtil| ~ 2.8, and -- crucially -- it is still firing at the
+        // converged state, not only during the early outers. That means these are
+        // not transients: the converged nodal solution genuinely wants |dhat| >
+        // |dtil| at those surfaces (reflector and strong-absorber interfaces).
+        // Clamping them unconditionally therefore does NOT remove an error, it
+        // breaks the CNCC consistency condition (dhat is defined so that CMFD
+        // reproduces the nodal net current exactly) and biases the answer by
+        // ~+100 pcm at BOC on CY01. So the envelope is counted by default and only
+        // enforced when RASBERY_DHAT_CLAMP=1 is set, which keeps the diagnostic
+        // available without silently changing converged results.
+        const double cap = std::abs(dtl);
+        if (cap > 0.0) {
+            const double ratio = std::abs(dh) / cap;
+            if (ratio > _dhat_ratio_max) _dhat_ratio_max = ratio;
+            if (ratio > 1.0) {
+                ++_dhat_clamped;
+                if (_dhat_clamp_enabled) dh = (dh > 0.0 ? cap : -cap);
+            }
+        }
+        dhat(ig, ls) = dh;
     }
+}
+
+void CMFD::reportDhatGuardStats(const char* tag) const {
+    if (_dhat_total == 0) return;
+    std::fprintf(stderr,
+                 "[RASBERY][dhat-guard]%s%s clamp=%s total=%lld fsum_guard=%lld (%.3g%%) "
+                 "over_envelope=%lld (%.3g%%) max|dhat/dtil|=%.6g\n",
+                 (*tag ? " " : ""), tag, _dhat_clamp_enabled ? "on" : "off(count-only)",
+                 _dhat_total, _dhat_fsum_guard,
+                 100.0 * static_cast<double>(_dhat_fsum_guard) / static_cast<double>(_dhat_total),
+                 _dhat_clamped,
+                 100.0 * static_cast<double>(_dhat_clamped) / static_cast<double>(_dhat_total),
+                 _dhat_ratio_max);
 }
 
 void CMFD::setls(const int& l) {
     // determine the area of surfaces at coarse meshes that is normal to directions
-    float area[NDIRMAX];
+    double area[NDIRMAX];
 
     area[XDIR] = _g.hmesh(YDIR, l) * _g.hmesh(ZDIR, l);
     area[YDIR] = _g.hmesh(XDIR, l) * _g.hmesh(ZDIR, l);

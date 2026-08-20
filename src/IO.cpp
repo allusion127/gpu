@@ -6,7 +6,7 @@
 #include <cctype>
 #include <cmath>
 #include <filesystem>
-#include <format>
+#include "CompatFormat.h"
 #include <fstream>
 #include <initializer_list>
 #include <iomanip>
@@ -156,6 +156,24 @@ int AssemblyNodeY(int symang, bool symdiv, int assembly_row, int local_row, int 
     return y;
 }
 
+// One 90-degree step of the quarter-core rotation, expressed on an assembly's
+// full-size local index grid (row index i runs south, column index j runs east).
+// This is the same step the shuffle's rotation=90 case applies, so the two stay
+// consistent by construction.
+void RotateAssemblyIndex(int& i, int& j, int ndivxy) {
+    const int ti = j;
+    const int tj = ndivxy - 1 - i;
+    i            = ti;
+    j            = tj;
+}
+
+void RotateAssemblyIndexInverse(int& i, int& j, int ndivxy) {
+    const int ti = ndivxy - 1 - j;
+    const int tj = i;
+    i            = ti;
+    j            = tj;
+}
+
 // Apply optional per-entry search and exposed convergence overrides directly to the Schedule fields.
 // Internal convergence tolerances and iteration caps stay at Scheduler constexpr defaults.
 void ApplyScheduleOverrides(const nlohmann::ordered_json& item, Schedule& entry) {
@@ -200,6 +218,39 @@ void ApplyScheduleOverrides(const nlohmann::ordered_json& item, Schedule& entry)
         entry.search_boron_probe = item["search_boron_probe"].get<double>();
     if (item.contains("search_rod_probe"))
         entry.search_rod_probe = item["search_rod_probe"].get<double>();
+    if (const auto* v = FirstPresentKey(
+            item, {"fuel temperature rise scale", "fuel_temperature_rise_scale"}))
+        entry.fuel_temp_rise_scale = v->get<double>();
+}
+
+/// @brief Write spectral-history macro delta-sigma terms for one monitored node.
+void writeTermContrib(HighFive::Group& ngrp, const XSSet& xs, int lk, int ng) {
+    std::vector<XSSet::TermContribution> terms;
+    xs.ResolveTermContributions(lk, terms);
+    const size_t nt    = terms.size();
+    const size_t ng_sz = static_cast<size_t>(ng);
+    if (!nt) return;
+
+    auto                     tc_grp = ngrp.createGroup("term_contrib");
+    std::vector<std::string> isotope(nt);
+    for (size_t t = 0; t < nt; ++t) {
+        isotope[t] =
+            terms[t].iso >= 0 ? std::string(Chiffon::Isotope::isotopeIds[terms[t].iso]) : "unknown";
+    }
+    tc_grp.createDataSet("isotope", isotope);
+    HighFive::DataSpace tc_space({nt, ng_sz});
+    auto                emit_term = [&](const std::string& name, Chiffon::XSTYPE xt) {
+        std::vector<double> v(nt * ng_sz, 0.0);
+        for (size_t t = 0; t < nt; ++t)
+            for (int ig = 0; ig < ng; ++ig)
+                v[t * ng_sz + ig] = terms[t].scalar[xt * ng + ig];
+        tc_grp.createDataSet<double>(name, tc_space).write_raw(v.data());
+    };
+    emit_term("xstf", Chiffon::XSTF);
+    emit_term("xsaf", Chiffon::XSAF);
+    emit_term("xsnf", Chiffon::XSNF);
+    emit_term("xskf", Chiffon::XSKF);
+    emit_term("xssf", Chiffon::XSSF);
 }
 
 } // namespace
@@ -207,6 +258,13 @@ void ApplyScheduleOverrides(const nlohmann::ordered_json& item, Schedule& entry)
 // Construct an IO helper bound to the main geometry, XS, and scheduler objects.
 IO::IO(Geometry& g, XSSet& xs, Scheduler& sched)
     : _g(g), _xs(xs), _s(sched) {
+}
+
+IO::~IO() {
+    // HighFive::File destruction also enters the non-thread-safe HDF5 runtime.
+    // Keep exception paths safe when a Driver fails before CloseResult().
+    Chiffon::Hdf5Guard hdf5_guard;
+    _result_file.reset();
 }
 
 // Parse the JSON "print" block of a schedule entry into a PrintOpt.
@@ -269,6 +327,7 @@ void IO::ParseSchedule(const nlohmann::ordered_json& config) {
     double              default_outlet_temperature = 610.0;
     double              default_mass_flow_rate     = 0.0;
     double              default_rated_power        = 520.0;
+    double              default_fuel_temp_rise_scale = 1.0;
     bool                default_use_mass_flow_rate = false;
     THMode              default_th_mode            = THMode::STEADY;
     std::vector<double> default_profile_power;
@@ -290,6 +349,9 @@ void IO::ParseSchedule(const nlohmann::ordered_json& config) {
             default_use_mass_flow_rate = default_mass_flow_rate > 0.0;
         }
         default_rated_power = th_config.value("rated power", 520.0);
+        if (const auto* v = FirstPresentKey(
+                th_config, {"fuel temperature rise scale", "fuel_temperature_rise_scale"}))
+            default_fuel_temp_rise_scale = v->get<double>();
         default_th_mode     = ParseThModeString(th_config.value("TH_mode", "steady"));
     }
     if (!default_inlet_profile.empty() || !default_outlet_profile.empty()) {
@@ -311,7 +373,8 @@ void IO::ParseSchedule(const nlohmann::ordered_json& config) {
     _s.SetDefaultCondition(default_boron_ppm, default_fuel_temperature, default_mod_temperature,
                            default_rated_power, 100.0);
     _s.SetDefaultTH(default_pressure, default_inlet_temperature, default_outlet_temperature,
-                    default_mass_flow_rate, default_use_mass_flow_rate);
+                    default_mass_flow_rate, default_use_mass_flow_rate,
+                    default_fuel_temp_rise_scale);
     _s.SetDefaultTHProfile(default_profile_power, default_inlet_profile, default_outlet_profile);
     _s.SetDefaultXenonTransient(default_xenon_transient);
 
@@ -422,6 +485,8 @@ void IO::ParseSchedule(const nlohmann::ordered_json& config) {
         } else if (entry_type == "rod insertion") {
             std::map<std::string, double> insertions;
             for (auto& [key, val] : item.items()) {
+                if (!val.is_number())
+                    continue;
                 if (key == "type" || key == "rate" || key == "rated power percent" ||
                     key == "rated_power_percent" || key == "search" || key == "search_min" ||
                     key == "search_max" || key == "search_target" || key == "search_tol" ||
@@ -461,6 +526,10 @@ void IO::ParseSchedule(const nlohmann::ordered_json& config) {
 
 // Read one JSON input deck and initialize geometry, XS, and scheduler state.
 void IO::ReadInput(const std::string& filepath) {
+    // This scope covers restart reads, shuffle reads, and XSSet::Initialize()
+    // (which loads the CHIFFON HDF5 library) as one transaction.  The guard is
+    // recursive because helper paths also protect their direct HDF5 entrypoints.
+    Chiffon::Hdf5Guard hdf5_guard;
     // 1. Resolve the input directory and load the JSON deck.
     {
         std::filesystem::path input_path(filepath);
@@ -469,7 +538,9 @@ void IO::ReadInput(const std::string& filepath) {
             _input_dir += '/';
     }
 
-    std::ifstream          input_stream(filepath);
+    std::ifstream input_stream(filepath);
+    if (!input_stream.is_open())
+        throw std::runtime_error("IO::ReadInput: cannot open input file: " + filepath);
     nlohmann::ordered_json config;
     input_stream >> config;
 
@@ -745,22 +816,10 @@ void IO::ReadInput(const std::string& filepath) {
         {
             std::vector<int> burn;
             rfile.getDataSet("burnup").read(burn);
-            if (static_cast<int>(burn.size()) == nxyz)
-                std::copy_n(burn.data(), nxyz, _xs.burn_data());
-        }
-
-        if (rfile.exist("history_ctype")) {
-            std::vector<int> history_ctyp;
-            rfile.getDataSet("history_ctype").read(history_ctyp);
-            if (static_cast<int>(history_ctyp.size()) == nxyz)
-                std::copy_n(history_ctyp.data(), nxyz, _xs.history_ctyp_data());
-        }
-
-        if (rfile.exist("rodded_fluence")) {
-            std::vector<double> rodded_fluence;
-            rfile.getDataSet("rodded_fluence").read(rodded_fluence);
-            if (static_cast<int>(rodded_fluence.size()) == nxyz)
-                std::copy_n(rodded_fluence.data(), nxyz, _xs.rodded_fluence_data());
+            if (static_cast<int>(burn.size()) != nxyz)
+                throw std::runtime_error(
+                    std::format("Restart: burnup size {} != nxyz {}", burn.size(), nxyz));
+            std::copy_n(burn.data(), nxyz, _xs.burn_data());
         }
 
         if (rfile.exist("axial_rod_division")) {
@@ -769,20 +828,54 @@ void IO::ReadInput(const std::string& filepath) {
             _xs.SetAxialRodDivision(saved_division);
         }
 
-        if (rfile.exist("fine_rod_fluence")) {
-            std::vector<double> fine_rod_fluence;
-            rfile.getDataSet("fine_rod_fluence").read(fine_rod_fluence);
-            auto& current = _xs.fine_rod_fluence_data();
-            // Fine rod fluence belongs to rod-material depletion state, not fuel
-            // shuffling. Ordinary restart restores it verbatim when the fine mesh
-            // shape matches the current axial rod division.
-            if (fine_rod_fluence.size() == current.size())
-                current = std::move(fine_rod_fluence);
+        if (rfile.exist("rod_state")) {
+            const auto               state = rfile.getGroup("rod_state");
+            std::vector<std::string> names;
+            std::vector<double>      insertions;
+            state.getDataSet("names").read(names);
+            state.getDataSet("insertions").read(insertions);
+            if (names.size() != insertions.size())
+                throw std::runtime_error(
+                    "Restart: rod-state name and insertion counts differ.");
+
+            std::map<std::string, double> saved;
+            for (size_t i = 0; i < names.size(); ++i) {
+                if (_xs.rod_groups().count(names[i]) == 0)
+                    throw std::runtime_error(
+                        "Restart: rod group '" + names[i] +
+                        "' is absent from the input configuration.");
+                saved.emplace(names[i], insertions[i]);
+            }
+            _xs.SetRod(saved);
+        }
+
+        // RDPL restart state. The v2.4.0 `fine_rod_fluence` was a total-group fluence;
+        // the RDPL axis is the THERMAL-group fluence, so a legacy file cannot seed it.
+        if (rfile.exist("fine_rod_thermal_fluence")) {
+            std::vector<double> saved;
+            rfile.getDataSet("fine_rod_thermal_fluence").read(saved);
+            auto& current = _xs.fine_rod_thermal_fluence_data();
+            if (saved.size() != current.size())
+                throw std::runtime_error(std::format(
+                    "Restart: fine_rod_thermal_fluence size {} != expected {}",
+                    saved.size(), current.size()));
+            current = std::move(saved);
+        } else if (rfile.exist("fine_rod_fluence")) {
+            PLOG_WARNING
+                << "Restart: legacy fine_rod_fluence contains total fluence and cannot "
+                   "initialize the thermal-fluence RDPL coordinate; starting that coordinate at zero.";
         }
 
         if (niso > 0 && rfile.exist("isotope_density")) {
             std::vector<double> iden_flat(static_cast<size_t>(nxyz) * niso, 0.0);
-            rfile.getDataSet("isotope_density").read_raw<double>(iden_flat.data());
+            auto                      density = rfile.getDataSet("isotope_density");
+            const std::vector<size_t> expectedShape = {
+                static_cast<size_t>(nxyz), static_cast<size_t>(niso)};
+            if (density.getDimensions() != expectedShape ||
+                density.getElementCount() != iden_flat.size())
+                throw std::runtime_error(
+                    "Restart: isotope_density dimensions do not match nxyz and niso.");
+            density.read_raw<double>(iden_flat.data());
             const double cooling_days = _restart_cooling_days[_primary_restart_cycle];
             if (cooling_days > 0.0) {
                 const int substeps = _restart_cooling_substeps[_primary_restart_cycle];
@@ -805,11 +898,14 @@ void IO::ReadInput(const std::string& filepath) {
             thst.getDataSet("tful").read(tful);
             thst.getDataSet("tmod").read(tmod);
             thst.getDataSet("dmod").read(dmod);
+            if (static_cast<int>(bppm.size()) != nxyz || static_cast<int>(tful.size()) != nxyz ||
+                static_cast<int>(tmod.size()) != nxyz || static_cast<int>(dmod.size()) != nxyz)
+                throw std::runtime_error(std::format("Restart: th_state size != nxyz {}", nxyz));
             for (int l = 0; l < nxyz; ++l) {
-                if (l < static_cast<int>(bppm.size())) _g.bppm(l) = bppm[l];
-                if (l < static_cast<int>(tful.size())) _g.tful(l) = tful[l];
-                if (l < static_cast<int>(tmod.size())) _g.tmod(l) = tmod[l];
-                if (l < static_cast<int>(dmod.size())) _g.dmod(l) = dmod[l];
+                _g.bppm(l) = bppm[l];
+                _g.tful(l) = tful[l];
+                _g.tmod(l) = tmod[l];
+                _g.dmod(l) = dmod[l];
             }
         }
 
@@ -885,6 +981,33 @@ void IO::AddResult(Geometry& g, double keff,
     int kec  = g.kec();
     int nxya = g.nxya();
 
+    // Half-core split used by every axial offset below.  The active stack is
+    // [kbc, kec); its geometric midplane generally falls INSIDE a node -- with
+    // the 25 equal 15.24 cm nodes of APR1400 it bisects the 13th -- and that
+    // node belongs half to each half-core.  bot_frac[k] is the fraction of node
+    // k lying below the midplane, so an odd stack is handled exactly and an
+    // even one degenerates to the plain 0/1 split.
+    //
+    // Assigning the central node wholly to one side (the previous
+    // `k < (kbc+kec)/2` test) biases the reported AO by the central node's
+    // power share, +0.037..+0.056 for APR1400, and compares two half-cores of
+    // unequal height (182.88 vs 198.12 cm).  MASTER splits it 50/50; that is
+    // also the only definition consistent with AO's own geometry.
+    std::vector<double> bot_frac(g.nz(), 0.0);
+    {
+        double h_tot = 0.0;
+        for (int k = kbc; k < kec; ++k)
+            h_tot += g.hz(k);
+        const double h_half = 0.5 * h_tot;
+        double       h_lo   = 0.0;
+        for (int k = kbc; k < kec; ++k) {
+            const double hz = g.hz(k);
+            if (hz <= 0.0) continue;
+            bot_frac[k] = std::min(1.0, std::max(0.0, (h_half - h_lo) / hz));
+            h_lo += hz;
+        }
+    }
+
     // 1. Build node-wise power data used by the rest of the summary metrics.
     double              p_tot = 0.0, v_tot = 0.0;
     std::vector<double> pdens(nxyz, 0.0);
@@ -937,14 +1060,24 @@ void IO::AddResult(Geometry& g, double keff,
         for (int k = 0; k < g.nz(); ++k) {
             if (ax_v[k] > 0.0) d.ax_power[k] = ax_pv[k] / ax_v[k];
         }
-        int    k_mid = (kbc + kec) / 2;
         double p_bot = 0.0, p_top = 0.0;
         for (int k = kbc; k < kec; ++k) {
-            double pw = d.ax_power[k] * g.hz(k);
-            if (k < k_mid)
+            double       pw = d.ax_power[k] * g.hz(k);
+            const double fb = bot_frac[k];
+            // A node lying wholly on one side is accumulated unscaled, so on a
+            // mesh whose midplane falls on a node boundary (iSMR: 24 x 10 cm)
+            // every term is the one the old code summed.  The two half-sums can
+            // still differ in the last bit there, because the loop is no longer
+            // splittable into two contiguous ranges and the reduction order
+            // changes; measured at 1.2e-16 on AO, xe_ao/sm_ao bit-identical.
+            if (fb >= 1.0)
                 p_bot += pw;
-            else
+            else if (fb <= 0.0)
                 p_top += pw;
+            else {
+                p_bot += pw * fb;
+                p_top += pw * (1.0 - fb);
+            }
         }
         d.ao  = (p_bot + p_top > 0.0) ? (p_top - p_bot) / (p_top + p_bot) : 0.0;
         d.asi = -d.ao;
@@ -980,6 +1113,7 @@ void IO::AddResult(Geometry& g, double keff,
         std::vector<double> ap(nxya, 0.0), av(nxya, 0.0);
         std::vector<double> an(nxya, 0.0), aa(nxya, 0.0);
         std::vector<double> ab(nxya, 0.0), ahm(nxya, 0.0);
+        std::vector<double> rp(nxy, 0.0), rv(nxy, 0.0);
 
         for (int k = kbc; k < kec; ++k)
             for (int l = 0; l < nxy; ++l) {
@@ -998,6 +1132,8 @@ void IO::AddResult(Geometry& g, double keff,
                 }
                 ap[la] += p * vol;
                 av[la] += vol;
+                rp[l] += p * vol;
+                rv[l] += vol;
                 an[la] += nf * vol;
                 aa[la] += af * vol;
                 if (hm > 1.0e-20) {
@@ -1012,12 +1148,31 @@ void IO::AddResult(Geometry& g, double keff,
         d.asm_kinf.resize(nxya, 0.0);
         double frn = 0.0;
 
+        // MASTER's FRN is the maximum axially integrated radial *nodal*
+        // power, not the maximum assembly-average power.  With xydivision=2
+        // the old assembly collapse erased the intra-assembly radial peak.
+        for (int l = 0; l < nxy; ++l)
+            if (rv[l] > 0.0)
+                frn = std::max(frn, (rp[l] / rv[l]) / p_avg);
+
         for (int la = 0; la < nxya; ++la) {
-            size_t mi      = _xs.assm(la);
+            // `_asmb` is stored per assembly-plane (la + nxya*k).  Indexing it
+            // with `la` alone selects the top reflector layer (RT) and mislabeled
+            // every fuel assembly in result files.  Identify the model from an
+            // active fuel subnode instead.
+            size_t mi = _xs.models().size();
+            for (int li = 0; li < g.ndivxy() * g.ndivxy(); ++li) {
+                const int l = g.latol(li, la);
+                if (l < 0) continue;
+                const int lk = kbc * nxy + l;
+                if (g.IsFuel(lk)) {
+                    mi = _xs.comp(lk);
+                    break;
+                }
+            }
             d.asm_type[la] = (mi < _xs.models().size()) ? _xs.models()[mi].name() : "?";
             if (av[la] > 0.0) {
                 d.asm_power[la] = (ap[la] / av[la]) / p_avg;
-                frn             = std::max(frn, d.asm_power[la]);
             }
             if (aa[la] > 1.0e-30)
                 d.asm_kinf[la] = an[la] / aa[la];
@@ -1038,9 +1193,12 @@ void IO::AddResult(Geometry& g, double keff,
         double xe_s = 0, xe_v = 0, sm_s = 0, sm_v = 0;
         double xe_bot = 0, xe_bv = 0, xe_top = 0, xe_tv = 0;
         double sm_bot = 0, sm_bv = 0, sm_top = 0, sm_tv = 0;
-        int    k_mid = (kbc + kec) / 2;
-
-        for (int k = kbc; k < kec; ++k)
+        for (int k = kbc; k < kec; ++k) {
+            // As for the power AO: a node wholly on one side is accumulated
+            // unscaled, so a boundary-aligned midplane sums the same terms.
+            const double fb   = bot_frac[k];
+            const double ft   = 1.0 - fb;
+            const bool   full = (fb >= 1.0 || fb <= 0.0);
             for (int l = 0; l < nxy; ++l) {
                 int    lk  = k * nxy + l;
                 double vol = g.vol(lk);
@@ -1049,27 +1207,42 @@ void IO::AddResult(Geometry& g, double keff,
                     double xe = _xs.iden(Chiffon::Isotope::iidx.at(xeKey), lk);
                     xe_s += xe * vol;
                     xe_v += vol;
-                    if (k < k_mid) {
-                        xe_bot += xe * vol;
-                        xe_bv += vol;
+                    if (full) {
+                        if (fb >= 1.0) {
+                            xe_bot += xe * vol;
+                            xe_bv += vol;
+                        } else {
+                            xe_top += xe * vol;
+                            xe_tv += vol;
+                        }
                     } else {
-                        xe_top += xe * vol;
-                        xe_tv += vol;
+                        xe_bot += xe * vol * fb;
+                        xe_bv += vol * fb;
+                        xe_top += xe * vol * ft;
+                        xe_tv += vol * ft;
                     }
                 }
                 if (hasSm) {
                     double sm = _xs.iden(Chiffon::Isotope::iidx.at(smKey), lk);
                     sm_s += sm * vol;
                     sm_v += vol;
-                    if (k < k_mid) {
-                        sm_bot += sm * vol;
-                        sm_bv += vol;
+                    if (full) {
+                        if (fb >= 1.0) {
+                            sm_bot += sm * vol;
+                            sm_bv += vol;
+                        } else {
+                            sm_top += sm * vol;
+                            sm_tv += vol;
+                        }
                     } else {
-                        sm_top += sm * vol;
-                        sm_tv += vol;
+                        sm_bot += sm * vol * fb;
+                        sm_bv += vol * fb;
+                        sm_top += sm * vol * ft;
+                        sm_tv += vol * ft;
                     }
                 }
             }
+        }
         d.xe_avg    = (xe_v > 0.0) ? xe_s / xe_v : 0.0;
         d.sm_avg    = (sm_v > 0.0) ? sm_s / sm_v : 0.0;
         double xe_b = (xe_bv > 0) ? xe_bot / xe_bv : 0;
@@ -1113,6 +1286,7 @@ void IO::AddResult(Geometry& g, double keff,
 
 /// @brief Create the result HDF5 file and write the geometry group.
 void IO::OpenResult(const std::string& filepath) {
+    Chiffon::Hdf5Guard hdf5_guard;
     _result_path                     = filepath;
     std::filesystem::path result_dir = _result_path.parent_path();
     if (result_dir.empty()) result_dir = ".";
@@ -1164,11 +1338,26 @@ void IO::OpenResult(const std::string& filepath) {
             ijtola[ja * nxa + ia] = _g.ijtola(ia, ja);
     geo.createDataSet("ijtola", ijtola);
 
+    // Compact fine-node index -> Cartesian (i,j).  The internal mesh omits
+    // leading/trailing void cells, so nxy can be smaller than nx*ny.
+    std::vector<int> node_i(nxy, -1), node_j(nxy, -1);
+    for (int j = 0; j < ny; ++j)
+        for (int i = _g.nxs(j); i < _g.nxe(j); ++i) {
+            const int l = _g.ijtol(i, j);
+            if (l >= 0 && l < nxy) {
+                node_i[l] = i;
+                node_j[l] = j;
+            }
+        }
+    geo.createDataSet("node_i", node_i);
+    geo.createDataSet("node_j", node_j);
+
     PLOG_INFO << "Result file opened: " << filepath;
 }
 
 /// @brief Write one step's data to the open HDF5 result file.
 void IO::WriteStepToResult(Geometry& g, const XSSet& xs, int schedule_index) {
+    Chiffon::Hdf5Guard hdf5_guard;
     if (!_result_file || schedule_index < 0 ||
         schedule_index >= static_cast<int>(_s.schedule().size()))
         return;
@@ -1194,6 +1383,84 @@ void IO::WriteStepToResult(Geometry& g, const XSSet& xs, int schedule_index) {
         grp.createDataSet("tful", d.ax_tful);
         grp.createDataSet("tmod", d.ax_tmod);
         grp.createDataSet("dmod", d.ax_dmod);
+    }
+
+    // Full nodal fields used for independent power / local-k / burnup audits.
+    // These are compact for a nodal core model and avoid trying to reconstruct
+    // spatial distributions from peak factors alone after the run.
+    {
+        const int nxyz = g.nxyz();
+        const int ng   = g.ng();
+        std::vector<double> power(nxyz, 0.0);
+        std::vector<double> burnup(nxyz, 0.0);
+        std::vector<double> kinf(nxyz, 0.0);
+        std::vector<double> flux(static_cast<size_t>(nxyz) * ng, 0.0);
+
+        double total_power = 0.0;
+        double fuel_volume = 0.0;
+        double total_flux  = 0.0;
+        for (int lk = 0; lk < nxyz; ++lk) {
+            for (int ig = 0; ig < ng; ++ig)
+                flux[static_cast<size_t>(lk) * ng + ig] = g.Phif()[lk * ng + ig];
+            if (!g.IsFuel(lk)) continue;
+
+            double fission_power = 0.0;
+            double production    = 0.0;
+            double absorption    = 0.0;
+            double node_flux     = 0.0;
+            for (int ig = 0; ig < ng; ++ig) {
+                const double phi = g.Phif()[lk * ng + ig];
+                fission_power += xs.xskf(ig, lk) * phi;
+                production += xs.xsnf(ig, lk) * phi;
+                absorption += xs.xsaf(ig, lk) * phi;
+                node_flux += phi;
+            }
+            total_flux += node_flux * g.vol(lk);
+            power[lk]  = fission_power;
+            kinf[lk]   = (absorption > 1.0e-30) ? production / absorption : 0.0;
+            burnup[lk] = static_cast<double>(xs.burn(lk)) / 1000.0;
+            total_power += fission_power * g.vol(lk);
+            fuel_volume += g.vol(lk);
+        }
+        const double average_power =
+            (fuel_volume > 0.0 && total_power > 1.0e-30) ? total_power / fuel_volume : 1.0;
+        // /steps/*/node/power is written on a 1.0-based scale: each node's power
+        // density divided by the fuel-volume-averaged power density. /steps/*/node/flux
+        // used to be dumped as the raw solver Phif, whose absolute magnitude is an
+        // artefact of the eigenvalue normalisation and drifts from step to step, so
+        // the two datasets in the same group were not on a common scale and flux
+        // could not be compared against power (or against another step) without an
+        // out-of-band rescale.
+        //
+        // "Same normalisation" here means the same *recipe*, not the same constant:
+        // dividing flux by average_power would be dimensionally wrong (average_power
+        // is a power density, so flux/average_power is neither a flux nor a ratio,
+        // and on CY01 it inflates the stored values by ~1e10). Flux is therefore
+        // divided by the fuel-volume-averaged group-summed flux, which puts it on
+        // the same 1.0-based footing as power while preserving the group spectrum
+        // ratio within each node.
+        const double average_flux =
+            (fuel_volume > 0.0 && total_flux > 1.0e-30) ? total_flux / fuel_volume : 1.0;
+        // Kept as a division (not a reciprocal multiply) so `power` stays bitwise
+        // identical to the previous output and this commit shows up in a regression
+        // diff only on `flux`.
+        for (int lk = 0; lk < nxyz; ++lk)
+            power[lk] /= average_power;
+        for (size_t i = 0; i < flux.size(); ++i)
+            flux[i] /= average_flux;
+
+        auto grp = step_grp.createGroup("node");
+        // Geometry stores only active row spans: use [z, compact-node] and
+        // `/geometry/node_i,node_j` rather than pretending nxy == nx*ny.
+        HighFive::DataSpace scalar_space(
+            {static_cast<size_t>(g.nz()), static_cast<size_t>(g.nxy())});
+        grp.createDataSet<double>("power", scalar_space).write_raw(power.data());
+        grp.createDataSet<double>("burnup", scalar_space).write_raw(burnup.data());
+        grp.createDataSet<double>("kinf", scalar_space).write_raw(kinf.data());
+        HighFive::DataSpace flux_space(
+            {static_cast<size_t>(g.nz()), static_cast<size_t>(g.nxy()),
+             static_cast<size_t>(ng)});
+        grp.createDataSet<double>("flux", flux_space).write_raw(flux.data());
     }
 
     // Pin-wise PPR output (only when pin_info is set)
@@ -1416,16 +1683,34 @@ void IO::WriteStepToResult(Geometry& g, const XSSet& xs, int schedule_index) {
             const int    burn = xs.burn(lk);
             const double bppm = g.bppm(lk);
             const double tful = g.tful(lk);
+            const double tmod = g.tmod(lk);
             const double dmod = g.dmod(lk);
+            // The reference cross section must be taken on the rod branch the node
+            // actually sits on, otherwise a rodded node is compared against an
+            // unrodded library point.  Fall back to rod-out when the model has no
+            // depletion trajectory for that control type.
+            const auto& model  = xs.models()[xs.comp(lk)];
+            int         ref_ct = (g.rod_fraction(lk) > 1.0e-12) ? xs.ctyp(lk) : 0;
+            if (ref_ct != 0 && model._refr_dpts.count(ref_ct) == 0)
+                ref_ct = 0;
 
             ngrp.createDataSet("burn", burn);
             ngrp.createDataSet("bppm", bppm);
             ngrp.createDataSet("tful", tful);
+            ngrp.createDataSet("tmod", tmod);
             ngrp.createDataSet("dmod", dmod);
+            ngrp.createDataSet("ref_ctype", ref_ct);
             ngrp.createDataSet("keff", d.eigv);
             ngrp.createDataSet("step", d.step);
             ngrp.createDataSet("efpd", d.efpd);
             ngrp.createDataSet("summary_burnup", d.bu_avg);
+
+            // Compare the runtime and library thermal-fluence coordinates used by RDPL.
+            const int ct = xs.ctyp(lk);
+            ngrp.createDataSet("rod_thermal_fluence",
+                               xs.FineRodThermalFluenceAverage(lk, ct));
+            ngrp.createDataSet("ref_rod_thermal_fluence",
+                               model.ReferenceRodFluence(ref_ct, burn));
 
             // Calculated (reconstructed) XS and flux
             std::vector<double> xsdf_v(ng), xsaf_v(ng), xsnf_v(ng), xskf_v(ng), xssf_v(ng), flux_v(ng);
@@ -1447,10 +1732,10 @@ void IO::WriteStepToResult(Geometry& g, const XSSet& xs, int schedule_index) {
             // Calculated isotope density
             ngrp.createDataSet("isotope_density", xs.getNodeIden(lk));
 
-            // Reference: library XS at the same (burn, bppm, tful, dmod)
-            const auto&          model = xs.models()[xs.comp(lk)];
+            // Reference library XS at the same burnup, boron, fuel temperature, and density.
             milk::Vector<double> ref_iden_local;
-            auto                 ref_xs = model.GetCrossSection(0, burn, bppm, tful, dmod, &ref_iden_local);
+            auto                 ref_xs =
+                model.GetCrossSection(ref_ct, burn, bppm, tful, dmod, &ref_iden_local);
 
             std::vector<double> ref_xsdf(ng), ref_xsaf(ng), ref_xsnf(ng), ref_xskf(ng), ref_xssf(ng);
             for (int ig = 0; ig < ng; ++ig) {
@@ -1493,9 +1778,12 @@ void IO::WriteStepToResult(Geometry& g, const XSSet& xs, int schedule_index) {
             dump_mic("xssf", Chiffon::XSSF);
             dump_mic("xs2n", Chiffon::XS2N);
 
+            // Spectral-history contributions to the macro group constants.
+            writeTermContrib(ngrp, xs, lk, ng);
+
             // Reference isotope density and kinf: interpolate between bounding depletion points
             {
-                const auto& refrMap = model._refr_dpts.at(0);
+                const auto& refrMap = model._refr_dpts.at(ref_ct);
                 auto        hiIt    = refrMap.lower_bound(burn);
                 auto        loIt    = hiIt;
                 if (hiIt == refrMap.end()) {
@@ -1540,6 +1828,7 @@ void IO::WriteStepToResult(Geometry& g, const XSSet& xs, int schedule_index) {
 
 /// @brief Write accumulated summary arrays and close the HDF5 result file.
 void IO::CloseResult() {
+    Chiffon::Hdf5Guard hdf5_guard;
     if (!_result_file) return;
 
     auto sum = _result_file->createGroup("summary");
@@ -1550,6 +1839,13 @@ void IO::CloseResult() {
     std::vector<double> xe_avg, xe_ao, sm_avg, sm_ao;
     std::vector<double> tf_avg, tf_max, tm_avg, tm_max, dm_avg, dm_max;
     std::vector<double> rod_step;
+    // Critical-search termination quality, per step.  search_status is the SearchExit enum
+    // (0 none / 1 converged / 2 best-point fallback / 3 unconverged); search_dk is the
+    // accepted |k_eff - target| residual and search_tol the tolerance it was judged against.
+    // Without these a step that terminated on a flux limit cycle or an exhausted search was
+    // indistinguishable in the result file from a properly converged one.
+    std::vector<int>    search_status;
+    std::vector<double> search_dk, search_tol;
 
     // Collect the union of rod-group names across all reported steps (stable order).
     std::vector<std::string>   rod_groups;
@@ -1587,6 +1883,9 @@ void IO::CloseResult() {
         dm_avg.push_back(d.dm_avg);
         dm_max.push_back(d.dm_max);
         rod_step.push_back(d.rod_step);
+        search_status.push_back(d.search_exit_status);
+        search_dk.push_back(d.search_exit_dk);
+        search_tol.push_back(d.search_exit_tol);
     }
 
     if (!steps.empty()) {
@@ -1613,6 +1912,9 @@ void IO::CloseResult() {
         sum.createDataSet("dm_avg", dm_avg);
         sum.createDataSet("dm_max", dm_max);
         sum.createDataSet("rod_step", rod_step);
+        sum.createDataSet("search_status", search_status);
+        sum.createDataSet("search_dk", search_dk);
+        sum.createDataSet("search_tol", search_tol);
     }
 
     // Rod insertion table lives outside `summary/` because its datasets do not match
@@ -1647,6 +1949,7 @@ void IO::CloseResult() {
 void IO::SaveRestart(const std::string& filepath,
                      Geometry& g, XSSet& xs,
                      double eigv, double efpd, int step) const {
+    Chiffon::Hdf5Guard hdf5_guard;
     const int nxyz = g.nxyz();
     const int ng   = g.ng();
     const int niso = static_cast<int>(Chiffon::Isotope::niso);
@@ -1713,22 +2016,25 @@ void IO::SaveRestart(const std::string& filepath,
         file.createDataSet("burnup", burn);
     }
 
-    // /history_ctype [nxyz]
-    {
-        std::vector<int> history_ctyp(xs.history_ctyp_data(), xs.history_ctyp_data() + nxyz);
-        file.createDataSet("history_ctype", history_ctyp);
-    }
-
-    // /rodded_fluence [nxyz]
-    {
-        std::vector<double> rodded_fluence(xs.rodded_fluence_data(), xs.rodded_fluence_data() + nxyz);
-        file.createDataSet("rodded_fluence", rodded_fluence);
-    }
-
-    // /fine_rod_fluence [nxy*nz*axial_rod_division]
+    // Fine rod thermal fluence is the RDPL restart state.
     {
         file.createDataSet("axial_rod_division", xs.axial_rod_division());
-        file.createDataSet("fine_rod_fluence", xs.fine_rod_fluence_data());
+        file.createDataSet("fine_rod_thermal_fluence",
+                           xs.fine_rod_thermal_fluence_data());
+    }
+
+    if (!xs.rod_groups().empty()) {
+        auto                     rods = file.createGroup("rod_state");
+        std::vector<std::string> names;
+        std::vector<double>      insertions;
+        names.reserve(xs.rod_groups().size());
+        insertions.reserve(xs.rod_groups().size());
+        for (const auto& [name, group] : xs.rod_groups()) {
+            names.push_back(name);
+            insertions.push_back(group.insertion);
+        }
+        rods.createDataSet("names", names);
+        rods.createDataSet("insertions", insertions);
     }
 
     // /isotope_density [nxyz x niso]
@@ -1827,9 +2133,12 @@ bool IO::TryParseShuffleEntry(const std::string& entry, int tgt_row, int tgt_col
 // Copy fuel-carried restart state into the shuffled target positions. Fine
 // rod-material fluence is intentionally not shuffled with fuel assemblies.
 void IO::ApplyShuffle() {
+    Chiffon::Hdf5Guard hdf5_guard;
     const int  ndivxy = _g.ndivxy();
     const int  symang = _g.symang();
     const bool symdiv = _g.symdiv();
+    // Which quarter-core fold the geometry was built with (see Geometry::Initialize).
+    const bool rotfold = (symang == 90 && _g.symopt() == 0);
     const int  nz     = _g.nz();
     const int  nxy    = _g.nxy();
     const int  niso   = static_cast<int>(Chiffon::Isotope::niso);
@@ -1838,8 +2147,6 @@ void IO::ApplyShuffle() {
     // 1. Cache each referenced restart cycle once.
     struct CycleSnapshot {
         std::vector<int>    burn;
-        std::vector<int>    history_ctyp;
-        std::vector<double> rodded_fluence;
         std::vector<double> iden;
         int                 nxyz = 0;
     };
@@ -1850,23 +2157,18 @@ void IO::ApplyShuffle() {
         CycleSnapshot& snap = cache[spec.cycle];
         rfile.getDataSet("burnup").read(snap.burn);
         snap.nxyz = static_cast<int>(snap.burn.size());
-        snap.history_ctyp.assign(snap.nxyz, 0);
-        if (rfile.exist("history_ctype")) {
-            std::vector<int> tmp;
-            rfile.getDataSet("history_ctype").read(tmp);
-            if (static_cast<int>(tmp.size()) == snap.nxyz)
-                snap.history_ctyp = std::move(tmp);
-        }
-        snap.rodded_fluence.assign(snap.nxyz, 0.0);
-        if (rfile.exist("rodded_fluence")) {
-            std::vector<double> tmp;
-            rfile.getDataSet("rodded_fluence").read(tmp);
-            if (static_cast<int>(tmp.size()) == snap.nxyz)
-                snap.rodded_fluence = std::move(tmp);
-        }
         snap.iden.resize(static_cast<size_t>(snap.nxyz) * niso, 0.0);
         if (niso > 0 && rfile.exist("isotope_density")) {
-            rfile.getDataSet("isotope_density").read_raw<double>(snap.iden.data());
+            auto                      density = rfile.getDataSet("isotope_density");
+            const std::vector<size_t> expectedShape = {
+                static_cast<size_t>(snap.nxyz), static_cast<size_t>(niso)};
+            if (density.getDimensions() != expectedShape ||
+                density.getElementCount() != snap.iden.size())
+                throw std::runtime_error(std::format(
+                    "Shuffle: cycle {} isotope_density dimensions do not "
+                    "match burnup and isotope counts.",
+                    spec.cycle));
+            density.read_raw<double>(snap.iden.data());
             const double cooling_days = _restart_cooling_days[spec.cycle];
             if (cooling_days > 0.0) {
                 const int substeps = _restart_cooling_substeps[spec.cycle];
@@ -1904,42 +2206,79 @@ void IO::ApplyShuffle() {
 
         std::vector<char>   full_valid(full_nodes, 0);
         std::vector<int>    full_burn(full_nodes, 0);
-        std::vector<int>    full_history(full_nodes, 0);
-        std::vector<double> full_rodded_fluence(full_nodes, 0.0);
         std::vector<double> full_iden(static_cast<size_t>(full_nodes) * niso, 0.0);
 
-        // Build a full assembly from the stored visible part. Symmetry-cut halves
-        // and quarters are completed by mirror reflection before rotation.
-        for (int li = 0; li < src_row_count; ++li) {
-            for (int lj = 0; lj < src_col_count; ++lj) {
-                const int src_x = AssemblyNodeX(symang, symdiv, spec.source_col, lj, n);
-                const int src_y = AssemblyNodeY(symang, symdiv, spec.source_row, li, n);
-                if (src_x < 0 || src_x >= _g.nx() || src_y < 0 || src_y >= _g.ny()) continue;
-                const int src_l2d = _g.ijtol(src_x, src_y);
-                if (src_l2d < 0) continue;
+        // Copy the visible nodes of one assembly of the source cycle into the
+        // full-assembly buffer. `rot_steps` rotates each node's local index by that
+        // many 90-degree steps on the way in, which is how the rotational fold's
+        // partner half (and the centre assembly's own other three quarters) are
+        // expressed in this assembly's frame. Slots already written are kept.
+        auto gather = [&](int a_row, int a_col, int rot_steps) {
+            const int row_count = VisibleAssemblyRows(symang, symdiv, a_row, n);
+            const int col_count = VisibleAssemblyCols(symang, symdiv, a_col, n);
+            const int row_off   = (a_row == 0 && symang == 90 && symdiv) ? n - row_count : 0;
+            const int col_off   = (a_col == 0 && symang == 90 && symdiv) ? n - col_count : 0;
 
-                const int full_i = src_row_off + li;
-                const int full_j = src_col_off + lj;
-                for (int k = 0; k < nz; ++k) {
-                    const int src_lk = src_l2d + k * nxy;
-                    if (src_lk >= snap.nxyz) continue;
+            for (int li = 0; li < row_count; ++li) {
+                for (int lj = 0; lj < col_count; ++lj) {
+                    const int src_x = AssemblyNodeX(symang, symdiv, a_col, lj, n);
+                    const int src_y = AssemblyNodeY(symang, symdiv, a_row, li, n);
+                    if (src_x < 0 || src_x >= _g.nx() || src_y < 0 || src_y >= _g.ny()) continue;
+                    const int src_l2d = _g.ijtol(src_x, src_y);
+                    if (src_l2d < 0) continue;
 
-                    const int full_lk            = (k * n + full_i) * n + full_j;
-                    full_valid[full_lk]          = 1;
-                    full_burn[full_lk]           = snap.burn[src_lk];
-                    full_history[full_lk]        = snap.history_ctyp[src_lk];
-                    full_rodded_fluence[full_lk] = snap.rodded_fluence[src_lk];
-                    if (niso > 0) {
-                        const auto src_off  = static_cast<ptrdiff_t>(src_lk) * niso;
-                        const auto full_off = static_cast<ptrdiff_t>(full_lk) * niso;
-                        std::copy_n(snap.iden.data() + src_off, niso,
-                                    full_iden.data() + full_off);
+                    int full_i = row_off + li;
+                    int full_j = col_off + lj;
+                    for (int s = 0; s < rot_steps; ++s)
+                        RotateAssemblyIndexInverse(full_i, full_j, n);
+
+                    for (int k = 0; k < nz; ++k) {
+                        const int src_lk = src_l2d + k * nxy;
+                        if (src_lk >= snap.nxyz) continue;
+
+                        const int full_lk = (k * n + full_i) * n + full_j;
+                        if (full_valid[full_lk]) continue;
+                        full_valid[full_lk] = 1;
+                        full_burn[full_lk]  = snap.burn[src_lk];
+                        if (niso > 0) {
+                            const auto src_off  = static_cast<ptrdiff_t>(src_lk) * niso;
+                            const auto full_off = static_cast<ptrdiff_t>(full_lk) * niso;
+                            std::copy_n(snap.iden.data() + src_off, niso,
+                                        full_iden.data() + full_off);
+                        }
                     }
                 }
             }
-        }
+        };
 
-        if (source_cut) {
+        gather(spec.source_row, spec.source_col, 0);
+
+        if (source_cut && rotfold) {
+            // Under the 90-degree fold a symmetry-cut assembly's missing part is not
+            // its own mirror image: it is the rotated image of the partner entry on
+            // the other arm of the quarter map. Quarter-map row 0 column c and row c
+            // column 0 are the two halves of ONE physical assembly, and the centre
+            // assembly's quarter carries all four of its own.
+            if (spec.source_row == 0 && spec.source_col == 0) {
+                gather(0, 0, 1);
+                gather(0, 0, 2);
+                gather(0, 0, 3);
+            } else if (spec.source_row == 0) {
+                // partner (c,0) node p sits at this assembly's index rot^-1(p)
+                gather(spec.source_col, 0, 1);
+            } else {
+                // partner (0,r) node p sits at this assembly's index rot(p)
+                gather(0, spec.source_row, 3);
+            }
+
+            for (int full_lk = 0; full_lk < full_nodes; ++full_lk)
+                if (!full_valid[full_lk])
+                    throw std::runtime_error(std::format(
+                        "IO: the 90-degree rotational fold could not complete the shuffle source "
+                        "at cycle{}/({},{}) -- its partner half on the other arm of the quarter "
+                        "map is missing.",
+                        spec.cycle, spec.source_row, spec.source_col));
+        } else if (source_cut) {
             for (int k = 0; k < nz; ++k) {
                 for (int full_i = 0; full_i < n; ++full_i) {
                     const int mirror_i = (spec.source_row == 0 && symang == 90 && symdiv &&
@@ -1955,10 +2294,8 @@ void IO::ApplyShuffle() {
                         const int mirror_lk = (k * n + mirror_i) * n + mirror_j;
                         if (full_valid[full_lk] || !full_valid[mirror_lk]) continue;
 
-                        full_valid[full_lk]          = 1;
-                        full_burn[full_lk]           = full_burn[mirror_lk];
-                        full_history[full_lk]        = full_history[mirror_lk];
-                        full_rodded_fluence[full_lk] = full_rodded_fluence[mirror_lk];
+                        full_valid[full_lk]   = 1;
+                        full_burn[full_lk]    = full_burn[mirror_lk];
                         if (niso > 0) {
                             const auto full_off   = static_cast<ptrdiff_t>(full_lk) * niso;
                             const auto mirror_off = static_cast<ptrdiff_t>(mirror_lk) * niso;
@@ -1983,24 +2320,28 @@ void IO::ApplyShuffle() {
                 const int tgt_l2d = _g.ijtol(tgt_x, tgt_y);
                 if (tgt_l2d < 0) continue;
 
+                // Mirror fold: a symmetry-cut target node stands for itself AND its
+                // mirror image inside the same assembly, so it receives their average.
+                // Rotational fold: the visible nodes are a fundamental domain -- the
+                // other half of the physical assembly is carried by the partner entry
+                // on the other arm of the quarter map -- so each node takes its own
+                // value and nothing is averaged.
                 int target_i[2] = {tgt_full_i, tgt_full_i};
                 int target_j[2] = {tgt_full_j, tgt_full_j};
                 int ni          = 1;
                 int nj          = 1;
-                if (spec.target_row == 0 && symang == 90 && symdiv) {
+                if (!rotfold && spec.target_row == 0 && symang == 90 && symdiv) {
                     const int mirror_i = n - 1 - tgt_full_i;
                     if (mirror_i != tgt_full_i) target_i[ni++] = mirror_i;
                 }
-                if (spec.target_col == 0 && symang == 90 && symdiv) {
+                if (!rotfold && spec.target_col == 0 && symang == 90 && symdiv) {
                     const int mirror_j = n - 1 - tgt_full_j;
                     if (mirror_j != tgt_full_j) target_j[nj++] = mirror_j;
                 }
 
                 for (int k = 0; k < nz; ++k) {
-                    int    count              = 0;
-                    double burn_sum           = 0.0;
-                    double rodded_fluence_sum = 0.0;
-                    int    history_val        = 0;
+                    int    count    = 0;
+                    double burn_sum = 0.0;
                     std::fill(nd_buf.begin(), nd_buf.end(), 0.0);
 
                     for (int ii = 0; ii < ni; ++ii) {
@@ -2030,8 +2371,6 @@ void IO::ApplyShuffle() {
 
                             ++count;
                             burn_sum += static_cast<double>(full_burn[src_full_lk]);
-                            rodded_fluence_sum += full_rodded_fluence[src_full_lk];
-                            if (history_val == 0) history_val = full_history[src_full_lk];
                             if (niso > 0) {
                                 const auto off = static_cast<ptrdiff_t>(src_full_lk) * niso;
                                 for (int iso = 0; iso < niso; ++iso)
@@ -2043,9 +2382,7 @@ void IO::ApplyShuffle() {
 
                     const int    tgt_lk        = tgt_l2d + k * nxy;
                     const double inv_count     = 1.0 / static_cast<double>(count);
-                    _xs.burn(tgt_lk)           = static_cast<int>(std::llround(burn_sum * inv_count));
-                    _xs.history_ctyp(tgt_lk)   = history_val;
-                    _xs.rodded_fluence(tgt_lk) = rodded_fluence_sum * inv_count;
+                    _xs.burn(tgt_lk) = static_cast<int>(std::llround(burn_sum * inv_count));
 
                     if (niso > 0) {
                         for (double& value : nd_buf) value *= inv_count;
@@ -2065,6 +2402,7 @@ void IO::ApplyShuffle() {
 
 // Reconstruct a GeometryInput from the geometry group saved in a restart HDF5 file.
 GeometryInput IO::LoadGeometryFromRestart(const std::string& filepath) {
+    Chiffon::Hdf5Guard hdf5_guard;
     HighFive::File file(filepath, HighFive::File::ReadOnly);
     auto           geo = file.getGroup("geometry");
 
