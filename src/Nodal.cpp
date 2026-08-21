@@ -778,6 +778,15 @@ bool Nodal::TryDriveGpu() {
     if (_ng != nodal::NG)
         return false;
 
+    // Rod-cusping reads the HOST trlcff arrays (axialTransverseLeakage), and
+    // the device arm leaves trlcff1 device-only -- so any fractional rod
+    // falls back to the CPU body.  The scan is 8451 loads, microseconds.
+    for (int lk = 0; lk < _nxyz; ++lk) {
+        const double fr = _g.rod_fraction(lk);
+        if (fr > 1.0e-9 && fr < 1.0 - 1.0e-9)
+            return false;
+    }
+
     XsReconBackend* backend = xs.EnsureBackend();
     if (backend == nullptr || !backend->available()) {
         static std::once_flag warn_once;
