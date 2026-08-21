@@ -372,6 +372,7 @@ int main(int argc, char* argv[]) {
             std::cout << "[RASBERY][FLATXS][GPU] {\"nodes_solved\":"
                       << rasbery::rasberyGpuFlatXsNodes() << "}" << std::endl;
         rasbery::xsphase::report(std::cout);
+        rasbery::outer_timing::report(std::cout);
         const auto hdf5_stats = Chiffon::GetHdf5LockStats();
         std::cout << "[RASBERY][HDF5][LOCK] {\"acquires\":"
                   << hdf5_stats.acquisitions << ",\"wait_ms\":"
@@ -403,6 +404,7 @@ int main(int argc, char* argv[]) {
         std::cout << "[RASBERY][FLATXS][GPU] {\"nodes_solved\":"
                   << rasbery::rasberyGpuFlatXsNodes() << "}" << std::endl;
     rasbery::xsphase::report(std::cout);
+    rasbery::outer_timing::report(std::cout);
     const auto hdf5_stats = Chiffon::GetHdf5LockStats();
     std::cout << "[RASBERY][HDF5][LOCK] {\"acquires\":"
               << hdf5_stats.acquisitions << ",\"wait_ms\":"

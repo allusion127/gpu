@@ -72,8 +72,11 @@ public:
     /// back into the host arrays, and returns true.  On any CUDA error returns
     /// false with the host arrays untouched beyond what a partial upload could
     /// never touch (uploads copy host->device only).
+    /// state_generation tracks host-side writes to _xs/_iden outside the
+    /// backend downloads; while it matches the resident copy, the per-call
+    /// xs/iden uploads are skipped (host and device are bit-identical).
     bool solve(const xsrecon::BatchView& host, unsigned long long micx_generation,
-               double* max_change_out);
+               unsigned long long state_generation, double* max_change_out);
 
     /// Run one unrodded flat-XS update for every node in `host` (host-side
     /// pointers; see flatxs::FlatXsView for the stream contract).
@@ -100,7 +103,8 @@ public:
     bool solveFlatXs(const flatxs::FlatXsView& host, const FlatXsLibShape& shape,
                      unsigned long long micx_generation,
                      unsigned long long micx_generation_next,
-                     unsigned long long ref_generation, bool mark_micx_resident);
+                     unsigned long long ref_generation,
+                     unsigned long long state_generation, bool mark_micx_resident);
 
     /// Total fuel nodes processed on the device by this process (all
     /// instances).  Zero means the device path never ran, whatever the flag

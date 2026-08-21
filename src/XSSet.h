@@ -180,6 +180,15 @@ private:
     unsigned long long              _micx_generation = 1;
     bool                            _xsrecon_pinned  = false;
 
+    // Advances whenever HOST code writes _xs or _iden outside the device
+    // backends' own downloads (CPU reference loops, cusping blends, depletion,
+    // Update, the reference rebuild).  While it holds still, the device copies
+    // of _xs/_iden are bit-identical to the host's (every solve downloads what
+    // it wrote), so the backends skip their per-call re-uploads.  Missing a
+    // bump site corrupts physics silently -- the full-deck debug-hash A/B is
+    // the gate for any new host-side writer.
+    unsigned long long _hoststate_generation = 1;
+
     // Flat-XS device arm (RASBERY_GPU_FLATXS, default off).  The reference
     // blocks (_ref_lmpx/_ref_micx) are device-resident and re-upload only
     // when PrecomputeBranchCoefficients rebuilds them (_ref_generation); the

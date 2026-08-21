@@ -122,8 +122,9 @@ struct XsReconBackend::Impl {
     unsigned long long* dev_scalars = nullptr; // [0]=max bits, [1]=solved
     double*             dev_dep     = nullptr; // depTrans rows: [0..38]=I135, [39..77]=Xe135
 
-    unsigned long long resident_micx_generation = 0; // 0 = nothing resident
-    bool               fuel_uploaded            = false;
+    unsigned long long resident_micx_generation  = 0; // 0 = nothing resident
+    unsigned long long resident_state_generation = 0; // _xs/_iden host==device
+    bool               fuel_uploaded             = false;
 
     // --- flat-XS extension (RASBERY_GPU_FLATXS) ---------------------------
     double*            dev_ref = nullptr; // [9 mic | msm | 9 lmp | lsm]
@@ -182,9 +183,10 @@ struct XsReconBackend::Impl {
         if (dev_fuel) { cudaFree(dev_fuel); dev_fuel = nullptr; }
         if (dev_ref) { cudaFree(dev_ref); dev_ref = nullptr; }
         if (dev_pernode) { cudaFree(dev_pernode); dev_pernode = nullptr; }
-        resident_micx_generation = 0;
-        resident_ref_generation  = 0;
-        fuel_uploaded            = false;
+        resident_micx_generation  = 0;
+        resident_state_generation = 0;
+        resident_ref_generation   = 0;
+        fuel_uploaded             = false;
 
         nxyz   = want_nxyz;
         n_fuel = want_fuel;
@@ -258,7 +260,7 @@ bool XsReconBackend::available() const { return _impl->available; }
 const std::string& XsReconBackend::status() const { return _impl->status; }
 
 bool XsReconBackend::solve(const xsr::BatchView& host, unsigned long long micx_generation,
-                           double* max_change_out) {
+                           unsigned long long state_generation, double* max_change_out) {
     Impl& d = *_impl;
     if (!d.available || host.n_fuel <= 0 || host.nxyz <= 0) return false;
     if (!d.ensure(host.nxyz, host.n_fuel)) {
@@ -293,11 +295,16 @@ bool XsReconBackend::solve(const xsr::BatchView& host, unsigned long long micx_g
 
     // Per-call state.  _iden and _xs are uploaded whole so the kernel's
     // fuel-only writes round-trip the non-fuel entries unchanged, keeping the
-    // host arrays authoritative for every node after the download.
-    if (!d.upload(host.iden, d.off_iden, static_cast<std::size_t>(xsr::NISO) * nx)) return false;
-    for (int xt = 0; xt < xsr::NXS; ++xt)
-        if (!d.upload(host.xs[xt], d.off_xs[xt], lmp)) return false;
-    if (!d.upload(host.xs_ssm, d.off_xs_ssm, ssm)) return false;
+    // host arrays authoritative for every node after the download.  While the
+    // host-state generation matches the resident copy, the host has not
+    // written _xs/_iden since our last download, so both are already
+    // bit-identical on the device and the ~4.4 MB re-upload is skipped.
+    if (state_generation != d.resident_state_generation) {
+        if (!d.upload(host.iden, d.off_iden, static_cast<std::size_t>(xsr::NISO) * nx)) return false;
+        for (int xt = 0; xt < xsr::NXS; ++xt)
+            if (!d.upload(host.xs[xt], d.off_xs[xt], lmp)) return false;
+        if (!d.upload(host.xs_ssm, d.off_xs_ssm, ssm)) return false;
+    }
     if (!d.upload(host.phif, d.off_phif, static_cast<std::size_t>(xsr::NG) * nx)) return false;
 
     RASBERY_CUDA_TRY(cudaMemsetAsync(d.dev_scalars, 0, 2 * sizeof(unsigned long long),
@@ -316,19 +323,20 @@ bool XsReconBackend::solve(const xsr::BatchView& host, unsigned long long micx_g
     v.phif    = d.dev_block + d.off_phif;
     v.fuel    = d.dev_fuel;
 
-    // depTrans rows: 39 doubles each, constant for the process, but owned per
-    // instance for simplicity.  Upload every call -- 624 bytes on a stream
-    // that is about to move megabytes.
+    // depTrans rows: 39 doubles each, constant for the process, so they are
+    // uploaded exactly once per instance.  With 100 Xe calls per case the two
+    // per-call copies were pure API-call overhead (nsys: memcpy CALL COUNT,
+    // not payload, dominates the timeline).
     if (d.dev_dep == nullptr) {
         RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d.dev_dep),
                                     2 * xsr::NISO * sizeof(double)), d.status);
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_dep, host.dep_i135,
+                                         xsr::NISO * sizeof(double),
+                                         cudaMemcpyHostToDevice, d.stream), d.status);
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_dep + xsr::NISO, host.dep_xe135,
+                                         xsr::NISO * sizeof(double),
+                                         cudaMemcpyHostToDevice, d.stream), d.status);
     }
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_dep, host.dep_i135,
-                                     xsr::NISO * sizeof(double),
-                                     cudaMemcpyHostToDevice, d.stream), d.status);
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_dep + xsr::NISO, host.dep_xe135,
-                                     xsr::NISO * sizeof(double),
-                                     cudaMemcpyHostToDevice, d.stream), d.status);
     v.dep_i135  = d.dev_dep;
     v.dep_xe135 = d.dev_dep + xsr::NISO;
 
@@ -357,6 +365,11 @@ bool XsReconBackend::solve(const xsr::BatchView& host, unsigned long long micx_g
     std::memcpy(&max_change, &scalars[0], sizeof(max_change));
     *max_change_out = max_change;
 
+    // The downloads above just made host _xs and the Xe-chain _iden rows
+    // equal to the device copy again; nothing else on the host wrote since
+    // state_generation was read.
+    d.resident_state_generation = state_generation;
+
     g_nodes_solved.fetch_add(scalars[1], std::memory_order_relaxed);
     return true;
 }
@@ -366,6 +379,7 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
                                  unsigned long long micx_generation,
                                  unsigned long long micx_generation_next,
                                  unsigned long long ref_generation,
+                                 unsigned long long state_generation,
                                  bool mark_micx_resident) {
     Impl& d = *_impl;
     if (!d.available || host.n_nodes <= 0 || host.nxyz <= 0) return false;
@@ -492,11 +506,14 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     }
 
     // --- per-call state: xs and iden whole (target-only writes round-trip
-    // every other column unchanged), plus the per-node inputs and stream.
-    for (int xt = 0; xt < xsr::NXS; ++xt)
-        if (!d.upload(host.xs[xt], d.off_xs[xt], lmp)) return false;
-    if (!d.upload(host.xs_ssm, d.off_xs_ssm, ssm)) return false;
-    if (!d.upload(host.iden, d.off_iden, static_cast<std::size_t>(xsr::NISO) * nx)) return false;
+    // every other column unchanged), skipped while the host-state generation
+    // says the resident copies are still bit-identical.
+    if (state_generation != d.resident_state_generation) {
+        for (int xt = 0; xt < xsr::NXS; ++xt)
+            if (!d.upload(host.xs[xt], d.off_xs[xt], lmp)) return false;
+        if (!d.upload(host.xs_ssm, d.off_xs_ssm, ssm)) return false;
+        if (!d.upload(host.iden, d.off_iden, static_cast<std::size_t>(xsr::NISO) * nx)) return false;
+    }
 
     if (d.dev_pernode == nullptr)
         RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d.dev_pernode),
@@ -595,12 +612,20 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
 
     // --- results the host needs back --------------------------------------
-    for (int t = 0; t < fxs::N_ACTIVE; ++t) {
-        if (!d.download(host.lmp[t], d.off_lmp[ACTIVE_XT9[t]], lmp)) return false;
-        if (!d.download(host.mic[t], d.off_mic[ACTIVE_XT9[t]], mic)) return false;
+    // EXPERIMENT (RASBERY_FLATXS_SKIP_MICX_DL=1): leave micx/lmpx device-only
+    // -- 57 of the 61 MB/call downloads.  UNSAFE whenever the host reads
+    // _micx/_lmpx afterwards (depletion, rodded NodeSpectralIndex fallback,
+    // full micx export, CPU fallback arms); the full-deck A/B is the gate for
+    // any deck class this is enabled on.  Default off.
+    static const bool skip_micx_dl = envFlagEnabled("RASBERY_FLATXS_SKIP_MICX_DL");
+    if (!skip_micx_dl) {
+        for (int t = 0; t < fxs::N_ACTIVE; ++t) {
+            if (!d.download(host.lmp[t], d.off_lmp[ACTIVE_XT9[t]], lmp)) return false;
+            if (!d.download(host.mic[t], d.off_mic[ACTIVE_XT9[t]], mic)) return false;
+        }
+        if (!d.download(host.lsm, d.off_lmp_ssm, ssm)) return false;
+        if (!d.download(host.msm, d.off_mic_ssm, msm)) return false;
     }
-    if (!d.download(host.lsm, d.off_lmp_ssm, ssm)) return false;
-    if (!d.download(host.msm, d.off_mic_ssm, msm)) return false;
     for (int xt = 0; xt < xsr::NXS; ++xt)
         if (!d.download(host.xs[xt], d.off_xs[xt], lmp)) return false;
     if (!d.download(host.xs_ssm, d.off_xs_ssm, ssm)) return false;
@@ -613,7 +638,11 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     // caller's post-call generation bump can be marked already-resident and
     // the next xsrecon call skips its ~70 MB re-upload.  A rodded CPU pass
     // after this call invalidates that (mark_micx_resident=false).
-    d.resident_micx_generation = mark_micx_resident ? micx_generation_next : 0;
+    d.resident_micx_generation  = mark_micx_resident ? micx_generation_next : 0;
+    // A rodded CPU pass right after this call rewrites _xs/_iden columns on
+    // the host, so the caller only lets us keep the state residency when the
+    // whole call was device-side.
+    d.resident_state_generation = mark_micx_resident ? state_generation : 0;
 
     g_flatxs_nodes_solved.fetch_add(static_cast<unsigned long long>(host.n_nodes),
                                     std::memory_order_relaxed);

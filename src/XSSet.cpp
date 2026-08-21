@@ -1010,6 +1010,7 @@ void XSSet::Update() {
 
     Reconstruct();
     ++_micx_generation; // full rebuild; see the note in UpdateFlatXS
+    ++_hoststate_generation;
 }
 
 // Pre-compute node lookup and burnup-interpolated reference XS.
@@ -1423,6 +1424,7 @@ void XSSet::PrecomputeBranchCoefficients() {
     // The flat-XS device arm keeps _ref_lmpx/_ref_micx resident; this rebuild
     // is the only writer, so the bump here is the complete invalidation set.
     ++_ref_generation;
+    ++_hoststate_generation; // the _iden overwrite above is a host write
 
     _simd_ready = true;
 }
@@ -2625,7 +2627,7 @@ bool XSSet::TryUpdateFlatXSGpu(const std::vector<int>& unrodded, bool any_rodded
 
     return _xsrecon_backend->solveFlatXs(v, MakeFlatXsLibShape(), _micx_generation,
                                          _micx_generation + 1, _ref_generation,
-                                         !any_rodded);
+                                         _hoststate_generation, !any_rodded);
 }
 
 void XSSet::UpdateFlatXS(const XSUpdateOptions& options) {
@@ -2708,6 +2710,10 @@ void XSSet::UpdateFlatXS(const XSUpdateOptions& options) {
                     ReconstructNode(static_cast<size_t>(l));
                 }
                 ++_micx_generation;
+                // The CPU wrote host arrays in this block only when the GPU
+                // declined (dump run) or rodded nodes ran after the download.
+                if (!gpu_ok || !rodded.empty())
+                    ++_hoststate_generation;
                 return;
             }
             // Device arm declined: fall through to the reference loop.
@@ -2734,6 +2740,7 @@ void XSSet::UpdateFlatXS(const XSUpdateOptions& options) {
     // Even a partial pass may have rebuilt _micx/_lmpx rows; the device copy
     // re-uploads whole, which is conservative but never stale.
     ++_micx_generation;
+    ++_hoststate_generation;
 }
 
 double XSSet::FineRodThermalFluenceAverage(int l, int ctype) const {
@@ -3112,6 +3119,7 @@ void XSSet::ApplyRodCuspingStencil(int tip_l, double reigv,
 }
 
 void XSSet::ResetCuspingNodesToBase(const std::vector<int>& nodes) {
+    ++_hoststate_generation; // restores _xs columns from host snapshots
     const int ng   = _g.ng();
     const int nxyz = _g.nxyz();
     if (static_cast<int>(_cusping_base_snapshot.size()) < nxyz)
@@ -3211,6 +3219,7 @@ bool XSSet::ApplyRodCusping(double eigv, const AxialTransverseLeakageView& leaka
             ResetCuspingNodesToBase(left);
     }
 
+    ++_hoststate_generation; // cusping blends _xs in place
     return !prev_scratch.empty() || !_rod_cusping_nodes_scratch.empty();
 }
 
@@ -3522,7 +3531,8 @@ bool XSSet::TryUpdateEquilibriumXenonGpu(double power, double relax, double& max
     v.dep_i135    = dep_i135.data();
     v.dep_xe135   = dep_xe135.data();
 
-    return _xsrecon_backend->solve(v, _micx_generation, &max_change);
+    return _xsrecon_backend->solve(v, _micx_generation, _hoststate_generation,
+                                   &max_change);
 }
 
 double XSSet::UpdateEquilibriumXenon(double power, double relax) {
@@ -3657,6 +3667,7 @@ double XSSet::UpdateEquilibriumXenon(double power, double relax) {
             std::fclose(f);
         }
     }
+    ++_hoststate_generation; // CPU arm wrote _xs and the Xe-chain _iden rows
     xsreconDebugHash(_xs, _iden, ng, nxyz, max_change);
     return max_change;
 }
@@ -3746,6 +3757,7 @@ void XSSet::Deplete(double dt, double power, bool xe_transient) {
             DepleteNode(ws_tls, l, abs_flux_tls.data(), ng, dt, xe_transient);
         }
     }
+    ++_hoststate_generation; // depletion rewrites _iden
 }
 
 void XSSet::DecayIsotopeDensityFlat(

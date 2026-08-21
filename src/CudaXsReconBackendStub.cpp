@@ -18,13 +18,14 @@ const std::string& XsReconBackend::status() const {
     return s;
 }
 
-bool XsReconBackend::solve(const xsrecon::BatchView&, unsigned long long, double*) {
+bool XsReconBackend::solve(const xsrecon::BatchView&, unsigned long long,
+                           unsigned long long, double*) {
     return false;
 }
 
 bool XsReconBackend::solveFlatXs(const flatxs::FlatXsView&, const FlatXsLibShape&,
                                  unsigned long long, unsigned long long,
-                                 unsigned long long, bool) {
+                                 unsigned long long, unsigned long long, bool) {
     return false;
 }
 

@@ -7,6 +7,7 @@
 #include "Scheduler.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -17,6 +18,56 @@
 #include <string>
 
 namespace rasbery {
+
+// Wall-clock attribution of the outer iteration's serial phases, process-wide
+// across batch instances (RASBERY_OUTER_TIMING=1; zero cost when unset).
+// Same design rules as xsphase (XSTiming.h): atomics, one JSON line at exit.
+namespace outer_timing {
+struct Buckets {
+    std::atomic<double> updpsi{0.0};
+    std::atomic<double> setls{0.0};    // host linear-system assembly
+    std::atomic<double> drive{0.0};    // BiCG outer incl. arena wait + sync
+    std::atomic<double> updjnet{0.0};
+    std::atomic<double> nodal{0.0};    // reset + drive
+    std::atomic<double> cusping{0.0};  // ApplyRodCusping (+ upddtil on change)
+    std::atomic<double> upddhat{0.0};
+    std::atomic<long long> outers{0};
+};
+inline Buckets& buckets() { static Buckets b; return b; }
+inline bool enabled() {
+    static const bool on = std::getenv("RASBERY_OUTER_TIMING") != nullptr;
+    return on;
+}
+class Scope {
+    std::atomic<double>* _acc = nullptr;
+    std::chrono::steady_clock::time_point _t0;
+public:
+    explicit Scope(std::atomic<double>& acc) {
+        if (!enabled()) return;
+        _acc = &acc;
+        _t0  = std::chrono::steady_clock::now();
+    }
+    ~Scope() {
+        if (_acc == nullptr) return;
+        const double dt = std::chrono::duration<double>(
+                              std::chrono::steady_clock::now() - _t0).count();
+        double cur = _acc->load(std::memory_order_relaxed);
+        while (!_acc->compare_exchange_weak(cur, cur + dt)) {}
+    }
+};
+inline void report(std::ostream& out) {
+    if (!enabled()) return;
+    Buckets& b = buckets();
+    out << "[RASBERY][OUTER][PHASE] {\"outers\":" << b.outers.load()
+        << ",\"updpsi\":" << b.updpsi.load()
+        << ",\"setls\":" << b.setls.load()
+        << ",\"drive\":" << b.drive.load()
+        << ",\"updjnet\":" << b.updjnet.load()
+        << ",\"nodal\":" << b.nodal.load()
+        << ",\"cusping\":" << b.cusping.load()
+        << ",\"upddhat\":" << b.upddhat.load() << "}" << std::endl;
+}
+} // namespace outer_timing
 
 class Driver {
 private:
@@ -253,22 +304,44 @@ private:
                                             has_search ? schedule.max_search_iter : 0});
         for (int iout = 0; iout < max_iter; ++iout) {
             // 1. Flux: CMFD BiCGSTAB iterations + Wielandt shift.
-            ctx.cmfd_solver.updpsi(ctx.geometry.Phif());
-            ctx.cmfd_solver.setls(eigv);
-            ctx.cmfd_solver.drive(eigv, ctx.geometry.Phif(), residual);
+            {
+                outer_timing::Scope t(outer_timing::buckets().updpsi);
+                ctx.cmfd_solver.updpsi(ctx.geometry.Phif());
+            }
+            {
+                outer_timing::Scope t(outer_timing::buckets().setls);
+                ctx.cmfd_solver.setls(eigv);
+            }
+            {
+                outer_timing::Scope t(outer_timing::buckets().drive);
+                ctx.cmfd_solver.drive(eigv, ctx.geometry.Phif(), residual);
+            }
             ++total_outer;
+            outer_timing::buckets().outers.fetch_add(1, std::memory_order_relaxed);
             const bool flux_converged = std::abs(prev_inner - eigv) < keff_tol && residual < flux_tol;
             prev_inner                = eigv;
 
             // 2. Nodal correction -> CNCC (d-hat) + rod cusping macro-XS update. The cusping blend
             //    co-converges with the flux, so its settledness is implied by flux_converged.
-            ctx.cmfd_solver.updjnet(ctx.geometry.Phif(), ctx.geometry.Jnet());
-            ctx.nodal_solver.reset(1.0 / eigv, ctx.geometry.Jnet(),
-                                   ctx.geometry.Phif(), ctx.geometry.Phis());
-            ctx.nodal_solver.drive();
-            if (ctx.cross_sections.ApplyRodCusping(eigv, ctx.nodal_solver.axialTransverseLeakage()))
-                ctx.cmfd_solver.upddtil();
-            ctx.cmfd_solver.upddhat(ctx.geometry.Phif(), ctx.geometry.Jnet());
+            {
+                outer_timing::Scope t(outer_timing::buckets().updjnet);
+                ctx.cmfd_solver.updjnet(ctx.geometry.Phif(), ctx.geometry.Jnet());
+            }
+            {
+                outer_timing::Scope t(outer_timing::buckets().nodal);
+                ctx.nodal_solver.reset(1.0 / eigv, ctx.geometry.Jnet(),
+                                       ctx.geometry.Phif(), ctx.geometry.Phis());
+                ctx.nodal_solver.drive();
+            }
+            {
+                outer_timing::Scope t(outer_timing::buckets().cusping);
+                if (ctx.cross_sections.ApplyRodCusping(eigv, ctx.nodal_solver.axialTransverseLeakage()))
+                    ctx.cmfd_solver.upddtil();
+            }
+            {
+                outer_timing::Scope t(outer_timing::buckets().upddhat);
+                ctx.cmfd_solver.upddhat(ctx.geometry.Phif(), ctx.geometry.Jnet());
+            }
 
             // Keep iterating flux + nodal/cusping until the flux is converged; the feedbacks
             // (search, T/H) are root-finds on k_eff / power and must act on a clean flux.
