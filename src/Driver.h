@@ -290,9 +290,15 @@ private:
         // statepoints.  The trigger form is preferable because an iteration that
         // contracts never trips it, so a healthy restart cycle keeps its old path.
         const int xe_streak_limit = primeXeDamping ? 1 : XE_OSCILLATION_STREAK;
-        double    xe_relax        = 1.0;
+        // Companion experiment knob: start the Xe iteration damped (same
+        // fixed points, contraction from step one) so interim stepping cannot
+        // kick the axial Xe map into another basin.  Default off.
+        static const bool xe_interim_damp =
+            std::getenv("RASBERY_XE_INTERIM_DAMP") != nullptr;
+        double    xe_relax        = xe_interim_damp ? XE_DAMPED_RELAX : 1.0;
         double prev_xe_change = std::numeric_limits<double>::infinity();
         int    xe_no_progress = 0;   // consecutive Xe steps that did not shrink
+        int    xe_interim_count = 0; // loose-flux Xe steps (RASBERY_XE_INTERIM_L2)
         SolveExit exit_reason = SolveExit::ITER_EXHAUSTED;
 
         if (has_search)
@@ -303,6 +309,11 @@ private:
         const int max_iter = 50 * std::max({schedule.max_outer_iter, schedule.max_th_iter,
                                             has_search ? schedule.max_search_iter : 0});
         for (int iout = 0; iout < max_iter; ++iout) {
+            bool stall_sample = false; // limit-cycle fall-through this outer
+            const int xe_budget_probe = ga_feedback_passes > 0
+                                            ? ga_feedback_passes
+                                            : ((xe_relax < 1.0) ? XE_EQUILIBRIUM_MAX_ITER_DAMPED
+                                                                : XE_EQUILIBRIUM_MAX_ITER);
             // 1. Flux: CMFD BiCGSTAB iterations + Wielandt shift.
             {
                 outer_timing::Scope t(outer_timing::buckets().updpsi);
@@ -345,7 +356,37 @@ private:
 
             // Keep iterating flux + nodal/cusping until the flux is converged; the feedbacks
             // (search, T/H) are root-finds on k_eff / power and must act on a clean flux.
-            if (!flux_converged) {
+            //
+            // EXPERIMENT (RASBERY_XE_INTERIM_L2=<residual>, default off = exact
+            // old path): the equilibrium-Xe cascade re-converges the flux to
+            // full tolerance between EVERY Xe update, and that cascade is where
+            // the outer budget goes (CY02: 622 outers/state vs MASTER's ~59).
+            // With the gate set, a pending Xe update may fire as soon as the
+            // flux residual is below the interim threshold; search and T/H
+            // still act only on a fully-converged flux, and final convergence
+            // still requires the full tolerance with Xe settled, so the
+            // converged fixed point is the same to within the tolerances --
+            // the PATH differs, so results shift at the pcm level and the
+            // accuracy gate is keff/CBC/AO/Fq against the canon run.
+            static const double xe_interim_l2 = [] {
+                const char* v = std::getenv("RASBERY_XE_INTERIM_L2");
+                return v ? std::atof(v) : 0.0;
+            }();
+            // Interim steps do not consume the settled-flux Xe budget: that
+            // budget exists to break converged-level limit cycles, and with
+            // interim stepping Xe fires nearly every outer, so counting those
+            // would freeze Xe long before it settles (measured: node power off
+            // by 11% at tol=1e-4 with the shared counter).  Interim spins are
+            // bounded separately at 10x the budget, under the global max_iter.
+            const bool xe_pending = has_eq_xe && xe_count < xe_budget_probe &&
+                                    (xe_count + xe_interim_count == 0 ||
+                                     prev_xe_change >= XE_EQUILIBRIUM_TOLERANCE);
+            const bool xe_interim = xe_interim_l2 > 0.0 && xe_pending &&
+                                    xe_interim_count < 10 * xe_budget_probe &&
+                                    !flux_converged && residual < xe_interim_l2;
+            if (xe_interim)
+                flux_stall = 0; // the Xe step below changes the problem; not a stall
+            if (!flux_converged && !xe_interim) {
                 if (++flux_stall <= schedule.max_outer_iter)
                     continue;
 
@@ -367,6 +408,7 @@ private:
                     exit_reason = SolveExit::FLUX_STALL;
                     break;
                 }
+                stall_sample = true;
                 // fall through: treat the limit-cycle k_eff as a (noisy) observation.
                 // The settling gate below must not hold here: the flux never converges on
                 // this trial point, so waiting for settled iterations would spin until the
@@ -379,14 +421,15 @@ private:
             // 3. Equilibrium xenon feedback.  Previously equilibrium Xe was
             // only overwritten inside depletion, so a BOC STANDARD step
             // silently ran with zero Xe despite "xenon":"equilibrium".
-            const int xe_budget = ga_feedback_passes > 0
-                                      ? ga_feedback_passes
-                                      : ((xe_relax < 1.0) ? XE_EQUILIBRIUM_MAX_ITER_DAMPED
-                                                          : XE_EQUILIBRIUM_MAX_ITER);
-            if (has_eq_xe && xe_count < xe_budget) {
+            const int xe_budget = xe_budget_probe;
+            if (has_eq_xe && xe_count < xe_budget &&
+                (flux_converged || xe_interim || stall_sample)) {
                 const double xe_change =
                     ctx.cross_sections.UpdateEquilibriumXenon(schedule.thermalPower(), xe_relax);
-                ++xe_count;
+                if (xe_interim && !flux_converged)
+                    ++xe_interim_count;
+                else
+                    ++xe_count;
                 // Not contracting?  The undamped Xe<->flux map is limit-cycling rather than
                 // converging.  Measured on APR1400 cy01 at 195-225 EFPD: [XE] rel bounces
                 // between 8e-x and 11e-x for 80+ iterations, eigv swinging +-30 pcm, until
@@ -418,6 +461,16 @@ private:
                     clean_iters = 0;
                     continue;
                 }
+            }
+
+            // An interim Xe step ran on a loosely-converged flux; whatever it
+            // returned, search/T-H may only act on a fully-converged flux.
+            // Scoped to the interim path only: the flux-stall fall-through
+            // above also reaches here unconverged, and its noisy-sample
+            // behavior must stay exactly as it was.
+            if (xe_interim && !flux_converged) {
+                prev_inner = eigv + 1.0;
+                continue;
             }
 
             // Settling gate.  The flux is converged and Xe has settled; give the nodal d-hat
