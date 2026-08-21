@@ -695,6 +695,9 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
                                 unsigned long long const_generation,
                                 unsigned long long ref_generation,
                                 unsigned long long state_generation) {
+    // calculateEven stays on the host until its 1-ULP residual class is
+    // mined out (RASBERY_GPU_NODAL_FULL=1 forces the all-device path).
+    static const bool hybrid_even = !envFlagEnabled("RASBERY_GPU_NODAL_FULL");
     Impl& d = *_impl;
     if (!d.available || host.nxyz <= 0 || host.nsurf <= 0) return false;
     if (!d.ensure(host.nxyz, d.n_fuel > 0 ? d.n_fuel : host.nxyz)) {
@@ -842,7 +845,101 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     kNodalTrl0<<<gn, B, 0, d.stream>>>(v);
     kNodalTrl12<<<gn, B, 0, d.stream>>>(v);
     kNodalMat<<<gn, B, 0, d.stream>>>(v);
+    RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
+
+    if (hybrid_even) {
+        // calculateEven runs on the HOST (the production member function is
+        // its own bit-exact reference; its mined mask still has a 1-ULP
+        // residual class).  Ship the inputs it needs, let the caller run it,
+        // and finish in solveNodalPost.
+        const std::size_t ndg2 = nx * ndl::NDIR * ndl::NG;
+        double* wk0 = d.ndev_dbl + d.n_off_work;
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(host.trlcff0, wk0,
+                                         ndg2 * sizeof(double),
+                                         cudaMemcpyDeviceToHost, d.stream), d.status);
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(host.trlcff2, wk0 + 2 * ndg2,
+                                         ndg2 * sizeof(double),
+                                         cudaMemcpyDeviceToHost, d.stream), d.status);
+        double* wmat = wk0 + 3 * ndg2 + 2 * nx * ndl::NDIR * ndl::NG2;
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(host.matM, wmat,
+                                         nx * ndl::NG2 * sizeof(double),
+                                         cudaMemcpyDeviceToHost, d.stream), d.status);
+        RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
+        return true; // caller: run host even, then solveNodalPost
+    }
+
     kNodalEven<<<gn, B, 0, d.stream>>>(v);
+    kNodalJnet<<<gs, B, 0, d.stream>>>(v);
+    RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
+
+    RASBERY_CUDA_TRY(cudaMemcpyAsync(host.jnet, v.jnet,
+                                     ns * ndl::NG * sizeof(double),
+                                     cudaMemcpyDeviceToHost, d.stream), d.status);
+    RASBERY_CUDA_TRY(cudaMemcpyAsync(host.phis, v.phis,
+                                     ns * ndl::NG * sizeof(double),
+                                     cudaMemcpyDeviceToHost, d.stream), d.status);
+    RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
+
+    g_nodal_drives.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool XsReconBackend::solveNodalPost(const ndl::NodalView& host) {
+    Impl& d = *_impl;
+    if (!d.available || d.ndev_dbl == nullptr) return false;
+    const std::size_t nx   = static_cast<std::size_t>(host.nxyz);
+    const std::size_t ns   = static_cast<std::size_t>(host.nsurf);
+    const std::size_t ndg2 = nx * ndl::NDIR * ndl::NG;
+
+    // Upload the host-computed dsncff blocks into the device work region.
+    double* wk0 = d.ndev_dbl + d.n_off_work;
+    double* wds = wk0 + 3 * ndg2 + 2 * nx * ndl::NDIR * ndl::NG2 +
+                  4 * nx * ndl::NG2;
+    RASBERY_CUDA_TRY(cudaMemcpyAsync(wds, host.dsncff2, ndg2 * sizeof(double),
+                                     cudaMemcpyHostToDevice, d.stream), d.status);
+    RASBERY_CUDA_TRY(cudaMemcpyAsync(wds + ndg2, host.dsncff4,
+                                     ndg2 * sizeof(double),
+                                     cudaMemcpyHostToDevice, d.stream), d.status);
+    RASBERY_CUDA_TRY(cudaMemcpyAsync(wds + 2 * ndg2, host.dsncff6,
+                                     ndg2 * sizeof(double),
+                                     cudaMemcpyHostToDevice, d.stream), d.status);
+
+    ndl::NodalView v = host;
+    v.lklr    = d.ndev_int + d.n_ioff_lklr;
+    v.idirlr  = d.ndev_int + d.n_ioff_idirlr;
+    v.sgnlr   = d.ndev_int + d.n_ioff_sgnlr;
+    v.lktosfc = d.ndev_int + d.n_ioff_lktosfc;
+    v.neib    = d.ndev_int + d.n_ioff_neib;
+    v.hmesh   = d.ndev_dbl + d.n_off_hmesh;
+    v.albedo  = d.ndev_dbl + d.n_off_albedo;
+    v.eta1   = d.ndev_dbl + d.n_off_consts + 0 * ndg2;
+    v.eta2   = d.ndev_dbl + d.n_off_consts + 1 * ndg2;
+    v.m260   = d.ndev_dbl + d.n_off_consts + 2 * ndg2;
+    v.m251   = d.ndev_dbl + d.n_off_consts + 3 * ndg2;
+    v.m253   = d.ndev_dbl + d.n_off_consts + 4 * ndg2;
+    v.m262   = d.ndev_dbl + d.n_off_consts + 5 * ndg2;
+    v.m264   = d.ndev_dbl + d.n_off_consts + 6 * ndg2;
+    v.diagD  = d.ndev_dbl + d.n_off_consts + 7 * ndg2;
+    v.diagDI = d.ndev_dbl + d.n_off_consts + 8 * ndg2;
+    v.jnet = d.ndev_dbl + d.n_off_jnet;
+    v.flux = d.ndev_dbl + d.n_off_flux;
+    v.phis = d.ndev_dbl + d.n_off_phis;
+    double* wk = wk0;
+    v.trlcff0 = wk; wk += ndg2;
+    v.trlcff1 = wk; wk += ndg2;
+    v.trlcff2 = wk; wk += ndg2;
+    v.mu = wk; wk += nx * ndl::NDIR * ndl::NG2;
+    v.tau = wk; wk += nx * ndl::NDIR * ndl::NG2;
+    v.matM = wk; wk += nx * ndl::NG2;
+    v.matMI = wk; wk += nx * ndl::NG2;
+    v.matMs = wk; wk += nx * ndl::NG2;
+    v.matMf = wk; wk += nx * ndl::NG2;
+    v.dsncff2 = wk; wk += ndg2;
+    v.dsncff4 = wk; wk += ndg2;
+    v.dsncff6 = wk; wk += ndg2;
+
+    const int B  = 128;
+    const int gs = (host.nsurf + B - 1) / B;
     kNodalJnet<<<gs, B, 0, d.stream>>>(v);
     RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
 

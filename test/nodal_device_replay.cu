@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace nk = rasbery::nodal;
@@ -56,6 +57,11 @@ __global__ void kEven(nk::NodalView v) {
 __global__ void kJnet(nk::NodalView v) {
     const int ls = blockIdx.x * blockDim.x + threadIdx.x;
     if (ls < v.nsurf) nk::nodalCalculateJnet(v, ls, nk::StaticForms{});
+}
+
+__global__ void kEvenProbe(nk::NodalView v, int lk, int idir, double* out) {
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        nk::nodalEvenProbe(v, lk, idir, nk::StaticForms{}, out);
 }
 
 template <class T>
@@ -155,6 +161,62 @@ int main(int argc, char** argv) {
     v.reigv = reigv;
     v.nxyz  = static_cast<int>(nxyz);
     v.nsurf = static_cast<int>(nsurf);
+
+    // --probe <lk> <idir>: single-element intermediate dump, device vs host.
+    if (argc > 3 && std::string(argv[2]) == std::string("--probe")) {
+        const int plk = std::atoi(argv[3]);
+        const int pdir = argc > 4 ? std::atoi(argv[4]) : 0;
+        // seed work arrays with captured upstream (trl0/trl2/matM already
+        // uploaded from capture in the view construction above)
+        double* dev_out = nullptr;
+        cudaMalloc(&dev_out, 64 * sizeof(double));
+        kEvenProbe<<<1, 1>>>(v, plk, pdir, dev_out);
+        TRY(cudaGetLastError());
+        TRY(cudaDeviceSynchronize());
+        double dv[64], hv[64];
+        cudaMemcpy(dv, dev_out, 64 * sizeof(double), cudaMemcpyDeviceToHost);
+        // host recompute with the same masks on the captured host arrays
+        nk::NodalView hview{};
+        hview = v; // copy scalars
+        hview.hmesh = hmesh.data(); hview.lktosfc = lktosfc.data();
+        hview.neib = neib.data(); hview.lklr = lklr.data();
+        hview.idirlr = idirlr.data(); hview.sgnlr = sgnlr.data();
+        hview.albedo = albedo.data();
+        hview.xsrf = xsrf.data(); hview.xsnf = xsnf.data(); hview.xssm = xssm.data();
+        hview.chif = chif_empty ? nullptr : chif.data();
+        hview.eta1 = C[0].data(); hview.eta2 = C[1].data(); hview.m260 = C[2].data();
+        hview.m251 = C[3].data(); hview.m253 = C[4].data(); hview.m262 = C[5].data();
+        hview.m264 = C[6].data(); hview.diagD = C[7].data(); hview.diagDI = C[8].data();
+        hview.trlcff0 = trl0.data(); hview.trlcff1 = trl1.data();
+        hview.trlcff2 = trl2.data();
+        hview.matM = matM.data(); hview.matMI = matMI.data();
+        hview.matMs = matMs.data(); hview.matMf = matMf.data();
+        hview.mu = mu.data(); hview.tau = tau.data();
+        hview.dsncff2 = c2.data(); hview.dsncff4 = c4.data();
+        hview.dsncff6 = c6.data();
+        hview.flux = flux.data(); hview.jnet = jnet_in.data();
+        hview.phis = phis_out.data();
+        nk::RuntimeForms rp;
+        for (int q = 0; q < 5; ++q) rp.mask[q] = nk::nodalFormsOf(q);
+        nk::nodalEvenProbe(hview, plk, pdir, rp, hv);
+        static const char* names[31] = {
+            "rm4464_0", "rm4464_1", "at2_00", "at2_10", "at2_01", "at2_11",
+            "a_00", "a_10", "a_01", "a_11", "bt2_0", "bt2_1", "bt1_0", "bt1_1",
+            "b_0", "b_1", "rdet", "c4_0", "c4_1", "c6_0", "c6_1", "c2_0",
+            "c2_1", "mu2_0", "mu2_1", "mu1_0", "mu1_1", "matM00", "matM10",
+            "matM01", "matM11"};
+        for (int i = 0; i < 31; ++i) {
+            const std::uint64_t u = ulp(dv[i], hv[i]);
+            std::printf("%-9s dev=%.17g host=%.17g %s\n", names[i], dv[i],
+                        hv[i], u ? "DIFF" : "");
+        }
+        // also compare against captured c4/c6/c2 at this element
+        const int lkd = plk * nk::NDIR + pdir;
+        std::printf("captured  c4=(%.17g, %.17g) c6=(%.17g, %.17g)\n",
+                    c4[lkd * nk::NG + 0], c4[lkd * nk::NG + 1],
+                    c6[lkd * nk::NG + 0], c6[lkd * nk::NG + 1]);
+        return 0;
+    }
 
     const int B = 128;
     const int gn = (v.nxyz + B - 1) / B;

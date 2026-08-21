@@ -38,6 +38,8 @@ bool XsReconBackend::solveNodal(const nodal::NodalView&, unsigned long long,
     return false;
 }
 
+bool XsReconBackend::solveNodalPost(const nodal::NodalView&) { return false; }
+
 unsigned long long XsReconBackend::nodalDrivesSolved() { return 0; }
 
 void XsReconBackend::pinHost(const void*, size_t) {}

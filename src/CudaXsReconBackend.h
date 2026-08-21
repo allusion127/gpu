@@ -130,6 +130,11 @@ public:
                     unsigned long long ref_generation,
                     unsigned long long state_generation);
 
+    /// Hybrid tail: after the caller ran the host calculateEven on the
+    /// arrays solveNodal downloaded, upload dsncff and finish with the jnet
+    /// phase.  Only valid right after a hybrid solveNodal returned true.
+    bool solveNodalPost(const nodal::NodalView& host);
+
     /// G0 receipt for the nodal kernel (RASBERY_GPU_NODAL): drive() calls
     /// completed on the device.
     static unsigned long long nodalDrivesSolved();

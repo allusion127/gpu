@@ -207,5 +207,20 @@ if (RASBERY_ENABLE_TESTS)
         set_source_files_properties(
                 "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_device_replay.cu"
                 PROPERTIES COMPILE_OPTIONS "--fmad=false")
+
+        add_executable(rasbery_nodal_mine_device
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_mine_device.cu")
+        target_compile_features(rasbery_nodal_mine_device PRIVATE cxx_std_20)
+        target_include_directories(rasbery_nodal_mine_device PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(rasbery_nodal_mine_device PRIVATE CUDA::cudart)
+        set_target_properties(rasbery_nodal_mine_device PROPERTIES
+                CUDA_STANDARD 17
+                CUDA_STANDARD_REQUIRED YES
+                CUDA_ARCHITECTURES "${RASBERY_CUDA_ARCHITECTURES}"
+                CUDA_SEPARABLE_COMPILATION ON)
+        set_source_files_properties(
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_mine_device.cu"
+                PROPERTIES COMPILE_OPTIONS "--fmad=false")
     endif ()
 endif ()

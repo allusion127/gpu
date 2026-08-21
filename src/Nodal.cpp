@@ -797,8 +797,25 @@ bool Nodal::TryDriveGpu() {
         updateConstant(lk);
 
     nodal::NodalView v = MakeView();
-    return backend->solveNodal(v, _const_generation, xs.refGeneration(),
-                               xs.hoststateGeneration());
+    if (!backend->solveNodal(v, _const_generation, xs.refGeneration(),
+                             xs.hoststateGeneration()))
+        return false;
+
+    static const bool full_device =
+        std::getenv("RASBERY_GPU_NODAL_FULL") != nullptr;
+    if (full_device)
+        return true;
+
+    // Hybrid: the device just downloaded trlcff0/trlcff2/matM; run the
+    // PRODUCTION calculateEven (its own bit-exact reference) and hand the
+    // dsncff blocks back for the device jnet phase.
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (_nxyz > rasbery_omp_gate)
+#endif
+    for (int lk = 0; lk < _nxyz; ++lk)
+        calculateEven(lk);
+
+    return backend->solveNodalPost(v);
 }
 
 void Nodal::driveBody() {
