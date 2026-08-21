@@ -144,4 +144,40 @@ if (RASBERY_ENABLE_TESTS)
         add_test(NAME xsrecon_device_consistency
                 COMMAND rasbery_xsrecon_device_consistency 4096)
     endif ()
+
+    # Flat-XS replay gate + contraction miner: scores the shared body of
+    # FlatXsKernel.h against a RASBERY_FLATXS_DUMP production capture.  Needs
+    # a capture on disk, so it is not an add_test -- run it by hand (see the
+    # header comment in test/flatxs_replay.cpp).
+    add_executable(rasbery_flatxs_replay
+            "${CMAKE_CURRENT_SOURCE_DIR}/test/flatxs_replay.cpp")
+    target_compile_features(rasbery_flatxs_replay PRIVATE cxx_std_20)
+    target_include_directories(rasbery_flatxs_replay PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    if (NOT MSVC)
+        target_compile_options(rasbery_flatxs_replay PRIVATE -march=native -O3)
+    endif ()
+    if (OpenMP_CXX_FOUND)
+        target_link_libraries(rasbery_flatxs_replay PRIVATE OpenMP::OpenMP_CXX)
+    endif ()
+
+    # Device arm of the same gate: the CUDA build of the shared body against
+    # the same capture, elementwise.  Compiled with --fmad=false exactly like
+    # the production TU.
+    if (RASBERY_ENABLE_CUDA)
+        add_executable(rasbery_flatxs_device_replay
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/flatxs_device_replay.cu")
+        target_compile_features(rasbery_flatxs_device_replay PRIVATE cxx_std_20)
+        target_include_directories(rasbery_flatxs_device_replay PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(rasbery_flatxs_device_replay PRIVATE CUDA::cudart)
+        set_target_properties(rasbery_flatxs_device_replay PROPERTIES
+                CUDA_STANDARD 17
+                CUDA_STANDARD_REQUIRED YES
+                CUDA_ARCHITECTURES "${RASBERY_CUDA_ARCHITECTURES}"
+                CUDA_SEPARABLE_COMPILATION ON)
+        set_source_files_properties(
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/flatxs_device_replay.cu"
+                PROPERTIES COMPILE_OPTIONS "--fmad=false")
+    endif ()
 endif ()

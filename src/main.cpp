@@ -368,6 +368,9 @@ int main(int argc, char* argv[]) {
         if (rasbery::rasberyGpuXsReconEnabled())
             std::cout << "[RASBERY][XSRECON][GPU] {\"nodes_solved\":"
                       << rasbery::rasberyGpuXsReconNodes() << "}" << std::endl;
+        if (rasbery::rasberyGpuFlatXsEnabled())
+            std::cout << "[RASBERY][FLATXS][GPU] {\"nodes_solved\":"
+                      << rasbery::rasberyGpuFlatXsNodes() << "}" << std::endl;
         rasbery::xsphase::report(std::cout);
         const auto hdf5_stats = Chiffon::GetHdf5LockStats();
         std::cout << "[RASBERY][HDF5][LOCK] {\"acquires\":"
@@ -396,6 +399,9 @@ int main(int argc, char* argv[]) {
     if (rasbery::rasberyGpuXsReconEnabled())
         std::cout << "[RASBERY][XSRECON][GPU] {\"nodes_solved\":"
                   << rasbery::rasberyGpuXsReconNodes() << "}" << std::endl;
+    if (rasbery::rasberyGpuFlatXsEnabled())
+        std::cout << "[RASBERY][FLATXS][GPU] {\"nodes_solved\":"
+                  << rasbery::rasberyGpuFlatXsNodes() << "}" << std::endl;
     rasbery::xsphase::report(std::cout);
     const auto hdf5_stats = Chiffon::GetHdf5LockStats();
     std::cout << "[RASBERY][HDF5][LOCK] {\"acquires\":"

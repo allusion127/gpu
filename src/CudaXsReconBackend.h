@@ -24,6 +24,7 @@
 //    off-by-default exploration path; fail-open-to-CPU keeps physics runs
 //    alive on machines without a device.
 
+#include <cstddef>
 #include <memory>
 #include <string>
 
@@ -32,6 +33,22 @@ namespace rasbery {
 namespace xsrecon {
 struct BatchView;
 }
+
+namespace flatxs {
+struct FlatXsView;
+}
+
+/// Element counts of the flat coefficient tables, so the backend can size the
+/// shared device copy without seeing XSSet.  All counts are in doubles except
+/// n_deltas/n_knots.
+struct FlatXsLibShape {
+    std::size_t lmp_slot;  ///< doubles per coeff_lmp[t] array
+    std::size_t lsm;       ///< doubles in coeff_lsm
+    std::size_t mic_slot;  ///< doubles per coeff_mic[t] array (0 without micx)
+    std::size_t msm;       ///< doubles in coeff_msm (0 without micx)
+    std::size_t n_knots;
+    std::size_t n_deltas;
+};
 
 class XsReconBackend {
 public:
@@ -58,10 +75,40 @@ public:
     bool solve(const xsrecon::BatchView& host, unsigned long long micx_generation,
                double* max_change_out);
 
+    /// Run one unrodded flat-XS update for every node in `host` (host-side
+    /// pointers; see flatxs::FlatXsView for the stream contract).
+    ///
+    ///  - The library coefficient tables are uploaded once per process per
+    ///    distinct content (shared across instances, keyed by a full FNV over
+    ///    the bytes; `shape` sizes the copy).
+    ///  - The reference blocks re-upload only when `ref_generation` differs
+    ///    from the resident copy's.
+    ///  - The live micx/lmpx blocks (shared storage with the xsrecon solve)
+    ///    re-upload only when `micx_generation` differs from the resident
+    ///    generation; the kernel then rewrites the target columns, the result
+    ///    downloads whole, and on `mark_micx_resident` the resident generation
+    ///    advances to `micx_generation_next` so the next xsrecon call skips
+    ///    its ~70 MB re-upload.  Callers pass mark_micx_resident=false when
+    ///    rodded nodes will mutate the host arrays right after this call.
+    ///  - xs (all slots + scatter) and iden upload whole per call so the
+    ///    kernel's target-only writes round-trip every other column unchanged.
+    ///
+    /// On success downloads lmp/mic (active slots + scatter), xs, and the
+    /// three light-isotope iden rows back into the host arrays and returns
+    /// true.  On any CUDA error returns false; uploads only copy host->device,
+    /// so a failed call leaves the host arrays untouched.
+    bool solveFlatXs(const flatxs::FlatXsView& host, const FlatXsLibShape& shape,
+                     unsigned long long micx_generation,
+                     unsigned long long micx_generation_next,
+                     unsigned long long ref_generation, bool mark_micx_resident);
+
     /// Total fuel nodes processed on the device by this process (all
     /// instances).  Zero means the device path never ran, whatever the flag
     /// said -- the G0 validity receipt.
     static unsigned long long nodesSolved();
+
+    /// Same receipt for the flat-XS kernel (RASBERY_GPU_FLATXS).
+    static unsigned long long flatXsNodesSolved();
 
     /// Page-lock a host buffer this backend will repeatedly memcpy (same
     /// contract as CudaBatchArena::pinHost: idempotent, never unregistered).
@@ -75,7 +122,13 @@ private:
 /// RASBERY_GPU_XSRECON, read once per process.  Stub builds return false.
 bool rasberyGpuXsReconEnabled();
 
+/// RASBERY_GPU_FLATXS, read once per process.  Stub builds return false.
+bool rasberyGpuFlatXsEnabled();
+
 /// Receipt accessor mirroring XsReconBackend::nodesSolved for main.cpp.
 unsigned long long rasberyGpuXsReconNodes();
+
+/// Receipt accessor mirroring XsReconBackend::flatXsNodesSolved for main.cpp.
+unsigned long long rasberyGpuFlatXsNodes();
 
 } // namespace rasbery

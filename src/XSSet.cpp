@@ -1420,6 +1420,10 @@ void XSSet::PrecomputeBranchCoefficients() {
             _iden[i * nxyz + l] = _ref_iden[i * nxyz + l];
     }
 
+    // The flat-XS device arm keeps _ref_lmpx/_ref_micx resident; this rebuild
+    // is the only writer, so the bump here is the complete invalidation set.
+    ++_ref_generation;
+
     _simd_ready = true;
 }
 
@@ -2313,6 +2317,317 @@ void XSSet::UpdateUnroddedNodeXS(int l) {
     }
 }
 
+// Fill the flat-XS pointer view with this instance's host arrays.  The stream
+// and node-list fields stay null; BuildFlatXsStream's caller wires them.
+flatxs::FlatXsView XSSet::MakeFlatXsHostView() {
+    namespace fxs = flatxs;
+    static_assert(fxs::N_ACTIVE == N_ACTIVE_XT, "ACTIVE_XT list drifted");
+
+    fxs::FlatXsView v{};
+    const auto coeff_lmpx = ScalarData(_lib_coeff_lmpx);
+    const auto coeff_micx = ScalarData(_lib_coeff_micx);
+    const auto ref_lmpx   = ScalarData(_ref_lmpx);
+    const auto ref_micx   = ScalarData(_ref_micx);
+    auto       lmpx       = ScalarXS(_lmpx);
+    auto       micx       = ScalarXS(_micx);
+    auto       xs         = ScalarXS(_xs);
+    for (int t = 0; t < N_ACTIVE_XT; ++t) {
+        v.coeff_lmp[t] = coeff_lmpx[ACTIVE_XT[t]];
+        v.coeff_mic[t] = coeff_micx[ACTIVE_XT[t]];
+        v.ref_lmp[t]   = ref_lmpx[ACTIVE_XT[t]];
+        v.ref_mic[t]   = ref_micx[ACTIVE_XT[t]];
+        v.lmp[t]       = lmpx[static_cast<size_t>(ACTIVE_XT[t])]->data();
+        v.mic[t]       = micx[static_cast<size_t>(ACTIVE_XT[t])]->data();
+    }
+    for (size_t xt = 0; xt < N_XS_SCALAR; ++xt) {
+        v.xs[xt]      = xs[xt]->data();
+        v.mic_all[xt] = micx[xt]->data();
+        v.lmp_all[xt] = lmpx[xt]->data();
+    }
+    v.coeff_lsm = _lib_coeff_lmpx.xssm.data();
+    v.coeff_msm = _lib_coeff_micx.xssm.data();
+    v.ref_lsm   = _ref_lmpx.xssm.data();
+    v.ref_msm   = _ref_micx.xssm.data();
+    v.lsm       = _lmpx.xssm.data();
+    v.msm       = _micx.xssm.data();
+    v.xs_ssm    = _xs.xssm.data();
+    v.iden      = _iden.data();
+    v.wvfr      = _node_wvfr.data();
+    v.dmod      = &_g.dmod(0);
+    v.bppm      = &_g.bppm(0);
+
+    if (_flatxs_deltas.size() != _lib_deltas.size()) {
+        _flatxs_deltas.resize(_lib_deltas.size());
+        for (size_t i = 0; i < _lib_deltas.size(); ++i) {
+            const auto& d     = _lib_deltas[i];
+            _flatxs_deltas[i] = {d.nord, d.mode, d.ncoeff, d.coeff_base,
+                                 d.knot_offset};
+        }
+    }
+    v.deltas             = _flatxs_deltas.data();
+    v.knots              = _lib_knots.data();
+    v.has_coeff_micx     = _lib_has_coeff_micx ? 1 : 0;
+    v.nxyz               = _g.nxyz();
+    v.boron_dmod_average = _boron_dmod_average;
+    v.use_average_dmod   = USE_AVERAGE_DMOD_FOR_BORON ? 1 : 0;
+    return v;
+}
+
+FlatXsLibShape XSSet::MakeFlatXsLibShape() const {
+    FlatXsLibShape s{};
+    s.lmp_slot = _lib_coeff_lmpx.xstf.size();
+    s.lsm      = _lib_coeff_lmpx.xssm.size();
+    s.mic_slot = _lib_has_coeff_micx ? _lib_coeff_micx.xstf.size() : 0;
+    s.msm      = _lib_has_coeff_micx ? _lib_coeff_micx.xssm.size() : 0;
+    s.n_knots  = _lib_knots.size();
+    s.n_deltas = _lib_deltas.size();
+    return s;
+}
+
+// Capture for offline replay (RASBERY_FLATXS_DUMP=<path>): the first
+// all-unrodded UpdateFlatXS call's full inputs (<path>.in, incl. the resolved
+// stream) and outputs (<path>.out), raw doubles.  test/flatxs_replay.cpp
+// applies the shared body to the captured inputs and reports elementwise ULP
+// against the captured outputs; its sweep mode mines the contraction mask.
+static void flatxsDumpState(const char* path, const flatxs::FlatXsView& v,
+                            const FlatXsLibShape& shape, int ng, bool full) {
+    namespace fxs = flatxs;
+    std::FILE* f = std::fopen(path, "wb");
+    if (!f)
+        return;
+    const std::size_t nx  = static_cast<std::size_t>(v.nxyz);
+    const std::size_t mic = static_cast<std::size_t>(xsrecon::NISO) * xsrecon::NG * nx;
+    const std::size_t lmp = static_cast<std::size_t>(xsrecon::NG) * nx;
+    const std::size_t msm = static_cast<std::size_t>(xsrecon::NISO) * xsrecon::NG * xsrecon::NG * nx;
+    const std::size_t ssm = static_cast<std::size_t>(xsrecon::NG) * xsrecon::NG * nx;
+    const std::size_t stream_len =
+        v.n_nodes > 0 ? static_cast<std::size_t>(v.node_off[v.n_nodes - 1]) +
+                            static_cast<std::size_t>(v.node_cnt[v.n_nodes - 1])
+                      : 0;
+
+    const std::int64_t hdr[16] = {
+        ng, v.nxyz, xsrecon::NISO, v.n_nodes,
+        static_cast<std::int64_t>(stream_len),
+        static_cast<std::int64_t>(shape.n_deltas),
+        static_cast<std::int64_t>(shape.n_knots),
+        static_cast<std::int64_t>(shape.lmp_slot),
+        static_cast<std::int64_t>(shape.lsm),
+        static_cast<std::int64_t>(shape.mic_slot),
+        static_cast<std::int64_t>(shape.msm),
+        v.has_coeff_micx, v.use_average_dmod, full ? 1 : 0, 0, 0};
+    std::fwrite(hdr, sizeof hdr[0], 16, f);
+    std::fwrite(&v.boron_dmod_average, sizeof(double), 1, f);
+
+    if (full) {
+        std::fwrite(v.nodes, sizeof(int), static_cast<std::size_t>(v.n_nodes), f);
+        std::fwrite(v.node_off, sizeof(int), static_cast<std::size_t>(v.n_nodes), f);
+        std::fwrite(v.node_cnt, sizeof(int), static_cast<std::size_t>(v.n_nodes), f);
+        std::fwrite(v.stream_did, sizeof(int), stream_len, f);
+        std::fwrite(v.stream_x, sizeof(double), stream_len, f);
+        std::fwrite(v.stream_scale, sizeof(double), stream_len, f);
+        std::fwrite(v.deltas, sizeof(fxs::DeltaMeta), shape.n_deltas, f);
+        std::fwrite(v.knots, sizeof(double), shape.n_knots, f);
+        for (int t = 0; t < fxs::N_ACTIVE; ++t)
+            std::fwrite(v.coeff_lmp[t], sizeof(double), shape.lmp_slot, f);
+        std::fwrite(v.coeff_lsm, sizeof(double), shape.lsm, f);
+        if (v.has_coeff_micx) {
+            for (int t = 0; t < fxs::N_ACTIVE; ++t)
+                std::fwrite(v.coeff_mic[t], sizeof(double), shape.mic_slot, f);
+            std::fwrite(v.coeff_msm, sizeof(double), shape.msm, f);
+        }
+        for (int t = 0; t < fxs::N_ACTIVE; ++t)
+            std::fwrite(v.ref_mic[t], sizeof(double), mic, f);
+        std::fwrite(v.ref_msm, sizeof(double), msm, f);
+        for (int t = 0; t < fxs::N_ACTIVE; ++t)
+            std::fwrite(v.ref_lmp[t], sizeof(double), lmp, f);
+        std::fwrite(v.ref_lsm, sizeof(double), ssm, f);
+        std::fwrite(v.wvfr, sizeof(double), nx, f);
+        std::fwrite(v.dmod, sizeof(double), nx, f);
+        std::fwrite(v.bppm, sizeof(double), nx, f);
+        std::fwrite(v.iden, sizeof(double), static_cast<std::size_t>(xsrecon::NISO) * nx, f);
+    }
+    // Live arrays: the .in file carries the pre-call state, the .out file the
+    // post-call state, in the same order.
+    for (int t = 0; t < fxs::N_ACTIVE; ++t)
+        std::fwrite(v.lmp[t], sizeof(double), lmp, f);
+    std::fwrite(v.lsm, sizeof(double), ssm, f);
+    for (int t = 0; t < fxs::N_ACTIVE; ++t)
+        std::fwrite(v.mic[t], sizeof(double), mic, f);
+    std::fwrite(v.msm, sizeof(double), msm, f);
+    for (size_t xt = 0; xt < N_XS_SCALAR; ++xt)
+        std::fwrite(v.xs[xt], sizeof(double), lmp, f);
+    std::fwrite(v.xs_ssm, sizeof(double), ssm, f);
+    if (!full)
+        std::fwrite(v.iden, sizeof(double), 3 * nx, f); // H-1/B-10/O-16 rows
+    std::fclose(f);
+}
+
+// Resolve every applyDelta call of the given (unrodded) nodes into the flat
+// stream scratch, in exactly the order UpdateUnroddedNodeXS makes them: the
+// three scalar branches (wu arm then history-twin arm per branch), then the
+// spectral-history terms of the node's own library, then the twin's.  The
+// history resolution is the very ResolveSpectralHistoryDeltas the CPU arm
+// calls, fed a two-element workspace probe for NodeSpectralIndex (computed
+// with the mined contraction forms, see FlatXsKernel.h).
+void XSSet::BuildFlatXsStream(const std::vector<int>& nodes) {
+    namespace fxs = flatxs;
+    const int    ng  = _g.ng();
+    const int    ith = ng - 1;
+    const size_t n   = nodes.size();
+    if (_flatxs_node_apps.size() < n)
+        _flatxs_node_apps.resize(n);
+    const fxs::FlatXsView hv = MakeFlatXsHostView();
+
+#pragma omp parallel for schedule(dynamic, 64) if (static_cast<int>(n) > OMP_THRESHOLD)
+    for (int i = 0; i < static_cast<int>(n); ++i) {
+        const int l    = nodes[i];
+        auto&     apps = _flatxs_node_apps[static_cast<size_t>(i)];
+        apps.clear();
+
+        const double boron_dmod = BoronDmod(_g, _boron_dmod_average, l);
+        const double x_vals[NUM_SCALAR_BRANCHES] = {
+            boron_dmod * _node_wvfr[l] * _g.bppm(l) * BORON_DENSITY_FACTOR,
+            std::sqrt(_g.tful(l)),
+            _g.dmod(l)};
+        const double hw = _node_hw.empty() ? 0.0 : _node_hw[l];
+        const double wu = 1.0 - hw;
+        for (int branch = 0; branch < NUM_SCALAR_BRANCHES; ++branch) {
+            const int lo = _node_delta_lo[branch][l];
+            if (lo >= 0 && wu > 0.0) {
+                const int    hi = _node_delta_hi[branch][l];
+                const double f  = _node_delta_frac[branch][l];
+                apps.push_back({lo, x_vals[branch], wu * (1.0 - f), 0});
+                if (hi != lo)
+                    apps.push_back({hi, x_vals[branch], wu * f, 0});
+            }
+            if (hw <= 0.0 || _node_delta_lo_p.empty())
+                continue;
+            const int lo_p = _node_delta_lo_p[branch][l];
+            if (lo_p < 0)
+                continue;
+            const int    hi_p = _node_delta_hi_p[branch][l];
+            const double f_p  = _node_delta_frac_p[branch][l];
+            apps.push_back({lo_p, x_vals[branch], hw * (1.0 - f_p), 0});
+            if (hi_p != lo_p)
+                apps.push_back({hi_p, x_vals[branch], hw * f_p, 0});
+        }
+
+        // Two-element XSAF workspace probe (base + branch state) for
+        // NodeSpectralIndex; ACTIVE_XT index 1 is XSAF.
+        static thread_local std::vector<double>            micprobe;
+        static thread_local std::vector<int>               p_did;
+        static thread_local std::vector<double>            p_x, p_scale;
+        static thread_local std::vector<DeltaApplication>  hist;
+        if (micprobe.size() != Isotope::niso * static_cast<size_t>(ng))
+            micprobe.assign(Isotope::niso * static_cast<size_t>(ng), 0.0);
+        p_did.clear(); p_x.clear(); p_scale.clear();
+        for (const auto& a : apps) {
+            p_did.push_back(a.did);
+            p_x.push_back(a.x);
+            p_scale.push_back(a.scale);
+        }
+        const int nb  = static_cast<int>(p_did.size());
+        const int ePu = static_cast<int>(Isotope::iPu239) * ng + ith;
+        const int eB  = static_cast<int>(Isotope::iB10) * ng + ith;
+        micprobe[static_cast<size_t>(ePu)] = fxs::flatxsProbeMicElement(
+            hv, l, 1, ePu, p_did.data(), p_x.data(), p_scale.data(), nb,
+            fxs::StaticForms{});
+        micprobe[static_cast<size_t>(eB)] = fxs::flatxsProbeMicElement(
+            hv, l, 1, eB, p_did.data(), p_x.data(), p_scale.data(), nb,
+            fxs::StaticForms{});
+
+        ResolveSpectralHistoryDeltas(l, hist, micprobe.data(),
+                                     static_cast<size_t>(-1), wu);
+        for (const auto& d : hist)
+            apps.push_back(d);
+        if (hw > 0.0) {
+            const int partner = _lib_history_partner.empty()
+                                    ? -1
+                                    : _lib_history_partner[_comp[l]];
+            if (partner >= 0) {
+                ResolveSpectralHistoryDeltas(l, hist, micprobe.data(),
+                                             static_cast<size_t>(partner), hw);
+                for (const auto& d : hist)
+                    apps.push_back(d);
+            }
+        }
+    }
+
+    // Serial concatenation keeps the stream in node order.
+    _flatxs_off.resize(n);
+    _flatxs_cnt.resize(n);
+    _flatxs_stream_did.clear();
+    _flatxs_stream_x.clear();
+    _flatxs_stream_scale.clear();
+    for (size_t i = 0; i < n; ++i) {
+        _flatxs_off[i] = static_cast<int>(_flatxs_stream_did.size());
+        for (const auto& a : _flatxs_node_apps[i]) {
+            _flatxs_stream_did.push_back(a.did);
+            _flatxs_stream_x.push_back(a.x);
+            _flatxs_stream_scale.push_back(a.scale);
+        }
+        _flatxs_cnt[i] = static_cast<int>(_flatxs_stream_did.size()) - _flatxs_off[i];
+    }
+}
+
+bool XSSet::TryUpdateFlatXSGpu(const std::vector<int>& unrodded, bool any_rodded) {
+    namespace fxs = flatxs;
+    if (_g.ng() != xsrecon::NG || static_cast<int>(Isotope::niso) != xsrecon::NISO)
+        return false;
+
+    if (!_xsrecon_backend)
+        _xsrecon_backend = std::make_unique<XsReconBackend>();
+    if (!_xsrecon_backend->available()) {
+        static std::once_flag warn_once;
+        std::call_once(warn_once, [this] {
+            std::cerr << "[RASBERY][WARN][flatxs] RASBERY_GPU_FLATXS set but device "
+                         "path unavailable ("
+                      << _xsrecon_backend->status() << ") -- CPU loop\n";
+        });
+        return false;
+    }
+
+    const int nxyz = _g.nxyz();
+    if (!_flatxs_pinned) {
+        // The live micx/lmpx/xs/iden pins are shared with the xsrecon arm
+        // (pinHost is idempotent); the reference blocks are this arm's own.
+        const size_t ngn = static_cast<size_t>(_g.ng()) * nxyz;
+        const size_t ssn = static_cast<size_t>(_g.ng()) * _g.ng() * nxyz;
+        for (int xt = 0; xt < xsrecon::NXS; ++xt) {
+            const auto t = static_cast<XSTYPE>(xt);
+            XsReconBackend::pinHost(_micx[t].data(), xsrecon::NISO * ngn * sizeof(double));
+            XsReconBackend::pinHost(_lmpx[t].data(), ngn * sizeof(double));
+            XsReconBackend::pinHost(_xs[t].data(), ngn * sizeof(double));
+        }
+        XsReconBackend::pinHost(_micx.xssm.data(), xsrecon::NISO * ssn * sizeof(double));
+        XsReconBackend::pinHost(_lmpx.xssm.data(), ssn * sizeof(double));
+        XsReconBackend::pinHost(_xs.xssm.data(), ssn * sizeof(double));
+        XsReconBackend::pinHost(_iden.data(),
+                                static_cast<size_t>(xsrecon::NISO) * nxyz * sizeof(double));
+        for (int t = 0; t < N_ACTIVE_XT; ++t) {
+            const auto xt = static_cast<XSTYPE>(ACTIVE_XT[t]);
+            XsReconBackend::pinHost(_ref_micx[xt].data(), xsrecon::NISO * ngn * sizeof(double));
+            XsReconBackend::pinHost(_ref_lmpx[xt].data(), ngn * sizeof(double));
+        }
+        XsReconBackend::pinHost(_ref_micx.xssm.data(), xsrecon::NISO * ssn * sizeof(double));
+        XsReconBackend::pinHost(_ref_lmpx.xssm.data(), ssn * sizeof(double));
+        _flatxs_pinned = true;
+    }
+
+    fxs::FlatXsView v = MakeFlatXsHostView();
+    v.nodes           = unrodded.data();
+    v.n_nodes         = static_cast<int>(unrodded.size());
+    v.node_off        = _flatxs_off.data();
+    v.node_cnt        = _flatxs_cnt.data();
+    v.stream_did      = _flatxs_stream_did.data();
+    v.stream_x        = _flatxs_stream_x.data();
+    v.stream_scale    = _flatxs_stream_scale.data();
+
+    return _xsrecon_backend->solveFlatXs(v, MakeFlatXsLibShape(), _micx_generation,
+                                         _micx_generation + 1, _ref_generation,
+                                         !any_rodded);
+}
+
 void XSSet::UpdateFlatXS(const XSUpdateOptions& options) {
     if (!_simd_ready) {
         Update();
@@ -2325,6 +2640,79 @@ void XSSet::UpdateFlatXS(const XSUpdateOptions& options) {
     xsphase::Scope flatxs_scope(xsphase::tallies().flatxs,
                                 static_cast<std::uint64_t>(node_count));
     _boron_dmod_average   = FuelVolumeAverageDmod(_g);
+
+    // Device arm (RASBERY_GPU_FLATXS) and capture (RASBERY_FLATXS_DUMP): both
+    // need the applyDelta stream resolved up front.  With neither set this
+    // whole block costs two cached getenv reads.
+    static const char* dump_path = std::getenv("RASBERY_FLATXS_DUMP");
+    static bool        dump_done = false;
+    const bool         want_dump = dump_path != nullptr && !dump_done;
+    if (rasberyGpuFlatXsEnabled() || want_dump) {
+        auto& unrodded = _flatxs_unrodded;
+        auto& rodded   = _flatxs_rodded;
+        unrodded.clear();
+        rodded.clear();
+        for (int i = 0; i < node_count; ++i) {
+            const int l = all_nodes ? i : options.nodes[i];
+            (UsesRodXS(l) ? rodded : unrodded).push_back(l);
+        }
+        if (!unrodded.empty()) {
+            // The CPU loop refreshes each node's wvfr before anything reads
+            // it, and nothing reads a neighbour's, so the bulk refresh sees
+            // the same values.
+            for (int l : unrodded)
+                _node_wvfr[l] = _ref_wvfr[l];
+            BuildFlatXsStream(unrodded);
+
+            // A capture forces the CPU reference loop so the .out file is the
+            // ground truth the replay gate scores against.
+            const bool dump_this = want_dump && rodded.empty();
+            bool       gpu_ok    = false;
+            if (rasberyGpuFlatXsEnabled() && !dump_this)
+                gpu_ok = TryUpdateFlatXSGpu(unrodded, !rodded.empty());
+
+            if (gpu_ok || dump_this) {
+                if (dump_this) {
+                    dump_done = true;
+                    flatxs::FlatXsView dv = MakeFlatXsHostView();
+                    dv.nodes              = unrodded.data();
+                    dv.n_nodes            = static_cast<int>(unrodded.size());
+                    dv.node_off           = _flatxs_off.data();
+                    dv.node_cnt           = _flatxs_cnt.data();
+                    dv.stream_did         = _flatxs_stream_did.data();
+                    dv.stream_x           = _flatxs_stream_x.data();
+                    dv.stream_scale       = _flatxs_stream_scale.data();
+                    flatxsDumpState((std::string(dump_path) + ".in").c_str(), dv,
+                                    MakeFlatXsLibShape(), _g.ng(), true);
+
+                    const int un = static_cast<int>(unrodded.size());
+#pragma omp parallel for schedule(dynamic, 16) if (un > OMP_THRESHOLD)
+                    for (int i = 0; i < un; ++i) {
+                        xsphase::Scope unrod_scope(xsphase::tallies().flatxs_unrodded, 1);
+                        UpdateUnroddedNodeXS(unrodded[static_cast<size_t>(i)]);
+                    }
+                    flatxsDumpState((std::string(dump_path) + ".out").c_str(), dv,
+                                    MakeFlatXsLibShape(), _g.ng(), false);
+                }
+
+                // Rodded remainder on the CPU, exactly the reference loop's
+                // rodded branch.  Runs after the device download so the
+                // device's whole-array downloads cannot clobber these columns.
+                const int rn = static_cast<int>(rodded.size());
+#pragma omp parallel for schedule(dynamic, 16) if (rn > OMP_THRESHOLD)
+                for (int i = 0; i < rn; ++i) {
+                    xsphase::Scope rod_scope(xsphase::tallies().flatxs_rodded, 1);
+                    const int l = rodded[static_cast<size_t>(i)];
+                    FillRodNodeXS(l);
+                    ApplySpectralHistoryToNode(l);
+                    ReconstructNode(static_cast<size_t>(l));
+                }
+                ++_micx_generation;
+                return;
+            }
+            // Device arm declined: fall through to the reference loop.
+        }
+    }
 
     // Rodded nodes cost far more than unrodded ones (two full Chiffon fills + rod
     // depletion), so dynamic chunks keep the rod-bank threads from straggling.

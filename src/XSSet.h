@@ -1,5 +1,6 @@
 #pragma once
 #include "CudaXsReconBackend.h"
+#include "FlatXsKernel.h"
 #include "Geometry.h"
 #include "Model.h"
 
@@ -179,6 +180,22 @@ private:
     unsigned long long              _micx_generation = 1;
     bool                            _xsrecon_pinned  = false;
 
+    // Flat-XS device arm (RASBERY_GPU_FLATXS, default off).  The reference
+    // blocks (_ref_lmpx/_ref_micx) are device-resident and re-upload only
+    // when PrecomputeBranchCoefficients rebuilds them (_ref_generation); the
+    // library coefficient tables upload once per process (content-hashed,
+    // shared across instances).  The stream scratch below carries the
+    // host-resolved (did, x, scale) applications of one UpdateFlatXS call.
+    unsigned long long  _ref_generation = 1;
+    bool                _flatxs_pinned  = false;
+    std::vector<int>    _flatxs_stream_did;
+    std::vector<double> _flatxs_stream_x;
+    std::vector<double> _flatxs_stream_scale;
+    std::vector<int>    _flatxs_off;
+    std::vector<int>    _flatxs_cnt;
+    std::vector<int>    _flatxs_unrodded;
+    std::vector<int>    _flatxs_rodded;
+
     // Flat branch delta storage
     // Pre-flattened reference XS (burnup-interpolated, SoA layout)
     XSArraySet           _ref_lmpx;  // [ig*nxyz + l]
@@ -289,6 +306,18 @@ private:
         int l, std::vector<DeltaApplication>& out,
         const double* micWork = nullptr,
         size_t modelIndex = static_cast<size_t>(-1), double weight = 1.0) const;
+
+    // Flat-XS device arm helpers (see the _flatxs_* scratch above).
+    // BuildFlatXsStream resolves every applyDelta call of the unrodded nodes
+    // into the flat stream scratch, in exactly the CPU loop's order;
+    // TryUpdateFlatXSGpu ships it to the backend and downloads the results.
+    std::vector<std::vector<DeltaApplication>> _flatxs_node_apps;
+    std::vector<flatxs::DeltaMeta>             _flatxs_deltas; // flattened _lib_deltas
+    flatxs::FlatXsView MakeFlatXsHostView();
+    FlatXsLibShape     MakeFlatXsLibShape() const;
+    void               BuildFlatXsStream(const std::vector<int>& nodes);
+    bool               TryUpdateFlatXSGpu(const std::vector<int>& unrodded,
+                                          bool any_rodded);
     /// @brief Blend weight toward the rodded-depletion twin, 0 when there is none.
     [[nodiscard]] double HistoryBlendWeight(int l) const {
         return _node_hw.empty() ? 0.0 : _node_hw[static_cast<size_t>(l)];
