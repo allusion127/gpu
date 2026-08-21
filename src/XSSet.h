@@ -528,6 +528,20 @@ public:
         return _ref_chix.empty() ? nullptr : _ref_chix.data();
     }
 
+    /// Shared device backend for the xs/nodal arms (created on first use;
+    /// null in stub builds is fine -- the caller falls back to the CPU body).
+    XsReconBackend* EnsureBackend() {
+        if (!_xsrecon_backend)
+            _xsrecon_backend = std::make_unique<XsReconBackend>();
+        return _xsrecon_backend.get();
+    }
+    [[nodiscard]] unsigned long long hoststateGeneration() const {
+        return _hoststate_generation;
+    }
+    [[nodiscard]] unsigned long long refGeneration() const {
+        return _ref_generation;
+    }
+
     // Microscopic XS accessors: [(iso, group), node]
     [[nodiscard]] double micx(Chiffon::XSTYPE xt, size_t iso, int ig, int l) const {
         const size_t elem = (iso * static_cast<size_t>(_g.ng()) + static_cast<size_t>(ig)) * static_cast<size_t>(_g.nxyz()) + static_cast<size_t>(l);

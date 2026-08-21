@@ -152,6 +152,9 @@ public:
     /// The six solve phases (capture wrapper lives in drive()).
     void driveBody();
 
+    /// Device arm behind RASBERY_GPU_NODAL; false = run the CPU body.
+    bool TryDriveGpu();
+
     /// @brief update the constant in the nodal calculation
     /// @param lk the node index
     void updateConstant(const int& lk);

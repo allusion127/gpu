@@ -2,7 +2,10 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
+#include <iostream>
+#include <mutex>
 #include <vector>
 
 #define jnet(ig, lks)    (_jnet[(lks) * _ng + ig])
@@ -734,13 +737,68 @@ void Nodal::drive() {
             jnet_snapshot.assign(_jnet, _jnet + static_cast<std::size_t>(_nsurf) * _ng);
         }
     }
-    driveBody();
+    if (!TryDriveGpu())
+        driveBody();
+
+    // Divergence probe (RASBERY_NODAL_DEBUG_HASH): one FNV line per drive()
+    // over jnet+phis; diffing the two arms' streams pinpoints the first call
+    // whose outputs differ.  Same tool pattern as RASBERY_XSRECON_DEBUG_HASH.
+    static const bool hash_on = std::getenv("RASBERY_NODAL_DEBUG_HASH") != nullptr;
+    if (hash_on) {
+        static std::atomic<int> hash_call{0};
+        auto mix = [](const double* ptr, std::size_t n, unsigned long long h) {
+            for (std::size_t i = 0; i < n; ++i) {
+                unsigned long long b;
+                std::memcpy(&b, &ptr[i], sizeof b);
+                h = (h ^ b) * 1099511628211ULL;
+            }
+            return h;
+        };
+        const int c = hash_call.fetch_add(1) + 1;
+        const std::size_t ng_surf = static_cast<std::size_t>(_nsurf) * _ng;
+        std::fprintf(stderr, "[NODAL][HASH] call=%d jnet=%016llx phis=%016llx\n",
+                     c, mix(_jnet, ng_surf, 1469598103934665603ULL),
+                     mix(_phis, ng_surf, 1469598103934665603ULL));
+    }
     if (dump_this) {
         nodal::NodalView v = MakeView();
         nodalDumpState(dump_path, v, jnet_snapshot.data());
         std::fprintf(stderr, "[RASBERY][NODAL][DUMP] call=%d -> %s\n", dump_call,
                      dump_path);
     }
+}
+
+// Device arm (RASBERY_GPU_NODAL): host runs the shadow-checked
+// updateConstant phase (the only transcendental), the backend runs the five
+// arithmetic phases with the mined contraction masks and returns jnet/phis.
+// Fail-open to the CPU body.
+bool Nodal::TryDriveGpu() {
+    if (!rasberyGpuNodalEnabled())
+        return false;
+    if (_ng != nodal::NG)
+        return false;
+
+    XsReconBackend* backend = xs.EnsureBackend();
+    if (backend == nullptr || !backend->available()) {
+        static std::once_flag warn_once;
+        std::call_once(warn_once, [&] {
+            std::cerr << "[RASBERY][WARN][nodal] RASBERY_GPU_NODAL set but device "
+                         "path unavailable -- CPU body\n";
+        });
+        return false;
+    }
+
+    // Phase 1 on the host: recompute only where xsrf/xsdf moved (shadowed),
+    // bumping _const_generation when anything did.
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (_nxyz > rasbery_omp_gate)
+#endif
+    for (int lk = 0; lk < _nxyz; ++lk)
+        updateConstant(lk);
+
+    nodal::NodalView v = MakeView();
+    return backend->solveNodal(v, _const_generation, xs.refGeneration(),
+                               xs.hoststateGeneration());
 }
 
 void Nodal::driveBody() {

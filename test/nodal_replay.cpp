@@ -274,7 +274,9 @@ unsigned long long mineMask(const char* name, const std::vector<Site>& sites,
         return nwin > 0 ? firstwin : best;
     }
     unsigned long long bestm = 0; std::uint64_t bestbad = ~0ull;
-    for (unsigned seedv = 0; seedv < 3; ++seedv) {
+    const unsigned seed_order[3] = {1, 2, 0}; // fused-first: free sites keep
+    for (unsigned si = 0; si < 3; ++si) {
+        const unsigned seedv = seed_order[si];
         std::uint64_t      bad = 0;
         const unsigned long long m =
             descend(sites, uniformMask(sites, seedv), trial, &bad);
@@ -333,6 +335,21 @@ int main(int argc, char** argv) {
         runPhase(5, c, w, pol, true);
         return scoreArr(w.jnet, c.jnet_out, type) + scoreArr(w.phis, c.phis_out, type);
     };
+
+    if (argc > 2 && std::string(argv[2]) == std::string("--evenstats")) {
+        nk::RuntimeForms rp;
+        for (int q = 0; q < 5; ++q) rp.mask[q] = nk::NODAL_FORMS[q];
+        runPhase(4, c, w, rp, true);
+        long long by_ig[2] = {0, 0}, by_dir[3] = {0, 0, 0};
+        for (std::size_t i2 = 0; i2 < w.c4.size(); ++i2)
+            if (ulp(w.c4[i2], c.c4[i2])) {
+                ++by_ig[i2 % nk::NG];
+                ++by_dir[(i2 / nk::NG) % nk::NDIR];
+            }
+        std::printf("c4 bad by ig: %lld %lld | by idir: %lld %lld %lld\n",
+                    by_ig[0], by_ig[1], by_dir[0], by_dir[1], by_dir[2]);
+        return 0;
+    }
 
     if (!sweep) {
         nk::StaticForms sp;

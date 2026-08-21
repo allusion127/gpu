@@ -33,11 +33,22 @@ unsigned long long XsReconBackend::nodesSolved() { return 0; }
 
 unsigned long long XsReconBackend::flatXsNodesSolved() { return 0; }
 
+bool XsReconBackend::solveNodal(const nodal::NodalView&, unsigned long long,
+                                unsigned long long, unsigned long long) {
+    return false;
+}
+
+unsigned long long XsReconBackend::nodalDrivesSolved() { return 0; }
+
 void XsReconBackend::pinHost(const void*, size_t) {}
 
 bool rasberyGpuXsReconEnabled() { return false; }
 
 bool rasberyGpuFlatXsEnabled() { return false; }
+
+bool rasberyGpuNodalEnabled() { return false; }
+
+unsigned long long rasberyGpuNodalDrives() { return 0; }
 
 unsigned long long rasberyGpuXsReconNodes() { return 0; }
 

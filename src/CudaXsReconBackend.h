@@ -38,6 +38,10 @@ namespace flatxs {
 struct FlatXsView;
 }
 
+namespace nodal {
+struct NodalView;
+}
+
 /// Element counts of the flat coefficient tables, so the backend can size the
 /// shared device copy without seeing XSSet.  All counts are in doubles except
 /// n_deltas/n_knots.
@@ -114,6 +118,22 @@ public:
     /// Same receipt for the flat-XS kernel (RASBERY_GPU_FLATXS).
     static unsigned long long flatXsNodesSolved();
 
+    /// Run one nodal drive() (the five per-outer phases) on the device.
+    /// Geometry tables upload once; the nine updateConstant arrays re-upload
+    /// on `const_generation`; chif on `ref_generation`; the working arrays
+    /// are device-only.  xsrf/xsnf/xssm are read from the resident xs block
+    /// when `state_generation` matches, else uploaded for this call (without
+    /// advancing the residency -- iden may still be stale).  Per call: jnet
+    /// and flux upload, jnet and phis download.  Fail-open to the CPU body.
+    bool solveNodal(const nodal::NodalView& host,
+                    unsigned long long const_generation,
+                    unsigned long long ref_generation,
+                    unsigned long long state_generation);
+
+    /// G0 receipt for the nodal kernel (RASBERY_GPU_NODAL): drive() calls
+    /// completed on the device.
+    static unsigned long long nodalDrivesSolved();
+
     /// Page-lock a host buffer this backend will repeatedly memcpy (same
     /// contract as CudaBatchArena::pinHost: idempotent, never unregistered).
     static void pinHost(const void* p, size_t bytes);
@@ -134,5 +154,11 @@ unsigned long long rasberyGpuXsReconNodes();
 
 /// Receipt accessor mirroring XsReconBackend::flatXsNodesSolved for main.cpp.
 unsigned long long rasberyGpuFlatXsNodes();
+
+/// RASBERY_GPU_NODAL, read once per process.  Stub builds return false.
+bool rasberyGpuNodalEnabled();
+
+/// Receipt accessor mirroring XsReconBackend::nodalDrivesSolved for main.cpp.
+unsigned long long rasberyGpuNodalDrives();
 
 } // namespace rasbery

@@ -371,6 +371,9 @@ int main(int argc, char* argv[]) {
         if (rasbery::rasberyGpuFlatXsEnabled())
             std::cout << "[RASBERY][FLATXS][GPU] {\"nodes_solved\":"
                       << rasbery::rasberyGpuFlatXsNodes() << "}" << std::endl;
+        if (rasbery::rasberyGpuNodalEnabled())
+            std::cout << "[RASBERY][NODAL][GPU] {\"drives_solved\":"
+                      << rasbery::rasberyGpuNodalDrives() << "}" << std::endl;
         rasbery::xsphase::report(std::cout);
         rasbery::outer_timing::report(std::cout);
         const auto hdf5_stats = Chiffon::GetHdf5LockStats();
@@ -403,6 +406,9 @@ int main(int argc, char* argv[]) {
     if (rasbery::rasberyGpuFlatXsEnabled())
         std::cout << "[RASBERY][FLATXS][GPU] {\"nodes_solved\":"
                   << rasbery::rasberyGpuFlatXsNodes() << "}" << std::endl;
+    if (rasbery::rasberyGpuNodalEnabled())
+        std::cout << "[RASBERY][NODAL][GPU] {\"drives_solved\":"
+                  << rasbery::rasberyGpuNodalDrives() << "}" << std::endl;
     rasbery::xsphase::report(std::cout);
     rasbery::outer_timing::report(std::cout);
     const auto hdf5_stats = Chiffon::GetHdf5LockStats();

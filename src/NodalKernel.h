@@ -58,7 +58,7 @@ constexpr double M242  = 14.;
 /// 2 = fma(C,D, round(A*B)).  trlcff12 and updateMatrix mined exact on the
 /// first pass (all their sites fused).
 constexpr unsigned long long NODAL_FORMS[5] = {
-    0x3Full, 0xFull, 0x355ADull, 0x5DD445Bull, 0xFBAAB56F79ull};
+    0x3Full, 0xFull, 0x355ADull, 0x7DD555Bull, 0xFBAAB56F79ull};
 
 /// Device code cannot address the namespace-scope array's storage (same
 /// finding as xsrecon's ACTIVE_XT); this constexpr function is the mask
@@ -67,7 +67,7 @@ RASBERY_XSR_HD constexpr unsigned long long nodalFormsOf(int phase) {
     return phase == 0   ? 0x3Full
            : phase == 1 ? 0xFull
            : phase == 2 ? 0x355ADull
-           : phase == 3 ? 0x5DD445Bull
+           : phase == 3 ? 0x7DD555Bull
                         : 0xFBAAB56F79ull;
 }
 

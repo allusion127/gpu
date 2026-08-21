@@ -1,6 +1,7 @@
 #include "CudaXsReconBackend.h"
 
 #include "FlatXsKernel.h"
+#include "NodalKernel.h"
 #include "XsReconKernel.h"
 
 #include <cuda_runtime.h>
@@ -70,6 +71,31 @@ __global__ void kernelFlatXs(fxs::FlatXsView v) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= v.n_nodes) return;
     fxs::flatxsSolveNode(v, i, fxs::StaticForms{});
+}
+
+namespace ndl = rasbery::nodal;
+
+std::atomic<unsigned long long> g_nodal_drives{0};
+
+__global__ void kNodalTrl0(ndl::NodalView v) {
+    const int lk = blockIdx.x * blockDim.x + threadIdx.x;
+    if (lk < v.nxyz) ndl::nodalTrlcff0(v, lk);
+}
+__global__ void kNodalTrl12(ndl::NodalView v) {
+    const int lk = blockIdx.x * blockDim.x + threadIdx.x;
+    if (lk < v.nxyz) ndl::nodalTrlcff12(v, lk, ndl::StaticForms{});
+}
+__global__ void kNodalMat(ndl::NodalView v) {
+    const int lk = blockIdx.x * blockDim.x + threadIdx.x;
+    if (lk < v.nxyz) ndl::nodalUpdateMatrix(v, lk, ndl::StaticForms{});
+}
+__global__ void kNodalEven(ndl::NodalView v) {
+    const int lk = blockIdx.x * blockDim.x + threadIdx.x;
+    if (lk < v.nxyz) ndl::nodalCalculateEven(v, lk, ndl::StaticForms{});
+}
+__global__ void kNodalJnet(ndl::NodalView v) {
+    const int ls = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ls < v.nsurf) ndl::nodalCalculateJnet(v, ls, ndl::StaticForms{});
 }
 
 // The 9 ACTIVE_XT slots of XSSet.cpp, as Chiffon::XSTYPE values.  The enum
@@ -144,6 +170,19 @@ struct XsReconBackend::Impl {
     double*     dev_sscale  = nullptr;
     std::size_t stream_cap  = 0;
 
+    // --- nodal extension (RASBERY_GPU_NODAL) ------------------------------
+    double*            ndev_dbl   = nullptr; // hmesh|albedo|consts x9|chif|jnet|flux|phis|work
+    int*               ndev_int   = nullptr; // lktosfc|neib|lklr|idirlr|sgnlr
+    bool               nodal_geom_uploaded = false;
+    unsigned long long resident_const_generation = 0;
+    unsigned long long resident_chif_generation  = 0;
+    int                nodal_nsurf = 0;
+    std::size_t n_off_hmesh = 0, n_off_albedo = 0, n_off_consts = 0,
+                n_off_chif = 0, n_off_jnet = 0, n_off_flux = 0, n_off_phis = 0,
+                n_off_work = 0;
+    std::size_t n_ioff_lktosfc = 0, n_ioff_neib = 0, n_ioff_lklr = 0,
+                n_ioff_idirlr = 0, n_ioff_sgnlr = 0;
+
     const FlatXsLibDevice* lib = nullptr;      // shared, process lifetime
     std::uint64_t          lib_hash_cached = 0; // host tables are immutable;
     const void*            lib_hash_key    = nullptr; // hash once per source
@@ -171,6 +210,8 @@ struct XsReconBackend::Impl {
         if (dev_sdid) cudaFree(dev_sdid);
         if (dev_sx) cudaFree(dev_sx);
         if (dev_sscale) cudaFree(dev_sscale);
+        if (ndev_dbl) cudaFree(ndev_dbl);
+        if (ndev_int) cudaFree(ndev_int);
         if (stream) cudaStreamDestroy(stream);
     }
 
@@ -229,7 +270,8 @@ struct XsReconBackend::Impl {
 };
 
 XsReconBackend::XsReconBackend() : _impl(std::make_unique<Impl>()) {
-    if (!rasberyGpuXsReconEnabled() && !rasberyGpuFlatXsEnabled()) {
+    if (!rasberyGpuXsReconEnabled() && !rasberyGpuFlatXsEnabled() &&
+        !rasberyGpuNodalEnabled()) {
         _impl->status = "disabled (RASBERY_GPU_XSRECON/RASBERY_GPU_FLATXS unset)";
         return;
     }
@@ -649,6 +691,177 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     return true;
 }
 
+bool XsReconBackend::solveNodal(const ndl::NodalView& host,
+                                unsigned long long const_generation,
+                                unsigned long long ref_generation,
+                                unsigned long long state_generation) {
+    Impl& d = *_impl;
+    if (!d.available || host.nxyz <= 0 || host.nsurf <= 0) return false;
+    if (!d.ensure(host.nxyz, d.n_fuel > 0 ? d.n_fuel : host.nxyz)) {
+        d.available = false;
+        return false;
+    }
+    const std::size_t nx = static_cast<std::size_t>(host.nxyz);
+    const std::size_t ns = static_cast<std::size_t>(host.nsurf);
+
+    if (d.ndev_dbl == nullptr || d.nodal_nsurf != host.nsurf) {
+        if (d.ndev_dbl) { cudaFree(d.ndev_dbl); d.ndev_dbl = nullptr; }
+        if (d.ndev_int) { cudaFree(d.ndev_int); d.ndev_int = nullptr; }
+        d.nodal_geom_uploaded       = false;
+        d.resident_const_generation = 0;
+        d.resident_chif_generation  = 0;
+        d.nodal_nsurf               = host.nsurf;
+        const std::size_t ndg0 = nx * ndl::NDIR * ndl::NG;
+        std::size_t off = 0;
+        d.n_off_hmesh = off; off += nx * ndl::NDIR;
+        d.n_off_albedo = off; off += ndl::NDIR * ndl::NLR;
+        d.n_off_consts = off; off += 9 * ndg0;
+        d.n_off_chif = off; off += ndl::NG * nx;
+        d.n_off_jnet = off; off += ns * ndl::NG;
+        d.n_off_flux = off; off += nx * ndl::NG;
+        d.n_off_phis = off; off += ns * ndl::NG;
+        d.n_off_work = off;
+        off += 3 * ndg0 + 2 * nx * ndl::NDIR * ndl::NG2 + 4 * nx * ndl::NG2 +
+               3 * ndg0;
+        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d.ndev_dbl),
+                                    off * sizeof(double)), d.status);
+        std::size_t ioff = 0;
+        d.n_ioff_lktosfc = ioff; ioff += nx * ndl::NDIR * ndl::NLR;
+        d.n_ioff_neib = ioff; ioff += nx * ndl::NEWSB;
+        d.n_ioff_lklr = ioff; ioff += ns * ndl::NLR;
+        d.n_ioff_idirlr = ioff; ioff += ns * ndl::NLR;
+        d.n_ioff_sgnlr = ioff; ioff += ns * ndl::NLR;
+        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d.ndev_int),
+                                    ioff * sizeof(int)), d.status);
+    }
+    const std::size_t ndg = nx * ndl::NDIR * ndl::NG;
+
+    if (!d.nodal_geom_uploaded) {
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_hmesh, host.hmesh,
+                                         nx * ndl::NDIR * sizeof(double),
+                                         cudaMemcpyHostToDevice, d.stream), d.status);
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_albedo, host.albedo,
+                                         ndl::NDIR * ndl::NLR * sizeof(double),
+                                         cudaMemcpyHostToDevice, d.stream), d.status);
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_int + d.n_ioff_lktosfc, host.lktosfc,
+                                         nx * ndl::NDIR * ndl::NLR * sizeof(int),
+                                         cudaMemcpyHostToDevice, d.stream), d.status);
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_int + d.n_ioff_neib, host.neib,
+                                         nx * ndl::NEWSB * sizeof(int),
+                                         cudaMemcpyHostToDevice, d.stream), d.status);
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_int + d.n_ioff_lklr, host.lklr,
+                                         ns * ndl::NLR * sizeof(int),
+                                         cudaMemcpyHostToDevice, d.stream), d.status);
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_int + d.n_ioff_idirlr, host.idirlr,
+                                         ns * ndl::NLR * sizeof(int),
+                                         cudaMemcpyHostToDevice, d.stream), d.status);
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_int + d.n_ioff_sgnlr, host.sgnlr,
+                                         ns * ndl::NLR * sizeof(int),
+                                         cudaMemcpyHostToDevice, d.stream), d.status);
+        d.nodal_geom_uploaded = true;
+    }
+
+    if (const_generation != d.resident_const_generation) {
+        const double* consts[9] = {host.eta1, host.eta2, host.m260,
+                                   host.m251, host.m253, host.m262,
+                                   host.m264, host.diagD, host.diagDI};
+        for (int i = 0; i < 9; ++i)
+            RASBERY_CUDA_TRY(
+                cudaMemcpyAsync(d.ndev_dbl + d.n_off_consts + i * ndg, consts[i],
+                                ndg * sizeof(double), cudaMemcpyHostToDevice,
+                                d.stream), d.status);
+        d.resident_const_generation = const_generation;
+    }
+
+    if (!host.chif_empty && ref_generation != d.resident_chif_generation) {
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_chif, host.chif,
+                                         ndl::NG * nx * sizeof(double),
+                                         cudaMemcpyHostToDevice, d.stream), d.status);
+        d.resident_chif_generation = ref_generation;
+    }
+
+    // xs inputs: resident when the host-state generation matches; upload the
+    // three rows for this call otherwise (residency untouched -- iden may be
+    // stale, and the xs arms own that contract).
+    const std::size_t lmp = static_cast<std::size_t>(xsr::NG) * nx;
+    const std::size_t ssm = static_cast<std::size_t>(xsr::NG) * xsr::NG * nx;
+    if (state_generation != d.resident_state_generation) {
+        if (!d.upload(host.xsrf, d.off_xs[xsr::T_XSRF], lmp)) return false;
+        if (!d.upload(host.xsnf, d.off_xs[xsr::T_XSNF], lmp)) return false;
+        if (!d.upload(host.xssm, d.off_xs_ssm, ssm)) return false;
+    }
+
+    RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_jnet, host.jnet,
+                                     ns * ndl::NG * sizeof(double),
+                                     cudaMemcpyHostToDevice, d.stream), d.status);
+    RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_flux, host.flux,
+                                     nx * ndl::NG * sizeof(double),
+                                     cudaMemcpyHostToDevice, d.stream), d.status);
+
+    ndl::NodalView v = host;
+    v.hmesh   = d.ndev_dbl + d.n_off_hmesh;
+    v.albedo  = d.ndev_dbl + d.n_off_albedo;
+    v.lktosfc = d.ndev_int + d.n_ioff_lktosfc;
+    v.neib    = d.ndev_int + d.n_ioff_neib;
+    v.lklr    = d.ndev_int + d.n_ioff_lklr;
+    v.idirlr  = d.ndev_int + d.n_ioff_idirlr;
+    v.sgnlr   = d.ndev_int + d.n_ioff_sgnlr;
+    v.eta1   = d.ndev_dbl + d.n_off_consts + 0 * ndg;
+    v.eta2   = d.ndev_dbl + d.n_off_consts + 1 * ndg;
+    v.m260   = d.ndev_dbl + d.n_off_consts + 2 * ndg;
+    v.m251   = d.ndev_dbl + d.n_off_consts + 3 * ndg;
+    v.m253   = d.ndev_dbl + d.n_off_consts + 4 * ndg;
+    v.m262   = d.ndev_dbl + d.n_off_consts + 5 * ndg;
+    v.m264   = d.ndev_dbl + d.n_off_consts + 6 * ndg;
+    v.diagD  = d.ndev_dbl + d.n_off_consts + 7 * ndg;
+    v.diagDI = d.ndev_dbl + d.n_off_consts + 8 * ndg;
+    v.chif   = d.ndev_dbl + d.n_off_chif;
+    v.xsrf = d.dev_block + d.off_xs[xsr::T_XSRF];
+    v.xsnf = d.dev_block + d.off_xs[xsr::T_XSNF];
+    v.xssm = d.dev_block + d.off_xs_ssm;
+    v.jnet = d.ndev_dbl + d.n_off_jnet;
+    v.flux = d.ndev_dbl + d.n_off_flux;
+    v.phis = d.ndev_dbl + d.n_off_phis;
+    double* wk = d.ndev_dbl + d.n_off_work;
+    v.trlcff0 = wk; wk += ndg;
+    v.trlcff1 = wk; wk += ndg;
+    v.trlcff2 = wk; wk += ndg;
+    v.mu = wk; wk += nx * ndl::NDIR * ndl::NG2;
+    v.tau = wk; wk += nx * ndl::NDIR * ndl::NG2;
+    v.matM = wk; wk += nx * ndl::NG2;
+    v.matMI = wk; wk += nx * ndl::NG2;
+    v.matMs = wk; wk += nx * ndl::NG2;
+    v.matMf = wk; wk += nx * ndl::NG2;
+    v.dsncff2 = wk; wk += ndg;
+    v.dsncff4 = wk; wk += ndg;
+    v.dsncff6 = wk; wk += ndg;
+
+    const int B  = 128;
+    const int gn = (host.nxyz + B - 1) / B;
+    const int gs = (host.nsurf + B - 1) / B;
+    kNodalTrl0<<<gn, B, 0, d.stream>>>(v);
+    kNodalTrl12<<<gn, B, 0, d.stream>>>(v);
+    kNodalMat<<<gn, B, 0, d.stream>>>(v);
+    kNodalEven<<<gn, B, 0, d.stream>>>(v);
+    kNodalJnet<<<gs, B, 0, d.stream>>>(v);
+    RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
+
+    RASBERY_CUDA_TRY(cudaMemcpyAsync(host.jnet, v.jnet,
+                                     ns * ndl::NG * sizeof(double),
+                                     cudaMemcpyDeviceToHost, d.stream), d.status);
+    RASBERY_CUDA_TRY(cudaMemcpyAsync(host.phis, v.phis,
+                                     ns * ndl::NG * sizeof(double),
+                                     cudaMemcpyDeviceToHost, d.stream), d.status);
+    RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
+
+    g_nodal_drives.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+unsigned long long XsReconBackend::nodalDrivesSolved() {
+    return g_nodal_drives.load(std::memory_order_relaxed);
+}
+
 unsigned long long XsReconBackend::nodesSolved() {
     return g_nodes_solved.load(std::memory_order_relaxed);
 }
@@ -672,6 +885,15 @@ bool rasberyGpuXsReconEnabled() {
 bool rasberyGpuFlatXsEnabled() {
     static const bool on = envFlagEnabled("RASBERY_GPU_FLATXS");
     return on;
+}
+
+bool rasberyGpuNodalEnabled() {
+    static const bool on = envFlagEnabled("RASBERY_GPU_NODAL");
+    return on;
+}
+
+unsigned long long rasberyGpuNodalDrives() {
+    return g_nodal_drives.load(std::memory_order_relaxed);
 }
 
 unsigned long long rasberyGpuXsReconNodes() {
