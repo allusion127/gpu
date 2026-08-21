@@ -1,5 +1,10 @@
 #include "Nodal.h"
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
 #define jnet(ig, lks)    (_jnet[(lks) * _ng + ig])
 #define trlcff0(ig, lkd) (_trlcff0[(lkd) * _ng + ig])
 #define trlcff1(ig, lkd) (_trlcff1[(lkd) * _ng + ig])
@@ -153,6 +158,11 @@ void Nodal::updateConstant(const int& lk) {
         _constant_xsrf[lkg0 + ig] = xs.xsrf(ig, lk);
         _constant_xsdf[lkg0 + ig] = xs.xsdf(ig, lk);
     }
+
+    // Any recompute makes the device copy of the nine coefficient arrays
+    // stale.  Racy increments from the omp for are fine: the consumer only
+    // compares against its resident value, so any change forces a re-upload.
+    ++_const_generation;
 }
 
 void Nodal::updateMatrix(const int& lk) {
@@ -601,7 +611,139 @@ void Nodal::reset(const double& reigv, double* jnet, double* phif, double* phis)
     _reigv = reigv;
 }
 
+nodal::NodalView Nodal::MakeView() {
+    nodal::NodalView v{};
+    v.hmesh   = &_g.hmesh(0, 0);
+    v.lktosfc = &_g.lktosfc(0, 0, 0);
+    v.neib    = &_g.neib(0, 0, 0);
+    v.lklr    = &_g.lklr(0, 0);
+    v.idirlr  = &_g.idirlr(0, 0);
+    v.sgnlr   = &_g.sgnlr(0, 0);
+    v.albedo  = &_g.albedo(0, 0);
+
+    v.xsrf       = xs.xsrfData();
+    v.xsnf       = xs.xsnfData();
+    v.xssm       = xs.xssmData();
+    v.chif       = xs.chifData();
+    v.chif_empty = v.chif == nullptr ? 1 : 0;
+
+    v.eta1   = _eta1;
+    v.eta2   = _eta2;
+    v.m260   = _m260;
+    v.m251   = _m251;
+    v.m253   = _m253;
+    v.m262   = _m262;
+    v.m264   = _m264;
+    v.diagD  = _diagD;
+    v.diagDI = _diagDI;
+
+    v.trlcff0 = _trlcff0;
+    v.trlcff1 = _trlcff1;
+    v.trlcff2 = _trlcff2;
+    v.mu      = _mu;
+    v.tau     = _tau;
+    v.matM    = _matM;
+    v.matMI   = _matMI;
+    v.matMs   = _matMs;
+    v.matMf   = _matMf;
+    v.dsncff2 = _dsncff2;
+    v.dsncff4 = _dsncff4;
+    v.dsncff6 = _dsncff6;
+
+    v.flux  = _flux;
+    v.jnet  = _jnet;
+    v.phis  = _phis;
+    v.reigv = _reigv;
+    v.nxyz  = _nxyz;
+    v.nsurf = _nsurf;
+    return v;
+}
+
+// Capture for offline replay (RASBERY_NODAL_DUMP=<path>): one drive() call's
+// full inputs -- geometry tables, xs rows, the nine constants, jnet/flux --
+// plus every intermediate array and the outputs, raw doubles.  The call index
+// is RASBERY_NODAL_DUMP_CALL (default 5: the first calls run on a rough flux).
+// test/nodal_replay.cpp replays the shared body phase by phase against it.
+static void nodalDumpState(const char* path, const nodal::NodalView& v,
+                           const double* jnet_in) {
+    std::FILE* f = std::fopen(path, "wb");
+    if (!f)
+        return;
+    namespace nk = rasbery::nodal;
+    const std::int64_t hdr[8] = {v.nxyz, v.nsurf, nk::NDIR, nk::NG,
+                                 nk::NEWSB, v.chif_empty, 0, 0};
+    std::fwrite(hdr, sizeof hdr[0], 8, f);
+    std::fwrite(&v.reigv, sizeof(double), 1, f);
+
+    const std::size_t nx = static_cast<std::size_t>(v.nxyz);
+    const std::size_t ns = static_cast<std::size_t>(v.nsurf);
+    std::fwrite(v.lktosfc, sizeof(int), nx * nk::NDIR * nk::NLR, f);
+    std::fwrite(v.neib, sizeof(int), nx * nk::NEWSB, f);
+    std::fwrite(v.lklr, sizeof(int), ns * nk::NLR, f);
+    std::fwrite(v.idirlr, sizeof(int), ns * nk::NLR, f);
+    std::fwrite(v.sgnlr, sizeof(int), ns * nk::NLR, f);
+    std::fwrite(v.hmesh, sizeof(double), nx * nk::NDIR, f);
+    std::fwrite(v.albedo, sizeof(double), nk::NDIR * nk::NLR, f);
+
+    std::fwrite(v.xsrf, sizeof(double), nk::NG * nx, f);
+    std::fwrite(v.xsnf, sizeof(double), nk::NG * nx, f);
+    std::fwrite(v.xssm, sizeof(double), nk::NG2 * nx, f);
+    if (!v.chif_empty)
+        std::fwrite(v.chif, sizeof(double), nk::NG * nx, f);
+
+    const double* consts[9] = {v.eta1, v.eta2, v.m260, v.m251, v.m253,
+                               v.m262, v.m264, v.diagD, v.diagDI};
+    for (const double* c : consts)
+        std::fwrite(c, sizeof(double), nx * nk::NDIR * nk::NG, f);
+
+    std::fwrite(jnet_in, sizeof(double), ns * nk::NG, f);
+    std::fwrite(v.flux, sizeof(double), nx * nk::NG, f);
+
+    // Post-drive state: intermediates then outputs.
+    std::fwrite(v.trlcff0, sizeof(double), nx * nk::NDIR * nk::NG, f);
+    std::fwrite(v.trlcff1, sizeof(double), nx * nk::NDIR * nk::NG, f);
+    std::fwrite(v.trlcff2, sizeof(double), nx * nk::NDIR * nk::NG, f);
+    std::fwrite(v.matMs, sizeof(double), nx * nk::NG2, f);
+    std::fwrite(v.matMf, sizeof(double), nx * nk::NG2, f);
+    std::fwrite(v.matM, sizeof(double), nx * nk::NG2, f);
+    std::fwrite(v.matMI, sizeof(double), nx * nk::NG2, f);
+    std::fwrite(v.mu, sizeof(double), nx * nk::NDIR * nk::NG2, f);
+    std::fwrite(v.tau, sizeof(double), nx * nk::NDIR * nk::NG2, f);
+    std::fwrite(v.dsncff2, sizeof(double), nx * nk::NDIR * nk::NG, f);
+    std::fwrite(v.dsncff4, sizeof(double), nx * nk::NDIR * nk::NG, f);
+    std::fwrite(v.dsncff6, sizeof(double), nx * nk::NDIR * nk::NG, f);
+    std::fwrite(v.jnet, sizeof(double), ns * nk::NG, f);
+    std::fwrite(v.phis, sizeof(double), ns * nk::NG, f);
+    std::fclose(f);
+}
+
 void Nodal::drive() {
+    static const char* dump_path = std::getenv("RASBERY_NODAL_DUMP");
+    static const int   dump_call = [] {
+        const char* v = std::getenv("RASBERY_NODAL_DUMP_CALL");
+        return v ? std::atoi(v) : 5;
+    }();
+    static std::atomic<int>  drive_calls{0};
+    static std::atomic<bool> dump_done{false};
+    std::vector<double>      jnet_snapshot;
+    bool                     dump_this = false;
+    if (dump_path != nullptr && !dump_done.load(std::memory_order_relaxed)) {
+        const int call = drive_calls.fetch_add(1) + 1;
+        if (call == dump_call && !dump_done.exchange(true)) {
+            dump_this = true;
+            jnet_snapshot.assign(_jnet, _jnet + static_cast<std::size_t>(_nsurf) * _ng);
+        }
+    }
+    driveBody();
+    if (dump_this) {
+        nodal::NodalView v = MakeView();
+        nodalDumpState(dump_path, v, jnet_snapshot.data());
+        std::fprintf(stderr, "[RASBERY][NODAL][DUMP] call=%d -> %s\n", dump_call,
+                     dump_path);
+    }
+}
+
+void Nodal::driveBody() {
     // Each per-node / per-surface routine is independent (writes its own node/surface data; reads
     // neighbours only across the implicit barrier between phases). One parallel region with a
     // barrier per phase amortizes fork/join; results are bit-identical (no cross-node reduction).

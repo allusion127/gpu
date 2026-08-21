@@ -519,6 +519,15 @@ public:
     }
     [[nodiscard]] double xssm(const int& igs, const int& ige, const int& l) const { return _xs.xssm[(igs * _g.ng() + ige) * _g.nxyz() + l]; }
 
+    // Raw SoA pointers for the nodal device arm (same arrays the accessors
+    // above index; chif may legitimately be absent).
+    [[nodiscard]] const double* xsrfData() const { return _xs.xsrf.data(); }
+    [[nodiscard]] const double* xsnfData() const { return _xs.xsnf.data(); }
+    [[nodiscard]] const double* xssmData() const { return _xs.xssm.data(); }
+    [[nodiscard]] const double* chifData() const {
+        return _ref_chix.empty() ? nullptr : _ref_chix.data();
+    }
+
     // Microscopic XS accessors: [(iso, group), node]
     [[nodiscard]] double micx(Chiffon::XSTYPE xt, size_t iso, int ig, int l) const {
         const size_t elem = (iso * static_cast<size_t>(_g.ng()) + static_cast<size_t>(ig)) * static_cast<size_t>(_g.nxyz()) + static_cast<size_t>(l);

@@ -161,6 +161,17 @@ if (RASBERY_ENABLE_TESTS)
         target_link_libraries(rasbery_flatxs_replay PRIVATE OpenMP::OpenMP_CXX)
     endif ()
 
+    # Nodal replay gate + per-phase contraction miner (host-only; needs a
+    # RASBERY_NODAL_DUMP capture on disk).
+    add_executable(rasbery_nodal_replay
+            "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_replay.cpp")
+    target_compile_features(rasbery_nodal_replay PRIVATE cxx_std_20)
+    target_include_directories(rasbery_nodal_replay PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    if (NOT MSVC)
+        target_compile_options(rasbery_nodal_replay PRIVATE -march=native -O3)
+    endif ()
+
     # Device arm of the same gate: the CUDA build of the shared body against
     # the same capture, elementwise.  Compiled with --fmad=false exactly like
     # the production TU.
@@ -178,6 +189,23 @@ if (RASBERY_ENABLE_TESTS)
                 CUDA_SEPARABLE_COMPILATION ON)
         set_source_files_properties(
                 "${CMAKE_CURRENT_SOURCE_DIR}/test/flatxs_device_replay.cu"
+                PROPERTIES COMPILE_OPTIONS "--fmad=false")
+    endif ()
+
+    if (RASBERY_ENABLE_CUDA)
+        add_executable(rasbery_nodal_device_replay
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_device_replay.cu")
+        target_compile_features(rasbery_nodal_device_replay PRIVATE cxx_std_20)
+        target_include_directories(rasbery_nodal_device_replay PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(rasbery_nodal_device_replay PRIVATE CUDA::cudart)
+        set_target_properties(rasbery_nodal_device_replay PROPERTIES
+                CUDA_STANDARD 17
+                CUDA_STANDARD_REQUIRED YES
+                CUDA_ARCHITECTURES "${RASBERY_CUDA_ARCHITECTURES}"
+                CUDA_SEPARABLE_COMPILATION ON)
+        set_source_files_properties(
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_device_replay.cu"
                 PROPERTIES COMPILE_OPTIONS "--fmad=false")
     endif ()
 endif ()

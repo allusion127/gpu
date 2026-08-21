@@ -1,6 +1,7 @@
 ﻿#pragma once
 
 #include "Geometry.h"
+#include "NodalKernel.h"
 #include "XSSet.h"
 #include "pch.h"
 
@@ -120,6 +121,8 @@ private:
     /// @brief the reciprocal of eigenvalue
     double _reigv;
 
+    unsigned long long _const_generation = 1;
+
 public:
     /// @brief the maximum number of iteration for updating the fission source shape
     int nmaxswp;
@@ -137,6 +140,17 @@ public:
 
     /// @brief run the nodal calculation and update the net current
     void drive();
+
+    /// Pointer view of this instance's nodal state for the shared kernel body
+    /// (host pointers; the device backend repoints them).
+    nodal::NodalView MakeView();
+
+    /// Advances whenever updateConstant actually recomputed any node, so the
+    /// device copy of the nine coefficient arrays re-uploads only then.
+    unsigned long long const_generation() const { return _const_generation; }
+
+    /// The six solve phases (capture wrapper lives in drive()).
+    void driveBody();
 
     /// @brief update the constant in the nodal calculation
     /// @param lk the node index
