@@ -3845,6 +3845,15 @@ void XSSet::CorrectorStep(double dt, double power, bool xe_transient) {
         const char* m = std::getenv("RASBERY_PC_MODE");
         return m != nullptr && std::string(m) == "decart";
     }();
+    // Isotalo-style corrector substepping (ANE 38 (2011)): split the corrector CRAM solve
+    // into k substeps whose one-group rates are linearly interpolated BOS->EOS at each
+    // substep midpoint.  No extra transport solves.  k=1 (default) takes the original
+    // code path untouched, so both existing PC modes stay bit-identical.
+    static const int pcSubsteps = []() {
+        const char* m = std::getenv("RASBERY_PC_SUBSTEPS");
+        const int   k = (m != nullptr) ? std::atoi(m) : 1;
+        return std::clamp(k, 1, 64);
+    }();
 
     const int           nxyz           = _g.nxyz();
     const int           ng             = _g.ng();
@@ -3890,38 +3899,86 @@ void XSSet::CorrectorStep(double dt, double power, bool xe_transient) {
             if (ws_tls.condensed.size() < condensed_size)
                 ws_tls.condensed.resize(condensed_size, 0.0);
 
-            double raw_sumflux = 0.0;
-            for (int ig = 0; ig < ng; ++ig)
-                raw_sumflux += corrected_flux_tls[ig];
-            const double invflux           = (raw_sumflux > 0.0) ? 1.0 / raw_sumflux : 0.0;
-            const double corrected_sumflux = FluxScale(corrected_flux_tls.data(), ng);
-
             const size_t node = static_cast<size_t>(l);
-            for (size_t iso = 0; iso < niso; ++iso) {
-                double* dst = ws_tls.condensed.data() + iso * N_XS_SCALAR;
-                for (size_t xt = 0; xt < N_XS_SCALAR; ++xt) {
-                    double sum = 0.0;
-                    for (int ig = 0; ig < ng; ++ig) {
-                        const size_t off = (iso * static_cast<size_t>(ng) + static_cast<size_t>(ig)) *
-                                               nxyz_size +
-                                           node;
-                        const double sigma_corrected = pcDensityAverage
-                                                           ? eos_ptrs[xt][off]
-                                                           : 0.5 * (bos_ptrs[xt][off] + eos_ptrs[xt][off]);
-                        sum += sigma_corrected * corrected_flux_tls[ig];
-                    }
-                    dst[xt] = sum * invflux;
-                }
-            }
             for (size_t i = 0; i < niso; ++i)
                 ws_tls.iden[i] = _iden_bos[i * nxyz_size + node];
 
-            BuildTransitionMatrix(ws_tls.condensed, corrected_sumflux, ws_tls.matrix);
-            milk::Solver<double>::solveBatemanCRAM(ws_tls.matrix, ws_tls.iden, dt, ws_tls.iden,
-                                                   ws_tls.cram, CRAM_ORDER, iI135);
+            if (pcSubsteps == 1) {
+                double raw_sumflux = 0.0;
+                for (int ig = 0; ig < ng; ++ig)
+                    raw_sumflux += corrected_flux_tls[ig];
+                const double invflux           = (raw_sumflux > 0.0) ? 1.0 / raw_sumflux : 0.0;
+                const double corrected_sumflux = FluxScale(corrected_flux_tls.data(), ng);
 
-            if (!xe_transient)
-                ApplyXeEquilibrium(ws_tls.iden, ws_tls.condensed, corrected_sumflux);
+                for (size_t iso = 0; iso < niso; ++iso) {
+                    double* dst = ws_tls.condensed.data() + iso * N_XS_SCALAR;
+                    for (size_t xt = 0; xt < N_XS_SCALAR; ++xt) {
+                        double sum = 0.0;
+                        for (int ig = 0; ig < ng; ++ig) {
+                            const size_t off = (iso * static_cast<size_t>(ng) + static_cast<size_t>(ig)) *
+                                                   nxyz_size +
+                                               node;
+                            const double sigma_corrected = pcDensityAverage
+                                                               ? eos_ptrs[xt][off]
+                                                               : 0.5 * (bos_ptrs[xt][off] + eos_ptrs[xt][off]);
+                            sum += sigma_corrected * corrected_flux_tls[ig];
+                        }
+                        dst[xt] = sum * invflux;
+                    }
+                }
+
+                BuildTransitionMatrix(ws_tls.condensed, corrected_sumflux, ws_tls.matrix);
+                milk::Solver<double>::solveBatemanCRAM(ws_tls.matrix, ws_tls.iden, dt, ws_tls.iden,
+                                                       ws_tls.cram, CRAM_ORDER, iI135);
+
+                if (!xe_transient)
+                    ApplyXeEquilibrium(ws_tls.iden, ws_tls.condensed, corrected_sumflux);
+            } else {
+                // Substep chain: k CRAM solves of dt/k each, rates linearly interpolated
+                // BOS->EOS at each substep midpoint.  Applies to both PC modes (in decart
+                // mode the chained result replaces the pure-EOS-rate corrector before the
+                // Eq. (6.20) density average below).
+                static thread_local std::vector<double> sub_flux_tls;
+                if (sub_flux_tls.size() != static_cast<size_t>(ng))
+                    sub_flux_tls.resize(ng);
+                double last_sumflux = 0.0;
+                for (int sub = 0; sub < pcSubsteps; ++sub) {
+                    const double w = (static_cast<double>(sub) + 0.5) / pcSubsteps;
+                    double raw_sumflux = 0.0;
+                    for (int ig = 0; ig < ng; ++ig) {
+                        sub_flux_tls[ig] = (1.0 - w) * _flux_bos[l * ng + ig] * bos_norm +
+                                           w * eos_flux[l * ng + ig] * eos_norm;
+                        raw_sumflux += sub_flux_tls[ig];
+                    }
+                    const double invflux     = (raw_sumflux > 0.0) ? 1.0 / raw_sumflux : 0.0;
+                    const double sub_sumflux = FluxScale(sub_flux_tls.data(), ng);
+                    last_sumflux             = sub_sumflux;
+
+                    for (size_t iso = 0; iso < niso; ++iso) {
+                        double* dst = ws_tls.condensed.data() + iso * N_XS_SCALAR;
+                        for (size_t xt = 0; xt < N_XS_SCALAR; ++xt) {
+                            double sum = 0.0;
+                            for (int ig = 0; ig < ng; ++ig) {
+                                const size_t off = (iso * static_cast<size_t>(ng) + static_cast<size_t>(ig)) *
+                                                       nxyz_size +
+                                                   node;
+                                sum += ((1.0 - w) * bos_ptrs[xt][off] + w * eos_ptrs[xt][off]) *
+                                       sub_flux_tls[ig];
+                            }
+                            dst[xt] = sum * invflux;
+                        }
+                    }
+
+                    BuildTransitionMatrix(ws_tls.condensed, sub_sumflux, ws_tls.matrix);
+                    milk::Solver<double>::solveBatemanCRAM(ws_tls.matrix, ws_tls.iden,
+                                                           dt / pcSubsteps, ws_tls.iden,
+                                                           ws_tls.cram, CRAM_ORDER, iI135);
+                }
+
+                // Xe equilibrium at the final (EOS-nearest) substep rates.
+                if (!xe_transient)
+                    ApplyXeEquilibrium(ws_tls.iden, ws_tls.condensed, last_sumflux);
+            }
 
             // ws_tls.iden now holds the corrector inventory N^C.  In DeCART mode _iden still
             // carries the predictor inventory N^P (PredictorStep wrote it, the transport solve
