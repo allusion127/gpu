@@ -92,7 +92,8 @@ endif ()
 
 # Warnings
 if (MSVC)
-    target_compile_options(RASBERY PRIVATE /W4)
+    # CXX-only: a bare /W4 reaching nvcc is parsed as an input file
+    target_compile_options(RASBERY PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 else ()
     target_compile_options(RASBERY PRIVATE
             -march=native
