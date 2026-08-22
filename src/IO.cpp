@@ -430,6 +430,10 @@ void IO::ParseSchedule(const nlohmann::ordered_json& config) {
                 _s.AddDepletionSchedule(time_days, power_rate, substeps, entry_search,
                                         burnup_increment, use_burnup_time);
                 finalize_entry(_s.schedule().back(), step_index == 0);
+                // MASTER %EXE_DEP tgobj-boron analogue: the entry re-queues itself at
+                // runtime until the converged critical boron reaches this target.
+                if (const auto* v = FirstPresentKey(item, {"until boron ppm", "until_boron_ppm"}))
+                    _s.schedule().back().until_boron_ppm = v->get<double>();
             }
 
         } else if (entry_type == "derivative") {

@@ -692,11 +692,13 @@ public:
         const double init_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - driver_start).count();
         std::cout << std::format("  [TIMING] Init+IO={:.3f} s\n", init_seconds);
 
-        // 3. Main schedule loop
-        double    total_io_seconds = 0.0;
-        const int schedule_count   = static_cast<int>(scheduler.schedule().size());
+        // 3. Main schedule loop.  The bound is re-read every iteration because a
+        // depletion entry carrying until_boron_ppm re-queues itself (natural EOC);
+        // decks without that key never grow the vector, so their path is unchanged.
+        double total_io_seconds    = 0.0;
+        int    natural_eoc_inserts = 0;
 
-        for (int step_index = 0; step_index < schedule_count; ++step_index) {
+        for (int step_index = 0; step_index < static_cast<int>(scheduler.schedule().size()); ++step_index) {
             auto& schedule = scheduler.schedule(step_index);
             const auto step_start = std::chrono::steady_clock::now();
 
@@ -809,6 +811,35 @@ public:
                 input_output.WriteStepToResult(geometry, cross_sections, step_index);
             }
             total_io_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - io_start).count();
+
+            // Natural EOC (MASTER %EXE_DEP tgobj boron): while the converged critical
+            // boron is still above the target, re-queue a copy of this entry right
+            // after it.  When the letdown slope predicts the target falls inside the
+            // next full step, the copy gets the predicted partial time and drops the
+            // flag, so it is FINAL and accepted wherever it lands -- the same one-shot
+            // prediction MASTER uses (600 d @15.11 ppm -> +1.482 d, lands 10.15 ppm).
+            {
+                const Schedule& cur = scheduler.schedule(step_index);
+                if (cur.type == ScheduleType::DEPLETION && cur.until_boron_ppm > 0.0 &&
+                    cur.ppm > cur.until_boron_ppm) {
+                    if (++natural_eoc_inserts > 500)
+                        throw std::runtime_error("natural EOC: boron target not reached within 500 extra steps");
+                    Schedule next = cur;
+                    next.ResetSearchState();
+                    if (step_index > 0 && cur.time > 0.0) {
+                        const double slope = (scheduler.schedule(step_index - 1).ppm - cur.ppm) / cur.time;
+                        if (slope > 1.0e-6) {
+                            const double t_hit = (cur.ppm - cur.until_boron_ppm) / slope;
+                            if (t_hit < cur.time) {
+                                next.time            = std::max(t_hit, 1.0e-3);
+                                next.until_boron_ppm = 0.0;
+                            }
+                        }
+                    }
+                    scheduler.schedule().insert(scheduler.schedule().begin() + step_index + 1,
+                                                std::move(next));
+                }
+            }
         }
 
         if (!light_result)

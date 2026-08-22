@@ -89,6 +89,7 @@ struct Schedule {
 
     // Depletion parameters
     double time            = 0.0;    // time per schedule step [days]
+    double until_boron_ppm = 0.0;    // >0: repeat this depletion entry until critical boron reaches this target (natural EOC)
     double burnup          = 0.0;    // burnup increment per schedule step [MWd/kgHM]
     double rate            = 100.0;  // thermal power rate (%)
     double rated_power     = 4200.0; // rated thermal power for the whole core [MW]
