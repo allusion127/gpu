@@ -923,7 +923,16 @@ public:
             // same-sized core map.
             topology_neighbors = host_neighbors;
 
+            // Greedy BFS graph colouring.  On a bipartite lattice the
+            // smallest-available-colour rule reproduces the historical
+            // red/black parity colouring exactly (same seeds, same queue
+            // order), so existing cores keep a bit-identical sweep.  The
+            // 90-degree rotational quarter-core fold stitches node (0,t) to
+            // node (t,0) -- a same-parity edge that makes the graph
+            // non-bipartite -- and there the greedy rule simply opens a
+            // third (or further) colour instead of refusing the core.
             std::vector<int> host_colors(static_cast<size_t>(nxyz), -1);
+            int              host_ncolors = 1;
             std::queue<int>  frontier;
             for (int seed = 0; seed < nxyz; ++seed) {
                 if (host_colors[seed] >= 0) continue;
@@ -934,16 +943,28 @@ public:
                     frontier.pop();
                     for (int slot = 0; slot < 6; ++slot) {
                         const int neighbor = host_neighbors[6 * l + slot];
-                        if (neighbor < 0) continue;
-                        if (host_colors[neighbor] < 0) {
-                            host_colors[neighbor] = 1 - host_colors[l];
-                            frontier.push(neighbor);
-                        } else if (host_colors[neighbor] == host_colors[l]) {
-                            throw std::runtime_error("CMFD neighbor graph is not bipartite");
+                        if (neighbor < 0 || host_colors[neighbor] >= 0) continue;
+                        unsigned used = 0;
+                        for (int s2 = 0; s2 < 6; ++s2) {
+                            const int nb2 = host_neighbors[6 * neighbor + s2];
+                            if (nb2 >= 0 && host_colors[nb2] >= 0)
+                                used |= 1u << host_colors[nb2];
                         }
+                        int c = 0;
+                        while (used & (1u << c)) ++c;
+                        host_colors[neighbor] = c;
+                        host_ncolors          = std::max(host_ncolors, c + 1);
+                        frontier.push(neighbor);
                     }
                 }
             }
+            for (int l = 0; l < nxyz; ++l)
+                for (int slot = 0; slot < 6; ++slot) {
+                    const int nb = host_neighbors[6 * l + slot];
+                    if (nb >= 0 && host_colors[nb] == host_colors[l])
+                        throw std::runtime_error("CMFD sweep colouring failed: adjacent nodes share a colour");
+                }
+            ncolors = std::max(host_ncolors, 2);
 
             if (const char* sweep_env = std::getenv("RASBERY_GPU_RB_SWEEPS"))
                 rb_sweeps = std::max(0, std::atoi(sweep_env));
@@ -1230,7 +1251,7 @@ public:
             nxyz, vec_stride(), mat_stride(), dinv, b, x, device_halt);
         for (int sweep = 0; sweep < rb_sweeps; ++sweep)
             colored_block_sweep<<<node_grid(), block_size, 0, stream>>>(
-                nxyz, vec_stride(), mat_stride(), cpl_stride(), sweep & 1, colors, neighbors,
+                nxyz, vec_stride(), mat_stride(), cpl_stride(), sweep % ncolors, colors, neighbors,
                 cc, dinv, b, x, device_halt);
     }
 
@@ -1568,6 +1589,7 @@ public:
     int*          colors = nullptr;
     int           block_size = kDefaultBlockSize;
     int           rb_sweeps = 4;
+    int           ncolors   = 2; // sweep colour count (2 = historical red/black; >2 under the rotational fold)
     double *diag = nullptr, *dinv = nullptr, *cc = nullptr, *src = nullptr, *phi = nullptr;
     double *r = nullptr, *r0 = nullptr, *p = nullptr, *v = nullptr, *s = nullptr, *t = nullptr;
     double *y = nullptr, *z = nullptr, *ax = nullptr;
