@@ -1214,6 +1214,47 @@ public:
         return std::max(0.0, fLo + frac * (fHi - fLo));
     }
 
+    /// @brief Corner-to-surface DF consistency ratio (sdfa/pdfa) of the ctype-0
+    /// reference trajectory, burnup-interpolated.  The PPR corner-balance flux is
+    /// a heterogeneous corner estimate; a node whose expansion works in the
+    /// surface-DF-folded (SET) space must rescale it by sdfa/pdfa before use --
+    /// the same physics MASTER carries through its CRADF corner factors.  The
+    /// lattice HGCs write side-uniform factors, so side/corner index 0 is used.
+    /// Returns 1.0 whenever either factor is absent or outside the physical
+    /// window (DeCART emits garbage on zero-current surfaces).
+    [[nodiscard]] double CornerToSurfaceDFRatio(int ig, int burnup) const {
+        auto it = _refr_dpts.find(0);
+        if (it == _refr_dpts.end() || it->second.empty())
+            return 1.0;
+        const auto& bmap = it->second;
+        auto        hi   = bmap.lower_bound(burnup);
+        auto        lo   = hi;
+        if (hi == bmap.end()) {
+            lo = std::prev(bmap.end());
+            hi = lo;
+        } else if (hi == bmap.begin()) {
+            lo = bmap.begin();
+        } else if (hi->first != burnup) {
+            lo = std::prev(hi);
+        }
+        auto ratioOf = [ig](const DepletionPoint& p) {
+            const size_t k = static_cast<size_t>(ig) * 4;
+            if (p._sdfa.size() <= k || p._pdfa.size() <= k)
+                return 1.0;
+            const double sd = p._sdfa[k];
+            const double pd = p._pdfa[k];
+            const bool   ok = sd > 0.05 && sd < 20.0 && pd > 0.05 && pd < 20.0;
+            return ok ? sd / pd : 1.0;
+        };
+        const double rLo = ratioOf(_dpts[lo->second]);
+        const double rHi = ratioOf(_dpts[hi->second]);
+        if (lo == hi || hi->first == lo->first)
+            return rLo;
+        const double frac = static_cast<double>(burnup - lo->first) /
+                            static_cast<double>(hi->first - lo->first);
+        return rLo + frac * (rHi - rLo);
+    }
+
     /// @brief Apply the relative rod-material depletion correction.
     /// @param xs Cross-section state to correct in place.
     /// @param delta Caller-owned scratch cross section.

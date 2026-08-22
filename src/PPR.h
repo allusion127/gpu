@@ -89,6 +89,42 @@ private:
     std::vector<PinQuadInfo> _pin_quad_table;
     bool                     _quad_table_built = false;
 
+    // Corner-DF consistency ratio sdfa/pdfa per (node, group), refreshed in
+    // reset().  The corner-balance phic is a heterogeneous corner-flux estimate;
+    // each node's expansion works in its own surface-DF-folded (SET) space and
+    // must consume rc * phic instead (MASTER: CRADF corner factors).  OFF by
+    // default: the MASTER runs benchmarked against carry no CRADF.INP, so the
+    // correction moves the comparison away from them.  RASBERY_PPR_CRDF=1
+    // enables it for physical-accuracy studies against transport references.
+    std::vector<double> _crdf;
+    bool                _crdf_on = false;
+
+    inline double crdf(int lk, int g) const { return _crdf[static_cast<size_t>(lk) * _ng + g]; }
+
+    // Reconstruction mode.  SENM (historical) iterates a semi-analytic expansion
+    // with source sweeps; MASTER mode is the MASTER 4.0 MM section 6.1 scheme:
+    // a 13-term Legendre interpolant of the nodal solution whose cross terms
+    // come from a corner-point-balance (CPB) linear system (Eq. 6.7/6.8), no
+    // source iteration.  RASBERY_PPR_MODE=master selects it.
+    bool _mode_master = false;
+
+    /// @brief MASTER MM 6.1 reconstruction: fill _c with the 13-term Legendre
+    /// coefficients (even terms from surfaces/currents, cross terms from the
+    /// CPB corner solve).
+    void driveMaster(int niter);
+
+    /// @brief Outward net current at surface lr of node lk, reduced by 2D/h
+    /// (the current unit of MM Eq. 6.6/6.8).
+    inline double getJoutRed(int lr, int dir, int lk, int g) {
+        if (lk < 0 || lk >= _nxyz) return 0.0;
+        const double D = _xs.xsdf(g, lk);
+        if (D <= 0.0) return 0.0;
+        const double h   = _g.hmesh(dir, lk);
+        const double jn  = _jnet[_g.lktosfc(lr, dir, lk) * _ng + g];
+        const double sgn = (lr == RIGHT) ? 1.0 : -1.0;
+        return sgn * jn * h / (2.0 * D);
+    }
+
     void buildQuadratureTable();
 
     /// @brief Fused update: Particular + Homogeneous + ProjectFlux in single pass

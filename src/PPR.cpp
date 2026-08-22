@@ -1,6 +1,8 @@
 #include "PPR.h"
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
+#include <string>
 
 using namespace rasbery;
 
@@ -30,6 +32,21 @@ PPR::PPR(Geometry& g, XSSet& xs)
     : _g(g), _xs(xs) {
     _nxyz = _g.nxyz();
     _ng   = _g.ng();
+
+    // Corner-DF consistency correction (sdfa/pdfa on the corner constraints).
+    // Opt-in: the MASTER benchmarks carry no CRADF.INP, so this is for
+    // physical-accuracy studies, not code-to-code matching.
+    if (const char* e = std::getenv("RASBERY_PPR_CRDF")) {
+        std::string v(e);
+        _crdf_on = (v == "1" || v == "on" || v == "ON" || v == "ratio");
+    }
+    _crdf.assign(static_cast<size_t>(_nxyz) * _ng, 1.0);
+
+    // Reconstruction mode (see PPR.h).
+    if (const char* e = std::getenv("RASBERY_PPR_MODE")) {
+        std::string v(e);
+        _mode_master = (v == "master" || v == "MASTER" || v == "afen");
+    }
 
     // All coefficient arrays are owned by Geometry; just cache pointers.
     _phic = _g.Phic();
@@ -167,6 +184,16 @@ void PPR::reset(const double reigv, double* jnet, double* phif, double* phis) {
     _phif  = phif;
     _phis  = phis;
 
+    // Refresh the per-node corner-DF ratios at the current burnup state.
+    if (_crdf_on) {
+        for (int lk = 0; lk < _nxyz; lk++) {
+            const auto& model = _xs.models()[_xs.comp(lk)];
+            const int   burn  = _xs.burn(lk);
+            for (int g = 0; g < _ng; g++)
+                _crdf[static_cast<size_t>(lk) * _ng + g] = model.CornerToSurfaceDFRatio(g, burn);
+        }
+    }
+
     for (int lk = 0; lk < _nxyz; lk++) {
         for (int g = 0; g < _ng; g++) {
             _hmesh = _g.hmesh(XDIR, lk);
@@ -221,15 +248,20 @@ void PPR::reset(const double reigv, double* jnet, double* phif, double* phis) {
             c(3, 0) = 0.1 * (phis(XDIR, LEFT) - phis(XDIR, RIGHT)) - (0.05 * _hmesh * invD) * (jnet(XDIR, RIGHT) + jnet(XDIR, LEFT));
             c(0, 3) = 0.1 * (phis(YDIR, LEFT) - phis(YDIR, RIGHT)) - (0.05 * _hmesh * invD) * (jnet(YDIR, RIGHT) + jnet(YDIR, LEFT));
 
-            c(2, 2) = aflux + 0.25 * (phic(NE) + phic(NW) + phic(SE) + phic(SW)) - 0.5 * (phis(XDIR, RIGHT) + phis(XDIR, LEFT) + phis(YDIR, RIGHT) + phis(YDIR, LEFT));
+            // The corner-balance phic is heterogeneous; this node's folded (SET)
+            // expansion needs sdfa/pdfa on it (all-1 unless RASBERY_PPR_CRDF on
+            // a library with corner factors).
+            const double rc = crdf(lk, g);
 
-            c(2, 1) = 0.25 * (phic(SE) + phic(SW) - phic(NE) - phic(NW)) + 0.5 * (phis(YDIR, RIGHT) - phis(YDIR, LEFT));
-            c(1, 2) = 0.25 * (phic(SE) - phic(SW) + phic(NE) - phic(NW)) + 0.5 * (phis(XDIR, RIGHT) - phis(XDIR, LEFT));
+            c(2, 2) = aflux + 0.25 * rc * (phic(NE) + phic(NW) + phic(SE) + phic(SW)) - 0.5 * (phis(XDIR, RIGHT) + phis(XDIR, LEFT) + phis(YDIR, RIGHT) + phis(YDIR, LEFT));
+
+            c(2, 1) = 0.25 * rc * (phic(SE) + phic(SW) - phic(NE) - phic(NW)) + 0.5 * (phis(YDIR, RIGHT) - phis(YDIR, LEFT));
+            c(1, 2) = 0.25 * rc * (phic(SE) - phic(SW) + phic(NE) - phic(NW)) + 0.5 * (phis(XDIR, RIGHT) - phis(XDIR, LEFT));
 
             c(2, 0) = 0.7142857143 * (-2 * aflux + phis(XDIR, LEFT) + phis(XDIR, RIGHT)) + (0.03571428571 * _hmesh * invD) * (jnet(XDIR, LEFT) - jnet(XDIR, RIGHT));
             c(0, 2) = 0.7142857143 * (-2 * aflux + phis(YDIR, LEFT) + phis(YDIR, RIGHT)) + (0.03571428571 * _hmesh * invD) * (jnet(YDIR, LEFT) - jnet(YDIR, RIGHT));
 
-            c(1, 1) = 0.25 * (phic(SE) - phic(SW) - phic(NE) + phic(NW));
+            c(1, 1) = 0.25 * rc * (phic(SE) - phic(SW) - phic(NE) + phic(NW));
 
             c(1, 0) = 0.6 * (phis(XDIR, LEFT) - phis(XDIR, RIGHT)) + (0.05 * _hmesh * invD) * (jnet(XDIR, RIGHT) + jnet(XDIR, LEFT));
             c(0, 1) = 0.6 * (phis(YDIR, LEFT) - phis(YDIR, RIGHT)) + (0.05 * _hmesh * invD) * (jnet(YDIR, RIGHT) + jnet(YDIR, LEFT));
@@ -287,11 +319,12 @@ void PPR::updateFused(int lk, int g) {
     double Sp2 = Sp * Sp;
     double Cp2 = Cp * Cp;
 
-    // updateHomogeneous
-    double hFlux_SW = phic(SW) - (p(0, 0) + p(0, 1) + p(0, 2) + p(0, 3) + p(0, 4) - p(1, 0) - p(1, 1) - p(1, 2) - p(1, 3) + p(2, 0) + p(2, 1) + p(2, 2) - p(3, 0) - p(3, 1) + p(4, 0));
-    double hFlux_SE = phic(SE) - (p(0, 0) + p(0, 1) + p(0, 2) + p(0, 3) + p(0, 4) + p(1, 0) + p(1, 1) + p(1, 2) + p(1, 3) + p(2, 0) + p(2, 1) + p(2, 2) + p(3, 0) + p(3, 1) + p(4, 0));
-    double hFlux_NW = phic(NW) - (p(0, 0) - p(0, 1) + p(0, 2) - p(0, 3) + p(0, 4) - p(1, 0) + p(1, 1) - p(1, 2) + p(1, 3) + p(2, 0) - p(2, 1) + p(2, 2) - p(3, 0) + p(3, 1) + p(4, 0));
-    double hFlux_NE = phic(NE) - (p(0, 0) - p(0, 1) + p(0, 2) - p(0, 3) + p(0, 4) + p(1, 0) - p(1, 1) + p(1, 2) - p(1, 3) + p(2, 0) - p(2, 1) + p(2, 2) + p(3, 0) - p(3, 1) + p(4, 0));
+    // updateHomogeneous (rc = corner-DF ratio; see reset())
+    const double rc = crdf(lk, g);
+    double hFlux_SW = rc * phic(SW) - (p(0, 0) + p(0, 1) + p(0, 2) + p(0, 3) + p(0, 4) - p(1, 0) - p(1, 1) - p(1, 2) - p(1, 3) + p(2, 0) + p(2, 1) + p(2, 2) - p(3, 0) - p(3, 1) + p(4, 0));
+    double hFlux_SE = rc * phic(SE) - (p(0, 0) + p(0, 1) + p(0, 2) + p(0, 3) + p(0, 4) + p(1, 0) + p(1, 1) + p(1, 2) + p(1, 3) + p(2, 0) + p(2, 1) + p(2, 2) + p(3, 0) + p(3, 1) + p(4, 0));
+    double hFlux_NW = rc * phic(NW) - (p(0, 0) - p(0, 1) + p(0, 2) - p(0, 3) + p(0, 4) - p(1, 0) + p(1, 1) - p(1, 2) + p(1, 3) + p(2, 0) - p(2, 1) + p(2, 2) - p(3, 0) + p(3, 1) + p(4, 0));
+    double hFlux_NE = rc * phic(NE) - (p(0, 0) - p(0, 1) + p(0, 2) - p(0, 3) + p(0, 4) + p(1, 0) - p(1, 1) + p(1, 2) - p(1, 3) + p(2, 0) - p(2, 1) + p(2, 2) + p(3, 0) - p(3, 1) + p(4, 0));
 
     double hCurr_xl = jnet(XDIR, LEFT) + _2DrH * (p(1, 0) - 3. * p(2, 0) + 6. * p(3, 0) - 10. * p(4, 0));
     double hCurr_xr = jnet(XDIR, RIGHT) + _2DrH * (p(1, 0) + 3. * p(2, 0) + 6. * p(3, 0) + 10. * p(4, 0));
@@ -372,7 +405,136 @@ void PPR::updateFused(int lk, int g) {
             c(i, j) += p(i, j);
 }
 
+// MASTER 4.0 MM section 6.1 reconstruction.  The intranodal shape is a 13-term
+// Legendre interpolant of the nodal solution (Eq. 6.1): even-parity terms follow
+// directly from surface fluxes/currents and the node average (Eq. 6.6); the four
+// cross terms need the corner fluxes, which solve the corner-point-balance
+// system Eq. 6.7 with the per-node leakage Eq. 6.8 -- a diagonally dominant
+// linear system swept with Gauss-Seidel.  No source iteration is involved: the
+// polynomial interpolates the converged nodal solution, it does not re-solve
+// the diffusion equation.  Coefficients land in the shared _c array using the
+// same 15-slot layout the SENM path uses (slots (1,3) and (3,1) stay zero), so
+// reconstructPinPower can evaluate either mode from _c/_p uniformly.
+void PPR::driveMaster(int niter) {
+    constexpr double r10 = 1.0 / 10.0;
+    constexpr double r14 = 1.0 / 14.0;
+
+    // 1. Even-parity coefficients (Eq. 6.2 and the first eight of Eq. 6.6).
+    for (int lk = 0; lk < _nxyz; lk++) {
+        for (int g = 0; g < _ng; g++) {
+            const double pb  = aflux;
+            const double pxr = phis(XDIR, RIGHT), pxl = phis(XDIR, LEFT);
+            const double pyr = phis(YDIR, RIGHT), pyl = phis(YDIR, LEFT);
+            const double jxr = getJoutRed(RIGHT, XDIR, lk, g), jxl = getJoutRed(LEFT, XDIR, lk, g);
+            const double jyr = getJoutRed(RIGHT, YDIR, lk, g), jyl = getJoutRed(LEFT, YDIR, lk, g);
+
+            c(0, 0) = pb;
+            c(1, 0) = r10 * (6.0 * (pxr - pxl) + (jxr - jxl));
+            c(2, 0) = r14 * (10.0 * (pxr + pxl) + (jxr + jxl) - 20.0 * pb);
+            c(3, 0) = -r10 * ((pxr - pxl) + (jxr - jxl));
+            c(4, 0) = -r14 * (3.0 * (pxr + pxl) + (jxr + jxl) - 6.0 * pb);
+            c(0, 1) = r10 * (6.0 * (pyr - pyl) + (jyr - jyl));
+            c(0, 2) = r14 * (10.0 * (pyr + pyl) + (jyr + jyl) - 20.0 * pb);
+            c(0, 3) = -r10 * ((pyr - pyl) + (jyr - jyl));
+            c(0, 4) = -r14 * (3.0 * (pyr + pyl) + (jyr + jyl) - 6.0 * pb);
+            c(1, 3) = 0.0;
+            c(3, 1) = 0.0;
+            c(1, 1) = 0.0;
+            c(1, 2) = 0.0;
+            c(2, 1) = 0.0;
+            c(2, 2) = 0.0;
+        }
+    }
+
+    // 2. CPB Gauss-Seidel sweep on the per-node corner-flux copies.  Every copy
+    // of a shared corner point evaluates the same 4-node balance, so the copies
+    // converge to a common value.  Stencil-position (di,dj): di=0 west of the
+    // corner (its own out-x face is EAST), di=1 east; dj=0 north (out-y SOUTH),
+    // dj=1 south.  Reflection flags flip the logical surface/corner indices the
+    // same way the SENM path's getPhis(RIGHT ^ xrev, ...) pattern does.
+    for (int citer = 0; citer < niter; citer++) {
+        double maxrel = 0.0;
+
+        for (int lk = 0; lk < _nxyz; lk++) {
+            int  idx[3][3];
+            bool xrev[3][3], yrev[3][3];
+            buildStencil(lk, idx, xrev, yrev);
+
+            for (int g = 0; g < _ng; g++) {
+                for (int j = 0; j < 2; j++) {
+                    for (int i = 0; i < 2; i++) {
+                        const int dir = j * 2 + i;
+                        double    num = 0.0;
+                        double    den = 0.0;
+
+                        for (int dj = 0; dj < 2; dj++) {
+                            for (int di = 0; di < 2; di++) {
+                                const int m = idx[i + di][j + dj];
+                                if (m < 0 || m >= _nxyz) continue;
+
+                                const bool xr = xrev[i + di][j + dj];
+                                const bool yr = yrev[i + di][j + dj];
+
+                                const int out_x = ((di == 0) ? RIGHT : LEFT) ^ (xr ? 1 : 0);
+                                const int out_y = ((dj == 0) ? RIGHT : LEFT) ^ (yr ? 1 : 0);
+
+                                const double pox = getPhis(out_x, XDIR, m, g);
+                                const double pix = getPhis(out_x ^ 1, XDIR, m, g);
+                                const double poy = getPhis(out_y, YDIR, m, g);
+                                const double piy = getPhis(out_y ^ 1, YDIR, m, g);
+                                const double jox = getJoutRed(out_x, XDIR, m, g);
+                                const double joy = getJoutRed(out_y, YDIR, m, g);
+                                const double pbm = _phif[m * _ng + g];
+
+                                // Logical corner index of this corner point in node m.
+                                const int icl = ((di == 0) ? 1 : 0) ^ (xr ? 1 : 0);
+                                const int jcl = ((dj == 0) ? 1 : 0) ^ (yr ? 1 : 0);
+                                const int adj1 = jcl * 2 + (1 - icl); // shares the y-edge
+                                const int adj2 = (1 - jcl) * 2 + icl; // shares the x-edge
+                                const double fadj1 = _phic[(m * 4 * _ng) + (g * 4) + adj1];
+                                const double fadj2 = _phic[(m * 4 * _ng) + (g * 4) + adj2];
+
+                                const double w = _xs.xsdf(g, m) / _g.hmesh(XDIR, m);
+                                num += w * (5.0 * (pox + poy) + (pix + piy) + jox + joy - 6.0 * pbm - fadj1 - fadj2);
+                                den += 4.0 * w;
+                            }
+                        }
+                        if (den <= 0.0) continue;
+
+                        const double fnew = num / den;
+                        const double fold = phic(dir);
+                        if (fold != 0.0)
+                            maxrel = std::max(maxrel, std::abs((fnew - fold) / fold));
+                        phic(dir) = fnew;
+                    }
+                }
+            }
+        }
+        if (maxrel < kCornerFluxTolerance) break;
+    }
+
+    // 3. Cross terms from the converged corners (last four of Eq. 6.6).
+    // MM axes: xi=+1 east, eta=+1 south, so phi1=SE, phi2=SW, phi3=NW, phi4=NE.
+    for (int lk = 0; lk < _nxyz; lk++) {
+        for (int g = 0; g < _ng; g++) {
+            const double f1 = phic(SE), f2 = phic(SW), f3 = phic(NW), f4 = phic(NE);
+            const double pxr = phis(XDIR, RIGHT), pxl = phis(XDIR, LEFT);
+            const double pyr = phis(YDIR, RIGHT), pyl = phis(YDIR, LEFT);
+
+            c(1, 1) = 0.25 * (f1 - f2 + f3 - f4);
+            c(1, 2) = 0.25 * (f1 - f2 - f3 + f4 - 2.0 * (pxr - pxl));
+            c(2, 1) = 0.25 * (f1 + f2 - f3 - f4 - 2.0 * (pyr - pyl));
+            c(2, 2) = 0.25 * (f1 + f2 + f3 + f4 - 2.0 * (pxr + pxl + pyr + pyl) + 4.0 * aflux);
+        }
+    }
+}
+
 void PPR::drive(int niter) {
+    if (_mode_master) {
+        driveMaster(std::max(niter, 200));
+        return;
+    }
+
     CornerFluxSums previousCornerFlux;
 
     // 1. Iterate until the corner-flux balance is stable.
@@ -551,6 +713,14 @@ double PPR::phig(int lk, int g, double x, double y) {
     const double Ly[5] = {1.0, y, 0.5 * (3.0 * y2 - 1.0), 0.5 * (5.0 * y2 - 3.0) * y,
                           0.125 * (35.0 * y2 * y2 - 30.0 * y2 + 3.0)};
 
+    if (_mode_master) {
+        double cflux = 0.0;
+        for (int i = 0; i < 5; ++i)
+            for (int j = 0; j < 5 - i; ++j)
+                cflux += c(i, j) * Lx[i] * Ly[j];
+        return cflux;
+    }
+
     double particularFlux = 0.0;
     for (int i = 0; i < 5; ++i)
         for (int j = 0; j < 5 - i; ++j)
@@ -728,6 +898,25 @@ void PPR::reconstructPinPower(bool use_quadrature, bool reconstruct_flux) {
                             if (l < 0) continue;
                             has_valid_node = true;
                             const int lk   = l + nxy * k;
+
+                            if (_mode_master) {
+                                // MASTER mode: pure Legendre interpolant in _c.
+                                for (int g = 0; g < ng; ++g) {
+                                    const double* c_base = &_c[(lk * 15 * _ng) + (g * 15)];
+                                    double        integ  = 0.0;
+                                    for (int qq = 0; qq < 9; ++qq) {
+                                        const auto& qp    = ovl.qpts[qq];
+                                        double      cflux = 0.0;
+                                        for (int t = 0; t < 15; ++t)
+                                            cflux += c_base[t] * qp.leg[t];
+                                        integ += qp.wt * cflux;
+                                    }
+                                    const double flux_contrib = integ * ovl.dx_h * ovl.dy_h * area_coeff;
+                                    hom_flux[g] += flux_contrib;
+                                    power_integral += flux_contrib * _xs.xskf(g, lk);
+                                }
+                                continue;
+                            }
 
                             for (int g = 0; g < ng; ++g) {
                                 const double  bt     = _bt[lk * _ng + g];
