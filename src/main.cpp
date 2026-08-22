@@ -325,7 +325,11 @@ int main(int argc, char* argv[]) {
         // One OpenMP level only: the instance loop is the parallelism. Nested
         // Driver regions reduce the measured GPU rendezvous width and lose
         // aggregate throughput even when total CPU threads are held constant.
+#ifndef _MSC_VER
         omp_set_max_active_levels(1);
+#else
+        omp_set_nested(0); // MSVC omp.h lacks omp_set_max_active_levels; nested-off is the same contract
+#endif
         omp_set_num_threads(host_threads);
 #endif
         std::vector<int> job_status(static_cast<std::size_t>(jobs), 0);

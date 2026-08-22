@@ -869,7 +869,9 @@ void XSSet::Reconstruct() {
                     const double* iden_ptr = _iden.data() + iso * nxyz + ls;
                     double*       dst_ptr  = dst.data() + ig * nxyz + ls;
 
+#ifndef _MSC_VER // MSVC needs -openmp:experimental for simd, which conflicts with the llvm runtime the max-reduction needs
 #pragma omp simd
+#endif
                     for (size_t l = 0; l < len; ++l)
                         dst_ptr[l] += mic_ptr[l] * iden_ptr[l];
                 }
@@ -891,7 +893,9 @@ void XSSet::Reconstruct() {
                         const double* iden_ptr = _iden.data() + iso * nxyz + ls;
                         double*       dst_ptr  = dst.data() + (igs * ng + ige) * nxyz + ls;
 
+#ifndef _MSC_VER // MSVC needs -openmp:experimental for simd, which conflicts with the llvm runtime the max-reduction needs
 #pragma omp simd
+#endif
                         for (size_t l = 0; l < len; ++l)
                             dst_ptr[l] += mic_ptr[l] * iden_ptr[l];
                     }
@@ -903,7 +907,9 @@ void XSSet::Reconstruct() {
         for (int ig = 0; ig < ng; ++ig) {
             double* xstf_ptr = _xs.xstf.data() + ig * nxyz + ls;
             double* xsdf_ptr = _xs.xsdf.data() + ig * nxyz + ls;
+#ifndef _MSC_VER // MSVC needs -openmp:experimental for simd, which conflicts with the llvm runtime the max-reduction needs
 #pragma omp simd
+#endif
             for (size_t l = 0; l < len; ++l) {
                 double tr   = xstf_ptr[l];
                 xsdf_ptr[l] = (tr > 1.0e-30) ? 0.333333333333333 / tr : 0.0;
@@ -914,13 +920,17 @@ void XSSet::Reconstruct() {
         for (int igs = 0; igs < ng; ++igs) {
             double*       xsrf_ptr = _xs.xsrf.data() + igs * nxyz + ls;
             const double* xsaf_ptr = _xs.xsaf.data() + igs * nxyz + ls;
+#ifndef _MSC_VER // MSVC needs -openmp:experimental for simd, which conflicts with the llvm runtime the max-reduction needs
 #pragma omp simd
+#endif
             for (size_t l = 0; l < len; ++l)
                 xsrf_ptr[l] = xsaf_ptr[l];
 
             for (int ige = 0; ige < ng; ++ige) {
                 const double* sm_ptr = _xs.xssm.data() + (igs * ng + ige) * nxyz + ls;
+#ifndef _MSC_VER // MSVC needs -openmp:experimental for simd, which conflicts with the llvm runtime the max-reduction needs
 #pragma omp simd
+#endif
                 for (size_t l = 0; l < len; ++l)
                     xsrf_ptr[l] += sm_ptr[l];
             }
@@ -2207,7 +2217,9 @@ void XSSet::UpdateUnroddedNodeXS(int l) {
         for (int t = 0; t < N_ACTIVE_XT; ++t) {
             const double* cdata = coeff_micx[ACTIVE_XT[t]];
             double*       dst   = bm + static_cast<size_t>(t) * nmic;
+#ifndef _MSC_VER // MSVC needs -openmp:experimental for simd, which conflicts with the llvm runtime the max-reduction needs
 #pragma omp simd
+#endif
             for (size_t e = 0; e < nmic; ++e) {
                 double val = cdata[(base + nord - 1) * nmic + e];
                 for (int p = nord - 2; p >= 0; --p)
@@ -2215,7 +2227,9 @@ void XSSet::UpdateUnroddedNodeXS(int l) {
                 dst[e] += scale * val;
             }
         }
+#ifndef _MSC_VER // MSVC needs -openmp:experimental for simd, which conflicts with the llvm runtime the max-reduction needs
 #pragma omp simd
+#endif
         for (size_t e = 0; e < nmsm; ++e) {
             double val = coeff_micx_sm[(base + nord - 1) * nmsm + e];
             for (int p = nord - 2; p >= 0; --p)

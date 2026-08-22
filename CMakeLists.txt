@@ -55,10 +55,18 @@ add_executable(RASBERY ${RASBERY_SOURCES})
 target_compile_features(RASBERY PRIVATE cxx_std_20)
 
 target_include_directories(RASBERY PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/src"
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
         "${CMAKE_CURRENT_SOURCE_DIR}/include/chiffon"
 )
+# src/ is deliberately NOT an include dir on Windows: MSVC searches /I dirs for
+# angle includes too, and the case-insensitive filesystem makes plog's CRT
+# `#include <io.h>` resolve to src/IO.h, poisoning every downstream header.
+# Quoted includes between src files resolve includer-relative, so src/*.cpp
+# never needed the dir; non-MSVC keeps it for the .cu separable-compilation
+# path parity with the historical build.
+if (NOT MSVC)
+    target_include_directories(RASBERY PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+endif ()
 
 if (TARGET HDF5::HDF5)
     target_link_libraries(RASBERY PRIVATE HDF5::HDF5)
