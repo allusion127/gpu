@@ -947,7 +947,10 @@ public:
                         unsigned used = 0;
                         for (int s2 = 0; s2 < 6; ++s2) {
                             const int nb2 = host_neighbors[6 * neighbor + s2];
-                            if (nb2 >= 0 && host_colors[nb2] >= 0)
+                            // A self-edge (the centre node's rotational closure maps its
+                            // west/north face onto itself) constrains nothing: the sweep's
+                            // self term reads the node's own previous iterate.
+                            if (nb2 >= 0 && nb2 != neighbor && host_colors[nb2] >= 0)
                                 used |= 1u << host_colors[nb2];
                         }
                         int c = 0;
@@ -961,7 +964,7 @@ public:
             for (int l = 0; l < nxyz; ++l)
                 for (int slot = 0; slot < 6; ++slot) {
                     const int nb = host_neighbors[6 * l + slot];
-                    if (nb >= 0 && host_colors[nb] == host_colors[l])
+                    if (nb >= 0 && nb != l && host_colors[nb] == host_colors[l])
                         throw std::runtime_error("CMFD sweep colouring failed: adjacent nodes share a colour");
                 }
             ncolors = std::max(host_ncolors, 2);
