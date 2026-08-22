@@ -774,7 +774,19 @@ public:
 
             // PPR
             pin_power_reconstruction.reset(1.0 / eigv, geometry.Jnet(), geometry.Phif(), geometry.Phis());
-            pin_power_reconstruction.drive(5);
+            // Corner-balance iteration cap.  The loop exits early on its own
+            // corner-flux tolerance; measured on KNGR CY1 it needs ~50 rounds,
+            // and the historical cap of 5 shipped an unconverged reconstruction
+            // (pin power vs MASTER: 4.76% rms at cap 5 -> 0.84% converged, with
+            // identical results from 50 to 200).  The cap is a safety bound, so
+            // set it far above the measured need; cost is ~0.1 s per printed
+            // statepoint.  RASBERY_PPR_ITERS overrides for studies.
+            static const int ppr_iters = []() {
+                const char* e = std::getenv("RASBERY_PPR_ITERS");
+                const int   v = e ? std::atoi(e) : 100;
+                return v > 0 ? v : 100;
+            }();
+            pin_power_reconstruction.drive(ppr_iters);
             // MASTER reports pin-volume-averaged reconstructed power.  A pin-centre
             // sample biases Fq high once intra-node curvature grows during burnup,
             // so use the precomputed 3x3 Gauss-Legendre pin-area integration.
