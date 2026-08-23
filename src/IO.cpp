@@ -1191,10 +1191,12 @@ void IO::AddResult(Geometry& g, double keff,
     {
         static const std::string xeKey = "541350";
         static const std::string smKey = "621490";
+        static const std::string gdKey = "640000";
         bool                     hasXe = Chiffon::Isotope::iidx.count(xeKey) > 0;
         bool                     hasSm = Chiffon::Isotope::iidx.count(smKey) > 0;
+        bool                     hasGd = Chiffon::Isotope::iidx.count(gdKey) > 0;
 
-        double xe_s = 0, xe_v = 0, sm_s = 0, sm_v = 0;
+        double xe_s = 0, xe_v = 0, sm_s = 0, sm_v = 0, gd_s = 0, gd_v = 0;
         double xe_bot = 0, xe_bv = 0, xe_top = 0, xe_tv = 0;
         double sm_bot = 0, sm_bv = 0, sm_top = 0, sm_tv = 0;
         for (int k = kbc; k < kec; ++k) {
@@ -1245,10 +1247,15 @@ void IO::AddResult(Geometry& g, double keff,
                         sm_tv += vol * ft;
                     }
                 }
+                if (hasGd) {
+                    gd_s += _xs.iden(Chiffon::Isotope::iidx.at(gdKey), lk) * vol;
+                    gd_v += vol;
+                }
             }
         }
         d.xe_avg    = (xe_v > 0.0) ? xe_s / xe_v : 0.0;
         d.sm_avg    = (sm_v > 0.0) ? sm_s / sm_v : 0.0;
+        d.gd_avg    = (gd_v > 0.0) ? gd_s / gd_v : 0.0;
         double xe_b = (xe_bv > 0) ? xe_bot / xe_bv : 0;
         double xe_t = (xe_tv > 0) ? xe_top / xe_tv : 0;
         d.xe_ao     = (xe_b + xe_t > 0) ? (xe_t - xe_b) / (xe_b + xe_t) : 0;
@@ -1840,7 +1847,7 @@ void IO::CloseResult() {
     std::vector<int>    steps;
     std::vector<double> efpd, bu_avg, ppm, keff, reactivity;
     std::vector<double> ao, asi, fqn, frn, fqp, frp;
-    std::vector<double> xe_avg, xe_ao, sm_avg, sm_ao;
+    std::vector<double> xe_avg, xe_ao, sm_avg, sm_ao, gd_avg;
     std::vector<double> tf_avg, tf_max, tm_avg, tm_max, dm_avg, dm_max;
     std::vector<double> rod_step;
     // Critical-search termination quality, per step.  search_status is the SearchExit enum
@@ -1879,6 +1886,7 @@ void IO::CloseResult() {
         xe_avg.push_back(d.xe_avg);
         xe_ao.push_back(d.xe_ao);
         sm_avg.push_back(d.sm_avg);
+        gd_avg.push_back(d.gd_avg);
         sm_ao.push_back(d.sm_ao);
         tf_avg.push_back(d.tf_avg);
         tf_max.push_back(d.tf_max);
@@ -1909,6 +1917,7 @@ void IO::CloseResult() {
         sum.createDataSet("xe_ao", xe_ao);
         sum.createDataSet("sm_avg", sm_avg);
         sum.createDataSet("sm_ao", sm_ao);
+        sum.createDataSet("gd_avg", gd_avg);
         sum.createDataSet("tf_avg", tf_avg);
         sum.createDataSet("tf_max", tf_max);
         sum.createDataSet("tm_avg", tm_avg);

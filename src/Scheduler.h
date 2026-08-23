@@ -200,6 +200,7 @@ struct Schedule {
     double xe_ao  = 0.0; // Xe-135 axial offset
     double sm_avg = 0.0; // Sm-149 average number density [at/b-cm]
     double sm_ao  = 0.0; // Sm-149 axial offset
+    double gd_avg = 0.0; // lumped-Gd ("640000") average number density [at/b-cm]
 
     // 4. Thermal-hydraulics parameters
     double tf_avg = 0.0; // volume-averaged fuel temperature [K]
