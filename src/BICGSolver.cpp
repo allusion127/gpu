@@ -108,7 +108,10 @@ BICGSolver::~BICGSolver() {
         << c.stream_sync_calls_during_iteration << ','
         << "\"graph_launches\":" << c.graph_launches << ','
         << "\"graph_reinstantiations\":" << c.graph_reinstantiations << ','
-        << "\"graph_fallbacks\":" << c.graph_fallbacks
+        << "\"graph_fallbacks\":" << c.graph_fallbacks << ','
+        << "\"iter_batch\":" << c.iter_batch << ','
+        << "\"batched_graph_launches\":" << c.batched_graph_launches << ','
+        << "\"overrun_iterations\":" << c.overrun_iterations
         << "}" << std::endl;
 }
 

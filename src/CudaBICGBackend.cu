@@ -72,6 +72,9 @@ enum CounterSlot : int {
     kRestartCount = 0,
     kEarlyExitCount,
     kSolveCount,
+    /// Captured iterations that found `halt` already raised and did nothing.
+    /// Appended last so the existing slot indices are untouched.
+    kOverrunCount,
     kCounterSlots
 };
 
@@ -115,6 +118,67 @@ void cublas_check(cublasStatus_t value, const char* expression) {
 // inactive-slot mask: initialize_solver_state seeds it with 1 for every slot
 // that is not taking part in this launch, so those slots' kernels retire on
 // their first instruction while the participating slots run untouched.
+//
+// ---- On "batch K iterations per graph launch" -----------------------------
+//
+// That optimisation is what the paragraph above already describes, and the
+// counters say so: `graph_launches` counts CMFD SWEEPS, not iterations, and
+// `iter_batch` is the 1 + nmax iterations each of those launches carries (4 on
+// KNGR).  There is no per-iteration launch or per-iteration status D2H left to
+// remove -- status_d2h_calls == graph_launches, one per sweep.
+//
+// Going DEEPER than 1 + nmax is possible (RASBERY_GPU_ITER_BATCH) and is
+// provably inert, because the last budgeted iteration raises the halt itself
+// and the gating below makes the rest no-ops.  It is also measurably a loss:
+// on KNGR, K = 8 executes 432 704 no-op iterations, returns a bit-identical
+// h5, and costs +8.7 s of 84.9 s.  The batching crossover the literature
+// points at was passed when the inner loop was first captured; past it, the
+// extra graph nodes are dispatched whether or not they do anything.
+//
+// What is left at the sweep boundary is host work, not launch latency: the
+// Wielandt update and updls run on the CPU between sweeps, so the stream must
+// drain every sweep.  Removing that drain means moving those to the device --
+// which is RASBERY_GPU_CMFD_SWEEP (enqueue_sweeps), today reachable only
+// through the batch arena.
+//
+// ---- On the cost that IS left: per-node dispatch ---------------------------
+//
+// With one launch and one status D2H per sweep, what remains is the graph's
+// own per-node dispatch: on KNGR the captured outer was 117 nodes (7 prologue
+// + 4 iterations x 27 + finalize + the status copy) for a 17 000-unknown
+// system whose arithmetic is ~10 us, and the launch measured ~449 us.  The
+// lever is therefore the NODE COUNT, and the only safe way to lower it is to
+// concatenate adjacent elementwise kernels over the same index domain: two
+// loop bodies run back to back over the same i is bit-identical to two kernels
+// run back to back over the same i, by construction.
+//
+// What was fused, and the count it bought (nmax = 3, rb_sweeps = 4):
+//
+//   prologue   7 -> 5   begin_outer_fused = invert + A*phi + initial residual
+//   iteration 27 -> 22  prepare_p + block_jacobi  -> prepare_p_jacobi
+//                       update_s  + block_jacobi  -> update_s_jacobi
+//                       (s.t) and (t.t)           -> one dot2 pair
+//                       the iter_flags memset node -> two existing scalar
+//                       kernels (initialize_solver_state / accumulate_iteration)
+//   outer    117 -> 95  (kernel+memset nodes 116 -> 94)
+//
+// What was deliberately NOT fused, and why:
+//
+//   * the colour sweeps.  Each reads x at NEIGHBOURING nodes, so it depends on
+//     the previous sweep across the whole grid; the kernel boundary is that
+//     barrier and the colour order is the Gauss-Seidel semantics.  Collapsing
+//     them needs a cooperative grid.sync(), which is a different (and much
+//     less local) argument than "same loop, same i" -- 8 of the remaining 22
+//     nodes sit here if anyone wants to make it.
+//   * anything through a reduction.  reduce_dot_stage1/2 keep their exact
+//     two-stage structure, partition and fold order.  dot2 is not an exception
+//     to that rule: it runs two INDEPENDENT reductions side by side, each with
+//     the partition and tree it had alone.
+//   * accumulate_iteration into the trailing stage2, and store_reference_norm
+//     into the prologue stage2.  Both are one-thread scalar kernels with the
+//     same launch geometry as their stage2, so they would fuse cleanly, but
+//     they gate on `active` where stage2 gates on `halt` -- and the difference
+//     between those two guards is exactly where the over-run telemetry lives.
 // ---------------------------------------------------------------------------
 #define HALT_GUARD(halt) \
     if (*(halt) != 0u) return
@@ -199,29 +263,93 @@ __global__ void reduce_dot_stage2(const int blocks,
     scalars[static_cast<long long>(m) * kScalarCount + slot] = take_sqrt ? sqrt(sum) : sum;
 }
 
-__global__ void invert_two_group_blocks(const int nxyz,
-                                        const long long mat_stride,
-                                        const double* __restrict__ diag,
-                                        double* __restrict__ dinv,
-                                        const std::uint32_t* __restrict__ halt) {
+// ---------------------------------------------------------------------------
+// TWO reductions in one pair of nodes.
+//
+// This is NOT a change to any reduction: it is two INDEPENDENT dot products
+// evaluated side by side in one kernel.  Each keeps its own accumulator, its
+// own shared array, the same `chunk` partition (a pure function of n and
+// gridDim.x, untouched below), the same per-thread traversal order, the same
+// fixed binary tree and the same strict index-order stage-2 fold.  Nothing is
+// re-associated and no operand pairing moves, so both results are bit-for-bit
+// what the two separate launches produced -- the only thing that disappears
+// is two graph nodes' worth of dispatch.
+//
+// Used for the (s.t, t.t) pair, the only two adjacent dots in a BiCGSTAB
+// iteration with no kernel between them.
+// ---------------------------------------------------------------------------
+__global__ void reduce_dot2_stage1(const int n,
+                                   const long long vec_stride,
+                                   const double* __restrict__ a0,
+                                   const double* __restrict__ b0,
+                                   const double* __restrict__ a1,
+                                   const double* __restrict__ b1,
+                                   double* __restrict__ partial0,
+                                   double* __restrict__ partial1,
+                                   const std::uint32_t* __restrict__ halt) {
     const int m = static_cast<int>(blockIdx.y);
     HALT_GUARD(halt + m);
-    const int l = blockIdx.x * blockDim.x + threadIdx.x;
-    if (l >= nxyz) return;
+    __shared__ double shared0[kReduceThreads];
+    __shared__ double shared1[kReduceThreads];
 
-    const double* dm = diag + m * mat_stride;
-    double*       im = dinv + m * mat_stride;
+    const double* a0m = a0 + m * vec_stride;
+    const double* b0m = b0 + m * vec_stride;
+    const double* a1m = a1 + m * vec_stride;
+    const double* b1m = b1 + m * vec_stride;
+    double*       p0m = partial0 + static_cast<long long>(m) * kMaxReduceBlocks;
+    double*       p1m = partial1 + static_cast<long long>(m) * kMaxReduceBlocks;
 
-    const double a00  = dm[4 * l + 0];
-    const double a01  = dm[4 * l + 1];
-    const double a10  = dm[4 * l + 2];
-    const double a11  = dm[4 * l + 3];
-    const double rdet = 1.0 / (a00 * a11 - a10 * a01);
+    // Identical to reduce_dot_stage1: depends only on (n, gridDim.x).
+    const int chunk = (n + static_cast<int>(gridDim.x) - 1) / static_cast<int>(gridDim.x);
+    const int begin = static_cast<int>(blockIdx.x) * chunk;
+    const int end   = min(begin + chunk, n);
 
-    im[4 * l + 0] = rdet * a11;
-    im[4 * l + 1] = -rdet * a01;
-    im[4 * l + 2] = -rdet * a10;
-    im[4 * l + 3] = rdet * a00;
+    double sum0 = 0.0;
+    double sum1 = 0.0;
+    for (int i = begin + static_cast<int>(threadIdx.x); i < end;
+         i += static_cast<int>(blockDim.x)) {
+        sum0 += a0m[i] * b0m[i];
+        sum1 += a1m[i] * b1m[i];
+    }
+
+    shared0[threadIdx.x] = sum0;
+    shared1[threadIdx.x] = sum1;
+    __syncthreads();
+
+    for (int stride = kReduceThreads / 2; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride) {
+            shared0[threadIdx.x] += shared0[threadIdx.x + stride];
+            shared1[threadIdx.x] += shared1[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        p0m[blockIdx.x] = shared0[0];
+        p1m[blockIdx.x] = shared1[0];
+    }
+}
+
+__global__ void reduce_dot2_stage2(const int blocks,
+                                   const double* __restrict__ partial0,
+                                   const double* __restrict__ partial1,
+                                   double* __restrict__ scalars,
+                                   const int slot0,
+                                   const int slot1,
+                                   const std::uint32_t* __restrict__ halt) {
+    if (threadIdx.x != 0) return;
+    const int m = static_cast<int>(blockIdx.y);
+    HALT_GUARD(halt + m);
+    const double* p0m = partial0 + static_cast<long long>(m) * kMaxReduceBlocks;
+    const double* p1m = partial1 + static_cast<long long>(m) * kMaxReduceBlocks;
+    double sum0 = 0.0;
+    double sum1 = 0.0;
+    for (int i = 0; i < blocks; ++i) {   // strict index order, one per reduction
+        sum0 += p0m[i];
+        sum1 += p1m[i];
+    }
+    scalars[static_cast<long long>(m) * kScalarCount + slot0] = sum0;
+    scalars[static_cast<long long>(m) * kScalarCount + slot1] = sum1;
 }
 
 __global__ void matvec_two_group(const int nxyz,
@@ -262,35 +390,125 @@ __global__ void matvec_two_group(const int nxyz,
     ym[2 * l + 1] = y1;
 }
 
-__global__ void initial_residual(const int n,
-                                 const long long vec_stride,
-                                 const double* __restrict__ src,
-                                 const double* __restrict__ ax,
-                                 double* __restrict__ r,
-                                 double* __restrict__ r0,
-                                 double* __restrict__ p,
-                                 double* __restrict__ v,
-                                 const std::uint32_t* __restrict__ halt) {
+// ---------------------------------------------------------------------------
+// FUSED: invert_two_group_blocks + matvec_two_group(phi -> ax) + initial_residual.
+//
+// Three former nodes, one index domain.  The vector-domain step folds in
+// because the two-group layout is node-major: element i = 2*l + ig belongs to
+// node l, so thread l of the node grid owns exactly the two elements the
+// vector grid gave two threads.  n == ng*nxyz == 2*nxyz is checked once in the
+// constructor, so the coverage is exact.
+//
+// Why no intermediate has another consumer:
+//   * dinv   -- written here, first read by the colour sweeps, i.e. after the
+//               next kernel boundary.  The block inversion is INDEPENDENT of
+//               the other two steps (it reads diag, writes dinv, and neither
+//               of the others touches dinv), so concatenating it is a pure
+//               node saving with no ordering question at all.
+//   * ax     -- written by the matvec, read only by the residual, and read
+//               only at the SAME node the writing thread owns.  No thread
+//               reads another thread's ax, so no grid-wide ordering is needed
+//               and the register value is the stored value.  ax is still
+//               written to memory: the sweep path reuses it as scratch.
+//
+// Bit-identity: every expression below is copied verbatim from the three
+// kernels it replaces, so nvcc makes the same contraction decisions on the
+// same operands (this TU compiles with the default --fmad, which is exactly
+// why the text must not drift).  `src - y0` substitutes the register for a
+// load of the double just stored there -- the same bits by definition.
+//
+// Gating: one HALT_GUARD stands in for the three identical ones.
+// ---------------------------------------------------------------------------
+__global__ void begin_outer_fused(const int nxyz,
+                                  const long long vec_stride,
+                                  const long long mat_stride,
+                                  const long long cpl_stride,
+                                  const int* __restrict__ neighbors,
+                                  const double* __restrict__ diag,
+                                  const double* __restrict__ cc,
+                                  const double* __restrict__ x,
+                                  const double* __restrict__ src,
+                                  double* __restrict__ dinv,
+                                  double* __restrict__ ax,
+                                  double* __restrict__ r,
+                                  double* __restrict__ r0,
+                                  double* __restrict__ p,
+                                  double* __restrict__ v,
+                                  const std::uint32_t* __restrict__ halt) {
     const int m = static_cast<int>(blockIdx.y);
     HALT_GUARD(halt + m);
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const long long base = m * vec_stride;
-    const double value   = src[base + i] - ax[base + i];
-    r[base + i]          = value;
-    r0[base + i]         = value;
-    p[base + i]          = 0.0;
-    v[base + i]          = 0.0;
+    const int l = blockIdx.x * blockDim.x + threadIdx.x;
+    if (l >= nxyz) return;
+
+    const double* dm = diag + m * mat_stride;
+
+    // ---- invert_two_group_blocks ----
+    {
+        double* im = dinv + m * mat_stride;
+
+        const double a00  = dm[4 * l + 0];
+        const double a01  = dm[4 * l + 1];
+        const double a10  = dm[4 * l + 2];
+        const double a11  = dm[4 * l + 3];
+        const double rdet = 1.0 / (a00 * a11 - a10 * a01);
+
+        im[4 * l + 0] = rdet * a11;
+        im[4 * l + 1] = -rdet * a01;
+        im[4 * l + 2] = -rdet * a10;
+        im[4 * l + 3] = rdet * a00;
+    }
+
+    // ---- matvec_two_group(x = phi -> y = ax) ----
+    const double* cm = cc + m * cpl_stride;
+    const double* xm = x + m * vec_stride;
+    double*       ym = ax + m * vec_stride;
+
+    const double x0 = xm[2 * l + 0];
+    const double x1 = xm[2 * l + 1];
+    double       y0 = dm[4 * l + 0] * x0 + dm[4 * l + 1] * x1;
+    double       y1 = dm[4 * l + 2] * x0 + dm[4 * l + 3] * x1;
+
+#pragma unroll
+    for (int slot = 0; slot < 6; ++slot) {
+        const int neighbor = neighbors[6 * l + slot];
+        if (neighbor >= 0) {
+            y0 += cm[12 * l + slot] * xm[2 * neighbor + 0];
+            y1 += cm[12 * l + 6 + slot] * xm[2 * neighbor + 1];
+        }
+    }
+
+    ym[2 * l + 0] = y0;
+    ym[2 * l + 1] = y1;
+
+    // ---- initial_residual over this node's two elements ----
+    const long long base   = m * vec_stride;
+    const double    value0 = src[base + 2 * l + 0] - y0;
+    const double    value1 = src[base + 2 * l + 1] - y1;
+    r[base + 2 * l + 0]    = value0;
+    r0[base + 2 * l + 0]   = value0;
+    p[base + 2 * l + 0]    = 0.0;
+    v[base + 2 * l + 0]    = 0.0;
+    r[base + 2 * l + 1]    = value1;
+    r0[base + 2 * l + 1]   = value1;
+    p[base + 2 * l + 1]    = 0.0;
+    v[base + 2 * l + 1]    = 0.0;
 }
 
 __global__ void initialize_solver_state(double* scalars,
                                         std::uint32_t* flags,
                                         std::uint32_t* halt,
                                         std::uint32_t* counters,
+                                        std::uint32_t* iter_flags,
                                         const std::uint32_t* __restrict__ active,
                                         const std::uint32_t* __restrict__ sweep_halt) {
     if (threadIdx.x != 0) return;
     const int m = static_cast<int>(blockIdx.y);
+
+    // Half of what the per-iteration cudaMemsetAsync(iter_flags) node used to
+    // do; the other half is the re-zero at the end of accumulate_iteration.
+    // Written for EVERY slot, participating or not, before the mask below --
+    // so this is byte for byte the memset's effect at the top of the outer.
+    iter_flags[m] = 0u;
 
     // The one place the participation mask enters the device: every later
     // kernel only ever consults `halt`, exactly as it did before batching.
@@ -325,21 +543,46 @@ __global__ void store_reference_norm(double* scalars,
     sm[kR20]   = sm[kInitialNorm];
 }
 
-__global__ void prepare_p(const int n,
-                         const long long vec_stride,
-                         double* scalars,
-                         std::uint32_t* flags,
-                         const double* __restrict__ r,
-                         const double* __restrict__ v,
-                         double* __restrict__ p,
-                         const std::uint32_t* __restrict__ halt) {
+// ---------------------------------------------------------------------------
+// FUSED: prepare_p + block_jacobi(b = p, x = y).
+//
+// block_jacobi is the DIAGONAL solve that opens the preconditioner chain: it
+// reads b only at its own node (bm[2l+0], bm[2l+1]) and dinv only at its own
+// node.  It therefore has no cross-thread dependency on its producer, which is
+// what makes this fusion legal where fusing the colour sweeps is not -- those
+// read x at NEIGHBOURING nodes and need the grid-wide barrier that a kernel
+// boundary provides.
+//
+// p has no other consumer between the two: the colour sweeps that follow read
+// b = p at their own node only (again no neighbour read of b), and the next
+// iteration's prepare_p reads the stored p, which this still writes.
+//
+// The arithmetic per element and per node is verbatim the two originals, so
+// the contraction pattern nvcc picks is unchanged; b0/b1 are the registers
+// holding the doubles just stored to p, i.e. the same bits block_jacobi used
+// to load back.  The atomicOr is idempotent, so folding n element-threads into
+// nxyz node-threads leaves `flags` at the same value.
+// ---------------------------------------------------------------------------
+__global__ void prepare_p_jacobi(const int nxyz,
+                                 const long long vec_stride,
+                                 const long long mat_stride,
+                                 double* scalars,
+                                 std::uint32_t* flags,
+                                 const double* __restrict__ dinv,
+                                 const double* __restrict__ r,
+                                 const double* __restrict__ v,
+                                 double* __restrict__ p,
+                                 double* __restrict__ y,
+                                 const std::uint32_t* __restrict__ halt) {
     const int m = static_cast<int>(blockIdx.y);
     HALT_GUARD(halt + m);
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
+    const int l = blockIdx.x * blockDim.x + threadIdx.x;
+    if (l >= nxyz) return;
 
     const double*  sm   = scalars + static_cast<long long>(m) * kScalarCount;
     const long long base = m * vec_stride;
+    const int       i0   = 2 * l + 0;
+    const int       i1   = 2 * l + 1;
 
     const double rho_new = sm[kRhoNew];
     const double rho_old = sm[kRho];
@@ -348,6 +591,7 @@ __global__ void prepare_p(const int n,
     const double denom   = rho_old * omega;
     const bool breakdown = !isfinite(rho_new) || !isfinite(denom) ||
                            fabs(denom) < 1.0e-30;
+    double b0, b1;
     if (breakdown) {
         // Restart convention (matches what the CPU reference effectively does
         // by carrying on with a degenerate beta): drop the Krylov direction
@@ -355,33 +599,22 @@ __global__ void prepare_p(const int n,
         // rho, alpha and omega from scratch, so the state self-heals.  The
         // flag is reported for telemetry, it is no longer fatal.
         atomicOr(flags + m, static_cast<std::uint32_t>(BICGSTAB_BREAKDOWN));
-        p[base + i] = r[base + i];
+        b0 = r[base + i0];
+        b1 = r[base + i1];
     } else {
         const double beta = rho_new * alpha / denom;
-        p[base + i] = r[base + i] + beta * (p[base + i] - omega * v[base + i]);
+        b0 = r[base + i0] + beta * (p[base + i0] - omega * v[base + i0]);
+        b1 = r[base + i1] + beta * (p[base + i1] - omega * v[base + i1]);
     }
-}
+    p[base + i0] = b0;
+    p[base + i1] = b1;
 
-__global__ void block_jacobi(const int nxyz,
-                             const long long vec_stride,
-                             const long long mat_stride,
-                             const double* __restrict__ dinv,
-                             const double* __restrict__ b,
-                             double* __restrict__ x,
-                             const std::uint32_t* __restrict__ halt) {
-    const int m = static_cast<int>(blockIdx.y);
-    HALT_GUARD(halt + m);
-    const int l = blockIdx.x * blockDim.x + threadIdx.x;
-    if (l >= nxyz) return;
-
+    // ---- block_jacobi(b = p, x = y) ----
     const double* im = dinv + m * mat_stride;
-    const double* bm = b + m * vec_stride;
-    double*       xm = x + m * vec_stride;
+    double*       xm = y + m * vec_stride;
 
-    const double b0 = bm[2 * l + 0];
-    const double b1 = bm[2 * l + 1];
-    xm[2 * l + 0]   = im[4 * l + 0] * b0 + im[4 * l + 1] * b1;
-    xm[2 * l + 1]   = im[4 * l + 2] * b0 + im[4 * l + 3] * b1;
+    xm[2 * l + 0] = im[4 * l + 0] * b0 + im[4 * l + 1] * b1;
+    xm[2 * l + 1] = im[4 * l + 2] * b0 + im[4 * l + 3] * b1;
 }
 
 __global__ void colored_block_sweep(const int nxyz,
@@ -421,21 +654,40 @@ __global__ void colored_block_sweep(const int nxyz,
     xm[2 * l + 1] = im[4 * l + 2] * b0 + im[4 * l + 3] * b1;
 }
 
-__global__ void update_s(const int n,
-                         const long long vec_stride,
-                         double* scalars,
-                         std::uint32_t* flags,
-                         const double* __restrict__ r,
-                         const double* __restrict__ v,
-                         double* __restrict__ s,
-                         const std::uint32_t* __restrict__ halt) {
+// ---------------------------------------------------------------------------
+// FUSED: update_s + block_jacobi(b = s, x = z).  Same argument as
+// prepare_p_jacobi: the diagonal solve reads only its own node's b.
+//
+// s has no other consumer before the next kernel boundary; afterwards the
+// colour sweeps (own-node b), the (s.t) dot and update_solution all read the
+// stored s, which this still writes.
+//
+// The three exits of the original are branches here rather than returns,
+// because the diagonal solve ran unconditionally as its own kernel and must
+// keep doing so.  Each branch computes the SAME expression the original ran
+// for that element, and `i == 0` becomes `l == 0` restricted to the first of
+// the node's two elements -- which is what element i = 0 was.
+// ---------------------------------------------------------------------------
+__global__ void update_s_jacobi(const int nxyz,
+                                const long long vec_stride,
+                                const long long mat_stride,
+                                double* scalars,
+                                std::uint32_t* flags,
+                                const double* __restrict__ dinv,
+                                const double* __restrict__ r,
+                                const double* __restrict__ v,
+                                double* __restrict__ s,
+                                double* __restrict__ z,
+                                const std::uint32_t* __restrict__ halt) {
     const int m = static_cast<int>(blockIdx.y);
     HALT_GUARD(halt + m);
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
+    const int l = blockIdx.x * blockDim.x + threadIdx.x;
+    if (l >= nxyz) return;
 
     double*         sm   = scalars + static_cast<long long>(m) * kScalarCount;
     const long long base = m * vec_stride;
+    const int       i0   = 2 * l + 0;
+    const int       i1   = 2 * l + 1;
 
     // A BICGSTAB_BREAKDOWN flag means prepare_p restarted with p = r; the
     // rest of the step is still well defined and must run so that rho, alpha
@@ -443,30 +695,41 @@ __global__ void update_s(const int n,
     // solver in the same degenerate state on every subsequent call.
     const double rho = sm[kRhoNew];
     const double r0v = sm[kR0V];
+    double b0, b1;
     if (!isfinite(rho) || !isfinite(r0v)) {
         atomicOr(flags + m, static_cast<std::uint32_t>(NONFINITE_DETECTED));
-        s[base + i] = r[base + i];
-        return;
+        b0 = r[base + i0];
+        b1 = r[base + i1];
+    } else {
+        // rho is committed unconditionally, exactly like the CPU reference
+        // (BICGSolver::solve assigns _crho before the |r0.v| test).  Leaving it
+        // stale here poisons beta = rho_new*alpha/(rho_old*omega) on the next
+        // call.  alpha stays untouched on the early exit, again as on the CPU.
+        if (l == 0) sm[kRho] = rho;
+
+        // The legacy CPU solver treats a finite, near-orthogonal r0.v as a
+        // successful no-op. Preserve that convergence behavior explicitly
+        // instead of misclassifying it as a fatal BiCGSTAB breakdown.
+        if (fabs(r0v) < 1.0e-10) {
+            atomicOr(flags + m, static_cast<std::uint32_t>(FLUX_CONVERGED));
+            b0 = r[base + i0];
+            b1 = r[base + i1];
+        } else {
+            const double alpha = rho / r0v;
+            b0 = r[base + i0] - alpha * v[base + i0];
+            b1 = r[base + i1] - alpha * v[base + i1];
+            if (l == 0) sm[kAlpha] = alpha;
+        }
     }
+    s[base + i0] = b0;
+    s[base + i1] = b1;
 
-    // rho is committed unconditionally, exactly like the CPU reference
-    // (BICGSolver::solve assigns _crho before the |r0.v| test).  Leaving it
-    // stale here poisons beta = rho_new*alpha/(rho_old*omega) on the next
-    // call.  alpha stays untouched on the early exit, again as on the CPU.
-    if (i == 0) sm[kRho] = rho;
+    // ---- block_jacobi(b = s, x = z) ----
+    const double* im = dinv + m * mat_stride;
+    double*       xm = z + m * vec_stride;
 
-    // The legacy CPU solver treats a finite, near-orthogonal r0.v as a
-    // successful no-op. Preserve that convergence behavior explicitly
-    // instead of misclassifying it as a fatal BiCGSTAB breakdown.
-    if (fabs(r0v) < 1.0e-10) {
-        atomicOr(flags + m, static_cast<std::uint32_t>(FLUX_CONVERGED));
-        s[base + i] = r[base + i];
-        return;
-    }
-
-    const double alpha = rho / r0v;
-    s[base + i] = r[base + i] - alpha * v[base + i];
-    if (i == 0) sm[kAlpha] = alpha;
+    xm[2 * l + 0] = im[4 * l + 0] * b0 + im[4 * l + 1] * b1;
+    xm[2 * l + 1] = im[4 * l + 2] * b0 + im[4 * l + 3] * b1;
 }
 
 __global__ void update_solution(const int n,
@@ -518,19 +781,48 @@ __global__ void update_solution(const int n,
 /// telemetry, and -- for every iteration except the first, which the CPU
 /// reference also runs unconditionally -- apply the relative exit test.
 __global__ void accumulate_iteration(const int allow_halt,
+                                     const int force_halt,
                                      const double* __restrict__ scalars,
-                                     const std::uint32_t* __restrict__ iter_flags,
+                                     std::uint32_t* iter_flags,
                                      std::uint32_t* sticky_flags,
                                      std::uint32_t* counters,
-                                     std::uint32_t* halt) {
+                                     std::uint32_t* halt,
+                                     const std::uint32_t* __restrict__ active) {
     if (threadIdx.x != 0) return;
     const int m = static_cast<int>(blockIdx.y);
-    HALT_GUARD(halt + m);
+    // A slot that is not taking part in this launch never had an iteration to
+    // over-run; it is masked exactly as the HALT_GUARD used to mask it.
+    if (active[m] == 0u) return;
 
     const double*  sm  = scalars + static_cast<long long>(m) * kScalarCount;
     std::uint32_t* cm  = counters + static_cast<long long>(m) * kCounterSlots;
 
+    // This is where the HALT_GUARD used to sit.  Splitting it out is what
+    // makes the over-run visible: every kernel of this iteration returned on
+    // its first instruction, so nothing in the solver state moved, and the
+    // only thing left to do is say so.  The counter is telemetry -- no other
+    // kernel and no host decision reads it -- so the numerical trajectory is
+    // byte for byte the one the plain HALT_GUARD produced.
+    if (halt[m] != 0u) {
+        ++cm[kOverrunCount];
+        return;
+    }
+
     const std::uint32_t flags = iter_flags[m];
+    // The other half of the retired per-iteration cudaMemsetAsync node: arm
+    // the scratch word for the NEXT captured iteration, here rather than in a
+    // memset node of its own.  Placed immediately after the read, so it holds
+    // on every exit below.
+    //
+    // The paths that skip it are exactly the paths on which nobody reads it
+    // again: `active == 0` (the slot never runs a kernel of this launch) and
+    // `halt != 0` (halt is monotone within an outer -- only this kernel sets
+    // it and only initialize_solver_state clears it -- so every later
+    // iteration returns here before the read, and the only writers of
+    // iter_flags are HALT_GUARDed).  initialize_solver_state zeroes the word
+    // for every slot at the top of each outer, which covers the first
+    // iteration and re-arms a slot whose previous outer halted.
+    iter_flags[m] = 0u;
     const double        ptt   = sm[kPtt];
     const double        rnorm = sm[kInitialNorm];
 
@@ -552,10 +844,18 @@ __global__ void accumulate_iteration(const int allow_halt,
         halt[m] = 1u;
         return;
     }
-    if (allow_halt == 0) return;
-
-    const double r20 = sm[kR20];
-    if (r20 <= 0.0 || rnorm / r20 < sm[kEps]) halt[m] = 1u;
+    if (allow_halt != 0) {
+        const double r20 = sm[kR20];
+        if (r20 <= 0.0 || rnorm / r20 < sm[kEps]) halt[m] = 1u;
+    }
+    // The algorithmic budget is `1 + nmax` iterations -- the host loop stopped
+    // there whether or not the residual test had fired.  When the graph
+    // captures MORE than that (RASBERY_GPU_ITER_BATCH > 1 + nmax), the last
+    // budgeted iteration raises the halt itself, which is what makes every
+    // extra captured iteration provably inert instead of silently deepening
+    // the inner solve.  With the default batch this argument is always 0 and
+    // the kernel behaves exactly as before.
+    if (force_halt != 0) halt[m] = 1u;
 }
 
 __global__ void finalize_status(const double* scalars,
@@ -590,7 +890,7 @@ __global__ void finalize_status(const double* scalars,
     status[m].dhat_update_max = unavailable;
     status[m].search_residual = unavailable;
     status[m].flags           = sticky;
-    status[m].outer_iter      = 0;
+    status[m].outer_iter      = cm[kOverrunCount];
     status[m].linear_iter     = cm[kSolveCount];
     // Reused as transport for the device-side tallies: the batched inner loop
     // no longer stops on the host, so these can only come back this way.
@@ -882,6 +1182,15 @@ public:
             status = "CUDA backend currently requires a two-group, six-neighbor CMFD system";
             return;
         }
+        // The fused kernels walk the vector domain from the NODE grid: thread
+        // l owns elements 2*l and 2*l+1 of a node-major two-group vector.  The
+        // coverage is exact only when n is exactly twice nxyz, so make the
+        // assumption a checked precondition rather than an implication of the
+        // ng == 2 test above.
+        if (n != 2 * nxyz) {
+            status = "CUDA backend requires ngxyz == 2 * nxyz for the node-major two-group layout";
+            return;
+        }
         if (slots < 1) {
             status = "CUDA batch arena needs at least one slot";
             return;
@@ -973,9 +1282,16 @@ public:
                 rb_sweeps = std::max(0, std::atoi(sweep_env));
             if (const char* graph_env = std::getenv("RASBERY_GPU_GRAPH"))
                 use_graph = std::string(graph_env) != "0";
+            if (const char* batch_env = std::getenv("RASBERY_GPU_ITER_BATCH")) {
+                const int requested = std::atoi(batch_env);
+                if (requested > 0) iter_batch_request = requested;
+            }
             status += " (block=" + std::to_string(block_size) +
                       ", RB sweeps=" + std::to_string(rb_sweeps) +
                       ", graph=" + (use_graph ? "on" : "off") +
+                      ", iter batch=" +
+                      (iter_batch_request > 0 ? std::to_string(iter_batch_request)
+                                              : std::string("auto")) +
                       ", slots=" + std::to_string(slots) + ")";
 
             const size_t S = static_cast<size_t>(slots);
@@ -1005,6 +1321,11 @@ public:
             allocate(reinterpret_cast<void**>(&z), vec_bytes);
             allocate(reinterpret_cast<void**>(&ax), vec_bytes);
             allocate(reinterpret_cast<void**>(&partials),
+                     S * static_cast<size_t>(kMaxReduceBlocks) * sizeof(double));
+            // Second landing pad so the paired (s.t, t.t) reduction can keep
+            // one partial array per dot product -- same layout, same stride,
+            // so each dot's stage-2 fold is the identical strict index walk.
+            allocate(reinterpret_cast<void**>(&partials2),
                      S * static_cast<size_t>(kMaxReduceBlocks) * sizeof(double));
             allocate(reinterpret_cast<void**>(&scalars), S * kScalarCount * sizeof(double));
             allocate(reinterpret_cast<void**>(&device_flags), S * sizeof(std::uint32_t));
@@ -1068,6 +1389,7 @@ public:
         cudaFree(z);
         cudaFree(ax);
         cudaFree(partials);
+        cudaFree(partials2);
         cudaFree(scalars);
         cudaFree(device_flags);
         cudaFree(iter_flags);
@@ -1093,6 +1415,7 @@ public:
         colors = nullptr;
         diag = dinv = cc = src = phi = r = r0 = p = v = s = t = y = z = ax = nullptr;
         partials = nullptr;
+        partials2 = nullptr;
         scalars = nullptr;
         device_flags = nullptr;
         iter_flags = nullptr;
@@ -1249,9 +1572,31 @@ public:
             blocks, partials, scalars, scalar_slot, take_sqrt, device_halt);
     }
 
-    void precondition(const double* b, double* x) {
-        block_jacobi<<<node_grid(), block_size, 0, stream>>>(
-            nxyz, vec_stride(), mat_stride(), dinv, b, x, device_halt);
+    /// Two independent dots over the same n in ONE pair of nodes.  See
+    /// reduce_dot2_stage1: this is not a fused reduction, it is two reductions
+    /// riding in one kernel with their own accumulators, their own partial
+    /// arrays and the same partition each had alone.
+    void dot2(const double* a0, const double* b0, int scalar_slot0,
+              const double* a1, const double* b1, int scalar_slot1) {
+        const int blocks = reduce_blocks_for(n);
+        reduce_dot2_stage1<<<dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(slots)),
+                             kReduceThreads, 0, stream>>>(
+            n, vec_stride(), a0, b0, a1, b1, partials, partials2, device_halt);
+        reduce_dot2_stage2<<<scalar_grid(), 1, 0, stream>>>(
+            blocks, partials, partials2, scalars, scalar_slot0, scalar_slot1, device_halt);
+    }
+
+    /// The COLOUR SWEEPS of the block-Jacobi preconditioner.
+    ///
+    /// The diagonal solve that used to open this chain (block_jacobi) is now
+    /// fused into whichever kernel produces `b` -- prepare_p_jacobi for
+    /// (p -> y), update_s_jacobi for (s -> z).  It could move because it reads
+    /// b only at its own node; the sweeps below cannot, because each reads x
+    /// at NEIGHBOURING nodes and therefore depends on the previous sweep's
+    /// writes across the whole grid.  The kernel boundary IS that barrier, and
+    /// the colour order is the Gauss-Seidel semantics, so this loop stays
+    /// exactly as it was.
+    void precondition_sweeps(const double* b, double* x) {
         for (int sweep = 0; sweep < rb_sweeps; ++sweep)
             colored_block_sweep<<<node_grid(), block_size, 0, stream>>>(
                 nxyz, vec_stride(), mat_stride(), cpl_stride(), sweep % ncolors, colors, neighbors,
@@ -1260,25 +1605,36 @@ public:
 
     /// One BiCGSTAB iteration.  `allow_halt` is 0 only for the first one,
     /// which the CPU reference also runs before testing anything.
-    void enqueue_iteration(int allow_halt) {
-        CUDA_CHECK(cudaMemsetAsync(
-            iter_flags, 0, static_cast<size_t>(slots) * sizeof(std::uint32_t), stream));
+    /// `force_halt` is 1 only on the last iteration of the algorithmic budget
+    /// when the capture is deeper than that budget (see enqueue_outer).
+    void enqueue_iteration(int allow_halt, int force_halt = 0) {
+        // The per-iteration cudaMemsetAsync(iter_flags) node is gone: its two
+        // halves now live in initialize_solver_state (arm at the top of the
+        // outer) and at the end of accumulate_iteration (re-arm for the next
+        // captured iteration).  Both are one-thread-per-slot writes of the
+        // same word at the same points in stream order, so the scratch flags
+        // every reader sees are the ones the memset produced -- see the
+        // argument at the re-arm site.
         dot(r0, r, kRhoNew);
-        prepare_p<<<vector_grid(), block_size, 0, stream>>>(
-            n, vec_stride(), scalars, iter_flags, r, v, p, device_halt);
-        precondition(p, y);
+        prepare_p_jacobi<<<node_grid(), block_size, 0, stream>>>(
+            nxyz, vec_stride(), mat_stride(), scalars, iter_flags, dinv, r, v, p, y,
+            device_halt);
+        precondition_sweeps(p, y);
         matvec_two_group<<<node_grid(), block_size, 0, stream>>>(
             nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag, cc, y, v, device_halt);
 
         dot(r0, v, kR0V);
-        update_s<<<vector_grid(), block_size, 0, stream>>>(
-            n, vec_stride(), scalars, iter_flags, r, v, s, device_halt);
-        precondition(s, z);
+        update_s_jacobi<<<node_grid(), block_size, 0, stream>>>(
+            nxyz, vec_stride(), mat_stride(), scalars, iter_flags, dinv, r, v, s, z,
+            device_halt);
+        precondition_sweeps(s, z);
         matvec_two_group<<<node_grid(), block_size, 0, stream>>>(
             nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag, cc, z, t, device_halt);
 
-        dot(s, t, kPts);
-        dot(t, t, kPtt);
+        // s.t and t.t are the only two adjacent dots with no kernel between
+        // them; one stage-1/stage-2 pair carries both, each with its own
+        // accumulator and partial array.
+        dot2(s, t, kPts, t, t, kPtt);
 
         update_solution<<<vector_grid(), block_size, 0, stream>>>(
             n, vec_stride(), scalars, iter_flags, y, z, s, t, phi, r, device_halt);
@@ -1287,7 +1643,22 @@ public:
         // is what the CPU publishes there too).
         dot(r, r, kInitialNorm, /*take_sqrt=*/true);
         accumulate_iteration<<<scalar_grid(), 1, 0, stream>>>(
-            allow_halt, scalars, iter_flags, device_flags, device_counters, device_halt);
+            allow_halt, force_halt, scalars, iter_flags, device_flags, device_counters,
+            device_halt, device_active);
+    }
+
+    /// How many BiCGSTAB iterations one graph launch carries.
+    ///
+    /// The default is the algorithmic budget itself: the inner loop is ALREADY
+    /// a single graph of `1 + nmax` iterations, so the per-iteration launch and
+    /// sync cost the batching literature targets is already amortised here --
+    /// `graph_launches` counts CMFD sweeps, not iterations.  K only ever
+    /// *raises* the capture depth, never lowers it: a shallower capture would
+    /// under-iterate, which the correctness contract forbids outright, so a
+    /// too-small K is clamped rather than honoured.
+    [[nodiscard]] int captured_iterations(int nmax) const {
+        const int algorithmic = 1 + nmax;
+        return iter_batch_request > algorithmic ? iter_batch_request : algorithmic;
     }
 
     /// The whole outer: initial residual, then 1 + nmax BiCGSTAB iterations of
@@ -1296,20 +1667,32 @@ public:
     /// operands in the same order.
     void enqueue_outer(int nmax) {
         initialize_solver_state<<<scalar_grid(), 1, 0, stream>>>(
-            scalars, device_flags, device_halt, device_counters, device_active,
-            sweep_halt);
-        invert_two_group_blocks<<<node_grid(), block_size, 0, stream>>>(
-            nxyz, mat_stride(), diag, dinv, device_halt);
-        matvec_two_group<<<node_grid(), block_size, 0, stream>>>(
-            nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag, cc, phi, ax,
-            device_halt);
-        initial_residual<<<vector_grid(), block_size, 0, stream>>>(
-            n, vec_stride(), src, ax, r, r0, p, v, device_halt);
+            scalars, device_flags, device_halt, device_counters, iter_flags,
+            device_active, sweep_halt);
+        // One node for what used to be three: the block inversion (independent
+        // of the other two), the A*phi matvec and the residual it feeds.
+        begin_outer_fused<<<node_grid(), block_size, 0, stream>>>(
+            nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag, cc, phi,
+            src, dinv, ax, r, r0, p, v, device_halt);
         dot(r, r, kInitialNorm, /*take_sqrt=*/true);
         store_reference_norm<<<scalar_grid(), 1, 0, stream>>>(scalars, device_halt);
 
-        enqueue_iteration(/*allow_halt=*/0);
-        for (int i = 0; i < nmax; ++i) enqueue_iteration(/*allow_halt=*/1);
+        // The algorithmic budget is `1 + nmax`; the capture may be deeper.
+        // Iteration `algorithmic - 1` then raises the halt itself, so every
+        // captured iteration past the budget finds halt set, returns on its
+        // first instruction in every kernel, and is counted as an over-run.
+        const int algorithmic = 1 + nmax;
+        const int captured    = captured_iterations(nmax);
+        for (int i = 0; i < captured; ++i)
+            enqueue_iteration(/*allow_halt=*/i == 0 ? 0 : 1,
+                              /*force_halt=*/(i == algorithmic - 1 && captured > algorithmic)
+                                  ? 1
+                                  : 0);
+        // A property of the capture, not a tally: assigned, never accumulated.
+        // Set here rather than at launch so it is right on the graph-off path
+        // too, where there is no launch to hang it off.
+        iter_batch_used      = captured;
+        telemetry.iter_batch = static_cast<std::uint64_t>(captured);
 
         finalize_status<<<scalar_grid(), 1, 0, stream>>>(
             scalars, device_flags, device_counters, device_status, device_active);
@@ -1346,6 +1729,19 @@ public:
                 // 3-argument form: the legacy (errorNode, logBuffer, size)
                 // overload is gone in CUDA 13, which the 238 server builds with.
                 rc = cudaGraphInstantiate(&graph_exec, graph, 0ull);
+            // The number this whole fusion exercise is about, measured rather
+            // than counted by hand.  Off by default (one stderr line would
+            // otherwise land in every log that parses this one); capture is
+            // rare enough -- graph_reinstantiations is 0 on a normal run --
+            // that the query costs nothing when it is on.
+            if (rc == cudaSuccess && graph != nullptr &&
+                std::getenv("RASBERY_GPU_GRAPH_NODES") != nullptr) {
+                size_t node_count = 0;
+                if (cudaGraphGetNodes(graph, nullptr, &node_count) == cudaSuccess)
+                    std::cerr << "[RASBERY][CUDA][GRAPH_NODES] {\"nmax\":" << nmax
+                              << ",\"captured_iterations\":" << iter_batch_used
+                              << ",\"nodes\":" << node_count << "}" << std::endl;
+            }
             if (graph != nullptr) cudaGraphDestroy(graph);
             if (rc != cudaSuccess) {
                 // Capture is a pure optimisation; a driver that refuses it
@@ -1371,6 +1767,10 @@ public:
         }
         CUDA_CHECK(cudaGraphLaunch(graph_exec, stream));
         ++telemetry.graph_launches;
+        // Counted only alongside a real graph launch, so the invariant
+        // `batched_graph_launches <= graph_launches` holds on every path --
+        // including graph-off and post-fallback, where there is no launch.
+        if (iter_batch_used >= 2) ++telemetry.batched_graph_launches;
     }
 
     // -----------------------------------------------------------------------
@@ -1443,6 +1843,7 @@ public:
         }
         CUDA_CHECK(cudaGraphLaunch(sweep_graph_exec, stream));
         ++telemetry.graph_launches;
+        if (iter_batch_used >= 2) ++telemetry.batched_graph_launches;
     }
 
     /// H2D for one sweep batch.  chif/vol mirror away their (rare/never)
@@ -1558,6 +1959,7 @@ public:
             telemetry.cmfd_gpu_calls += host_status[m].flux_gen;
             telemetry.bicg_restarts += host_status[m].material_gen;
             telemetry.bicg_early_convergence_exits += host_status[m].operator_gen;
+            telemetry.overrun_iterations += host_status[m].outer_iter;
             // A non-finite flux is THAT instance's failure, not the batch's:
             // recorded per slot here, thrown from the owning thread on its way
             // out of solve().  The old batch-fatal throw took every batch-mate
@@ -1597,6 +1999,7 @@ public:
     double *r = nullptr, *r0 = nullptr, *p = nullptr, *v = nullptr, *s = nullptr, *t = nullptr;
     double *y = nullptr, *z = nullptr, *ax = nullptr;
     double*        partials = nullptr;
+    double*        partials2 = nullptr;
     double*        scalars = nullptr;
     std::uint32_t* device_flags = nullptr;
     std::uint32_t* iter_flags = nullptr;
@@ -1609,6 +2012,12 @@ public:
     BackendCounters telemetry{};
     std::vector<Slot> slot;
     bool          use_graph = true;
+    /// RASBERY_GPU_ITER_BATCH: requested iterations per graph launch.  0 =
+    /// unset = follow the algorithmic budget (today's behaviour, and the only
+    /// setting for which the capture depth is exactly `1 + nmax`).
+    int           iter_batch_request = 0;
+    /// What the last capture actually carried.
+    int           iter_batch_used = 0;
     cudaGraphExec_t graph_exec = nullptr;
     int           graph_nmax = -1;
 
@@ -2140,7 +2549,10 @@ void rasberyReleaseBatchArena() {
               << ','
               << "\"graph_launches\":" << c.graph_launches << ','
               << "\"graph_reinstantiations\":" << c.graph_reinstantiations << ','
-              << "\"graph_fallbacks\":" << c.graph_fallbacks << '}' << std::endl;
+              << "\"graph_fallbacks\":" << c.graph_fallbacks << ','
+              << "\"iter_batch\":" << c.iter_batch << ','
+              << "\"batched_graph_launches\":" << c.batched_graph_launches << ','
+              << "\"overrun_iterations\":" << c.overrun_iterations << '}' << std::endl;
     g_arena.reset();
 }
 

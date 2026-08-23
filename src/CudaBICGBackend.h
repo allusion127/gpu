@@ -32,6 +32,9 @@ struct alignas(64) DeviceSolveStatus {
     double search_residual;
 
     std::uint32_t flags;
+    /// Reused as transport for the device-side tally of captured iterations
+    /// that executed past the halt and were therefore no-ops.  The linear
+    /// solver has no outer-iteration count of its own to report here.
     std::uint32_t outer_iter;
     std::uint32_t linear_iter;
     std::uint32_t material_gen;
@@ -68,6 +71,18 @@ struct BackendCounters {
     std::uint64_t graph_launches                       = 0;
     std::uint64_t graph_reinstantiations               = 0;
     std::uint64_t graph_fallbacks                      = 0;
+    /// Inner BiCGSTAB iterations captured into ONE graph launch -- the K of
+    /// the iteration-batching knob (RASBERY_GPU_ITER_BATCH).  0 until the
+    /// first launch; otherwise `max(1 + nmax, K)`.
+    std::uint64_t iter_batch                           = 0;
+    /// Graph launches that carried more than one captured iteration, i.e. the
+    /// launches over which the per-iteration launch+sync cost was amortised.
+    std::uint64_t batched_graph_launches               = 0;
+    /// Captured iterations that ran after the device halt was raised and were
+    /// therefore no-ops.  This is the direct evidence that the halt gating is
+    /// complete: it is nonzero on every run where the inner loop converges
+    /// early, and the accepted solution is unchanged by those iterations.
+    std::uint64_t overrun_iterations                   = 0;
 };
 
 /**
@@ -108,6 +123,10 @@ public:
     /// unconditional iteration and `nmax` conditional ones -- as a single
     /// replayed CUDA graph.  The relative exit test `||r||/||r0|| < eps` runs
     /// on the device, so the host neither observes nor steers the loop.
+    ///
+    /// One call is therefore one graph launch and one status D2H carrying
+    /// `1 + nmax` batched iterations; RASBERY_GPU_ITER_BATCH can capture more
+    /// than that (inertly, see the counters), never fewer.
     void solveInner(int nmax, double eps);
 
     /// Drain the stream once per outer: fetch the flux and the status packet
