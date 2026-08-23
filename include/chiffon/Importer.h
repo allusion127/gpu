@@ -1739,6 +1739,9 @@ private:
                 blockData >> nden;
 
                 double weight = gdWeight.contains(rawIso) ? gdWeight.at(rawIso) : 0.0;
+                if (std::getenv("RASBERY_GD_DEBUG"))
+                    std::fprintf(stderr, "[GDDBG] raw=%s nden=%.4E w=%.1f before=%.4E\n",
+                                 rawIso.c_str(), nden, weight, dpnt.iden("640000"));
                 // N_eff += w_i * N_i
                 dpnt.iden("640000") += weight * nden;
 

@@ -197,11 +197,43 @@ PY
   [ $? -ne 0 ] && fail=1
 }
 
+# ---------------------------------------------------------------------------
+# Tier 3 -- whole-output golden h5diff on the CPU arm (adopted from the rev00
+# tree's regression, where it caught PPR/isotopic regressions Tier 2's
+# keff/rod-only check passes silently).  CPU-only (RASBERY_GPU=0), so the
+# byte-identity objection to h5diff does not apply; /summary/reactivity is
+# excluded because its OpenMP reduction order is thread-count dependent.
+# Record with: GOLDEN=<dir> .regress.sh --tier 3 (missing golden = record)
+# ---------------------------------------------------------------------------
+tier3() {
+  echo "=== T3: CPU golden h5diff (whole output) ==="
+  command -v h5diff >/dev/null || { note SKIP "h5diff not on PATH"; return; }
+  local golden="${GOLDEN:-$ROOT/test/7_i-SMR_Validation/.golden_cpu}"
+  local deck_dir="$ROOT/test/7_i-SMR_Validation"
+  local w="$OUT/golden"; rm -rf "$w"; mkdir -p "$w"
+  cp "$deck_dir"/i-SMR_CY01.json "$w/" 2>/dev/null || { note SKIP "deck missing"; return; }
+  cp "${IISC_CORE_LIB:-$ROOT/test/CrossSections/i-SMR_Validation.h5}" "$w/i-SMR_Validation.h5" 2>/dev/null || {
+    note SKIP "core library not found (set IISC_CORE_LIB=)"; return; }
+  ( cd "$w" && RASBERY_GPU=0 "$BIN" --rasi i-SMR_CY01.json --raso out_CY01.h5 ) > "$w/log.txt" 2>&1
+  if [ ! -f "$golden/out_CY01.h5" ]; then
+    mkdir -p "$golden"; cp "$w/out_CY01.h5" "$golden/"
+    note RECORD "golden recorded at $golden"; return
+  fi
+  if h5diff -q -p 1e-9 --exclude-path /summary/reactivity \
+        "$golden/out_CY01.h5" "$w/out_CY01.h5" > "$w/h5diff.txt" 2>&1; then
+    note PASS "CY01 whole-output identical to golden (p<=1e-9)"
+  else
+    note FAIL "CY01 differs from golden -- see $w/h5diff.txt"
+    fail=1
+  fi
+}
+
 case "$TIER" in
   0) tier0 ;;
   1) tier1 ;;
   2) tier2 ;;
-  all) tier0; tier1; tier2 ;;
+  3) tier3 ;;
+  all) tier0; tier1; tier2; tier3 ;;
   *) echo "unknown tier: $TIER" >&2; exit 2 ;;
 esac
 
