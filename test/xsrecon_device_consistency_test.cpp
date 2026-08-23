@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
             return 3;
         }
         double dev_max = 0.0;
-        if (!backend.solve(dev_a.view(norm_factor, relax), 1, &dev_max)) {
+        if (!backend.solve(dev_a.view(norm_factor, relax), 1, 1, &dev_max)) {
             std::printf("FAIL solve() returned false: %s\n", backend.status().c_str());
             return 4;
         }

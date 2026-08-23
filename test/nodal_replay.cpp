@@ -190,8 +190,26 @@ namespace {
 struct Site { int bit; int width; }; // width 1: states {0,1}; width 2: {0,1,2}
 
 const std::vector<Site> SITES_TRL12 = {{0,1},{1,1},{2,1},{3,1},{4,1},{5,1}};
-const std::vector<Site> SITES_EVEN = {{0,2},{2,1},{3,2},{5,2},{7,1},{8,2},
-                                      {10,2},{12,2},{14,2},{16,1},{17,1}};
+// calculateEven: one entry per UNROLLED instance, mirroring the site map in
+// NodalKernel.h.  Keep identical to SITES in test/nodal_mine_device.cu -- that
+// tool, not this one, is the phase-2 authority (gcc compiles the two host
+// template instantiations of the shared body differently, so only the device
+// build scores the written forms literally).  This table exists so --sweep's
+// phase-2 pass at least addresses the right bits.
+const std::vector<Site> SITES_EVEN = {
+    {0,2},{2,2},{4,2},{6,2},          // A_IN x4
+    {8,1},{9,1},{10,1},{11,1},        // A_OUT x4
+    {12,1},{13,1},                    // A_DIAG x2
+    {14,2},{16,2},                    // BT2 x2
+    {18,2},{20,2},                    // B_IN x2
+    {22,1},{23,1},                    // B_OUT x2
+    {24,2},                           // DET
+    {26,2},{28,2},                    // C4 rows
+    {30,2},{32,2},                    // C6 x2
+    {34,2},{36,2},                    // C2F x2
+    {38,1},{39,1},                    // C2L x2
+    {40,1},{41,1},                    // AT2_DIAG x2
+};
 const std::vector<Site> SITES_1N = {{0,1},{1,2},{3,1},{4,2},{6,2},{8,2},{10,2},
                                     {12,2},{14,2},{16,2},{18,1},{19,1},{20,2},
                                     {22,1},{23,1},{24,1},{25,1},{26,1}};

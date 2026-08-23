@@ -762,6 +762,13 @@ void Nodal::drive() {
     }
     if (dump_this) {
         nodal::NodalView v = MakeView();
+        if (rasberyGpuNodalFullEnabled())
+            std::fprintf(stderr,
+                         "[RASBERY][WARN][nodal] RASBERY_GPU_NODAL_FULL: the "
+                         "dump's INTERMEDIATE blocks (trlcff*, mat*, mu, tau, "
+                         "dsncff*) are stale host memory -- FULL keeps them "
+                         "device-only.  Only the inputs and the jnet/phis "
+                         "outputs are live.\n");
         nodalDumpState(dump_path, v, jnet_snapshot.data());
         std::fprintf(stderr, "[RASBERY][NODAL][DUMP] call=%d -> %s\n", dump_call,
                      dump_path);
@@ -779,11 +786,19 @@ bool Nodal::TryDriveGpu() {
         return false;
 
     // Rod-cusping reads the HOST trlcff arrays (axialTransverseLeakage), and
-    // the device arm leaves trlcff1 device-only -- so any fractional rod
-    // falls back to the CPU body.  The scan is 8451 loads, microseconds.
+    // the device arm leaves trlcff1 device-only (FULL mode leaves all three
+    // device-only) -- so any fractional rod falls back to the CPU body.  The
+    // scan is 8451 loads, microseconds.
+    //
+    // The threshold is EPS, not 1e-9, so this predicate is EXACTLY the one
+    // XSSet::ApplyRodCusping uses to decide which nodes reach
+    // ApplyRodCuspingStencil -- the only reader of the leakage view
+    // (XSSet.cpp:3220-3223, `frac > EPS && frac < 1.0 - EPS`).  At 1e-9 a
+    // fraction in (1e-10, 1e-9] was cusped from stale trlcff.  Matching the
+    // reader can only ADD CPU fallbacks, never admit a stale-trlcff cusp.
     for (int lk = 0; lk < _nxyz; ++lk) {
         const double fr = _g.rod_fraction(lk);
-        if (fr > 1.0e-9 && fr < 1.0 - 1.0e-9)
+        if (fr > EPS && fr < 1.0 - EPS)
             return false;
     }
 
@@ -810,9 +825,11 @@ bool Nodal::TryDriveGpu() {
                              xs.hoststateGeneration()))
         return false;
 
-    static const bool full_device =
-        std::getenv("RASBERY_GPU_NODAL_FULL") != nullptr;
-    if (full_device)
+    // Same predicate the backend uses (rasberyGpuNodalFullEnabled), so the two
+    // halves of one drive can never end up in different modes.  In FULL mode
+    // solveNodal already ran calculateEven + jnet on the device and downloaded
+    // jnet/phis; nothing is left for the host.
+    if (rasberyGpuNodalFullEnabled())
         return true;
 
     // Hybrid: the device just downloaded trlcff0/trlcff2/matM; run the

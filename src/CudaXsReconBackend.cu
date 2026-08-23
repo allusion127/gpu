@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -33,6 +34,14 @@ bool envFlagEnabled(const char* name) {
     if (v == nullptr) return false;
     const std::string s(v);
     return !(s.empty() || s == "0" || s == "off" || s == "OFF" || s == "false" || s == "FALSE");
+}
+
+/// Default-ON counterpart: true only when the variable is present AND falsy.
+bool envFlagDisabled(const char* name) {
+    const char* v = std::getenv(name);
+    if (v == nullptr) return false;
+    const std::string s(v);
+    return s.empty() || s == "0" || s == "off" || s == "OFF" || s == "false" || s == "FALSE";
 }
 
 #define RASBERY_CUDA_TRY(expr, sink)                                         \
@@ -76,14 +85,29 @@ __global__ void kernelFlatXs(fxs::FlatXsView v) {
 namespace ndl = rasbery::nodal;
 
 std::atomic<unsigned long long> g_nodal_drives{0};
+std::atomic<unsigned long long> g_nodal_graph_launches{0};
+std::atomic<unsigned long long> g_nodal_graph_fallbacks{0};
+std::atomic<unsigned long long> g_nodal_d2h_bytes{0}; // per drive, last shape seen
 
+// The two group-SEPARABLE phases run one thread per (node, group): trlcff0 and
+// trlcff12 carry nothing across the ig loop (see NodalKernel.h), so lk*NG+ig is
+// the smallest real work unit and the launch gets 2x the threads at NG=2.
+// Adjacent threads then differ only in ig, and every array they touch is
+// [...*NG + ig], so the doubled thread count also coalesces better than the
+// thread-per-node form did.  updateMatrix/calculateEven stay thread-per-node:
+// their 2x2 group coupling (matM/matMI inversion, the a[2][2] solve) is
+// inherent and cannot be split without changing the arithmetic.
 __global__ void kNodalTrl0(ndl::NodalView v) {
-    const int lk = blockIdx.x * blockDim.x + threadIdx.x;
-    if (lk < v.nxyz) ndl::nodalTrlcff0(v, lk);
+    const int i  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int lk = i / ndl::NG;
+    const int ig = i - lk * ndl::NG;
+    if (lk < v.nxyz) ndl::nodalTrlcff0Group(v, lk, ig);
 }
 __global__ void kNodalTrl12(ndl::NodalView v) {
-    const int lk = blockIdx.x * blockDim.x + threadIdx.x;
-    if (lk < v.nxyz) ndl::nodalTrlcff12(v, lk, ndl::StaticForms{});
+    const int i  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int lk = i / ndl::NG;
+    const int ig = i - lk * ndl::NG;
+    if (lk < v.nxyz) ndl::nodalTrlcff12Group(v, lk, ig, ndl::StaticForms{});
 }
 __global__ void kNodalMat(ndl::NodalView v) {
     const int lk = blockIdx.x * blockDim.x + threadIdx.x;
@@ -132,6 +156,36 @@ struct FlatXsLibDevice {
 std::mutex                    g_flatxs_lib_mutex;
 std::vector<FlatXsLibDevice>* g_flatxs_libs = nullptr; // leaked on purpose (process lifetime)
 
+/// Extended [RASBERY][NODAL][GPU] receipt.
+///
+/// main.cpp already prints `{"drives_solved":N}` from rasberyGpuNodalDrives(),
+/// and main.cpp is not this member's file to edit -- so the arm's own counters
+/// (which only exist in this TU) are emitted from here as a strict SUPERSET of
+/// that line, at static destruction, i.e. AFTER main returns and after main's
+/// line.  A consumer taking the LAST [RASBERY][NODAL][GPU] match gets every
+/// field; one taking the first still gets valid, if shorter, JSON.
+///
+/// <iostream> is included at the top of this TU, so its ios_base::Init object
+/// is constructed before this one and destroyed after it: std::cout is alive
+/// here.
+struct NodalReceipt {
+    ~NodalReceipt() {
+        if (!rasbery::rasberyGpuNodalEnabled()) return;
+        std::cout << "[RASBERY][NODAL][GPU] {\"drives_solved\":"
+                  << g_nodal_drives.load(std::memory_order_relaxed)
+                  << ",\"full_mode\":"
+                  << (rasbery::rasberyGpuNodalFullEnabled() ? 1 : 0)
+                  << ",\"graph_launches\":"
+                  << g_nodal_graph_launches.load(std::memory_order_relaxed)
+                  << ",\"graph_fallbacks\":"
+                  << g_nodal_graph_fallbacks.load(std::memory_order_relaxed)
+                  << ",\"d2h_bytes_per_drive\":"
+                  << g_nodal_d2h_bytes.load(std::memory_order_relaxed) << "}"
+                  << std::endl;
+    }
+};
+NodalReceipt g_nodal_receipt;
+
 } // namespace
 
 struct XsReconBackend::Impl {
@@ -179,9 +233,37 @@ struct XsReconBackend::Impl {
     int                nodal_nsurf = 0;
     std::size_t n_off_hmesh = 0, n_off_albedo = 0, n_off_consts = 0,
                 n_off_chif = 0, n_off_jnet = 0, n_off_flux = 0, n_off_phis = 0,
-                n_off_work = 0;
+                n_off_reigv = 0, n_off_work = 0;
     std::size_t n_ioff_lktosfc = 0, n_ioff_neib = 0, n_ioff_lklr = 0,
                 n_ioff_idirlr = 0, n_ioff_sgnlr = 0;
+
+    // --- FULL-mode CUDA graph (RASBERY_GPU_NODAL_FULL) --------------------
+    // The FULL drive is the same sequence of fixed-address operations every
+    // time, so it is captured once and replayed.  `nodal_h_reigv` is the
+    // pinned host slot the captured H2D reads from: a graph bakes memcpy
+    // source addresses, not their contents, so writing the new eigenvalue
+    // there before each launch is what keeps the replay current.
+    // RASBERY_GPU_NODAL_GRAPH=0 forces the plain per-drive launches.  It is
+    // the A/B knob that proves the capture (and the reigv indirection it
+    // needs) changes nothing numerically: graph on vs off must be bit-equal.
+    cudaGraphExec_t nodal_graph      = nullptr;
+    bool            nodal_use_graph  = !envFlagDisabled("RASBERY_GPU_NODAL_GRAPH");
+    double*         nodal_h_reigv    = nullptr; // pinned, 1 double
+    // Everything else the capture baked in.  Any change invalidates it.
+    const void*     g_key_ndev = nullptr;
+    const void*     g_key_dblk = nullptr;
+    const void*     g_key_jnet = nullptr;
+    const void*     g_key_phis = nullptr;
+    const void*     g_key_flux = nullptr;
+    int             g_key_nxyz = 0, g_key_nsurf = 0, g_key_chif_empty = -1;
+
+    void dropNodalGraph() {
+        if (nodal_graph != nullptr) {
+            cudaGraphExecDestroy(nodal_graph);
+            nodal_graph = nullptr;
+        }
+        g_key_ndev = nullptr;
+    }
 
     const FlatXsLibDevice* lib = nullptr;      // shared, process lifetime
     std::uint64_t          lib_hash_cached = 0; // host tables are immutable;
@@ -210,6 +292,8 @@ struct XsReconBackend::Impl {
         if (dev_sdid) cudaFree(dev_sdid);
         if (dev_sx) cudaFree(dev_sx);
         if (dev_sscale) cudaFree(dev_sscale);
+        if (nodal_graph) cudaGraphExecDestroy(nodal_graph);
+        if (nodal_h_reigv) cudaFreeHost(nodal_h_reigv);
         if (ndev_dbl) cudaFree(ndev_dbl);
         if (ndev_int) cudaFree(ndev_int);
         if (stream) cudaStreamDestroy(stream);
@@ -220,6 +304,9 @@ struct XsReconBackend::Impl {
             n_fuel = want_fuel;
             return true;
         }
+        // The nodal graph baked dev_block-relative xs pointers into its kernel
+        // nodes; this realloc moves them.
+        dropNodalGraph();
         if (dev_block) { cudaFree(dev_block); dev_block = nullptr; }
         if (dev_fuel) { cudaFree(dev_fuel); dev_fuel = nullptr; }
         if (dev_ref) { cudaFree(dev_ref); dev_ref = nullptr; }
@@ -697,7 +784,9 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
                                 unsigned long long state_generation) {
     // calculateEven stays on the host until its 1-ULP residual class is
     // mined out (RASBERY_GPU_NODAL_FULL=1 forces the all-device path).
-    static const bool hybrid_even = !envFlagEnabled("RASBERY_GPU_NODAL_FULL");
+    // Shared with Nodal::TryDriveGpu through the one inline flag reader, so
+    // the two halves of a drive cannot disagree about which mode this is.
+    const bool hybrid_even = !rasberyGpuNodalFullEnabled();
     Impl& d = *_impl;
     if (!d.available || host.nxyz <= 0 || host.nsurf <= 0) return false;
     if (!d.ensure(host.nxyz, d.n_fuel > 0 ? d.n_fuel : host.nxyz)) {
@@ -708,6 +797,7 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     const std::size_t ns = static_cast<std::size_t>(host.nsurf);
 
     if (d.ndev_dbl == nullptr || d.nodal_nsurf != host.nsurf) {
+        d.dropNodalGraph(); // baked ndev_dbl-relative pointers
         if (d.ndev_dbl) { cudaFree(d.ndev_dbl); d.ndev_dbl = nullptr; }
         if (d.ndev_int) { cudaFree(d.ndev_int); d.ndev_int = nullptr; }
         d.nodal_geom_uploaded       = false;
@@ -723,6 +813,7 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         d.n_off_jnet = off; off += ns * ndl::NG;
         d.n_off_flux = off; off += nx * ndl::NG;
         d.n_off_phis = off; off += ns * ndl::NG;
+        d.n_off_reigv = off; off += 1;
         d.n_off_work = off;
         off += 3 * ndg0 + 2 * nx * ndl::NDIR * ndl::NG2 + 4 * nx * ndl::NG2 +
                3 * ndg0;
@@ -761,6 +852,13 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_int + d.n_ioff_sgnlr, host.sgnlr,
                                          ns * ndl::NLR * sizeof(int),
                                          cudaMemcpyHostToDevice, d.stream), d.status);
+        // The three per-drive host buffers are Geometry-owned and live for the
+        // process; page-locking them once makes the per-drive copies truly
+        // async and keeps them capturable as graph memcpy nodes.  pinHost is
+        // idempotent and never unregisters.
+        pinHost(host.jnet, ns * ndl::NG * sizeof(double));
+        pinHost(host.phis, ns * ndl::NG * sizeof(double));
+        pinHost(host.flux, nx * ndl::NG * sizeof(double));
         d.nodal_geom_uploaded = true;
     }
 
@@ -793,13 +891,6 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         if (!d.upload(host.xsnf, d.off_xs[xsr::T_XSNF], lmp)) return false;
         if (!d.upload(host.xssm, d.off_xs_ssm, ssm)) return false;
     }
-
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_jnet, host.jnet,
-                                     ns * ndl::NG * sizeof(double),
-                                     cudaMemcpyHostToDevice, d.stream), d.status);
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_flux, host.flux,
-                                     nx * ndl::NG * sizeof(double),
-                                     cudaMemcpyHostToDevice, d.stream), d.status);
 
     ndl::NodalView v = host;
     v.hmesh   = d.ndev_dbl + d.n_off_hmesh;
@@ -842,12 +933,28 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     const int B  = 128;
     const int gn = (host.nxyz + B - 1) / B;
     const int gs = (host.nsurf + B - 1) / B;
-    kNodalTrl0<<<gn, B, 0, d.stream>>>(v);
-    kNodalTrl12<<<gn, B, 0, d.stream>>>(v);
-    kNodalMat<<<gn, B, 0, d.stream>>>(v);
-    RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
+    // trlcff0/trlcff12 are launched over (node, group) pairs; the rest stay
+    // per node / per surface.
+    const int gng = (host.nxyz * ndl::NG + B - 1) / B;
+    const std::size_t surf_bytes = ns * ndl::NG * sizeof(double);
 
     if (hybrid_even) {
+        // ---- HYBRID (validated fallback): unchanged, and deliberately NOT
+        // graphed -- its mid-drive host hop makes the sequence non-static.
+        // reigv_dev stays null so updateMatrix reads the by-value scalar
+        // exactly as before.
+        v.reigv_dev = nullptr;
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_jnet, host.jnet,
+                                         surf_bytes,
+                                         cudaMemcpyHostToDevice, d.stream), d.status);
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_flux, host.flux,
+                                         nx * ndl::NG * sizeof(double),
+                                         cudaMemcpyHostToDevice, d.stream), d.status);
+        kNodalTrl0<<<gng, B, 0, d.stream>>>(v);
+        kNodalTrl12<<<gng, B, 0, d.stream>>>(v);
+        kNodalMat<<<gn, B, 0, d.stream>>>(v);
+        RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
+
         // calculateEven runs on the HOST (the production member function is
         // its own bit-exact reference; its mined mask still has a 1-ULP
         // residual class).  Ship the inputs it needs, let the caller run it,
@@ -865,21 +972,166 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
                                          nx * ndl::NG2 * sizeof(double),
                                          cudaMemcpyDeviceToHost, d.stream), d.status);
         RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
+        // Hybrid D2H per drive = trlcff0 + trlcff2 + matM here, jnet + phis in
+        // solveNodalPost.
+        g_nodal_d2h_bytes.store((2 * ndg2 + nx * ndl::NG2) * sizeof(double) +
+                                    2 * surf_bytes,
+                                std::memory_order_relaxed);
         return true; // caller: run host even, then solveNodalPost
     }
 
-    kNodalEven<<<gn, B, 0, d.stream>>>(v);
-    kNodalJnet<<<gs, B, 0, d.stream>>>(v);
-    RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
+    // ---- FULL device path -------------------------------------------------
+    // The whole drive is one device pipeline: nothing comes back mid-drive,
+    // and the ONLY arrays copied out are the two the host actually consumes
+    // afterwards (jnet, read by CMFD::upddhat on the very next line of
+    // Driver::SolveLoop; phis, read by PPR/NormalizeFluxSign at the
+    // statepoint).  Everything the hybrid used to round-trip -- trlcff0,
+    // trlcff2, matM down and dsncff2/4/6 back up, 5 transfers and a mid-drive
+    // stream sync -- is gone, because calculateEven now runs on the device
+    // beside the data.  trlcff1/2/0 stay device-only, which is exactly what
+    // the fractional-rod guard in Nodal::TryDriveGpu already covers: rod
+    // cusping is the only host reader of trlcff, and it never runs when that
+    // guard let us get here.
+    v.reigv_dev = d.ndev_dbl + d.n_off_reigv;
+    if (d.nodal_h_reigv == nullptr) {
+        if (cudaHostAlloc(reinterpret_cast<void**>(&d.nodal_h_reigv),
+                          sizeof(double), cudaHostAllocDefault) != cudaSuccess) {
+            cudaGetLastError();
+            d.nodal_h_reigv   = nullptr;
+            d.nodal_use_graph = false; // no stable staging slot -> no capture
+        }
+    }
+    // The captured memcpy reads this address at every replay, so the current
+    // eigenvalue has to be in it BEFORE the launch.
+    if (d.nodal_h_reigv != nullptr)
+        *d.nodal_h_reigv = host.reigv;
 
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(host.jnet, v.jnet,
-                                     ns * ndl::NG * sizeof(double),
-                                     cudaMemcpyDeviceToHost, d.stream), d.status);
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(host.phis, v.phis,
-                                     ns * ndl::NG * sizeof(double),
-                                     cudaMemcpyDeviceToHost, d.stream), d.status);
-    RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
+    const double* reigv_src =
+        d.nodal_h_reigv != nullptr ? d.nodal_h_reigv : &host.reigv;
 
+    // One drive's worth of device work, all fixed addresses -- this is what
+    // gets captured.  No host callbacks, no allocation, no synchronisation
+    // inside: every one of those is illegal or capture-breaking.
+    auto enqueue_full = [&]() -> bool {
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_reigv, reigv_src,
+                                         sizeof(double),
+                                         cudaMemcpyHostToDevice, d.stream), d.status);
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_jnet, host.jnet,
+                                         surf_bytes,
+                                         cudaMemcpyHostToDevice, d.stream), d.status);
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_flux, host.flux,
+                                         nx * ndl::NG * sizeof(double),
+                                         cudaMemcpyHostToDevice, d.stream), d.status);
+        kNodalTrl0<<<gng, B, 0, d.stream>>>(v);
+        kNodalTrl12<<<gng, B, 0, d.stream>>>(v);
+        kNodalMat<<<gn, B, 0, d.stream>>>(v);
+        kNodalEven<<<gn, B, 0, d.stream>>>(v);
+        kNodalJnet<<<gs, B, 0, d.stream>>>(v);
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(host.jnet, v.jnet, surf_bytes,
+                                         cudaMemcpyDeviceToHost, d.stream), d.status);
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(host.phis, v.phis, surf_bytes,
+                                         cudaMemcpyDeviceToHost, d.stream), d.status);
+        return true;
+    };
+
+    // Anything the capture baked in that could have moved since.  host.jnet /
+    // host.phis / host.flux are Geometry-owned and stable per backend
+    // instance, but a re-bound Nodal::reset would silently orphan the graph,
+    // so they are checked rather than assumed.
+    const bool key_ok = d.nodal_graph != nullptr &&
+                        d.g_key_ndev == d.ndev_dbl &&
+                        d.g_key_dblk == d.dev_block &&
+                        d.g_key_jnet == host.jnet &&
+                        d.g_key_phis == host.phis &&
+                        d.g_key_flux == host.flux &&
+                        d.g_key_nxyz == host.nxyz &&
+                        d.g_key_nsurf == host.nsurf &&
+                        d.g_key_chif_empty == host.chif_empty;
+    if (d.nodal_graph != nullptr && !key_ok)
+        d.dropNodalGraph();
+
+    // Failing out of a half-enqueued drive must not leave a D2H in flight:
+    // TryDriveGpu answers false and the CPU body then writes the very same
+    // host.jnet/host.phis this stream is still copying into.  Drain first.
+    auto fail_drained = [&]() {
+        cudaStreamSynchronize(d.stream);
+        cudaGetLastError();
+        return false;
+    };
+
+    bool ok = true;
+    if (!d.nodal_use_graph) {
+        ok = enqueue_full();
+    } else if (d.nodal_graph != nullptr) {
+        const cudaError_t lrc = cudaGraphLaunch(d.nodal_graph, d.stream);
+        if (lrc != cudaSuccess) {
+            d.status = std::string("cudaGraphLaunch -> ") + cudaGetErrorString(lrc);
+            ok = false;
+        } else {
+            g_nodal_graph_launches.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else {
+        // Capture once, then replay for the rest of the run.  The conditional
+        // uploads above are already queued on this stream; drain them so the
+        // capture starts on an idle stream (once per run, so free).
+        RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
+        cudaGraph_t graph  = nullptr;
+        bool        enq_ok = true;
+        cudaError_t rc =
+            cudaStreamBeginCapture(d.stream, cudaStreamCaptureModeThreadLocal);
+        if (rc == cudaSuccess) {
+            enq_ok = enqueue_full();
+            // Must be called even when the enqueue failed: it is what takes
+            // the stream back out of capture mode.
+            rc = cudaStreamEndCapture(d.stream, &graph);
+        }
+        if (rc == cudaSuccess && enq_ok)
+            // 3-argument form: the legacy (errorNode, logBuffer, size) overload
+            // is gone in CUDA 13, which the 238 server builds with.
+            rc = cudaGraphInstantiate(&d.nodal_graph, graph, 0ull);
+        if (graph != nullptr) cudaGraphDestroy(graph);
+        if (rc != cudaSuccess || !enq_ok) {
+            // Capture is a pure optimisation; a driver that refuses it must
+            // not take the solver down.  Work submitted to a stream in capture
+            // mode is RECORDED, not executed, and a failed capture leaves
+            // nothing pending -- so the re-enqueue below is this drive's first
+            // and only execution, not a double application.
+            cudaGetLastError();
+            d.nodal_graph     = nullptr;
+            d.nodal_use_graph = false;
+            g_nodal_graph_fallbacks.fetch_add(1, std::memory_order_relaxed);
+            ok = enqueue_full();
+        } else {
+            d.g_key_ndev       = d.ndev_dbl;
+            d.g_key_dblk       = d.dev_block;
+            d.g_key_jnet       = host.jnet;
+            d.g_key_phis       = host.phis;
+            d.g_key_flux       = host.flux;
+            d.g_key_nxyz       = host.nxyz;
+            d.g_key_nsurf      = host.nsurf;
+            d.g_key_chif_empty = host.chif_empty;
+            const cudaError_t lrc = cudaGraphLaunch(d.nodal_graph, d.stream);
+            if (lrc != cudaSuccess) {
+                d.status = std::string("cudaGraphLaunch -> ") + cudaGetErrorString(lrc);
+                ok = false;
+            } else {
+                g_nodal_graph_launches.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    if (!ok) return fail_drained();
+
+    // Sync unconditionally (it is also the drain), then judge both errors.
+    const cudaError_t lasterr = cudaGetLastError();
+    const cudaError_t syncrc  = cudaStreamSynchronize(d.stream);
+    if (lasterr != cudaSuccess || syncrc != cudaSuccess) {
+        d.status = std::string("nodal FULL -> ") +
+                   cudaGetErrorString(lasterr != cudaSuccess ? lasterr : syncrc);
+        cudaGetLastError();
+        return false;
+    }
+
+    g_nodal_d2h_bytes.store(2 * surf_bytes, std::memory_order_relaxed);
     g_nodal_drives.fetch_add(1, std::memory_order_relaxed);
     return true;
 }

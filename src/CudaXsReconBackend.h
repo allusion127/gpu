@@ -25,6 +25,7 @@
 //    alive on machines without a device.
 
 #include <cstddef>
+#include <cstdlib>
 #include <memory>
 #include <string>
 
@@ -162,6 +163,27 @@ unsigned long long rasberyGpuFlatXsNodes();
 
 /// RASBERY_GPU_NODAL, read once per process.  Stub builds return false.
 bool rasberyGpuNodalEnabled();
+
+/// RASBERY_GPU_NODAL_FULL: run calculateEven on the device too, so the drive
+/// is one uninterrupted device pipeline instead of the hybrid round-trip.
+///
+/// Deliberately an inline header function rather than another exported symbol:
+/// Nodal.cpp and the backend BOTH have to agree on this flag (they used to
+/// disagree -- Nodal.cpp tested presence, the backend tested truthiness, so
+/// RASBERY_GPU_NODAL_FULL=0 put the two halves of the drive in different
+/// modes and dropped the hybrid tail), and an inline definition keeps the
+/// no-CUDA stub TU compiling untouched.  One static local, one process-wide
+/// answer, same truthiness rule as the other flags.
+inline bool rasberyGpuNodalFullEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("RASBERY_GPU_NODAL_FULL");
+        if (v == nullptr) return false;
+        const std::string s(v);
+        return !(s.empty() || s == "0" || s == "off" || s == "OFF" ||
+                 s == "false" || s == "FALSE");
+    }();
+    return on;
+}
 
 /// Receipt accessor mirroring XsReconBackend::nodalDrivesSolved for main.cpp.
 unsigned long long rasberyGpuNodalDrives();

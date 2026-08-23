@@ -57,8 +57,29 @@ constexpr double M242  = 14.;
 /// A*B + C*D: 0 = both products rounded; 1 = fma(A,B, round(C*D));
 /// 2 = fma(C,D, round(A*B)).  trlcff12 and updateMatrix mined exact on the
 /// first pass (all their sites fused).
+///
+/// Phase 2 (calculateEven) -- MINED EXACT 2026-08-24, mask 0x2D555D57F55.
+///   provenance: KNGR deck (~/kngr_238/kngr_238.json, RASBERY_PPR_MODE=master
+///     RASBERY_PC_MODE=decart, pure-CPU drive), captures cpu3/cpu9/cpu17.bin
+///     from RASBERY_NODAL_DUMP with RASBERY_NODAL_DUMP_CALL=3/9/17
+///     (nxyz=8451, nsurf=26692);
+///   tool: build/rasbery_nodal_mine_device cpu3.bin cpu9.bin cpu17.bin
+///     (CUDA_VISIBLE_DEVICES=0, sm_120, --fmad=false) -> bad=0 EXACT, and
+///     build/rasbery_nodal_device_replay <capture> -> c2/c4/c6 bad=0.
+///   what was wrong before: the mask 0xD555D57F55 was never mined, it was the
+///     uniform "everything fused" seed, and it left 1154 of 152118 c2/c4/c6
+///     elements 1-2 ULP off.  Coordinate descent AND the pairwise stage both
+///     stalled there because the residual was not representable by the site
+///     set: `at2[igd][igd] += m022*rm220*m240` (Nodal.cpp:332) carried no
+///     site at all.  Reading gcc-14.3 -O3 -march=native asm for
+///     rasbery::Nodal::calculateEven settled it: gcc fuses that add into the
+///     diagonal product for igd=1 (`vfmadd132sd (%rsi,%r12,8), %xmm7, %xmm0`)
+///     but NOT for igd=0 (`vaddsd %xmm7, %xmm2, %xmm2`) -- the igd=0 product
+///     has two uses across the `_ng == 1` versioning branch, so gcc's
+///     widening_mul cannot consume it.  Sites 40/41 below spell that asymmetry
+///     out; every other phase-2 site is fused, exactly as the old seed assumed.
 constexpr unsigned long long NODAL_FORMS[5] = {
-    0x3Full, 0xFull, 0xD555D57F55ull, 0x7DD555Bull, 0xFBAAB56F79ull};
+    0x3Full, 0xFull, 0x2D555D57F55ull, 0x7DD555Bull, 0xFBAAB56F79ull};
 
 /// Device code cannot address the namespace-scope array's storage (same
 /// finding as xsrecon's ACTIVE_XT); this constexpr function is the mask
@@ -66,7 +87,7 @@ constexpr unsigned long long NODAL_FORMS[5] = {
 RASBERY_XSR_HD constexpr unsigned long long nodalFormsOf(int phase) {
     return phase == 0   ? 0x3Full
            : phase == 1 ? 0xFull
-           : phase == 2 ? 0xD555D57F55ull
+           : phase == 2 ? 0x2D555D57F55ull
            : phase == 3 ? 0x7DD555Bull
                         : 0xFBAAB56F79ull;
 }
@@ -172,6 +193,12 @@ struct NodalView {
     double*       jnet;
     double*       phis;
     double        reigv;
+    /// Optional indirection for `reigv`, the ONLY per-drive scalar in this
+    /// view.  A CUDA graph bakes kernel arguments, so the device arm parks
+    /// reigv in a device slot and points here; nullptr (host, replay tools,
+    /// hybrid arm) keeps the by-value `reigv` above.  Both spellings deliver
+    /// the identical double to the identical arithmetic site.
+    const double* reigv_dev;
     int           nxyz;
     int           nsurf;
 };
@@ -186,98 +213,127 @@ RASBERY_XSR_HD inline double nvTau(const NodalView& v, int i, int j, int lkd) { 
 // ---------------------------------------------------------------------------
 // Phase caltrlcff0 (per node): products, divides and adds only -- no
 // contraction sites, so no policy involvement.
+//
+// Group-SEPARABLE: the `ig` loop below carries nothing across iterations --
+// avgjnet[] is fully rewritten for every ig before it is read, and the three
+// trlcff0 writes are indexed by ig -- so one (node, group) pair is the real
+// smallest work unit.  ...Group() is that unit, verbatim; the whole-node entry
+// calls it in the original ig order so the host/replay path is textually the
+// same math in the same order, while the device launches lk*NG+ig threads.
 // ---------------------------------------------------------------------------
-RASBERY_XSR_HD inline void nodalTrlcff0(const NodalView& v, int lk) {
+RASBERY_XSR_HD inline void nodalTrlcff0Group(const NodalView& v, int lk, int ig) {
     const int lkd0 = lk * NDIR;
     double    avgjnet[NDIR];
 
-    for (int ig = 0; ig < NG; ig++) {
-        for (int idir = 0; idir < NDIR; idir++) {
-            const int lsl = v.lktosfc[(lk * NDIR + idir) * NLR + C_LEFT];
-            const int lsr = v.lktosfc[(lk * NDIR + idir) * NLR + C_RIGHT];
-            avgjnet[idir] =
-                (v.jnet[lsr * NG + ig] - v.jnet[lsl * NG + ig]) / v.hmesh[lk * NDIR + idir];
-        }
-        v.trlcff0[(lkd0 + C_XDIR) * NG + ig] = avgjnet[C_YDIR] + avgjnet[C_ZDIR];
-        v.trlcff0[(lkd0 + C_YDIR) * NG + ig] = avgjnet[C_XDIR] + avgjnet[C_ZDIR];
-        v.trlcff0[(lkd0 + C_ZDIR) * NG + ig] = avgjnet[C_XDIR] + avgjnet[C_YDIR];
+    for (int idir = 0; idir < NDIR; idir++) {
+        const int lsl = v.lktosfc[(lk * NDIR + idir) * NLR + C_LEFT];
+        const int lsr = v.lktosfc[(lk * NDIR + idir) * NLR + C_RIGHT];
+        avgjnet[idir] =
+            (v.jnet[lsr * NG + ig] - v.jnet[lsl * NG + ig]) / v.hmesh[lk * NDIR + idir];
     }
+    v.trlcff0[(lkd0 + C_XDIR) * NG + ig] = avgjnet[C_YDIR] + avgjnet[C_ZDIR];
+    v.trlcff0[(lkd0 + C_YDIR) * NG + ig] = avgjnet[C_XDIR] + avgjnet[C_ZDIR];
+    v.trlcff0[(lkd0 + C_ZDIR) * NG + ig] = avgjnet[C_XDIR] + avgjnet[C_YDIR];
+}
+
+RASBERY_XSR_HD inline void nodalTrlcff0(const NodalView& v, int lk) {
+    for (int ig = 0; ig < NG; ig++)
+        nodalTrlcff0Group(v, lk, ig);
 }
 
 // ---------------------------------------------------------------------------
 // Phase caltrlcff12 (per node).  trlcffbyintg inlined verbatim.
 // Sites (phase 0): 0..3 = the four rh-product accumulations of the interior
 // branch (each `x*y + z*w`-shaped via the second-product-rounded form).
+//
+// Group-SEPARABLE: the inner `ig` loop reads only trlcff0 (written by the
+// PREVIOUS phase, i.e. a different kernel launch) and writes only
+// trlcff1/trlcff2 at [lkd*NG+ig]; every temporary (avgtrl3, hmesh3, sh, rh) is
+// declared inside the loop.  So (node, dir, group) is the smallest unit --
+// ...Cell() below.  The whole-node entry keeps the ORIGINAL idir-outer /
+// ig-inner nesting so the host/replay path is byte-for-byte the same sequence
+// of ...Cell() bodies; ...Group() is the device's ig-fixed traversal of the
+// same cells.  lkl/lkr/lkd move inside the cell: integer index loads only, no
+// floating-point site is added, removed or reordered.
 // ---------------------------------------------------------------------------
 template <class POL>
-RASBERY_XSR_HD inline void nodalTrlcff12(const NodalView& v, int lk, const POL& pol) {
-    const int lkd0 = lk * NDIR;
+RASBERY_XSR_HD inline void nodalTrlcff12Cell(const NodalView& v, int lk, int idir,
+                                             int ig, const POL& pol) {
+    const int lkd = lk * NDIR + idir;
 
-    for (int idir = 0; idir < NDIR; idir++) {
-        const int lkd = lkd0 + idir;
+    const int lkl = v.neib[lk * NEWSB + idir * NLR + C_LEFT];
+    const int lkr = v.neib[lk * NEWSB + idir * NLR + C_RIGHT];
 
-        const int lkl = v.neib[lk * NEWSB + idir * NLR + C_LEFT];
-        const int lkr = v.neib[lk * NEWSB + idir * NLR + C_RIGHT];
+    double avgtrl3[3] = {};
+    double hmesh3[3]  = {};
+    hmesh3[C_CENTER]  = v.hmesh[lk * NDIR + idir];
+    avgtrl3[C_CENTER] = v.trlcff0[lkd * NG + ig];
 
-        for (int ig = 0; ig < NG; ig++) {
-            double avgtrl3[3] = {};
-            double hmesh3[3]  = {};
-            hmesh3[C_CENTER]  = v.hmesh[lk * NDIR + idir];
-            avgtrl3[C_CENTER] = v.trlcff0[lkd * NG + ig];
-
-            if (lkl > -1) {
-                const int lsl    = v.lktosfc[(lk * NDIR + idir) * NLR + C_LEFT];
-                const int idirl  = v.idirlr[lsl * NLR + C_LEFT];
-                hmesh3[C_LEFT]   = v.hmesh[lkl * NDIR + idirl];
-                avgtrl3[C_LEFT]  = v.trlcff0[(lkl * NDIR + idirl) * NG + ig];
-            } else if (v.albedo[idir * NLR + C_LEFT] < 1.0E-10) {
-                hmesh3[C_LEFT]  = hmesh3[C_CENTER];
-                avgtrl3[C_LEFT] = avgtrl3[C_CENTER];
-            }
-
-            if (lkr > -1) {
-                const int lsr    = v.lktosfc[(lk * NDIR + idir) * NLR + C_RIGHT];
-                const int idirr  = v.idirlr[lsr * NLR + C_RIGHT];
-                hmesh3[C_RIGHT]  = v.hmesh[lkr * NDIR + idirr];
-                avgtrl3[C_RIGHT] = v.trlcff0[(lkr * NDIR + idirr) * NG + ig];
-            } else if (v.albedo[idir * NLR + C_RIGHT] < 1.0E-10) {
-                hmesh3[C_RIGHT]  = hmesh3[C_CENTER];
-                avgtrl3[C_RIGHT] = avgtrl3[C_CENTER];
-            }
-
-            // --- trlcffbyintg, inlined verbatim ---
-            double& out1 = v.trlcff1[lkd * NG + ig];
-            double& out2 = v.trlcff2[lkd * NG + ig];
-            double  sh[4];
-            const double rh =
-                (1 / ((hmesh3[C_LEFT] + hmesh3[C_CENTER] + hmesh3[C_RIGHT]) *
-                      (hmesh3[C_LEFT] + hmesh3[C_CENTER]) *
-                      (hmesh3[C_CENTER] + hmesh3[C_RIGHT])));
-            sh[0] = (2 * hmesh3[C_LEFT] + hmesh3[C_CENTER]) *
-                    (hmesh3[C_LEFT] + hmesh3[C_CENTER]);
-            sh[1] = hmesh3[C_LEFT] + hmesh3[C_CENTER];
-            sh[2] = (hmesh3[C_CENTER] + 2 * hmesh3[C_RIGHT]) *
-                    (hmesh3[C_CENTER] + hmesh3[C_RIGHT]);
-            sh[3] = hmesh3[C_CENTER] + hmesh3[C_RIGHT];
-
-            if (hmesh3[C_LEFT] == 0.0) {
-                out1 = 0.125 * pol.ma(0, 2, 5., avgtrl3[C_CENTER], avgtrl3[C_RIGHT]);
-                out2 = 0.125 * pol.ma(0, 3, -3., avgtrl3[C_CENTER], avgtrl3[C_RIGHT]);
-            } else if (hmesh3[C_RIGHT] == 0.0) {
-                out1 = -0.125 * pol.ma(0, 4, 5., avgtrl3[C_CENTER], avgtrl3[C_LEFT]);
-                out2 = 0.125 * pol.ma(0, 5, -3., avgtrl3[C_CENTER], avgtrl3[C_LEFT]);
-            } else {
-                // (a-b)*s2 + (c-a)*s0, second product rounded first per the
-                // CMFD form finding; sites 0/1.
-                out1 = 0.5 * rh * hmesh3[C_CENTER] *
-                       pol.ma(0, 0, (avgtrl3[C_CENTER] - avgtrl3[C_LEFT]), sh[2],
-                              xsrMul((avgtrl3[C_RIGHT] - avgtrl3[C_CENTER]), sh[0]));
-                out2 = 0.5 * rh * (hmesh3[C_CENTER] * hmesh3[C_CENTER]) *
-                       pol.ma(0, 1, (avgtrl3[C_LEFT] - avgtrl3[C_CENTER]), sh[3],
-                              xsrMul((avgtrl3[C_RIGHT] - avgtrl3[C_CENTER]), sh[1]));
-            }
-        }
+    if (lkl > -1) {
+        const int lsl    = v.lktosfc[(lk * NDIR + idir) * NLR + C_LEFT];
+        const int idirl  = v.idirlr[lsl * NLR + C_LEFT];
+        hmesh3[C_LEFT]   = v.hmesh[lkl * NDIR + idirl];
+        avgtrl3[C_LEFT]  = v.trlcff0[(lkl * NDIR + idirl) * NG + ig];
+    } else if (v.albedo[idir * NLR + C_LEFT] < 1.0E-10) {
+        hmesh3[C_LEFT]  = hmesh3[C_CENTER];
+        avgtrl3[C_LEFT] = avgtrl3[C_CENTER];
     }
+
+    if (lkr > -1) {
+        const int lsr    = v.lktosfc[(lk * NDIR + idir) * NLR + C_RIGHT];
+        const int idirr  = v.idirlr[lsr * NLR + C_RIGHT];
+        hmesh3[C_RIGHT]  = v.hmesh[lkr * NDIR + idirr];
+        avgtrl3[C_RIGHT] = v.trlcff0[(lkr * NDIR + idirr) * NG + ig];
+    } else if (v.albedo[idir * NLR + C_RIGHT] < 1.0E-10) {
+        hmesh3[C_RIGHT]  = hmesh3[C_CENTER];
+        avgtrl3[C_RIGHT] = avgtrl3[C_CENTER];
+    }
+
+    // --- trlcffbyintg, inlined verbatim ---
+    double& out1 = v.trlcff1[lkd * NG + ig];
+    double& out2 = v.trlcff2[lkd * NG + ig];
+    double  sh[4];
+    const double rh =
+        (1 / ((hmesh3[C_LEFT] + hmesh3[C_CENTER] + hmesh3[C_RIGHT]) *
+              (hmesh3[C_LEFT] + hmesh3[C_CENTER]) *
+              (hmesh3[C_CENTER] + hmesh3[C_RIGHT])));
+    sh[0] = (2 * hmesh3[C_LEFT] + hmesh3[C_CENTER]) *
+            (hmesh3[C_LEFT] + hmesh3[C_CENTER]);
+    sh[1] = hmesh3[C_LEFT] + hmesh3[C_CENTER];
+    sh[2] = (hmesh3[C_CENTER] + 2 * hmesh3[C_RIGHT]) *
+            (hmesh3[C_CENTER] + hmesh3[C_RIGHT]);
+    sh[3] = hmesh3[C_CENTER] + hmesh3[C_RIGHT];
+
+    if (hmesh3[C_LEFT] == 0.0) {
+        out1 = 0.125 * pol.ma(0, 2, 5., avgtrl3[C_CENTER], avgtrl3[C_RIGHT]);
+        out2 = 0.125 * pol.ma(0, 3, -3., avgtrl3[C_CENTER], avgtrl3[C_RIGHT]);
+    } else if (hmesh3[C_RIGHT] == 0.0) {
+        out1 = -0.125 * pol.ma(0, 4, 5., avgtrl3[C_CENTER], avgtrl3[C_LEFT]);
+        out2 = 0.125 * pol.ma(0, 5, -3., avgtrl3[C_CENTER], avgtrl3[C_LEFT]);
+    } else {
+        // (a-b)*s2 + (c-a)*s0, second product rounded first per the
+        // CMFD form finding; sites 0/1.
+        out1 = 0.5 * rh * hmesh3[C_CENTER] *
+               pol.ma(0, 0, (avgtrl3[C_CENTER] - avgtrl3[C_LEFT]), sh[2],
+                      xsrMul((avgtrl3[C_RIGHT] - avgtrl3[C_CENTER]), sh[0]));
+        out2 = 0.5 * rh * (hmesh3[C_CENTER] * hmesh3[C_CENTER]) *
+               pol.ma(0, 1, (avgtrl3[C_LEFT] - avgtrl3[C_CENTER]), sh[3],
+                      xsrMul((avgtrl3[C_RIGHT] - avgtrl3[C_CENTER]), sh[1]));
+    }
+}
+
+template <class POL>
+RASBERY_XSR_HD inline void nodalTrlcff12(const NodalView& v, int lk, const POL& pol) {
+    for (int idir = 0; idir < NDIR; idir++)
+        for (int ig = 0; ig < NG; ig++)
+            nodalTrlcff12Cell(v, lk, idir, ig, pol);
+}
+
+template <class POL>
+RASBERY_XSR_HD inline void nodalTrlcff12Group(const NodalView& v, int lk, int ig,
+                                              const POL& pol) {
+    for (int idir = 0; idir < NDIR; idir++)
+        nodalTrlcff12Cell(v, lk, idir, ig, pol);
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +347,10 @@ template <class POL>
 RASBERY_XSR_HD inline void nodalUpdateMatrix(const NodalView& v, int lk, const POL& pol) {
     const int lkd0 = lk * NDIR;
     const int nxyz = v.nxyz;
+    // Same double either way (see NodalView::reigv_dev); the load exists only
+    // so a captured CUDA graph does not bake the eigenvalue of its capture
+    // drive into the kernel argument.
+    const double reigv = v.reigv_dev != nullptr ? *v.reigv_dev : v.reigv;
 
     for (int ige = 0; ige < NG; ige++) {
         for (int igs = 0; igs < NG; igs++) {
@@ -303,7 +363,7 @@ RASBERY_XSR_HD inline void nodalUpdateMatrix(const NodalView& v, int lk, const P
 
         for (int igs = 0; igs < NG; igs++) {
             v.matM[lk * NG2 + ige * NG + igs] =
-                pol.ma(1, 0, -v.reigv, v.matMf[lk * NG2 + ige * NG + igs],
+                pol.ma(1, 0, -reigv, v.matMf[lk * NG2 + ige * NG + igs],
                        v.matMs[lk * NG2 + ige * NG + igs]);
         }
     }
@@ -366,15 +426,21 @@ RASBERY_XSR_HD inline void nodalUpdateMatrix(const NodalView& v, int lk, const P
 }
 
 // ---------------------------------------------------------------------------
-// Phase calculateEven (per node).  Sites (phase 2):
-//  0: at2 = m022*rm220*mu2*matM       (pure products -- no site; kept literal)
-//  0: a = mu1*matM + M0*at2_0 + M1*at2_1   (3-term chain: two ma sites 0,1)
-//  2: bt2 inner  M0*flux0 + M1*flux1 (+trl0)  -- sites 2,3
-//  4: b = m022*trl2 + (M0*bt1_0 + M1*bt1_1)  -- sites 4,5
-//  6: rdet = a00*a11 - a10*a01
-//  7: dsncff4 row solves a11*b0 - a10*b1
-//  8: dsncff6 contraction M0*c4_0 + M1*c4_1
-//  9: dsncff2 tail  -m240*c4 - m260*c6 (+DI*bt2)  -- sites 9,10
+// Phase calculateEven (per node).  Site map (phase 2), one entry per UNROLLED
+// instance because gcc contracts each copy of the NG=2 loops independently:
+//   0,2,4,6   (ma2) a  = mu1*matM + matM0*at2_0     [inst = igd*NG+igs]
+//   8..11     (ma1) a += matM1*at2_1                [inst]
+//   12,13     (ma1) a[igd][igd] += diagD*m242
+//   14,16     (ma2) bt2 inner  matM0*flux0 + matM1*flux1
+//   18,20     (ma2) b inner    matM0*bt1_0 + matM1*bt1_1
+//   22,23     (ma1) b   = m022*trlcff2 + inner
+//   24        (ma2) rdet = a00*a11 - a10*a01
+//   26,28     (ma2) dsncff4 row solves  a11*b0 - a10*b1 / a00*b1 - a01*b0
+//   30,32     (ma2) dsncff6 contraction matM0*c4_0 + matM1*c4_1
+//   34,36     (ma2) dsncff2 head  diagDI*bt2 - m240*c4
+//   38,39     (ma1) dsncff2 tail  ... - m260*c6
+//   40,41     (ma1) at2[igd][igd] = (m022*rm220*mu2)*matM + m022*rm220*m240
+//                   -- gcc fuses this only for igd=1; see the mask comment.
 // ---------------------------------------------------------------------------
 template <class POL>
 RASBERY_XSR_HD inline void nodalCalculateEven(const NodalView& v, int lk, const POL& pol) {
@@ -391,11 +457,16 @@ RASBERY_XSR_HD inline void nodalCalculateEven(const NodalView& v, int lk, const 
 
             const double mu2 =
                 rm4464[igd] * v.m260[lkd * NG + igd] * v.diagDI[lkd * NG + igd];
+            // Named exactly the way `m022 * rm220 * mu2 * matM` associates:
+            // ((m022*rm220) * mu2) * matM.  The temp adds no rounding, it just
+            // gives the diagonal's multiply-add a spellable a*b+c shape.
+            const double mu2c = M022 * RM220 * mu2;
 
             for (int igs = 0; igs < NG; igs++) {
-                at2[igs][igd] = M022 * RM220 * mu2 * nvMatM(v, igs, igd, lk);
+                at2[igs][igd] = mu2c * nvMatM(v, igs, igd, lk);
             }
-            at2[igd][igd] += M022 * RM220 * M240;
+            at2[igd][igd] = pol.ma(2, 40 + igd, mu2c, nvMatM(v, igd, igd, lk),
+                                   M022 * RM220 * M240);
         }
 
         for (int igd = 0; igd < NG; igd++) {
@@ -790,9 +861,11 @@ RASBERY_XSR_HD inline void nodalEvenProbe(const NodalView& v, int lk, int idir,
         const double mu2 =
             rm4464[igd] * v.m260[lkd * NG + igd] * v.diagDI[lkd * NG + igd];
         out[23 + igd] = mu2;
+        const double mu2c = M022 * RM220 * mu2;
         for (int igs = 0; igs < NG; igs++)
-            at2[igs][igd] = M022 * RM220 * mu2 * nvMatM(v, igs, igd, lk);
-        at2[igd][igd] += M022 * RM220 * M240;
+            at2[igs][igd] = mu2c * nvMatM(v, igs, igd, lk);
+        at2[igd][igd] = pol.ma(2, 40 + igd, mu2c, nvMatM(v, igd, igd, lk),
+                               M022 * RM220 * M240);
     }
     out[0] = rm4464[0]; out[1] = rm4464[1];
     out[2] = at2[0][0]; out[3] = at2[1][0]; out[4] = at2[0][1]; out[5] = at2[1][1];
