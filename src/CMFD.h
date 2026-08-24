@@ -143,15 +143,22 @@ public:
     virtual void drive(double& eigv, double* flux, double& errl2) = 0;
 
     /// @brief update fission source term for each node
+    /// @param l the node index
+    /// @param flux the flux
     void updpsi(const int& l, const double* flux);
 
     /// @brief update d_tilde for each surface
+    /// @param ls the surface index
     void upddtil(const int& ls);
 
     /// @brief update d_hat for each surface
+    /// @param ls the surface index
+    /// @param flux the flux
+    /// @param jnet the net current
     void upddhat(const int& ls, double* flux, double* jnet);
 
     /// @brief setup the linear system element for each node for CMFD calculation
+    /// @param l the node index
     void setls(const int& l);
 
     /// @brief set the number of CMFD iteration
@@ -240,15 +247,28 @@ public:
     void updjnet(const int& ls, const double* flux, double* jnet) {
         const int ll = cachedSurfaceNode(LEFT, ls);
         const int lr = cachedSurfaceNode(RIGHT, ls);
+        const int ng = _g.ng();
 
-        for (int ig = 0; ig < _g.ng(); ig++) {
+        const auto update_group = [&](const int ig) {
+            const size_t si = static_cast<size_t>(ls) * ng + ig;
+            const double dt = _dtil[si];
+            const double dh = _dhat[si];
             if (ll < 0) {
-                jnet[ls * _g.ng() + ig] = -(dtil(ig, ls) + dhat(ig, ls)) * flux[lr * _g.ng() + ig];
+                jnet[si] = -(dt + dh) * flux[static_cast<size_t>(lr) * ng + ig];
             } else if (lr < 0) {
-                jnet[ls * _g.ng() + ig] = (dtil(ig, ls) - dhat(ig, ls)) * flux[ll * _g.ng() + ig];
+                jnet[si] = (dt - dh) * flux[static_cast<size_t>(ll) * ng + ig];
             } else {
-                jnet[ls * _g.ng() + ig] = -dtil(ig, ls) * (flux[lr * _g.ng() + ig] - flux[ll * _g.ng() + ig]) - dhat(ig, ls) * (flux[lr * _g.ng() + ig] + flux[ll * _g.ng() + ig]);
+                const double fl = flux[static_cast<size_t>(ll) * ng + ig];
+                const double fr = flux[static_cast<size_t>(lr) * ng + ig];
+                jnet[si] = -dt * (fr - fl) - dh * (fr + fl);
             }
+        };
+
+        if (ng == 2) {
+            update_group(0);
+            update_group(1);
+        } else {
+            for (int ig = 0; ig < ng; ++ig) update_group(ig);
         }
     }
 };

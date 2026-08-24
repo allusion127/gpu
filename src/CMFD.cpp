@@ -102,39 +102,44 @@ void CMFD::upddtil(const int& ls) {
 void CMFD::upddhat(const int& ls, double* flux, double* jnet) {
     const int ll = cachedSurfaceNode(LEFT, ls);
     const int lr = cachedSurfaceNode(RIGHT, ls);
+    const int ng = _g.ng();
 
-    for (int ig = 0; ig < _g.ng(); ig++) {
+    // APR1400 production decks are two-group.  Keep a generic fallback, but
+    // make the hot path a fixed-trip body so the compiler can keep the surface
+    // state in registers instead of repeatedly evaluating accessor strides.
+    const auto update_group = [&](const int ig) {
         double fdiff, fsum;
         if (ll < 0) {
-            fdiff = flux(ig, lr);
-            fsum  = flux(ig, lr);
+            fdiff = flux[lr * ng + ig];
+            fsum  = flux[lr * ng + ig];
         } else if (lr < 0) {
-            fdiff = -flux(ig, ll);
-            fsum  = flux(ig, ll);
+            fdiff = -flux[ll * ng + ig];
+            fsum  = flux[ll * ng + ig];
         } else {
-            fdiff = flux(ig, lr) - flux(ig, ll);
-            fsum  = flux(ig, lr) + flux(ig, ll);
+            fdiff = flux[lr * ng + ig] - flux[ll * ng + ig];
+            fsum  = flux[lr * ng + ig] + flux[ll * ng + ig];
         }
-        double jnet_fdm = -dtil(ig, ls) * (fdiff);
+        const size_t surface_group = static_cast<size_t>(ls) * ng + ig;
+        const double dtl           = _dtil[surface_group];
+        const double jnet_fdm      = -dtl * fdiff;
 
         // Guard 1: fsum is a sum of (nominally positive) fluxes, but during the
         // early outers it can collapse toward zero or go negative, which turns
         // the division into a spike that poisons the coupling coefficients.
         // Scale the floor to dtil so the test is dimensionally consistent.
         ++_dhat_total;
-        const double dtl   = dtil(ig, ls);
         const double floor = 1.0e-12 * std::max(1.0, std::abs(dtl));
         if (!(std::abs(fsum) > floor) || !std::isfinite(fsum)) {
             ++_dhat_fsum_guard;
-            dhat(ig, ls) = 0.0;
-            continue;
+            _dhat[surface_group] = 0.0;
+            return;
         }
 
-        double dh = (jnet_fdm - jnet(ig, ls)) / fsum;
+        double dh = (jnet_fdm - jnet[surface_group]) / fsum;
         if (!std::isfinite(dh)) {
             ++_dhat_fsum_guard;
-            dhat(ig, ls) = 0.0;
-            continue;
+            _dhat[surface_group] = 0.0;
+            return;
         }
 
         // Diagnostic 2: |dhat| > |dtil| makes one of the two CMFD coupling
@@ -161,7 +166,14 @@ void CMFD::upddhat(const int& ls, double* flux, double* jnet) {
                 if (_dhat_clamp_enabled) dh = (dh > 0.0 ? cap : -cap);
             }
         }
-        dhat(ig, ls) = dh;
+        _dhat[surface_group] = dh;
+    };
+
+    if (ng == 2) {
+        update_group(0);
+        update_group(1);
+    } else {
+        for (int ig = 0; ig < ng; ++ig) update_group(ig);
     }
 }
 
@@ -179,34 +191,33 @@ void CMFD::reportDhatGuardStats(const char* tag) const {
 }
 
 void CMFD::setls(const int& l) {
-    const int    ng     = _g.ng();
+    // Surface areas and volume are immutable geometry.  Reuse the constructor
+    // cache, while keeping the historical accessor/arithmetic order below so
+    // the optimisation remains numerically inert.
+    double area[NDIRMAX];
+    area[XDIR] = cachedNodeFaceArea(XDIR, l);
+    area[YDIR] = cachedNodeFaceArea(YDIR, l);
+    area[ZDIR] = cachedNodeFaceArea(ZDIR, l);
     const double volume = cachedNodeVolume(l);
-    double* const diag_l = _diag + static_cast<size_t>(l) * ng * ng;
-    double* const cc_l   = _cc + static_cast<size_t>(l) * ng * NDIRMAX * LR;
 
-    // Keep the historical loop and arithmetic order, but replace repeated
-    // Geometry mapping and accessor calls with contiguous cached data.
-    for (int ige = 0; ige < ng; ++ige) {
-        for (int igs = 0; igs < ng; ++igs)
-            diag_l[ige * ng + igs] = -_x.xssm(igs, ige, l) * volume;
+    for (int ige = 0; ige < _g.ng(); ++ige) {
 
-        double& diagonal = diag_l[ige * ng + ige];
-        diagonal += _x.xsrf(ige, l) * volume;
+        for (int igs = 0; igs < _g.ng(); ++igs) {
+            diag(igs, ige, l) = -_x.xssm(igs, ige, l) * volume;
+        }
+        diag(ige, ige, l) += _x.xsrf(ige, l) * volume;
 
         for (int idir = NDIRMAX - 1; idir >= 0; --idir) {
-            const int    ls   = cachedNodeSurface(LEFT, idir, l);
-            const double area = cachedNodeFaceArea(idir, l);
-            cc_l[ige * NDIRMAX * LR + idir * LR + LEFT] =
-                (-dtil(ige, ls) + dhat(ige, ls)) * area;
-            diagonal += (dtil(ige, ls) + dhat(ige, ls)) * area;
+            const int ls = cachedNodeSurface(LEFT, idir, l);
+
+            cc(LEFT, idir, ige, l) = (-dtil(ige, ls) + dhat(ige, ls)) * area[idir];
+            diag(ige, ige, l) += (dtil(ige, ls) + dhat(ige, ls)) * area[idir];
         }
 
         for (int idir = 0; idir < NDIRMAX; ++idir) {
-            const int    ls   = cachedNodeSurface(RIGHT, idir, l);
-            const double area = cachedNodeFaceArea(idir, l);
-            cc_l[ige * NDIRMAX * LR + idir * LR + RIGHT] =
-                (-dtil(ige, ls) - dhat(ige, ls)) * area;
-            diagonal += (dtil(ige, ls) - dhat(ige, ls)) * area;
+            const int ls = cachedNodeSurface(RIGHT, idir, l);
+            cc(RIGHT, idir, ige, l) = (-dtil(ige, ls) - dhat(ige, ls)) * area[idir];
+            diag(ige, ige, l) += (dtil(ige, ls) - dhat(ige, ls)) * area[idir];
         }
     }
 }
@@ -220,11 +231,20 @@ void CMFD::setEpsl2(double epsl2) {
 }
 
 void CMFD::updpsi(const int& l, const double* flux) {
+    const int ng = _g.ng();
+    if (ng == 2) {
+        const int nxyz = _g.nxyz();
+        const double* const xsnf = _x.xsnfData();
+        double value = 0.0;
+        value += flux[static_cast<size_t>(l) * 2 + 0] * xsnf[l];
+        value += flux[static_cast<size_t>(l) * 2 + 1] *
+                 xsnf[static_cast<size_t>(nxyz) + l];
+        _psi[l] = value * cachedNodeVolume(l);
+        return;
+    }
 
     _psi[l] = 0.0;
-
-    for (int ig = 0; ig < _g.ng(); ig++) {
-        _psi[l] += flux(ig, l) * _x.xsnf(ig, l);
-    }
+    for (int ig = 0; ig < ng; ++ig)
+        _psi[l] += flux[static_cast<size_t>(l) * ng + ig] * _x.xsnf(ig, l);
     _psi[l] = _psi[l] * cachedNodeVolume(l);
 }
