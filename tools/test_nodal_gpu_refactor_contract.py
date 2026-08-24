@@ -18,6 +18,7 @@ def main(argv: list[str] | None = None) -> int:
     required = (
         '#include "CudaTransferMirror.h"',
         '// RASBERY_NODAL_REFACTOR_V1',
+        '// RASBERY_NODAL_XS_MIRROR_NO_BATCH_ALLOCATION',
         'bool nodalFuseMatEvenEnabled()',
         'bool nodalXsMirrorEnabled()',
         '__global__ void kNodalMatEven',
@@ -28,6 +29,8 @@ def main(argv: list[str] | None = None) -> int:
         'cuda_transfer::ByteExactMirror<double> xsrf_mirror;',
         'cuda_transfer::ByteExactMirror<double> xsnf_mirror;',
         'cuda_transfer::ByteExactMirror<double> xssm_mirror;',
+        'bool pushed_xsrf = false',
+        'sl.pushed_xsrf = _mirror_xs && push_xsrf;',
         'xs_h2d_skipped_bytes',
         '\\"mat_even_fused\\"',
         '\\"xs_h2d_bytes\\"',
@@ -53,6 +56,10 @@ def main(argv: list[str] | None = None) -> int:
     commit = source.find('sl.xsrf_mirror.commit', sync)
     if sync < 0 or commit < sync:
         fail("mirror commit is not after a successful stream synchronize")
+
+    for token in ('PendingXsMirror', 'pending_xs.reserve', 'pending_xs.push_back'):
+        if token in source:
+            fail(f"per-batch heap-allocation token remains: {token}")
 
     unconditional = source.find('xsrf/xsnf/xssm upload UNCONDITIONALLY')
     if unconditional >= 0:
