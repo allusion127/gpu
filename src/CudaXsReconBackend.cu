@@ -518,6 +518,8 @@ private:
         cuda_transfer::ByteExactMirror<double> xsrf_mirror;
         cuda_transfer::ByteExactMirror<double> xsnf_mirror;
         cuda_transfer::ByteExactMirror<double> xssm_mirror;
+        // RASBERY_NODAL_XS_MIRROR_NO_BATCH_ALLOCATION
+        bool pushed_xsrf = false, pushed_xsnf = false, pushed_xssm = false;
         // Page-locking is idempotent but it is a synchronising call, so it runs
         // only when one of these pointers actually changed (i.e. once).
         const void* pin_bulk[6]  = {}; // jnet, phis, flux, xsrf, xsnf, xssm
@@ -776,14 +778,6 @@ private:
         const std::size_t ng2b = _cnt_ng2 * sizeof(double);
         const std::size_t ndgb = _cnt_ndg * sizeof(double);
 
-        struct PendingXsMirror {
-            int  slot = -1;
-            bool xsrf = false;
-            bool xsnf = false;
-            bool xssm = false;
-        };
-        std::vector<PendingXsMirror> pending_xs;
-        pending_xs.reserve(part.size());
         unsigned long long xs_h2d_bytes = 0;
         unsigned long long xs_h2d_skipped_bytes = 0;
 
@@ -860,8 +854,9 @@ private:
             } else {
                 xs_h2d_skipped_bytes += ng2b;
             }
-            if (_mirror_xs)
-                pending_xs.push_back({m, push_xsrf, push_xsnf, push_xssm});
+            sl.pushed_xsrf = _mirror_xs && push_xsrf;
+            sl.pushed_xsnf = _mirror_xs && push_xsnf;
+            sl.pushed_xssm = _mirror_xs && push_xssm;
             if (!memcpyAsyncOrFail(_base.jnet + s * _cnt_sg, sl.h_jnet, sgb,
                                    cudaMemcpyHostToDevice, "nodal arena jnet H2D") ||
                 !memcpyAsyncOrFail(const_cast<double*>(_base.flux) + s * _cnt_ng1, sl.h_flux, ng1b,
@@ -905,11 +900,12 @@ private:
         // Commit only after the drain proved the queued H2D reached the device.
         // A failed batch leaves the previous mirrors untouched, so they never
         // describe bytes that may not be resident.
-        for (const PendingXsMirror& pending : pending_xs) {
-            Slot& sl = _slot[static_cast<std::size_t>(pending.slot)];
-            if (pending.xsrf) sl.xsrf_mirror.commit(sl.h_xsrf, _cnt_ng1);
-            if (pending.xsnf) sl.xsnf_mirror.commit(sl.h_xsnf, _cnt_ng1);
-            if (pending.xssm) sl.xssm_mirror.commit(sl.h_xssm, _cnt_ng2);
+        for (int m : part) {
+            Slot& sl = _slot[static_cast<std::size_t>(m)];
+            if (sl.pushed_xsrf) sl.xsrf_mirror.commit(sl.h_xsrf, _cnt_ng1);
+            if (sl.pushed_xsnf) sl.xsnf_mirror.commit(sl.h_xsnf, _cnt_ng1);
+            if (sl.pushed_xssm) sl.xssm_mirror.commit(sl.h_xssm, _cnt_ng2);
+            sl.pushed_xsrf = sl.pushed_xsnf = sl.pushed_xssm = false;
         }
         g_nodal_batch_xs_h2d_bytes.fetch_add(xs_h2d_bytes, std::memory_order_relaxed);
         g_nodal_batch_xs_h2d_skipped_bytes.fetch_add(
