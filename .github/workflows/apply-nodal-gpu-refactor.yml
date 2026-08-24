@@ -1,5 +1,7 @@
 name: Apply nodal GPU refactor
 
+# revision: allocation-free XS mirror decision path
+
 on:
   push:
     branches:
@@ -19,12 +21,14 @@ jobs:
   apply-and-verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out branch
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: ${{ github.ref_name }}
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
@@ -32,16 +36,20 @@ jobs:
         run: |
           python -m py_compile \
             tools/apply_nodal_gpu_refactor.py \
+            tools/apply_nodal_gpu_hotpath_fix.py \
             tools/test_apply_nodal_gpu_refactor.py \
+            tools/test_apply_nodal_gpu_hotpath_fix.py \
             tools/test_cuda_transfer_mirror.py \
             tools/test_nodal_gpu_refactor_contract.py
           python tools/test_apply_nodal_gpu_refactor.py
+          python tools/test_apply_nodal_gpu_hotpath_fix.py
           python tools/test_cuda_transfer_mirror.py
 
       - name: Validate source anchors and apply refactor
         run: |
           python tools/apply_nodal_gpu_refactor.py --check src/CudaXsReconBackend.cu
           python tools/apply_nodal_gpu_refactor.py --in-place src/CudaXsReconBackend.cu
+          python tools/apply_nodal_gpu_hotpath_fix.py --in-place src/CudaXsReconBackend.cu
           python tools/test_nodal_gpu_refactor_contract.py src/CudaXsReconBackend.cu
 
       - name: Inspect patch
@@ -60,5 +68,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add src/CudaXsReconBackend.cu
-          git commit -m "nodal gpu: fuse Mat/Even and mirror arena XS uploads"
+          git commit -m "nodal gpu: remove per-batch XS mirror allocation"
           git push origin "HEAD:${GITHUB_REF_NAME}"
