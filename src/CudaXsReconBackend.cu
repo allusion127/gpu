@@ -6,13 +6,18 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -89,6 +94,19 @@ std::atomic<unsigned long long> g_nodal_graph_launches{0};
 std::atomic<unsigned long long> g_nodal_graph_fallbacks{0};
 std::atomic<unsigned long long> g_nodal_d2h_bytes{0}; // per drive, last shape seen
 
+// --- batch arena receipts (see NodalArena below).  Kept as TU-scope atomics,
+// not arena members, so the static-destruction receipt never has to reason
+// about whether the arena object is still alive.
+std::atomic<int>                g_nodal_batch_slots{0};
+std::atomic<unsigned long long> g_nodal_batches{0};        // batches launched
+std::atomic<unsigned long long> g_nodal_batch_drives{0};   // sum of participants
+std::atomic<unsigned long long> g_nodal_batch_graph_launches{0};
+std::atomic<unsigned long long> g_nodal_batch_graph_fallbacks{0};
+std::atomic<unsigned long long> g_nodal_batch_fallbacks{0}; // -> per-instance arm
+std::atomic<unsigned long long> g_nodal_batch_refused{0};   // slot/geometry refusals
+std::atomic<unsigned long long> g_nodal_batch_hist[65]     = {}; // width -> count
+std::atomic<unsigned long long> g_nodal_batch_linger_us{0};
+
 // The two group-SEPARABLE phases run one thread per (node, group): trlcff0 and
 // trlcff12 carry nothing across the ig loop (see NodalKernel.h), so lk*NG+ig is
 // the smallest real work unit and the launch gets 2x the threads at NG=2.
@@ -97,27 +115,62 @@ std::atomic<unsigned long long> g_nodal_d2h_bytes{0}; // per drive, last shape s
 // thread-per-node form did.  updateMatrix/calculateEven stay thread-per-node:
 // their 2x2 group coupling (matM/matMI inversion, the a[2][2] solve) is
 // inherent and cannot be split without changing the arithmetic.
-__global__ void kNodalTrl0(ndl::NodalView v) {
+//
+// BATCH AXIS.  Every one of the five is templated on BATCHED:
+//
+//  - BATCHED=false is the per-instance launch: grid.y is 1, `active` is null,
+//    and the body is textually what it always was -- `base` is used verbatim,
+//    nodalSlotView is not even instantiated on that path.  Adding the batch
+//    axis therefore cannot perturb the single-instance arm at all, not even by
+//    an extra integer add.
+//
+//  - BATCHED=true is the arena launch: grid.y == slots, blockIdx.y is the slot
+//    index m, and the FIRST instruction is the per-slot participation guard --
+//    the CMFD HALT_GUARD shape (CudaBICGBackend.cu:183), one uniform predicate
+//    per block, evaluated before anything is read or written, so a masked slot
+//    contributes nothing but an early-returning block.  gridDim.x chunking is
+//    untouched, so lk / ig / ls are computed exactly as in the per-instance
+//    launch; only the base pointers move (see nodal::nodalSlotView).
+//
+#define RASBERY_NODAL_SLOT_GUARD(base, active, v)                              \
+    int _m = 0;                                                                \
+    if (BATCHED) {                                                             \
+        _m = static_cast<int>(blockIdx.y);                                     \
+        if ((active)[_m] == 0u) return;                                        \
+    }                                                                          \
+    const ndl::NodalView v = BATCHED ? ndl::nodalSlotView(base, _m) : (base)
+
+template <bool BATCHED>
+__global__ void kNodalTrl0(ndl::NodalView base, const std::uint32_t* __restrict__ active) {
+    RASBERY_NODAL_SLOT_GUARD(base, active, v);
     const int i  = blockIdx.x * blockDim.x + threadIdx.x;
     const int lk = i / ndl::NG;
     const int ig = i - lk * ndl::NG;
     if (lk < v.nxyz) ndl::nodalTrlcff0Group(v, lk, ig);
 }
-__global__ void kNodalTrl12(ndl::NodalView v) {
+template <bool BATCHED>
+__global__ void kNodalTrl12(ndl::NodalView base, const std::uint32_t* __restrict__ active) {
+    RASBERY_NODAL_SLOT_GUARD(base, active, v);
     const int i  = blockIdx.x * blockDim.x + threadIdx.x;
     const int lk = i / ndl::NG;
     const int ig = i - lk * ndl::NG;
     if (lk < v.nxyz) ndl::nodalTrlcff12Group(v, lk, ig, ndl::StaticForms{});
 }
-__global__ void kNodalMat(ndl::NodalView v) {
+template <bool BATCHED>
+__global__ void kNodalMat(ndl::NodalView base, const std::uint32_t* __restrict__ active) {
+    RASBERY_NODAL_SLOT_GUARD(base, active, v);
     const int lk = blockIdx.x * blockDim.x + threadIdx.x;
     if (lk < v.nxyz) ndl::nodalUpdateMatrix(v, lk, ndl::StaticForms{});
 }
-__global__ void kNodalEven(ndl::NodalView v) {
+template <bool BATCHED>
+__global__ void kNodalEven(ndl::NodalView base, const std::uint32_t* __restrict__ active) {
+    RASBERY_NODAL_SLOT_GUARD(base, active, v);
     const int lk = blockIdx.x * blockDim.x + threadIdx.x;
     if (lk < v.nxyz) ndl::nodalCalculateEven(v, lk, ndl::StaticForms{});
 }
-__global__ void kNodalJnet(ndl::NodalView v) {
+template <bool BATCHED>
+__global__ void kNodalJnet(ndl::NodalView base, const std::uint32_t* __restrict__ active) {
+    RASBERY_NODAL_SLOT_GUARD(base, active, v);
     const int ls = blockIdx.x * blockDim.x + threadIdx.x;
     if (ls < v.nsurf) ndl::nodalCalculateJnet(v, ls, ndl::StaticForms{});
 }
@@ -153,8 +206,723 @@ struct FlatXsLibDevice {
     std::size_t         off_knots = 0;
 };
 
-std::mutex                    g_flatxs_lib_mutex;
-std::vector<FlatXsLibDevice>* g_flatxs_libs = nullptr; // leaked on purpose (process lifetime)
+std::mutex g_flatxs_lib_mutex;
+/// std::deque, NOT std::vector: `Impl::lib` caches the address of an element
+/// and is dereferenced later WITHOUT the mutex (solveFlatXs builds the kernel
+/// view from it).  A vector's push_back can reallocate, which would dangle
+/// every already-cached pointer the moment a second distinct library appeared.
+/// deque never invalidates references to existing elements on push_back, so the
+/// cached address stays valid for the process lifetime.  Single-library runs --
+/// every run today -- behave identically.
+std::deque<FlatXsLibDevice>* g_flatxs_libs = nullptr; // leaked on purpose (process lifetime)
+
+// ===========================================================================
+// NodalArena -- the multi-instance nodal arena.
+//
+// WHY.  In M64 batch mode the per-instance nodal device arm is correct but far
+// too light to matter: 8451 nodes x 2 groups is 67-209 blocks, 3-9% occupancy
+// on a 188-SM device, and the 64 instances take turns at it.  Host nodal work
+// was measured at 36.5% of all thread-time (18 ms/outer/instance) and it is
+// what manufactures the ~6 ms arrival skew that holds the CMFD rendezvous down
+// to mean width 17/64.  Aggregating the SAME five kernels across instances --
+// 64 x 8451 x 2 = 1.08M work items, ~4 full waves -- is the only way this arm
+// fills the device, which is why it is an arena and not a wider block size.
+//
+// STRUCTURE.  Deliberately the same recipe as the CMFD CudaBatchArena
+// (CudaBICGBackend.cu:1297-2530), because that one is proven in production:
+//
+//   * slot-strided allocations, one block per array, stride = the array's
+//     single-instance element count (nodal::nodalSlotView is the rebase);
+//   * gridDim.y == slots with blockIdx.y == m, and a per-slot participation
+//     mask read as the kernels' first instruction (the HALT_GUARD shape);
+//   * ONE fixed-topology graph that serves every subset -- participation lives
+//     in device memory, not in the launch shape, so the graph is captured once
+//     and replayed for every batch whatever its width;
+//   * opportunistic rendezvous: a batch is whoever arrived while the last one
+//     was on the device, with a bounded adaptive linger;
+//   * a single elected launcher (`_launching`), because two launchers on one
+//     stream corrupt captures -- see the comment at the election site;
+//   * fail-open everywhere: any refusal or failure drops that instance back on
+//     the per-instance FULL path, which drops back to the CPU body.
+//
+// WHAT STAYS PER INSTANCE.  Everything above the five phases: updateConstant
+// (host, shadow-checked, the only transcendental), convergence tests, the
+// critical search, TH.  Instances arrive, hand over five phases' worth of
+// arithmetic, and go back to their own control flow.  A slot's answer does not
+// depend on who else rode along -- that is what makes the opportunistic batch
+// legitimate, and it is the same argument the CMFD arena rests on.
+// ===========================================================================
+
+class NodalArena {
+public:
+    NodalArena(const ndl::NodalView& proto, int slots) : _slots(slots > 0 ? slots : 1) {
+        if (const char* w = std::getenv("RASBERY_NODAL_BATCH_WAIT_US")) {
+            const std::string requested(w);
+            if (requested == "auto" || requested == "AUTO" || requested == "adaptive")
+                _wait_auto = true;
+            else {
+                const long parsed = std::atol(w);
+                if (parsed >= 0) { _wait_us = parsed; _wait_auto = false; }
+            }
+        }
+        if (const char* mx = std::getenv("RASBERY_NODAL_BATCH_WAIT_MAX_US")) {
+            const long parsed = std::atol(mx);
+            if (parsed >= 0) _wait_max_us = std::min(parsed, 20000L);
+        }
+        _use_graph = !envFlagDisabled("RASBERY_GPU_NODAL_GRAPH");
+        init(proto);
+    }
+
+    // Never destroyed in practice: the arena is a process-lifetime singleton
+    // and tearing its device allocations down during static destruction would
+    // race the CUDA runtime's own teardown.  Same policy as g_flatxs_libs.
+    NodalArena(const NodalArena&)            = delete;
+    NodalArena& operator=(const NodalArena&) = delete;
+
+    [[nodiscard]] bool               available() const { return _available; }
+    [[nodiscard]] const std::string& status() const { return _status; }
+    [[nodiscard]] int                slots() const { return _slots; }
+
+    /// Byte-exact compatibility of one instance's view with the arena's SHARED
+    /// immutable geometry.  Shape counts alone are not enough -- two decks can
+    /// agree on nxyz/nsurf and still have different neighbour maps, and sharing
+    /// the first map would produce physically wrong currents with no error --
+    /// so this is the full memcmp, exactly as CudaBatchArena::compatibleGeometry
+    /// walks the CMFD neighbour table.
+    [[nodiscard]] bool compatible(const ndl::NodalView& p) const {
+        if (p.nxyz != _nxyz || p.nsurf != _nsurf || p.chif_empty != _chif_empty)
+            return false;
+        const std::size_t nx = static_cast<std::size_t>(_nxyz);
+        const std::size_t ns = static_cast<std::size_t>(_nsurf);
+        return std::memcmp(_ref_hmesh.data(), p.hmesh, nx * ndl::NDIR * sizeof(double)) == 0 &&
+               std::memcmp(_ref_albedo.data(), p.albedo,
+                           ndl::NDIR * ndl::NLR * sizeof(double)) == 0 &&
+               std::memcmp(_ref_lktosfc.data(), p.lktosfc,
+                           nx * ndl::NDIR * ndl::NLR * sizeof(int)) == 0 &&
+               std::memcmp(_ref_neib.data(), p.neib, nx * ndl::NEWSB * sizeof(int)) == 0 &&
+               std::memcmp(_ref_lklr.data(), p.lklr, ns * ndl::NLR * sizeof(int)) == 0 &&
+               std::memcmp(_ref_idirlr.data(), p.idirlr, ns * ndl::NLR * sizeof(int)) == 0 &&
+               std::memcmp(_ref_sgnlr.data(), p.sgnlr, ns * ndl::NLR * sizeof(int)) == 0;
+    }
+
+    int acquireSlot(const ndl::NodalView& p) {
+        if (!_available || !compatible(p)) return -1;
+        std::lock_guard<std::mutex> lock(_mutex);
+        for (int m = 0; m < _slots; ++m) {
+            if (_slot[static_cast<std::size_t>(m)].in_use) continue;
+            Slot& sl = _slot[static_cast<std::size_t>(m)];
+            // A fresh tenant inherits nothing: the previous tenant's residency
+            // flags would elide uploads the new one needs.
+            sl              = Slot{};
+            sl.in_use       = true;
+            return m;
+        }
+        return -1;
+    }
+
+    void releaseSlot(int m) {
+        if (m < 0) return;
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            _slot[static_cast<std::size_t>(m)].in_use = false;
+        }
+        // A lingering launcher may still be waiting for this slot to show up.
+        // It never will, and inUseCount() has just dropped, so wake it.
+        _cv.notify_all();
+    }
+
+    /// One batched nodal drive for slot `m`.  Blocks until the batch that
+    /// carried this slot has finished and its jnet/phis have landed in the
+    /// caller's host arrays.  false = the caller must run its own arm.
+    /// No `state_generation`: see the xs upload in launchBatch for why the
+    /// arena cannot use it as a residency key.
+    bool drive(int m, const ndl::NodalView& host, unsigned long long const_gen,
+               unsigned long long ref_gen) {
+        if (!_available) return false;
+
+        // ---- stage.  No CUDA call here: every instance thread runs this
+        // concurrently, and the launcher is the only one allowed near the
+        // stream (CudaBatchArena::stageSlot has the same contract).
+        {
+            Slot& sl     = _slot[static_cast<std::size_t>(m)];
+            sl.h_jnet    = host.jnet;
+            sl.h_flux    = host.flux;
+            sl.h_phis    = host.phis;
+            sl.h_xsrf    = host.xsrf;
+            sl.h_xsnf    = host.xsnf;
+            sl.h_xssm    = host.xssm;
+            sl.h_chif    = host.chif;
+            sl.h_const[0] = host.eta1;   sl.h_const[1] = host.eta2;
+            sl.h_const[2] = host.m260;   sl.h_const[3] = host.m251;
+            sl.h_const[4] = host.m253;   sl.h_const[5] = host.m262;
+            sl.h_const[6] = host.m264;   sl.h_const[7] = host.diagD;
+            sl.h_const[8] = host.diagDI;
+            sl.reigv     = host.reigv;
+            sl.const_gen = const_gen;
+            sl.ref_gen   = ref_gen;
+        }
+
+        std::unique_lock<std::mutex> lock(_mutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (_have_arrival) {
+            const double gap_us = static_cast<double>(
+                std::chrono::duration_cast<std::chrono::microseconds>(now - _last_arrival).count());
+            if (gap_us >= 0.0 && gap_us <= 1.0e6)
+                _arrival_gap_ewma_us = _arrival_gap_ewma_us == 0.0
+                                           ? gap_us
+                                           : 0.8 * _arrival_gap_ewma_us + 0.2 * gap_us;
+        }
+        _last_arrival = now;
+        _have_arrival = true;
+
+        const unsigned long long my_batch = _open_batch;
+        _pending.push_back(m);
+        if (_lingering) _cv.notify_all();
+
+        while (true) {
+            if (_completed > my_batch) {
+                // Somebody else ran our batch; our jnet/phis are already home.
+                //
+                // The test is `>=`, not `==`: one launch failure disables the
+                // arena for good (fail() clears _available and launchBatch
+                // refuses immediately after that), so every batch from the
+                // first failure onwards failed.  Comparing against a
+                // last-failure marker would let a straggler from the failing
+                // batch wake up after a later failure moved the marker and
+                // report success it never got.
+                return my_batch < _first_failed_batch;
+            }
+            if (_launching || _open_batch != my_batch) {
+                _cv.wait(lock);
+                continue;
+            }
+
+            // ---- nobody is on the device: WE launch this batch --------------
+            //
+            // Claim it BEFORE anything that releases the lock.  The linger
+            // below waits on the condition variable, which unlocks; without
+            // this flag set first, a thread arriving during the linger would
+            // see `_launching == false` and `_open_batch == my_batch` and elect
+            // itself a SECOND launcher of the same batch.  Two launchers then
+            // drive one stream at once, which is exactly the failure the CMFD
+            // arena documents at CudaBICGBackend.cu:2345-2355: NaN results,
+            // corrupted graph captures and heap corruption, invisible until the
+            // batches get wide enough for the linger to matter.  One stream,
+            // one elected launcher, no exceptions.
+            _launching = true;
+
+            long linger_us = _wait_us;
+            if (_wait_auto) {
+                if (_wait_max_us <= 0) {
+                    linger_us = 0;
+                } else {
+                    const double estimate =
+                        _arrival_gap_ewma_us > 0.0 ? 2.0 * _arrival_gap_ewma_us : 100.0;
+                    linger_us = static_cast<long>(
+                        std::clamp(estimate, 25.0, static_cast<double>(_wait_max_us)));
+                }
+            }
+            const auto wait_start = std::chrono::steady_clock::now();
+            if (linger_us > 0 && static_cast<int>(_pending.size()) < inUseCount()) {
+                const auto deadline = wait_start + std::chrono::microseconds(linger_us);
+                _lingering          = true;
+                while (static_cast<int>(_pending.size()) < inUseCount() &&
+                       _cv.wait_until(lock, deadline) != std::cv_status::timeout) {
+                }
+                _lingering = false;
+            }
+            g_nodal_batch_linger_us.store(static_cast<unsigned long long>(linger_us),
+                                          std::memory_order_relaxed);
+
+            std::vector<int> participants;
+            participants.swap(_pending);
+            ++_open_batch; // arrivals from here on join the NEXT batch
+            std::sort(participants.begin(), participants.end());
+
+            // The device work runs UNLOCKED on purpose: this is the window in
+            // which the next batch fills up.
+            lock.unlock();
+            bool ok = true;
+            if (!participants.empty()) ok = launchBatch(participants);
+            lock.lock();
+            _launching = false;
+            _completed = my_batch + 1;
+            if (!ok) {
+                if (my_batch < _first_failed_batch) _first_failed_batch = my_batch;
+            } else if (!participants.empty()) {
+                g_nodal_batches.fetch_add(1, std::memory_order_relaxed);
+                g_nodal_batch_drives.fetch_add(participants.size(), std::memory_order_relaxed);
+                const std::size_t w = std::min<std::size_t>(participants.size(), 64);
+                g_nodal_batch_hist[w].fetch_add(1, std::memory_order_relaxed);
+            }
+            lock.unlock();
+            _cv.notify_all();
+            return ok;
+        }
+    }
+
+private:
+    struct Slot {
+        bool in_use = false;
+        // staged host pointers for the drive in flight
+        double*       h_jnet     = nullptr;
+        const double* h_flux     = nullptr;
+        double*       h_phis     = nullptr;
+        const double* h_xsrf     = nullptr;
+        const double* h_xsnf     = nullptr;
+        const double* h_xssm     = nullptr;
+        const double* h_chif     = nullptr;
+        const double* h_const[9] = {};
+        double        reigv      = 0.0;
+        unsigned long long const_gen = 0, ref_gen = 0;
+        // device residency, per array.  Explicit booleans rather than a
+        // "generation 0 means nothing" sentinel: ref/state generations may
+        // legitimately BE zero.
+        bool               have_const = false, have_chif = false;
+        unsigned long long res_const_gen = 0, res_ref_gen = 0;
+        // Page-locking is idempotent but it is a synchronising call, so it runs
+        // only when one of these pointers actually changed (i.e. once).
+        const void* pin_bulk[6]  = {}; // jnet, phis, flux, xsrf, xsnf, xssm
+        const void* pin_const[9] = {};
+        const void* pin_chif     = nullptr;
+    };
+
+    [[nodiscard]] int inUseCount() const {
+        int c = 0;
+        for (const Slot& s : _slot)
+            if (s.in_use) ++c;
+        return c;
+    }
+
+    bool fail(const char* what, cudaError_t e) {
+        _status    = std::string(what) + " -> " + cudaGetErrorString(e);
+        _available = false;
+        return false;
+    }
+
+    void init(const ndl::NodalView& p) {
+        _nxyz       = p.nxyz;
+        _nsurf      = p.nsurf;
+        _chif_empty = p.chif_empty;
+
+        const std::size_t S   = static_cast<std::size_t>(_slots);
+        const std::size_t nx  = static_cast<std::size_t>(_nxyz);
+        const std::size_t ns  = static_cast<std::size_t>(_nsurf);
+        const std::size_t ndg = nx * ndl::NDIR * ndl::NG;
+        const std::size_t dg2 = nx * ndl::NDIR * ndl::NG2;
+        const std::size_t ng1 = nx * ndl::NG;
+        const std::size_t ng2 = nx * ndl::NG2;
+        const std::size_t sg  = ns * ndl::NG;
+
+        // Host shadows of the SHARED immutable tables, for compatible().
+        _ref_hmesh.assign(p.hmesh, p.hmesh + nx * ndl::NDIR);
+        _ref_albedo.assign(p.albedo, p.albedo + ndl::NDIR * ndl::NLR);
+        _ref_lktosfc.assign(p.lktosfc, p.lktosfc + nx * ndl::NDIR * ndl::NLR);
+        _ref_neib.assign(p.neib, p.neib + nx * ndl::NEWSB);
+        _ref_lklr.assign(p.lklr, p.lklr + ns * ndl::NLR);
+        _ref_idirlr.assign(p.idirlr, p.idirlr + ns * ndl::NLR);
+        _ref_sgnlr.assign(p.sgnlr, p.sgnlr + ns * ndl::NLR);
+
+        std::size_t off = 0;
+        auto        take_shared = [&](std::size_t n) { const std::size_t o = off; off += n; return o; };
+        auto        take_slot   = [&](std::size_t n) { const std::size_t o = off; off += S * n; return o; };
+
+        const std::size_t o_hmesh  = take_shared(nx * ndl::NDIR);
+        const std::size_t o_albedo = take_shared(ndl::NDIR * ndl::NLR);
+        std::size_t       o_const[9];
+        for (int i = 0; i < 9; ++i) o_const[i] = take_slot(ndg);
+        const std::size_t o_chif = take_slot(ng1);
+        const std::size_t o_xsrf = take_slot(ng1);
+        const std::size_t o_xsnf = take_slot(ng1);
+        const std::size_t o_xssm = take_slot(ng2);
+        const std::size_t o_jnet = take_slot(sg);
+        const std::size_t o_flux = take_slot(ng1);
+        const std::size_t o_phis = take_slot(sg);
+        const std::size_t o_reig = take_slot(1);
+        const std::size_t o_tr0  = take_slot(ndg);
+        const std::size_t o_tr1  = take_slot(ndg);
+        const std::size_t o_tr2  = take_slot(ndg);
+        const std::size_t o_mu   = take_slot(dg2);
+        const std::size_t o_tau  = take_slot(dg2);
+        const std::size_t o_mM   = take_slot(ng2);
+        const std::size_t o_mMI  = take_slot(ng2);
+        const std::size_t o_mMs  = take_slot(ng2);
+        const std::size_t o_mMf  = take_slot(ng2);
+        const std::size_t o_ds2  = take_slot(ndg);
+        const std::size_t o_ds4  = take_slot(ndg);
+        const std::size_t o_ds6  = take_slot(ndg);
+
+        std::size_t ioff = 0;
+        auto        take_int = [&](std::size_t n) { const std::size_t o = ioff; ioff += n; return o; };
+        const std::size_t o_lktosfc = take_int(nx * ndl::NDIR * ndl::NLR);
+        const std::size_t o_neib    = take_int(nx * ndl::NEWSB);
+        const std::size_t o_lklr    = take_int(ns * ndl::NLR);
+        const std::size_t o_idirlr  = take_int(ns * ndl::NLR);
+        const std::size_t o_sgnlr   = take_int(ns * ndl::NLR);
+
+        cudaError_t rc = cudaMalloc(reinterpret_cast<void**>(&_dbl), off * sizeof(double));
+        if (rc != cudaSuccess) { fail("cudaMalloc(nodal arena doubles)", rc); return; }
+        rc = cudaMalloc(reinterpret_cast<void**>(&_idx), ioff * sizeof(int));
+        if (rc != cudaSuccess) { fail("cudaMalloc(nodal arena ints)", rc); return; }
+        rc = cudaMalloc(reinterpret_cast<void**>(&_d_active), S * sizeof(std::uint32_t));
+        if (rc != cudaSuccess) { fail("cudaMalloc(nodal arena mask)", rc); return; }
+        rc = cudaMallocHost(reinterpret_cast<void**>(&_h_active), S * sizeof(std::uint32_t));
+        if (rc != cudaSuccess) { fail("cudaMallocHost(nodal arena mask)", rc); return; }
+        rc = cudaMallocHost(reinterpret_cast<void**>(&_h_reigv), S * sizeof(double));
+        if (rc != cudaSuccess) { fail("cudaMallocHost(nodal arena reigv)", rc); return; }
+        std::memset(_h_active, 0, S * sizeof(std::uint32_t));
+        std::memset(_h_reigv, 0, S * sizeof(double));
+        rc = cudaMemset(_d_active, 0, S * sizeof(std::uint32_t));
+        if (rc != cudaSuccess) { fail("cudaMemset(nodal arena mask)", rc); return; }
+        rc = cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking);
+        if (rc != cudaSuccess) { fail("cudaStreamCreateWithFlags(nodal arena)", rc); return; }
+
+        // SHARED geometry, uploaded once, synchronously, before any slot exists.
+        struct { const void* src; std::size_t off; std::size_t bytes; bool is_int; } geo[] = {
+            {p.hmesh, o_hmesh, nx * ndl::NDIR * sizeof(double), false},
+            {p.albedo, o_albedo, ndl::NDIR * ndl::NLR * sizeof(double), false},
+            {p.lktosfc, o_lktosfc, nx * ndl::NDIR * ndl::NLR * sizeof(int), true},
+            {p.neib, o_neib, nx * ndl::NEWSB * sizeof(int), true},
+            {p.lklr, o_lklr, ns * ndl::NLR * sizeof(int), true},
+            {p.idirlr, o_idirlr, ns * ndl::NLR * sizeof(int), true},
+            {p.sgnlr, o_sgnlr, ns * ndl::NLR * sizeof(int), true},
+        };
+        for (const auto& g : geo) {
+            void* dst = g.is_int ? static_cast<void*>(_idx + g.off)
+                                 : static_cast<void*>(_dbl + g.off);
+            rc = cudaMemcpy(dst, g.src, g.bytes, cudaMemcpyHostToDevice);
+            if (rc != cudaSuccess) { fail("cudaMemcpy(nodal arena geometry)", rc); return; }
+        }
+
+        // The SLOT-0 base view.  Everything the graph bakes lives here and none
+        // of it ever moves: one allocation, no realloc path, no per-batch
+        // rebinding.  nodalSlotView(base, m) is the only thing that turns this
+        // into slot m's view, and it runs inside the kernel.
+        _base            = p;              // shape scalars + chif_empty
+        _base.hmesh      = _dbl + o_hmesh;
+        _base.albedo     = _dbl + o_albedo;
+        _base.lktosfc    = _idx + o_lktosfc;
+        _base.neib       = _idx + o_neib;
+        _base.lklr       = _idx + o_lklr;
+        _base.idirlr     = _idx + o_idirlr;
+        _base.sgnlr      = _idx + o_sgnlr;
+        _base.eta1       = _dbl + o_const[0];
+        _base.eta2       = _dbl + o_const[1];
+        _base.m260       = _dbl + o_const[2];
+        _base.m251       = _dbl + o_const[3];
+        _base.m253       = _dbl + o_const[4];
+        _base.m262       = _dbl + o_const[5];
+        _base.m264       = _dbl + o_const[6];
+        _base.diagD      = _dbl + o_const[7];
+        _base.diagDI     = _dbl + o_const[8];
+        _base.chif       = _dbl + o_chif;
+        _base.xsrf       = _dbl + o_xsrf;
+        _base.xsnf       = _dbl + o_xsnf;
+        _base.xssm       = _dbl + o_xssm;
+        _base.jnet       = _dbl + o_jnet;
+        _base.flux       = _dbl + o_flux;
+        _base.phis       = _dbl + o_phis;
+        _base.trlcff0    = _dbl + o_tr0;
+        _base.trlcff1    = _dbl + o_tr1;
+        _base.trlcff2    = _dbl + o_tr2;
+        _base.mu         = _dbl + o_mu;
+        _base.tau        = _dbl + o_tau;
+        _base.matM       = _dbl + o_mM;
+        _base.matMI      = _dbl + o_mMI;
+        _base.matMs      = _dbl + o_mMs;
+        _base.matMf      = _dbl + o_mMf;
+        _base.dsncff2    = _dbl + o_ds2;
+        _base.dsncff4    = _dbl + o_ds4;
+        _base.dsncff6    = _dbl + o_ds6;
+        _base.reigv      = 0.0;              // superseded by reigv_dev, per slot
+        _base.reigv_dev  = _dbl + o_reig;
+
+        _cnt_ndg = ndg; _cnt_ng1 = ng1; _cnt_ng2 = ng2; _cnt_sg = sg;
+
+        _slot.resize(S);
+        _available = true;
+        _status    = "ready";
+        g_nodal_batch_slots.store(_slots, std::memory_order_relaxed);
+    }
+
+    /// Page-lock the host buffers this slot will be DMA'd from/to.  Launcher
+    /// thread only, outside any capture, and only when a pointer actually
+    /// changed -- cudaHostRegister is a synchronising call, not a per-drive one.
+    void pinSlot(Slot& sl) {
+        const void* const  bulk[6]  = {sl.h_jnet, sl.h_phis, sl.h_flux,
+                                       sl.h_xsrf, sl.h_xsnf, sl.h_xssm};
+        const std::size_t  bytes[6] = {_cnt_sg * sizeof(double),  _cnt_sg * sizeof(double),
+                                       _cnt_ng1 * sizeof(double), _cnt_ng1 * sizeof(double),
+                                       _cnt_ng1 * sizeof(double), _cnt_ng2 * sizeof(double)};
+        for (int i = 0; i < 6; ++i) {
+            if (bulk[i] == nullptr || bulk[i] == sl.pin_bulk[i]) continue;
+            XsReconBackend::pinHost(bulk[i], bytes[i]);
+            sl.pin_bulk[i] = bulk[i];
+        }
+        for (int i = 0; i < 9; ++i) {
+            if (sl.h_const[i] == nullptr || sl.h_const[i] == sl.pin_const[i]) continue;
+            XsReconBackend::pinHost(sl.h_const[i], _cnt_ndg * sizeof(double));
+            sl.pin_const[i] = sl.h_const[i];
+        }
+        if (sl.h_chif != nullptr && sl.h_chif != sl.pin_chif) {
+            XsReconBackend::pinHost(sl.h_chif, _cnt_ng1 * sizeof(double));
+            sl.pin_chif = sl.h_chif;
+        }
+    }
+
+    bool memcpyAsyncOrFail(void* dst, const void* src, std::size_t bytes,
+                           cudaMemcpyKind kind, const char* what) {
+        const cudaError_t rc = cudaMemcpyAsync(dst, src, bytes, kind, _stream);
+        if (rc != cudaSuccess) { fail(what, rc); return false; }
+        return true;
+    }
+
+    /// The fixed-topology graph: five kernels, grid.y == slots, participation
+    /// read from device memory.  Because nothing about the launch shape depends
+    /// on WHO is in the batch, this single capture serves every subset for the
+    /// rest of the run.  Failure is not fatal -- the plain launches below are
+    /// numerically the same thing.
+    void ensureGraph() {
+        if (!_use_graph || _graph != nullptr) return;
+        const cudaError_t drc = cudaStreamSynchronize(_stream);
+        if (drc != cudaSuccess) { _use_graph = false; return; }
+        cudaGraph_t graph = nullptr;
+        cudaError_t rc =
+            cudaStreamBeginCapture(_stream, cudaStreamCaptureModeThreadLocal);
+        if (rc == cudaSuccess) {
+            enqueueKernels();
+            // Must run even if the enqueue faulted: this is what takes the
+            // stream back OUT of capture mode.
+            rc = cudaStreamEndCapture(_stream, &graph);
+        }
+        if (rc == cudaSuccess) rc = cudaGraphInstantiate(&_graph, graph, 0ull);
+        if (graph != nullptr) cudaGraphDestroy(graph);
+        if (rc != cudaSuccess) {
+            // Work submitted to a capturing stream is RECORDED, not executed,
+            // so a failed capture leaves nothing pending and the direct
+            // launches below are this batch's first and only execution.
+            cudaGetLastError();
+            _graph     = nullptr;
+            _use_graph = false;
+            g_nodal_batch_graph_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    void enqueueKernels() {
+        const unsigned S  = static_cast<unsigned>(_slots);
+        const int      B  = 128;
+        const int      gn = (_nxyz + B - 1) / B;
+        const int      gs = (_nsurf + B - 1) / B;
+        const int      gg = (_nxyz * ndl::NG + B - 1) / B;
+        kNodalTrl0<true><<<dim3(static_cast<unsigned>(gg), S), B, 0, _stream>>>(_base, _d_active);
+        kNodalTrl12<true><<<dim3(static_cast<unsigned>(gg), S), B, 0, _stream>>>(_base, _d_active);
+        kNodalMat<true><<<dim3(static_cast<unsigned>(gn), S), B, 0, _stream>>>(_base, _d_active);
+        kNodalEven<true><<<dim3(static_cast<unsigned>(gn), S), B, 0, _stream>>>(_base, _d_active);
+        kNodalJnet<true><<<dim3(static_cast<unsigned>(gs), S), B, 0, _stream>>>(_base, _d_active);
+    }
+
+    /// Launcher-thread only.  Uploads for the participants, one graph launch
+    /// (or five plain launches), downloads for the participants, one drain.
+    bool launchBatch(const std::vector<int>& part) {
+        if (!_available) return false; // a previous batch already took us down
+        const std::size_t S    = static_cast<std::size_t>(_slots);
+        const std::size_t sgb  = _cnt_sg * sizeof(double);
+        const std::size_t ng1b = _cnt_ng1 * sizeof(double);
+        const std::size_t ng2b = _cnt_ng2 * sizeof(double);
+        const std::size_t ndgb = _cnt_ndg * sizeof(double);
+
+        for (int m : part) pinSlot(_slot[static_cast<std::size_t>(m)]);
+        ensureGraph();
+
+        // ---- participation mask ------------------------------------------
+        std::memset(_h_active, 0, S * sizeof(std::uint32_t));
+        for (int m : part) _h_active[m] = 1u;
+        if (!memcpyAsyncOrFail(_d_active, _h_active, S * sizeof(std::uint32_t),
+                               cudaMemcpyHostToDevice, "nodal arena mask H2D"))
+            return drained();
+
+        // ---- per-slot uploads: the SAME set the per-instance FULL path
+        // uploads, with the same residency rules, in the same order ----------
+        for (int m : part) {
+            Slot&             sl = _slot[static_cast<std::size_t>(m)];
+            const std::size_t s  = static_cast<std::size_t>(m);
+            _h_reigv[s]          = sl.reigv;
+
+            if (!sl.have_const || sl.const_gen != sl.res_const_gen) {
+                for (int i = 0; i < 9; ++i)
+                    if (!memcpyAsyncOrFail(_dbl_const(i) + s * _cnt_ndg, sl.h_const[i], ndgb,
+                                           cudaMemcpyHostToDevice, "nodal arena consts H2D"))
+                        return drained();
+                sl.res_const_gen = sl.const_gen;
+                sl.have_const    = true;
+            }
+            if (!_chif_empty && sl.h_chif != nullptr &&
+                (!sl.have_chif || sl.ref_gen != sl.res_ref_gen)) {
+                if (!memcpyAsyncOrFail(const_cast<double*>(_base.chif) + s * _cnt_ng1, sl.h_chif,
+                                       ng1b, cudaMemcpyHostToDevice, "nodal arena chif H2D"))
+                    return drained();
+                sl.res_ref_gen = sl.ref_gen;
+                sl.have_chif   = true;
+            }
+            // xsrf/xsnf/xssm upload UNCONDITIONALLY, and `state_gen` is
+            // deliberately not used as a residency key here.
+            //
+            // The trap: XSSet::hoststateGeneration() counts HOST writes to
+            // _xs/_iden, and the GPU xs arms do not bump it when they rewrite
+            // _xs by DOWNLOAD (XSSet.cpp:2728-2730 skips the bump on a clean
+            // device pass).  That is sound for the per-instance path, whose
+            // xs pointers are dev_block -- the same download refreshed both
+            // sides, so equal generations really do mean equal bytes.  It is
+            // NOT sound for a separate arena buffer, which that download never
+            // touched: caching on the generation would pin slot m to the xs of
+            // some earlier outer, silently and forever.  540 KB a drive is the
+            // price of not having that bug.  (The nine updateConstant arrays
+            // below are different: Nodal owns them, Nodal alone writes them,
+            // and Nodal bumps _const_generation when it does -- so THAT key is
+            // honest, and it is the 3.65 MB one that matters.)
+            if (!memcpyAsyncOrFail(const_cast<double*>(_base.xsrf) + s * _cnt_ng1, sl.h_xsrf,
+                                   ng1b, cudaMemcpyHostToDevice, "nodal arena xsrf H2D") ||
+                !memcpyAsyncOrFail(const_cast<double*>(_base.xsnf) + s * _cnt_ng1, sl.h_xsnf,
+                                   ng1b, cudaMemcpyHostToDevice, "nodal arena xsnf H2D") ||
+                !memcpyAsyncOrFail(const_cast<double*>(_base.xssm) + s * _cnt_ng2, sl.h_xssm,
+                                   ng2b, cudaMemcpyHostToDevice, "nodal arena xssm H2D"))
+                return drained();
+            if (!memcpyAsyncOrFail(_base.jnet + s * _cnt_sg, sl.h_jnet, sgb,
+                                   cudaMemcpyHostToDevice, "nodal arena jnet H2D") ||
+                !memcpyAsyncOrFail(const_cast<double*>(_base.flux) + s * _cnt_ng1, sl.h_flux, ng1b,
+                                   cudaMemcpyHostToDevice, "nodal arena flux H2D"))
+                return drained();
+        }
+        // One copy of the whole reigv array: 8 bytes a slot, and it keeps the
+        // per-drive eigenvalue out of the kernel arguments the graph baked.
+        if (!memcpyAsyncOrFail(const_cast<double*>(_base.reigv_dev), _h_reigv, S * sizeof(double),
+                               cudaMemcpyHostToDevice, "nodal arena reigv H2D"))
+            return drained();
+
+        // ---- the five phases ----------------------------------------------
+        if (_graph != nullptr) {
+            const cudaError_t rc = cudaGraphLaunch(_graph, _stream);
+            if (rc != cudaSuccess) { fail("cudaGraphLaunch(nodal arena)", rc); return drained(); }
+            g_nodal_batch_graph_launches.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            enqueueKernels();
+        }
+        // Judged BEFORE the downloads are queued: a launch that never ran must
+        // not have stale device jnet copied over the caller's host array, which
+        // is the very buffer its CPU fallback then reads as an input.
+        const cudaError_t lerr = cudaGetLastError();
+        if (lerr != cudaSuccess) { fail("nodal arena launch", lerr); return drained(); }
+
+        // ---- the mined minimal download set, per participant ---------------
+        for (int m : part) {
+            Slot&             sl = _slot[static_cast<std::size_t>(m)];
+            const std::size_t s  = static_cast<std::size_t>(m);
+            if (!memcpyAsyncOrFail(sl.h_jnet, _base.jnet + s * _cnt_sg, sgb,
+                                   cudaMemcpyDeviceToHost, "nodal arena jnet D2H") ||
+                !memcpyAsyncOrFail(sl.h_phis, _base.phis + s * _cnt_sg, sgb,
+                                   cudaMemcpyDeviceToHost, "nodal arena phis D2H"))
+                return drained();
+        }
+
+        const cudaError_t src = cudaStreamSynchronize(_stream);
+        if (src != cudaSuccess) { fail("nodal arena drain", src); return false; }
+        g_nodal_d2h_bytes.store(2 * sgb, std::memory_order_relaxed);
+        g_nodal_drives.fetch_add(part.size(), std::memory_order_relaxed);
+        return true;
+    }
+
+    /// Failing out of a half-enqueued batch must not leave a D2H in flight:
+    /// every participant is about to run its own CPU body over the very
+    /// host.jnet this stream might still be writing.  Drain first.
+    bool drained() {
+        cudaStreamSynchronize(_stream);
+        cudaGetLastError();
+        return false;
+    }
+
+    [[nodiscard]] double* _dbl_const(int i) const {
+        const double* base[9] = {_base.eta1, _base.eta2, _base.m260, _base.m251, _base.m253,
+                                 _base.m262, _base.m264, _base.diagD, _base.diagDI};
+        return const_cast<double*>(base[i]);
+    }
+
+    int          _slots      = 0;
+    bool         _available  = false;
+    std::string  _status     = "not initialised";
+    int          _nxyz = 0, _nsurf = 0, _chif_empty = 0;
+    cudaStream_t _stream = nullptr;
+
+    double*        _dbl         = nullptr;
+    int*           _idx         = nullptr;
+    std::uint32_t* _d_active    = nullptr;
+    std::uint32_t* _h_active    = nullptr; // pinned
+    double*        _h_reigv     = nullptr; // pinned
+
+    ndl::NodalView  _base{};
+    cudaGraphExec_t _graph     = nullptr;
+    bool            _use_graph = true;
+
+    std::size_t _cnt_ndg = 0, _cnt_ng1 = 0, _cnt_ng2 = 0, _cnt_sg = 0;
+
+    std::vector<double> _ref_hmesh, _ref_albedo;
+    std::vector<int>    _ref_lktosfc, _ref_neib, _ref_lklr, _ref_idirlr, _ref_sgnlr;
+
+    std::vector<Slot>       _slot;
+    std::mutex              _mutex;
+    std::condition_variable _cv;
+    std::vector<int>        _pending;
+    unsigned long long      _open_batch         = 0;
+    unsigned long long      _completed          = 0;
+    unsigned long long      _first_failed_batch = ~0ull;
+    bool                    _launching    = false;
+    bool                    _lingering    = false;
+    // Default: NO linger -- a batch is purely "whoever arrived while the last
+    // one ran".  Same default as the CMFD arena, and for the same reason: a
+    // slot that is somewhere else entirely (CMFD, TH, I/O) is not coming, so a
+    // launcher that waits for a full house pays the budget on every single
+    // drive and buys nothing.  RASBERY_NODAL_BATCH_WAIT_US=auto turns on the
+    // bounded 2x-arrival-gap estimate; a number sets a fixed budget.
+    long                    _wait_us      = 0;
+    bool                    _wait_auto    = false;
+    long                    _wait_max_us  = 2000;
+    std::chrono::steady_clock::time_point _last_arrival{};
+    bool                                  _have_arrival        = false;
+    double                                _arrival_gap_ewma_us = 0.0;
+};
+
+std::mutex  g_nodal_arena_mutex;
+NodalArena* g_nodal_arena        = nullptr; // leaked on purpose (process lifetime)
+bool        g_nodal_arena_failed = false;
+
+/// The arena is engaged ONLY for a real multi-instance batch running the FULL
+/// device pipeline.  Width 1, hybrid mode, or the arm switched off all keep the
+/// existing per-instance paths exactly as they are.
+bool nodalArenaWanted() {
+    static const bool on = [] {
+        return rasberyGpuNodalEnabled() && rasberyGpuNodalFullEnabled() &&
+               !envFlagDisabled("RASBERY_GPU_NODAL_BATCH");
+    }();
+    return on && rasberyNodalBatchWidth() > 1;
+}
+
+NodalArena* nodalArenaFor(const ndl::NodalView& proto) {
+    std::lock_guard<std::mutex> lock(g_nodal_arena_mutex);
+    if (g_nodal_arena_failed) return nullptr;
+    if (g_nodal_arena == nullptr) {
+        NodalArena* a = new NodalArena(proto, rasberyNodalBatchWidth());
+        if (!a->available()) {
+            std::cerr << "[RASBERY][WARN][nodal] batch arena unavailable (" << a->status()
+                      << ") -- per-instance nodal arm\n";
+            g_nodal_arena_failed = true;
+            return nullptr; // deliberately leaked: it may still own device memory
+        }
+        g_nodal_arena = a;
+        std::cout << "[RASBERY][NODAL][BATCH] arena: slots=" << a->slots()
+                  << " nxyz=" << proto.nxyz << " nsurf=" << proto.nsurf << " (" << a->status()
+                  << ")" << std::endl;
+    }
+    return g_nodal_arena;
+}
 
 /// Extended [RASBERY][NODAL][GPU] receipt.
 ///
@@ -182,6 +950,39 @@ struct NodalReceipt {
                   << ",\"d2h_bytes_per_drive\":"
                   << g_nodal_d2h_bytes.load(std::memory_order_relaxed) << "}"
                   << std::endl;
+
+        // The arena's own receipt, on its own tag so nothing consuming the line
+        // above has to change.  Printed whenever the arena was reachable at all
+        // (slots>0), so "engaged but never launched" is distinguishable from
+        // "never built".
+        const int slots = g_nodal_batch_slots.load(std::memory_order_relaxed);
+        if (slots <= 0) return;
+        const unsigned long long b = g_nodal_batches.load(std::memory_order_relaxed);
+        const unsigned long long p = g_nodal_batch_drives.load(std::memory_order_relaxed);
+        std::ostringstream line;
+        line << "[RASBERY][NODAL][BATCH] {\"slots\":" << slots
+             << ",\"batches_launched\":" << b
+             << ",\"instance_drives\":" << p
+             << ",\"mean_width\":"
+             << (b ? static_cast<double>(p) / static_cast<double>(b) : 0.0)
+             << ",\"graph_launches\":"
+             << g_nodal_batch_graph_launches.load(std::memory_order_relaxed)
+             << ",\"graph_fallbacks\":"
+             << g_nodal_batch_graph_fallbacks.load(std::memory_order_relaxed)
+             << ",\"drive_fallbacks\":"
+             << g_nodal_batch_fallbacks.load(std::memory_order_relaxed)
+             << ",\"slot_refusals\":"
+             << g_nodal_batch_refused.load(std::memory_order_relaxed)
+             << ",\"last_linger_us\":"
+             << g_nodal_batch_linger_us.load(std::memory_order_relaxed)
+             << ",\"width_histogram\":[";
+        const int wmax = slots < 64 ? slots : 64;
+        for (int w = 1; w <= wmax; ++w) {
+            if (w > 1) line << ',';
+            line << g_nodal_batch_hist[w].load(std::memory_order_relaxed);
+        }
+        line << "]}";
+        std::cout << line.str() << std::endl;
     }
 };
 NodalReceipt g_nodal_receipt;
@@ -265,6 +1066,14 @@ struct XsReconBackend::Impl {
         g_key_ndev = nullptr;
     }
 
+    // --- batch arena (multi-instance nodal) -------------------------------
+    // The arena is process-wide; this instance only holds the slot it was
+    // handed.  -1 with `nodal_slot_refused` set means "asked once, refused"
+    // (geometry mismatch or more instances than slots): never ask again, just
+    // run the per-instance arm below.
+    int  nodal_slot          = -1;
+    bool nodal_slot_refused  = false;
+
     const FlatXsLibDevice* lib = nullptr;      // shared, process lifetime
     std::uint64_t          lib_hash_cached = 0; // host tables are immutable;
     const void*            lib_hash_key    = nullptr; // hash once per source
@@ -280,6 +1089,13 @@ struct XsReconBackend::Impl {
     std::size_t off_phif          = 0;
 
     ~Impl() {
+        // Hand the arena slot back BEFORE anything else: a lingering launcher
+        // may be counting this instance among the participants it is waiting
+        // for, and releaseSlot is what wakes it.
+        if (nodal_slot >= 0 && g_nodal_arena != nullptr) {
+            g_nodal_arena->releaseSlot(nodal_slot);
+            nodal_slot = -1;
+        }
         if (dev_block) cudaFree(dev_block);
         if (dev_fuel) cudaFree(dev_fuel);
         if (dev_scalars) cudaFree(dev_scalars);
@@ -544,7 +1360,7 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
         d.lib_hash_key    = host.coeff_lsm;
 
         std::lock_guard<std::mutex> lock(g_flatxs_lib_mutex);
-        if (g_flatxs_libs == nullptr) g_flatxs_libs = new std::vector<FlatXsLibDevice>;
+        if (g_flatxs_libs == nullptr) g_flatxs_libs = new std::deque<FlatXsLibDevice>;
         const FlatXsLibDevice* found = nullptr;
         for (const auto& e : *g_flatxs_libs)
             if (e.hash == h) { found = &e; break; }
@@ -789,6 +1605,31 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     const bool hybrid_even = !rasberyGpuNodalFullEnabled();
     Impl& d = *_impl;
     if (!d.available || host.nxyz <= 0 || host.nsurf <= 0) return false;
+
+    // ---- multi-instance batch arena ---------------------------------------
+    // Engaged only for --batch-mode M>1 with the FULL pipeline; see
+    // NodalArena.  Every refusal and every failure below falls through to the
+    // per-instance code that follows, which is untouched.
+    if (nodalArenaWanted()) {
+        NodalArena* arena = nodalArenaFor(host);
+        if (arena != nullptr) {
+            if (d.nodal_slot < 0 && !d.nodal_slot_refused) {
+                d.nodal_slot = arena->acquireSlot(host);
+                if (d.nodal_slot < 0) {
+                    d.nodal_slot_refused = true;
+                    g_nodal_batch_refused.fetch_add(1, std::memory_order_relaxed);
+                    std::cerr << "[RASBERY][WARN][nodal] batch arena refused a slot "
+                                 "(geometry mismatch or width exhausted) -- per-instance arm\n";
+                }
+            }
+            if (d.nodal_slot >= 0) {
+                if (arena->drive(d.nodal_slot, host, const_generation, ref_generation))
+                    return true; // jnet/phis are home; counters bumped in the arena
+                g_nodal_batch_fallbacks.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
     if (!d.ensure(host.nxyz, d.n_fuel > 0 ? d.n_fuel : host.nxyz)) {
         d.available = false;
         return false;
@@ -950,9 +1791,9 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_flux, host.flux,
                                          nx * ndl::NG * sizeof(double),
                                          cudaMemcpyHostToDevice, d.stream), d.status);
-        kNodalTrl0<<<gng, B, 0, d.stream>>>(v);
-        kNodalTrl12<<<gng, B, 0, d.stream>>>(v);
-        kNodalMat<<<gn, B, 0, d.stream>>>(v);
+        kNodalTrl0<false><<<gng, B, 0, d.stream>>>(v, nullptr);
+        kNodalTrl12<false><<<gng, B, 0, d.stream>>>(v, nullptr);
+        kNodalMat<false><<<gn, B, 0, d.stream>>>(v, nullptr);
         RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
 
         // calculateEven runs on the HOST (the production member function is
@@ -1022,11 +1863,11 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_flux, host.flux,
                                          nx * ndl::NG * sizeof(double),
                                          cudaMemcpyHostToDevice, d.stream), d.status);
-        kNodalTrl0<<<gng, B, 0, d.stream>>>(v);
-        kNodalTrl12<<<gng, B, 0, d.stream>>>(v);
-        kNodalMat<<<gn, B, 0, d.stream>>>(v);
-        kNodalEven<<<gn, B, 0, d.stream>>>(v);
-        kNodalJnet<<<gs, B, 0, d.stream>>>(v);
+        kNodalTrl0<false><<<gng, B, 0, d.stream>>>(v, nullptr);
+        kNodalTrl12<false><<<gng, B, 0, d.stream>>>(v, nullptr);
+        kNodalMat<false><<<gn, B, 0, d.stream>>>(v, nullptr);
+        kNodalEven<false><<<gn, B, 0, d.stream>>>(v, nullptr);
+        kNodalJnet<false><<<gs, B, 0, d.stream>>>(v, nullptr);
         RASBERY_CUDA_TRY(cudaMemcpyAsync(host.jnet, v.jnet, surf_bytes,
                                          cudaMemcpyDeviceToHost, d.stream), d.status);
         RASBERY_CUDA_TRY(cudaMemcpyAsync(host.phis, v.phis, surf_bytes,
@@ -1192,7 +2033,7 @@ bool XsReconBackend::solveNodalPost(const ndl::NodalView& host) {
 
     const int B  = 128;
     const int gs = (host.nsurf + B - 1) / B;
-    kNodalJnet<<<gs, B, 0, d.stream>>>(v);
+    kNodalJnet<false><<<gs, B, 0, d.stream>>>(v, nullptr);
     RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
 
     RASBERY_CUDA_TRY(cudaMemcpyAsync(host.jnet, v.jnet,

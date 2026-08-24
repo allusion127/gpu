@@ -299,6 +299,9 @@ int main(int argc, char* argv[]) {
     // -----------------------------------------------------------------------
     if (batch_width > 0 && !rasbery_inputs.empty()) {
         rasbery::rasberySetBatchWidth(batch_width);
+        // Same width, published to the nodal arm.  The two arenas are separate
+        // (different phases, different rendezvous), but they are the same M.
+        rasbery::rasberyNodalSetBatchWidth(batch_width);
         const int jobs = static_cast<int>(rasbery_inputs.size());
         int host_threads = std::min(batch_width, jobs);
 #ifdef _OPENMP

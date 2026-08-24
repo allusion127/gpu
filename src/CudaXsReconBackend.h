@@ -185,6 +185,25 @@ inline bool rasberyGpuNodalFullEnabled() {
     return on;
 }
 
+/// Arena width for the multi-instance NODAL batch (--batch-mode M), published
+/// by main() next to rasberySetBatchWidth().
+///
+/// Deliberately NOT a call into rasberyBatchWidth(): CudaXsReconBackend.cu is
+/// linked on its own into the device-consistency test target, without the CMFD
+/// translation unit that defines that symbol, and the nodal arm has no other
+/// reason to depend on the CMFD backend.  An inline function-local static gives
+/// one process-wide value with no new exported symbol, so the CUDA build and
+/// the no-CUDA stub build both keep linking unchanged -- the same reasoning as
+/// rasberyGpuNodalFullEnabled above.
+inline int& rasberyNodalBatchWidthRef() {
+    static int width = 0;
+    return width;
+}
+inline void rasberyNodalSetBatchWidth(int slots) {
+    rasberyNodalBatchWidthRef() = slots > 0 ? slots : 0;
+}
+inline int rasberyNodalBatchWidth() { return rasberyNodalBatchWidthRef(); }
+
 /// Receipt accessor mirroring XsReconBackend::nodalDrivesSolved for main.cpp.
 unsigned long long rasberyGpuNodalDrives();
 

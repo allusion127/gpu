@@ -203,6 +203,68 @@ struct NodalView {
     int           nsurf;
 };
 
+/// Rebase a batch arena's SLOT-0 view onto slot `m`.
+///
+/// The arena (CudaXsReconBackend.cu) allocates every per-instance array as one
+/// contiguous block whose slot stride is exactly that array's single-instance
+/// element count, so slot m's copy of any array starts at `base + m * count`.
+/// The seven immutable geometry tables -- hmesh, lktosfc, neib, lklr, idirlr,
+/// sgnlr, albedo -- are SHARED, one copy at stride 0, which the arena verifies
+/// byte-for-byte against every joining instance before it hands out a slot.
+/// The three shape scalars (nxyz, nsurf, chif_empty) are verified equal too, so
+/// they need no rebase either.
+///
+/// This is a pure index rebase: not one value that an arithmetic site reads
+/// changes, only which instance's array the read lands in.  Together with
+/// "gridDim.x chunking is unchanged, the batch axis is gridDim.y" that is the
+/// whole bit-identity argument for the batched launches -- thread (lk, ig) of
+/// slot m executes the identical instruction sequence on the identical bytes
+/// that the per-instance launch executed for that instance.
+RASBERY_XSR_HD inline NodalView nodalSlotView(NodalView v, int m) {
+    const long long s   = m;
+    const long long nx  = v.nxyz;
+    const long long ns  = v.nsurf;
+    const long long ndg = nx * NDIR * NG;  // per-(node, dir, group)
+    const long long dg2 = nx * NDIR * NG2; // per-(node, dir) 2x2
+    const long long ng1 = nx * NG;         // per-(node, group)  [also SoA xs rows]
+    const long long ng2 = nx * NG2;        // per-node 2x2       [also xssm]
+    const long long sg  = ns * NG;         // per-(surface, group)
+
+    v.xsrf += s * ng1;
+    v.xsnf += s * ng1;
+    v.xssm += s * ng2;
+    if (v.chif != nullptr) v.chif += s * ng1;
+
+    v.eta1 += s * ndg;
+    v.eta2 += s * ndg;
+    v.m260 += s * ndg;
+    v.m251 += s * ndg;
+    v.m253 += s * ndg;
+    v.m262 += s * ndg;
+    v.m264 += s * ndg;
+    v.diagD += s * ndg;
+    v.diagDI += s * ndg;
+
+    v.trlcff0 += s * ndg;
+    v.trlcff1 += s * ndg;
+    v.trlcff2 += s * ndg;
+    v.mu += s * dg2;
+    v.tau += s * dg2;
+    v.matM += s * ng2;
+    v.matMI += s * ng2;
+    v.matMs += s * ng2;
+    v.matMf += s * ng2;
+    v.dsncff2 += s * ndg;
+    v.dsncff4 += s * ndg;
+    v.dsncff6 += s * ndg;
+
+    v.flux += s * ng1;
+    v.jnet += s * sg;
+    v.phis += s * sg;
+    if (v.reigv_dev != nullptr) v.reigv_dev += s;
+    return v;
+}
+
 // Accessor helpers mirroring the Nodal.cpp macros.
 RASBERY_XSR_HD inline double nvTrl0(const NodalView& v, int ig, int lkd) { return v.trlcff0[lkd * NG + ig]; }
 RASBERY_XSR_HD inline double nvMatM(const NodalView& v, int i, int j, int lk) { return v.matM[lk * NG2 + j * NG + i]; }
