@@ -35,6 +35,8 @@ RASBERY_GPU_NODAL_FUSE_MAT_EVEN=0
 
 새 경로는 각 슬롯에 마지막으로 **성공적으로 drain된 H2D 바이트**를 보관한다. 다음 입력이 `memcmp` 기준 완전히 동일할 때만 DMA를 생략한다. `double` 비교가 아니라 byte 비교이므로 signed zero, NaN payload와 최하위 비트까지 구분한다. shadow는 `cudaStreamSynchronize` 성공 후에만 갱신한다.
 
+XS 업로드 여부는 batch마다 임시 container를 만들지 않고 기존 슬롯 객체의 3개 boolean에 기록한다. 따라서 전송 생략 최적화가 host allocator 호출을 새로 만들지 않는다.
+
 기본은 활성화이며 아래 설정으로 기존 무조건 업로드 경로를 사용한다.
 
 ```bash
@@ -56,6 +58,7 @@ xs_h2d_skipped_bytes
 
 - transfer mirror C++20 compile/run 계약
 - source transformer idempotence 및 anchor drift fail-closed
+- allocation-free hot-path transformer 계약
 - phase dependency와 rollback 경로 정적 계약
 - Python syntax 검사
 - `git diff --check`
