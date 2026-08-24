@@ -1,5 +1,6 @@
 #include "CudaBICGBackend.h"
 
+#include "CudaXsReconBackend.h" // rasberyHostPinningEnabled(): header-only gate
 #include "Geometry.h"
 #include "pch.h"
 
@@ -998,18 +999,29 @@ __global__ void cmfd_wiel_finalize(const int nxyz,
                                    const double* __restrict__ terms_c,
                                    double* scalars,
                                    std::uint32_t* sweep_halt) {
-    if (threadIdx.x != 0) return;
     const int m = static_cast<int>(blockIdx.y);
-    if (sweep_halt[m] != 0u) return;
+    if (sweep_halt[m] != 0u) return; // uniform for the whole slot block
+    const int lane = static_cast<int>(threadIdx.x);
     const double* ta = terms_ab + m * vec_stride;
     const double* tc = terms_c + m * vec_stride;
-    double err = 0.0, gammad = 0.0, gamman = 0.0;
-    for (int l = 0; l < nxyz; ++l) {
-        err    = err + ta[l];
-        gammad = gammad + ta[nxyz + l];
-        gamman = gamman + tc[l];
+    __shared__ double lane_sum[3];
+
+    // Each independent sum retains the original l-ascending dependency chain.
+    // Lanes 0, 1 and 2 therefore run concurrently without changing a sum's
+    // operand pairing or deterministic double result.
+    if (lane < 3) {
+        const double* values = lane == 0 ? ta : (lane == 1 ? ta + nxyz : tc);
+        double sum = 0.0;
+        for (int l = 0; l < nxyz; ++l) sum = sum + values[l];
+        lane_sum[lane] = sum;
     }
-    double* sm  = scalars + static_cast<long long>(m) * kScalarCount;
+    __syncthreads();
+    if (lane != 0) return;
+
+    const double err    = lane_sum[0];
+    const double gammad = lane_sum[1];
+    const double gamman = lane_sum[2];
+    double* sm = scalars + static_cast<long long>(m) * kScalarCount;
     sm[kErrAcc] = err;
     sm[kGammaD] = gammad;
     sm[kGammaN] = gamman;
@@ -1536,8 +1548,8 @@ public:
                                            sizeof(double),
                                            cudaMemcpyHostToDevice,
                                            stream));
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-                ++telemetry.stream_sync_calls_during_iteration;
+                // Graph/direct kernels are submitted to this same stream, so
+                // stream order publishes eps without draining the pipeline.
                 sl.eps_on_device = sl.eps;
             }
 
@@ -1794,7 +1806,7 @@ public:
             cmfd_wiel_terms<<<node_grid(), block_size, 0, stream>>>(
                 nxyz, vec_stride(), node_stride(), phi, psi_dev, xs_xsnf, node_vol,
                 ax, s, sweep_halt);
-            cmfd_wiel_finalize<<<scalar_grid(), 1, 0, stream>>>(
+            cmfd_wiel_finalize<<<scalar_grid(), 32, 0, stream>>>(
                 nxyz, vec_stride(), ax, s, scalars, sweep_halt);
             cmfd_updls<<<node_grid(), block_size, 0, stream>>>(
                 nxyz, vec_stride(), node_stride(), mat_stride(), xs_chif, xs_xsnf,
@@ -2207,14 +2219,18 @@ int CudaBatchArena::acquireSlot() {
         _impl->taken[static_cast<size_t>(m)] = 1;
         // A fresh instance inherits nothing: the upload shadows of the previous
         // tenant would otherwise elide an upload the new tenant needs.
+        //
+        // Reset the WHOLE slot, not the four fields the plain solve happens to
+        // read.  The partial reset predates the sweep path, which added
+        // chif_mirror/vol_mirror and a second set of host_* pointers; those were
+        // left carrying the previous tenant's state, and every host_* pointer a
+        // dead Driver left behind dangles into freed memory.  `Slot{}` is exactly
+        // the state slot.resize() gives a slot on the first acquire, so on the
+        // validated one-worker-per-deck path (a single acquire per slot) this
+        // assignment is a no-op -- same reset the NodalArena already does.
         BatchCore::Slot& sl = _impl->core.slot[static_cast<size_t>(m)];
-        sl.diag_mirror.valid = false;
-        sl.cc_mirror.valid   = false;
-        sl.phi_mirror.valid  = false;
-        sl.eps_on_device     = std::numeric_limits<double>::quiet_NaN();
-        sl.eps               = std::numeric_limits<double>::quiet_NaN();
-        sl.nmax              = -1;
-        sl.in_use            = true;
+        sl        = BatchCore::Slot{};
+        sl.in_use = true;
         return m;
     }
     return -1;
@@ -2247,6 +2263,10 @@ void CudaBatchArena::solve(int m, double* out_phi) { solveCommon(m, out_phi, 0);
 
 void CudaBatchArena::pinHost(const void* p, size_t bytes) const {
     if (p == nullptr || bytes == 0) return;
+    // Permanent registration, so only legal while the caller's buffer outlives
+    // the process.  A recycled Driver worker breaks that: see
+    // rasberySetHostPinningEnabled() in CudaXsReconBackend.h.
+    if (!rasberyHostPinningEnabled()) return;
     const cudaError_t rc =
         cudaHostRegister(const_cast<void*>(p), bytes, cudaHostRegisterDefault);
     if (rc != cudaSuccess) cudaGetLastError(); // already registered / exotic host

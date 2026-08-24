@@ -2062,6 +2062,12 @@ unsigned long long XsReconBackend::flatXsNodesSolved() {
 
 void XsReconBackend::pinHost(const void* p, size_t bytes) {
     if (p == nullptr || bytes == 0) return;
+    // These registrations are permanent -- there is no unpin path -- so they are
+    // only legal while the caller's buffer outlives the process.  When Drivers
+    // are recycled onto a shared worker pool that is false, and re-registering a
+    // recycled address aliases the dead deck's pages.  See
+    // rasberySetHostPinningEnabled() in CudaXsReconBackend.h.
+    if (!rasberyHostPinningEnabled()) return;
     const cudaError_t rc =
         cudaHostRegister(const_cast<void*>(p), bytes, cudaHostRegisterDefault);
     if (rc != cudaSuccess) cudaGetLastError(); // already registered / exotic host

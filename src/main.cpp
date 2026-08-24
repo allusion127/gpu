@@ -37,7 +37,10 @@ namespace {
 
 constexpr int RASBERY_OMP_THREADS = 8;
 
-int rasberyVisibleCpuThreads() {
+/// Live process affinity capacity straight from the kernel, or 0 when the
+/// platform/query cannot answer.  Only trustworthy while nothing has bound the
+/// calling thread yet -- see rasberyVisibleCpuThreads() below.
+int rasberyAffinityCpuCount() {
 #if defined(__linux__)
     cpu_set_t affinity;
     CPU_ZERO(&affinity);
@@ -46,6 +49,23 @@ int rasberyVisibleCpuThreads() {
         if (count > 0) return count;
     }
 #endif
+    return 0;
+}
+
+int rasberyVisibleCpuThreads() {
+    // RASBERY_STARTUP_CPUS is stamped by rasberyPrepareOpenMPStartup() in the
+    // FIRST process image, before OMP_PROC_BIND=TRUE / OMP_PLACES=cores are
+    // exported and the process re-execs itself.  In the re-exec'd image libgomp
+    // binds the initial thread to a single place before main() is entered, so a
+    // sched_getaffinity here reports that one place (2 CPUs on an SMT host)
+    // instead of the 24-CPU cpuset the job actually owns.  Prefer the stamped
+    // value; the live query stays the fallback for images that never re-exec.
+    if (const char* startup = std::getenv("RASBERY_STARTUP_CPUS")) {
+        const int stamped = std::atoi(startup);
+        if (stamped > 0) return stamped;
+    }
+    const int live = rasberyAffinityCpuCount();
+    if (live > 0) return live;
 #ifdef _OPENMP
     return std::max(1, omp_get_num_procs());
 #else
@@ -75,6 +95,17 @@ void rasberyPrepareOpenMPStartup(char* argv[]) {
 #if !defined(_WIN32)
     if (std::getenv("RASBERY_OMP_ENV_READY") != nullptr)
         return;
+
+    // Stamp the true cpuset capacity here, in the first image, while nothing has
+    // bound this thread yet.  The OMP_PROC_BIND/OMP_PLACES pair set below makes
+    // libgomp pin the initial thread of the re-exec'd image, and from that point
+    // on sched_getaffinity can only see the one place it was pinned to.  An
+    // inherited/explicit value is left alone.
+    if (std::getenv("RASBERY_STARTUP_CPUS") == nullptr) {
+        const int startup_cpus = rasberyAffinityCpuCount();
+        if (startup_cpus > 0)
+            rasberySetEnv("RASBERY_STARTUP_CPUS", std::to_string(startup_cpus).c_str(), true);
+    }
 
     bool changed = false;
     changed |= rasberySetEnvIfNeeded("OMP_WAIT_POLICY", "PASSIVE");
@@ -315,15 +346,38 @@ int main(int argc, char* argv[]) {
             const int requested = std::atoi(host_env);
             if (requested > 0) host_threads = std::min({requested, batch_width, jobs});
         }
+        const int concurrent_workers = host_threads;
 #else
-        const int visible_cpus = 1;
+        const int visible_cpus       = 1;
+        // No OpenMP: the instance loop below is a plain serial for, so every deck
+        // after the first runs on a thread that has already torn one down.
+        const int concurrent_workers = 1;
 #endif
+        // Host page-locking is permanent and un-undoable (see
+        // rasberySetHostPinningEnabled), so it is only sound while every Driver
+        // outlives the run.  With one worker per deck that holds.  With fewer
+        // workers the OpenMP queue recycles a worker onto a second deck, whose
+        // Geometry/XSSet/BICGCMFD land on the freed -- and still registered --
+        // addresses of the deck that just finished; that aliasing is what turned
+        // `--batch-mode 64` with 24 workers into 54 failed decks.  Disabling the
+        // registration makes the same copies run from pageable memory: slower,
+        // and numerically identical.
+        const bool host_pinning = (concurrent_workers >= jobs);
+        rasbery::rasberySetHostPinningEnabled(host_pinning);
         std::cout << "\n[RASBERY][BATCH] " << jobs << " deck(s), width " << batch_width
                   << ", " << host_threads << " host Driver worker(s)" << std::endl;
         std::cout << "[RASBERY][BATCH_HOST] {\"jobs\":" << jobs
                   << ",\"arena_width\":" << batch_width
                   << ",\"host_threads\":" << host_threads
-                  << ",\"visible_cpus\":" << visible_cpus << "}" << std::endl;
+                  << ",\"visible_cpus\":" << visible_cpus
+                  << ",\"host_pinning\":" << (host_pinning ? "true" : "false") << "}" << std::endl;
+        if (!host_pinning)
+            std::cout << "[RASBERY][BATCH_HOST] concurrent Driver workers("
+                      << concurrent_workers << ") < jobs(" << jobs
+                      << "): workers are recycled onto later decks, so host page-locking is off "
+                         "for this run (correct, and slower on the PCIe copies). Use "
+                         "RASBERY_BATCH_HOST_THREADS=" << jobs
+                      << " for the page-locked configuration." << std::endl;
 #ifdef _OPENMP
         // One OpenMP level only: the instance loop is the parallelism. Nested
         // Driver regions reduce the measured GPU rendezvous width and lose
@@ -390,6 +444,13 @@ int main(int argc, char* argv[]) {
                   << "}" << std::endl;
         return exit_code;
     }
+
+    // Same rule as the batch branch above: this loop destroys each Driver before
+    // building the next one, so with more than one deck the permanent host
+    // registrations pinHost leaves behind would be inherited by whatever the
+    // allocator puts at those addresses next.  One deck per process is the only
+    // shape here that can page-lock safely.
+    rasbery::rasberySetHostPinningEnabled(rasbery_inputs.size() <= 1);
 
     for (std::size_t i = 0; i < rasbery_inputs.size(); ++i) {
         const fs::path rasbery_input_path  = rasbery_inputs[i];
