@@ -1,0 +1,64 @@
+name: Apply nodal GPU refactor
+
+on:
+  push:
+    branches:
+      - codex/nodal-mat-even-xs-residency
+    paths:
+      - .github/workflows/apply-nodal-gpu-refactor.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nodal-gpu-refactor-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  apply-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref_name }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify transformer and mirror helper
+        run: |
+          python -m py_compile \
+            tools/apply_nodal_gpu_refactor.py \
+            tools/test_apply_nodal_gpu_refactor.py \
+            tools/test_cuda_transfer_mirror.py \
+            tools/test_nodal_gpu_refactor_contract.py
+          python tools/test_apply_nodal_gpu_refactor.py
+          python tools/test_cuda_transfer_mirror.py
+
+      - name: Validate source anchors and apply refactor
+        run: |
+          python tools/apply_nodal_gpu_refactor.py --check src/CudaXsReconBackend.cu
+          python tools/apply_nodal_gpu_refactor.py --in-place src/CudaXsReconBackend.cu
+          python tools/test_nodal_gpu_refactor_contract.py src/CudaXsReconBackend.cu
+
+      - name: Inspect patch
+        run: |
+          git diff --check
+          git diff --stat
+          git diff -- src/CudaXsReconBackend.cu
+
+      - name: Commit verified source change
+        shell: bash
+        run: |
+          if git diff --quiet -- src/CudaXsReconBackend.cu; then
+            echo "Source already contains the validated refactor."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/CudaXsReconBackend.cu
+          git commit -m "nodal gpu: fuse Mat/Even and mirror arena XS uploads"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
