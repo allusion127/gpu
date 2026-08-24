@@ -1,43 +1,46 @@
 #!/usr/bin/env python3
-"""Test the allocation-free normalization after the main nodal transformer."""
+"""Regression gate: the nodal XS mirror launch path allocates no batch container."""
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def load(name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-main_transform = load("nodal_main_transform", ROOT / "tools" / "apply_nodal_gpu_refactor.py")
-hotfix = load("nodal_hotfix", ROOT / "tools" / "apply_nodal_gpu_hotpath_fix.py")
-fixture_mod = load("nodal_fixture", ROOT / "tools" / "test_apply_nodal_gpu_refactor.py")
+SOURCE = ROOT / "src" / "CudaXsReconBackend.cu"
 
 
 def main() -> int:
-    v1 = main_transform.apply(fixture_mod.fixture())
-    assert "PendingXsMirror" in v1
-    patched = hotfix.apply(v1)
-    assert hotfix.HOTPATH_MARKER in patched
-    assert "PendingXsMirror" not in patched
-    assert "std::vector<PendingXsMirror>" not in patched
-    assert patched == hotfix.apply(patched), "hot-path normalization must be idempotent"
+    source = SOURCE.read_text(encoding="utf-8")
+    required = (
+        "// RASBERY_NODAL_XS_MIRROR_NO_BATCH_ALLOCATION",
+        "bool pushed_xsrf = false, pushed_xsnf = false, pushed_xssm = false;",
+        "sl.pushed_xsrf = _mirror_xs && push_xsrf;",
+        "sl.pushed_xsnf = _mirror_xs && push_xsnf;",
+        "sl.pushed_xssm = _mirror_xs && push_xssm;",
+        "if (sl.pushed_xsrf) sl.xsrf_mirror.commit",
+        "if (sl.pushed_xsnf) sl.xsnf_mirror.commit",
+        "if (sl.pushed_xssm) sl.xssm_mirror.commit",
+        "sl.pushed_xsrf = sl.pushed_xsnf = sl.pushed_xssm = false;",
+    )
+    missing = [token for token in required if token not in source]
+    if missing:
+        raise SystemExit(f"nodal XS mirror no-allocation: FAIL missing={missing}")
 
-    try:
-        hotfix.apply(v1.replace("pending_xs.reserve(part.size());", "pending_xs.reserve(1);"))
-    except RuntimeError:
-        pass
-    else:
-        raise AssertionError("hot-path anchor drift did not fail closed")
+    forbidden = (
+        "PendingXsMirror",
+        "std::vector<PendingXsMirror>",
+        "pending_xs.reserve",
+        "pending_xs.push_back",
+    )
+    stale = [token for token in forbidden if token in source]
+    if stale:
+        raise SystemExit(f"nodal XS mirror no-allocation: FAIL stale={stale}")
 
-    print("nodal XS mirror hot-path transformer: PASS")
+    sync = source.find("const cudaError_t src = cudaStreamSynchronize(_stream);")
+    commit = source.find("if (sl.pushed_xsrf) sl.xsrf_mirror.commit", sync)
+    if sync < 0 or commit < sync:
+        raise SystemExit("nodal XS mirror no-allocation: FAIL commit precedes drain")
+
+    print("nodal XS mirror no-allocation: PASS")
     return 0
 
 
