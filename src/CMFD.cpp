@@ -15,6 +15,50 @@ CMFD::CMFD(Geometry& g, XSSet& x)
     _src   = new double[_g.nxyz() * _g.ng()]{};
     _psi   = new double[_g.nxyz()]{};
 
+    // Geometry is fixed for the lifetime of a Driver.  Build the compact maps
+    // once instead of re-running the node/surface indexing helpers in every
+    // setls/upddhat/updjnet call of every concurrent instance.
+    const int nsurf = _g.nsurf();
+    _surface_node.resize(static_cast<size_t>(nsurf) * LR);
+    _surface_dir.resize(static_cast<size_t>(nsurf) * LR);
+    for (int ls = 0; ls < nsurf; ++ls) {
+        for (int lr = 0; lr < LR; ++lr) {
+            const size_t i = static_cast<size_t>(ls) * LR + lr;
+            _surface_node[i] = _g.lklr(lr, ls);
+            _surface_dir[i]  = _g.idirlr(lr, ls);
+        }
+    }
+
+    const int nxyz = _g.nxyz();
+    _node_surface.resize(static_cast<size_t>(nxyz) * NDIRMAX * LR);
+    _node_neighbor.resize(static_cast<size_t>(nxyz) * NDIRMAX * LR);
+    _node_hmesh.resize(static_cast<size_t>(nxyz) * NDIRMAX);
+    _node_face_area.resize(static_cast<size_t>(nxyz) * NDIRMAX);
+    _node_volume.resize(static_cast<size_t>(nxyz));
+    for (int l = 0; l < nxyz; ++l) {
+        const size_t dir_base = static_cast<size_t>(l) * NDIRMAX;
+        for (int idir = 0; idir < NDIRMAX; ++idir) {
+            _node_hmesh[dir_base + idir] = _g.hmesh(idir, l);
+            for (int lr = 0; lr < LR; ++lr) {
+                const size_t i = (dir_base + idir) * LR + lr;
+                _node_surface[i]  = _g.lktosfc(lr, idir, l);
+                _node_neighbor[i] = _g.neib(lr, idir, l);
+            }
+        }
+        _node_face_area[dir_base + XDIR] =
+            _node_hmesh[dir_base + YDIR] * _node_hmesh[dir_base + ZDIR];
+        _node_face_area[dir_base + YDIR] =
+            _node_hmesh[dir_base + XDIR] * _node_hmesh[dir_base + ZDIR];
+        _node_face_area[dir_base + ZDIR] =
+            _node_hmesh[dir_base + XDIR] * _node_hmesh[dir_base + YDIR];
+        _node_volume[static_cast<size_t>(l)] = _g.vol(l);
+    }
+
+    _boundary_albedo.resize(static_cast<size_t>(NDIRMAX) * LR);
+    for (int idir = 0; idir < NDIRMAX; ++idir)
+        for (int lr = 0; lr < LR; ++lr)
+            _boundary_albedo[static_cast<size_t>(idir) * LR + lr] = _g.albedo(lr, idir);
+
     if (const char* c = std::getenv("RASBERY_DHAT_CLAMP"))
         _dhat_clamp_enabled = (std::atoi(c) != 0);
 }
@@ -33,31 +77,31 @@ void CMFD::resetDhat() {
 }
 
 void CMFD::upddtil(const int& ls) {
-    int ll    = _g.lklr(LEFT, ls);
-    int lr    = _g.lklr(RIGHT, ls);
-    int idirl = _g.idirlr(LEFT, ls);
-    int idirr = _g.idirlr(RIGHT, ls);
+    const int ll    = cachedSurfaceNode(LEFT, ls);
+    const int lr    = cachedSurfaceNode(RIGHT, ls);
+    const int idirl = cachedSurfaceDirection(LEFT, ls);
+    const int idirr = cachedSurfaceDirection(RIGHT, ls);
 
     double betal, betar;
 
     for (int ig = 0; ig < _g.ng(); ig++) {
         if (ll < 0) {
-            betal = _g.albedo(LEFT, idirl) * 0.5;
+            betal = cachedBoundaryAlbedo(LEFT, idirl) * 0.5;
         } else {
-            betal = _x.xsdf(ig, ll) / _g.hmesh(idirl, ll);
+            betal = _x.xsdf(ig, ll) / cachedNodeHmesh(idirl, ll);
         }
         if (lr < 0) {
-            betar = _g.albedo(RIGHT, idirr) * 0.5;
+            betar = cachedBoundaryAlbedo(RIGHT, idirr) * 0.5;
         } else {
-            betar = _x.xsdf(ig, lr) / _g.hmesh(idirr, lr);
+            betar = _x.xsdf(ig, lr) / cachedNodeHmesh(idirr, lr);
         }
         dtil(ig, ls) = 2 * betal * betar / (betal + betar);
     }
 }
 
 void CMFD::upddhat(const int& ls, double* flux, double* jnet) {
-    int ll = _g.lklr(LEFT, ls);
-    int lr = _g.lklr(RIGHT, ls);
+    const int ll = cachedSurfaceNode(LEFT, ls);
+    const int lr = cachedSurfaceNode(RIGHT, ls);
 
     for (int ig = 0; ig < _g.ng(); ig++) {
         double fdiff, fsum;
@@ -135,31 +179,34 @@ void CMFD::reportDhatGuardStats(const char* tag) const {
 }
 
 void CMFD::setls(const int& l) {
-    // determine the area of surfaces at coarse meshes that is normal to directions
-    double area[NDIRMAX];
+    const int    ng     = _g.ng();
+    const double volume = cachedNodeVolume(l);
+    double* const diag_l = _diag + static_cast<size_t>(l) * ng * ng;
+    double* const cc_l   = _cc + static_cast<size_t>(l) * ng * NDIRMAX * LR;
 
-    area[XDIR] = _g.hmesh(YDIR, l) * _g.hmesh(ZDIR, l);
-    area[YDIR] = _g.hmesh(XDIR, l) * _g.hmesh(ZDIR, l);
-    area[ZDIR] = _g.hmesh(XDIR, l) * _g.hmesh(YDIR, l);
+    // Keep the historical loop and arithmetic order, but replace repeated
+    // Geometry mapping and accessor calls with contiguous cached data.
+    for (int ige = 0; ige < ng; ++ige) {
+        for (int igs = 0; igs < ng; ++igs)
+            diag_l[ige * ng + igs] = -_x.xssm(igs, ige, l) * volume;
 
-    for (int ige = 0; ige < _g.ng(); ++ige) {
-
-        for (int igs = 0; igs < _g.ng(); ++igs) {
-            diag(igs, ige, l) = -_x.xssm(igs, ige, l) * _g.vol(l);
-        }
-        diag(ige, ige, l) += _x.xsrf(ige, l) * _g.vol(l);
+        double& diagonal = diag_l[ige * ng + ige];
+        diagonal += _x.xsrf(ige, l) * volume;
 
         for (int idir = NDIRMAX - 1; idir >= 0; --idir) {
-            int ls = _g.lktosfc(LEFT, idir, l);
-
-            cc(LEFT, idir, ige, l) = (-dtil(ige, ls) + dhat(ige, ls)) * area[idir];
-            diag(ige, ige, l) += (dtil(ige, ls) + dhat(ige, ls)) * area[idir];
+            const int    ls   = cachedNodeSurface(LEFT, idir, l);
+            const double area = cachedNodeFaceArea(idir, l);
+            cc_l[ige * NDIRMAX * LR + idir * LR + LEFT] =
+                (-dtil(ige, ls) + dhat(ige, ls)) * area;
+            diagonal += (dtil(ige, ls) + dhat(ige, ls)) * area;
         }
 
-        for (int idir = 0; idir < NDIRMAX; idir++) {
-            int ls                  = _g.lktosfc(RIGHT, idir, l);
-            cc(RIGHT, idir, ige, l) = (-dtil(ige, ls) - dhat(ige, ls)) * area[idir];
-            diag(ige, ige, l) += (dtil(ige, ls) - dhat(ige, ls)) * area[idir];
+        for (int idir = 0; idir < NDIRMAX; ++idir) {
+            const int    ls   = cachedNodeSurface(RIGHT, idir, l);
+            const double area = cachedNodeFaceArea(idir, l);
+            cc_l[ige * NDIRMAX * LR + idir * LR + RIGHT] =
+                (-dtil(ige, ls) - dhat(ige, ls)) * area;
+            diagonal += (dtil(ige, ls) - dhat(ige, ls)) * area;
         }
     }
 }
@@ -179,5 +226,5 @@ void CMFD::updpsi(const int& l, const double* flux) {
     for (int ig = 0; ig < _g.ng(); ig++) {
         _psi[l] += flux(ig, l) * _x.xsnf(ig, l);
     }
-    _psi[l] = _psi[l] * _g.vol(l);
+    _psi[l] = _psi[l] * cachedNodeVolume(l);
 }
