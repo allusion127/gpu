@@ -1,4 +1,5 @@
 #include "Nodal.h"
+#include "NodalConstantKernel.h"
 
 #include <atomic>
 #include <cstdio>
@@ -96,76 +97,52 @@ Nodal::~Nodal() {
     delete[] _matMf;
 }
 
-void Nodal::updateConstant(const int& lk) {
+bool Nodal::updateConstant(const int& lk) {
     const int lkg0 = lk * _ng;
-    bool unchanged = true;
+
+    // Nodal is a two-group method throughout (the matrix/even phases use
+    // fixed 2x2 storage). Snapshot the material inputs once per node instead
+    // of re-running XSSet/Geometry indexing in every direction and output.
+    double xsrf_node[nodal::NG];
+    double xsdf_node[nodal::NG];
+    bool   unchanged = true;
     for (int ig = 0; ig < _ng; ++ig) {
+        xsrf_node[ig] = xs.xsrf(ig, lk);
+        xsdf_node[ig] = xs.xsdf(ig, lk);
         unchanged = unchanged &&
-                    _constant_xsrf[lkg0 + ig] == xs.xsrf(ig, lk) &&
-                    _constant_xsdf[lkg0 + ig] == xs.xsdf(ig, lk);
+                    _constant_xsrf[lkg0 + ig] == xsrf_node[ig] &&
+                    _constant_xsdf[lkg0 + ig] == xsdf_node[ig];
     }
-    if (unchanged) return;
+    if (unchanged) return false;
 
-    int lkd0 = lk * NDIRMAX;
+    double hmesh_node[NDIRMAX];
+    for (int idir = 0; idir < NDIRMAX; ++idir)
+        hmesh_node[idir] = _g.hmesh(idir, lk);
 
-    for (int idir = 0; idir < NDIRMAX; idir++) {
-        int lkd = lkd0 + idir;
-
-        for (int ig = 0; ig < _ng; ig++) {
-            double kp2    = xs.xsrf(ig, lk) * _g.hmesh(idir, lk) * _g.hmesh(idir, lk) / (4 * xs.xsdf(ig, lk));
-            double kp     = sqrt(kp2);
-            double kp3    = kp2 * kp;
-            double kp4    = kp2 * kp2;
-            double kp5    = kp2 * kp3;
-            double rkp    = 1 / kp;
-            double rkp2   = rkp * rkp;
-            double rkp3   = rkp2 * rkp;
-            double rkp4   = rkp2 * rkp2;
-            double rkp5   = rkp2 * rkp3;
-            // sinh/cosh via a single exp (glibc sinh/cosh are slow and call expm1/hypot); same
-            // trick as PPR.cpp. One exp + reciprocal instead of two transcendental library calls.
-            double ekp    = std::exp(kp);
-            double iekp   = 1.0 / ekp;
-            double sinhkp = 0.5 * (ekp - iekp);
-            double coshkp = 0.5 * (ekp + iekp);
-
-            // calculate coefficient of basic functions P5and P6
-            double bfcff0 = -sinhkp * rkp;
-            double bfcff2 = -5 * (-3 * kp * coshkp + 3 * sinhkp + kp2 * sinhkp) * rkp3;
-            double bfcff4 =
-                -9. * (-105 * kp * coshkp - 10 * kp3 * coshkp + 105 * sinhkp + 45 * kp2 * sinhkp + kp4 * sinhkp) *
-                rkp5;
-            double bfcff1 = -3 * (kp * coshkp - sinhkp) * rkp2;
-            double bfcff3 = -7 * (15 * kp * coshkp + kp3 * coshkp - 15 * sinhkp - 6 * kp2 * sinhkp) * rkp4;
-
-            double oddtemp  = 1 / (sinhkp + bfcff1 + bfcff3);
-            double eventemp = 1 / (coshkp + bfcff0 + bfcff2 + bfcff4);
-
-            // eta1, eta2
-            eta1(ig, lkd) = (kp * coshkp + bfcff1 + 6 * bfcff3) * oddtemp;
-            eta2(ig, lkd) = (kp * sinhkp + 3 * bfcff2 + 10 * bfcff4) * eventemp;
-
-            // set to variables that depends on node properties by integrating of Pi* pj over - 1 ~1
-            m260(ig, lkd) = 2 * eta2(ig, lkd);
-            m251(ig, lkd) = 2 * (kp * coshkp - sinhkp + 5 * bfcff3) * oddtemp;
-            m253(ig, lkd) = 2 * (kp * (15 + kp2) * coshkp - 3 * (5 + 2 * kp2) * sinhkp) * oddtemp * rkp2;
-            m262(ig, lkd) = 2 * (-3 * kp * coshkp + (3 + kp2) * sinhkp + 7 * kp * bfcff4) * eventemp * rkp;
-            m264(ig, lkd) = 2 * (-5 * kp * (21 + 2 * kp2) * coshkp + (105 + 45 * kp2 + kp4) * sinhkp) * eventemp * rkp3;
-
-            diagD(ig, lkd)  = 4 * xs.xsdf(ig, lk) / (_g.hmesh(idir, lk) * _g.hmesh(idir, lk));
-            diagDI(ig, lkd) = 1.0 / diagD(ig, lkd);
+    const int lkd0 = lk * NDIRMAX;
+    for (int idir = 0; idir < NDIRMAX; ++idir) {
+        const int lkd = lkd0 + idir;
+        for (int ig = 0; ig < _ng; ++ig) {
+            const nodal::NodalConstantCoefficients c =
+                nodal::nodalConstantCoefficients(xsrf_node[ig], xsdf_node[ig],
+                                                  hmesh_node[idir]);
+            eta1(ig, lkd)   = c.eta1;
+            eta2(ig, lkd)   = c.eta2;
+            m260(ig, lkd)   = c.m260;
+            m251(ig, lkd)   = c.m251;
+            m253(ig, lkd)   = c.m253;
+            m262(ig, lkd)   = c.m262;
+            m264(ig, lkd)   = c.m264;
+            diagD(ig, lkd)  = c.diagD;
+            diagDI(ig, lkd) = c.diagDI;
         }
     }
 
     for (int ig = 0; ig < _ng; ++ig) {
-        _constant_xsrf[lkg0 + ig] = xs.xsrf(ig, lk);
-        _constant_xsdf[lkg0 + ig] = xs.xsdf(ig, lk);
+        _constant_xsrf[lkg0 + ig] = xsrf_node[ig];
+        _constant_xsdf[lkg0 + ig] = xsdf_node[ig];
     }
-
-    // Any recompute makes the device copy of the nine coefficient arrays
-    // stale.  Racy increments from the omp for are fine: the consumer only
-    // compares against its resident value, so any change forces a re-upload.
-    ++_const_generation;
+    return true;
 }
 
 void Nodal::updateMatrix(const int& lk) {
@@ -812,13 +789,19 @@ bool Nodal::TryDriveGpu() {
         return false;
     }
 
-    // Phase 1 on the host: recompute only where xsrf/xsdf moved (shadowed),
-    // bumping _const_generation when anything did.
+    // Phase 1 on the host: recompute only where xsrf/xsdf moved. The
+    // per-node function returns a dirty bit; OpenMP combines those bits and
+    // advances the device-residency generation exactly once per drive. This
+    // removes the previous data race on _const_generation and avoids thousands
+    // of redundant increments when a whole core state changes.
+    int constants_changed = 0;
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (_nxyz > rasbery_omp_gate)
+#pragma omp parallel for reduction(| : constants_changed) schedule(static) if (_nxyz > rasbery_omp_gate)
 #endif
     for (int lk = 0; lk < _nxyz; ++lk)
-        updateConstant(lk);
+        constants_changed |= updateConstant(lk) ? 1 : 0;
+    if (constants_changed != 0)
+        ++_const_generation;
 
     nodal::NodalView v = MakeView();
     if (!backend->solveNodal(v, _const_generation, xs.refGeneration(),
@@ -848,11 +831,17 @@ void Nodal::driveBody() {
     // Each per-node / per-surface routine is independent (writes its own node/surface data; reads
     // neighbours only across the implicit barrier between phases). One parallel region with a
     // barrier per phase amortizes fork/join; results are bit-identical (no cross-node reduction).
+    int constants_changed = 0;
 #pragma omp parallel if (_nxyz > rasbery_omp_gate)
     {
-#pragma omp for schedule(static)
+#pragma omp for reduction(| : constants_changed) schedule(static)
         for (int lk = 0; lk < _nxyz; ++lk)
-            updateConstant(lk);
+            constants_changed |= updateConstant(lk) ? 1 : 0;
+#pragma omp single
+        {
+            if (constants_changed != 0)
+                ++_const_generation;
+        }
 #pragma omp for schedule(static)
         for (int lk = 0; lk < _nxyz; ++lk)
             caltrlcff0(lk);

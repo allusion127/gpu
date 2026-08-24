@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "Geometry.h"
 #include "NodalKernel.h"
@@ -157,7 +157,7 @@ public:
 
     /// @brief update the constant in the nodal calculation
     /// @param lk the node index
-    void updateConstant(const int& lk);
+    bool updateConstant(const int& lk);
 
     /// @brief update the matrix in the nodal calculation
     /// @param lk the node index
