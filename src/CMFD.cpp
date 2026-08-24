@@ -15,6 +15,50 @@ CMFD::CMFD(Geometry& g, XSSet& x)
     _src   = new double[_g.nxyz() * _g.ng()]{};
     _psi   = new double[_g.nxyz()]{};
 
+    // Geometry is fixed for the lifetime of a Driver.  Build the compact maps
+    // once instead of re-running the node/surface indexing helpers in every
+    // setls/upddhat/updjnet call of every concurrent instance.
+    const int nsurf = _g.nsurf();
+    _surface_node.resize(static_cast<size_t>(nsurf) * LR);
+    _surface_dir.resize(static_cast<size_t>(nsurf) * LR);
+    for (int ls = 0; ls < nsurf; ++ls) {
+        for (int lr = 0; lr < LR; ++lr) {
+            const size_t i = static_cast<size_t>(ls) * LR + lr;
+            _surface_node[i] = _g.lklr(lr, ls);
+            _surface_dir[i]  = _g.idirlr(lr, ls);
+        }
+    }
+
+    const int nxyz = _g.nxyz();
+    _node_surface.resize(static_cast<size_t>(nxyz) * NDIRMAX * LR);
+    _node_neighbor.resize(static_cast<size_t>(nxyz) * NDIRMAX * LR);
+    _node_hmesh.resize(static_cast<size_t>(nxyz) * NDIRMAX);
+    _node_face_area.resize(static_cast<size_t>(nxyz) * NDIRMAX);
+    _node_volume.resize(static_cast<size_t>(nxyz));
+    for (int l = 0; l < nxyz; ++l) {
+        const size_t dir_base = static_cast<size_t>(l) * NDIRMAX;
+        for (int idir = 0; idir < NDIRMAX; ++idir) {
+            _node_hmesh[dir_base + idir] = _g.hmesh(idir, l);
+            for (int lr = 0; lr < LR; ++lr) {
+                const size_t i = (dir_base + idir) * LR + lr;
+                _node_surface[i]  = _g.lktosfc(lr, idir, l);
+                _node_neighbor[i] = _g.neib(lr, idir, l);
+            }
+        }
+        _node_face_area[dir_base + XDIR] =
+            _node_hmesh[dir_base + YDIR] * _node_hmesh[dir_base + ZDIR];
+        _node_face_area[dir_base + YDIR] =
+            _node_hmesh[dir_base + XDIR] * _node_hmesh[dir_base + ZDIR];
+        _node_face_area[dir_base + ZDIR] =
+            _node_hmesh[dir_base + XDIR] * _node_hmesh[dir_base + YDIR];
+        _node_volume[static_cast<size_t>(l)] = _g.vol(l);
+    }
+
+    _boundary_albedo.resize(static_cast<size_t>(NDIRMAX) * LR);
+    for (int idir = 0; idir < NDIRMAX; ++idir)
+        for (int lr = 0; lr < LR; ++lr)
+            _boundary_albedo[static_cast<size_t>(idir) * LR + lr] = _g.albedo(lr, idir);
+
     if (const char* c = std::getenv("RASBERY_DHAT_CLAMP"))
         _dhat_clamp_enabled = (std::atoi(c) != 0);
 }
@@ -33,64 +77,69 @@ void CMFD::resetDhat() {
 }
 
 void CMFD::upddtil(const int& ls) {
-    int ll    = _g.lklr(LEFT, ls);
-    int lr    = _g.lklr(RIGHT, ls);
-    int idirl = _g.idirlr(LEFT, ls);
-    int idirr = _g.idirlr(RIGHT, ls);
+    const int ll    = cachedSurfaceNode(LEFT, ls);
+    const int lr    = cachedSurfaceNode(RIGHT, ls);
+    const int idirl = cachedSurfaceDirection(LEFT, ls);
+    const int idirr = cachedSurfaceDirection(RIGHT, ls);
 
     double betal, betar;
 
     for (int ig = 0; ig < _g.ng(); ig++) {
         if (ll < 0) {
-            betal = _g.albedo(LEFT, idirl) * 0.5;
+            betal = cachedBoundaryAlbedo(LEFT, idirl) * 0.5;
         } else {
-            betal = _x.xsdf(ig, ll) / _g.hmesh(idirl, ll);
+            betal = _x.xsdf(ig, ll) / cachedNodeHmesh(idirl, ll);
         }
         if (lr < 0) {
-            betar = _g.albedo(RIGHT, idirr) * 0.5;
+            betar = cachedBoundaryAlbedo(RIGHT, idirr) * 0.5;
         } else {
-            betar = _x.xsdf(ig, lr) / _g.hmesh(idirr, lr);
+            betar = _x.xsdf(ig, lr) / cachedNodeHmesh(idirr, lr);
         }
         dtil(ig, ls) = 2 * betal * betar / (betal + betar);
     }
 }
 
 void CMFD::upddhat(const int& ls, double* flux, double* jnet) {
-    int ll = _g.lklr(LEFT, ls);
-    int lr = _g.lklr(RIGHT, ls);
+    const int ll = cachedSurfaceNode(LEFT, ls);
+    const int lr = cachedSurfaceNode(RIGHT, ls);
+    const int ng = _g.ng();
 
-    for (int ig = 0; ig < _g.ng(); ig++) {
+    // APR1400 production decks are two-group.  Keep a generic fallback, but
+    // make the hot path a fixed-trip body so the compiler can keep the surface
+    // state in registers instead of repeatedly evaluating accessor strides.
+    const auto update_group = [&](const int ig) {
         double fdiff, fsum;
         if (ll < 0) {
-            fdiff = flux(ig, lr);
-            fsum  = flux(ig, lr);
+            fdiff = flux[lr * ng + ig];
+            fsum  = flux[lr * ng + ig];
         } else if (lr < 0) {
-            fdiff = -flux(ig, ll);
-            fsum  = flux(ig, ll);
+            fdiff = -flux[ll * ng + ig];
+            fsum  = flux[ll * ng + ig];
         } else {
-            fdiff = flux(ig, lr) - flux(ig, ll);
-            fsum  = flux(ig, lr) + flux(ig, ll);
+            fdiff = flux[lr * ng + ig] - flux[ll * ng + ig];
+            fsum  = flux[lr * ng + ig] + flux[ll * ng + ig];
         }
-        double jnet_fdm = -dtil(ig, ls) * (fdiff);
+        const size_t surface_group = static_cast<size_t>(ls) * ng + ig;
+        const double dtl           = _dtil[surface_group];
+        const double jnet_fdm      = -dtl * fdiff;
 
         // Guard 1: fsum is a sum of (nominally positive) fluxes, but during the
         // early outers it can collapse toward zero or go negative, which turns
         // the division into a spike that poisons the coupling coefficients.
         // Scale the floor to dtil so the test is dimensionally consistent.
         ++_dhat_total;
-        const double dtl   = dtil(ig, ls);
         const double floor = 1.0e-12 * std::max(1.0, std::abs(dtl));
         if (!(std::abs(fsum) > floor) || !std::isfinite(fsum)) {
             ++_dhat_fsum_guard;
-            dhat(ig, ls) = 0.0;
-            continue;
+            _dhat[surface_group] = 0.0;
+            return;
         }
 
-        double dh = (jnet_fdm - jnet(ig, ls)) / fsum;
+        double dh = (jnet_fdm - jnet[surface_group]) / fsum;
         if (!std::isfinite(dh)) {
             ++_dhat_fsum_guard;
-            dhat(ig, ls) = 0.0;
-            continue;
+            _dhat[surface_group] = 0.0;
+            return;
         }
 
         // Diagnostic 2: |dhat| > |dtil| makes one of the two CMFD coupling
@@ -117,7 +166,14 @@ void CMFD::upddhat(const int& ls, double* flux, double* jnet) {
                 if (_dhat_clamp_enabled) dh = (dh > 0.0 ? cap : -cap);
             }
         }
-        dhat(ig, ls) = dh;
+        _dhat[surface_group] = dh;
+    };
+
+    if (ng == 2) {
+        update_group(0);
+        update_group(1);
+    } else {
+        for (int ig = 0; ig < ng; ++ig) update_group(ig);
     }
 }
 
@@ -135,29 +191,31 @@ void CMFD::reportDhatGuardStats(const char* tag) const {
 }
 
 void CMFD::setls(const int& l) {
-    // determine the area of surfaces at coarse meshes that is normal to directions
+    // Surface areas and volume are immutable geometry.  Reuse the constructor
+    // cache, while keeping the historical accessor/arithmetic order below so
+    // the optimisation remains numerically inert.
     double area[NDIRMAX];
-
-    area[XDIR] = _g.hmesh(YDIR, l) * _g.hmesh(ZDIR, l);
-    area[YDIR] = _g.hmesh(XDIR, l) * _g.hmesh(ZDIR, l);
-    area[ZDIR] = _g.hmesh(XDIR, l) * _g.hmesh(YDIR, l);
+    area[XDIR] = cachedNodeFaceArea(XDIR, l);
+    area[YDIR] = cachedNodeFaceArea(YDIR, l);
+    area[ZDIR] = cachedNodeFaceArea(ZDIR, l);
+    const double volume = cachedNodeVolume(l);
 
     for (int ige = 0; ige < _g.ng(); ++ige) {
 
         for (int igs = 0; igs < _g.ng(); ++igs) {
-            diag(igs, ige, l) = -_x.xssm(igs, ige, l) * _g.vol(l);
+            diag(igs, ige, l) = -_x.xssm(igs, ige, l) * volume;
         }
-        diag(ige, ige, l) += _x.xsrf(ige, l) * _g.vol(l);
+        diag(ige, ige, l) += _x.xsrf(ige, l) * volume;
 
         for (int idir = NDIRMAX - 1; idir >= 0; --idir) {
-            int ls = _g.lktosfc(LEFT, idir, l);
+            const int ls = cachedNodeSurface(LEFT, idir, l);
 
             cc(LEFT, idir, ige, l) = (-dtil(ige, ls) + dhat(ige, ls)) * area[idir];
             diag(ige, ige, l) += (dtil(ige, ls) + dhat(ige, ls)) * area[idir];
         }
 
-        for (int idir = 0; idir < NDIRMAX; idir++) {
-            int ls                  = _g.lktosfc(RIGHT, idir, l);
+        for (int idir = 0; idir < NDIRMAX; ++idir) {
+            const int ls = cachedNodeSurface(RIGHT, idir, l);
             cc(RIGHT, idir, ige, l) = (-dtil(ige, ls) - dhat(ige, ls)) * area[idir];
             diag(ige, ige, l) += (dtil(ige, ls) - dhat(ige, ls)) * area[idir];
         }
@@ -173,11 +231,20 @@ void CMFD::setEpsl2(double epsl2) {
 }
 
 void CMFD::updpsi(const int& l, const double* flux) {
+    const int ng = _g.ng();
+    if (ng == 2) {
+        const int nxyz = _g.nxyz();
+        const double* const xsnf = _x.xsnfData();
+        double value = 0.0;
+        value += flux[static_cast<size_t>(l) * 2 + 0] * xsnf[l];
+        value += flux[static_cast<size_t>(l) * 2 + 1] *
+                 xsnf[static_cast<size_t>(nxyz) + l];
+        _psi[l] = value * cachedNodeVolume(l);
+        return;
+    }
 
     _psi[l] = 0.0;
-
-    for (int ig = 0; ig < _g.ng(); ig++) {
-        _psi[l] += flux(ig, l) * _x.xsnf(ig, l);
-    }
-    _psi[l] = _psi[l] * _g.vol(l);
+    for (int ig = 0; ig < ng; ++ig)
+        _psi[l] += flux[static_cast<size_t>(l) * ng + ig] * _x.xsnf(ig, l);
+    _psi[l] = _psi[l] * cachedNodeVolume(l);
 }

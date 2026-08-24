@@ -142,12 +142,12 @@ int main(int argc, char* argv[]) {
                       << "  - Values after each flag are consumed until the next --flag.\n"
                       << "  - The number of --chiffoni and --chiffono paths must match.\n"
                       << "  - The number of --rasi and --raso paths must match.\n"
-                      << "  - --batch-mode M runs the --rasi decks M at a time in one process,\n"
-                      << "    one host thread per instance, with their CMFD linear solves\n"
-                      << "    batched into a single GPU grid.  Every deck must share one\n"
-                      << "    geometry; only the state (temperatures, power, rods, schedule)\n"
-                      << "    may differ.  Requires a CUDA build.  Each instance is\n"
-                      << "    bit-identical to running that deck on its own.\n";
+                      << "  - --batch-mode M keeps an M-slot CUDA arena and feeds it from a\n"
+                      << "    bounded host Driver pool.  Every deck must share one geometry;\n"
+                      << "    only the state (temperatures, power, rods, schedule) may differ.\n"
+                      << "    RASBERY_BATCH_HOST_THREADS accepts a positive count or legacy.\n"
+                      << "    Requires a CUDA build.  Each instance remains independent of\n"
+                      << "    the batch composition.\n";
             return 0;
         }
 
@@ -303,27 +303,36 @@ int main(int argc, char* argv[]) {
         // (different phases, different rendezvous), but they are the same M.
         rasbery::rasberyNodalSetBatchWidth(batch_width);
         const int jobs = static_cast<int>(rasbery_inputs.size());
-        int host_threads = std::min(batch_width, jobs);
+        int         visible_cpus = 1;
+        int         host_threads = 1;
+        const char* host_policy  = "serial";
 #ifdef _OPENMP
-        const int visible_cpus = startup_visible_cpus;
-        // The CUDA arena width and the number of CPU Driver workers are separate
-        // resources.  Use an explicit, benchmarked cap because OMP_PROC_BIND can
-        // narrow the main-thread affinity before this branch and make automatic
-        // CPU-count discovery platform/runtime dependent.  With no override the
-        // historical one-worker-per-live-instance behavior is preserved.
+        visible_cpus = startup_visible_cpus;
+        // CUDA arena width and CPU Driver concurrency are separate resources.
+        // Default to process affinity capacity instead of oversubscribing every
+        // live GPU slot; explicit counts remain the production tuning knob.
+        host_threads = std::min({visible_cpus, batch_width, jobs});
+        host_policy  = "auto-visible-cpus";
         if (const char* host_env = std::getenv("RASBERY_BATCH_HOST_THREADS")) {
-            const int requested = std::atoi(host_env);
-            if (requested > 0) host_threads = std::min({requested, batch_width, jobs});
+            if (std::strcmp(host_env, "legacy") == 0) {
+                host_threads = std::min(batch_width, jobs);
+                host_policy  = "legacy-live-slots";
+            } else {
+                const int requested = std::atoi(host_env);
+                if (requested > 0) {
+                    host_threads = std::min({requested, batch_width, jobs});
+                    host_policy  = "explicit";
+                }
+            }
         }
-#else
-        const int visible_cpus = 1;
 #endif
         std::cout << "\n[RASBERY][BATCH] " << jobs << " deck(s), width " << batch_width
                   << ", " << host_threads << " host Driver worker(s)" << std::endl;
         std::cout << "[RASBERY][BATCH_HOST] {\"jobs\":" << jobs
                   << ",\"arena_width\":" << batch_width
                   << ",\"host_threads\":" << host_threads
-                  << ",\"visible_cpus\":" << visible_cpus << "}" << std::endl;
+                  << ",\"visible_cpus\":" << visible_cpus
+                  << ",\"policy\":\"" << host_policy << "\"}" << std::endl;
 #ifdef _OPENMP
         // One OpenMP level only: the instance loop is the parallelism. Nested
         // Driver regions reduce the measured GPU rendezvous width and lose

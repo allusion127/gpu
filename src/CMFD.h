@@ -3,6 +3,8 @@
 #include "XSSet.h"
 #include "pch.h"
 
+#include <vector>
+
 namespace rasbery {
 /**
  * @brief Class for implementing Coarse Mesh Finite Difference Method (CMFD)
@@ -35,6 +37,51 @@ protected:
 
     /// @brief fission source term for CMFD
     double* _psi;
+
+    // Geometry is immutable after a Driver is constructed.  CMFD's hottest
+    // host loops used to re-index Geometry for every surface/node of every
+    // outer iteration.  Cache only immutable topology/metrics here; stateful
+    // fluxes, currents, cross sections and CMFD coefficients remain per-call.
+    std::vector<int>    _surface_node;     ///< [surface][left/right]
+    std::vector<int>    _surface_dir;      ///< [surface][left/right]
+    std::vector<int>    _node_surface;     ///< [node][direction][left/right]
+    std::vector<int>    _node_neighbor;    ///< [node][direction][left/right]
+    std::vector<double> _node_hmesh;       ///< [node][direction]
+    std::vector<double> _node_face_area;   ///< [node][direction]
+    std::vector<double> _node_volume;      ///< [node]
+    std::vector<double> _boundary_albedo;  ///< [direction][left/right]
+
+    [[nodiscard]] inline int cachedSurfaceNode(const int lr, const int ls) const {
+        return _surface_node[static_cast<size_t>(ls) * LR + lr];
+    }
+
+    [[nodiscard]] inline int cachedSurfaceDirection(const int lr, const int ls) const {
+        return _surface_dir[static_cast<size_t>(ls) * LR + lr];
+    }
+
+    [[nodiscard]] inline int cachedNodeSurface(const int lr, const int idir, const int l) const {
+        return _node_surface[(static_cast<size_t>(l) * NDIRMAX + idir) * LR + lr];
+    }
+
+    [[nodiscard]] inline int cachedNodeNeighbor(const int lr, const int idir, const int l) const {
+        return _node_neighbor[(static_cast<size_t>(l) * NDIRMAX + idir) * LR + lr];
+    }
+
+    [[nodiscard]] inline double cachedNodeHmesh(const int idir, const int l) const {
+        return _node_hmesh[static_cast<size_t>(l) * NDIRMAX + idir];
+    }
+
+    [[nodiscard]] inline double cachedNodeFaceArea(const int idir, const int l) const {
+        return _node_face_area[static_cast<size_t>(l) * NDIRMAX + idir];
+    }
+
+    [[nodiscard]] inline double cachedNodeVolume(const int l) const {
+        return _node_volume[static_cast<size_t>(l)];
+    }
+
+    [[nodiscard]] inline double cachedBoundaryAlbedo(const int lr, const int idir) const {
+        return _boundary_albedo[static_cast<size_t>(idir) * LR + lr];
+    }
 
     /// @brief criterion for convergence
     double _epsl2;
@@ -101,7 +148,7 @@ public:
     void updpsi(const int& l, const double* flux);
 
     /// @brief update d_tilde for each surface
-    /// @param ls th surface index
+    /// @param ls the surface index
     void upddtil(const int& ls);
 
     /// @brief update d_hat for each surface
@@ -184,7 +231,7 @@ public:
 
         for (int idir = 0; idir < NDIRMAX; ++idir) {
             for (int lr = 0; lr < LR; ++lr) {
-                int ln = _g.neib(lr, idir, l);
+                const int ln = cachedNodeNeighbor(lr, idir, l);
                 if (ln != -1)
                     ab += cc(lr, idir, ig, l) * flux[ln * _g.ng() + ig];
             }
@@ -198,19 +245,30 @@ public:
     /// @param flux the flux
     /// @param jnet the net current to be updated
     void updjnet(const int& ls, const double* flux, double* jnet) {
-        int ll    = _g.lklr(LEFT, ls);
-        int lr    = _g.lklr(RIGHT, ls);
-        int idirl = _g.idirlr(LEFT, ls);
-        int idirr = _g.idirlr(RIGHT, ls);
+        const int ll = cachedSurfaceNode(LEFT, ls);
+        const int lr = cachedSurfaceNode(RIGHT, ls);
+        const int ng = _g.ng();
 
-        for (int ig = 0; ig < _g.ng(); ig++) {
+        const auto update_group = [&](const int ig) {
+            const size_t si = static_cast<size_t>(ls) * ng + ig;
+            const double dt = _dtil[si];
+            const double dh = _dhat[si];
             if (ll < 0) {
-                jnet[ls * _g.ng() + ig] = -(dtil(ig, ls) + dhat(ig, ls)) * flux[lr * _g.ng() + ig];
+                jnet[si] = -(dt + dh) * flux[static_cast<size_t>(lr) * ng + ig];
             } else if (lr < 0) {
-                jnet[ls * _g.ng() + ig] = (dtil(ig, ls) - dhat(ig, ls)) * flux[ll * _g.ng() + ig];
+                jnet[si] = (dt - dh) * flux[static_cast<size_t>(ll) * ng + ig];
             } else {
-                jnet[ls * _g.ng() + ig] = -dtil(ig, ls) * (flux[lr * _g.ng() + ig] - flux[ll * _g.ng() + ig]) - dhat(ig, ls) * (flux[lr * _g.ng() + ig] + flux[ll * _g.ng() + ig]);
+                const double fl = flux[static_cast<size_t>(ll) * ng + ig];
+                const double fr = flux[static_cast<size_t>(lr) * ng + ig];
+                jnet[si] = -dt * (fr - fl) - dh * (fr + fl);
             }
+        };
+
+        if (ng == 2) {
+            update_group(0);
+            update_group(1);
+        } else {
+            for (int ig = 0; ig < ng; ++ig) update_group(ig);
         }
     }
 };
