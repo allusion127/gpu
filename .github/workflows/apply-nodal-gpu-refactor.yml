@@ -1,0 +1,68 @@
+name: Nodal GPU refactor contracts
+
+on:
+  push:
+    branches:
+      - codex/nodal-mat-even-xs-residency
+    paths:
+      - src/CudaTransferMirror.h
+      - src/CudaXsReconBackend.cu
+      - tools/test_cuda_transfer_mirror.py
+      - tools/test_nodal_gpu_refactor_contract.py
+      - tools/test_apply_nodal_gpu_hotpath_fix.py
+      - .github/workflows/apply-nodal-gpu-refactor.yml
+  pull_request:
+    paths:
+      - src/CudaTransferMirror.h
+      - src/CudaXsReconBackend.cu
+      - tools/test_cuda_transfer_mirror.py
+      - tools/test_nodal_gpu_refactor_contract.py
+      - tools/test_apply_nodal_gpu_hotpath_fix.py
+      - .github/workflows/apply-nodal-gpu-refactor.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nodal-gpu-contracts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-host-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compile contract scripts
+        run: |
+          python -m py_compile \
+            tools/test_cuda_transfer_mirror.py \
+            tools/test_nodal_gpu_refactor_contract.py \
+            tools/test_apply_nodal_gpu_hotpath_fix.py
+
+      - name: Verify byte-exact transfer mirror
+        run: python tools/test_cuda_transfer_mirror.py
+
+      - name: Verify nodal CUDA dependency and rollback contract
+        run: python tools/test_nodal_gpu_refactor_contract.py
+
+      - name: Verify allocation-free XS mirror hot path
+        run: python tools/test_apply_nodal_gpu_hotpath_fix.py
+
+      - name: Check whitespace and patch integrity
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            git diff --check "${{ github.event.pull_request.base.sha }}...HEAD"
+          else
+            git show --check --oneline HEAD
+          fi
