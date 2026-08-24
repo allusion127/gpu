@@ -1,5 +1,6 @@
 #include "CudaXsReconBackend.h"
 
+#include "CudaTransferMirror.h"
 #include "FlatXsKernel.h"
 #include "NodalKernel.h"
 #include "XsReconKernel.h"
@@ -47,6 +48,25 @@ bool envFlagDisabled(const char* name) {
     if (v == nullptr) return false;
     const std::string s(v);
     return s.empty() || s == "0" || s == "off" || s == "OFF" || s == "false" || s == "FALSE";
+}
+
+// RASBERY_NODAL_REFACTOR_V1
+/// Mat and Even are node-local and have an exact producer/consumer relation:
+/// calculateEven(lk) reads only the matrices and coefficients produced by
+/// updateMatrix(lk). Running both bodies in one thread removes one graph node
+/// without changing any floating-point expression or cross-node ordering.
+bool nodalFuseMatEvenEnabled() {
+    static const bool on = !envFlagDisabled("RASBERY_GPU_NODAL_FUSE_MAT_EVEN");
+    return on;
+}
+
+/// The arena has a separate XS allocation, so hoststateGeneration is not an
+/// honest residency key. A byte shadow is: an upload is skipped only when the
+/// complete incoming xsrf/xsnf/xssm bytes equal the last successfully drained
+/// upload for that same slot and destination.
+bool nodalXsMirrorEnabled() {
+    static const bool on = !envFlagDisabled("RASBERY_GPU_NODAL_XS_MIRROR");
+    return on;
 }
 
 #define RASBERY_CUDA_TRY(expr, sink)                                         \
@@ -106,6 +126,8 @@ std::atomic<unsigned long long> g_nodal_batch_fallbacks{0}; // -> per-instance a
 std::atomic<unsigned long long> g_nodal_batch_refused{0};   // slot/geometry refusals
 std::atomic<unsigned long long> g_nodal_batch_hist[65]     = {}; // width -> count
 std::atomic<unsigned long long> g_nodal_batch_linger_us{0};
+std::atomic<unsigned long long> g_nodal_batch_xs_h2d_bytes{0};
+std::atomic<unsigned long long> g_nodal_batch_xs_h2d_skipped_bytes{0};
 
 // The two group-SEPARABLE phases run one thread per (node, group): trlcff0 and
 // trlcff12 carry nothing across the ig loop (see NodalKernel.h), so lk*NG+ig is
@@ -167,6 +189,17 @@ __global__ void kNodalEven(ndl::NodalView base, const std::uint32_t* __restrict_
     RASBERY_NODAL_SLOT_GUARD(base, active, v);
     const int lk = blockIdx.x * blockDim.x + threadIdx.x;
     if (lk < v.nxyz) ndl::nodalCalculateEven(v, lk, ndl::StaticForms{});
+}
+
+template <bool BATCHED>
+__global__ void kNodalMatEven(ndl::NodalView base,
+                              const std::uint32_t* __restrict__ active) {
+    RASBERY_NODAL_SLOT_GUARD(base, active, v);
+    const int lk = blockIdx.x * blockDim.x + threadIdx.x;
+    if (lk >= v.nxyz) return;
+    const ndl::StaticForms forms{};
+    ndl::nodalUpdateMatrix(v, lk, forms);
+    ndl::nodalCalculateEven(v, lk, forms);
 }
 template <bool BATCHED>
 __global__ void kNodalJnet(ndl::NodalView base, const std::uint32_t* __restrict__ active) {
@@ -269,7 +302,9 @@ public:
             const long parsed = std::atol(mx);
             if (parsed >= 0) _wait_max_us = std::min(parsed, 20000L);
         }
-        _use_graph = !envFlagDisabled("RASBERY_GPU_NODAL_GRAPH");
+        _use_graph     = !envFlagDisabled("RASBERY_GPU_NODAL_GRAPH");
+        _fuse_mat_even = nodalFuseMatEvenEnabled();
+        _mirror_xs     = nodalXsMirrorEnabled();
         init(proto);
     }
 
@@ -480,6 +515,9 @@ private:
         // legitimately BE zero.
         bool               have_const = false, have_chif = false;
         unsigned long long res_const_gen = 0, res_ref_gen = 0;
+        cuda_transfer::ByteExactMirror<double> xsrf_mirror;
+        cuda_transfer::ByteExactMirror<double> xsnf_mirror;
+        cuda_transfer::ByteExactMirror<double> xssm_mirror;
         // Page-locking is idempotent but it is a synchronising call, so it runs
         // only when one of these pointers actually changed (i.e. once).
         const void* pin_bulk[6]  = {}; // jnet, phis, flux, xsrf, xsnf, xssm
@@ -716,8 +754,15 @@ private:
         const int      gg = (_nxyz * ndl::NG + B - 1) / B;
         kNodalTrl0<true><<<dim3(static_cast<unsigned>(gg), S), B, 0, _stream>>>(_base, _d_active);
         kNodalTrl12<true><<<dim3(static_cast<unsigned>(gg), S), B, 0, _stream>>>(_base, _d_active);
-        kNodalMat<true><<<dim3(static_cast<unsigned>(gn), S), B, 0, _stream>>>(_base, _d_active);
-        kNodalEven<true><<<dim3(static_cast<unsigned>(gn), S), B, 0, _stream>>>(_base, _d_active);
+        if (_fuse_mat_even) {
+            kNodalMatEven<true><<<dim3(static_cast<unsigned>(gn), S), B, 0, _stream>>>(
+                _base, _d_active);
+        } else {
+            kNodalMat<true><<<dim3(static_cast<unsigned>(gn), S), B, 0, _stream>>>(
+                _base, _d_active);
+            kNodalEven<true><<<dim3(static_cast<unsigned>(gn), S), B, 0, _stream>>>(
+                _base, _d_active);
+        }
         kNodalJnet<true><<<dim3(static_cast<unsigned>(gs), S), B, 0, _stream>>>(_base, _d_active);
     }
 
@@ -730,6 +775,17 @@ private:
         const std::size_t ng1b = _cnt_ng1 * sizeof(double);
         const std::size_t ng2b = _cnt_ng2 * sizeof(double);
         const std::size_t ndgb = _cnt_ndg * sizeof(double);
+
+        struct PendingXsMirror {
+            int  slot = -1;
+            bool xsrf = false;
+            bool xsnf = false;
+            bool xssm = false;
+        };
+        std::vector<PendingXsMirror> pending_xs;
+        pending_xs.reserve(part.size());
+        unsigned long long xs_h2d_bytes = 0;
+        unsigned long long xs_h2d_skipped_bytes = 0;
 
         for (int m : part) pinSlot(_slot[static_cast<std::size_t>(m)]);
         ensureGraph();
@@ -764,29 +820,48 @@ private:
                 sl.res_ref_gen = sl.ref_gen;
                 sl.have_chif   = true;
             }
-            // xsrf/xsnf/xssm upload UNCONDITIONALLY, and `state_gen` is
-            // deliberately not used as a residency key here.
-            //
-            // The trap: XSSet::hoststateGeneration() counts HOST writes to
-            // _xs/_iden, and the GPU xs arms do not bump it when they rewrite
-            // _xs by DOWNLOAD (XSSet.cpp:2728-2730 skips the bump on a clean
-            // device pass).  That is sound for the per-instance path, whose
-            // xs pointers are dev_block -- the same download refreshed both
-            // sides, so equal generations really do mean equal bytes.  It is
-            // NOT sound for a separate arena buffer, which that download never
-            // touched: caching on the generation would pin slot m to the xs of
-            // some earlier outer, silently and forever.  540 KB a drive is the
-            // price of not having that bug.  (The nine updateConstant arrays
-            // below are different: Nodal owns them, Nodal alone writes them,
-            // and Nodal bumps _const_generation when it does -- so THAT key is
-            // honest, and it is the 3.65 MB one that matters.)
-            if (!memcpyAsyncOrFail(const_cast<double*>(_base.xsrf) + s * _cnt_ng1, sl.h_xsrf,
-                                   ng1b, cudaMemcpyHostToDevice, "nodal arena xsrf H2D") ||
-                !memcpyAsyncOrFail(const_cast<double*>(_base.xsnf) + s * _cnt_ng1, sl.h_xsnf,
-                                   ng1b, cudaMemcpyHostToDevice, "nodal arena xsnf H2D") ||
-                !memcpyAsyncOrFail(const_cast<double*>(_base.xssm) + s * _cnt_ng2, sl.h_xssm,
-                                   ng2b, cudaMemcpyHostToDevice, "nodal arena xssm H2D"))
-                return drained();
+            // The arena cannot use hoststateGeneration because its XS
+            // allocation is separate from the per-instance backend. Instead,
+            // compare every byte with the last upload that completed
+            // successfully for this slot. This is conservative for all NaN
+            // payloads and signed zeroes, and never assumes a physics
+            // generation implies residency.
+            const bool push_xsrf =
+                !_mirror_xs || !sl.xsrf_mirror.matches(sl.h_xsrf, _cnt_ng1);
+            const bool push_xsnf =
+                !_mirror_xs || !sl.xsnf_mirror.matches(sl.h_xsnf, _cnt_ng1);
+            const bool push_xssm =
+                !_mirror_xs || !sl.xssm_mirror.matches(sl.h_xssm, _cnt_ng2);
+
+            if (push_xsrf) {
+                if (!memcpyAsyncOrFail(const_cast<double*>(_base.xsrf) + s * _cnt_ng1,
+                                       sl.h_xsrf, ng1b, cudaMemcpyHostToDevice,
+                                       "nodal arena xsrf H2D"))
+                    return drained();
+                xs_h2d_bytes += ng1b;
+            } else {
+                xs_h2d_skipped_bytes += ng1b;
+            }
+            if (push_xsnf) {
+                if (!memcpyAsyncOrFail(const_cast<double*>(_base.xsnf) + s * _cnt_ng1,
+                                       sl.h_xsnf, ng1b, cudaMemcpyHostToDevice,
+                                       "nodal arena xsnf H2D"))
+                    return drained();
+                xs_h2d_bytes += ng1b;
+            } else {
+                xs_h2d_skipped_bytes += ng1b;
+            }
+            if (push_xssm) {
+                if (!memcpyAsyncOrFail(const_cast<double*>(_base.xssm) + s * _cnt_ng2,
+                                       sl.h_xssm, ng2b, cudaMemcpyHostToDevice,
+                                       "nodal arena xssm H2D"))
+                    return drained();
+                xs_h2d_bytes += ng2b;
+            } else {
+                xs_h2d_skipped_bytes += ng2b;
+            }
+            if (_mirror_xs)
+                pending_xs.push_back({m, push_xsrf, push_xsnf, push_xssm});
             if (!memcpyAsyncOrFail(_base.jnet + s * _cnt_sg, sl.h_jnet, sgb,
                                    cudaMemcpyHostToDevice, "nodal arena jnet H2D") ||
                 !memcpyAsyncOrFail(const_cast<double*>(_base.flux) + s * _cnt_ng1, sl.h_flux, ng1b,
@@ -826,6 +901,19 @@ private:
 
         const cudaError_t src = cudaStreamSynchronize(_stream);
         if (src != cudaSuccess) { fail("nodal arena drain", src); return false; }
+
+        // Commit only after the drain proved the queued H2D reached the device.
+        // A failed batch leaves the previous mirrors untouched, so they never
+        // describe bytes that may not be resident.
+        for (const PendingXsMirror& pending : pending_xs) {
+            Slot& sl = _slot[static_cast<std::size_t>(pending.slot)];
+            if (pending.xsrf) sl.xsrf_mirror.commit(sl.h_xsrf, _cnt_ng1);
+            if (pending.xsnf) sl.xsnf_mirror.commit(sl.h_xsnf, _cnt_ng1);
+            if (pending.xssm) sl.xssm_mirror.commit(sl.h_xssm, _cnt_ng2);
+        }
+        g_nodal_batch_xs_h2d_bytes.fetch_add(xs_h2d_bytes, std::memory_order_relaxed);
+        g_nodal_batch_xs_h2d_skipped_bytes.fetch_add(
+            xs_h2d_skipped_bytes, std::memory_order_relaxed);
         g_nodal_d2h_bytes.store(2 * sgb, std::memory_order_relaxed);
         g_nodal_drives.fetch_add(part.size(), std::memory_order_relaxed);
         return true;
@@ -861,6 +949,8 @@ private:
     ndl::NodalView  _base{};
     cudaGraphExec_t _graph     = nullptr;
     bool            _use_graph = true;
+    bool            _fuse_mat_even = true;
+    bool            _mirror_xs = true;
 
     std::size_t _cnt_ndg = 0, _cnt_ng1 = 0, _cnt_ng2 = 0, _cnt_sg = 0;
 
@@ -943,6 +1033,8 @@ struct NodalReceipt {
                   << g_nodal_drives.load(std::memory_order_relaxed)
                   << ",\"full_mode\":"
                   << (rasbery::rasberyGpuNodalFullEnabled() ? 1 : 0)
+                  << ",\"mat_even_fused\":"
+                  << (nodalFuseMatEvenEnabled() ? 1 : 0)
                   << ",\"graph_launches\":"
                   << g_nodal_graph_launches.load(std::memory_order_relaxed)
                   << ",\"graph_fallbacks\":"
@@ -975,6 +1067,11 @@ struct NodalReceipt {
              << g_nodal_batch_refused.load(std::memory_order_relaxed)
              << ",\"last_linger_us\":"
              << g_nodal_batch_linger_us.load(std::memory_order_relaxed)
+             << ",\"xs_mirror\":" << (nodalXsMirrorEnabled() ? 1 : 0)
+             << ",\"xs_h2d_bytes\":"
+             << g_nodal_batch_xs_h2d_bytes.load(std::memory_order_relaxed)
+             << ",\"xs_h2d_skipped_bytes\":"
+             << g_nodal_batch_xs_h2d_skipped_bytes.load(std::memory_order_relaxed)
              << ",\"width_histogram\":[";
         const int wmax = slots < 64 ? slots : 64;
         for (int w = 1; w <= wmax; ++w) {
@@ -1865,8 +1962,12 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
                                          cudaMemcpyHostToDevice, d.stream), d.status);
         kNodalTrl0<false><<<gng, B, 0, d.stream>>>(v, nullptr);
         kNodalTrl12<false><<<gng, B, 0, d.stream>>>(v, nullptr);
-        kNodalMat<false><<<gn, B, 0, d.stream>>>(v, nullptr);
-        kNodalEven<false><<<gn, B, 0, d.stream>>>(v, nullptr);
+        if (nodalFuseMatEvenEnabled()) {
+            kNodalMatEven<false><<<gn, B, 0, d.stream>>>(v, nullptr);
+        } else {
+            kNodalMat<false><<<gn, B, 0, d.stream>>>(v, nullptr);
+            kNodalEven<false><<<gn, B, 0, d.stream>>>(v, nullptr);
+        }
         kNodalJnet<false><<<gs, B, 0, d.stream>>>(v, nullptr);
         RASBERY_CUDA_TRY(cudaMemcpyAsync(host.jnet, v.jnet, surf_bytes,
                                          cudaMemcpyDeviceToHost, d.stream), d.status);
