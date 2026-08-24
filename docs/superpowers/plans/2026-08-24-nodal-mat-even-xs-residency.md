@@ -1,6 +1,6 @@
 # Nodal Mat/Even Fusion and Arena XS Residency Plan
 
-**Execution basis:** `docs/GPU_NODAL_SUITABILITY_AND_SPEED_ROADMAP_20260824_KO.md`  
+**Execution basis:** `docs/GPU_NODAL_SUITABILITY_AND_SPEED_ROADMAP_20260824_KO.md`
 **Base:** `codex/single-gpu-batch-dispatch-v2`
 
 ## Goal

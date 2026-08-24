@@ -1,7 +1,7 @@
 # GPU RASBERY 노달 CUDA 리팩토링 적용 영수증
 
-작성일: 2026-08-24  
-기준: `codex/single-gpu-batch-dispatch-v2`  
+작성일: 2026-08-24
+기준: `codex/single-gpu-batch-dispatch-v2`
 설계 근거: `GPU_NODAL_SUITABILITY_AND_SPEED_ROADMAP_20260824_KO.md`
 
 ## 적용 범위
