@@ -1,0 +1,64 @@
+name: Apply reviewed one-GPU source patch
+
+on:
+  push:
+    branches:
+      - codex/single-gpu-batch-dispatch
+    paths:
+      - .github/workflows/apply-reviewed-one-gpu-patch.yml
+      - tools/apply_single_gpu_safe_patches.py
+      - tools/test_single_gpu_safe_patches.py
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-reviewed-one-gpu-patch-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate exact-base patch contracts
+        run: |
+          python -m py_compile \
+            tools/apply_single_gpu_safe_patches.py \
+            tools/test_single_gpu_safe_patches.py
+          python tools/test_single_gpu_safe_patches.py
+          python tools/apply_single_gpu_safe_patches.py --check
+
+      - name: Apply the reviewed source patch
+        run: |
+          python tools/apply_single_gpu_safe_patches.py
+          git diff --check
+          grep -F 'cmfd_wiel_finalize<<<scalar_grid(), 32, 0, stream>>>' \
+            src/CudaBICGBackend.cu
+          grep -F '"auto-visible-cpus"' src/main.cpp
+          if sed -n '/void issueUploads/,/void launchGraph/p' \
+              src/CudaBICGBackend.cu | grep -F 'cudaStreamSynchronize(stream)'; then
+            echo 'unexpected issueUploads stream drain remains' >&2
+            exit 1
+          fi
+
+      - name: Commit the patched production sources
+        run: |
+          test -n "$(git status --short -- src/CudaBICGBackend.cu src/main.cpp)"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/CudaBICGBackend.cu src/main.cpp
+          git commit -m 'perf: streamline one-GPU batch execution'
+          git push origin "HEAD:${GITHUB_REF_NAME}"
