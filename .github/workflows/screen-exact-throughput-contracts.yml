@@ -1,0 +1,53 @@
+name: Screen-exact throughput contracts
+
+on:
+  push:
+    branches:
+      - codex/screen-exact-master-w16-throughput
+    paths:
+      - tools/run_screen_exact_campaign.py
+      - tools/test_screen_exact_campaign.py
+      - docs/EXACT_AND_SCREENING_THROUGHPUT_STRATEGY_20260825_KO.md
+      - .github/workflows/screen-exact-throughput-contracts.yml
+  pull_request:
+    paths:
+      - tools/run_screen_exact_campaign.py
+      - tools/test_screen_exact_campaign.py
+      - docs/EXACT_AND_SCREENING_THROUGHPUT_STRATEGY_20260825_KO.md
+      - .github/workflows/screen-exact-throughput-contracts.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compile scripts
+        run: |
+          python -m py_compile \
+            tools/run_screen_exact_campaign.py \
+            tools/test_screen_exact_campaign.py
+
+      - name: Run fail-closed campaign contracts
+        run: python tools/test_screen_exact_campaign.py
+
+      - name: Check patch integrity
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            git diff --check "${{ github.event.pull_request.base.sha }}...HEAD"
+          else
+            git show --check --oneline HEAD
+          fi
