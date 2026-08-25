@@ -1,0 +1,36 @@
+name: Export CMFD refactor worktree
+
+on:
+  push:
+    branches:
+      - codex/cmfd-gpu-assembly-drive-fusion
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export-source:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact branch source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Record source identity
+        run: |
+          git rev-parse HEAD > SOURCE_COMMIT
+          git status --short > SOURCE_STATUS
+
+      - name: Upload source worktree
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmfd-refactor-source
+          path: |
+            .
+            !.git/**
+            !test/**
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
