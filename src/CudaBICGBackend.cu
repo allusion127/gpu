@@ -2179,6 +2179,10 @@ public:
                 sl.cc_mirror.valid = false;
             } else {
                 sl.pushed_xsnf = sl.pushed_xsrf = sl.pushed_xssm = sl.pushed_dtil = false;
+                // This branch overwrites xs_xsnf without going through the
+                // mirror; a stale shadow must not elide a later assembly-path
+                // upload if the slot toggles back.
+                sl.xsnf_mirror.invalidate();
                 push(xs_xsnf + m * vec_stride(), sl.host_xsnf, static_cast<size_t>(n));
                 push(udiag_dev + m * mat_stride(), sl.host_udiag, matrix_count);
                 push(diag + m * mat_stride(), sl.host_diag, matrix_count);

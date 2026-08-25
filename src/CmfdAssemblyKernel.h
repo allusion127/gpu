@@ -43,8 +43,17 @@ struct View {
     double* udiag; ///< unshifted diagonal, same layout as diag
 };
 
+// The four `diagonal +=` accumulation sites below are an INFERRED contraction:
+// unlike the Wielandt shift (mined from live gcc codegen via the form probe),
+// they were never captured by RASBERY_CMFD_DUMP.  Empirically gcc 13 fuses all
+// of them at -O3 -march=native (the production Release flags) and does NOT at
+// -O2 or below or with -ffp-contract=off.  If the golden gate ever fails on a
+// non-Release or non-gcc host build, define RASBERY_CMFD_ASSEMBLY_NO_CONTRACT
+// to bisect the accumulation form without rolling back the whole feature.
 RASBERY_CMFD_ASSEMBLY_HD inline double mulAdd(double a, double b, double c) {
-#if defined(__CUDA_ARCH__)
+#if defined(RASBERY_CMFD_ASSEMBLY_NO_CONTRACT)
+    return a * b + c;
+#elif defined(__CUDA_ARCH__)
     return fma(a, b, c);
 #else
     return std::fma(a, b, c);

@@ -154,13 +154,32 @@ int main() {
 }
 '''
 
+    # The contract only holds at the production optimization level: gcc fuses
+    # the setls accumulations into FMA at -O3 (Release) and not at -O2 or
+    # below.  Prefer the flags the actual build used so a non-Release build
+    # cannot pass this gate while breaking bit-exactness in the binary.
+    opt_flags = ["-O3", "-march=native"]
+    for flags_make in sorted(ROOT.glob("build*/CMakeFiles/RASBERY.dir/flags.make")):
+        text = flags_make.read_text(encoding="utf-8", errors="ignore")
+        for line in text.splitlines():
+            if line.startswith("CXX_FLAGS"):
+                found = [tok for tok in line.split()
+                         if tok.startswith("-O") or tok.startswith("-march")
+                         or tok.startswith("-mtune") or tok.startswith("-ffp-contract")
+                         or tok in ("-mno-fma", "-ffast-math")]
+                if found:
+                    opt_flags = found
+                    print(f"cmfd assembly kernel: using build flags from {flags_make}: {' '.join(opt_flags)}")
+                break
+        break
+
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         cpp = tmp_path / "cmfd_assembly_test.cpp"
         exe = tmp_path / "cmfd_assembly_test"
         cpp.write_text(source, encoding="utf-8")
         subprocess.run(
-            [compiler, "-std=c++20", "-O3", "-march=native", "-Wall", "-Wextra",
+            [compiler, "-std=c++20", *opt_flags, "-Wall", "-Wextra",
              "-Werror", "-I", str(ROOT / "src"), str(cpp), "-o", str(exe)],
             check=True,
         )

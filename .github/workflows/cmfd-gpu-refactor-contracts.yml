@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - codex/cmfd-gpu-assembly-drive-fusion
+      - codex/cmfd-gpu-assembly-drive-fusion-v2
     paths:
       - src/CmfdAssemblyKernel.h
       - src/BICGCMFD.cpp
