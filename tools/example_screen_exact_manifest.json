@@ -1,0 +1,10 @@
+[
+  {
+    "id": "loading_0000",
+    "input": "../decks/loading_0000.json"
+  },
+  {
+    "id": "loading_0001",
+    "input": "../decks/loading_0001.json"
+  }
+]
