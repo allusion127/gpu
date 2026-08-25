@@ -1,0 +1,1 @@
+Implementation content complete; server physics and throughput gates remain external.
