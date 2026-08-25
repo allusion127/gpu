@@ -36,6 +36,22 @@ struct CmfdDump {
     }
 };
 CmfdDump g_cmfd_dump;
+
+bool envFlagEnabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) return false;
+    const std::string s(value);
+    return !(s.empty() || s == "0" || s == "off" || s == "OFF" ||
+             s == "false" || s == "FALSE");
+}
+
+bool envFlagEnabledDefaultOn(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) return true;
+    const std::string s(value);
+    return !(s.empty() || s == "0" || s == "off" || s == "OFF" ||
+             s == "false" || s == "FALSE");
+}
 } // namespace
 
 BICGCMFD::BICGCMFD(Geometry& g, XSSet& x)
@@ -154,24 +170,37 @@ void BICGCMFD::upddhat(double* flux, double* jnet) {
     }
 }
 
-void BICGCMFD::setls(const double& eigv) {
+bool BICGCMFD::canUseDeviceAssembly() const {
+    // The arena assembly is deliberately coupled to the resident multi-sweep
+    // path.  Otherwise setls() could skip the host operator and the pristine
+    // host drive loop would observe stale diag/cc arrays.
+    return envFlagEnabledDefaultOn("RASBERY_GPU_CMFD_ASSEMBLY") &&
+           envFlagEnabled("RASBERY_GPU_CMFD_SWEEP") &&
+           std::getenv("RASBERY_CMFD_DUMP") == nullptr &&
+           _g.ng() == 2 && _ls->usingCuda() && _ls->arena() != nullptr &&
+           _wiel_sweep >= WIELANDT_WARMUP_SWEEPS;
+}
+
+void BICGCMFD::assembleHostLinearSystem(const double& eigv) {
     // Zero shift does not need an extra unshifted-diagonal copy/update pass.
     if (_eshift == 0.0) {
-        for (int l = 0; l < _g.nxyz(); ++l) {
-            setls(l);
-        }
+        for (int l = 0; l < _g.nxyz(); ++l) setls(l);
         _ls->facilu(_diag, _cc);
         return;
     }
 
-    double reigvs = 0.0;
-    if (_eshift != 0.0) reigvs = 1. / (eigv + _eshift);
-
+    const double reigvs = 1. / (eigv + _eshift);
     for (int l = 0; l < _g.nxyz(); ++l) {
         setls(l);
         updls(l, reigvs);
     }
     _ls->facilu(_diag, _cc);
+}
+
+void BICGCMFD::setls(const double& eigv) {
+    _device_assembly_pending = canUseDeviceAssembly();
+    if (_device_assembly_pending) return;
+    assembleHostLinearSystem(eigv);
 }
 
 void BICGCMFD::setls(const int& l) {
@@ -225,6 +254,11 @@ void BICGCMFD::updpsi(const double* flux) {
 bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
     const int nxyz = _g.nxyz();
     const int ng   = _g.ng();
+    const bool use_device_assembly = _device_assembly_pending;
+    auto finish = [&](bool result) {
+        _device_assembly_pending = false;
+        return result;
+    };
     _sweep_chif.resize(static_cast<size_t>(ng) * nxyz);
     _sweep_xsnf.resize(static_cast<size_t>(ng) * nxyz);
     _sweep_vol.resize(static_cast<size_t>(nxyz));
@@ -251,6 +285,10 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
         ar->pinHost(_udiag.data(), _udiag.size() * sizeof(double));
         ar->pinHost(_sweep_chif.data(), _sweep_chif.size() * sizeof(double));
         ar->pinHost(_sweep_xsnf.data(), _sweep_xsnf.size() * sizeof(double));
+        ar->pinHost(_x.xsrfData(), nn * sizeof(double));
+        ar->pinHost(_x.xssmData(), static_cast<size_t>(ng * ng) * nd * sizeof(double));
+        ar->pinHost(_dtil, static_cast<size_t>(_g.nsurf()) * ng * sizeof(double));
+        ar->pinHost(_dhat, static_cast<size_t>(_g.nsurf()) * ng * sizeof(double));
         ar->pinHost(_sweep_vol.data(), _sweep_vol.size() * sizeof(double));
         _sweep_pinned = true;
     }
@@ -269,9 +307,14 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
         CudaBatchArena::CmfdSweepIO io;
         io.chif         = _sweep_chif.data();
         io.xsnf         = _sweep_xsnf.data();
+        io.xsrf         = _x.xsrfData();
+        io.xssm         = _x.xssmData();
+        io.dtil         = _dtil;
+        io.dhat         = _dhat;
         io.vol          = _sweep_vol.data();
         io.udiag        = _udiag.data();
         io.psi          = _psi;
+        io.device_assembly = use_device_assembly;
         io.eigv         = eigv;
         io.reigv        = reigv;
         io.reigvs       = reigvs;
@@ -283,8 +326,12 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
         io.icmfd_done   = icmfd;
         io.ngxyz        = _g.ngxyz();
 
-        if (!_ls->driveSweepsCuda(flux, io))
-            return false; // nothing ran; the caller's host loop takes over
+        if (!_ls->driveSweepsCuda(flux, io)) {
+            // Nothing ran. Rebuild the host operator before allowing the
+            // pristine host loop to take over; stale diag/cc is fail-closed.
+            if (use_device_assembly) assembleHostLinearSystem(eigv);
+            return finish(false);
+        }
 
         const int attempts = io.icmfd_done - icmfd;
         icmfd              = io.icmfd_done;
@@ -296,7 +343,7 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
         reigvs = io.reigvs;
         errl2  = io.errl2;
 
-        if (io.state == 1 || io.state == 3) return true; // converged / budget spent
+        if (io.state == 1 || io.state == 3) return finish(true); // converged / budget spent
 
         if (io.state == 2) {
             // Degenerate gamma: the device ran this sweep's source/BiCG/psi
@@ -331,13 +378,13 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
                     if (flux(ig2, l) < 0) ++negative;
             if (negative == _g.ngxyz()) negative = 0;
             if (!(negative != 0 && icmfd < 20 * _ncmfd)) ++iout;
-            if (errl2 < _epsl2) return true;
+            if (errl2 < _epsl2) return finish(true);
             continue;
         }
         // state 0: the launch unroll was spent on retries; go again with the
         // remaining budget.
     }
-    return true;
+    return finish(true);
 }
 
 void BICGCMFD::drive(double& eigv, double* flux, double& errl2) {
@@ -494,7 +541,8 @@ void BICGCMFD::drive(double& eigv, double* flux, double& errl2) {
 }
 
 void BICGCMFD::resetIteration() {
-    iter        = 0;
-    _wiel_sweep = 0;
+    iter                     = 0;
+    _wiel_sweep              = 0;
+    _device_assembly_pending = false;
 }
 

@@ -87,6 +87,13 @@ BICGSolver::~BICGSolver() {
         << "\"xs_cpu_fallbacks\":" << c.xs_cpu_fallbacks << ','
         << "\"cmfd_gpu_calls\":" << c.cmfd_gpu_calls << ','
         << "\"cmfd_cpu_fallbacks\":" << c.cmfd_cpu_fallbacks << ','
+        << "\"cmfd_assembly_gpu_calls\":" << c.cmfd_assembly_gpu_calls << ','
+        << "\"cmfd_assembly_cpu_fallbacks\":"
+        << c.cmfd_assembly_cpu_fallbacks << ','
+        << "\"cmfd_diag_h2d_elided_bytes\":"
+        << c.cmfd_diag_h2d_elided_bytes << ','
+        << "\"cmfd_cc_h2d_elided_bytes\":"
+        << c.cmfd_cc_h2d_elided_bytes << ','
         << "\"bicg_early_convergence_exits\":"
         << c.bicg_early_convergence_exits << ','
         << "\"bicg_restarts\":" << c.bicg_restarts << ','

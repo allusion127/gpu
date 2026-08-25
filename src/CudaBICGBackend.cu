@@ -1,5 +1,7 @@
 #include "CudaBICGBackend.h"
 
+#include "CmfdAssemblyKernel.h"
+#include "CudaTransferMirror.h"
 #include "CudaXsReconBackend.h" // rasberyHostPinningEnabled(): header-only gate
 #include "Geometry.h"
 #include "pch.h"
@@ -95,6 +97,24 @@ void cublas_check(cublasStatus_t value, const char* expression) {
 
 #define CUDA_CHECK(expr) cuda_check((expr), #expr)
 #define CUBLAS_CHECK(expr) cublas_check((expr), #expr)
+
+bool envFlagDisabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) return false;
+    const std::string s(value);
+    return s.empty() || s == "0" || s == "off" || s == "OFF" ||
+           s == "false" || s == "FALSE";
+}
+
+bool cmfdAssemblyEnabled() {
+    static const bool enabled = !envFlagDisabled("RASBERY_GPU_CMFD_ASSEMBLY");
+    return enabled;
+}
+
+bool cmfdScalarFusionEnabled() {
+    static const bool enabled = !envFlagDisabled("RASBERY_GPU_CMFD_SCALAR_FUSION");
+    return enabled;
+}
 
 // ---------------------------------------------------------------------------
 // Device-side inner-loop control.
@@ -262,6 +282,26 @@ __global__ void reduce_dot_stage2(const int blocks,
     double sum = 0.0;
     for (int i = 0; i < blocks; ++i) sum += pm[i];   // strict index order
     scalars[static_cast<long long>(m) * kScalarCount + slot] = take_sqrt ? sqrt(sum) : sum;
+}
+
+/// Strict stage-2 fold plus the immediately dependent r20 snapshot.
+/// This removes one scalar graph node without changing the reduction tree or
+/// the liveness/participation guard used by the former two-kernel sequence.
+__global__ void reduce_norm_store_reference_stage2(
+    const int blocks,
+    const double* __restrict__ partial,
+    double* scalars,
+    const std::uint32_t* __restrict__ halt) {
+    if (threadIdx.x != 0) return;
+    const int m = static_cast<int>(blockIdx.y);
+    HALT_GUARD(halt + m);
+    const double* pm = partial + static_cast<long long>(m) * kMaxReduceBlocks;
+    double sum = 0.0;
+    for (int i = 0; i < blocks; ++i) sum += pm[i];
+    const double norm = sqrt(sum);
+    double* sm = scalars + static_cast<long long>(m) * kScalarCount;
+    sm[kInitialNorm] = norm;
+    sm[kR20] = norm;
 }
 
 // ---------------------------------------------------------------------------
@@ -777,58 +817,27 @@ __global__ void update_solution(const int n,
     if (i == 0) sm[kOmega] = omega;
 }
 
-/// End-of-iteration bookkeeping that the host used to perform after every
-/// status D2H: fold the per-iteration flags into the sticky set, tally the
-/// telemetry, and -- for every iteration except the first, which the CPU
-/// reference also runs unconditionally -- apply the relative exit test.
-__global__ void accumulate_iteration(const int allow_halt,
-                                     const int force_halt,
-                                     const double* __restrict__ scalars,
-                                     std::uint32_t* iter_flags,
-                                     std::uint32_t* sticky_flags,
-                                     std::uint32_t* counters,
-                                     std::uint32_t* halt,
-                                     const std::uint32_t* __restrict__ active) {
-    if (threadIdx.x != 0) return;
-    const int m = static_cast<int>(blockIdx.y);
-    // A slot that is not taking part in this launch never had an iteration to
-    // over-run; it is masked exactly as the HALT_GUARD used to mask it.
-    if (active[m] == 0u) return;
-
-    const double*  sm  = scalars + static_cast<long long>(m) * kScalarCount;
-    std::uint32_t* cm  = counters + static_cast<long long>(m) * kCounterSlots;
-
-    // This is where the HALT_GUARD used to sit.  Splitting it out is what
-    // makes the over-run visible: every kernel of this iteration returned on
-    // its first instruction, so nothing in the solver state moved, and the
-    // only thing left to do is say so.  The counter is telemetry -- no other
-    // kernel and no host decision reads it -- so the numerical trajectory is
-    // byte for byte the one the plain HALT_GUARD produced.
-    if (halt[m] != 0u) {
-        ++cm[kOverrunCount];
-        return;
-    }
+/// Shared end-of-iteration state transition. The caller has already verified
+/// that the slot is active and not halted. Both the historical standalone
+/// kernel and the fused norm-finalizer call this exact body.
+__device__ inline void accumulate_iteration_active(
+    const int m,
+    const int allow_halt,
+    const int force_halt,
+    const double* __restrict__ scalars,
+    std::uint32_t* iter_flags,
+    std::uint32_t* sticky_flags,
+    std::uint32_t* counters,
+    std::uint32_t* halt) {
+    const double* sm = scalars + static_cast<long long>(m) * kScalarCount;
+    std::uint32_t* cm = counters + static_cast<long long>(m) * kCounterSlots;
 
     const std::uint32_t flags = iter_flags[m];
-    // The other half of the retired per-iteration cudaMemsetAsync node: arm
-    // the scratch word for the NEXT captured iteration, here rather than in a
-    // memset node of its own.  Placed immediately after the read, so it holds
-    // on every exit below.
-    //
-    // The paths that skip it are exactly the paths on which nobody reads it
-    // again: `active == 0` (the slot never runs a kernel of this launch) and
-    // `halt != 0` (halt is monotone within an outer -- only this kernel sets
-    // it and only initialize_solver_state clears it -- so every later
-    // iteration returns here before the read, and the only writers of
-    // iter_flags are HALT_GUARDed).  initialize_solver_state zeroes the word
-    // for every slot at the top of each outer, which covers the first
-    // iteration and re-arms a slot whose previous outer halted.
+    // Re-arm the scratch flags for the next captured iteration at the same
+    // stream-ordered point as the retired cudaMemsetAsync node.
     iter_flags[m] = 0u;
-    const double        ptt   = sm[kPtt];
-    const double        rnorm = sm[kInitialNorm];
-
-    // Same corrupt-state test finalize_status applied: a non-finite or
-    // negative t.t means the reported residual is meaningless.
+    const double ptt = sm[kPtt];
+    const double rnorm = sm[kInitialNorm];
     const bool corrupt = !isfinite(ptt) || ptt < 0.0 || !isfinite(rnorm);
 
     sticky_flags[m] |= flags;
@@ -840,8 +849,6 @@ __global__ void accumulate_iteration(const int allow_halt,
     ++cm[kSolveCount];
 
     if (corrupt || (sticky_flags[m] & static_cast<std::uint32_t>(NONFINITE_DETECTED)) != 0) {
-        // The host threw as soon as it saw this; stop the batch so the state
-        // handed back is the first bad one rather than three more of them.
         halt[m] = 1u;
         return;
     }
@@ -849,14 +856,64 @@ __global__ void accumulate_iteration(const int allow_halt,
         const double r20 = sm[kR20];
         if (r20 <= 0.0 || rnorm / r20 < sm[kEps]) halt[m] = 1u;
     }
-    // The algorithmic budget is `1 + nmax` iterations -- the host loop stopped
-    // there whether or not the residual test had fired.  When the graph
-    // captures MORE than that (RASBERY_GPU_ITER_BATCH > 1 + nmax), the last
-    // budgeted iteration raises the halt itself, which is what makes every
-    // extra captured iteration provably inert instead of silently deepening
-    // the inner solve.  With the default batch this argument is always 0 and
-    // the kernel behaves exactly as before.
     if (force_halt != 0) halt[m] = 1u;
+}
+
+/// End-of-iteration bookkeeping retained as the runtime rollback path.
+__global__ void accumulate_iteration(const int allow_halt,
+                                     const int force_halt,
+                                     const double* __restrict__ scalars,
+                                     std::uint32_t* iter_flags,
+                                     std::uint32_t* sticky_flags,
+                                     std::uint32_t* counters,
+                                     std::uint32_t* halt,
+                                     const std::uint32_t* __restrict__ active) {
+    if (threadIdx.x != 0) return;
+    const int m = static_cast<int>(blockIdx.y);
+    if (active[m] == 0u) return;
+
+    std::uint32_t* cm = counters + static_cast<long long>(m) * kCounterSlots;
+    if (halt[m] != 0u) {
+        ++cm[kOverrunCount];
+        return;
+    }
+    accumulate_iteration_active(m, allow_halt, force_halt, scalars, iter_flags,
+                                sticky_flags, counters, halt);
+}
+
+/// Strict residual-norm stage 2 fused with accumulate_iteration. The early
+/// active/halt test is intentionally before the partial fold: an overrun
+/// iteration never wrote new partials and must only increment its telemetry.
+__global__ void reduce_norm_accumulate_stage2(
+    const int blocks,
+    const int allow_halt,
+    const int force_halt,
+    const double* __restrict__ partial,
+    double* scalars,
+    std::uint32_t* iter_flags,
+    std::uint32_t* sticky_flags,
+    std::uint32_t* counters,
+    std::uint32_t* halt,
+    const std::uint32_t* __restrict__ active) {
+    if (threadIdx.x != 0) return;
+    const int m = static_cast<int>(blockIdx.y);
+    if (active[m] == 0u) return;
+
+    std::uint32_t* cm = counters + static_cast<long long>(m) * kCounterSlots;
+    if (halt[m] != 0u) {
+        ++cm[kOverrunCount];
+        return;
+    }
+
+    const double* pm = partial + static_cast<long long>(m) * kMaxReduceBlocks;
+    double sum = 0.0;
+    for (int i = 0; i < blocks; ++i) sum += pm[i];
+    const double norm = sqrt(sum);
+    double* sm = scalars + static_cast<long long>(m) * kScalarCount;
+    sm[kInitialNorm] = norm;
+
+    accumulate_iteration_active(m, allow_halt, force_halt, scalars, iter_flags,
+                                sticky_flags, counters, halt);
 }
 
 __global__ void finalize_status(const double* scalars,
@@ -917,6 +974,56 @@ __global__ void finalize_status(const double* scalars,
 // fused sites and __dmul_rn() pins the unfused ones regardless of this TU's
 // -fmad setting, so the kernels below cannot drift when compiler flags do.
 // ---------------------------------------------------------------------------
+
+/// Build the unshifted two-group CMFD operator and its initial Wielandt
+/// diagonal directly in the arena allocations consumed by BiCGSTAB. Geometry
+/// is shared; every mutable input/output is slot-strided.
+__global__ void cmfd_assemble_operator_2g(
+    const int nxyz,
+    const long long vec_stride,
+    const long long mat_stride,
+    const long long cpl_stride,
+    const long long surface_stride,
+    const int* __restrict__ node_surface,
+    const double* __restrict__ face_area,
+    const double* __restrict__ geometry_volume,
+    const double* __restrict__ xsrf,
+    const double* __restrict__ xssm,
+    const double* __restrict__ chif,
+    const double* __restrict__ xsnf,
+    const double* __restrict__ dtil,
+    const double* __restrict__ dhat,
+    double* diag,
+    double* cc,
+    double* udiag,
+    const double* __restrict__ scalars,
+    const std::uint32_t* __restrict__ device_assembly_active,
+    const std::uint32_t* __restrict__ sweep_halt) {
+    const int m = static_cast<int>(blockIdx.y);
+    if (device_assembly_active[m] == 0u || sweep_halt[m] != 0u) return;
+    const int l = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (l >= nxyz) return;
+
+    const double* sm = scalars + static_cast<long long>(m) * kScalarCount;
+    cmfd_assembly::View view{
+        nxyz,
+        node_surface,
+        face_area,
+        geometry_volume,
+        xsrf + m * vec_stride,
+        xssm + m * mat_stride,
+        chif + m * vec_stride,
+        xsnf + m * vec_stride,
+        dtil + m * surface_stride,
+        dhat + m * surface_stride,
+        sm[kReigvs],
+        sm[kEshift],
+        diag + m * mat_stride,
+        cc + m * cpl_stride,
+        udiag + m * mat_stride,
+    };
+    cmfd_assembly::assembleNode2G(view, l);
+}
 
 __global__ void cmfd_sweep_begin(double* scalars, std::uint32_t* sweep_halt) {
     if (threadIdx.x != 0) return;
@@ -1156,6 +1263,8 @@ public:
     struct Slot {
         const double* host_diag = nullptr;
         const double* host_cc   = nullptr;
+        double*       host_diag_out = nullptr;
+        double*       host_cc_out   = nullptr;
         const double* host_phi  = nullptr;
         const double* host_src  = nullptr;
         bool          push_diag = true;
@@ -1174,9 +1283,22 @@ public:
         // ---- sweep-mode staging (RASBERY_GPU_CMFD_SWEEP) ----
         const double* host_chif  = nullptr;
         const double* host_xsnf  = nullptr;
+        const double* host_xsrf  = nullptr;
+        const double* host_xssm  = nullptr;
+        const double* host_dtil  = nullptr;
+        const double* host_dhat  = nullptr;
         const double* host_vol   = nullptr;
-        const double* host_udiag = nullptr;
+        double*       host_udiag = nullptr;
         double*       host_psi   = nullptr; ///< in/out
+        bool          device_assembly = false;
+        bool          pushed_xsrf = false;
+        bool          pushed_xssm = false;
+        bool          pushed_xsnf = false;
+        bool          pushed_dtil = false;
+        cuda_transfer::ByteExactMirror<double> xsrf_mirror;
+        cuda_transfer::ByteExactMirror<double> xssm_mirror;
+        cuda_transfer::ByteExactMirror<double> xsnf_mirror;
+        cuda_transfer::ByteExactMirror<double> dtil_mirror;
         MirroredUpload chif_mirror;
         MirroredUpload vol_mirror;
         double        sweep_in[kSweepCount]  = {};
@@ -1188,6 +1310,7 @@ public:
         : slots(slot_count),
           nxyz(geometry.nxyz()),
           n(geometry.ngxyz()),
+          surface_group_count(static_cast<size_t>(geometry.nsurf()) * geometry.ng()),
           matrix_count(static_cast<size_t>(geometry.ng2()) * geometry.nxyz()),
           coupling_count(static_cast<size_t>(geometry.ng()) * NDIRMAX * LR * geometry.nxyz()) {
         if (geometry.ng() != 2 || NDIRMAX * LR != 6) {
@@ -1244,6 +1367,26 @@ public:
             // same-sized core map.
             topology_neighbors = host_neighbors;
 
+            std::vector<int> host_node_surface(static_cast<size_t>(nxyz) * 6);
+            std::vector<double> host_face_area(static_cast<size_t>(nxyz) * NDIRMAX);
+            std::vector<double> host_geometry_volume(static_cast<size_t>(nxyz));
+            for (int l = 0; l < nxyz; ++l) {
+                const double hx = geometry.hmesh(XDIR, l);
+                const double hy = geometry.hmesh(YDIR, l);
+                const double hz = geometry.hmesh(ZDIR, l);
+                host_face_area[static_cast<size_t>(l) * NDIRMAX + XDIR] = hy * hz;
+                host_face_area[static_cast<size_t>(l) * NDIRMAX + YDIR] = hx * hz;
+                host_face_area[static_cast<size_t>(l) * NDIRMAX + ZDIR] = hx * hy;
+                host_geometry_volume[static_cast<size_t>(l)] = geometry.vol(l);
+                for (int idir = 0; idir < NDIRMAX; ++idir)
+                    for (int lr = 0; lr < LR; ++lr)
+                        host_node_surface[static_cast<size_t>(l) * 6 + idir * LR + lr] =
+                            geometry.lktosfc(lr, idir, l);
+            }
+            topology_node_surface = host_node_surface;
+            topology_face_area = host_face_area;
+            topology_volume = host_geometry_volume;
+
             // Greedy BFS graph colouring.  On a bipartite lattice the
             // smallest-available-colour rule reproduces the historical
             // red/black parity colouring exactly (same seeds, same queue
@@ -1298,12 +1441,15 @@ public:
                 const int requested = std::atoi(batch_env);
                 if (requested > 0) iter_batch_request = requested;
             }
+            scalar_fusion = cmfdScalarFusionEnabled();
             status += " (block=" + std::to_string(block_size) +
                       ", RB sweeps=" + std::to_string(rb_sweeps) +
                       ", graph=" + (use_graph ? "on" : "off") +
                       ", iter batch=" +
                       (iter_batch_request > 0 ? std::to_string(iter_batch_request)
                                               : std::string("auto")) +
+                      ", assembly=" + (cmfdAssemblyEnabled() ? "on" : "off") +
+                      ", scalar fusion=" + (scalar_fusion ? "on" : "off") +
                       ", slots=" + std::to_string(slots) + ")";
 
             const size_t S = static_cast<size_t>(slots);
@@ -1316,6 +1462,21 @@ public:
             CUDA_CHECK(cudaMemcpy(colors,
                                   host_colors.data(),
                                   host_colors.size() * sizeof(int),
+                                  cudaMemcpyHostToDevice));
+            allocate(reinterpret_cast<void**>(&assembly_node_surface),
+                     host_node_surface.size() * sizeof(int));
+            CUDA_CHECK(cudaMemcpy(assembly_node_surface, host_node_surface.data(),
+                                  host_node_surface.size() * sizeof(int),
+                                  cudaMemcpyHostToDevice));
+            allocate(reinterpret_cast<void**>(&assembly_face_area),
+                     host_face_area.size() * sizeof(double));
+            CUDA_CHECK(cudaMemcpy(assembly_face_area, host_face_area.data(),
+                                  host_face_area.size() * sizeof(double),
+                                  cudaMemcpyHostToDevice));
+            allocate(reinterpret_cast<void**>(&assembly_volume),
+                     host_geometry_volume.size() * sizeof(double));
+            CUDA_CHECK(cudaMemcpy(assembly_volume, host_geometry_volume.data(),
+                                  host_geometry_volume.size() * sizeof(double),
                                   cudaMemcpyHostToDevice));
             allocate(reinterpret_cast<void**>(&diag), S * matrix_count * sizeof(double));
             allocate(reinterpret_cast<void**>(&dinv), S * matrix_count * sizeof(double));
@@ -1349,11 +1510,19 @@ public:
             allocate(reinterpret_cast<void**>(&device_status), S * sizeof(DeviceSolveStatus));
             allocate(reinterpret_cast<void**>(&xs_chif), vec_bytes);
             allocate(reinterpret_cast<void**>(&xs_xsnf), vec_bytes);
+            allocate(reinterpret_cast<void**>(&xs_xsrf), vec_bytes);
+            allocate(reinterpret_cast<void**>(&xs_xssm), S * matrix_count * sizeof(double));
+            allocate(reinterpret_cast<void**>(&dtil_dev), S * surface_group_count * sizeof(double));
+            allocate(reinterpret_cast<void**>(&dhat_dev), S * surface_group_count * sizeof(double));
             allocate(reinterpret_cast<void**>(&node_vol), S * static_cast<size_t>(nxyz) * sizeof(double));
             allocate(reinterpret_cast<void**>(&udiag_dev), S * matrix_count * sizeof(double));
             allocate(reinterpret_cast<void**>(&psi_dev), S * static_cast<size_t>(nxyz) * sizeof(double));
             allocate(reinterpret_cast<void**>(&sweep_halt), S * sizeof(std::uint32_t));
+            allocate(reinterpret_cast<void**>(&device_assembly_active),
+                     S * sizeof(std::uint32_t));
             CUDA_CHECK(cudaMemset(sweep_halt, 0, S * sizeof(std::uint32_t)));
+            CUDA_CHECK(cudaMemset(device_assembly_active, 0, S * sizeof(std::uint32_t)));
+            host_assembly_active.assign(S, 0u);
             CUDA_CHECK(cudaMemset(device_halt, 0, S * sizeof(std::uint32_t)));
             CUDA_CHECK(cudaMemset(device_active, 0, S * sizeof(std::uint32_t)));
             CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&host_status),
@@ -1386,6 +1555,9 @@ public:
         stream = nullptr;
         cudaFree(neighbors);
         cudaFree(colors);
+        cudaFree(assembly_node_surface);
+        cudaFree(assembly_face_area);
+        cudaFree(assembly_volume);
         cudaFree(diag);
         cudaFree(dinv);
         cudaFree(cc);
@@ -1413,18 +1585,26 @@ public:
         sweep_graph_exec = nullptr;
         cudaFree(xs_chif);
         cudaFree(xs_xsnf);
+        cudaFree(xs_xsrf);
+        cudaFree(xs_xssm);
+        cudaFree(dtil_dev);
+        cudaFree(dhat_dev);
         cudaFree(node_vol);
         cudaFree(udiag_dev);
         cudaFree(psi_dev);
         cudaFree(sweep_halt);
-        xs_chif = xs_xsnf = node_vol = udiag_dev = psi_dev = nullptr;
-        sweep_halt = nullptr;
+        cudaFree(device_assembly_active);
+        xs_chif = xs_xsnf = xs_xsrf = xs_xssm = dtil_dev = dhat_dev = nullptr;
+        node_vol = udiag_dev = psi_dev = nullptr;
+        sweep_halt = device_assembly_active = nullptr;
         if (host_status != nullptr) cudaFreeHost(host_status);
         host_status = nullptr;
         if (host_active != nullptr) cudaFreeHost(host_active);
         host_active = nullptr;
         neighbors = nullptr;
         colors = nullptr;
+        assembly_node_surface = nullptr;
+        assembly_face_area = assembly_volume = nullptr;
         diag = dinv = cc = src = phi = r = r0 = p = v = s = t = y = z = ax = nullptr;
         partials = nullptr;
         partials2 = nullptr;
@@ -1443,6 +1623,9 @@ public:
     [[nodiscard]] long long vec_stride() const { return static_cast<long long>(n); }
     [[nodiscard]] long long mat_stride() const { return static_cast<long long>(matrix_count); }
     [[nodiscard]] long long cpl_stride() const { return static_cast<long long>(coupling_count); }
+    [[nodiscard]] long long surface_stride() const {
+        return static_cast<long long>(surface_group_count);
+    }
 
     /// Exact compatibility check for the immutable CMFD topology.  Shape
     /// counts alone are insufficient: two loading maps can have identical
@@ -1453,13 +1636,25 @@ public:
             geometry.ngxyz() != n ||
             static_cast<size_t>(geometry.ng2()) * geometry.nxyz() != matrix_count)
             return false;
-        for (int l = 0; l < nxyz; ++l)
-            for (int idir = 0; idir < NDIRMAX; ++idir)
+        for (int l = 0; l < nxyz; ++l) {
+            for (int idir = 0; idir < NDIRMAX; ++idir) {
                 for (int lr = 0; lr < LR; ++lr) {
                     const size_t idx = static_cast<size_t>(6 * l + idir * LR + lr);
-                    if (topology_neighbors[idx] != geometry.neib(lr, idir, l))
+                    if (topology_neighbors[idx] != geometry.neib(lr, idir, l) ||
+                        topology_node_surface[idx] != geometry.lktosfc(lr, idir, l))
                         return false;
                 }
+            }
+            const double hx = geometry.hmesh(XDIR, l);
+            const double hy = geometry.hmesh(YDIR, l);
+            const double hz = geometry.hmesh(ZDIR, l);
+            const double area[NDIRMAX] = {hy * hz, hx * hz, hx * hy};
+            for (int idir = 0; idir < NDIRMAX; ++idir)
+                if (topology_face_area[static_cast<size_t>(l) * NDIRMAX + idir] !=
+                    area[idir])
+                    return false;
+            if (topology_volume[static_cast<size_t>(l)] != geometry.vol(l)) return false;
+        }
         return true;
     }
 
@@ -1483,6 +1678,8 @@ public:
         Slot& sl     = slot[static_cast<size_t>(m)];
         sl.host_diag = host_diag;
         sl.host_cc   = host_cc;
+        sl.host_diag_out = const_cast<double*>(host_diag);
+        sl.host_cc_out   = const_cast<double*>(host_cc);
         sl.host_phi  = host_phi;
         sl.host_src  = host_src;
         // diag is rewritten every outer (Wielandt) and every CMFD sweep
@@ -1650,13 +1847,25 @@ public:
 
         update_solution<<<vector_grid(), block_size, 0, stream>>>(
             n, vec_stride(), scalars, iter_flags, y, z, s, t, phi, r, device_halt);
-        // Absolute residual of the iterate that update_solution just wrote (or
-        // of the unchanged iterate on the breakdown / early-exit paths, which
-        // is what the CPU publishes there too).
-        dot(r, r, kInitialNorm, /*take_sqrt=*/true);
-        accumulate_iteration<<<scalar_grid(), 1, 0, stream>>>(
-            allow_halt, force_halt, scalars, iter_flags, device_flags, device_counters,
-            device_halt, device_active);
+        // Absolute residual of the iterate that update_solution just wrote.
+        // The stage-1 partition is unchanged; only the scalar stage-2 node is
+        // optionally fused with its immediately dependent bookkeeping node.
+        const int norm_blocks = reduce_blocks_for(n);
+        reduce_dot_stage1<<<
+            dim3(static_cast<unsigned>(norm_blocks), static_cast<unsigned>(slots)),
+            kReduceThreads, 0, stream>>>(
+            n, vec_stride(), r, r, partials, device_halt);
+        if (scalar_fusion) {
+            reduce_norm_accumulate_stage2<<<scalar_grid(), 1, 0, stream>>>(
+                norm_blocks, allow_halt, force_halt, partials, scalars, iter_flags,
+                device_flags, device_counters, device_halt, device_active);
+        } else {
+            reduce_dot_stage2<<<scalar_grid(), 1, 0, stream>>>(
+                norm_blocks, partials, scalars, kInitialNorm, true, device_halt);
+            accumulate_iteration<<<scalar_grid(), 1, 0, stream>>>(
+                allow_halt, force_halt, scalars, iter_flags, device_flags,
+                device_counters, device_halt, device_active);
+        }
     }
 
     /// How many BiCGSTAB iterations one graph launch carries.
@@ -1686,8 +1895,19 @@ public:
         begin_outer_fused<<<node_grid(), block_size, 0, stream>>>(
             nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag, cc, phi,
             src, dinv, ax, r, r0, p, v, device_halt);
-        dot(r, r, kInitialNorm, /*take_sqrt=*/true);
-        store_reference_norm<<<scalar_grid(), 1, 0, stream>>>(scalars, device_halt);
+        const int reference_blocks = reduce_blocks_for(n);
+        reduce_dot_stage1<<<
+            dim3(static_cast<unsigned>(reference_blocks), static_cast<unsigned>(slots)),
+            kReduceThreads, 0, stream>>>(
+            n, vec_stride(), r, r, partials, device_halt);
+        if (scalar_fusion) {
+            reduce_norm_store_reference_stage2<<<scalar_grid(), 1, 0, stream>>>(
+                reference_blocks, partials, scalars, device_halt);
+        } else {
+            reduce_dot_stage2<<<scalar_grid(), 1, 0, stream>>>(
+                reference_blocks, partials, scalars, kInitialNorm, true, device_halt);
+            store_reference_norm<<<scalar_grid(), 1, 0, stream>>>(scalars, device_halt);
+        }
 
         // The algorithmic budget is `1 + nmax`; the capture may be deeper.
         // Iteration `algorithmic - 1` then raises the halt itself, so every
@@ -1795,6 +2015,13 @@ public:
     /// refresh), wiel, updls, the negative census and the control tail --
     /// with sweep_halt carrying the host loop's break/retry decisions.
     void enqueue_sweeps(int nmax, int unroll) {
+        // One operator build per drive. The following sweep loop only updates
+        // the shifted diagonal as reigvs changes; cc and udiag stay resident.
+        cmfd_assemble_operator_2g<<<node_grid(), block_size, 0, stream>>>(
+            nxyz, vec_stride(), mat_stride(), cpl_stride(), surface_stride(),
+            assembly_node_surface, assembly_face_area, assembly_volume,
+            xs_xsrf, xs_xssm, xs_chif, xs_xsnf, dtil_dev, dhat_dev,
+            diag, cc, udiag_dev, scalars, device_assembly_active, sweep_halt);
         for (int sweep = 0; sweep < unroll; ++sweep) {
             cmfd_sweep_begin<<<scalar_grid(), 1, 0, stream>>>(scalars, sweep_halt);
             cmfd_src_build<<<node_grid(), block_size, 0, stream>>>(
@@ -1865,10 +2092,20 @@ public:
     /// path never sees a stale mask.
     void issueSweepUploads(const int* active_slots, int count) {
         std::memset(host_active, 0, static_cast<size_t>(slots) * sizeof(std::uint32_t));
-        for (int i = 0; i < count; ++i) host_active[active_slots[i]] = 1u;
+        std::fill(host_assembly_active.begin(), host_assembly_active.end(), 0u);
+        for (int i = 0; i < count; ++i) {
+            const int m = active_slots[i];
+            host_active[m] = 1u;
+            host_assembly_active[static_cast<size_t>(m)] =
+                slot[static_cast<size_t>(m)].device_assembly ? 1u : 0u;
+        }
         CUDA_CHECK(cudaMemcpyAsync(device_active, host_active,
                                    static_cast<size_t>(slots) * sizeof(std::uint32_t),
                                    cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(device_assembly_active, host_assembly_active.data(),
+                                   static_cast<size_t>(slots) * sizeof(std::uint32_t),
+                                   cudaMemcpyHostToDevice, stream));
+
         // participants: sweep_halt = 0; everyone else: 1 (masks their slots
         // inside every sweep kernel AND the inner reset).
         for (int m = 0; m < slots; ++m) host_active[m] = host_active[m] ? 0u : 1u;
@@ -1892,18 +2129,65 @@ public:
                                             static_cast<size_t>(nxyz))
                            : true,
                        sl.vol_mirror);
+
             auto push = [&](double* dst, const double* src_host, size_t cnt) {
+                if (src_host == nullptr)
+                    throw std::invalid_argument("CMFD sweep upload received a null host buffer");
                 CUDA_CHECK(cudaMemcpyAsync(dst, src_host, cnt * sizeof(double),
                                            cudaMemcpyHostToDevice, stream));
                 ++telemetry.bulk_h2d_calls_during_iteration;
                 telemetry.bulk_h2d_bytes_during_iteration += cnt * sizeof(double);
             };
-            push(xs_xsnf + m * vec_stride(), sl.host_xsnf, static_cast<size_t>(n));
-            push(udiag_dev + m * mat_stride(), sl.host_udiag, matrix_count);
+            auto push_pending = [&](double* dst, const double* src_host, size_t cnt,
+                                    bool& pushed,
+                                    cuda_transfer::ByteExactMirror<double>& mirror) {
+                if (src_host == nullptr)
+                    throw std::invalid_argument("CMFD assembly upload received a null host buffer");
+                pushed = !mirror.matches(src_host, cnt);
+                if (!pushed) {
+                    ++telemetry.bulk_h2d_skipped_during_iteration;
+                    return;
+                }
+                push(dst, src_host, cnt);
+            };
+
+            if (sl.device_assembly) {
+                push_pending(xs_xsnf + m * vec_stride(), sl.host_xsnf,
+                             static_cast<size_t>(n), sl.pushed_xsnf,
+                             sl.xsnf_mirror);
+                push_pending(xs_xsrf + m * vec_stride(), sl.host_xsrf,
+                             static_cast<size_t>(n), sl.pushed_xsrf,
+                             sl.xsrf_mirror);
+                push_pending(xs_xssm + m * mat_stride(), sl.host_xssm,
+                             matrix_count, sl.pushed_xssm, sl.xssm_mirror);
+                push_pending(dtil_dev + m * surface_stride(), sl.host_dtil,
+                             surface_group_count, sl.pushed_dtil,
+                             sl.dtil_mirror);
+                // dhat changes after every nodal correction, so comparing it
+                // on the launcher's critical path is wasted work.
+                push(dhat_dev + m * surface_stride(), sl.host_dhat,
+                     surface_group_count);
+
+                ++telemetry.cmfd_assembly_gpu_calls;
+                telemetry.cmfd_diag_h2d_elided_bytes += matrix_count * sizeof(double);
+                telemetry.cmfd_cc_h2d_elided_bytes += coupling_count * sizeof(double);
+                telemetry.bulk_h2d_skipped_during_iteration += 3; // diag/cc/udiag
+
+                // The assembly kernel overwrites cc. A former host mirror no
+                // longer describes device memory and must not elide a later
+                // rollback upload.
+                sl.cc_mirror.valid = false;
+            } else {
+                sl.pushed_xsnf = sl.pushed_xsrf = sl.pushed_xssm = sl.pushed_dtil = false;
+                push(xs_xsnf + m * vec_stride(), sl.host_xsnf, static_cast<size_t>(n));
+                push(udiag_dev + m * mat_stride(), sl.host_udiag, matrix_count);
+                push(diag + m * mat_stride(), sl.host_diag, matrix_count);
+                pushOrSkip(cc + m * cpl_stride(), sl.host_cc, coupling_count,
+                           sl.push_cc, sl.cc_mirror);
+                ++telemetry.cmfd_assembly_cpu_fallbacks;
+            }
+
             push(psi_dev + m * node_stride(), sl.host_psi, static_cast<size_t>(nxyz));
-            push(diag + m * mat_stride(), sl.host_diag, matrix_count);
-            pushOrSkip(cc + m * cpl_stride(), sl.host_cc, coupling_count, sl.push_cc,
-                       sl.cc_mirror);
             pushOrSkip(phi + m * vec_stride(), sl.host_phi, static_cast<size_t>(n),
                        sl.push_phi, sl.phi_mirror);
             CUDA_CHECK(cudaMemcpyAsync(
@@ -1955,12 +2239,56 @@ public:
         }
     }
 
+    void commitAssemblyMirrors(const int* active_slots, int count) {
+        for (int i = 0; i < count; ++i) {
+            Slot& sl = slot[static_cast<size_t>(active_slots[i])];
+            if (!sl.device_assembly) continue;
+            if (sl.pushed_xsrf) sl.xsrf_mirror.commit(sl.host_xsrf, static_cast<size_t>(n));
+            if (sl.pushed_xssm) sl.xssm_mirror.commit(sl.host_xssm, matrix_count);
+            if (sl.pushed_xsnf) sl.xsnf_mirror.commit(sl.host_xsnf, static_cast<size_t>(n));
+            if (sl.pushed_dtil) sl.dtil_mirror.commit(sl.host_dtil, surface_group_count);
+        }
+    }
+
+    /// A degenerate Wielandt gamma hands control to the host Rayleigh branch.
+    /// Only those exceptional slots need a host copy of the operator that the
+    /// assembly kernel produced; the normal path never downloads diag/cc/udiag.
+    void issueExceptionalOperatorDownloads(const int* active_slots, int count) {
+        bool queued = false;
+        for (int i = 0; i < count; ++i) {
+            const int m = active_slots[i];
+            Slot& sl = slot[static_cast<size_t>(m)];
+            const int state = static_cast<int>(sl.sweep_out[kSweepState - kSweepFirst]);
+            if (!sl.device_assembly || state != 2) continue;
+            if (sl.host_diag_out == nullptr || sl.host_cc_out == nullptr ||
+                sl.host_udiag == nullptr)
+                throw std::runtime_error(
+                    "CMFD device assembly fallback has no writable host operator buffers");
+            CUDA_CHECK(cudaMemcpyAsync(sl.host_diag_out, diag + m * mat_stride(),
+                                       matrix_count * sizeof(double),
+                                       cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(sl.host_cc_out, cc + m * cpl_stride(),
+                                       coupling_count * sizeof(double),
+                                       cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(sl.host_udiag, udiag_dev + m * mat_stride(),
+                                       matrix_count * sizeof(double),
+                                       cudaMemcpyDeviceToHost, stream));
+            telemetry.bulk_d2h_calls_during_iteration += 3;
+            queued = true;
+        }
+        if (!queued) return;
+        ++telemetry.stream_sync_calls_during_iteration;
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaGetLastError());
+    }
+
     /// The one drain per launch.  It covers the flux copies *and* the status
     /// packets the graph already queued, which is why the inner loop needs none.
     void drain(const int* active_slots, int count) {
         ++telemetry.stream_sync_calls_during_iteration;
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaGetLastError());
+        commitAssemblyMirrors(active_slots, count);
 
         for (int i = 0; i < count; ++i) {
             const int m = active_slots[i];
@@ -1995,15 +2323,22 @@ public:
     int           slots;
     int           nxyz;
     int           n;
+    size_t        surface_group_count;
     size_t        matrix_count;
     size_t        coupling_count;
     std::vector<int> topology_neighbors;
+    std::vector<int> topology_node_surface;
+    std::vector<double> topology_face_area;
+    std::vector<double> topology_volume;
     bool          available = false;
     std::string   status;
     cublasHandle_t handle = nullptr;
     cudaStream_t  stream = nullptr;
     int*          neighbors = nullptr;
     int*          colors = nullptr;
+    int*          assembly_node_surface = nullptr;
+    double*       assembly_face_area = nullptr;
+    double*       assembly_volume = nullptr;
     int           block_size = kDefaultBlockSize;
     int           rb_sweeps = 4;
     int           ncolors   = 2; // sweep colour count (2 = historical red/black; >2 under the rotational fold)
@@ -2023,7 +2358,9 @@ public:
     std::uint32_t*     host_active = nullptr;
     BackendCounters telemetry{};
     std::vector<Slot> slot;
+    std::vector<std::uint32_t> host_assembly_active;
     bool          use_graph = true;
+    bool          scalar_fusion = true;
     /// RASBERY_GPU_ITER_BATCH: requested iterations per graph launch.  0 =
     /// unset = follow the algorithmic budget (today's behaviour, and the only
     /// setting for which the capture depth is exactly `1 + nmax`).
@@ -2036,10 +2373,15 @@ public:
     // ---- device-resident CMFD sweep state (RASBERY_GPU_CMFD_SWEEP) ----
     double*        xs_chif    = nullptr; ///< [slot][ig*nxyz+l]
     double*        xs_xsnf    = nullptr; ///< [slot][ig*nxyz+l]
+    double*        xs_xsrf    = nullptr; ///< [slot][ig*nxyz+l]
+    double*        xs_xssm    = nullptr; ///< [slot][(igs*ng+ige)*nxyz+l]
+    double*        dtil_dev   = nullptr; ///< [slot][surface*ng+ig]
+    double*        dhat_dev   = nullptr; ///< [slot][surface*ng+ig]
     double*        node_vol   = nullptr; ///< [slot][l]
     double*        udiag_dev  = nullptr; ///< [slot][l*ng2+ige*ng+igs]
     double*        psi_dev    = nullptr; ///< [slot][l]
     std::uint32_t* sweep_halt = nullptr; ///< all-zero outside the sweep path
+    std::uint32_t* device_assembly_active = nullptr;
     cudaGraphExec_t sweep_graph_exec = nullptr;
     int             sweep_graph_nmax = -1;
     int             sweep_graph_unroll = -1;
@@ -2276,9 +2618,19 @@ void CudaBatchArena::stageSweeps(int m, const CmfdSweepIO& io) {
     auto& sl      = _impl->core.slot[static_cast<size_t>(m)];
     sl.host_chif  = io.chif;
     sl.host_xsnf  = io.xsnf;
+    sl.host_xsrf  = io.xsrf;
+    sl.host_xssm  = io.xssm;
+    sl.host_dtil  = io.dtil;
+    sl.host_dhat  = io.dhat;
     sl.host_vol   = io.vol;
     sl.host_udiag = io.udiag;
     sl.host_psi   = io.psi;
+    sl.device_assembly = io.device_assembly && cmfdAssemblyEnabled();
+    if (sl.device_assembly &&
+        (sl.host_xsrf == nullptr || sl.host_xssm == nullptr ||
+         sl.host_dtil == nullptr || sl.host_dhat == nullptr))
+        throw std::invalid_argument(
+            "CMFD device assembly requires xsrf/xssm/dtil/dhat inputs");
     double* in    = sl.sweep_in;
     in[kEigv - kSweepFirst]        = io.eigv;
     in[kReigv - kSweepFirst]       = io.reigv;
@@ -2457,6 +2809,8 @@ void CudaBatchArena::solveCommon(int m, double* out_phi, int kind) {
                                                static_cast<int>(participants.size()));
                     a.core.drain(participants.data(),
                                  static_cast<int>(participants.size()));
+                    a.core.issueExceptionalOperatorDownloads(
+                        participants.data(), static_cast<int>(participants.size()));
                 }
             } catch (const std::exception& error) {
                 failed  = true;
@@ -2558,6 +2912,13 @@ void rasberyReleaseBatchArena() {
     const BackendCounters c = g_arena->counters();
     std::cout << "[RASBERY][CUDA][BACKEND_COUNTERS] {"
               << "\"cmfd_gpu_calls\":" << c.cmfd_gpu_calls << ','
+              << "\"cmfd_assembly_gpu_calls\":" << c.cmfd_assembly_gpu_calls << ','
+              << "\"cmfd_assembly_cpu_fallbacks\":"
+              << c.cmfd_assembly_cpu_fallbacks << ','
+              << "\"cmfd_diag_h2d_elided_bytes\":"
+              << c.cmfd_diag_h2d_elided_bytes << ','
+              << "\"cmfd_cc_h2d_elided_bytes\":"
+              << c.cmfd_cc_h2d_elided_bytes << ','
               << "\"bicg_early_convergence_exits\":" << c.bicg_early_convergence_exits << ','
               << "\"bicg_restarts\":" << c.bicg_restarts << ','
               << "\"bulk_h2d_calls_during_iteration\":" << c.bulk_h2d_calls_during_iteration << ','

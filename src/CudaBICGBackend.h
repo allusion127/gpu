@@ -53,6 +53,13 @@ struct BackendCounters {
     std::uint64_t xs_cpu_fallbacks                     = 0;
     std::uint64_t cmfd_gpu_calls                       = 0;
     std::uint64_t cmfd_cpu_fallbacks                   = 0;
+    /// Slot-level CMFD operators assembled directly in the batch arena.
+    std::uint64_t cmfd_assembly_gpu_calls              = 0;
+    /// Sweep slots that retained the host-assembled operator path.
+    std::uint64_t cmfd_assembly_cpu_fallbacks          = 0;
+    /// Host diag/cc transfers avoided because assembly wrote resident arrays.
+    std::uint64_t cmfd_diag_h2d_elided_bytes           = 0;
+    std::uint64_t cmfd_cc_h2d_elided_bytes             = 0;
     std::uint64_t bicg_early_convergence_exits          = 0;
     std::uint64_t bicg_restarts                        = 0;
     std::uint64_t nodal_gpu_calls                      = 0;
@@ -206,9 +213,15 @@ public:
     struct CmfdSweepIO {
         const double* chif  = nullptr; ///< [ig*nxyz+l]
         const double* xsnf  = nullptr; ///< [ig*nxyz+l]
+        const double* xsrf  = nullptr; ///< [ig*nxyz+l], device assembly input
+        const double* xssm  = nullptr; ///< [(igs*ng+ige)*nxyz+l]
+        const double* dtil  = nullptr; ///< [surface*ng+ig]
+        const double* dhat  = nullptr; ///< [surface*ng+ig]
         const double* vol   = nullptr; ///< [l]
-        const double* udiag = nullptr; ///< [l*ng2+ige*ng+igs]
+        double*       udiag = nullptr; ///< [l*ng2+ige*ng+igs], host fallback
         double*       psi   = nullptr; ///< [l], in/out
+        /// Build diag/cc/udiag in the arena before the resident sweep graph.
+        bool          device_assembly = false;
         double eigv = 0, reigv = 0, reigvs = 0, errl2 = 0;
         double epsl2 = 0, eshift = 0;
         int    sweep_budget = 0, icmfd_budget = 0, icmfd_done = 0, ngxyz = 0;

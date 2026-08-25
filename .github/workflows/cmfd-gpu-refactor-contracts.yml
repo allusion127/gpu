@@ -1,0 +1,94 @@
+name: CMFD GPU refactor contracts
+
+on:
+  push:
+    branches:
+      - codex/cmfd-gpu-assembly-drive-fusion
+    paths:
+      - src/CmfdAssemblyKernel.h
+      - src/BICGCMFD.cpp
+      - src/BICGCMFD.h
+      - src/BICGSolver.cpp
+      - src/CudaBICGBackend.cu
+      - src/CudaBICGBackend.h
+      - tools/test_cmfd_assembly_kernel.py
+      - tools/test_cmfd_gpu_residency_contract.py
+      - tools/test_cmfd_scalar_fusion_contract.py
+      - docs/CMFD_GPU_ASSEMBLY_AND_DRIVE_FUSION_20260825_KO.md
+      - .github/workflows/cmfd-gpu-refactor-contracts.yml
+  pull_request:
+    paths:
+      - src/CmfdAssemblyKernel.h
+      - src/BICGCMFD.cpp
+      - src/BICGCMFD.h
+      - src/BICGSolver.cpp
+      - src/CudaBICGBackend.cu
+      - src/CudaBICGBackend.h
+      - tools/test_cmfd_assembly_kernel.py
+      - tools/test_cmfd_gpu_residency_contract.py
+      - tools/test_cmfd_scalar_fusion_contract.py
+      - docs/CMFD_GPU_ASSEMBLY_AND_DRIVE_FUSION_20260825_KO.md
+      - .github/workflows/cmfd-gpu-refactor-contracts.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cmfd-gpu-refactor-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-host-contracts:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install host build dependency
+        run: sudo apt-get update && sudo apt-get install -y libhdf5-dev
+
+      - name: Compile contract scripts
+        run: |
+          python -m py_compile \
+            tools/test_cmfd_assembly_kernel.py \
+            tools/test_cmfd_gpu_residency_contract.py \
+            tools/test_cmfd_scalar_fusion_contract.py
+
+      - name: Verify CMFD assembly arithmetic
+        run: python tools/test_cmfd_assembly_kernel.py
+
+      - name: Verify resident operator and fallback wiring
+        run: python tools/test_cmfd_gpu_residency_contract.py
+
+      - name: Verify BiCG scalar graph fusion
+        run: python tools/test_cmfd_scalar_fusion_contract.py
+
+      - name: Run related existing contracts
+        run: |
+          python tools/test_cmfd_geometry_cache.py
+          python tools/test_cuda_transfer_mirror.py
+
+      - name: Build complete non-CUDA target
+        run: |
+          cmake -S . -B build-ci \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DRASBERY_ENABLE_CUDA=OFF \
+            -DRASBERY_ENABLE_OPENMP=OFF
+          cmake --build build-ci -j2
+
+      - name: Check whitespace and patch integrity
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            git diff --check "${{ github.event.pull_request.base.sha }}...HEAD"
+          else
+            git show --check --oneline HEAD
+          fi
