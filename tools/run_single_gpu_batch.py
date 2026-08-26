@@ -30,6 +30,16 @@ BATCH_HOST_RECEIPT = re.compile(r"\[RASBERY\]\[BATCH_HOST\]\s*(\{.*\})")
 # [RASBERY][NODAL][BATCH].  Any nonzero one means a capture was refused and the
 # run is not the configuration the benchmark claims to measure.
 GRAPH_FALLBACK_COUNTER = re.compile(r'"([A-Za-z_]*graph_fallbacks)"\s*:\s*(\d+)')
+# `[RASBERY][PHYSICS_MODE] {...}` -- main() emits this before any deck starts.
+# The exact-only campaign accepts full-exact runs only (plan Rev.4 Sec 2), so a
+# missing receipt or any field that is not the exact value voids the run.
+PHYSICS_MODE_RECEIPT = re.compile(r"\[RASBERY\]\[PHYSICS_MODE\]\s*(\{.*\})")
+EXACT_PHYSICS_MODE = {
+    "physics_mode": "full_exact_nodal",
+    "screening": False,
+    "feedback_pass_limit": 0,
+    "full_hdf5": True,
+}
 
 
 DEFAULT_ENV = {
@@ -123,6 +133,17 @@ def compute_host_workers(
     return min(cap, explicit), "explicit"
 
 
+def path_key(path: str) -> str:
+    """Job-namespace comparison key, matching main.cpp's rasberyPathKey().
+
+    realpath, not abspath: `std::filesystem::weakly_canonical` on the C++ side
+    resolves symlinks, so two --raso paths that reach one file through a link
+    have to compare equal here too (plan Rev.4 Sec 7).  normcase folds case on
+    Windows, where the filesystem does.
+    """
+    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+
+
 def validate_deck_paths(command: Sequence[str]) -> list[str]:
     """Reject deck/output combinations that would silently clobber results.
 
@@ -130,6 +151,11 @@ def validate_deck_paths(command: Sequence[str]) -> list[str]:
     run without --raso hands every Driver the same output path: the decks race on
     one HDF5 file and the run produces a single, arbitrary survivor.  That has to
     be caught here, before the executable is launched and the GPU time is spent.
+
+    Repeated --rasi decks stay ALLOWED on purpose: sweeping many states off one
+    input file is the batch workload.  Only the output namespace has to be
+    distinct, and since Driver::RestartPath now derives restart files from the
+    output path, distinct --raso is also what keeps the restart namespaces apart.
     """
     rasi = values_after(command, "--rasi")
     raso = values_after(command, "--raso")
@@ -148,7 +174,7 @@ def validate_deck_paths(command: Sequence[str]) -> list[str]:
     seen = set()
     repeated = []
     for path in raso:
-        key = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+        key = path_key(path)
         if key in seen:
             repeated.append(path)
         seen.add(key)
@@ -160,9 +186,44 @@ def validate_deck_paths(command: Sequence[str]) -> list[str]:
     return rasi
 
 
+def check_physics_mode(output: str) -> list[str]:
+    """Exact-only audit (plan Rev.4 Sec 2.2).
+
+    A run whose physics-mode receipt is missing, unparseable, or not full-exact
+    is not an acceptance measurement, however good its throughput looked.
+    """
+    problems = []
+    receipt = None
+    for match in PHYSICS_MODE_RECEIPT.finditer(output):
+        try:
+            receipt = json.loads(match.group(1))
+        except ValueError:
+            problems.append(
+                "could not parse the [RASBERY][PHYSICS_MODE] receipt: %s" % match.group(1)
+            )
+            receipt = None
+    if receipt is None:
+        if not problems:
+            problems.append(
+                "no [RASBERY][PHYSICS_MODE] receipt in the run output: the exact-only "
+                "contract (plan Sec 2) is unverified, so this run is not an acceptance "
+                "measurement"
+            )
+        return problems
+    for key, expected in EXACT_PHYSICS_MODE.items():
+        if key not in receipt:
+            problems.append("[RASBERY][PHYSICS_MODE] is missing %r" % key)
+        elif receipt[key] != expected:
+            problems.append(
+                "[RASBERY][PHYSICS_MODE] %s=%r but full-exact requires %r: this run used a "
+                "screening/approximate path" % (key, receipt[key], expected)
+            )
+    return problems
+
+
 def check_run_receipts(output: str, plan: "LaunchPlan") -> list[str]:
     """Post-run receipt audit: did the run have the shape that was asked for?"""
-    problems = []
+    problems = check_physics_mode(output)
 
     receipt = None
     for match in BATCH_HOST_RECEIPT.finditer(output):
