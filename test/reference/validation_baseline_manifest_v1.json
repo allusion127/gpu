@@ -1,4 +1,4 @@
-{
+﻿{
   "schema_version": 1,
   "frozen_utc": "2026-08-26",
   "baseline_commit_sha": "ae5965d5955d2fd756f439eff2522df18049a97e",
@@ -15,11 +15,11 @@
   },
   "benchmark_input": {
     "deck": "kngr_238.json (APR1400/KNGR CY1 PSAR, 35-state natural EOC, quarter core 8451 nodes NG=2)",
-    "input_sha256": "ac6a28ba31b51c7 (truncated as reported; full value in gateA provenance log on 238)",
+    "input_sha256": "ac6a28bae361dcd072abb742c1610bd05c03337b7a8a114cee488550231b51c7",
     "env": "RASBERY_PPR_MODE=master RASBERY_PC_MODE=decart RASBERY_GPU=1 RASBERY_GPU_CMFD_SWEEP=1 RASBERY_GPU_XSRECON=1 RASBERY_GPU_FLATXS=1 RASBERY_GPU_NODAL=1 RASBERY_GPU_NODAL_FULL=1 (assembly/fusion default ON)"
   },
   "golden_outputs": {
-    "single_deck_h5_sha256": "b778a504b3005b4 (truncated; = gateA_rep1.h5, dataset-identical to ref_aedae80.h5 lineage)",
+    "single_deck_h5_sha256": "b778a504593935ca5d63b35bb1b17ef8211bb785e872153743dca0c4eb3005b4 (= gateA_rep1.h5)",
     "repeats": 4,
     "repeat_walls_s": [93.29, 92.84, 92.99, 92.69],
     "determinism": "500/500 datasets bit-exact across repeats; container md5 differs (HDF5 metadata only)"
