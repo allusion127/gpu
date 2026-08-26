@@ -42,7 +42,12 @@ bool XsReconBackend::solveNodalPost(const nodal::NodalView&) { return false; }
 
 unsigned long long XsReconBackend::nodalDrivesSolved() { return 0; }
 
-void XsReconBackend::pinHost(const void*, size_t) {}
+// Lease bookkeeping without a device call: no hook is installed in a stub
+// build, so the registry tracks ownership and the owner destructors exercise
+// the same release path they take under CUDA.
+bool XsReconBackend::pinHost(const void* p, size_t bytes) {
+    return rasberyPinHost(p, bytes);
+}
 
 bool rasberyGpuXsReconEnabled() { return false; }
 

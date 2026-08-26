@@ -52,8 +52,18 @@ protected:
     /// drive() for the device-resident sweep path (RASBERY_GPU_CMFD_SWEEP)
     std::vector<double> _sweep_chif, _sweep_xsnf, _sweep_vol;
 
-    /// @brief one-shot page-locking of the buffers the sweep path uploads
+    /// @brief one-shot page-locking of the FIXED-address buffers the sweep path
+    /// uploads (the raw arrays owned by Geometry/CMFD/XSSet)
     bool _sweep_pinned = false;
+
+    /// @brief the addresses the four vector-backed host pin leases were taken
+    /// on, so a resize that reallocates releases the old lease and acquires a
+    /// new one instead of leaving a registration on freed memory (plan Sec 6.5).
+    /// ~BICGCMFD releases exactly these.
+    const void* _pin_udiag      = nullptr;
+    const void* _pin_sweep_chif = nullptr;
+    const void* _pin_sweep_xsnf = nullptr;
+    const void* _pin_sweep_vol  = nullptr;
 
     /// The preceding setls() intentionally left diag/cc/udiag to the arena.
     bool _device_assembly_pending = false;

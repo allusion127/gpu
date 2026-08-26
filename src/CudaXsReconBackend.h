@@ -24,6 +24,8 @@
 //    off-by-default exploration path; fail-open-to-CPU keeps physics runs
 //    alive on machines without a device.
 
+#include "HostPinRegistry.h"
+
 #include <cstddef>
 #include <cstdlib>
 #include <memory>
@@ -141,8 +143,12 @@ public:
     static unsigned long long nodalDrivesSolved();
 
     /// Page-lock a host buffer this backend will repeatedly memcpy (same
-    /// contract as CudaBatchArena::pinHost: idempotent, never unregistered).
-    static void pinHost(const void* p, size_t bytes);
+    /// contract as CudaBatchArena::pinHost: idempotent, and leased rather than
+    /// permanent -- the buffer's OWNER releases it with rasberyUnpinHost() in
+    /// its destructor, see HostPinRegistry.h).  Returns true when the range is
+    /// page-locked; false means the copies run pageable, which is legal and
+    /// only slower.
+    static bool pinHost(const void* p, size_t bytes);
 
 private:
     struct Impl;
@@ -207,40 +213,11 @@ inline int rasberyNodalBatchWidth() { return rasberyNodalBatchWidthRef(); }
 /// Receipt accessor mirroring XsReconBackend::nodalDrivesSolved for main.cpp.
 unsigned long long rasberyGpuNodalDrives();
 
-/// Process-wide gate for host page-locking (cudaHostRegister), honoured by BOTH
-/// XsReconBackend::pinHost and CudaBatchArena::pinHost.
-///
-/// Both of those register CALLER-owned host memory and never unregister it --
-/// the registration is documented as permanent.  That contract is only sound
-/// while every buffer they are handed also outlives the process, which holds
-/// exactly when no Driver is ever destroyed before the run ends: a single deck
-/// per process, or --batch-mode with one host worker per deck.
-///
-/// The moment a worker thread recycles (host_threads < jobs), Driver::Drive()
-/// returns and destroys its stack-local Geometry/XSSet/BICGCMFD, freeing ranges
-/// the CUDA driver still holds page-locked.  The allocator then hands those same
-/// addresses to the next deck -- same thread arena, same sizes, same order -- so
-/// the new deck's buffers alias a dead tenant's registration: cudaHostRegister
-/// answers "already mapped", the DMA lands on the previous tenant's physical
-/// pages, and any block that malloc served with mmap (and freed with munmap)
-/// turns every later cudaMemcpyAsync on it into "invalid argument".
-///
-/// main() clears this gate for exactly those configurations.  Page-locking is a
-/// throughput optimisation and nothing else: with it off the identical copies
-/// run from pageable memory -- same bytes, same order, merely slower -- so the
-/// numerical result is untouched.  Defaults to enabled, so every target that
-/// does not call the setter (the replay/consistency executables, the stub build)
-/// behaves exactly as before.
-///
-/// Deliberately an inline function-local static, for the same reason as
-/// rasberyNodalBatchWidthRef() above: several test targets link
-/// CudaXsReconBackend.cu without CudaBICGBackend.cu (and vice versa), and a
-/// header-only flag adds no exported symbol to either.
-inline bool& rasberyHostPinningRef() {
-    static bool enabled = true;
-    return enabled;
-}
-inline void rasberySetHostPinningEnabled(bool enabled) { rasberyHostPinningRef() = enabled; }
-inline bool rasberyHostPinningEnabled() { return rasberyHostPinningRef(); }
+// The process-wide host page-locking gate (rasberyHostPinningRef /
+// rasberySetHostPinningEnabled / rasberyHostPinningEnabled) now lives in
+// HostPinRegistry.h, included above, next to the lease lifecycle it gates:
+// registration is no longer permanent, so the gate and the ownership registry
+// are one contract and the owners that release leases (Geometry, Nodal, CMFD,
+// BICGCMFD, XSSet) must be able to see it without pulling in a backend header.
 
 } // namespace rasbery

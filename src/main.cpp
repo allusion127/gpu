@@ -10,11 +10,14 @@
 #include "plog/Init.h"
 #include "plog/Log.h"
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <map>
 #include <string>
+#include <system_error>
 #include <vector>
 #ifdef _OPENMP
     #include <omp.h>
@@ -89,6 +92,30 @@ bool rasberySetEnvIfNeeded(const char* key, const char* value, bool overwrite = 
 
     rasberySetEnv(key, value, true);
     return true;
+}
+
+/// Comparison key for job-namespace collisions (plan Rev.4 Sec 7).
+///
+/// weakly_canonical resolves symlinks and `..` for the part of the path that
+/// exists and normalises the rest, so it answers for files that have not been
+/// written yet -- which every --raso is at argument-parsing time.  On Windows
+/// the comparison is additionally case-folded, because the filesystem is:
+/// `out/A.h5` and `OUT/a.h5` are one file there and two strings everywhere.
+std::string rasberyPathKey(const std::string& path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path        resolved = fs::weakly_canonical(fs::path(path), ec);
+    if (ec) {
+        ec.clear();
+        resolved = fs::absolute(fs::path(path), ec);
+        if (ec) resolved = fs::path(path);
+    }
+    std::string key = resolved.lexically_normal().string();
+#if defined(_WIN32)
+    std::transform(key.begin(), key.end(), key.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+#endif
+    return key;
 }
 
 void rasberyPrepareOpenMPStartup(char* argv[]) {
@@ -232,15 +259,85 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const int ga_feedback_passes = rasbery::BatchLightResult::FeedbackPasses();
-    if (ga_feedback_passes > 0) {
-        if (!rasbery::BatchLightResult::Enabled()) {
-            std::cerr << "RASBERY_GA_FEEDBACK_PASSES is a GA screening approximation and "
-                         "requires RASBERY_BATCH_LIGHT_RESULT=1. Rerun selected candidates "
-                         "with RASBERY_GA_FEEDBACK_PASSES unset for acceptance."
-                      << std::endl;
-            return 2;
+    // Job namespace policy (plan Rev.4 Sec 7).  Repeating a --rasi deck is
+    // ALLOWED and is how a batch sweeps states off one input file.  Repeating a
+    // --raso path is not: the two Drivers would race inside one HDF5 file, and
+    // since the restart namespace is now derived from the output path (see
+    // Driver::RestartPath) they would collide on their restart files too.  The
+    // launcher already refuses this; enforcing it here covers direct
+    // invocations, which is where the GPU time actually gets spent.
+    {
+        std::map<std::string, std::size_t> seen_outputs;
+        for (std::size_t i = 0; i < rasbery_outputs.size(); ++i) {
+            const std::string key = rasberyPathKey(rasbery_outputs[i]);
+            const auto [it, inserted] = seen_outputs.emplace(key, i);
+            if (!inserted) {
+                std::cerr << "--raso paths must be distinct, one per deck: entry "
+                          << (it->second + 1) << " (" << rasbery_outputs[it->second]
+                          << ") and entry " << (i + 1) << " (" << rasbery_outputs[i]
+                          << ") resolve to the same file. Identical --rasi decks are fine; "
+                             "identical outputs would overwrite each other and share a "
+                             "restart namespace." << std::endl;
+                return 1;
+            }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Exact-only hard contract (plan Rev.4 Sec 2).
+    //
+    // The campaign accepts full-exact results and nothing else, so the two
+    // approximations that exist in this binary -- the GA feedback-pass limit
+    // and the light (scalar-only, no HDF5) result writer -- must be impossible
+    // to enable BY ACCIDENT.  A warning would not do it: an inherited
+    // environment variable from a screening job is exactly how a screening run
+    // ends up in an acceptance table, and nothing downstream would know.  So
+    // this refuses to start, and RASBERY_ALLOW_SCREENING=1 is the only way to
+    // get a screening run -- never silently, and the receipt below records
+    // which one this was for the benchmark parser.
+    // -----------------------------------------------------------------------
+    const int  ga_feedback_passes = rasbery::BatchLightResult::FeedbackPasses();
+    const bool light_result       = rasbery::BatchLightResult::Enabled();
+    const bool screening          = (ga_feedback_passes > 0) || light_result;
+    const bool allow_screening    = [] {
+        const char* value = std::getenv("RASBERY_ALLOW_SCREENING");
+        if (value == nullptr || *value == '\0') return false;
+        const std::string requested(value);
+        return !(requested == "0" || requested == "off" || requested == "OFF" ||
+                 requested == "false" || requested == "FALSE");
+    }();
+
+    if (screening && !allow_screening) {
+        std::cerr << "[RASBERY][EXACT_ONLY][FAIL] this build runs full-exact physics only.\n"
+                  << "  RASBERY_GA_FEEDBACK_PASSES=" << ga_feedback_passes
+                  << " (required: 0 or unset)\n"
+                  << "  RASBERY_BATCH_LIGHT_RESULT=" << (light_result ? "1" : "0")
+                  << " (required: 0 or unset; full HDF5 output is part of the contract)\n"
+                  << "  Unset them to run exact, or set RASBERY_ALLOW_SCREENING=1 to run a "
+                     "screening job on purpose. Screening results are never acceptance "
+                     "results."
+                  << std::endl;
+        return 2;
+    }
+
+    if (ga_feedback_passes > 0 && !light_result) {
+        std::cerr << "RASBERY_GA_FEEDBACK_PASSES is a GA screening approximation and "
+                     "requires RASBERY_BATCH_LIGHT_RESULT=1. Rerun selected candidates "
+                     "with RASBERY_GA_FEEDBACK_PASSES unset for acceptance."
+                  << std::endl;
+        return 2;
+    }
+
+    // Machine-readable physics-mode receipt, emitted by EVERY run before any
+    // deck starts (Sec 2.2).  The benchmark parser voids a run whose receipt is
+    // missing or whose fields disagree with full-exact.
+    std::cout << "[RASBERY][PHYSICS_MODE] {\"physics_mode\":\""
+              << (screening ? "ga_screen_feedback_limited" : "full_exact_nodal")
+              << "\",\"screening\":" << (screening ? "true" : "false")
+              << ",\"feedback_pass_limit\":" << ga_feedback_passes
+              << ",\"full_hdf5\":" << (light_result ? "false" : "true") << "}" << std::endl;
+
+    if (screening) {
         std::cout << "[RASBERY][GA][SCREEN] {\"physics_mode\":"
                      "\"ga_screen_feedback_limited\",\"feedback_passes\":"
                   << ga_feedback_passes
@@ -353,16 +450,27 @@ int main(int argc, char* argv[]) {
         // after the first runs on a thread that has already torn one down.
         const int concurrent_workers = 1;
 #endif
-        // Host page-locking is permanent and un-undoable (see
-        // rasberySetHostPinningEnabled), so it is only sound while every Driver
-        // outlives the run.  With one worker per deck that holds.  With fewer
-        // workers the OpenMP queue recycles a worker onto a second deck, whose
-        // Geometry/XSSet/BICGCMFD land on the freed -- and still registered --
-        // addresses of the deck that just finished; that aliasing is what turned
-        // `--batch-mode 64` with 24 workers into 54 failed decks.  Disabling the
-        // registration makes the same copies run from pageable memory: slower,
-        // and numerically identical.
-        const bool host_pinning = (concurrent_workers >= jobs);
+        // Host page-locking used to be permanent and un-undoable, so it was
+        // only sound while every Driver outlived the run: with fewer workers
+        // than decks the OpenMP queue recycles a worker onto a second deck,
+        // whose Geometry/XSSet/BICGCMFD land on the freed -- and still
+        // registered -- addresses of the deck that just finished.  That
+        // aliasing is what turned `--batch-mode 64` with 24 workers into 54
+        // failed decks, and `workers >= jobs` was the criterion that avoided it
+        // by giving up the pinning instead.
+        //
+        // HostPinRegistry.h closes the lifecycle hole itself: every
+        // registration is leased, the owner releases it in its destructor
+        // before the memory is freed, and cudaHostUnregister runs at the
+        // registered address.  A recycled worker therefore hands the next deck
+        // an EMPTY registry, which is the state in which registering afresh is
+        // correct.  So under `auto` the gate is simply "not off" -- the
+        // worker/deck ratio no longer decides it.  The legacy criterion is kept
+        // below for the receipt (and is what to fall back to if the lease is
+        // ever compiled out).
+        const bool legacy_pinning_criterion = (concurrent_workers >= jobs);
+        const bool host_pinning =
+            (rasbery::rasberyHostPinningMode() != rasbery::HostPinningMode::Off);
         rasbery::rasberySetHostPinningEnabled(host_pinning);
         std::cout << "\n[RASBERY][BATCH] " << jobs << " deck(s), width " << batch_width
                   << ", " << host_threads << " host Driver worker(s)" << std::endl;
@@ -370,14 +478,17 @@ int main(int argc, char* argv[]) {
                   << ",\"arena_width\":" << batch_width
                   << ",\"host_threads\":" << host_threads
                   << ",\"visible_cpus\":" << visible_cpus
-                  << ",\"host_pinning\":" << (host_pinning ? "true" : "false") << "}" << std::endl;
-        if (!host_pinning)
+                  << ",\"host_pinning\":" << (host_pinning ? "true" : "false")
+                  << ",\"pin_lease\":true"
+                  << ",\"legacy_pinning_criterion\":"
+                  << (legacy_pinning_criterion ? "true" : "false") << "}" << std::endl;
+        if (host_pinning && !legacy_pinning_criterion)
             std::cout << "[RASBERY][BATCH_HOST] concurrent Driver workers("
                       << concurrent_workers << ") < jobs(" << jobs
-                      << "): workers are recycled onto later decks, so host page-locking is off "
-                         "for this run (correct, and slower on the PCIe copies). Use "
-                         "RASBERY_BATCH_HOST_THREADS=" << jobs
-                      << " for the page-locked configuration." << std::endl;
+                      << "): workers are recycled onto later decks. Host page-locking stays ON "
+                         "-- every registration is leased and released by its owner's "
+                         "destructor (RASBERY_HOST_PINNING=off to force pageable copies)."
+                      << std::endl;
 #ifdef _OPENMP
         // One OpenMP level only: the instance loop is the parallelism. Nested
         // Driver regions reduce the measured GPU rendezvous width and lose
@@ -423,7 +534,20 @@ int main(int argc, char* argv[]) {
             if (exit_code == 0) exit_code = job_status[static_cast<std::size_t>(i)];
         }
 
+        // Plan Sec 6.6, in order: every Driver is gone (the parallel region
+        // joined above), the arena drains and tears down the backend streams,
+        // and only then does the pin registry unregister what is left.  CUDA
+        // teardown is never left to a function-local static destructor.
         rasbery::rasberyReleaseBatchArena();
+        rasbery::rasberyDrainPinnedRegistry();
+        // The Sec 6.8 pinning receipt.  It extends the BATCH_HOST family rather
+        // than the BATCH_HOST line itself because the counters are only final
+        // here, at the end of the run, while that line reports the requested
+        // configuration before the first deck starts.  The serial branch emits
+        // the same tag, so one parser rule covers both.
+        std::cout << "[RASBERY][BATCH_HOST][PIN] {";
+        rasbery::rasberyAppendHostPinReceiptFields(std::cout);
+        std::cout << "}" << std::endl;
         // Receipt for the xsrecon device path: a zero here means it never ran,
         // whatever the flag said, and an A/B built on it is void (G0).
         if (rasbery::rasberyGpuXsReconEnabled())
@@ -445,12 +569,15 @@ int main(int argc, char* argv[]) {
         return exit_code;
     }
 
-    // Same rule as the batch branch above: this loop destroys each Driver before
-    // building the next one, so with more than one deck the permanent host
-    // registrations pinHost leaves behind would be inherited by whatever the
-    // allocator puts at those addresses next.  One deck per process is the only
-    // shape here that can page-lock safely.
-    rasbery::rasberySetHostPinningEnabled(rasbery_inputs.size() <= 1);
+    // Same rule as the batch branch above.  This loop destroys each Driver
+    // before building the next one, which used to make page-locking unsafe for
+    // more than one deck: the permanent registrations pinHost left behind were
+    // inherited by whatever the allocator put at those addresses next.  With
+    // the lease (HostPinRegistry.h) each Driver's destructors unregister what
+    // they registered, so the deck count no longer decides this -- only
+    // RASBERY_HOST_PINNING does.
+    rasbery::rasberySetHostPinningEnabled(rasbery::rasberyHostPinningMode() !=
+                                          rasbery::HostPinningMode::Off);
 
     for (std::size_t i = 0; i < rasbery_inputs.size(); ++i) {
         const fs::path rasbery_input_path  = rasbery_inputs[i];
@@ -467,6 +594,14 @@ int main(int argc, char* argv[]) {
             exit_code = driver_exit_code;
         }
     }
+
+    // Same explicit shutdown order as the batch branch (plan Sec 6.6): the
+    // Drivers are gone, so release the leases that outlived them before the
+    // CUDA context does.  Same receipt tag too, deliberately: one parser rule.
+    rasbery::rasberyDrainPinnedRegistry();
+    std::cout << "[RASBERY][BATCH_HOST][PIN] {";
+    rasbery::rasberyAppendHostPinReceiptFields(std::cout);
+    std::cout << "}" << std::endl;
 
     if (rasbery::rasberyGpuXsReconEnabled())
         std::cout << "[RASBERY][XSRECON][GPU] {\"nodes_solved\":"

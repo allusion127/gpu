@@ -474,7 +474,44 @@ XSSet::XSSet(Geometry& g) noexcept : _g(g) {
     }
 }
 
-XSSet::~XSSet() = default;
+XSSet::~XSSet() {
+    // Tear the device backend down FIRST: ~Impl hands the nodal arena slot back
+    // and frees this instance's device allocations, so nothing is left holding
+    // a handle to the host arrays whose leases are released below.  Every solve
+    // is synchronous from the instance's side (solve/solveNodal return after
+    // their downloads landed), so no DMA is in flight here either -- plan Sec
+    // 6.4's conservative drain, in place of per-stream event tracking.
+    _xsrecon_backend.reset();
+
+    // Release every host pin lease the two pin arms take, enumerated from
+    // TryUpdateFlatXSGpu (the flatxs arm, the superset) and TryUpdateXsGpu (the
+    // xsrecon arm, whose live-block bases are the same allocations).  Releasing
+    // a base that was never leased -- a build that never ran either arm, or a
+    // request that took the pageable fallback -- is a no-op, so the list is
+    // unconditional.  _g.Phif() is deliberately NOT here: Geometry owns it and
+    // ~Geometry releases it.
+    for (int xt = 0; xt < xsrecon::NXS; ++xt) {
+        const auto t = static_cast<XSTYPE>(xt);
+        rasberyUnpinHost(_micx[t].data());
+        rasberyUnpinHost(_lmpx[t].data());
+        rasberyUnpinHost(_xs[t].data());
+    }
+    rasberyUnpinHost(_micx.xssm.data());
+    rasberyUnpinHost(_lmpx.xssm.data());
+    rasberyUnpinHost(_xs.xssm.data());
+    rasberyUnpinHost(_iden.data());
+    for (int t = 0; t < N_ACTIVE_XT; ++t) {
+        const auto xt = static_cast<XSTYPE>(ACTIVE_XT[t]);
+        rasberyUnpinHost(_ref_micx[xt].data());
+        rasberyUnpinHost(_ref_lmpx[xt].data());
+    }
+    rasberyUnpinHost(_ref_micx.xssm.data());
+    rasberyUnpinHost(_ref_lmpx.xssm.data());
+    // Not from either pin arm: the nodal batch arena page-locks chifData()
+    // (NodalArena::pinSlot's h_chif).  XSSet owns that buffer, so XSSet
+    // releases it -- the same rule that puts jnet/phis/phif in ~Geometry.
+    rasberyUnpinHost(_ref_chix.data());
+}
 
 void XSSet::LoadTHTables() {
 #ifdef DATA_DIR

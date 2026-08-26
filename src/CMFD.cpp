@@ -1,5 +1,7 @@
 ﻿#include "CMFD.h"
 
+#include "HostPinRegistry.h"
+
 #define flux(ig, l)  (flux[(l) * _g.ng() + ig])
 #define jnet(ig, ls) (jnet[(ls) * _g.ng() + ig])
 
@@ -64,6 +66,17 @@ CMFD::CMFD(Geometry& g, XSSet& x)
 }
 
 CMFD::~CMFD() {
+    // Six of the thirteen ranges BICGCMFD::driveDeviceSweeps page-locks are
+    // owned here.  Release the leases before the delete[]s: BICGCMFD's own
+    // destructor has already reset the solver (and with it the arena slot), so
+    // nothing can still be copying from them.  See HostPinRegistry.h.
+    rasberyUnpinHost(_dtil);
+    rasberyUnpinHost(_dhat);
+    rasberyUnpinHost(_diag);
+    rasberyUnpinHost(_cc);
+    rasberyUnpinHost(_src);
+    rasberyUnpinHost(_psi);
+
     delete[] _dtil;
     delete[] _dhat;
     delete[] _diag;

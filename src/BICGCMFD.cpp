@@ -1,5 +1,7 @@
 #include "BICGCMFD.h"
 
+#include "HostPinRegistry.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -85,7 +87,28 @@ void BICGCMFD::setIterLim(int maxls, double epsls) {
     _epsbicg  = epsls;
 }
 
-BICGCMFD::~BICGCMFD() = default;
+BICGCMFD::~BICGCMFD() {
+    // Order matters, and it is the reason this is no longer `= default`.
+    //
+    // Members are destroyed in reverse declaration order, which would free the
+    // four page-locked vectors BEFORE _ls (declared first) hands its arena slot
+    // back.  Tear the backend handles down first, then release the leases.
+    //
+    // What makes this the conservative drain Sec 6.4 permits in place of
+    // per-stream event tracking: every solve this instance issues is
+    // synchronous from the instance's side -- solveSweeps/drive return only
+    // after the batch that carried this slot completed and its downloads
+    // landed -- so once the last one returned, no DMA is in flight on these
+    // buffers.  Releasing the slot first additionally stops a lingering
+    // launcher from waiting on an instance that is going away.
+    _nodal.reset();
+    _ls.reset();
+
+    rasberyUnpinHost(_pin_udiag);
+    rasberyUnpinHost(_pin_sweep_chif);
+    rasberyUnpinHost(_pin_sweep_xsnf);
+    rasberyUnpinHost(_pin_sweep_vol);
+}
 
 void BICGCMFD::setEshift(double eshift) {
     _eshift = eshift;
@@ -273,24 +296,45 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
     // Page-lock every buffer the sweep launcher memcpys, once per instance:
     // pageable async copies stage through the driver ON the launcher's
     // critical path, pinned ones run at bus speed and actually overlap.
-    if (!_sweep_pinned && _ls->arena() != nullptr) {
+    //
+    // The registrations are LEASED (HostPinRegistry.h): the nine fixed-address
+    // ranges below are owned by Geometry/CMFD/XSSet and released in THEIR
+    // destructors, the four vector-backed ones by ~BICGCMFD.
+    if (_ls->arena() != nullptr) {
         auto*        ar   = _ls->arena();
         const size_t nd   = static_cast<size_t>(nxyz);
         const size_t nn   = static_cast<size_t>(_g.ngxyz());
-        ar->pinHost(_diag, static_cast<size_t>(_g.ng2()) * nd * sizeof(double));
-        ar->pinHost(_cc, static_cast<size_t>(ng) * NEWSBT * nd * sizeof(double));
-        ar->pinHost(_src, nn * sizeof(double));
-        ar->pinHost(_psi, nd * sizeof(double));
-        ar->pinHost(flux, nn * sizeof(double));
-        ar->pinHost(_udiag.data(), _udiag.size() * sizeof(double));
-        ar->pinHost(_sweep_chif.data(), _sweep_chif.size() * sizeof(double));
-        ar->pinHost(_sweep_xsnf.data(), _sweep_xsnf.size() * sizeof(double));
-        ar->pinHost(_x.xsrfData(), nn * sizeof(double));
-        ar->pinHost(_x.xssmData(), static_cast<size_t>(ng * ng) * nd * sizeof(double));
-        ar->pinHost(_dtil, static_cast<size_t>(_g.nsurf()) * ng * sizeof(double));
-        ar->pinHost(_dhat, static_cast<size_t>(_g.nsurf()) * ng * sizeof(double));
-        ar->pinHost(_sweep_vol.data(), _sweep_vol.size() * sizeof(double));
-        _sweep_pinned = true;
+        if (!_sweep_pinned) {
+            // Raw arrays, allocated once by their owner and never reallocated.
+            ar->pinHost(_diag, static_cast<size_t>(_g.ng2()) * nd * sizeof(double));
+            ar->pinHost(_cc, static_cast<size_t>(ng) * NEWSBT * nd * sizeof(double));
+            ar->pinHost(_src, nn * sizeof(double));
+            ar->pinHost(_psi, nd * sizeof(double));
+            ar->pinHost(flux, nn * sizeof(double));
+            ar->pinHost(_x.xsrfData(), nn * sizeof(double));
+            ar->pinHost(_x.xssmData(), static_cast<size_t>(ng * ng) * nd * sizeof(double));
+            ar->pinHost(_dtil, static_cast<size_t>(_g.nsurf()) * ng * sizeof(double));
+            ar->pinHost(_dhat, static_cast<size_t>(_g.nsurf()) * ng * sizeof(double));
+            _sweep_pinned = true;
+        }
+        // Vector-reallocation contract (plan Sec 6.5).  The three _sweep_*
+        // vectors are resized at the top of this function and _udiag is sized
+        // in the constructor, so on the steady path .data() never moves and
+        // these four comparisons are the whole cost.  If a resize ever DID
+        // reallocate, a lease left on the old address would be a registration
+        // pointing at freed memory: release it, then lease the new address.
+        // "Size before pin, never realloc while leased" is the rule; this is
+        // what enforces it rather than assuming it.
+        auto lease_vector = [ar](const void*& leased, const void* data, size_t bytes) {
+            if (leased == data) return;
+            if (leased != nullptr) rasberyUnpinHost(leased);
+            ar->pinHost(data, bytes);
+            leased = data;
+        };
+        lease_vector(_pin_udiag, _udiag.data(), _udiag.size() * sizeof(double));
+        lease_vector(_pin_sweep_chif, _sweep_chif.data(), _sweep_chif.size() * sizeof(double));
+        lease_vector(_pin_sweep_xsnf, _sweep_xsnf.data(), _sweep_xsnf.size() * sizeof(double));
+        lease_vector(_pin_sweep_vol, _sweep_vol.data(), _sweep_vol.size() * sizeof(double));
     }
 
     double reigv  = 1. / eigv;

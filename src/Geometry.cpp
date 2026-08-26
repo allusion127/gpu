@@ -1,5 +1,7 @@
 #include "Geometry.h"
 
+#include "HostPinRegistry.h"
+
 using namespace rasbery;
 
 Geometry::Geometry() {
@@ -56,6 +58,17 @@ Geometry::Geometry() {
 }
 
 Geometry::~Geometry() {
+    // Release the host pin leases the device backends took on Geometry-owned
+    // buffers BEFORE the delete[]s below hand the pages back to the allocator.
+    // _phif/_jnet/_phis are the three the nodal arm and the CMFD sweep path
+    // page-lock (Phif also under its BICGCMFD alias `flux`); unpinning an
+    // address that was never leased is a no-op, so this list is unconditional.
+    // Without it the next deck on this worker inherits a live registration at
+    // its own fresh addresses -- see HostPinRegistry.h.
+    rasberyUnpinHost(_phif);
+    rasberyUnpinHost(_jnet);
+    rasberyUnpinHost(_phis);
+
     delete[] _albedo;
     delete[] _neibr;
     delete[] _neibrb;

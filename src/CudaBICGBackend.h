@@ -233,9 +233,11 @@ public:
     /// Page-lock a host buffer the arena will repeatedly memcpy.  Pageable
     /// cudaMemcpyAsync stages through the driver and blocks the launcher;
     /// pinned transfers run at bus speed and genuinely overlap.  Idempotent
-    /// (an already-registered range is left alone); never unregistered --
-    /// callers pin long-lived per-instance buffers once.
-    void pinHost(const void* p, size_t bytes) const;
+    /// (an already-registered range is reused, not re-registered), and LEASED:
+    /// the buffer's owner releases it with rasberyUnpinHost() in its destructor
+    /// so a recycled Driver worker cannot inherit a dead deck's registration.
+    /// See HostPinRegistry.h.  Returns true when the range is page-locked.
+    bool pinHost(const void* p, size_t bytes) const;
 
     /// Record one drive()'s sweep inputs for @p slot.  No CUDA call, no lock.
     void stageSweeps(int slot, const CmfdSweepIO& io);

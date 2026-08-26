@@ -2607,15 +2607,38 @@ void CudaBatchArena::setInner(int m, int nmax, double eps) {
 
 void CudaBatchArena::solve(int m, double* out_phi) { solveCommon(m, out_phi, 0); }
 
-void CudaBatchArena::pinHost(const void* p, size_t bytes) const {
-    if (p == nullptr || bytes == 0) return;
-    // Permanent registration, so only legal while the caller's buffer outlives
-    // the process.  A recycled Driver worker breaks that: see
-    // rasberySetHostPinningEnabled() in CudaXsReconBackend.h.
-    if (!rasberyHostPinningEnabled()) return;
-    const cudaError_t rc =
-        cudaHostRegister(const_cast<void*>(p), bytes, cudaHostRegisterDefault);
+namespace {
+
+/// Same two hooks CudaXsReconBackend.cu installs; both TUs install because
+/// either can be the first to reach a pinHost call, and the install is
+/// idempotent.  An anonymous namespace in each TU keeps them ODR-private.
+int cudaHostPinRegister(void* address, std::size_t bytes) {
+    const cudaError_t rc = cudaHostRegister(address, bytes, cudaHostRegisterDefault);
     if (rc != cudaSuccess) cudaGetLastError(); // already registered / exotic host
+    return static_cast<int>(rc);
+}
+
+int cudaHostPinUnregister(void* address) {
+    const cudaError_t rc = cudaHostUnregister(address);
+    if (rc != cudaSuccess) cudaGetLastError();
+    return static_cast<int>(rc);
+}
+
+void installHostPinHooks() {
+    static const bool installed = [] {
+        rasberyInstallHostPinHooks(&cudaHostPinRegister, &cudaHostPinUnregister);
+        return true;
+    }();
+    (void)installed;
+}
+
+} // namespace
+
+bool CudaBatchArena::pinHost(const void* p, size_t bytes) const {
+    // Leased registration; the buffer's owner releases it in its destructor.
+    // See HostPinRegistry.h and XsReconBackend::pinHost.
+    installHostPinHooks();
+    return rasberyPinHost(p, bytes);
 }
 
 void CudaBatchArena::stageSweeps(int m, const CmfdSweepIO& io) {

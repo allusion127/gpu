@@ -359,7 +359,18 @@ public:
         if (m < 0) return;
         {
             std::lock_guard<std::mutex> lock(_mutex);
-            _slot[static_cast<std::size_t>(m)].in_use = false;
+            Slot& sl  = _slot[static_cast<std::size_t>(m)];
+            sl.in_use = false;
+            // Drop the pin memo with the tenant.  These are NOT leases -- the
+            // lease belongs to the buffer's owner (Geometry/XSSet), which
+            // releases it in its own destructor -- they are only "have I
+            // already asked pinHost about this pointer".  A memo that outlived
+            // the tenant would let the next one skip a pinHost call for an
+            // address that merely happens to match a dead deck's, so it is
+            // cleared here as well as in acquireSlot's full Slot{} reset.
+            for (int i = 0; i < 6; ++i) sl.pin_bulk[i] = nullptr;
+            for (int i = 0; i < 9; ++i) sl.pin_const[i] = nullptr;
+            sl.pin_chif = nullptr;
         }
         // A lingering launcher may still be waiting for this slot to show up.
         // It never will, and inUseCount() has just dropped, so wake it.
@@ -688,6 +699,10 @@ private:
     /// Page-lock the host buffers this slot will be DMA'd from/to.  Launcher
     /// thread only, outside any capture, and only when a pointer actually
     /// changed -- cudaHostRegister is a synchronising call, not a per-drive one.
+    /// The leases these take are owned by the buffers' owners (Geometry's
+    /// jnet/phis/flux, XSSet's xs blocks, Nodal's nine constants) and released
+    /// in their destructors; the pin_* fields here are only the per-tenant memo
+    /// that keeps this from calling pinHost again on every batch.
     void pinSlot(Slot& sl) {
         const void* const  bulk[6]  = {sl.h_jnet, sl.h_phis, sl.h_flux,
                                        sl.h_xsrf, sl.h_xsnf, sl.h_xssm};
@@ -1786,10 +1801,10 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_int + d.n_ioff_sgnlr, host.sgnlr,
                                          ns * ndl::NLR * sizeof(int),
                                          cudaMemcpyHostToDevice, d.stream), d.status);
-        // The three per-drive host buffers are Geometry-owned and live for the
-        // process; page-locking them once makes the per-drive copies truly
-        // async and keeps them capturable as graph memcpy nodes.  pinHost is
-        // idempotent and never unregisters.
+        // The three per-drive host buffers are Geometry-owned; page-locking
+        // them once makes the per-drive copies truly async and keeps them
+        // capturable as graph memcpy nodes.  pinHost is idempotent, and the
+        // lease it takes is released by ~Geometry, not here.
         pinHost(host.jnet, ns * ndl::NG * sizeof(double));
         pinHost(host.phis, ns * ndl::NG * sizeof(double));
         pinHost(host.flux, nx * ndl::NG * sizeof(double));
@@ -2157,17 +2172,42 @@ unsigned long long XsReconBackend::flatXsNodesSolved() {
     return g_flatxs_nodes_solved.load(std::memory_order_relaxed);
 }
 
-void XsReconBackend::pinHost(const void* p, size_t bytes) {
-    if (p == nullptr || bytes == 0) return;
-    // These registrations are permanent -- there is no unpin path -- so they are
-    // only legal while the caller's buffer outlives the process.  When Drivers
-    // are recycled onto a shared worker pool that is false, and re-registering a
-    // recycled address aliases the dead deck's pages.  See
-    // rasberySetHostPinningEnabled() in CudaXsReconBackend.h.
-    if (!rasberyHostPinningEnabled()) return;
-    const cudaError_t rc =
-        cudaHostRegister(const_cast<void*>(p), bytes, cudaHostRegisterDefault);
+namespace {
+
+/// The two hooks HostPinRegistry.h calls; installed by installHostPinHooks()
+/// below at first use, so a stub build (which links neither .cu) keeps the
+/// lease bookkeeping and makes no device call.
+int cudaHostPinRegister(void* address, std::size_t bytes) {
+    const cudaError_t rc = cudaHostRegister(address, bytes, cudaHostRegisterDefault);
     if (rc != cudaSuccess) cudaGetLastError(); // already registered / exotic host
+    return static_cast<int>(rc);
+}
+
+int cudaHostPinUnregister(void* address) {
+    const cudaError_t rc = cudaHostUnregister(address);
+    if (rc != cudaSuccess) cudaGetLastError();
+    return static_cast<int>(rc);
+}
+
+void installHostPinHooks() {
+    static const bool installed = [] {
+        rasberyInstallHostPinHooks(&cudaHostPinRegister, &cudaHostPinUnregister);
+        return true;
+    }();
+    (void)installed;
+}
+
+} // namespace
+
+bool XsReconBackend::pinHost(const void* p, size_t bytes) {
+    // Registration is LEASED, not permanent: the registry hands out one lease
+    // per distinct base address, the buffer's owner releases it in its
+    // destructor, and cudaHostUnregister runs at the address cudaHostRegister
+    // saw.  That is what makes a recycled Driver worker safe -- the next deck's
+    // allocation arrives at an empty registry instead of aliasing a dead
+    // tenant's registration.  See HostPinRegistry.h.
+    installHostPinHooks();
+    return rasberyPinHost(p, bytes);
 }
 
 bool rasberyGpuXsReconEnabled() {

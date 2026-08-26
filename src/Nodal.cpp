@@ -1,4 +1,5 @@
 #include "Nodal.h"
+#include "HostPinRegistry.h"
 #include "NodalConstantKernel.h"
 
 #include <atomic>
@@ -72,6 +73,20 @@ Nodal::Nodal(Geometry& g, XSSet& xs)
 }
 
 Nodal::~Nodal() {
+    // The nine updateConstant arrays are the ones both nodal arms page-lock
+    // (NodalArena::pinSlot's h_const[9] and solveNodal's per-instance consts[9],
+    // in this order).  Release the leases before the delete[]s below: a
+    // registration that outlives its memory is what aliases the next deck.
+    rasberyUnpinHost(_eta1);
+    rasberyUnpinHost(_eta2);
+    rasberyUnpinHost(_m260);
+    rasberyUnpinHost(_m251);
+    rasberyUnpinHost(_m253);
+    rasberyUnpinHost(_m262);
+    rasberyUnpinHost(_m264);
+    rasberyUnpinHost(_diagD);
+    rasberyUnpinHost(_diagDI);
+
     delete[] _trlcff0;
     delete[] _trlcff1;
     delete[] _trlcff2;
