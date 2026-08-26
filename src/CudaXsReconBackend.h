@@ -148,7 +148,11 @@ public:
     /// its destructor, see HostPinRegistry.h).  Returns true when the range is
     /// page-locked; false means the copies run pageable, which is legal and
     /// only slower.
-    static bool pinHost(const void* p, size_t bytes);
+    ///
+    /// @param tag static string naming the CALL SITE, kept by the registry so a
+    ///        RASBERY_PIN_DEBUG=1 refusal names both halves of the collision.
+    ///        Defaulted so call sites that do not care still compile.
+    static bool pinHost(const void* p, size_t bytes, const char* tag = nullptr);
 
 private:
     struct Impl;

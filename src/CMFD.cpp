@@ -10,12 +10,23 @@ using namespace rasbery;
 CMFD::CMFD(Geometry& g, XSSet& x)
     : _g(g), _x(x) {
     _epsl2 = 1.E-5;
-    _dtil  = new double[_g.nsurf() * _g.ng()]{};
-    _dhat  = new double[_g.nsurf() * _g.ng()]{};
-    _diag  = new double[_g.nxyz() * _g.ng2()]{};
-    _cc    = new double[_g.nxyz() * _g.ng() * NEWSBT]{};
-    _src   = new double[_g.nxyz() * _g.ng()]{};
-    _psi   = new double[_g.nxyz()]{};
+    // Six of the thirteen ranges BICGCMFD::driveDeviceSweeps page-locks are
+    // these, and a plain `new double[]` run puts every array after the first
+    // inside its predecessor's last page -- which cudaHostRegister refuses, so
+    // five of the six would take pageable H2D copies forever.  Page-exclusive
+    // storage is what makes the six registrations independent; see the section
+    // on it in HostPinRegistry.h.  Same zero-fill as the `{}` it replaces.
+    _dtil  = rasberyPageExclusiveZeroedArray<double>(
+        static_cast<size_t>(_g.nsurf()) * static_cast<size_t>(_g.ng()));
+    _dhat  = rasberyPageExclusiveZeroedArray<double>(
+        static_cast<size_t>(_g.nsurf()) * static_cast<size_t>(_g.ng()));
+    _diag  = rasberyPageExclusiveZeroedArray<double>(
+        static_cast<size_t>(_g.nxyz()) * static_cast<size_t>(_g.ng2()));
+    _cc    = rasberyPageExclusiveZeroedArray<double>(
+        static_cast<size_t>(_g.nxyz()) * static_cast<size_t>(_g.ng()) * NEWSBT);
+    _src   = rasberyPageExclusiveZeroedArray<double>(
+        static_cast<size_t>(_g.nxyz()) * static_cast<size_t>(_g.ng()));
+    _psi   = rasberyPageExclusiveZeroedArray<double>(static_cast<size_t>(_g.nxyz()));
 
     // Geometry is fixed for the lifetime of a Driver.  Build the compact maps
     // once instead of re-running the node/surface indexing helpers in every
@@ -77,12 +88,12 @@ CMFD::~CMFD() {
     rasberyUnpinHost(_src);
     rasberyUnpinHost(_psi);
 
-    delete[] _dtil;
-    delete[] _dhat;
-    delete[] _diag;
-    delete[] _cc;
-    delete[] _src;
-    delete[] _psi;
+    rasberyPageExclusiveDeleteArray(_dtil);
+    rasberyPageExclusiveDeleteArray(_dhat);
+    rasberyPageExclusiveDeleteArray(_diag);
+    rasberyPageExclusiveDeleteArray(_cc);
+    rasberyPageExclusiveDeleteArray(_src);
+    rasberyPageExclusiveDeleteArray(_psi);
 }
 
 void CMFD::resetDhat() {

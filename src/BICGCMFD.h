@@ -1,6 +1,7 @@
 #pragma once
 #include "BICGSolver.h"
 #include "CMFD.h"
+#include "HostPinRegistry.h"
 #include "Nodal.h"
 #include <memory>
 #include <vector>
@@ -57,11 +58,16 @@ protected:
     double _eshift;
 
     /// @brief the unshifted diagonal matrix
-    std::vector<double> _udiag;
+    ///
+    /// Page-exclusive storage (HostPinRegistry.h): this and the three staging
+    /// vectors below are the four vector-backed ranges driveDeviceSweeps
+    /// page-locks, and std::vector's default allocator packs them adjacently,
+    /// which makes every one after the first unregisterable.
+    PageExclusiveVector<double> _udiag;
 
     /// @brief group-major chif/xsnf and node volumes, materialized once per
     /// drive() for the device-resident sweep path (RASBERY_GPU_CMFD_SWEEP)
-    std::vector<double> _sweep_chif, _sweep_xsnf, _sweep_vol;
+    PageExclusiveVector<double> _sweep_chif, _sweep_xsnf, _sweep_vol;
 
     /// @brief one-shot page-locking of the FIXED-address buffers the sweep path
     /// uploads (the raw arrays owned by Geometry/CMFD/XSSet)

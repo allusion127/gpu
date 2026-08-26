@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <complex>
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
@@ -40,6 +42,25 @@ class Solver;
 
 /// @brief Byte alignment used for milk-owned contiguous numeric storage.
 inline constexpr std::size_t kAlignment = 32;
+
+/// @brief Page granularity for page-exclusive storage.
+inline constexpr std::size_t kPageSize = 4096;
+
+/// @brief Byte size at or above which storage is given page-exclusive backing.
+///
+/// Large milk vectors are what the CUDA backends page-lock (the XS array sets:
+/// micx, lmpx, xs, iden, the reference blocks).  cudaHostRegister works on whole
+/// pages, so two buffers that share one page cannot both be registered -- the
+/// second is answered "already mapped" and its whole multi-megabyte range falls
+/// back to a pageable copy.  A general-purpose allocator packs adjacent chunks
+/// 16 bytes apart, so a run of arrays allocated one after another (exactly what
+/// XSArraySet::allocate does) has every member after the first starting inside
+/// its predecessor's last page.  Storage at or above this size therefore gets a
+/// page-aligned, page-rounded block that no other allocation can live in.  The
+/// threshold keeps small vectors on the cheap 32-byte path, where a whole page
+/// each would be pure waste.  See src/HostPinRegistry.h, which does the same for
+/// the raw arrays CMFD, Nodal and Geometry own.
+inline constexpr std::size_t kPageExclusiveThreshold = 32 * 1024;
 
 namespace detail {
 
@@ -88,19 +109,58 @@ concept MatrixExpression = requires(const bare_t<Expr>& expr, std::size_t row, s
     { expr.eval(row, col) } -> std::convertible_to<typename bare_t<Expr>::value_type>;
 };
 
+/// @brief Rotating sub-page offset for page-exclusive blocks.
+///
+/// Page-aligning a dozen arrays that are indexed together would map the same
+/// element of each onto the same L1 cache set.  The payload therefore starts a
+/// rotating multiple of 64 bytes into the block -- still over-aligned for every
+/// milk scalar, still inside the block's own first page, and recoverable at
+/// deallocation by masking the pointer down to its page.
+inline std::size_t nextPageSkew() noexcept {
+    static std::atomic<std::size_t> next{0};
+    constexpr std::size_t           kStride = 64;
+    constexpr std::size_t           kSlots  = kPageSize / kStride;
+    return (next.fetch_add(1, std::memory_order_relaxed) % kSlots) * kStride;
+}
+
+/// @brief True when `bytes` of storage is allocated page-exclusively.
+///
+/// A pure function of the byte count, so allocate() and deallocate() can never
+/// disagree about which path a block came from without being handed a header.
+inline constexpr bool isPageExclusive(std::size_t bytes) noexcept {
+    return bytes >= kPageExclusiveThreshold;
+}
+
 template <Scalar T>
 inline T* allocate(std::size_t count) {
     if (count == 0) {
         return nullptr;
     }
-    return static_cast<T*>(::operator new[](count * sizeof(T), std::align_val_t{kAlignment}));
+    const std::size_t bytes = count * sizeof(T);
+    if (!isPageExclusive(bytes)) {
+        return static_cast<T*>(::operator new[](bytes, std::align_val_t{kAlignment}));
+    }
+    const std::size_t skew  = nextPageSkew();
+    const std::size_t total = (skew + bytes + kPageSize - 1) & ~(kPageSize - 1);
+    char* const       block =
+        static_cast<char*>(::operator new[](total, std::align_val_t{kPageSize}));
+    return reinterpret_cast<T*>(block + skew);
 }
 
+/// @param count Entry count the pointer was allocated with -- it selects the
+///        same path allocate() took.
 template <Scalar T>
-inline void deallocate(T* ptr) noexcept {
-    if (ptr != nullptr) {
-        ::operator delete[](ptr, std::align_val_t{kAlignment});
+inline void deallocate(T* ptr, std::size_t count) noexcept {
+    if (ptr == nullptr) {
+        return;
     }
+    if (!isPageExclusive(count * sizeof(T))) {
+        ::operator delete[](ptr, std::align_val_t{kAlignment});
+        return;
+    }
+    void* const block = reinterpret_cast<void*>(reinterpret_cast<std::uintptr_t>(ptr) &
+                                                ~static_cast<std::uintptr_t>(kPageSize - 1));
+    ::operator delete[](block, std::align_val_t{kPageSize});
 }
 
 template <typename T>
@@ -459,7 +519,7 @@ public:
     }
 
     ~Vector() {
-        detail::deallocate(_data);
+        detail::deallocate(_data, _size);
     }
 
     Vector(const Vector& other)
@@ -484,7 +544,7 @@ public:
         if (this == &other) {
             return *this;
         }
-        detail::deallocate(_data);
+        detail::deallocate(_data, _size);
         _data = std::exchange(other._data, nullptr);
         _size = std::exchange(other._size, 0);
         return *this;
@@ -501,7 +561,7 @@ public:
 
     /// @brief Release storage and reset size to zero.
     void clear() {
-        detail::deallocate(_data);
+        detail::deallocate(_data, _size);
         _data = nullptr;
         _size = 0;
     }
@@ -670,7 +730,7 @@ private:
         }
 
         T* replacement = detail::allocate<T>(size);
-        detail::deallocate(_data);
+        detail::deallocate(_data, _size);
         _data = replacement;
         _size = size;
     }
@@ -738,7 +798,7 @@ public:
     }
 
     ~Matrix() {
-        detail::deallocate(_data);
+        detail::deallocate(_data, _rows * _cols);
     }
 
     Matrix(const Matrix& other)
@@ -764,7 +824,7 @@ public:
         if (this == &other) {
             return *this;
         }
-        detail::deallocate(_data);
+        detail::deallocate(_data, _rows * _cols);
         _data = std::exchange(other._data, nullptr);
         _rows = std::exchange(other._rows, 0);
         _cols = std::exchange(other._cols, 0);
@@ -782,7 +842,7 @@ public:
 
     /// @brief Release storage and reset shape to zero by zero.
     void clear() {
-        detail::deallocate(_data);
+        detail::deallocate(_data, _rows * _cols);
         _data = nullptr;
         _rows = 0;
         _cols = 0;
@@ -1089,7 +1149,7 @@ private:
         }
 
         T* replacement = detail::allocate<T>(rows * cols);
-        detail::deallocate(_data);
+        detail::deallocate(_data, _rows * _cols);
         _data = replacement;
         _rows = rows;
         _cols = cols;

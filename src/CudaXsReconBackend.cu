@@ -709,18 +709,24 @@ private:
         const std::size_t  bytes[6] = {_cnt_sg * sizeof(double),  _cnt_sg * sizeof(double),
                                        _cnt_ng1 * sizeof(double), _cnt_ng1 * sizeof(double),
                                        _cnt_ng1 * sizeof(double), _cnt_ng2 * sizeof(double)};
+        // The byte counts match the per-instance arm below and the XSSet/CMFD
+        // arms exactly, so a buffer already leased by one of them deduplicates
+        // here instead of arriving as a wider request the registry must refuse.
+        const char* const tags[6] = {"geom.jnet@arena", "geom.phis@arena", "geom.phif@arena",
+                                     "xs.xsrf@arena",   "xs.xsnf@arena",   "xs.xssm@arena"};
         for (int i = 0; i < 6; ++i) {
             if (bulk[i] == nullptr || bulk[i] == sl.pin_bulk[i]) continue;
-            XsReconBackend::pinHost(bulk[i], bytes[i]);
+            XsReconBackend::pinHost(bulk[i], bytes[i], tags[i]);
             sl.pin_bulk[i] = bulk[i];
         }
         for (int i = 0; i < 9; ++i) {
             if (sl.h_const[i] == nullptr || sl.h_const[i] == sl.pin_const[i]) continue;
-            XsReconBackend::pinHost(sl.h_const[i], _cnt_ndg * sizeof(double));
+            XsReconBackend::pinHost(sl.h_const[i], _cnt_ndg * sizeof(double),
+                                    "nodal.const@arena");
             sl.pin_const[i] = sl.h_const[i];
         }
         if (sl.h_chif != nullptr && sl.h_chif != sl.pin_chif) {
-            XsReconBackend::pinHost(sl.h_chif, _cnt_ng1 * sizeof(double));
+            XsReconBackend::pinHost(sl.h_chif, _cnt_ng1 * sizeof(double), "xs.chif@arena");
             sl.pin_chif = sl.h_chif;
         }
     }
@@ -1805,9 +1811,9 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         // them once makes the per-drive copies truly async and keeps them
         // capturable as graph memcpy nodes.  pinHost is idempotent, and the
         // lease it takes is released by ~Geometry, not here.
-        pinHost(host.jnet, ns * ndl::NG * sizeof(double));
-        pinHost(host.phis, ns * ndl::NG * sizeof(double));
-        pinHost(host.flux, nx * ndl::NG * sizeof(double));
+        pinHost(host.jnet, ns * ndl::NG * sizeof(double), "geom.jnet@nodal");
+        pinHost(host.phis, ns * ndl::NG * sizeof(double), "geom.phis@nodal");
+        pinHost(host.flux, nx * ndl::NG * sizeof(double), "geom.phif@nodal");
         d.nodal_geom_uploaded = true;
     }
 
@@ -2199,7 +2205,7 @@ void installHostPinHooks() {
 
 } // namespace
 
-bool XsReconBackend::pinHost(const void* p, size_t bytes) {
+bool XsReconBackend::pinHost(const void* p, size_t bytes, const char* tag) {
     // Registration is LEASED, not permanent: the registry hands out one lease
     // per distinct base address, the buffer's owner releases it in its
     // destructor, and cudaHostUnregister runs at the address cudaHostRegister
@@ -2207,7 +2213,7 @@ bool XsReconBackend::pinHost(const void* p, size_t bytes) {
     // allocation arrives at an empty registry instead of aliasing a dead
     // tenant's registration.  See HostPinRegistry.h.
     installHostPinHooks();
-    return rasberyPinHost(p, bytes);
+    return rasberyPinHost(p, bytes, tag);
 }
 
 bool rasberyGpuXsReconEnabled() {

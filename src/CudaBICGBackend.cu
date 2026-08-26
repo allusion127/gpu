@@ -2641,11 +2641,11 @@ void installHostPinHooks() {
 
 } // namespace
 
-bool CudaBatchArena::pinHost(const void* p, size_t bytes) const {
+bool CudaBatchArena::pinHost(const void* p, size_t bytes, const char* tag) const {
     // Leased registration; the buffer's owner releases it in its destructor.
     // See HostPinRegistry.h and XsReconBackend::pinHost.
     installHostPinHooks();
-    return rasberyPinHost(p, bytes);
+    return rasberyPinHost(p, bytes, tag);
 }
 
 void CudaBatchArena::stageSweeps(int m, const CmfdSweepIO& io) {

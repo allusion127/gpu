@@ -2648,22 +2648,29 @@ bool XSSet::TryUpdateFlatXSGpu(const std::vector<int>& unrodded, bool any_rodded
         const size_t ssn = static_cast<size_t>(_g.ng()) * _g.ng() * nxyz;
         for (int xt = 0; xt < xsrecon::NXS; ++xt) {
             const auto t = static_cast<XSTYPE>(xt);
-            XsReconBackend::pinHost(_micx[t].data(), xsrecon::NISO * ngn * sizeof(double));
-            XsReconBackend::pinHost(_lmpx[t].data(), ngn * sizeof(double));
-            XsReconBackend::pinHost(_xs[t].data(), ngn * sizeof(double));
+            XsReconBackend::pinHost(_micx[t].data(), xsrecon::NISO * ngn * sizeof(double),
+                                    "xs.micx@flatxs");
+            XsReconBackend::pinHost(_lmpx[t].data(), ngn * sizeof(double), "xs.lmpx@flatxs");
+            XsReconBackend::pinHost(_xs[t].data(), ngn * sizeof(double), "xs.xs@flatxs");
         }
-        XsReconBackend::pinHost(_micx.xssm.data(), xsrecon::NISO * ssn * sizeof(double));
-        XsReconBackend::pinHost(_lmpx.xssm.data(), ssn * sizeof(double));
-        XsReconBackend::pinHost(_xs.xssm.data(), ssn * sizeof(double));
+        XsReconBackend::pinHost(_micx.xssm.data(), xsrecon::NISO * ssn * sizeof(double),
+                                "xs.micx_ssm@flatxs");
+        XsReconBackend::pinHost(_lmpx.xssm.data(), ssn * sizeof(double), "xs.lmpx_ssm@flatxs");
+        XsReconBackend::pinHost(_xs.xssm.data(), ssn * sizeof(double), "xs.xssm@flatxs");
         XsReconBackend::pinHost(_iden.data(),
-                                static_cast<size_t>(xsrecon::NISO) * nxyz * sizeof(double));
+                                static_cast<size_t>(xsrecon::NISO) * nxyz * sizeof(double),
+                                "xs.iden@flatxs");
         for (int t = 0; t < N_ACTIVE_XT; ++t) {
             const auto xt = static_cast<XSTYPE>(ACTIVE_XT[t]);
-            XsReconBackend::pinHost(_ref_micx[xt].data(), xsrecon::NISO * ngn * sizeof(double));
-            XsReconBackend::pinHost(_ref_lmpx[xt].data(), ngn * sizeof(double));
+            XsReconBackend::pinHost(_ref_micx[xt].data(), xsrecon::NISO * ngn * sizeof(double),
+                                    "xs.ref_micx@flatxs");
+            XsReconBackend::pinHost(_ref_lmpx[xt].data(), ngn * sizeof(double),
+                                    "xs.ref_lmpx@flatxs");
         }
-        XsReconBackend::pinHost(_ref_micx.xssm.data(), xsrecon::NISO * ssn * sizeof(double));
-        XsReconBackend::pinHost(_ref_lmpx.xssm.data(), ssn * sizeof(double));
+        XsReconBackend::pinHost(_ref_micx.xssm.data(), xsrecon::NISO * ssn * sizeof(double),
+                                "xs.ref_micx_ssm@flatxs");
+        XsReconBackend::pinHost(_ref_lmpx.xssm.data(), ssn * sizeof(double),
+                                "xs.ref_lmpx_ssm@flatxs");
         _flatxs_pinned = true;
     }
 
@@ -3541,18 +3548,25 @@ bool XSSet::TryUpdateEquilibriumXenonGpu(double power, double relax, double& max
     if (!_xsrecon_pinned) {
         const size_t ngn = static_cast<size_t>(_g.ng()) * nxyz;
         const size_t ssn = static_cast<size_t>(_g.ng()) * _g.ng() * nxyz;
+        // Deliberately the SAME bases at the SAME byte counts as the flatxs arm
+        // above: identical requests deduplicate into one lease (one owner base),
+        // where a narrower or wider repeat would be a Sec 6.2 refusal and drop
+        // the buffer to pageable copies for the rest of the run.
         for (int xt = 0; xt < xsrecon::NXS; ++xt) {
             const auto t = static_cast<XSTYPE>(xt);
-            XsReconBackend::pinHost(_micx[t].data(), xsrecon::NISO * ngn * sizeof(double));
-            XsReconBackend::pinHost(_lmpx[t].data(), ngn * sizeof(double));
-            XsReconBackend::pinHost(_xs[t].data(), ngn * sizeof(double));
+            XsReconBackend::pinHost(_micx[t].data(), xsrecon::NISO * ngn * sizeof(double),
+                                    "xs.micx@xsrecon");
+            XsReconBackend::pinHost(_lmpx[t].data(), ngn * sizeof(double), "xs.lmpx@xsrecon");
+            XsReconBackend::pinHost(_xs[t].data(), ngn * sizeof(double), "xs.xs@xsrecon");
         }
-        XsReconBackend::pinHost(_micx.xssm.data(), xsrecon::NISO * ssn * sizeof(double));
-        XsReconBackend::pinHost(_lmpx.xssm.data(), ssn * sizeof(double));
-        XsReconBackend::pinHost(_xs.xssm.data(), ssn * sizeof(double));
+        XsReconBackend::pinHost(_micx.xssm.data(), xsrecon::NISO * ssn * sizeof(double),
+                                "xs.micx_ssm@xsrecon");
+        XsReconBackend::pinHost(_lmpx.xssm.data(), ssn * sizeof(double), "xs.lmpx_ssm@xsrecon");
+        XsReconBackend::pinHost(_xs.xssm.data(), ssn * sizeof(double), "xs.xssm@xsrecon");
         XsReconBackend::pinHost(_iden.data(),
-                                static_cast<size_t>(xsrecon::NISO) * nxyz * sizeof(double));
-        XsReconBackend::pinHost(_g.Phif(), ngn * sizeof(double));
+                                static_cast<size_t>(xsrecon::NISO) * nxyz * sizeof(double),
+                                "xs.iden@xsrecon");
+        XsReconBackend::pinHost(_g.Phif(), ngn * sizeof(double), "geom.phif@xsrecon");
         _xsrecon_pinned = true;
     }
 

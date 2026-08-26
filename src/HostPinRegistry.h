@@ -49,6 +49,7 @@
 // no new exported symbol in either backend.
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -57,9 +58,11 @@
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <new>
 #include <ostream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace rasbery {
@@ -67,6 +70,129 @@ namespace rasbery {
 /// Page granularity for the CONFLICT interval only.  Registration itself always
 /// uses the caller's address and byte count (see PinRecord).
 inline constexpr std::uintptr_t kHostPinPageSize = 4096;
+
+// PAGE-EXCLUSIVE HOST STORAGE -- the SOURCE fix for Sec 6.2 overlap refusals.
+//
+// cudaHostRegister works on whole pages.  Two DIFFERENT allocations that happen
+// to share one page therefore cannot both be registered: the second call is
+// answered "already mapped" and its whole buffer -- however many megabytes --
+// takes the pageable path.  The registry sees exactly the same thing one level
+// up (a request whose page interval straddles a live record without being
+// contained by it) and refuses it, which is what a receipt reports as
+// overlap_rejections.
+//
+// Nothing about that is a policy bug: the request really is unregisterable.
+// The bug is upstream, in how the buffers are allocated.  A general-purpose
+// allocator packs its chunks 16 bytes apart, so a RUN of adjacent buffers --
+// exactly what CMFD, Nodal, Geometry and the XS array sets allocate, one after
+// another in their constructors -- has every member after the first starting
+// inside its predecessor's last page.  Every one of those is a refusal, on
+// every deck, forever.  A worker-recycled batch run re-pays it per deck.
+//
+// So the buffers the backends page-lock get storage no other allocation can
+// live in: the block is page-aligned and its length is rounded up to whole
+// pages, which makes the page interval of ANY sub-range of it disjoint from
+// every other such block.  Two consequences worth stating: the registry's
+// containment test then always succeeds for a repeat request, and a caller that
+// asks for a sub-range (jnet's first nsurf*ng entries, say) can never collide
+// with a caller that asks for the whole thing.
+//
+// The payload is placed SKEW bytes into the block, with skew rotating in
+// 64-byte steps.  Page-aligning a dozen arrays that are indexed together would
+// otherwise map the same element of each onto the same L1 cache set; the skew
+// is the standard fix and costs nothing, because the block is page-exclusive
+// either way.  skew < kHostPinPageSize is what lets the free path recover the
+// block by masking the payload address -- no header, no bookkeeping, and a
+// deallocation that cannot disagree with its allocation.
+inline constexpr std::size_t kHostPinSkewStride = 64;
+
+inline std::atomic<std::size_t>& rasberyHostPinSkewRef() {
+    static std::atomic<std::size_t> next{0};
+    return next;
+}
+
+/// Storage for `bytes` whose pages belong to this block alone.  Uninitialised,
+/// like operator new[]; the array helpers below add the zero fill where the
+/// call site had one.
+inline void* rasberyPageExclusiveAlloc(std::size_t bytes) {
+    if (bytes == 0) return nullptr;
+    const std::size_t slots = static_cast<std::size_t>(kHostPinPageSize) / kHostPinSkewStride;
+    const std::size_t skew =
+        (rasberyHostPinSkewRef().fetch_add(1, std::memory_order_relaxed) % slots) *
+        kHostPinSkewStride;
+    const std::size_t total = (skew + bytes + static_cast<std::size_t>(kHostPinPageSize) - 1) &
+                              ~(static_cast<std::size_t>(kHostPinPageSize) - 1);
+    char* const block = static_cast<char*>(
+        ::operator new[](total, std::align_val_t{static_cast<std::size_t>(kHostPinPageSize)}));
+    return block + skew;
+}
+
+/// Free a rasberyPageExclusiveAlloc payload.  The block base is the payload
+/// address masked to its page, because the skew is always below one page.
+inline void rasberyPageExclusiveFree(void* payload) noexcept {
+    if (payload == nullptr) return;
+    void* const block = reinterpret_cast<void*>(reinterpret_cast<std::uintptr_t>(payload) &
+                                                ~(kHostPinPageSize - 1));
+    ::operator delete[](block, std::align_val_t{static_cast<std::size_t>(kHostPinPageSize)});
+}
+
+/// `new T[count]` with page-exclusive backing.  Scalar arrays only -- the free
+/// path runs no destructors, which is the same contract the raw `new double[]`
+/// arrays these replace already had.
+template <class T>
+inline T* rasberyPageExclusiveArray(std::size_t count) {
+    static_assert(std::is_trivially_default_constructible_v<T> &&
+                      std::is_trivially_destructible_v<T>,
+                  "page-exclusive arrays hold trivial scalars only");
+    return static_cast<T*>(rasberyPageExclusiveAlloc(count * sizeof(T)));
+}
+
+/// `new T[count]{}` with page-exclusive backing.
+template <class T>
+inline T* rasberyPageExclusiveZeroedArray(std::size_t count) {
+    T* const data = rasberyPageExclusiveArray<T>(count);
+    if (data != nullptr) std::fill_n(data, count, T{});
+    return data;
+}
+
+/// Matching `delete[]`.
+template <class T>
+inline void rasberyPageExclusiveDeleteArray(T* data) noexcept {
+    rasberyPageExclusiveFree(data);
+}
+
+/// std::vector allocator over the same storage, for the page-locked buffers
+/// that are vectors rather than raw arrays (BICGCMFD's sweep staging).
+template <class T>
+struct PageExclusiveAllocator {
+    using value_type = T;
+
+    PageExclusiveAllocator() noexcept = default;
+    template <class U>
+    PageExclusiveAllocator(const PageExclusiveAllocator<U>&) noexcept {}
+
+    T* allocate(std::size_t n) {
+        if (n == 0) return nullptr;
+        void* const p = rasberyPageExclusiveAlloc(n * sizeof(T));
+        if (p == nullptr) throw std::bad_alloc();
+        return static_cast<T*>(p);
+    }
+    void deallocate(T* p, std::size_t) noexcept { rasberyPageExclusiveFree(p); }
+
+    template <class U>
+    bool operator==(const PageExclusiveAllocator<U>&) const noexcept {
+        return true;
+    }
+    template <class U>
+    bool operator!=(const PageExclusiveAllocator<U>&) const noexcept {
+        return false;
+    }
+};
+
+/// A std::vector whose storage is page-exclusive.  Same interface, same
+/// value_type, same .data() contract -- only the pages underneath differ.
+template <class T>
+using PageExclusiveVector = std::vector<T, PageExclusiveAllocator<T>>;
 
 /// RASBERY_HOST_PINNING (plan Rev.4 Sec 6.7).
 enum class HostPinningMode {
@@ -103,6 +229,12 @@ struct PinRecord {
     /// IS `owners`; the addresses are what makes release idempotent and makes a
     /// release from a caller that was refused a lease a harmless no-op.
     std::vector<std::uintptr_t> owner_bases;
+
+    /// Static string naming the call site that REGISTERED this range (never a
+    /// heap string -- the record keeps the pointer, not a copy).  Only a
+    /// diagnostic: it is what lets a RASBERY_PIN_DEBUG=1 refusal name both
+    /// halves of the colliding pair instead of two bare addresses.
+    const char* tag = nullptr;
 };
 
 /// Sec 6.8 receipt counters.
@@ -114,6 +246,10 @@ struct HostPinCounters {
     unsigned long long unregistered_ranges   = 0;
     unsigned long long overlap_rejections    = 0;
     unsigned long long stale_evicted         = 0;
+    /// Registrations retaken WIDER for their own sole owner (see the safe
+    /// upgrade in rasberyPinHost).  A subset of registered_ranges, carried
+    /// separately so a receipt shows the path was taken at all.
+    unsigned long long upgraded_ranges       = 0;
 };
 
 /// Installed by the CUDA translation units; 0 means success, anything else is
@@ -211,6 +347,39 @@ inline bool rasberyHostPinStrict() {
     return strict;
 }
 
+/// RASBERY_PIN_DEBUG=1 prints one line per Sec 6.2 refusal and per safe
+/// upgrade, naming the call-site tag and byte count on BOTH sides.  That is the
+/// colliding-pair table, emitted by the run that has the addresses rather than
+/// reconstructed from a receipt afterwards.  Off by default -- it is a
+/// std::cerr write per event.
+inline bool rasberyHostPinDebug() {
+    static const bool debug = [] {
+        const char* value = std::getenv("RASBERY_PIN_DEBUG");
+        if (value == nullptr) return false;
+        const std::string s(value);
+        return !(s.empty() || s == "0" || s == "off" || s == "OFF" || s == "false" ||
+                 s == "FALSE");
+    }();
+    return debug;
+}
+
+/// RASBERY_PIN_UPGRADE=0 disables the safe-upgrade path in rasberyPinHost and
+/// puts the wider-request case back on the plain Sec 6.2 refusal.  The kill
+/// switch exists because the upgrade is the one place the registry unregisters
+/// a live record outside a destructor; with page-exclusive storage (above) it
+/// should never fire on a default run, and upgraded_ranges in the receipt says
+/// whether it did.
+inline bool rasberyHostPinUpgradeEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("RASBERY_PIN_UPGRADE");
+        if (value == nullptr) return true;
+        const std::string s(value);
+        return !(s == "0" || s == "off" || s == "OFF" || s == "false" || s == "FALSE" ||
+                 s == "no");
+    }();
+    return enabled;
+}
+
 /// Process-wide programmatic gate, published by main() for the configuration it
 /// is about to run.
 ///
@@ -263,6 +432,34 @@ inline void unregisterLocked(PinRecord& record, HostPinCounters& counters) {
     ++counters.unregistered_ranges;
 }
 
+/// One line per Sec 6.2 refusal under RASBERY_PIN_DEBUG=1.  Caller holds the
+/// registry lock, so the line is atomic with respect to other pin requests.
+inline void logRejectionLocked(std::uintptr_t base, std::size_t bytes,
+                               std::uintptr_t page_begin, std::uintptr_t page_end,
+                               const char* tag, const std::vector<RecordIter>& hits) {
+    const auto    name = [](const char* t) { return t != nullptr ? t : "?"; };
+    std::ostream& os   = std::cerr;
+    os << "[RASBERY][PIN][reject] {\"tag\":\"" << name(tag) << "\",\"base\":\"0x"
+       << std::hex << base << "\",\"page_begin\":\"0x" << page_begin
+       << "\",\"page_end\":\"0x" << page_end << "\"" << std::dec
+       << ",\"bytes\":" << bytes << ",\"holders\":[";
+    bool first = true;
+    for (const RecordIter& it : hits) {
+        const PinRecord& record = it->second;
+        if (!first) os << ',';
+        first = false;
+        os << "{\"tag\":\"" << name(record.tag) << "\",\"base\":\"0x" << std::hex
+           << reinterpret_cast<std::uintptr_t>(record.registered_address)
+           << "\",\"page_begin\":\"0x" << record.conflict_page_begin
+           << "\",\"page_end\":\"0x" << record.conflict_page_end << "\"" << std::dec
+           << ",\"bytes\":" << record.registered_bytes << ",\"owners\":" << record.owners
+           << '}';
+    }
+    os << "],\"reason\":\""
+       << (hits.size() == 1 ? "wider-or-straddling-single-record" : "spans-several-records")
+       << "\"}\n";
+}
+
 } // namespace host_pin_detail
 
 /// Acquire a lease on [p, p+bytes).  Returns true when the range is page-locked
@@ -276,8 +473,13 @@ inline void unregisterLocked(PinRecord& record, HostPinCounters& counters) {
 /// existing record: unregistering a range another owner is copying from is
 /// exactly the aliasing failure this registry exists to prevent, and pageable
 /// async copies are already a legal path (they are what RASBERY_HOST_PINNING=off
-/// runs everywhere).
-inline bool rasberyPinHost(const void* p, std::size_t bytes) {
+/// runs everywhere).  The ONE exception is the safe upgrade below, which is
+/// gated so tightly that neither hazard can be present.
+///
+/// `tag` names the CALL SITE and must be a string literal or other static
+/// string: the record stores the pointer.  It is a diagnostic only -- it takes
+/// no part in any decision.
+inline bool rasberyPinHost(const void* p, std::size_t bytes, const char* tag = nullptr) {
     if (p == nullptr || bytes == 0) return false;
     if (!rasberyHostPinningEnabled()) return false;
 
@@ -322,6 +524,7 @@ inline bool rasberyPinHost(const void* p, std::size_t bytes) {
         record.conflict_page_end   = page_end;
         record.registered_address  = address;
         record.registered_bytes    = bytes;
+        record.tag                 = tag;
         record.owner_bases.push_back(base);
         record.owners = 1;
         records.emplace(page_begin, std::move(record));
@@ -342,10 +545,67 @@ inline bool rasberyPinHost(const void* p, std::size_t bytes) {
             }
             return true;
         }
+
+        // SAFE UPGRADE.  A request that CONTAINS the single record it overlaps
+        // is normally the "existing SUBSET requested" refusal, because widening
+        // means unregistering a range somebody else may still be copying from.
+        // Both halves of that objection are absent when the record's SOLE owner
+        // is this very base and nothing is in flight on it: there is no foreign
+        // owner to evict (Sec 6.3 is not touched), and the new range is a strict
+        // superset, so no partial-overlap aliasing is created either -- every
+        // address the old registration covered stays covered.  Re-registering
+        // the owner's own range wider is then the same operation the owner would
+        // have got by asking for the wide range first.
+        //
+        // in_flight is the conservative Sec 6.4 counter, so this holds on the
+        // same terms the destructors do: the leases are taken at first use from
+        // the thread that then issues the copies, and a wider late request comes
+        // from that same thread between drives, not from under one.
+        if (rasberyHostPinUpgradeEnabled() && record.in_flight == 0 && record.owners == 1 &&
+            record.owner_bases.size() == 1 && record.owner_bases.front() == base &&
+            page_begin <= record.conflict_page_begin &&
+            page_end >= record.conflict_page_end) {
+            const char* const previous_tag   = record.tag;
+            const std::size_t previous_bytes = record.registered_bytes;
+            host_pin_detail::unregisterLocked(record, counters);
+            records.erase(hits.front());
+
+            void* const address = const_cast<void*>(p);
+            if (HostPinRegisterHook hook = rasberyHostPinRegisterHookRef(); hook != nullptr) {
+                if (hook(address, bytes) != 0) {
+                    // The old registration is gone and the new one did not
+                    // take: the buffer is simply pageable now, and the owner's
+                    // later release finds nothing, which is a no-op by design.
+                    ++counters.pageable_fallbacks;
+                    return false;
+                }
+            }
+            PinRecord upgraded;
+            upgraded.conflict_page_begin = page_begin;
+            upgraded.conflict_page_end   = page_end;
+            upgraded.registered_address  = address;
+            upgraded.registered_bytes    = bytes;
+            upgraded.tag                 = tag != nullptr ? tag : previous_tag;
+            upgraded.owner_bases.push_back(base);
+            upgraded.owners = 1;
+            records.emplace(page_begin, std::move(upgraded));
+            ++counters.registered_ranges;
+            ++counters.upgraded_ranges;
+            counters.registered_bytes += bytes;
+            if (rasberyHostPinDebug())
+                std::cerr << "[RASBERY][PIN][upgrade] {\"tag\":\""
+                          << (tag != nullptr ? tag : "?") << "\",\"was\":\""
+                          << (previous_tag != nullptr ? previous_tag : "?")
+                          << "\",\"bytes\":" << bytes << ",\"was_bytes\":" << previous_bytes
+                          << "}\n";
+            return true;
+        }
     }
 
     ++counters.overlap_rejections;
     ++counters.pageable_fallbacks;
+    if (rasberyHostPinDebug())
+        host_pin_detail::logRejectionLocked(base, bytes, page_begin, page_end, tag, hits);
     if (rasberyHostPinStrict())
         throw std::runtime_error(
             "RASBERY_PIN_STRICT: host pin request overlaps a live registration without "
@@ -456,7 +716,8 @@ inline void rasberyAppendHostPinReceiptFields(std::ostream& os) {
        << ",\"pageable_fallbacks\":" << counters.pageable_fallbacks
        << ",\"unregistered_ranges\":" << counters.unregistered_ranges
        << ",\"overlap_rejections\":" << counters.overlap_rejections
-       << ",\"stale_evicted\":" << counters.stale_evicted;
+       << ",\"stale_evicted\":" << counters.stale_evicted
+       << ",\"upgraded_ranges\":" << counters.upgraded_ranges;
 }
 
 } // namespace rasbery

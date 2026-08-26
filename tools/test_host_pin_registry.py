@@ -2,9 +2,11 @@
 """HostPinLease registry contract (plan Rev.4 Sec 6).
 
 Compiles src/HostPinRegistry.h on its own and runs the lease lifecycle against
-fake register/unregister hooks -- no CUDA, no device.  Where no C++ compiler is
-available (the Windows authoring host) it falls back to a static contract over
-the header and the owner destructors, so the wiring is still checked.
+fake register/unregister hooks -- no CUDA, no device.  Any of c++/g++/clang++
+serves; on the Windows authoring host the MSVC toolchain is discovered through
+vswhere and driven under vcvars64, so the compiled scenarios run there too.
+Only when no compiler at all is found does it fall back to the static contract
+over the header and the owner destructors.
 """
 from __future__ import annotations
 
@@ -85,19 +87,158 @@ int main(int argc, char** argv) {
     }
 
     if (scenario == "strict") {
-        // RASBERY_PIN_STRICT=1 turns the overlap refusal into an error.
+        // RASBERY_PIN_STRICT=1 turns the overlap refusal into an error.  The
+        // request has to come from a base the record does NOT belong to,
+        // because a sole owner widening its OWN range is the safe upgrade
+        // below, not an aliasing hazard.
         CHECK(rasberyHostPinStrict(), 30);
-        CHECK(rasberyPinHost(pool + 4096, 8192), 31);
+        CHECK(rasberyPinHost(pool + 4096, 8192, "strict.holder"), 31);
         bool threw = false;
         try {
-            rasberyPinHost(pool + 4096, 4 * 4096); // existing SUBSET requested
+            rasberyPinHost(pool, 4 * 4096, "strict.straddle"); // different base, wider
         } catch (const std::runtime_error&) {
             threw = true;
         }
         CHECK(threw, 32);
         CHECK(rasberyHostPinCounters().overlap_rejections == 1, 33);
+        CHECK(rasberyHostPinCounters().upgraded_ranges == 0, 36);
         CHECK(g_registered.size() == 1, 34);   // nothing was re-registered
         CHECK(g_unregistered.empty(), 35);     // and nothing was torn down
+        return 0;
+    }
+
+    if (scenario == "upgrade") {
+        // SAFE UPGRADE (fix strategy b).  A wider request from the record's
+        // SOLE owner is admissible: no foreign owner is evicted, and the new
+        // range is a superset, so nothing is aliased.
+        void* const a = pool + 4096;
+        CHECK(rasberyHostPinUpgradeEnabled(), 400);
+        CHECK(rasberyPinHost(a, 128, "narrow"), 401);
+        CHECK(g_registered.size() == 1 && g_registered[0].second == 128, 402);
+        CHECK(rasberyHostPinOwners(a) == 1, 403);
+
+        CHECK(rasberyPinHost(a, 3 * 4096, "wide"), 404);
+        CHECK(rasberyHostPinCounters().upgraded_ranges == 1, 405);
+        CHECK(rasberyHostPinCounters().overlap_rejections == 0, 406);
+        // torn down at the address cudaHostRegister saw, retaken at the new width
+        CHECK(g_unregistered.size() == 1 && g_unregistered[0] == a, 407);
+        CHECK(g_registered.size() == 2 && g_registered[1].first == a &&
+                  g_registered[1].second == 3 * 4096,
+              408);
+        CHECK(rasberyHostPinOwners(a) == 1, 409);
+        // the register/unregister ledger still balances against the live record
+        CHECK(rasberyHostPinCounters().registered_ranges == 2, 410);
+        CHECK(rasberyHostPinCounters().unregistered_ranges == 1, 411);
+        // and the widened range really is the one now covered
+        CHECK(rasberyPinHost(pool + 3 * 4096, 64, "inside-the-upgrade"), 412);
+        CHECK(rasberyHostPinOwners(a) == 2, 413);
+
+        // A SECOND owner blocks the next upgrade: widening would tear down a
+        // range that other owner is entitled to (Sec 6.3 is not negotiable).
+        CHECK(!rasberyPinHost(a, 6 * 4096, "wider-with-foreign-owner"), 414);
+        CHECK(rasberyHostPinCounters().overlap_rejections == 1, 415);
+        CHECK(rasberyHostPinCounters().upgraded_ranges == 1, 416);
+        CHECK(g_unregistered.size() == 1, 417); // nothing torn down
+
+        // A wider request from a DIFFERENT base is never an upgrade either,
+        // even once it is the only other owner that is gone.
+        rasberyUnpinHost(pool + 3 * 4096);
+        CHECK(rasberyHostPinOwners(a) == 1, 418);
+        CHECK(!rasberyPinHost(pool, 8 * 4096, "different-base"), 419);
+        CHECK(rasberyHostPinCounters().overlap_rejections == 2, 420);
+        CHECK(g_unregistered.size() == 1, 421);
+
+        rasberyUnpinHost(a);
+        CHECK(rasberyHostPinLiveRanges() == 0, 422);
+        CHECK(g_unregistered.size() == 2, 423);
+        return 0;
+    }
+
+    if (scenario == "upgrade_off") {
+        // RASBERY_PIN_UPGRADE=0 puts the wider-request case back on the plain
+        // Sec 6.2 refusal, unchanged from the pre-upgrade registry.
+        CHECK(!rasberyHostPinUpgradeEnabled(), 430);
+        void* const a = pool + 4096;
+        CHECK(rasberyPinHost(a, 128, "narrow"), 431);
+        CHECK(!rasberyPinHost(a, 3 * 4096, "wide"), 432);
+        CHECK(rasberyHostPinCounters().overlap_rejections == 1, 433);
+        CHECK(rasberyHostPinCounters().upgraded_ranges == 0, 434);
+        CHECK(g_unregistered.empty(), 435);
+        return 0;
+    }
+
+    if (scenario == "canonical") {
+        // The SOURCE fix.  Page-exclusive storage is what keeps two DIFFERENT
+        // buffers out of each other's pages: 5000 bytes is deliberately not a
+        // page multiple, so a general-purpose allocator would start the next
+        // block inside this one's last page and every registration after the
+        // first would be refused.
+        constexpr int         kBuffers = 32;
+        constexpr std::size_t kCount   = 625; // 5000 bytes
+        constexpr std::size_t kBytes   = kCount * sizeof(double);
+        std::vector<double*>  buffers;
+        for (int i = 0; i < kBuffers; ++i)
+            buffers.push_back(rasberyPageExclusiveZeroedArray<double>(kCount));
+
+        for (int i = 0; i < kBuffers; ++i) {
+            CHECK(buffers[i] != nullptr, 500);
+            CHECK(buffers[i][0] == 0.0 && buffers[i][kCount - 1] == 0.0, 501);
+            CHECK(reinterpret_cast<std::uintptr_t>(buffers[i]) % 32 == 0, 502);
+            CHECK(rasberyPinHost(buffers[i], kBytes, "canonical"), 503);
+        }
+        CHECK(rasberyHostPinCounters().overlap_rejections == 0, 504);
+        CHECK(rasberyHostPinCounters().pageable_fallbacks == 0, 505);
+        CHECK(rasberyHostPinLiveRanges() == static_cast<std::size_t>(kBuffers), 506);
+
+        // Page intervals are pairwise disjoint -- that IS the property, stated
+        // directly rather than inferred from the counters above.
+        const auto page_begin = [](const void* p) {
+            return reinterpret_cast<std::uintptr_t>(p) & ~(kHostPinPageSize - 1);
+        };
+        const auto page_end = [](const void* p, std::size_t bytes) {
+            return (reinterpret_cast<std::uintptr_t>(p) + bytes + kHostPinPageSize - 1) &
+                   ~(kHostPinPageSize - 1);
+        };
+        for (int i = 0; i < kBuffers; ++i)
+            for (int j = i + 1; j < kBuffers; ++j)
+                CHECK(page_end(buffers[i], kBytes) <= page_begin(buffers[j]) ||
+                          page_end(buffers[j], kBytes) <= page_begin(buffers[i]),
+                      507);
+
+        // CANONICAL WIDTH: a repeat request at the same base and the same width
+        // deduplicates, and a consumer that only needs a sub-range asks from an
+        // interior base and becomes a second owner.  Neither is a refusal.
+        CHECK(rasberyPinHost(buffers[0], kBytes, "canonical.repeat"), 508);
+        CHECK(rasberyHostPinCounters().deduplicated_requests == 1, 509);
+        CHECK(rasberyPinHost(buffers[0] + 8, 64, "canonical.subrange"), 510);
+        CHECK(rasberyHostPinOwners(buffers[0]) == 2, 511);
+        CHECK(rasberyHostPinCounters().overlap_rejections == 0, 512);
+
+        rasberyUnpinHost(buffers[0] + 8);
+        for (int i = 0; i < kBuffers; ++i) rasberyUnpinHost(buffers[i]);
+        CHECK(rasberyHostPinLiveRanges() == 0, 513);
+        CHECK(rasberyHostPinCounters().registered_ranges ==
+                  rasberyHostPinCounters().unregistered_ranges,
+              514);
+        for (int i = 0; i < kBuffers; ++i) rasberyPageExclusiveDeleteArray(buffers[i]);
+
+        // The std::vector flavour the sweep staging buffers use.
+        PageExclusiveVector<double> staged(kCount, 1.0);
+        CHECK(rasberyPinHost(staged.data(), staged.size() * sizeof(double), "canonical.vector"),
+              515);
+        CHECK(rasberyHostPinCounters().overlap_rejections == 0, 516);
+        rasberyUnpinHost(staged.data());
+        CHECK(rasberyHostPinLiveRanges() == 0, 517);
+        return 0;
+    }
+
+    if (scenario == "debug") {
+        // RASBERY_PIN_DEBUG=1 must name BOTH call sites on the rejection line;
+        // the Python driver greps stderr for the pair.
+        CHECK(rasberyHostPinDebug(), 600);
+        CHECK(rasberyPinHost(pool + 4096, 8192, "site.A"), 601);
+        CHECK(!rasberyPinHost(pool, 4 * 4096, "site.B"), 602);
+        CHECK(rasberyHostPinCounters().overlap_rejections == 1, 603);
         return 0;
     }
 
@@ -129,10 +270,13 @@ int main(int argc, char** argv) {
     CHECK(rasberyHostPinOwners(a) == 2, 132);
     CHECK(rasberyHostPinCounters().deduplicated_requests == 2, 133);
 
-    // 4. existing SUBSET requested -> pageable fallback, never an expand.
+    // 4. existing SUBSET requested -> pageable fallback, never an expand.  The
+    //    safe upgrade cannot apply here: b is a second owner, and widening
+    //    would tear down a range b is entitled to.
     CHECK(!rasberyPinHost(a, 4 * 4096), 140);
     CHECK(rasberyHostPinCounters().overlap_rejections == 1, 141);
     CHECK(rasberyHostPinCounters().pageable_fallbacks == 1, 142);
+    CHECK(rasberyHostPinCounters().upgraded_ranges == 0, 145);
     CHECK(g_registered.size() == 1 && g_unregistered.empty(), 143);
     CHECK(rasberyHostPinOwners(a) == 2, 144);
 
@@ -232,27 +376,62 @@ STATIC_TOKENS = {
         "unregistered_ranges",
         "overlap_rejections",
         "stale_evicted",
+        "upgraded_ranges",
+        "RASBERY_PIN_DEBUG",
+        "RASBERY_PIN_UPGRADE",
+        "logRejectionLocked",
+        # The source fix: page-exclusive storage for everything that gets pinned.
+        "rasberyPageExclusiveAlloc",
+        "rasberyPageExclusiveFree",
+        "rasberyPageExclusiveZeroedArray",
+        "rasberyPageExclusiveDeleteArray",
+        "PageExclusiveVector",
         "\\\"pinning_mode\\\":\\\"",
+    ),
+    # Every buffer the backends page-lock owns its pages outright, so no two
+    # registrations can collide on a shared boundary page.
+    "include/milk.h": (
+        "kPageExclusiveThreshold",
+        "isPageExclusive",
+        "nextPageSkew",
+        "deallocate(T* ptr, std::size_t count)",
     ),
     # Every owner releases in its destructor, before the memory is freed.
     "src/Geometry.cpp": (
         "rasberyUnpinHost(_phif);",
         "rasberyUnpinHost(_jnet);",
         "rasberyUnpinHost(_phis);",
+        "_phif = rasberyPageExclusiveZeroedArray<double>(",
+        "rasberyPageExclusiveDeleteArray(_jnet);",
     ),
     "src/Nodal.cpp": (
         "rasberyUnpinHost(_eta1);",
         "rasberyUnpinHost(_diagDI);",
+        "_eta1    = rasberyPageExclusiveArray<double>(nconst);",
+        "rasberyPageExclusiveDeleteArray(_diagD);",
     ),
     "src/CMFD.cpp": (
         "rasberyUnpinHost(_dtil);",
         "rasberyUnpinHost(_psi);",
+        "_dtil  = rasberyPageExclusiveZeroedArray<double>(",
+        "rasberyPageExclusiveDeleteArray(_psi);",
     ),
     "src/BICGCMFD.cpp": (
         "_ls.reset();",
         "rasberyUnpinHost(_pin_udiag);",
         "rasberyUnpinHost(_pin_sweep_vol);",
         "lease_vector(",
+        # every sweep-path request carries its call-site tag
+        '"cmfd.diag@sweep"',
+        '"xs.xssm@sweep"',
+        '"bicg.sweep_vol@sweep"',
+    ),
+    "src/BICGCMFD.h": (
+        "PageExclusiveVector<double> _udiag;",
+        "PageExclusiveVector<double> _sweep_chif, _sweep_xsnf, _sweep_vol;",
+    ),
+    "src/XSSet.h": (
+        "PageExclusiveVector<double> _ref_chix;",
     ),
     "src/XSSet.cpp": (
         "_xsrecon_backend.reset();",
@@ -260,6 +439,16 @@ STATIC_TOKENS = {
         "rasberyUnpinHost(_ref_micx.xssm.data());",
         # chifData(), page-locked by NodalArena::pinSlot and owned here.
         "rasberyUnpinHost(_ref_chix.data());",
+        # both arms ask for the SAME bases at the SAME widths, tagged per arm
+        '"xs.micx@flatxs"',
+        '"xs.micx@xsrecon"',
+        '"geom.phif@xsrecon"',
+    ),
+    "src/CudaXsReconBackend.cu": (
+        '"geom.jnet@arena"',
+        '"nodal.const@arena"',
+        '"xs.chif@arena"',
+        '"geom.phif@nodal"',
     ),
     "src/main.cpp": (
         "rasberyDrainPinnedRegistry();",
@@ -279,11 +468,73 @@ def static_contract() -> list[str]:
     # The permanent-registration contract must be gone from both pin bodies.
     for relative in ("src/CudaXsReconBackend.cu", "src/CudaBICGBackend.cu"):
         text = (ROOT / relative).read_text(encoding="utf-8")
-        if "return rasberyPinHost(p, bytes);" not in text:
+        if "return rasberyPinHost(p, bytes, tag);" not in text:
             problems.append(f"{relative}: pinHost does not go through the registry")
         if "installHostPinHooks();" not in text:
             problems.append(f"{relative}: CUDA register/unregister hooks are never installed")
     return problems
+
+
+# Every environment override the compiled scenarios read, cleared before each
+# run so the parent shell cannot leak one in.
+PIN_ENV = ("RASBERY_HOST_PINNING", "RASBERY_PIN_STRICT", "RASBERY_PIN_DEBUG",
+           "RASBERY_PIN_UPGRADE")
+
+SCENARIOS = (
+    ("default", {}),
+    ("off", {"RASBERY_HOST_PINNING": "off"}),
+    ("force", {"RASBERY_HOST_PINNING": "force"}),
+    ("strict", {"RASBERY_PIN_STRICT": "1"}),
+    ("upgrade", {}),
+    ("upgrade_off", {"RASBERY_PIN_UPGRADE": "0"}),
+    ("canonical", {}),
+    ("debug", {"RASBERY_PIN_DEBUG": "1"}),
+)
+
+
+def msvc_vcvars() -> str | None:
+    """vcvars64.bat of the newest MSVC install, or None off Windows."""
+    if os.name != "nt":
+        return None
+    program_files = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    vswhere = Path(program_files) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if not vswhere.is_file():
+        return None
+    done = subprocess.run(
+        [str(vswhere), "-latest", "-products", "*", "-requires",
+         "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+         "-property", "installationPath"],
+        capture_output=True, universal_newlines=True)
+    root = done.stdout.strip().splitlines()
+    if done.returncode != 0 or not root:
+        return None
+    bat = Path(root[0]) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+    return str(bat) if bat.is_file() else None
+
+
+def compile_harness(compiler: str, cpp: Path, exe: Path) -> None:
+    """Build the harness with either a POSIX compiler or MSVC under vcvars64."""
+    if compiler.lower().endswith("vcvars64.bat"):
+        # cl.exe only has its include/lib environment under vcvars, and it drops
+        # its intermediates in the CWD, so the build runs from a batch file inside
+        # the temp directory -- a script sidesteps cmd.exe's quoting rules for the
+        # space-bearing Visual Studio path.  /WX because a warning in this header
+        # is a contract break too.
+        script = cpp.parent / "build_host_pin_registry_test.bat"
+        script.write_text(
+            "@echo off\r\n"
+            + 'call "%s" >nul\r\n' % compiler
+            + 'cl /nologo /std:c++20 /EHsc /W4 /WX /D_CRT_SECURE_NO_WARNINGS '
+              '/I "%s" "%s" /Fe:"%s"\r\n' % (SRC, cpp, exe),
+            encoding="utf-8")
+        subprocess.run(["cmd", "/c", str(script)], check=True, cwd=str(cpp.parent),
+                       capture_output=True, universal_newlines=True)
+        return
+    subprocess.run(
+        [compiler, "-std=c++20", "-Wall", "-Wextra", "-Werror",
+         "-I", str(SRC), str(cpp), "-o", str(exe)],
+        check=True,
+    )
 
 
 def run_harness(compiler: str) -> list[str]:
@@ -291,23 +542,18 @@ def run_harness(compiler: str) -> list[str]:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         cpp = tmp_path / "host_pin_registry_test.cpp"
-        exe = tmp_path / "host_pin_registry_test"
+        exe = tmp_path / ("host_pin_registry_test.exe" if os.name == "nt"
+                          else "host_pin_registry_test")
         cpp.write_text(HARNESS, encoding="utf-8")
-        subprocess.run(
-            [compiler, "-std=c++20", "-Wall", "-Wextra", "-Werror",
-             "-I", str(SRC), str(cpp), "-o", str(exe)],
-            check=True,
-        )
-        scenarios = (
-            ("default", {}),
-            ("off", {"RASBERY_HOST_PINNING": "off"}),
-            ("force", {"RASBERY_HOST_PINNING": "force"}),
-            ("strict", {"RASBERY_PIN_STRICT": "1"}),
-        )
-        for name, overrides in scenarios:
+        try:
+            compile_harness(compiler, cpp, exe)
+        except subprocess.CalledProcessError as failure:
+            output = (failure.stdout or "") + (failure.stderr or "")
+            return ["harness did not compile: " + output.strip()[-2000:]]
+        for name, overrides in SCENARIOS:
             env = os.environ.copy()
-            env.pop("RASBERY_HOST_PINNING", None)
-            env.pop("RASBERY_PIN_STRICT", None)
+            for key in PIN_ENV:
+                env.pop(key, None)
             env.update(overrides)
             done = subprocess.run([str(exe), name], env=env, capture_output=True,
                                   universal_newlines=True)
@@ -315,12 +561,24 @@ def run_harness(compiler: str) -> list[str]:
                 problems.append(
                     "scenario %s exited %d: %s" % (name, done.returncode, done.stderr.strip())
                 )
+                continue
+            if name == "debug":
+                # The rejection line is the diagnostic this whole exercise turns
+                # on: it has to carry both call-site tags and both byte counts.
+                line = next((l for l in done.stderr.splitlines()
+                             if "[RASBERY][PIN][reject]" in l), "")
+                for needed in ('"site.B"', '"site.A"', '"bytes":16384', '"bytes":8192',
+                               '"owners":1'):
+                    if needed not in line:
+                        problems.append(
+                            "RASBERY_PIN_DEBUG rejection line lacks %s: %r" % (needed, line))
     return problems
 
 
 def main() -> int:
     problems = static_contract()
-    compiler = shutil.which("c++") or shutil.which("g++") or shutil.which("clang++")
+    compiler = (shutil.which("c++") or shutil.which("g++") or shutil.which("clang++")
+                or msvc_vcvars())
     if compiler is not None:
         problems.extend(run_harness(compiler))
     if problems:
@@ -331,7 +589,8 @@ def main() -> int:
         print("host pin registry: static contract PASS "
               "(no C++ compiler here -- the compiled harness was skipped)")
     else:
-        print("host pin registry: PASS (static contract + 4 compiled scenarios)")
+        print("host pin registry: PASS (static contract + %d compiled scenarios, %s)"
+              % (len(SCENARIOS), Path(compiler).name))
     return 0
 
 

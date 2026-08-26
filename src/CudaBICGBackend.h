@@ -241,7 +241,10 @@ public:
     /// the buffer's owner releases it with rasberyUnpinHost() in its destructor
     /// so a recycled Driver worker cannot inherit a dead deck's registration.
     /// See HostPinRegistry.h.  Returns true when the range is page-locked.
-    bool pinHost(const void* p, size_t bytes) const;
+    ///
+    /// @param tag static string naming the CALL SITE, kept by the registry for
+    ///        the RASBERY_PIN_DEBUG=1 collision report.
+    bool pinHost(const void* p, size_t bytes, const char* tag = nullptr) const;
 
     /// Record one drive()'s sweep inputs for @p slot.  No CUDA call, no lock.
     void stageSweeps(int slot, const CmfdSweepIO& io);

@@ -66,8 +66,8 @@ void CudaBatchArena::solve(int, double*) {
 // The lease bookkeeping still runs in a stub build; no hook is installed, so
 // no device call is made.  That keeps the owner destructors' unpin path on the
 // SAME code in the MSVC/no-CUDA regression as in the CUDA build.
-bool CudaBatchArena::pinHost(const void* p, size_t bytes) const {
-    return rasberyPinHost(p, bytes);
+bool CudaBatchArena::pinHost(const void* p, size_t bytes, const char* tag) const {
+    return rasberyPinHost(p, bytes, tag);
 }
 void CudaBatchArena::stageSweeps(int, const CmfdSweepIO&) {
     throw std::runtime_error(_impl->status);

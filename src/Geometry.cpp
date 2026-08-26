@@ -102,9 +102,9 @@ Geometry::~Geometry() {
     delete[] _tmod;
     delete[] _dmod;
     delete[] _rod_fraction;
-    delete[] _phif;
-    delete[] _jnet;
-    delete[] _phis;
+    rasberyPageExclusiveDeleteArray(_phif);
+    rasberyPageExclusiveDeleteArray(_jnet);
+    rasberyPageExclusiveDeleteArray(_phis);
     delete[] _psi;
     delete[] _phic;
     delete[] _ppr_p;
@@ -380,10 +380,16 @@ void Geometry::Initialize(const GeometryInput& in) {
     for (int k = 0; k < _nz; k++)
         hz(k) = hmesh(ZDIR, k * _nxy);
 
-    // Allocate solution arrays
-    _jnet = new double[LR * _ng * NDIRMAX * _nxyz]{};
-    _phis = new double[LR * _ng * NDIRMAX * _nxyz]{};
-    _phif = new double[_ng * _nxyz]{};
+    // Allocate solution arrays.  jnet/phis/phif are the three Geometry-owned
+    // buffers both nodal arms and the CMFD sweep path page-lock, so they get
+    // page-exclusive storage: adjacent heap arrays share their boundary pages,
+    // and cudaHostRegister refuses the second of any two that do.  See the
+    // page-exclusive section of HostPinRegistry.h.
+    _jnet = rasberyPageExclusiveZeroedArray<double>(
+        static_cast<size_t>(LR) * _ng * NDIRMAX * _nxyz);
+    _phis = rasberyPageExclusiveZeroedArray<double>(
+        static_cast<size_t>(LR) * _ng * NDIRMAX * _nxyz);
+    _phif = rasberyPageExclusiveZeroedArray<double>(static_cast<size_t>(_ng) * _nxyz);
     std::fill_n(_phif, _ng * _nxyz, 1.0);
     _psi          = new double[_nxyz];
     _bppm         = new double[_nxyz]{};

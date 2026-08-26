@@ -318,15 +318,24 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
         const size_t nn   = static_cast<size_t>(_g.ngxyz());
         if (!_sweep_pinned) {
             // Raw arrays, allocated once by their owner and never reallocated.
-            ar->pinHost(_diag, static_cast<size_t>(_g.ng2()) * nd * sizeof(double));
-            ar->pinHost(_cc, static_cast<size_t>(ng) * NEWSBT * nd * sizeof(double));
-            ar->pinHost(_src, nn * sizeof(double));
-            ar->pinHost(_psi, nd * sizeof(double));
-            ar->pinHost(flux, nn * sizeof(double));
-            ar->pinHost(_x.xsrfData(), nn * sizeof(double));
-            ar->pinHost(_x.xssmData(), static_cast<size_t>(ng * ng) * nd * sizeof(double));
-            ar->pinHost(_dtil, static_cast<size_t>(_g.nsurf()) * ng * sizeof(double));
-            ar->pinHost(_dhat, static_cast<size_t>(_g.nsurf()) * ng * sizeof(double));
+            // Byte counts are the OWNING allocation's full width, which is what
+            // the other arms ask for too -- xsrf/xssm are the same ranges the
+            // XSSet arms and the nodal arena page-lock, so those three requests
+            // deduplicate instead of colliding (plan Sec 6.2).
+            ar->pinHost(_diag, static_cast<size_t>(_g.ng2()) * nd * sizeof(double),
+                        "cmfd.diag@sweep");
+            ar->pinHost(_cc, static_cast<size_t>(ng) * NEWSBT * nd * sizeof(double),
+                        "cmfd.cc@sweep");
+            ar->pinHost(_src, nn * sizeof(double), "cmfd.src@sweep");
+            ar->pinHost(_psi, nd * sizeof(double), "cmfd.psi@sweep");
+            ar->pinHost(flux, nn * sizeof(double), "geom.phif@sweep");
+            ar->pinHost(_x.xsrfData(), nn * sizeof(double), "xs.xsrf@sweep");
+            ar->pinHost(_x.xssmData(), static_cast<size_t>(ng * ng) * nd * sizeof(double),
+                        "xs.xssm@sweep");
+            ar->pinHost(_dtil, static_cast<size_t>(_g.nsurf()) * ng * sizeof(double),
+                        "cmfd.dtil@sweep");
+            ar->pinHost(_dhat, static_cast<size_t>(_g.nsurf()) * ng * sizeof(double),
+                        "cmfd.dhat@sweep");
             _sweep_pinned = true;
         }
         // Vector-reallocation contract (plan Sec 6.5).  The three _sweep_*
@@ -337,16 +346,21 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
         // pointing at freed memory: release it, then lease the new address.
         // "Size before pin, never realloc while leased" is the rule; this is
         // what enforces it rather than assuming it.
-        auto lease_vector = [ar](const void*& leased, const void* data, size_t bytes) {
+        auto lease_vector = [ar](const void*& leased, const void* data, size_t bytes,
+                                 const char* tag) {
             if (leased == data) return;
             if (leased != nullptr) rasberyUnpinHost(leased);
-            ar->pinHost(data, bytes);
+            ar->pinHost(data, bytes, tag);
             leased = data;
         };
-        lease_vector(_pin_udiag, _udiag.data(), _udiag.size() * sizeof(double));
-        lease_vector(_pin_sweep_chif, _sweep_chif.data(), _sweep_chif.size() * sizeof(double));
-        lease_vector(_pin_sweep_xsnf, _sweep_xsnf.data(), _sweep_xsnf.size() * sizeof(double));
-        lease_vector(_pin_sweep_vol, _sweep_vol.data(), _sweep_vol.size() * sizeof(double));
+        lease_vector(_pin_udiag, _udiag.data(), _udiag.size() * sizeof(double),
+                     "bicg.udiag@sweep");
+        lease_vector(_pin_sweep_chif, _sweep_chif.data(), _sweep_chif.size() * sizeof(double),
+                     "bicg.sweep_chif@sweep");
+        lease_vector(_pin_sweep_xsnf, _sweep_xsnf.data(), _sweep_xsnf.size() * sizeof(double),
+                     "bicg.sweep_xsnf@sweep");
+        lease_vector(_pin_sweep_vol, _sweep_vol.data(), _sweep_vol.size() * sizeof(double),
+                     "bicg.sweep_vol@sweep");
     }
 
     double reigv  = 1. / eigv;

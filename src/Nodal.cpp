@@ -48,15 +48,22 @@ Nodal::Nodal(Geometry& g, XSSet& xs)
     _trlcff0 = new double[_nxyz * NDIRMAX * _ng];
     _trlcff1 = new double[_nxyz * NDIRMAX * _ng];
     _trlcff2 = new double[_nxyz * NDIRMAX * _ng];
-    _eta1    = new double[_nxyz * NDIRMAX * _ng];
-    _eta2    = new double[_nxyz * NDIRMAX * _ng];
-    _m260    = new double[_nxyz * NDIRMAX * _ng];
-    _m251    = new double[_nxyz * NDIRMAX * _ng];
-    _m253    = new double[_nxyz * NDIRMAX * _ng];
-    _m262    = new double[_nxyz * NDIRMAX * _ng];
-    _m264    = new double[_nxyz * NDIRMAX * _ng];
-    _diagDI  = new double[_nxyz * NDIRMAX * _ng];
-    _diagD   = new double[_nxyz * NDIRMAX * _ng];
+    // The nine updateConstant arrays are the ones both nodal arms page-lock.
+    // They are allocated as a run, so on a general-purpose allocator each one
+    // after the first starts inside its predecessor's last page and only the
+    // first could ever be registered.  Page-exclusive storage removes the
+    // sharing; see HostPinRegistry.h.  Left uninitialised, exactly as the plain
+    // new[] they replace was.
+    const std::size_t nconst = static_cast<std::size_t>(_nxyz) * NDIRMAX * _ng;
+    _eta1    = rasberyPageExclusiveArray<double>(nconst);
+    _eta2    = rasberyPageExclusiveArray<double>(nconst);
+    _m260    = rasberyPageExclusiveArray<double>(nconst);
+    _m251    = rasberyPageExclusiveArray<double>(nconst);
+    _m253    = rasberyPageExclusiveArray<double>(nconst);
+    _m262    = rasberyPageExclusiveArray<double>(nconst);
+    _m264    = rasberyPageExclusiveArray<double>(nconst);
+    _diagDI  = rasberyPageExclusiveArray<double>(nconst);
+    _diagD   = rasberyPageExclusiveArray<double>(nconst);
     _constant_xsrf = new double[_nxyz * _ng];
     _constant_xsdf = new double[_nxyz * _ng];
     std::fill_n(_constant_xsrf, _nxyz * _ng, std::numeric_limits<double>::quiet_NaN());
@@ -90,15 +97,15 @@ Nodal::~Nodal() {
     delete[] _trlcff0;
     delete[] _trlcff1;
     delete[] _trlcff2;
-    delete[] _eta1;
-    delete[] _eta2;
-    delete[] _m260;
-    delete[] _m251;
-    delete[] _m253;
-    delete[] _m262;
-    delete[] _m264;
-    delete[] _diagDI;
-    delete[] _diagD;
+    rasberyPageExclusiveDeleteArray(_eta1);
+    rasberyPageExclusiveDeleteArray(_eta2);
+    rasberyPageExclusiveDeleteArray(_m260);
+    rasberyPageExclusiveDeleteArray(_m251);
+    rasberyPageExclusiveDeleteArray(_m253);
+    rasberyPageExclusiveDeleteArray(_m262);
+    rasberyPageExclusiveDeleteArray(_m264);
+    rasberyPageExclusiveDeleteArray(_diagDI);
+    rasberyPageExclusiveDeleteArray(_diagD);
     delete[] _constant_xsrf;
     delete[] _constant_xsdf;
     delete[] _dsncff2;

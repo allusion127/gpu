@@ -212,7 +212,11 @@ private:
     milk::Vector<double> _ref_iden;  // [niso*nxyz] (non-H/B/O isotopes)
     std::vector<double>  _ref_wvfr;  // unrodded AD_WVFR per node
     std::vector<double>  _node_wvfr; // live AD_WVFR per node
-    std::vector<double>  _ref_chix;  // burnup-interpolated fission spectrum per node [ig*nxyz + l]
+    // Page-exclusive storage (HostPinRegistry.h): chifData() is page-locked by
+    // NodalArena::pinSlot, and a plain std::vector shares its boundary pages
+    // with whatever the allocator put next to it, which cudaHostRegister
+    // refuses.
+    PageExclusiveVector<double> _ref_chix; // burnup-interpolated fission spectrum [ig*nxyz + l]
     double               _boron_dmod_average = 0.0;
     double               _current_power_rate = 1.0;
 
