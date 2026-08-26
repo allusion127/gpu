@@ -623,6 +623,35 @@ private:
                 stall_events);
     }
 
+    /// Where this run's restart_<step>.h5 goes (plan Rev.4 Sec 7).
+    ///
+    /// The historical location is the INPUT directory, which is a namespace
+    /// collision the moment a batch runs several decks off one input file --
+    /// the policy explicitly allows that ("same input file: allowed") and
+    /// equally explicitly forbids sharing a restart namespace.  Every deck
+    /// would write the same restart_1.h5, and with N host workers they would
+    /// interleave inside a single HDF5 file.
+    ///
+    /// In batch mode the default therefore keys off the OUTPUT path, which the
+    /// launcher and main() both guarantee is unique per deck.  Both halves of
+    /// that path are used -- directory AND stem -- because Sec 7 also allows
+    /// two jobs to share an output PARENT directory, so
+    /// `<dir>/<stem>_restart_<step>.h5` is what makes "distinct --raso implies
+    /// distinct restart namespace" true.  It is the same derivation
+    /// IO::OpenResult already uses for `<stem>_pinpower.csv`.
+    /// RASBERY_RESTART_AT_INPUT=1 restores the legacy location for anything
+    /// that reads restarts back by their old path.
+    static std::string RestartPath(const IO& input_output, int step_number) {
+        const char* at_input = std::getenv("RASBERY_RESTART_AT_INPUT");
+        const bool  legacy =
+            (at_input != nullptr && *at_input != '\0' && std::string(at_input) != "0");
+        const std::string result_dir  = input_output.result_dir();
+        const std::string result_stem = input_output.result_stem();
+        if (legacy || rasberyBatchWidth() <= 0 || result_dir.empty() || result_stem.empty())
+            return input_output.input_dir() + std::format("restart_{}.h5", step_number);
+        return result_dir + std::format("{}_restart_{}.h5", result_stem, step_number);
+    }
+
 public:
     explicit Driver(const std::string& input, const std::string& result_output = "")
         : _input(input),
@@ -806,7 +835,7 @@ public:
             input_output.AddResult(geometry, eigv, step_index, step_number, efpd);
 
             if (!light_result && schedule.print_opt.save) {
-                input_output.SaveRestart(input_output.input_dir() + std::format("restart_{}.h5", step_number),
+                input_output.SaveRestart(RestartPath(input_output, step_number),
                                          geometry, cross_sections, eigv, efpd, step_number);
             }
 

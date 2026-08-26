@@ -45,4 +45,41 @@ assert env["CUDA_VISIBLE_DEVICES"] == "0"
 assert env["RASBERY_BATCH_HOST_THREADS"] == "2"
 assert env["RASBERY_GPU_CMFD_SWEEP"] == "1"
 assert env["RASBERY_GPU_NODAL_FULL"] == "1"
+
+# --- job namespace policy (plan Rev.4 Sec 7) --------------------------------
+# Same input file for many decks: allowed.  Same output path: forbidden.
+assert module.validate_deck_paths(
+    ["RASBERY", "--rasi", "deck.json", "deck.json", "--raso", "o0.h5", "o1.h5"]
+) == ["deck.json", "deck.json"]
+for bad in (
+    ["RASBERY", "--rasi", "a.json", "b.json", "--raso", "o0.h5", "o0.h5"],
+    ["RASBERY", "--rasi", "a.json", "b.json", "--raso", "o0.h5", "./o0.h5"],
+    ["RASBERY", "--rasi", "a.json", "b.json"],
+):
+    try:
+        module.validate_deck_paths(bad)
+    except ValueError:
+        pass
+    else:
+        raise SystemExit(f"single gpu batch profile: FAIL accepted {bad}")
+# The key canonicalises, so `out/../out/x.h5` and `out/x.h5` are one namespace.
+assert module.path_key("out/x.h5") == module.path_key("out/../out/x.h5")
+
+# --- the C++ side of the same policy ----------------------------------------
+main_cpp = (ROOT / "src" / "main.cpp").read_text(encoding="utf-8")
+driver_h = (ROOT / "src" / "Driver.h").read_text(encoding="utf-8")
+io_h = (ROOT / "src" / "IO.h").read_text(encoding="utf-8")
+for token, text, name in (
+    ("weakly_canonical", main_cpp, "main.cpp"),
+    ("rasberyPathKey", main_cpp, "main.cpp"),
+    ("--raso paths must be distinct", main_cpp, "main.cpp"),
+    ("std::string result_dir() const", io_h, "IO.h"),
+    ("std::string result_stem() const", io_h, "IO.h"),
+    ("RestartPath(input_output, step_number)", driver_h, "Driver.h"),
+    ("RASBERY_RESTART_AT_INPUT", driver_h, "Driver.h"),
+    ("{}_restart_{}.h5", driver_h, "Driver.h"),
+):
+    if token not in text:
+        raise SystemExit(f"single gpu batch profile: FAIL {name} missing {token!r}")
+
 print("single gpu batch profile: PASS")

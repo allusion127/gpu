@@ -61,6 +61,33 @@ public:
     ~IO();
 
     const std::string& input_dir() const { return _input_dir; }
+
+    /// Directory the result HDF5 was opened in, with a trailing separator, so
+    /// it composes exactly like input_dir().  Empty before OpenResult().
+    ///
+    /// This is the base of a job's OUTPUT namespace (plan Rev.4 Sec 7): decks
+    /// may share an input file and an output parent directory, but never an
+    /// output path -- so deriving restart/scratch from the output keeps every
+    /// job's namespace distinct by construction, whereas deriving them from the
+    /// input makes N decks that share one input collide on restart_1.h5.
+    std::string result_dir() const {
+        if (_result_path.empty()) return {};
+        std::string dir = _result_path.parent_path().string();
+        if (dir.empty()) return "./";
+        if (dir.back() != '/' && dir.back() != '\\') dir += '/';
+        return dir;
+    }
+
+    /// Stem of the result HDF5 ("out0" for .../run/out0.h5), the second half of
+    /// the output namespace: Sec 7 allows two jobs to SHARE an output parent
+    /// directory, so the directory alone does not separate their restart files.
+    /// Same derivation OpenResult() already uses for the pin-power CSV.
+    std::string result_stem() const {
+        if (_result_path.empty()) return {};
+        const std::string stem = _result_path.stem().string();
+        return stem.empty() ? std::string("result") : stem;
+    }
+
     const std::string& xs_path() const { return _xs_path; }
     const std::string& restart_path() const { return _restart_path; }
     bool has_restart() const { return !_restart_path.empty(); }
