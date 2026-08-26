@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "frozen_utc": "2026-08-26",
+  "derivation": "Baseline binary ae5965d ran 4x on kngr_238.json (238 GPU0): all repeats dataset-level bit-exact (500/500, keff/ppm max_abs_delta 0.0). Observed numerical noise = 0, so every threshold below is an engineering floor per plan Rev.4 s3.4, not a noise-derived bound. Frozen before any trajectory-changing feature lands; no modification permitted afterward.",
+  "gate_a_vs_rasbery_baseline": {
+    "keff_pcm": 1.0,
+    "cbc_ppm": 1.0,
+    "final_cmfd_residual": "<= existing production tolerance (unchanged deck epsilons)",
+    "final_nonlinear_residual": "<= existing production tolerance",
+    "ao_abs": 0.005,
+    "fq_rel": 0.002,
+    "fr_rel": 0.002,
+    "node_power_rel_rms": 0.001,
+    "node_power_rel_max": 0.005,
+    "pin_power_rel_rms": 0.001,
+    "pin_power_rel_max": 0.005,
+    "xe_sm_inventory_rel": 1e-05,
+    "isotope_inventory_rel": 1e-05,
+    "burnup_rel": 1e-06,
+    "convergence_status": "no state may regress from converged to unconverged",
+    "all_statepoints": "finite and converged"
+  },
+  "gate_a_master_nondegradation": {
+    "delta_RMS_pctpt": 0.02,
+    "delta_max_pctpt": 0.10,
+    "reference": "MASTER_pin_RMS(candidate) <= MASTER_pin_RMS(baseline) + delta_RMS; same for max. Baseline BOC pin RMS = 0.239 pct, max = 0.79 pct (fig20, MASTER_vs_RASBERY_COMPARISON_20260824)."
+  },
+  "gate_b_master_envelope": {
+    "reactivity_pcm": 2.0,
+    "cbc_ppm": 15.0,
+    "pin_rms_pct": 0.30,
+    "burnup_points": "BOC + mid-burnup + EOC pin distributions required"
+  },
+  "phase4_anderson": {
+    "axial_trust_ao_abs": 0.02,
+    "note": "abs(AO_candidate - AO_picard) <= axial_trust per plan s10.4; normalized axial power L2 distance may supplement"
+  }
+}

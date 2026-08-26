@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "frozen_utc": "2026-08-26",
+  "baseline_commit_sha": "ae5965d5955d2fd756f439eff2522df18049a97e",
+  "branch": "codex/exact-throughput-campaign",
+  "compiler": "x86_64-conda-linux-gnu-g++ (conda-forge) 14.3.0 at /home/kmk/codex/tools/gcc13/bin",
+  "cuda_compiler": "nvcc 13.0.88 (/usr/local/cuda-13.0)",
+  "release_flags": "-O3 -DNDEBUG -std=gnu++20 -march=native -Wall -Wextra -Wpedantic -fopenmp (CMAKE_BUILD_TYPE=Release, RASBERY_CUDA_ARCHITECTURES=120, per-TU --fmad=false on CudaXsReconBackend.cu)",
+  "gpu": {
+    "model": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "uuid": "GPU-e73893d2-bd77-cccc-bf09-c0b3016cbe13",
+    "driver": "590.48.01",
+    "cuda_runtime": "13.1",
+    "host": "166.104.40.238 (GPU0)"
+  },
+  "benchmark_input": {
+    "deck": "kngr_238.json (APR1400/KNGR CY1 PSAR, 35-state natural EOC, quarter core 8451 nodes NG=2)",
+    "input_sha256": "ac6a28ba31b51c7 (truncated as reported; full value in gateA provenance log on 238)",
+    "env": "RASBERY_PPR_MODE=master RASBERY_PC_MODE=decart RASBERY_GPU=1 RASBERY_GPU_CMFD_SWEEP=1 RASBERY_GPU_XSRECON=1 RASBERY_GPU_FLATXS=1 RASBERY_GPU_NODAL=1 RASBERY_GPU_NODAL_FULL=1 (assembly/fusion default ON)"
+  },
+  "golden_outputs": {
+    "single_deck_h5_sha256": "b778a504b3005b4 (truncated; = gateA_rep1.h5, dataset-identical to ref_aedae80.h5 lineage)",
+    "repeats": 4,
+    "repeat_walls_s": [93.29, 92.84, 92.99, 92.69],
+    "determinism": "500/500 datasets bit-exact across repeats; container md5 differs (HDF5 metadata only)"
+  },
+  "master_comparison_data_version": "kngr_mas_sum.txt + mas_ppi_{boc,0060..0420} (MASTER 4.0 KNGQ01, campaign 2026-08-22..24); comparator tools/compare_master_rasbery.py",
+  "throughput_baselines": {
+    "single_deck_wall_s": 92.9,
+    "m64_exact_cases_per_hour": 213.9,
+    "master_w16_cases_per_hour": 217.0
+  },
+  "threshold_file": "validation_thresholds_v1.json",
+  "threshold_file_note": "sha256 of the frozen threshold file recorded in the campaign report at each gate evaluation"
+}
