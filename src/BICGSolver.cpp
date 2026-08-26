@@ -109,6 +109,8 @@ BICGSolver::~BICGSolver() {
         << c.bulk_h2d_bytes_during_iteration << ','
         << "\"bulk_d2h_calls_during_iteration\":"
         << c.bulk_d2h_calls_during_iteration << ','
+        << "\"bulk_d2h_bytes_during_iteration\":"
+        << c.bulk_d2h_bytes_during_iteration << ','
         << "\"status_d2h_calls_during_iteration\":"
         << c.status_d2h_calls_during_iteration << ','
         << "\"stream_sync_calls_during_iteration\":"

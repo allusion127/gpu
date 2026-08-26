@@ -73,6 +73,10 @@ struct BackendCounters {
     /// Bytes actually pushed across PCIe by the bulk uploads above.
     std::uint64_t bulk_h2d_bytes_during_iteration      = 0;
     std::uint64_t bulk_d2h_calls_during_iteration      = 0;
+    /// Bytes actually pulled back across PCIe by the bulk downloads above.  The
+    /// D2H half of the per-statepoint transfer budget (plan Rev.4 Sec 8); its
+    /// H2D counterpart is bulk_h2d_bytes_during_iteration.
+    std::uint64_t bulk_d2h_bytes_during_iteration      = 0;
     std::uint64_t status_d2h_calls_during_iteration    = 0;
     std::uint64_t stream_sync_calls_during_iteration   = 0;
     std::uint64_t graph_launches                       = 0;

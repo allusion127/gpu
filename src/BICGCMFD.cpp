@@ -80,6 +80,18 @@ BICGCMFD::BICGCMFD(Geometry& g, XSSet& x)
     _eshift     = 0.04;
     iter        = 0;
     _wiel_sweep = 0;
+    _bicg_iters = 0;
+}
+
+BackendCounters BICGCMFD::backendCounters() const {
+    if (_ls == nullptr) return BackendCounters{};
+    if (CudaBatchArena* shared = _ls->arena(); shared != nullptr)
+        return shared->counters();
+    return _ls->cudaCounters();
+}
+
+int BICGCMFD::batchSlot() const {
+    return _ls != nullptr ? _ls->batchSlot() : -1;
 }
 
 void BICGCMFD::setIterLim(int maxls, double epsls) {
@@ -382,6 +394,9 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
         iout += io.sweeps_done;
         _wiel_sweep += attempts;
         iter += attempts;
+        // Each device sweep runs the same captured inner loop the host path
+        // launches: one unconditional iteration plus _nmaxbicg more.
+        _bicg_iters += static_cast<long long>(attempts) * (1 + _nmaxbicg);
         eigv   = io.eigv;
         reigv  = io.reigv;
         reigvs = io.reigvs;
@@ -509,13 +524,16 @@ void BICGCMFD::drive(double& eigv, double* flux, double& errl2) {
             // in between, so the whole thing is one CUDA graph launch instead of
             // a per-iteration status copy plus stream drain.
             _ls->solveInner(_nmaxbicg, _epsbicg);
+            _bicg_iters += 1 + _nmaxbicg;
         } else {
             double r2 = r20;
             _ls->solve(_diag, _cc, r20, flux, r2);
+            ++_bicg_iters;
 
             for (int iin = 0; iin < _nmaxbicg; ++iin) {
                 // solve linear system A*phi = src
                 _ls->solve(_diag, _cc, r20, flux, r2);
+                ++_bicg_iters;
                 PLOG(plog::debug) << iin << "-th Inner Solver Error " << r2;
                 // One relative exit, measured against the fixed reference r20.  The companion
                 // `if (r2 < 1.E-6 && iin > 2) break;` is gone: since fix4 un-aliased r20 from r2,
@@ -587,6 +605,7 @@ void BICGCMFD::drive(double& eigv, double* flux, double& errl2) {
 void BICGCMFD::resetIteration() {
     iter                     = 0;
     _wiel_sweep              = 0;
+    _bicg_iters              = 0;
     _device_assembly_pending = false;
 }
 

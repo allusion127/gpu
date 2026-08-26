@@ -159,6 +159,8 @@ public:
 
     [[nodiscard]] bool usingCuda() const { return _use_cuda; }
     [[nodiscard]] CudaBatchArena* arena() const { return _arena; }
+    /// Batch-arena slot, or -1 when this instance is not in the arena.
+    [[nodiscard]] int batchSlot() const { return _batch_slot; }
     [[nodiscard]] BackendCounters cudaCounters() const {
         return _cuda ? _cuda->counters() : BackendCounters{};
     }

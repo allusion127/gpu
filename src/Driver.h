@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <filesystem>
@@ -19,19 +20,216 @@
 
 namespace rasbery {
 
+// Per-statepoint decomposition telemetry (plan Rev.4 Sec 8), behind
+// RASBERY_STATEPOINT_TELEMETRY=1.
+//
+// WHY.  Every phase of this campaign is scored against the Sec 1 Amdahl model
+//
+//   T_total = T_fixed + N_outer*T_outer + N_xe*T_xe + N_search*T_search
+//             + T_depletion + T_IO + T_startup
+//
+// and none of its coefficients are recoverable from the receipts we already
+// print: [RASBERY][OUTER][PHASE] is one process-wide sum over the whole run,
+// and the `NO.= .. outer=` line gives N_outer per statepoint but not what
+// CAUSED those outers.  This splits the ~600 outers of a statepoint into the
+// driver causes that produced them, so Phase 3 (warm-start audit, adaptive
+// inner tolerance), Phase 4 (Anderson) and Phase 5 (persistent kernel) are
+// ordered by measured headroom instead of by guess.
+//
+// ATTRIBUTION.  Every outer belongs to exactly ONE cause, decided by SEGMENT
+// BOUNDARY rather than by inspecting the outer itself: an outer is charged to
+// the most recent state perturbation before it, and a perturbation opens a new
+// segment at the point in SolveLoop where it commits.  The rules, in the order
+// SolveLoop applies them:
+//
+//   INITIAL   from SolveLoop entry until the first perturbation of that call.
+//             This is the cost of re-converging the flux on the state the
+//             previous statepoint (or the predictor/corrector step) handed
+//             over -- exactly the quantity Phase 3's warm-start audit needs.
+//   XE        after every XSSet::UpdateEquilibriumXenon call, settled-flux or
+//             interim.  An Xe step is a perturbation whether or not its
+//             returned change clears XE_EQUILIBRIUM_TOLERANCE, so the outers
+//             after it are XE until something else perturbs.
+//   TH        after XSSet::UpdateTH.
+//   SEARCH    after a trial point is committed AND applied (SetBoron/SetRod).
+//             A search step that exits without committing (SEARCH_EXHAUSTED,
+//             NO_PROPOSAL) opens no segment, because no state moved.
+//   SETTLE    after the SEARCH_SETTLE_ITERS gate defers an otherwise usable
+//             k_eff sample.  These are Sec 8's "settling gate extra outers":
+//             outers that exist only because the gate refused the sample.
+//   FALLBACK  the bounded ReconvergeFlux() run on the best observed trial point
+//             after a non-converged search.  Measured as the delta of
+//             total_outer across that call -- no cause can change inside it.
+//
+// TIE-BREAK.  T/H and the search can both perturb inside one outer (SolveLoop
+// runs T/H first, then the search).  The following segment is charged to
+// SEARCH: a trial point moves boron/rod macro-XS core-wide, whereas the T/H
+// step is a bounded temperature correction.  How often the ambiguity arises is
+// published as `th_search_coincident`, so an analysis can bound the error the
+// tie-break can introduce instead of having to trust it.
+//
+// INVARIANT.  sum(outers_by_cause) equals the `outer=` count of the NO.= line,
+// which is republished here as `outers` for exactly that cross-check.
+//
+// COST (Sec 8.1 contract).  The integer tallies are plain non-atomic members of
+// the per-Driver SolverContext -- no atomics, no thread-local lookup, no
+// allocation -- and each is one increment in a loop body whose iteration
+// already costs milliseconds, so they are carried unconditionally, the same way
+// `total_outer` and BICGCMFD::iter already are.  Everything with real cost is
+// gated on enabled(): the per-phase clock reads (outer_timing::Scope), the
+// backend counter snapshots, and every string.  Formatting happens once per
+// statepoint (35-51 lines/run) and once at end of run, never inside a loop.
+namespace sptelem {
+
+enum Phase : int {
+    PH_UPDPSI = 0,
+    PH_SETLS,
+    PH_DRIVE,
+    PH_UPDJNET,
+    PH_NODAL,
+    PH_CUSPING,
+    PH_UPDDHAT,
+    PH_COUNT
+};
+
+inline const char* phaseName(int phase) {
+    switch (phase) {
+        case PH_UPDPSI:  return "updpsi";
+        case PH_SETLS:   return "setls";
+        case PH_DRIVE:   return "drive";
+        case PH_UPDJNET: return "updjnet";
+        case PH_NODAL:   return "nodal";
+        case PH_CUSPING: return "cusping";
+        case PH_UPDDHAT: return "upddhat";
+        default:         break;
+    }
+    return "unknown";
+}
+
+enum Cause : int {
+    CAUSE_INITIAL = 0,
+    CAUSE_XE,
+    CAUSE_TH,
+    CAUSE_SEARCH,
+    CAUSE_SETTLE,
+    CAUSE_FALLBACK,
+    CAUSE_COUNT
+};
+
+inline bool enabled() {
+    static const bool on = [] {
+        const char* value = std::getenv("RASBERY_STATEPOINT_TELEMETRY");
+        if (value == nullptr) return false;
+        const std::string s(value);
+        return !(s.empty() || s == "0" || s == "off" || s == "OFF" ||
+                 s == "false" || s == "FALSE");
+    }();
+    return on;
+}
+
+/// Per-thread phase wall in seconds, written by outer_timing::Scope.  One
+/// Driver owns one host thread (batch mode gives every deck its own), so this
+/// is per-Driver by construction and needs no atomics; Drive() snapshots it at
+/// the statepoint boundary and publishes the difference.
+inline double* phaseWall() {
+    static thread_local double wall[PH_COUNT] = {};
+    return wall;
+}
+
+/// One statepoint's tallies plus the baselines its deltas are measured from.
+/// The same type doubles as the run-total accumulator, through accumulate().
+struct Counters {
+    long long outers_by_cause[CAUSE_COUNT]{};
+    long long outers_driver        = 0;  ///< Driver's own total_outer (cross-check)
+    long long solve_loops          = 0;  ///< SolveLoop calls (BOS/predictor/final/...)
+    long long xe_updates           = 0;  ///< settled-flux equilibrium-Xe steps
+    long long xe_interim_updates   = 0;  ///< RASBERY_XE_INTERIM_L2 loose-flux steps
+    long long search_trials        = 0;  ///< committed AND applied trial points
+    long long th_updates           = 0;
+    long long flux_limit_retries   = 0;  ///< flux limit-cycle events ([WARN][flux])
+    long long th_search_coincident = 0;  ///< outers where T/H and search both fired
+    long long cmfd_sweeps          = 0;
+    long long bicg_iters           = 0;
+    double    wall                 = 0.0;  ///< solve wall of the statepoint
+    double    io_wall              = 0.0;
+    double    phase[PH_COUNT]{};
+
+    double        phase0[PH_COUNT]{};
+    std::uint64_t graph0 = 0, h2d0 = 0, d2h0 = 0, d2h_calls0 = 0;
+    std::uint64_t graph_delta = 0, h2d_delta = 0, d2h_delta = 0, d2h_calls_delta = 0;
+
+    [[nodiscard]] long long outers() const {
+        long long sum = 0;
+        for (long long v : outers_by_cause) sum += v;
+        return sum;
+    }
+
+    /// Clear the tallies and arm the baselines for a new statepoint.
+    void begin(std::uint64_t graph, std::uint64_t h2d, std::uint64_t d2h,
+               std::uint64_t d2h_calls) {
+        *this                 = Counters{};
+        const double* current = phaseWall();
+        for (int p = 0; p < PH_COUNT; ++p) phase0[p] = current[p];
+        graph0     = graph;
+        h2d0       = h2d;
+        d2h0       = d2h;
+        d2h_calls0 = d2h_calls;
+    }
+
+    /// Close the statepoint: resolve every delta against the armed baselines.
+    void end(std::uint64_t graph, std::uint64_t h2d, std::uint64_t d2h,
+             std::uint64_t d2h_calls) {
+        const double* current = phaseWall();
+        for (int p = 0; p < PH_COUNT; ++p) phase[p] = current[p] - phase0[p];
+        graph_delta     = graph - graph0;
+        h2d_delta       = h2d - h2d0;
+        d2h_delta       = d2h - d2h0;
+        d2h_calls_delta = d2h_calls - d2h_calls0;
+    }
+
+    /// Fold one closed statepoint into a run-total accumulator.
+    void accumulate(const Counters& step) {
+        for (int c = 0; c < CAUSE_COUNT; ++c)
+            outers_by_cause[c] += step.outers_by_cause[c];
+        for (int p = 0; p < PH_COUNT; ++p) phase[p] += step.phase[p];
+        outers_driver        += step.outers_driver;
+        solve_loops          += step.solve_loops;
+        xe_updates           += step.xe_updates;
+        xe_interim_updates   += step.xe_interim_updates;
+        search_trials        += step.search_trials;
+        th_updates           += step.th_updates;
+        flux_limit_retries   += step.flux_limit_retries;
+        th_search_coincident += step.th_search_coincident;
+        cmfd_sweeps          += step.cmfd_sweeps;
+        bicg_iters           += step.bicg_iters;
+        wall                 += step.wall;
+        io_wall              += step.io_wall;
+        graph_delta          += step.graph_delta;
+        h2d_delta            += step.h2d_delta;
+        d2h_delta            += step.d2h_delta;
+        d2h_calls_delta      += step.d2h_calls_delta;
+    }
+};
+
+} // namespace sptelem
+
 // Wall-clock attribution of the outer iteration's serial phases, process-wide
 // across batch instances (RASBERY_OUTER_TIMING=1; zero cost when unset).
 // Same design rules as xsphase (XSTiming.h): atomics, one JSON line at exit.
+//
+// The same Scope feeds sptelem's per-thread, per-statepoint phase wall, so the
+// two receipts can never disagree about where a phase boundary is.  When both
+// variables are unset the scope stores nothing and never reads the clock.
 namespace outer_timing {
 struct Buckets {
-    std::atomic<double> updpsi{0.0};
-    std::atomic<double> setls{0.0};    // host linear-system assembly
-    std::atomic<double> drive{0.0};    // BiCG outer incl. arena wait + sync
-    std::atomic<double> updjnet{0.0};
-    std::atomic<double> nodal{0.0};    // reset + drive
-    std::atomic<double> cusping{0.0};  // ApplyRodCusping (+ upddtil on change)
-    std::atomic<double> upddhat{0.0};
+    /// Indexed by sptelem::Phase: updpsi, setls (host linear-system assembly),
+    /// drive (BiCG outer incl. arena wait + sync), updjnet, nodal (reset +
+    /// drive), cusping (ApplyRodCusping (+ upddtil on change)), upddhat.
+    std::atomic<double>    phase[sptelem::PH_COUNT];
     std::atomic<long long> outers{0};
+    Buckets() {
+        for (auto& bucket : phase) bucket.store(0.0, std::memory_order_relaxed);
+    }
 };
 inline Buckets& buckets() { static Buckets b; return b; }
 inline bool enabled() {
@@ -39,33 +237,37 @@ inline bool enabled() {
     return on;
 }
 class Scope {
-    std::atomic<double>* _acc = nullptr;
+    int  _phase  = -1;
+    bool _global = false;
+    bool _local  = false;
     std::chrono::steady_clock::time_point _t0;
 public:
-    explicit Scope(std::atomic<double>& acc) {
-        if (!enabled()) return;
-        _acc = &acc;
-        _t0  = std::chrono::steady_clock::now();
+    explicit Scope(sptelem::Phase phase) {
+        _global = enabled();
+        _local  = sptelem::enabled();
+        if (!_global && !_local) return;
+        _phase = static_cast<int>(phase);
+        _t0    = std::chrono::steady_clock::now();
     }
     ~Scope() {
-        if (_acc == nullptr) return;
+        if (_phase < 0) return;
         const double dt = std::chrono::duration<double>(
                               std::chrono::steady_clock::now() - _t0).count();
-        double cur = _acc->load(std::memory_order_relaxed);
-        while (!_acc->compare_exchange_weak(cur, cur + dt)) {}
+        if (_global) {
+            std::atomic<double>& acc = buckets().phase[_phase];
+            double cur = acc.load(std::memory_order_relaxed);
+            while (!acc.compare_exchange_weak(cur, cur + dt)) {}
+        }
+        if (_local) sptelem::phaseWall()[_phase] += dt;
     }
 };
 inline void report(std::ostream& out) {
     if (!enabled()) return;
     Buckets& b = buckets();
-    out << "[RASBERY][OUTER][PHASE] {\"outers\":" << b.outers.load()
-        << ",\"updpsi\":" << b.updpsi.load()
-        << ",\"setls\":" << b.setls.load()
-        << ",\"drive\":" << b.drive.load()
-        << ",\"updjnet\":" << b.updjnet.load()
-        << ",\"nodal\":" << b.nodal.load()
-        << ",\"cusping\":" << b.cusping.load()
-        << ",\"upddhat\":" << b.upddhat.load() << "}" << std::endl;
+    out << "[RASBERY][OUTER][PHASE] {\"outers\":" << b.outers.load();
+    for (int p = 0; p < sptelem::PH_COUNT; ++p)
+        out << ",\"" << sptelem::phaseName(p) << "\":" << b.phase[p].load();
+    out << "}" << std::endl;
 }
 } // namespace outer_timing
 
@@ -159,6 +361,10 @@ private:
         BICGCMFD&    cmfd_solver;
         Nodal&       nodal_solver;
         SearchMemory search_memory;
+        /// Phase 2 statepoint telemetry (plan Rev.4 Sec 8).  Per-Driver, plain
+        /// members, never shared -- see the sptelem comment block.  Drive()
+        /// re-arms it at every statepoint boundary; SolveLoop only increments.
+        sptelem::Counters telemetry{};
     };
 
     // Flux-only re-convergence (CMFD/BiCGSTAB + nodal/CNCC + cusping), with every feedback
@@ -300,6 +506,10 @@ private:
         int    xe_no_progress = 0;   // consecutive Xe steps that did not shrink
         int    xe_interim_count = 0; // loose-flux Xe steps (RASBERY_XE_INTERIM_L2)
         SolveExit exit_reason = SolveExit::ITER_EXHAUSTED;
+        // Telemetry only (plan Rev.4 Sec 8).  The cause of the segment the NEXT
+        // outer belongs to; see the attribution rules in the sptelem comment.
+        sptelem::Cause sp_cause = sptelem::CAUSE_INITIAL;
+        ++ctx.telemetry.solve_loops;
 
         if (has_search)
             schedule.ResetSearchExitStatus();
@@ -310,24 +520,28 @@ private:
                                             has_search ? schedule.max_search_iter : 0});
         for (int iout = 0; iout < max_iter; ++iout) {
             bool stall_sample = false; // limit-cycle fall-through this outer
+            bool th_fired     = false; // telemetry: T/H perturbed inside this outer
             const int xe_budget_probe = ga_feedback_passes > 0
                                             ? ga_feedback_passes
                                             : ((xe_relax < 1.0) ? XE_EQUILIBRIUM_MAX_ITER_DAMPED
                                                                 : XE_EQUILIBRIUM_MAX_ITER);
             // 1. Flux: CMFD BiCGSTAB iterations + Wielandt shift.
             {
-                outer_timing::Scope t(outer_timing::buckets().updpsi);
+                outer_timing::Scope t(sptelem::PH_UPDPSI);
                 ctx.cmfd_solver.updpsi(ctx.geometry.Phif());
             }
             {
-                outer_timing::Scope t(outer_timing::buckets().setls);
+                outer_timing::Scope t(sptelem::PH_SETLS);
                 ctx.cmfd_solver.setls(eigv);
             }
             {
-                outer_timing::Scope t(outer_timing::buckets().drive);
+                outer_timing::Scope t(sptelem::PH_DRIVE);
                 ctx.cmfd_solver.drive(eigv, ctx.geometry.Phif(), residual);
             }
             ++total_outer;
+            // Exactly one cause bucket per outer, charged to the segment this
+            // outer belongs to (plan Rev.4 Sec 8 attribution rules).
+            ++ctx.telemetry.outers_by_cause[sp_cause];
             outer_timing::buckets().outers.fetch_add(1, std::memory_order_relaxed);
             const bool flux_converged = std::abs(prev_inner - eigv) < keff_tol && residual < flux_tol;
             prev_inner                = eigv;
@@ -335,22 +549,22 @@ private:
             // 2. Nodal correction -> CNCC (d-hat) + rod cusping macro-XS update. The cusping blend
             //    co-converges with the flux, so its settledness is implied by flux_converged.
             {
-                outer_timing::Scope t(outer_timing::buckets().updjnet);
+                outer_timing::Scope t(sptelem::PH_UPDJNET);
                 ctx.cmfd_solver.updjnet(ctx.geometry.Phif(), ctx.geometry.Jnet());
             }
             {
-                outer_timing::Scope t(outer_timing::buckets().nodal);
+                outer_timing::Scope t(sptelem::PH_NODAL);
                 ctx.nodal_solver.reset(1.0 / eigv, ctx.geometry.Jnet(),
                                        ctx.geometry.Phif(), ctx.geometry.Phis());
                 ctx.nodal_solver.drive();
             }
             {
-                outer_timing::Scope t(outer_timing::buckets().cusping);
+                outer_timing::Scope t(sptelem::PH_CUSPING);
                 if (ctx.cross_sections.ApplyRodCusping(eigv, ctx.nodal_solver.axialTransverseLeakage()))
                     ctx.cmfd_solver.upddtil();
             }
             {
-                outer_timing::Scope t(outer_timing::buckets().upddhat);
+                outer_timing::Scope t(sptelem::PH_UPDDHAT);
                 ctx.cmfd_solver.upddhat(ctx.geometry.Phif(), ctx.geometry.Jnet());
             }
 
@@ -396,6 +610,7 @@ private:
                 // 5e-5 rod-crit tolerance).  Record it, warn, and carry on with the search so
                 // the root find can step off the pathological point.
                 ++stall_events;
+                ++ctx.telemetry.flux_limit_retries;
                 if (has_search)
                     schedule.search_stall_count = stall_events;
                 std::cerr << std::format(
@@ -426,10 +641,17 @@ private:
                 (flux_converged || xe_interim || stall_sample)) {
                 const double xe_change =
                     ctx.cross_sections.UpdateEquilibriumXenon(schedule.thermalPower(), xe_relax);
-                if (xe_interim && !flux_converged)
+                // An Xe step moves the macro-XS whatever it returns, so it opens
+                // an XE segment even when the change is under tolerance and the
+                // loop falls through to the search/T-H checks below.
+                sp_cause = sptelem::CAUSE_XE;
+                if (xe_interim && !flux_converged) {
                     ++xe_interim_count;
-                else
+                    ++ctx.telemetry.xe_interim_updates;
+                } else {
                     ++xe_count;
+                    ++ctx.telemetry.xe_updates;
+                }
                 // Not contracting?  The undamped Xe<->flux map is limit-cycling rather than
                 // converging.  Measured on APR1400 cy01 at 195-225 EFPD: [XE] rel bounces
                 // between 8e-x and 11e-x for 80+ iterations, eigv swinging +-30 pcm, until
@@ -490,6 +712,9 @@ private:
                 clean_iters < SEARCH_SETTLE_ITERS) {
                 ++clean_iters;
                 prev_inner = eigv + 1.0;   // force a real re-drive before the next check
+                // The next outer exists only because the gate refused this
+                // sample: that is Sec 8's "settling gate extra outer".
+                sp_cause = sptelem::CAUSE_SETTLE;
                 continue;
             }
 
@@ -523,6 +748,9 @@ private:
                 th_dop = ctx.cross_sections.UpdateTH(power_fraction);
                 ++total_th;
                 ++th_count;
+                ++ctx.telemetry.th_updates;
+                th_fired    = true;
+                sp_cause    = sptelem::CAUSE_TH;
                 clean_iters = 0;   // the cross sections just moved
                 if (trace_sl)
                     std::cout << std::format("        [TH] it={} th_dop={:.3e} eigv={:.6f}\n",
@@ -563,6 +791,12 @@ private:
                     ctx.cross_sections.SetRod(schedule.search_current_x);
                     schedule.rod_step = schedule.search_current_x;
                 }
+                // Committed AND applied: this is the trial the segment below
+                // pays for.  A T/H step in the same outer loses the tie-break
+                // (see the sptelem comment) but is counted as ambiguous.
+                ++ctx.telemetry.search_trials;
+                if (th_fired) ++ctx.telemetry.th_search_coincident;
+                sp_cause    = sptelem::CAUSE_SEARCH;
                 clean_iters = 0;   // new trial point: the next sample must settle first
             }
         }
@@ -589,8 +823,13 @@ private:
                     ctx.cross_sections.SetRod(schedule.search_current_x);
                     schedule.rod_step = schedule.search_current_x;
                 }
+                const int fallback_outer0 = total_outer;
                 ReconvergeFlux(ctx, eigv, FALLBACK_RECONVERGE_ITER, keff_tol, flux_tol,
                                total_outer);
+                // ReconvergeFlux runs its own loop with every feedback frozen, so
+                // no cause can change inside it: charge the whole delta at once.
+                ctx.telemetry.outers_by_cause[sptelem::CAUSE_FALLBACK] +=
+                    total_outer - fallback_outer0;
                 k_res                       = schedule.searchResidual(eigv);
                 schedule.search_exit_status = static_cast<int>(SearchExit::BEST_FALLBACK);
                 std::cerr << std::format(
@@ -614,6 +853,12 @@ private:
 
         if (has_search && schedule.searchType == SearchType::RODCRIT)
             schedule.rod_step = schedule.search_current_x;
+
+        // BICGCMFD zeroes both counters in the resetIteration() at the top of
+        // this function, so what they hold now is this SolveLoop's own total --
+        // ReconvergeFlux's sweeps included, since it ran above.
+        ctx.telemetry.cmfd_sweeps += ctx.cmfd_solver.innerIterations();
+        ctx.telemetry.bicg_iters  += ctx.cmfd_solver.bicgIterations();
 
         if (trace_sl)
             std::cout << std::format(
@@ -660,6 +905,9 @@ public:
 
     int Drive() {
         const auto driver_start = std::chrono::steady_clock::now();
+        // Phase 2 statepoint telemetry (plan Rev.4 Sec 8).  One static-local
+        // bool read; every cost beyond the plain counters hangs off it.
+        const bool sp_telem = sptelem::enabled();
         // Inner GA evaluations only need scalar fitness/safety receipts.  Full
         // HDF5/restart/pin output remains the default and is used for selected
         // exact cases; light mode avoids queueing mutable Geometry/Schedule
@@ -672,7 +920,12 @@ public:
         XSSet     cross_sections(geometry);
 
         IO input_output(geometry, cross_sections, scheduler);
+        // Deck + XSLIB parse, split out of Init+IO so the Amdahl model's T_fixed
+        // can be separated from the XSLIB-cache track (plan Rev.4 Sec 14).
+        const auto library_start = std::chrono::steady_clock::now();
         input_output.ReadInput(_input);
+        const double library_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - library_start).count();
 
         BICGCMFD cmfd_solver(geometry, cross_sections);
         cmfd_solver.setNcmfd(5);
@@ -721,6 +974,21 @@ public:
         const double init_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - driver_start).count();
         std::cout << std::format("  [TIMING] Init+IO={:.3f} s\n", init_seconds);
 
+        // Receipt keys (plan Rev.4 Sec 8.1).  result_stem() is empty until
+        // OpenResult(), and light-result runs never call it, so fall back to the
+        // stem of the path this deck was told to write -- the same string that
+        // makes a job's output namespace unique (Sec 7).  Built once, and only
+        // when the telemetry is on: nothing is allocated on the default path.
+        std::string sp_job_id;
+        int         sp_slot = -1;
+        sptelem::Counters sp_run;
+        if (sp_telem) {
+            sp_job_id = input_output.result_stem();
+            if (sp_job_id.empty())
+                sp_job_id = std::filesystem::path(result_path).stem().string();
+            sp_slot = cmfd_solver.batchSlot();
+        }
+
         // 3. Main schedule loop.  The bound is re-read every iteration because a
         // depletion entry carrying until_boron_ppm re-queues itself (natural EOC);
         // decks without that key never grow the vector, so their path is unchanged.
@@ -742,6 +1010,16 @@ public:
 
             int        total_outer = 0;
             int        total_th    = 0;
+            // Arm this statepoint's telemetry.  The backend tallies are
+            // cumulative, so everything device-side is published as a delta.
+            {
+                const BackendCounters base =
+                    sp_telem ? cmfd_solver.backendCounters() : BackendCounters{};
+                ctx.telemetry.begin(base.graph_launches,
+                                    base.bulk_h2d_bytes_during_iteration,
+                                    base.bulk_d2h_bytes_during_iteration,
+                                    base.bulk_d2h_calls_during_iteration);
+            }
             const bool keep_search = schedule.keepSearchBetweenSolves();
             // Only the first statepoint of a cycle that inherited its state from another
             // run starts with a decayed Xe field, and only there does the Xe<->flux map
@@ -851,7 +1129,56 @@ public:
             } else {
                 input_output.WriteStepToResult(geometry, cross_sections, step_index);
             }
-            total_io_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - io_start).count();
+            const double step_io_seconds =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - io_start).count();
+            total_io_seconds += step_io_seconds;
+
+            // Statepoint boundary: close the deltas and emit ONE machine-readable
+            // line (plan Rev.4 Sec 8.1).  This is the only place the telemetry
+            // formats anything, and it runs 35-51 times per run.
+            if (sp_telem) {
+                const BackendCounters now = cmfd_solver.backendCounters();
+                ctx.telemetry.end(now.graph_launches,
+                                  now.bulk_h2d_bytes_during_iteration,
+                                  now.bulk_d2h_bytes_during_iteration,
+                                  now.bulk_d2h_calls_during_iteration);
+                ctx.telemetry.outers_driver = total_outer;
+                ctx.telemetry.wall          = step_seconds;
+                ctx.telemetry.io_wall       = step_io_seconds;
+                const sptelem::Counters& c  = ctx.telemetry;
+                // Batch mode shares ONE arena, and therefore one set of device
+                // tallies, across every deck in the process: a delta taken here
+                // then includes whatever the other slots did meanwhile.  Say so
+                // rather than let the number be read as this deck's alone.
+                const bool shared = (sp_slot >= 0);
+                std::cout << std::format(
+                    "[RASBERY][SPTELEM] {{\"schema_version\":1,\"job_id\":\"{}\",\"slot\":{},"
+                    "\"statepoint\":{},\"efpd\":{:.4f},\"outers\":{},\"outers_attributed\":{},"
+                    "\"outers_initial\":{},\"xe_updates\":{},\"xe_interim_updates\":{},"
+                    "\"xe_outers\":{},\"search_trials\":{},\"search_outers\":{},"
+                    "\"th_updates\":{},\"th_outers\":{},\"settle_outers\":{},"
+                    "\"fallback_outers\":{},\"th_search_coincident\":{},"
+                    "\"flux_limit_retries\":{},\"solve_loops\":{},\"cmfd_sweeps\":{},"
+                    "\"bicg_iters\":{},\"graph_launches_delta\":{},\"h2d_bytes_delta\":{},"
+                    "\"d2h_bytes_delta\":{},\"d2h_calls_delta\":{},\"counters_shared\":{},"
+                    "\"wall\":{:.6f},\"io_wall\":{:.6f},\"phase_wall\":{{\"updpsi\":{:.6f},"
+                    "\"setls\":{:.6f},\"drive\":{:.6f},\"updjnet\":{:.6f},\"nodal\":{:.6f},"
+                    "\"cusping\":{:.6f},\"upddhat\":{:.6f}}}}}\n",
+                    sp_job_id, sp_slot, step_number, efpd, total_outer, c.outers(),
+                    c.outers_by_cause[sptelem::CAUSE_INITIAL], c.xe_updates,
+                    c.xe_interim_updates, c.outers_by_cause[sptelem::CAUSE_XE],
+                    c.search_trials, c.outers_by_cause[sptelem::CAUSE_SEARCH],
+                    c.th_updates, c.outers_by_cause[sptelem::CAUSE_TH],
+                    c.outers_by_cause[sptelem::CAUSE_SETTLE],
+                    c.outers_by_cause[sptelem::CAUSE_FALLBACK], c.th_search_coincident,
+                    c.flux_limit_retries, c.solve_loops, c.cmfd_sweeps, c.bicg_iters,
+                    c.graph_delta, c.h2d_delta, c.d2h_delta, c.d2h_calls_delta, shared,
+                    c.wall, c.io_wall, c.phase[sptelem::PH_UPDPSI],
+                    c.phase[sptelem::PH_SETLS], c.phase[sptelem::PH_DRIVE],
+                    c.phase[sptelem::PH_UPDJNET], c.phase[sptelem::PH_NODAL],
+                    c.phase[sptelem::PH_CUSPING], c.phase[sptelem::PH_UPDDHAT]);
+                sp_run.accumulate(c);
+            }
 
             // Natural EOC (MASTER %EXE_DEP tgobj boron): while the converged critical
             // boron is still above the target, re-queue a copy of this entry right
@@ -893,6 +1220,47 @@ public:
         const double total_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - driver_start).count();
         std::cout << std::format("  [TIMING] IO write={:.3f} s\n", total_io_seconds);
         std::cout << std::format("  TOTAL DRIVER TIME={:10.3f} s\n", total_seconds);
+
+        // Run summary (plan Rev.4 Sec 8.1): the run totals of every per-statepoint
+        // field, plus the measured T_fixed of the Sec 1 Amdahl model.  T_fixed is
+        // reported as the Init+IO block (deck parse, XSLIB load, geometry build,
+        // result-file open) with its library-parse half broken out, because the
+        // XSLIB cache track (Sec 14) attacks exactly that half.  Process startup
+        // before Drive() is NOT included -- this Driver cannot observe it, so
+        // T_startup stays a harness-level measurement.
+        if (sp_telem) {
+            const sptelem::Counters& c = sp_run;
+            std::cout << std::format(
+                "[RASBERY][SPTELEM][SUMMARY] {{\"schema_version\":1,\"job_id\":\"{}\","
+                "\"slot\":{},\"statepoints\":{},\"outers\":{},\"outers_attributed\":{},"
+                "\"outers_initial\":{},\"xe_updates\":{},\"xe_interim_updates\":{},"
+                "\"xe_outers\":{},\"search_trials\":{},\"search_outers\":{},"
+                "\"th_updates\":{},\"th_outers\":{},\"settle_outers\":{},"
+                "\"fallback_outers\":{},\"th_search_coincident\":{},"
+                "\"flux_limit_retries\":{},\"solve_loops\":{},\"cmfd_sweeps\":{},"
+                "\"bicg_iters\":{},\"graph_launches_delta\":{},\"h2d_bytes_delta\":{},"
+                "\"d2h_bytes_delta\":{},\"d2h_calls_delta\":{},\"counters_shared\":{},"
+                "\"t_fixed\":{:.6f},\"init_seconds\":{:.6f},\"library_seconds\":{:.6f},"
+                "\"solve_wall\":{:.6f},\"io_wall\":{:.6f},\"total_seconds\":{:.6f},"
+                "\"phase_wall\":{{\"updpsi\":{:.6f},\"setls\":{:.6f},\"drive\":{:.6f},"
+                "\"updjnet\":{:.6f},\"nodal\":{:.6f},\"cusping\":{:.6f},"
+                "\"upddhat\":{:.6f}}}}}\n",
+                sp_job_id, sp_slot, static_cast<int>(scheduler.schedule().size()),
+                c.outers_driver, c.outers(), c.outers_by_cause[sptelem::CAUSE_INITIAL],
+                c.xe_updates, c.xe_interim_updates, c.outers_by_cause[sptelem::CAUSE_XE],
+                c.search_trials, c.outers_by_cause[sptelem::CAUSE_SEARCH],
+                c.th_updates, c.outers_by_cause[sptelem::CAUSE_TH],
+                c.outers_by_cause[sptelem::CAUSE_SETTLE],
+                c.outers_by_cause[sptelem::CAUSE_FALLBACK], c.th_search_coincident,
+                c.flux_limit_retries, c.solve_loops, c.cmfd_sweeps, c.bicg_iters,
+                c.graph_delta, c.h2d_delta, c.d2h_delta, c.d2h_calls_delta,
+                sp_slot >= 0, init_seconds, init_seconds, library_seconds,
+                c.wall, total_io_seconds, total_seconds,
+                c.phase[sptelem::PH_UPDPSI], c.phase[sptelem::PH_SETLS],
+                c.phase[sptelem::PH_DRIVE], c.phase[sptelem::PH_UPDJNET],
+                c.phase[sptelem::PH_NODAL], c.phase[sptelem::PH_CUSPING],
+                c.phase[sptelem::PH_UPDDHAT]);
+        }
         return 0;
     }
 };

@@ -2222,6 +2222,8 @@ public:
                 scalars + static_cast<long long>(m) * kScalarCount + kSweepFirst,
                 kSweepCount * sizeof(double), cudaMemcpyDeviceToHost, stream));
             ++telemetry.bulk_d2h_calls_during_iteration;
+            telemetry.bulk_d2h_bytes_during_iteration +=
+                (static_cast<std::uint64_t>(nxyz) + kSweepCount) * sizeof(double);
         }
         CUDA_CHECK(cudaMemsetAsync(sweep_halt, 0,
                                    static_cast<size_t>(slots) * sizeof(std::uint32_t),
@@ -2239,6 +2241,8 @@ public:
                                        cudaMemcpyDeviceToHost,
                                        stream));
             ++telemetry.bulk_d2h_calls_during_iteration;
+            telemetry.bulk_d2h_bytes_during_iteration +=
+                static_cast<std::uint64_t>(n) * sizeof(double);
             ++telemetry.status_d2h_calls_during_iteration;
         }
     }
@@ -2278,6 +2282,9 @@ public:
                                        matrix_count * sizeof(double),
                                        cudaMemcpyDeviceToHost, stream));
             telemetry.bulk_d2h_calls_during_iteration += 3;
+            telemetry.bulk_d2h_bytes_during_iteration +=
+                (2 * static_cast<std::uint64_t>(matrix_count) +
+                 static_cast<std::uint64_t>(coupling_count)) * sizeof(double);
             queued = true;
         }
         if (!queued) return;
@@ -2953,6 +2960,7 @@ void rasberyReleaseBatchArena() {
               << ','
               << "\"bulk_h2d_bytes_during_iteration\":" << c.bulk_h2d_bytes_during_iteration << ','
               << "\"bulk_d2h_calls_during_iteration\":" << c.bulk_d2h_calls_during_iteration << ','
+              << "\"bulk_d2h_bytes_during_iteration\":" << c.bulk_d2h_bytes_during_iteration << ','
               << "\"stream_sync_calls_during_iteration\":" << c.stream_sync_calls_during_iteration
               << ','
               << "\"graph_launches\":" << c.graph_launches << ','

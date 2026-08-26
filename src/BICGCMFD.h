@@ -22,6 +22,17 @@ protected:
     /// @brief total number of CMFD sweeps since the last resetIteration(); diagnostic only
     int iter;
 
+    /// @brief inner BiCGSTAB iterations issued since the last resetIteration();
+    /// diagnostic only, and the `bicg_iters` field of the Sec 8 statepoint
+    /// telemetry.
+    ///
+    /// Host path: exact -- one per BICGSolver::solve() call, so the early
+    /// relative exit is reflected.  CUDA path: the captured graph budget,
+    /// 1 + _nmaxbicg per sweep, because that is the number of iterations the
+    /// device actually executes; the ones that run after an early halt are
+    /// no-ops and are reported separately as BackendCounters::overrun_iterations.
+    long long _bicg_iters;
+
     /// @brief Number of CMFD sweeps since the last resetIteration(), used ONLY to decide
     /// when the Wielandt extrapolation may take over from the Rayleigh-quotient warm-up.
     ///
@@ -81,6 +92,24 @@ public:
     ~BICGCMFD() override;
 
     [[nodiscard]] int innerIterations() const { return iter; }
+
+    /// @brief inner BiCGSTAB iterations since the last resetIteration()
+    [[nodiscard]] long long bicgIterations() const { return _bicg_iters; }
+
+    /// @brief the CUDA backend's cumulative counters, whichever backend this
+    /// instance actually uses.  Zeroed when there is no CUDA backend at all.
+    ///
+    /// In batch mode the arena is process-wide, so the numbers cover EVERY slot
+    /// -- see batchSlot() -- and the copy is taken without the arena lock, so a
+    /// concurrent launcher can be mid-update.  Both are acceptable only because
+    /// the sole consumer is diagnostic (the Sec 8 telemetry, which publishes
+    /// `counters_shared` alongside the deltas); nothing numerical may read this.
+    [[nodiscard]] BackendCounters backendCounters() const;
+
+    /// @brief this instance's batch-arena slot, or -1 when it is not in the
+    /// arena (single-instance CUDA or CPU).  >= 0 therefore also means
+    /// backendCounters() is shared with the other decks in this process.
+    [[nodiscard]] int batchSlot() const;
 
     /// @brief set the iteration limit for BICGCMFD
     /// @param maxls maximum number of iteration in BICG calculation
