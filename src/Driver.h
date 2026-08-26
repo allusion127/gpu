@@ -144,6 +144,15 @@ struct Counters {
     long long solve_loops          = 0;  ///< SolveLoop calls (BOS/predictor/final/...)
     long long xe_updates           = 0;  ///< settled-flux equilibrium-Xe steps
     long long xe_interim_updates   = 0;  ///< RASBERY_XE_INTERIM_L2 loose-flux steps
+    /// Xe re-convergence cascade STARTS: one per SolveLoop entry plus one per
+    /// committed perturbation (search trial, T/H update) that moves the macro-XS
+    /// and therefore the Xe fixed point.  xe_updates/xe_cascades is the steps-per-
+    /// cascade the outer budget is actually being spent on; a statepoint whose
+    /// ratio collapses toward 1 is one whose late cascades are being starved.
+    long long xe_cascades          = 0;
+    /// Cascades that spent their step budget with the Xe change still above
+    /// XE_EQUILIBRIUM_TOLERANCE -- i.e. published a truncated Xe inventory.
+    long long xe_budget_exhausted  = 0;
     long long search_trials        = 0;  ///< committed AND applied trial points
     long long th_updates           = 0;
     long long flux_limit_retries   = 0;  ///< flux limit-cycle events ([WARN][flux])
@@ -196,6 +205,8 @@ struct Counters {
         solve_loops          += step.solve_loops;
         xe_updates           += step.xe_updates;
         xe_interim_updates   += step.xe_interim_updates;
+        xe_cascades          += step.xe_cascades;
+        xe_budget_exhausted  += step.xe_budget_exhausted;
         search_trials        += step.search_trials;
         th_updates           += step.th_updates;
         flux_limit_retries   += step.flux_limit_retries;
@@ -316,6 +327,17 @@ private:
     // a cap-exhausted, still-unconverged Xe state -- a different way to publish the wrong
     // inventory.
     static constexpr int    XE_EQUILIBRIUM_MAX_ITER_DAMPED = 200;
+    // XE_EQUILIBRIUM_MAX_ITER is spent by ONE counter shared by every Xe cascade in a
+    // SolveLoop, but a cascade restarts at every committed perturbation (a search trial
+    // point, a T/H update): the macro-XS moves, so the Xe fixed point moves with it and
+    // the iteration has to contract to 1e-6 all over again.  On a search-heavy statepoint
+    // the early cascades therefore eat the budget and the late ones are cut off
+    // mid-contraction -- and the inventory that gets PUBLISHED belongs to a late cascade.
+    // With RASBERY_XE_CASCADE_BUDGET set the counter is re-armed at each cascade start,
+    // and this multiple of the per-cascade budget becomes the SolveLoop-wide ceiling so a
+    // pathological deck still cannot spin forever.  Default off; the reset changes the
+    // iteration path, so it is a gated correctness fix pending Gate A/B validation.
+    static constexpr int    XE_CASCADE_TOTAL_MULTIPLIER = 10;
     // A trial point whose flux never satisfies the joint (delta-k, L2) test inside one full
     // outer budget is almost always a rod-cusping limit cycle: the fractional fine-cell blend
     // flips between two states, so the CMFD matrix alternates and the L2 residual parks at
@@ -365,6 +387,11 @@ private:
         /// members, never shared -- see the sptelem comment block.  Drive()
         /// re-arms it at every statepoint boundary; SolveLoop only increments.
         sptelem::Counters telemetry{};
+        /// Which statepoint SolveLoop is currently serving, for diagnostics only
+        /// (the [WARN][xe] cascade-starvation line).  Drive() stamps both at the
+        /// top of the schedule loop; nothing in the solve path reads them.
+        int    statepoint = 0;
+        double efpd       = 0.0;
     };
 
     // Flux-only re-convergence (CMFD/BiCGSTAB + nodal/CNCC + cusping), with every feedback
@@ -502,14 +529,35 @@ private:
         static const bool xe_interim_damp =
             std::getenv("RASBERY_XE_INTERIM_DAMP") != nullptr;
         double    xe_relax        = xe_interim_damp ? XE_DAMPED_RELAX : 1.0;
+        // Per-cascade Xe budget (RASBERY_XE_CASCADE_BUDGET, default off = exact old
+        // path).  See XE_CASCADE_TOTAL_MULTIPLIER for why one shared counter starves
+        // the late cascades of a search-heavy statepoint.
+        static const bool xe_cascade_budget = [] {
+            const char* value = std::getenv("RASBERY_XE_CASCADE_BUDGET");
+            if (value == nullptr) return false;
+            const std::string s(value);
+            return !(s.empty() || s == "0" || s == "off" || s == "OFF" ||
+                     s == "false" || s == "FALSE");
+        }();
         double prev_xe_change = std::numeric_limits<double>::infinity();
         int    xe_no_progress = 0;   // consecutive Xe steps that did not shrink
         int    xe_interim_count = 0; // loose-flux Xe steps (RASBERY_XE_INTERIM_L2)
+        // Settled Xe steps over the WHOLE SolveLoop.  xe_count is per-cascade once the
+        // gate is set, so this is what the safety ceiling is measured against; with the
+        // gate unset it is written but never read, and the old bound stands unchanged.
+        int    xe_total       = 0;
+        // One starvation charge per cascade.  With the gate unset there is exactly one
+        // cascade per SolveLoop, so this latches after the first event -- which is the
+        // pre-existing behaviour, just now counted.
+        bool   xe_cap_charged = false;
         SolveExit exit_reason = SolveExit::ITER_EXHAUSTED;
         // Telemetry only (plan Rev.4 Sec 8).  The cause of the segment the NEXT
         // outer belongs to; see the attribution rules in the sptelem comment.
         sptelem::Cause sp_cause = sptelem::CAUSE_INITIAL;
         ++ctx.telemetry.solve_loops;
+        // Entering the loop is itself a Xe cascade start: the inventory carried in was
+        // equilibrated against a different flux, so it has to re-converge from scratch.
+        if (has_eq_xe) ++ctx.telemetry.xe_cascades;
 
         if (has_search)
             schedule.ResetSearchExitStatus();
@@ -521,6 +569,7 @@ private:
         for (int iout = 0; iout < max_iter; ++iout) {
             bool stall_sample = false; // limit-cycle fall-through this outer
             bool th_fired     = false; // telemetry: T/H perturbed inside this outer
+            bool xe_restart   = false; // a commit below re-fires the Xe cascade
             const int xe_budget_probe = ga_feedback_passes > 0
                                             ? ga_feedback_passes
                                             : ((xe_relax < 1.0) ? XE_EQUILIBRIUM_MAX_ITER_DAMPED
@@ -592,7 +641,17 @@ private:
             // would freeze Xe long before it settles (measured: node power off
             // by 11% at tol=1e-4 with the shared counter).  Interim spins are
             // bounded separately at 10x the budget, under the global max_iter.
-            const bool xe_pending = has_eq_xe && xe_count < xe_budget_probe &&
+            //
+            // "Out of budget", in one place so the interim probe and the Xe step
+            // below can never disagree about it.  xe_count is per-cascade once
+            // RASBERY_XE_CASCADE_BUDGET is set, so the SolveLoop-wide ceiling on
+            // xe_total takes over as the safety bound there; with the gate unset the
+            // second term is not evaluated and this is exactly xe_count < xe_budget.
+            const int  xe_budget  = xe_budget_probe;
+            const bool xe_starved = xe_count >= xe_budget ||
+                                    (xe_cascade_budget &&
+                                     xe_total >= XE_CASCADE_TOTAL_MULTIPLIER * xe_budget);
+            const bool xe_pending = has_eq_xe && !xe_starved &&
                                     (xe_count + xe_interim_count == 0 ||
                                      prev_xe_change >= XE_EQUILIBRIUM_TOLERANCE);
             const bool xe_interim = xe_interim_l2 > 0.0 && xe_pending &&
@@ -633,11 +692,31 @@ private:
                 flux_stall = 0;
             }
 
+            // Starvation probe (telemetry, always on).  The cascade still has a change
+            // above tolerance but has no steps left, so every inventory published from
+            // here on -- including the one this statepoint writes out -- is a truncated,
+            // unconverged one.  Read at the top of the outer rather than at the step
+            // that spent the last unit, so a budget that has just doubled because the
+            // damper engaged is already reflected and cannot raise a false alarm.
+            if (has_eq_xe && !xe_cap_charged && xe_starved &&
+                prev_xe_change >= XE_EQUILIBRIUM_TOLERANCE) {
+                xe_cap_charged = true;
+                ++ctx.telemetry.xe_budget_exhausted;
+                // GA screening deliberately truncates the feedback passes, so the
+                // event is expected there and only the counter is wanted.
+                if (xe_cascade_budget && ga_feedback_passes == 0)
+                    std::cerr << std::format(
+                        "[RASBERY][WARN][xe] cascade budget exhausted at statepoint {} "
+                        "(EFPD {:.3f}): {} steps, last rel={:.3e} > tol {:.1e}; published "
+                        "Xe inventory is NOT converged\n",
+                        ctx.statepoint, ctx.efpd, xe_count, prev_xe_change,
+                        XE_EQUILIBRIUM_TOLERANCE);
+            }
+
             // 3. Equilibrium xenon feedback.  Previously equilibrium Xe was
             // only overwritten inside depletion, so a BOC STANDARD step
             // silently ran with zero Xe despite "xenon":"equilibrium".
-            const int xe_budget = xe_budget_probe;
-            if (has_eq_xe && xe_count < xe_budget &&
+            if (has_eq_xe && !xe_starved &&
                 (flux_converged || xe_interim || stall_sample)) {
                 const double xe_change =
                     ctx.cross_sections.UpdateEquilibriumXenon(schedule.thermalPower(), xe_relax);
@@ -650,6 +729,7 @@ private:
                     ++ctx.telemetry.xe_interim_updates;
                 } else {
                     ++xe_count;
+                    ++xe_total;
                     ++ctx.telemetry.xe_updates;
                 }
                 // Not contracting?  The undamped Xe<->flux map is limit-cycling rather than
@@ -750,6 +830,7 @@ private:
                 ++th_count;
                 ++ctx.telemetry.th_updates;
                 th_fired    = true;
+                xe_restart  = true; // new temperatures -> new Xe fixed point
                 sp_cause    = sptelem::CAUSE_TH;
                 clean_iters = 0;   // the cross sections just moved
                 if (trace_sl)
@@ -796,8 +877,28 @@ private:
                 // (see the sptelem comment) but is counted as ambiguous.
                 ++ctx.telemetry.search_trials;
                 if (th_fired) ++ctx.telemetry.th_search_coincident;
+                xe_restart  = true; // new boron / rod position -> new Xe fixed point
                 sp_cause    = sptelem::CAUSE_SEARCH;
                 clean_iters = 0;   // new trial point: the next sample must settle first
+            }
+
+            // Cascade boundary.  A committed AND APPLIED perturbation moved the
+            // macro-XS, so the Xe iteration that just converged is finished and a new
+            // one starts here -- the same two sites the SEARCH/TH attribution segments
+            // open at, because they are the same events.  A T/H step and a search step
+            // in the same outer are one restart, not two (the tie-break the sptelem
+            // comment describes).  Counting is unconditional; re-arming the budget is
+            // gated, since that is what changes the trajectory.
+            if (xe_restart && has_eq_xe) {
+                ++ctx.telemetry.xe_cascades;
+                // xe_interim_count is re-armed with it so the fresh cascade is allowed
+                // its first interim step: xe_pending's "nothing has fired yet" term
+                // reads the pair.  Interim spins stay bounded by max_iter.
+                if (xe_cascade_budget) {
+                    xe_count         = 0;
+                    xe_interim_count = 0;
+                    xe_cap_charged   = false;
+                }
             }
         }
 
@@ -1007,6 +1108,9 @@ public:
             const double step_dt        = schedule.time * 86400.0;
             cross_sections.SetPowerRate(power_fraction);
             efpd += schedule.time * power_fraction;
+            // Diagnostics only; see SolverContext.
+            ctx.statepoint = step_index + 1;
+            ctx.efpd       = efpd;
 
             int        total_outer = 0;
             int        total_th    = 0;
@@ -1151,10 +1255,18 @@ public:
                 // then includes whatever the other slots did meanwhile.  Say so
                 // rather than let the number be read as this deck's alone.
                 const bool shared = (sp_slot >= 0);
+                // Derived at print, never carried: the cascade resolution of the Xe
+                // budget.  Additive fields only, so schema_version stays 1.
+                const double xe_per_cascade =
+                    c.xe_cascades > 0
+                        ? static_cast<double>(c.xe_updates) / static_cast<double>(c.xe_cascades)
+                        : 0.0;
                 std::cout << std::format(
                     "[RASBERY][SPTELEM] {{\"schema_version\":1,\"job_id\":\"{}\",\"slot\":{},"
                     "\"statepoint\":{},\"efpd\":{:.4f},\"outers\":{},\"outers_attributed\":{},"
                     "\"outers_initial\":{},\"xe_updates\":{},\"xe_interim_updates\":{},"
+                    "\"xe_cascades\":{},\"xe_steps_per_cascade\":{:.3f},"
+                    "\"xe_budget_exhausted\":{},"
                     "\"xe_outers\":{},\"search_trials\":{},\"search_outers\":{},"
                     "\"th_updates\":{},\"th_outers\":{},\"settle_outers\":{},"
                     "\"fallback_outers\":{},\"th_search_coincident\":{},"
@@ -1166,7 +1278,8 @@ public:
                     "\"cusping\":{:.6f},\"upddhat\":{:.6f}}}}}\n",
                     sp_job_id, sp_slot, step_number, efpd, total_outer, c.outers(),
                     c.outers_by_cause[sptelem::CAUSE_INITIAL], c.xe_updates,
-                    c.xe_interim_updates, c.outers_by_cause[sptelem::CAUSE_XE],
+                    c.xe_interim_updates, c.xe_cascades, xe_per_cascade,
+                    c.xe_budget_exhausted, c.outers_by_cause[sptelem::CAUSE_XE],
                     c.search_trials, c.outers_by_cause[sptelem::CAUSE_SEARCH],
                     c.th_updates, c.outers_by_cause[sptelem::CAUSE_TH],
                     c.outers_by_cause[sptelem::CAUSE_SETTLE],
@@ -1230,10 +1343,16 @@ public:
         // T_startup stays a harness-level measurement.
         if (sp_telem) {
             const sptelem::Counters& c = sp_run;
+            const double xe_per_cascade =
+                c.xe_cascades > 0
+                    ? static_cast<double>(c.xe_updates) / static_cast<double>(c.xe_cascades)
+                    : 0.0;
             std::cout << std::format(
                 "[RASBERY][SPTELEM][SUMMARY] {{\"schema_version\":1,\"job_id\":\"{}\","
                 "\"slot\":{},\"statepoints\":{},\"outers\":{},\"outers_attributed\":{},"
                 "\"outers_initial\":{},\"xe_updates\":{},\"xe_interim_updates\":{},"
+                "\"xe_cascades\":{},\"xe_steps_per_cascade\":{:.3f},"
+                "\"xe_budget_exhausted\":{},"
                 "\"xe_outers\":{},\"search_trials\":{},\"search_outers\":{},"
                 "\"th_updates\":{},\"th_outers\":{},\"settle_outers\":{},"
                 "\"fallback_outers\":{},\"th_search_coincident\":{},"
@@ -1247,7 +1366,8 @@ public:
                 "\"upddhat\":{:.6f}}}}}\n",
                 sp_job_id, sp_slot, static_cast<int>(scheduler.schedule().size()),
                 c.outers_driver, c.outers(), c.outers_by_cause[sptelem::CAUSE_INITIAL],
-                c.xe_updates, c.xe_interim_updates, c.outers_by_cause[sptelem::CAUSE_XE],
+                c.xe_updates, c.xe_interim_updates, c.xe_cascades, xe_per_cascade,
+                c.xe_budget_exhausted, c.outers_by_cause[sptelem::CAUSE_XE],
                 c.search_trials, c.outers_by_cause[sptelem::CAUSE_SEARCH],
                 c.th_updates, c.outers_by_cause[sptelem::CAUSE_TH],
                 c.outers_by_cause[sptelem::CAUSE_SETTLE],

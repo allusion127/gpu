@@ -3905,6 +3905,17 @@ void XSSet::CorrectorStep(double dt, double power, bool xe_transient) {
         const int   k = (m != nullptr) ? std::atoi(m) : 1;
         return std::clamp(k, 1, 64);
     }();
+    // RASBERY_PC_XE_EQUILIBRIUM_FIX: restore the Xe fixed-point property that the
+    // Eq. (6.20) density average destroys.  See the block at the end of the node
+    // loop.  Opt-in for now -- with the gate unset the corrector is byte-for-byte
+    // the old one -- and it does nothing outside decart mode or with transient Xe.
+    static const bool pcXeEquilibriumFix = []() {
+        const char* m = std::getenv("RASBERY_PC_XE_EQUILIBRIUM_FIX");
+        if (m == nullptr) return false;
+        const std::string s(m);
+        return !(s.empty() || s == "0" || s == "off" || s == "OFF" ||
+                 s == "false" || s == "FALSE");
+    }();
 
     const int           nxyz           = _g.nxyz();
     const int           ng             = _g.ng();
@@ -3954,12 +3965,17 @@ void XSSet::CorrectorStep(double dt, double power, bool xe_transient) {
             for (size_t i = 0; i < niso; ++i)
                 ws_tls.iden[i] = _iden_bos[i * nxyz_size + node];
 
+            // The corrector half's own one-group flux scale, kept where the Eq. (6.20)
+            // average below can still see it (both branches scope theirs privately).
+            double xe_sumflux = 0.0;
+
             if (pcSubsteps == 1) {
                 double raw_sumflux = 0.0;
                 for (int ig = 0; ig < ng; ++ig)
                     raw_sumflux += corrected_flux_tls[ig];
                 const double invflux           = (raw_sumflux > 0.0) ? 1.0 / raw_sumflux : 0.0;
                 const double corrected_sumflux = FluxScale(corrected_flux_tls.data(), ng);
+                xe_sumflux                     = corrected_sumflux;
 
                 for (size_t iso = 0; iso < niso; ++iso) {
                     double* dst = ws_tls.condensed.data() + iso * N_XS_SCALAR;
@@ -4027,6 +4043,7 @@ void XSSet::CorrectorStep(double dt, double power, bool xe_transient) {
                 }
 
                 // Xe equilibrium at the final (EOS-nearest) substep rates.
+                xe_sumflux = last_sumflux;
                 if (!xe_transient)
                     ApplyXeEquilibrium(ws_tls.iden, ws_tls.condensed, last_sumflux);
             }
@@ -4038,6 +4055,34 @@ void XSSet::CorrectorStep(double dt, double power, bool xe_transient) {
                 const double n_corr = ws_tls.iden[i];
                 _iden[i * nxyz_size + node] =
                     pcDensityAverage ? 0.5 * (_iden[i * nxyz_size + node] + n_corr) : n_corr;
+            }
+
+            // The average above ran over EVERY row from iI135 up, the three
+            // equilibrium-Xe rows included -- and both halves had already been put on
+            // their own Xe equilibrium (the predictor inside Deplete, the corrector
+            // just above).  The average of two fixed points is not a fixed point: the
+            // published I-135/Xe-135/Xe-135m come out off the equilibrium of the
+            // published (averaged) actinide inventory by roughly half the step's Xe
+            // swing, so the next SolveLoop opens its re-convergence cascade two orders
+            // of magnitude from the 1e-6 tolerance and spends about twice the Picard
+            // steps walking back to a point the corrector had already reached.
+            //
+            // Re-solve the equilibrium on the AVERAGED inventory.  ApplyXeEquilibrium
+            // is an explicit formula in the actinide densities, the condensed
+            // one-group XS and the flux scale -- no iteration, and nothing here that
+            // CorrectorStep does not already hold: ws_tls.condensed still carries the
+            // corrector half's rates and xe_sumflux its flux scale, which are exactly
+            // the rates the averaged burnup is about to be reconstructed at.  The
+            // actinide rows are all >= iI135, so copying the averaged tail back into
+            // ws_tls.iden gives the formula the published state it must be consistent
+            // with; only the three Xe-chain rows are written back.
+            if (pcXeEquilibriumFix && pcDensityAverage && !xe_transient) {
+                for (size_t i = iI135; i < niso; ++i)
+                    ws_tls.iden[i] = _iden[i * nxyz_size + node];
+                ApplyXeEquilibrium(ws_tls.iden, ws_tls.condensed, xe_sumflux);
+                _iden[iI135 * nxyz_size + node]   = ws_tls.iden[iI135];
+                _iden[iXe135 * nxyz_size + node]  = ws_tls.iden[iXe135];
+                _iden[iXe135m * nxyz_size + node] = ws_tls.iden[iXe135m];
             }
 
             _burn[l] = _burn_bos[l];

@@ -128,6 +128,29 @@ for anchor, counter, span in (
     if f"ctx.telemetry.{counter}" not in solve_loop[i:i + span]:
         fail(f"{counter} is not incremented at its perturbation site ({anchor!r})")
 
+# Cascade resolution.  A Xe cascade starts on entry and again at every committed
+# perturbation, so xe_cascades is charged at exactly those two sites; the budget
+# re-arm that changes the iteration path stays behind its own cached env gate.
+if solve_loop.count("++ctx.telemetry.xe_cascades;") != 2:
+    fail("xe_cascades must be charged exactly twice: SolveLoop entry and the "
+         "cascade-restart site after a committed perturbation")
+if DRIVER.count('std::getenv("RASBERY_XE_CASCADE_BUDGET")') != 1:
+    fail("the per-cascade Xe budget must be read through exactly one cached gate")
+if "static const bool xe_cascade_budget" not in solve_loop:
+    fail("the per-cascade Xe budget gate is not cached in a static bool")
+if not re.search(r"if \(xe_cascade_budget\) \{\s*\n\s*xe_count\s*=\s*0;", solve_loop):
+    fail("the per-cascade Xe counter re-arm is not gated on xe_cascade_budget; "
+         "feature-off would not be byte-golden")
+# One definition of "out of budget", shared by the interim probe, the Xe step and
+# the starvation charge, so no gated ceiling can block one of them but not another.
+if solve_loop.count("const bool xe_starved =") != 1:
+    fail("the Xe budget test is not defined once as xe_starved")
+if solve_loop.count("!xe_starved") != 2:
+    fail("xe_starved must gate exactly the interim probe and the Xe step")
+exhausted = solve_loop.find("++ctx.telemetry.xe_budget_exhausted;")
+if exhausted < 0 or "xe_starved &&" not in solve_loop[max(0, exhausted - 400):exhausted]:
+    fail("xe_budget_exhausted is not charged at the budget-starvation test")
+
 # ---------------------------------------------------------------------------
 # 5. Print sites: one per statepoint at the statepoint boundary, one per run.
 # ---------------------------------------------------------------------------
@@ -171,6 +194,9 @@ REQUIRED = (
     "th_updates", "th_outers", "settle_outers", "flux_limit_retries",
     "cmfd_sweeps", "bicg_iters", "graph_launches_delta", "h2d_bytes_delta",
     "d2h_bytes_delta", "phase_wall",
+    # Cascade resolution of the Xe budget.  Additive, so schema_version stays 1:
+    # a consumer that predates them still parses every field it knows.
+    "xe_cascades", "xe_steps_per_cascade", "xe_budget_exhausted",
 )
 step_block = drive[step_print:drive.index(");", step_print)]
 missing = [f for f in REQUIRED if f'"{f}"' not in step_block.replace('\\"', '"')]
@@ -182,7 +208,8 @@ if '"schema_version\\":1' not in step_block:
 summary_block = drive[summary:drive.index(");", summary)]
 for field in ("schema_version", "job_id", "statepoints", "outers", "xe_updates",
               "search_trials", "th_updates", "cmfd_sweeps", "bicg_iters",
-              "t_fixed", "library_seconds", "phase_wall"):
+              "t_fixed", "library_seconds", "phase_wall",
+              "xe_cascades", "xe_steps_per_cascade", "xe_budget_exhausted"):
     if f'"{field}"' not in summary_block.replace('\\"', '"'):
         fail(f"run summary missing {field!r} (Sec 8.1 wants totals + a T_fixed estimate)")
 
