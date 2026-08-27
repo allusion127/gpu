@@ -154,6 +154,14 @@ struct Counters {
     /// Cascades that spent their step budget with the Xe change still above
     /// XE_EQUILIBRIUM_TOLERANCE -- i.e. published a truncated Xe inventory.
     long long xe_budget_exhausted  = 0;
+    /// RASBERY_XE_MODE=once only.  Steps beyond the cascade's first, i.e. the damped
+    /// trust-region steps bought by a step that overshot XE_ONCE_TRUST; zero on a run
+    /// whose cascades all land inside the trust region on their first step.
+    long long xe_once_extra_steps  = 0;
+    /// RASBERY_XE_MODE=once only.  Steps whose RAW relative change exceeded
+    /// XE_ONCE_TRUST.  Counted at the cap too, so a cascade that ran out of steps
+    /// while still outside the region is visible as trips == XE_ONCE_MAX_STEPS.
+    long long xe_once_trust_trips  = 0;
     long long search_trials        = 0;  ///< committed AND applied trial points
     long long th_updates           = 0;
     long long flux_limit_retries   = 0;  ///< flux limit-cycle events ([WARN][flux])
@@ -208,6 +216,8 @@ struct Counters {
         xe_interim_updates   += step.xe_interim_updates;
         xe_cascades          += step.xe_cascades;
         xe_budget_exhausted  += step.xe_budget_exhausted;
+        xe_once_extra_steps  += step.xe_once_extra_steps;
+        xe_once_trust_trips  += step.xe_once_trust_trips;
         search_trials        += step.search_trials;
         th_updates           += step.th_updates;
         flux_limit_retries   += step.flux_limit_retries;
@@ -318,14 +328,29 @@ inline void report(std::ostream& out) {
 // failures are structurally out of reach while nearly all of the cascade
 // multiplicity -- which is where the outer budget goes -- is still retired.
 //
-// WHAT once IS NOT.  It is still not the equilibrium fixed point: one Picard
-// step from a moved macro-XS state lands near it, not on it, so results move
-// at the pcm level and this is a campaign mode compared against the exact run,
-// never an acceptance path.  The damper and the interim-flux probe are both
-// bypassed -- a single undamped step per segment cannot limit-cycle, so there
-// is nothing for the oscillation detector to detect, and the interim probe
-// exists to spend cascade steps on a loose flux, which is the opposite of what
-// this mode does.
+// BOUNDED STEPS, NOT ONE STEP.  The first cut of the mode took literally one
+// UNDAMPED step per segment, and that was measured to be unsafe on exactly the
+// decks it was built for: a restart deck arrives far from its current-flux
+// equilibrium, so the single step covered the WHOLE distance at once and handed
+// the converged flux an absorption-XS jolt it could not absorb -- 17 of 64
+// i-SMR CY02 restart jobs at M64 died in the following re-convergence with a
+// non-finite BiCGSTAB iterate, each at a different statepoint.  Equilibrium
+// mode survives the same distance because it crosses it in many small damped
+// steps.  So what a segment is capped at is the step SIZE, not just the count:
+// a step whose raw relative change exceeds XE_ONCE_TRUST buys the cascade
+// another, damped step (XE_ONCE_MAX_STEPS total), each followed by the usual
+// flux re-convergence, and the first cascade of a restart's first statepoint --
+// the one with no earlier step to measure -- is damped up front.  A mid-cycle
+// cascade lands inside the trust region on its first step and still costs
+// exactly one.
+//
+// WHAT once IS NOT.  It is still not the equilibrium fixed point: one to three
+// Picard steps from a moved macro-XS state land near it, not on it, so results
+// move at the pcm level and this is a campaign mode compared against the exact
+// run, never an acceptance path.  The oscillation damper and the interim-flux
+// probe are both bypassed -- the mode sizes its own steps, so the damper has
+// nothing left to decide, and the interim probe exists to spend cascade steps
+// on a loose flux, which is the opposite of what this mode does.
 //
 // WHY.  Measured on KNGR CY1: 17,564 of 21,271 outer iterations (82.6 %) were
 // Xe-update reconvergence cascades.  Retiring them is the single largest lever
@@ -374,8 +399,9 @@ inline XeMode xeMode() {
 /// True when the in-core Xe<->flux fixed-point iteration is switched off.
 inline bool xeFrozen() { return xeMode() == XeMode::FROZEN; }
 
-/// True when the iteration still runs but every cascade is capped at one
-/// undamped step.  Deliberately NOT folded into xeFrozen(): frozen mode's
+/// True when the iteration still runs but every cascade is bounded: at most
+/// XE_ONCE_MAX_STEPS steps, sized so no one of them moves the inventory by more
+/// than the trust region.  Deliberately NOT folded into xeFrozen(): frozen mode's
 /// short-circuit (has_eq_xe) must stay a frozen-only property, because once
 /// mode needs every arm of the machinery that gate feeds.
 inline bool xeOnce() { return xeMode() == XeMode::ONCE; }
@@ -431,6 +457,28 @@ private:
     static constexpr int    XE_OSCILLATION_STREAK = 3;
     static constexpr double XE_OSCILLATION_FLOOR  = 100.0 * XE_EQUILIBRIUM_TOLERANCE;
     static constexpr double XE_DAMPED_RELAX       = 0.5;
+    // RASBERY_XE_MODE=once caps the step COUNT per cascade; these two cap the step
+    // SIZE, which is what actually has to be bounded.
+    //
+    // The count cap alone was measured to be unsafe.  A restart deck arrives with an
+    // inventory equilibrated against a DIFFERENT flux, so the distance to the
+    // current-flux equilibrium is large; one undamped step covers all of it at once
+    // and hands a converged flux a correspondingly large absorption-XS jolt.  On the
+    // i-SMR CY02 restart set at M64, 17 of 64 jobs then died in the following flux
+    // re-convergence with a non-finite BiCGSTAB residual, at a different statepoint in
+    // each deck.  Equilibrium mode covered the same distance safely because it covered
+    // it in many small damped steps.
+    //
+    // So: a step whose RAW (pre-damping, see UpdateEquilibriumXenon) relative change
+    // exceeds XE_ONCE_TRUST is a step the flux is not trusted to absorb, and the
+    // cascade is allowed up to XE_ONCE_MAX_STEPS total, the extras damped, each
+    // followed by the usual flux re-convergence.  The stopping test is the trust
+    // threshold, NOT XE_EQUILIBRIUM_TOLERANCE: the mode is bounding shock, not
+    // converging the fixed point -- that is still equilibrium mode's job.  A typical
+    // mid-cycle cascade lands well inside the trust region on its first step and the
+    // one-step fast path is exactly what it was.
+    static constexpr int    XE_ONCE_MAX_STEPS = 3;
+    static constexpr double XE_ONCE_TRUST     = 0.10;
     // A damped iteration legitimately needs about twice the steps for the same contraction,
     // so it gets about twice the budget.  Without this the damping trades a limit cycle for
     // a cap-exhausted, still-unconverged Xe state -- a different way to publish the wrong
@@ -636,11 +684,13 @@ private:
         // was: !schedule.xenon_transient.
         const bool   has_eq_xe      = !schedule.xenon_transient && !xeFrozen();
         // RASBERY_XE_MODE=once keeps has_eq_xe -- it needs the cascade
-        // counters, the step itself and the cascade re-arm -- and caps each
-        // cascade at one undamped step instead.  This is the only place the
-        // mode is read (xeOnce() is a cached lookup of an env var resolved once
-        // per process), and every once-specific term below short-circuits on
-        // it, so an unset variable leaves all of them exactly what they were.
+        // counters, the step itself and the cascade re-arm -- and bounds each
+        // cascade instead: at most XE_ONCE_MAX_STEPS steps, and the extras
+        // damped, so no single step can hand the converged flux a shock bigger
+        // than the trust region.  This is the only place the mode is read
+        // (xeOnce() is a cached lookup of an env var resolved once per
+        // process), and every once-specific term below short-circuits on it, so
+        // an unset variable leaves all of them exactly what they were.
         const bool   xe_once_mode   = xeOnce();
         // Optional multi-fidelity GA screening mode.  A positive value limits
         // the expensive Xe and T/H fixed-point feedback passes, while the
@@ -735,11 +785,12 @@ private:
         // kick the axial Xe map into another basin.  Default off.
         static const bool xe_interim_damp =
             std::getenv("RASBERY_XE_INTERIM_DAMP") != nullptr;
-        // ONCE mode is undamped by definition: relax rescales the applied step
-        // of an ITERATION, and one step per segment is not an iteration.  A
-        // damped single step would simply publish half of the equilibrium move
-        // and call it the segment's answer, so the companion knob is ignored
-        // there and the damper below is switched off with it.
+        // ONCE mode sizes every step itself, at the step (see xe_once_full), so
+        // neither this companion knob nor the oscillation damper below may touch
+        // its relax: the knob would damp a step the trust region has already
+        // decided should be full, and the damper's streak is assembled out of
+        // single steps taken against DIFFERENT macro-XS states, which is not a
+        // limit cycle.  Both are switched off in the mode.
         double    xe_relax        = (xe_interim_damp && !xe_once_mode)
                                         ? XE_DAMPED_RELAX
                                         : 1.0;
@@ -753,6 +804,17 @@ private:
             return !(s.empty() || s == "0" || s == "off" || s == "OFF" ||
                      s == "false" || s == "FALSE");
         }();
+        // ONCE mode's trust region (RASBERY_XE_ONCE_TRUST, default XE_ONCE_TRUST):
+        // the largest RAW relative Xe change a single step is trusted to hand the
+        // converged flux.  Cached in a function-local static like every other knob
+        // here, so the loop never reaches getenv, and read only under xe_once_mode.
+        // A non-positive or unparsable override would make every step a trip and
+        // spend the cap on every cascade, so it falls back to the default instead.
+        static const double xe_once_trust = [] {
+            const char*  value = std::getenv("RASBERY_XE_ONCE_TRUST");
+            const double t     = (value != nullptr) ? std::atof(value) : XE_ONCE_TRUST;
+            return (t > 0.0) ? t : XE_ONCE_TRUST;
+        }();
         double prev_xe_change = std::numeric_limits<double>::infinity();
         int    xe_no_progress = 0;   // consecutive Xe steps that did not shrink
         int    xe_interim_count = 0; // loose-flux Xe steps (RASBERY_XE_INTERIM_L2)
@@ -764,13 +826,29 @@ private:
         // cascade per SolveLoop, so this latches after the first event -- which is the
         // pre-existing behaviour, just now counted.
         bool   xe_cap_charged = false;
-        // ONCE mode: has this cascade already spent its single Xe step?  Cleared
-        // at the three cascade starts -- SolveLoop entry (this initializer) and
-        // the T/H and search commits, the same sites the cascade counter and the
+        // ONCE mode, per-cascade state.  All three are cleared at the three cascade
+        // starts -- SolveLoop entry (these initializers) and the T/H and search
+        // commits, the same sites the cascade counter and the
         // RASBERY_XE_CASCADE_BUDGET re-arm use, because they are the same events.
-        // Written unconditionally and read only under xe_once_mode, so the
-        // default path gains a dead store and nothing else.
-        bool   xe_once_fired  = false;
+        // Written unconditionally and read only under xe_once_mode, so the default
+        // path gains three dead stores and nothing else.
+        //
+        // xe_once_steps: Xe steps this cascade has spent (cap XE_ONCE_MAX_STEPS).
+        // xe_once_done:  the cascade's allowance is closed -- either the last step
+        //                landed inside the trust region, or the cap is spent.  This
+        //                is the term on the step gate, exactly where the one-step
+        //                cap used to sit.
+        int    xe_once_steps  = 0;
+        bool   xe_once_done   = false;
+        // The FIRST cascade of a primed statepoint (the first statepoint of a
+        // restart/shuffle cycle, primeXeDamping) is the one that arrives farthest
+        // from the current-flux equilibrium -- the pool has decayed the inventory,
+        // or the shuffle has moved it to a different flux.  There is no earlier step
+        // to measure that distance, so the trust region cannot bound step one after
+        // the fact; damp it up front instead, the same intent primeXeDamping already
+        // carries for the equilibrium iteration.  Cleared at the cascade re-arm, so
+        // every later cascade starts at a full step again.
+        bool   xe_once_prime  = primeXeDamping;
         SolveExit exit_reason = SolveExit::ITER_EXHAUSTED;
         // Telemetry only (plan Rev.4 Sec 8).  The cause of the segment the NEXT
         // outer belongs to; see the attribution rules in the sptelem comment.
@@ -942,12 +1020,27 @@ private:
             // only overwritten inside depletion, so a BOC STANDARD step
             // silently ran with zero Xe despite "xenon":"equilibrium".
             // ONCE mode's cap lives here, as one term on the gate the step
-            // already hangs off: `(!xe_once_mode || !xe_once_fired)` is
-            // identically true with the mode unset, and in the mode it lets
-            // exactly one step through per cascade, with no test on the Xe
-            // residual -- the single Picard step is the segment's answer.
-            if (has_eq_xe && !xe_starved && (!xe_once_mode || !xe_once_fired) &&
+            // already hangs off: `(!xe_once_mode || !xe_once_done)` is
+            // identically true with the mode unset, and in the mode it lets a
+            // cascade through until the trust-region block below closes it --
+            // one step when that step lands inside the region, at most
+            // XE_ONCE_MAX_STEPS when it does not.  The gate carries no test on
+            // the Xe residual: XE_EQUILIBRIUM_TOLERANCE is not what this mode
+            // is chasing.
+            if (has_eq_xe && !xe_starved && (!xe_once_mode || !xe_once_done) &&
                 (flux_converged || xe_interim || stall_sample)) {
+                // ONCE sizes THIS step, here, because the size is per-step and
+                // not per-iteration: a full step unless the trust region has
+                // already been breached this cascade (xe_once_steps > 0) or the
+                // cascade is the primed one that cannot be measured first.
+                // Both writes are unreachable with the mode unset, so xe_relax
+                // reaches the call exactly as the damper left it.  The one other
+                // reader of xe_relax is xe_budget_probe, which hands a damped
+                // solve the larger XE_EQUILIBRIUM_MAX_ITER_DAMPED budget: a once
+                // cascade that had to damp buys the same loosening, which is the
+                // safe direction and is nowhere near binding at a cap of three.
+                const bool xe_once_full = xe_once_mode && xe_once_steps == 0 && !xe_once_prime;
+                if (xe_once_mode) xe_relax = xe_once_full ? 1.0 : XE_DAMPED_RELAX;
                 const double xe_change =
                     ctx.cross_sections.UpdateEquilibriumXenon(schedule.thermalPower(), xe_relax);
                 // An Xe step moves the macro-XS whatever it returns, so it opens
@@ -962,8 +1055,23 @@ private:
                     ++xe_total;
                     ++ctx.telemetry.xe_updates;
                 }
-                // This cascade has now spent its ONCE step.  See xe_once_fired.
-                xe_once_fired = true;
+                // ONCE mode's trust region.  UpdateEquilibriumXenon returns the RAW,
+                // PRE-damping relative change (XSSet.cpp measures |new-old|/|new| off
+                // the undamped Picard image and only then blends by relax; the GPU
+                // kernel in XsReconKernel.h does the same, in the same order), so
+                // xe_change is the distance to the current-flux equilibrium whatever
+                // relax this step was applied with -- which is exactly the shock a
+                // full step would have delivered.  Bound THAT, not the residual:
+                // stop the cascade as soon as a step lands inside the region, and
+                // otherwise buy one more damped step, up to the hard cap.
+                if (xe_once_mode) {
+                    const bool xe_once_extra = xe_once_steps > 0;
+                    ++xe_once_steps;
+                    if (xe_once_extra) ++ctx.telemetry.xe_once_extra_steps;
+                    const bool xe_once_trip = xe_change > xe_once_trust;
+                    if (xe_once_trip) ++ctx.telemetry.xe_once_trust_trips;
+                    xe_once_done = !xe_once_trip || xe_once_steps >= XE_ONCE_MAX_STEPS;
+                }
                 // Not contracting?  The undamped Xe<->flux map is limit-cycling rather than
                 // converging.  Measured on APR1400 cy01 at 195-225 EFPD: [XE] rel bounces
                 // between 8e-x and 11e-x for 80+ iterations, eigv swinging +-30 pcm, until
@@ -992,7 +1100,14 @@ private:
                 if (trace_sl)
                     std::cout << std::format("        [XE] it={} rel={:.3e} eigv={:.6f}\n",
                                              xe_count, xe_change, eigv);
-                if (xe_change >= XE_EQUILIBRIUM_TOLERANCE) {
+                // The second term is ONCE mode's: a cascade the trust region has
+                // left open owes its next step a re-converged flux, and that has
+                // to hold even for a RASBERY_XE_ONCE_TRUST set below the
+                // equilibrium tolerance, where the first term would not fire.
+                // It short-circuits on xe_once_mode, so with the mode unset this
+                // is exactly `xe_change >= XE_EQUILIBRIUM_TOLERANCE` and only that
+                // is evaluated.
+                if (xe_change >= XE_EQUILIBRIUM_TOLERANCE || (xe_once_mode && !xe_once_done)) {
                     // Cross sections changed; re-converge the flux before
                     // taking a search or T/H feedback step.
                     prev_inner  = eigv + 1.0;
@@ -1127,12 +1242,19 @@ private:
             // gated, since that is what changes the trajectory.
             if (xe_restart && has_eq_xe) {
                 ++ctx.telemetry.xe_cascades;
-                // The fresh cascade gets its ONCE step: the macro-XS just moved,
-                // so the inventory equilibrated against the previous state is
-                // stale and one step against the new one is exactly what this
-                // mode owes the segment.  Unconditional; only read under
-                // xe_once_mode, so the default path is unchanged.
-                xe_once_fired = false;
+                // The fresh cascade gets its own ONCE allowance: the macro-XS just
+                // moved, so the inventory equilibrated against the previous state is
+                // stale and a step against the new one is what this mode owes the
+                // segment.  The step count and the trust latch reset together -- a
+                // cascade that hit XE_ONCE_MAX_STEPS must not carry the cap into the
+                // next one -- and the prime flag is spent here, because after a
+                // committed perturbation the inventory is no longer the far-off one
+                // the deck handed over and the trust region can measure the distance
+                // for itself.  Unconditional; only read under xe_once_mode, so the
+                // default path is unchanged.
+                xe_once_steps = 0;
+                xe_once_done  = false;
+                xe_once_prime = false;
                 // xe_interim_count is re-armed with it so the fresh cascade is allowed
                 // its first interim step: xe_pending's "nothing has fired yet" term
                 // reads the pair.  Interim spins stay bounded by max_iter.
@@ -1519,6 +1641,7 @@ public:
                     "\"xe_updates\":{},\"xe_interim_updates\":{},"
                     "\"xe_cascades\":{},\"xe_steps_per_cascade\":{:.3f},"
                     "\"xe_budget_exhausted\":{},"
+                    "\"xe_once_extra_steps\":{},\"xe_once_trust_trips\":{},"
                     "\"xe_outers\":{},\"search_trials\":{},\"search_outers\":{},"
                     "\"th_updates\":{},\"th_outers\":{},\"settle_outers\":{},"
                     "\"fallback_outers\":{},\"th_search_coincident\":{},"
@@ -1531,7 +1654,8 @@ public:
                     sp_job_id, sp_slot, step_number, efpd, total_outer, c.outers(),
                     c.outers_by_cause[sptelem::CAUSE_INITIAL], xeModeName(),
                     c.xe_updates, c.xe_interim_updates, c.xe_cascades, xe_per_cascade,
-                    c.xe_budget_exhausted, c.outers_by_cause[sptelem::CAUSE_XE],
+                    c.xe_budget_exhausted, c.xe_once_extra_steps, c.xe_once_trust_trips,
+                    c.outers_by_cause[sptelem::CAUSE_XE],
                     c.search_trials, c.outers_by_cause[sptelem::CAUSE_SEARCH],
                     c.th_updates, c.outers_by_cause[sptelem::CAUSE_TH],
                     c.outers_by_cause[sptelem::CAUSE_SETTLE],
@@ -1606,6 +1730,7 @@ public:
                 "\"xe_updates\":{},\"xe_interim_updates\":{},"
                 "\"xe_cascades\":{},\"xe_steps_per_cascade\":{:.3f},"
                 "\"xe_budget_exhausted\":{},"
+                "\"xe_once_extra_steps\":{},\"xe_once_trust_trips\":{},"
                 "\"xe_outers\":{},\"search_trials\":{},\"search_outers\":{},"
                 "\"th_updates\":{},\"th_outers\":{},\"settle_outers\":{},"
                 "\"fallback_outers\":{},\"th_search_coincident\":{},"
@@ -1621,7 +1746,8 @@ public:
                 c.outers_driver, c.outers(), c.outers_by_cause[sptelem::CAUSE_INITIAL],
                 xeModeName(), c.xe_updates, c.xe_interim_updates, c.xe_cascades,
                 xe_per_cascade,
-                c.xe_budget_exhausted, c.outers_by_cause[sptelem::CAUSE_XE],
+                c.xe_budget_exhausted, c.xe_once_extra_steps, c.xe_once_trust_trips,
+                c.outers_by_cause[sptelem::CAUSE_XE],
                 c.search_trials, c.outers_by_cause[sptelem::CAUSE_SEARCH],
                 c.th_updates, c.outers_by_cause[sptelem::CAUSE_TH],
                 c.outers_by_cause[sptelem::CAUSE_SETTLE],

@@ -3,7 +3,7 @@
 
 The modes are a runtime switch on a GPU solver, so the properties that make them
 safe cannot be observed from a Python test run -- they have to be checked in the
-source.  Seven things are guarded here:
+source.  Eight things are guarded here:
 
   1. BYTE-GOLDENNESS.  With RASBERY_XE_MODE unset (or `equilibrium`) the solver
      path must be what it was: the env var is read exactly once, cached in a
@@ -27,15 +27,26 @@ source.  Seven things are guarded here:
      the depletion rates stay gated on the deck's `xe_transient` alone, and
      nothing in XSSet knows the modes exist.  Sm-149 has no in-core equilibrium
      to freeze -- if one is ever added, this test fails on purpose.
-  6. ONCE = ONE STEP PER CASCADE.  `xe_once_fired` is set by the Xe step, gates
-     the Xe step, and is cleared at exactly the three cascade starts the
+  6. ONCE = A BOUNDED CASCADE.  `xe_once_done` gates the Xe step, is set by the
+     trust-region block that closes the cascade, and is cleared -- together with
+     the step count and the prime flag -- at exactly the three cascade starts the
      cascade counter itself opens a segment at (SolveLoop entry, T/H commit,
-     search commit).  The cap carries no test on the Xe residual: one Picard
-     step per segment, accepted as it stands.
-  7. ONCE HAS NO DAMPER AND NO INTERIM PATH.  A single undamped step cannot
-     limit-cycle, so both the oscillation damper and the RASBERY_XE_INTERIM_*
-     probe -- including the RASBERY_XE_INTERIM_DAMP primer that would start the
-     step at relax=0.5 -- must be unreachable in the mode.
+     search commit).  The gate carries no test on the Xe residual: the mode is
+     bounding the shock a step hands the flux, not converging the fixed point.
+  7. ONCE BOUNDS THE STEP SIZE, NOT JUST THE COUNT.  The count cap alone was
+     measured to kill 17 of 64 i-SMR CY02 restart jobs at M64 with a non-finite
+     BiCGSTAB iterate: one undamped step covered the whole distance to the
+     current-flux equilibrium and the flux could not absorb it.  So the cap is
+     XE_ONCE_MAX_STEPS (<= 3), a step whose RAW change exceeds the cached
+     RASBERY_XE_ONCE_TRUST region buys the next one damped, the first cascade of
+     a primed (restart/shuffle first) statepoint is damped up front because
+     nothing has measured its distance yet, and every extra step goes back
+     through the flux re-convergence `continue`.  The oscillation damper and the
+     RASBERY_XE_INTERIM_* probe -- including the RASBERY_XE_INTERIM_DAMP primer
+     -- stay unreachable: the mode sizes its own steps.
+  8. ONCE TELEMETRY.  The extra damped steps and the trust trips are counted, in
+     the gated region, and published by both SPTELEM receipts with the format
+     placeholders and the argument list still in step.
 """
 from __future__ import annotations
 
@@ -342,8 +353,8 @@ for sm in ("iSm149", "iPm149"):
              "treatment, and RASBERY_XE_MODE=frozen must be extended to hold it")
 
 # ---------------------------------------------------------------------------
-# 7. ONCE mode: one undamped step per cascade, cleared at the three cascade
-#    starts, with no damper and no interim path reachable.
+# 6/7. ONCE mode: a cascade bounded in step COUNT and step SIZE, re-armed at the
+#      three cascade starts, with no damper and no interim path reachable.
 # ---------------------------------------------------------------------------
 ONCE_GATE = "const bool   xe_once_mode   = xeOnce();"
 if ONCE_GATE not in SOLVE_LOOP:
@@ -360,44 +371,149 @@ for after in ("ctx.cmfd_solver.resetIteration();", "++ctx.telemetry.solve_loops;
              "behaviour change")
 
 # The cap: one term on the gate the step already hangs off, and no test on the
-# Xe residual anywhere in it -- one Picard step per segment, accepted as-is.
-STEP_GATE = ("if (has_eq_xe && !xe_starved && (!xe_once_mode || !xe_once_fired) &&\n"
+# Xe residual anywhere in it -- the mode bounds the shock, not the fixed point.
+STEP_GATE = ("if (has_eq_xe && !xe_starved && (!xe_once_mode || !xe_once_done) &&\n"
              "                (flux_converged || xe_interim || stall_sample)) {")
 if STEP_GATE not in SOLVE_LOOP:
-    fail("the Xe step gate does not carry `(!xe_once_mode || !xe_once_fired)`; the cap "
+    fail("the Xe step gate does not carry `(!xe_once_mode || !xe_once_done)`; the cap "
          "must be one term on the existing gate, not a second branch")
 if "XE_EQUILIBRIUM_TOLERANCE" in STEP_GATE:
-    fail("the once cap tests the Xe residual; the single step is accepted as it stands")
+    fail("the once cap tests the Xe residual; XE_EQUILIBRIUM_TOLERANCE is equilibrium "
+         "mode's stopping test, not this one's")
 
-# The flag: declared false at SolveLoop entry (cascade start 1), set by the
-# step, cleared at the commit re-arm (cascade starts 2 and 3 -- T/H and search
-# are one restart, the tie-break the sptelem comment describes).
-if "bool   xe_once_fired  = false;" not in SOLVE_LOOP:
-    fail("xe_once_fired is not initialised false at SolveLoop entry, which IS the first "
-         "cascade start")
-if SOLVE_CODE.count("xe_once_fired = true;") != 1:
-    fail("xe_once_fired must be set in exactly one place: the Xe step that spends it")
-set_at = SOLVE_LOOP.index("xe_once_fired = true;")
-step_at = SOLVE_LOOP.index("UpdateEquilibriumXenon(")
-if set_at < step_at:
-    fail("xe_once_fired is set before the Xe step it accounts for")
-if SOLVE_LOOP.rfind(STEP_GATE, 0, set_at) < 0:
-    fail("xe_once_fired is set outside the gated Xe step")
-if SOLVE_CODE.count("xe_once_fired = false;") != 1:
-    fail("xe_once_fired must be cleared in exactly one place inside the loop: the cascade "
-         "re-arm.  SolveLoop entry is the declaration; T/H and search commits share the "
-         "re-arm because they are one restart, not two")
+# --- The constants.  The count cap is small and hard; the trust region is the
+# --- step-SIZE bound the M64 restart failures showed was the missing half.
+CAP = re.search(r"static constexpr int\s+XE_ONCE_MAX_STEPS\s*=\s*(\d+);", DRIVER)
+if CAP is None:
+    fail("XE_ONCE_MAX_STEPS is not a static constexpr int in Driver.h")
+if not 1 <= int(CAP.group(1)) <= 3:
+    fail(f"XE_ONCE_MAX_STEPS = {CAP.group(1)}; the per-cascade cap is at most 3 steps -- "
+         "a cascade that needs more is asking for equilibrium mode")
+TRUST = re.search(r"static constexpr double\s+XE_ONCE_TRUST\s*=\s*([0-9.]+);", DRIVER)
+if TRUST is None:
+    fail("XE_ONCE_TRUST is not a static constexpr double in Driver.h")
+if not 0.0 < float(TRUST.group(1)) < 1.0:
+    fail(f"XE_ONCE_TRUST = {TRUST.group(1)}; a trust region outside (0,1) either trips on "
+         "every step or never bounds anything")
+
+# --- The trust env: one cached read, resolved before the outer loop, never in it.
+if DRIVER.count('std::getenv("RASBERY_XE_ONCE_TRUST")') != 1:
+    fail("RASBERY_XE_ONCE_TRUST must be read through exactly one cached gate")
+if "static const double xe_once_trust = [] {" not in SOLVE_LOOP:
+    fail("the trust region is not cached in a function-local static; the loop would reach "
+         "getenv on every step")
+trust_env = region(SOLVE_LOOP, "static const double xe_once_trust = [] {", "}();",
+                   "xe_once_trust")
+if "XE_ONCE_TRUST" not in trust_env:
+    fail("an unset RASBERY_XE_ONCE_TRUST does not fall back to XE_ONCE_TRUST")
+if "(t > 0.0) ? t" not in trust_env:
+    fail("a non-positive/unparsable RASBERY_XE_ONCE_TRUST is not rejected; it would trip "
+         "on every step and spend the cap on every cascade")
+trust_at = SOLVE_LOOP.index("static const double xe_once_trust = [] {")
+loop_at = SOLVE_LOOP.index("for (int iout = 0;")
+if trust_at > loop_at:
+    fail("the trust region is resolved inside the outer loop")
+
+# --- Per-cascade state: the step count, the closed latch, and the prime flag,
+# --- all declared at SolveLoop entry (cascade start 1).
+for decl, what in (("int    xe_once_steps  = 0;", "the per-cascade step count"),
+                   ("bool   xe_once_done   = false;", "the cascade-closed latch"),
+                   ("bool   xe_once_prime  = primeXeDamping;", "the primed-cascade flag")):
+    if decl not in SOLVE_LOOP:
+        fail(f"{what} is not declared at SolveLoop entry as {decl!r}, which IS the first "
+             "cascade start")
+    if SOLVE_LOOP.index(decl) > loop_at:
+        fail(f"{what} is declared inside the outer loop; it would reset every iteration")
+
+# --- Step 1 of a PRIMED cascade is damped up front.  There is no earlier step to
+# --- measure its distance with, and that is exactly the cascade the M64 restart
+# --- decks died on: the deck arrives far from its current-flux equilibrium.
+FULL = "const bool xe_once_full = xe_once_mode && xe_once_steps == 0 && !xe_once_prime;"
+PICK = "if (xe_once_mode) xe_relax = xe_once_full ? 1.0 : XE_DAMPED_RELAX;"
+for token, what in ((FULL, "the full-step test"), (PICK, "the step-size pick")):
+    if token not in SOLVE_LOOP:
+        fail(f"{what} is not {token!r}; a primed first cascade would take its first step "
+             "undamped and hand the converged flux the whole distance at once")
+if SOLVE_LOOP.index(FULL) < SOLVE_LOOP.index(STEP_GATE):
+    fail("the step size is picked outside the gated Xe step")
+if SOLVE_LOOP.index(PICK) > SOLVE_LOOP.index("UpdateEquilibriumXenon("):
+    fail("the step size is picked after the step it sizes")
+# The call still takes xe_relax, so once and equilibrium share ONE call site and
+# the mode cannot grow a second, ungated one.
+if "UpdateEquilibriumXenon(schedule.thermalPower(), xe_relax)" not in SOLVE_LOOP:
+    fail("the Xe step no longer passes xe_relax; once mode must size the shared call, "
+         "not open a second one")
+# Nothing else may move xe_relax inside the loop: the damper (guarded !xe_once_mode)
+# and the once pick (guarded xe_once_mode) are the only two writers.
+loop_body = SOLVE_LOOP[loop_at:]
+for m in re.finditer(r"^\s*(?:if \([^)]*\) )?xe_relax\s*=[^=]", loop_body, re.M):
+    line = loop_body[m.start():loop_body.index("\n", m.start())]
+    if "xe_once_mode" not in line and "xe_relax = XE_DAMPED_RELAX;" not in line:
+        fail(f"an unguarded write to xe_relax inside the loop: {line.strip()!r}")
+
+# --- The trust region itself: raw change vs. the cached threshold, the hard cap,
+# --- and both counters, all inside the gated step.
+TRUST_BLOCK_HEAD = ("if (xe_once_mode) {\n"
+                    "                    const bool xe_once_extra = xe_once_steps > 0;\n"
+                    "                    ++xe_once_steps;")
+if TRUST_BLOCK_HEAD not in SOLVE_LOOP:
+    fail("the trust-region block does not open by taking the extra-step flag off the "
+         "pre-increment step count and then charging the step")
+trust_block = region(SOLVE_LOOP, TRUST_BLOCK_HEAD, "\n                }\n", "trust region")
+TRIP = "const bool xe_once_trip = xe_change > xe_once_trust;"
+if TRIP not in trust_block:
+    fail(f"the trust test is not {TRIP!r}; it must read the RAW change the step returned "
+         "against the cached region")
+DONE = "xe_once_done = !xe_once_trip || xe_once_steps >= XE_ONCE_MAX_STEPS;"
+if DONE not in trust_block:
+    fail(f"the cascade is not closed as {DONE!r}; it must stop early inside the region and "
+         "hard-stop at the cap")
+if "XE_EQUILIBRIUM_TOLERANCE" in trust_block:
+    fail("the trust region stops on the equilibrium tolerance; it bounds shock, not the "
+         "fixed-point residual -- that is what equilibrium mode is for")
+if "++ctx.telemetry.xe_once_extra_steps;" not in trust_block:
+    fail("xe_once_extra_steps is not charged in the trust-region block")
+if "if (xe_once_extra) ++ctx.telemetry.xe_once_extra_steps;" not in trust_block:
+    fail("xe_once_extra_steps counts the cascade's FIRST step; only the extras the trust "
+         "region bought are extra")
+if "if (xe_once_trip) ++ctx.telemetry.xe_once_trust_trips;" not in trust_block:
+    fail("xe_once_trust_trips is not charged on the trust test itself")
+block_at = SOLVE_LOOP.index(TRUST_BLOCK_HEAD)
+if block_at < SOLVE_LOOP.index("UpdateEquilibriumXenon("):
+    fail("the trust region is evaluated before the step whose change it judges")
+if SOLVE_LOOP.rfind(STEP_GATE, 0, block_at) < 0:
+    fail("the trust region sits outside the gated Xe step, so its counters could be "
+         "charged on a step that never happened")
+for counter in ("xe_once_extra_steps", "xe_once_trust_trips"):
+    if SOLVE_CODE.count(f"++ctx.telemetry.{counter};") != 1:
+        fail(f"{counter} must be charged in exactly one place: the trust-region block")
+
+# --- Every extra step gets a re-converged flux, including for a trust region set
+# --- below the equilibrium tolerance, where the first term would not fire.
+RECONV = "if (xe_change >= XE_EQUILIBRIUM_TOLERANCE || (xe_once_mode && !xe_once_done)) {"
+if RECONV not in SOLVE_LOOP:
+    fail("an open once cascade does not force the flux re-convergence `continue`; a second "
+         "Xe step would then land on the flux the first one invalidated")
+
+# --- The re-arm: all three per-cascade fields, together, outside the unrelated
+# --- RASBERY_XE_CASCADE_BUDGET branch.
 rearm = region(SOLVE_LOOP, "if (xe_restart && has_eq_xe) {",
                "\n        }\n", "cascade re-arm")
-if "xe_once_fired = false;" not in rearm:
-    fail("the cascade re-arm does not clear xe_once_fired; the T/H and search commits "
-         "would not start a new once segment")
 if "if (xe_cascade_budget)" not in rearm:
     fail("the cascade re-arm lost its budget branch")
 budget_at = rearm.index("if (xe_cascade_budget)")
-if rearm.index("xe_once_fired = false;") > budget_at:
-    fail("xe_once_fired is cleared inside the RASBERY_XE_CASCADE_BUDGET branch; the once "
-         "cap must not depend on an unrelated experiment gate")
+for token, what in (("xe_once_steps = 0;", "the step count"),
+                    ("xe_once_done  = false;", "the cascade-closed latch"),
+                    ("xe_once_prime = false;", "the primed-cascade flag")):
+    if token not in rearm:
+        fail(f"the cascade re-arm does not reset {what} ({token!r}); the T/H and search "
+             "commits would not start a new once segment")
+    if rearm.index(token) > budget_at:
+        fail(f"{what} is re-armed inside the RASBERY_XE_CASCADE_BUDGET branch; the once "
+             "bound must not depend on an unrelated experiment gate")
+    if SOLVE_CODE.count(token) != 1:
+        fail(f"{what} is reset in more than one place inside the loop: the cascade re-arm "
+             "is the only cascade boundary there (SolveLoop entry is the declaration)")
 
 # No damper, no interim, in the mode.
 damper = "if (!xe_once_mode && xe_relax == 1.0 && xe_no_progress >= xe_streak_limit) {"
@@ -406,23 +522,44 @@ if damper not in SOLVE_LOOP:
          "single steps against different macro-XS states is not a limit cycle")
 relax0 = "double    xe_relax        = (xe_interim_damp && !xe_once_mode)"
 if relax0 not in SOLVE_LOOP:
-    fail("RASBERY_XE_INTERIM_DAMP can still start once mode's single step at relax=0.5; "
-         "the mode is undamped by definition")
+    fail("RASBERY_XE_INTERIM_DAMP can still preset once mode's relax; the mode sizes every "
+         "step itself, at the step")
 if "const bool xe_interim = xe_interim_l2 > 0.0 && !xe_once_mode && xe_pending &&" \
         not in SOLVE_LOOP:
-    fail("the interim-flux probe is reachable in once mode; the single step has to be "
-         "taken on the converged flux the segment publishes")
+    fail("the interim-flux probe is reachable in once mode; every step has to be taken on "
+         "the converged flux the segment publishes")
 
 # Byte-goldenness of the once terms: every one of them short-circuits to the
-# pre-once expression when xe_once_mode is false.  `xe_once_fired` is a dead
-# store on that path, so it may only ever be READ next to xe_once_mode.
+# pre-once expression when xe_once_mode is false, so the per-cascade fields are
+# dead stores on that path and may only ever be READ next to xe_once_mode --
+# either on the line itself or inside the trust block, whose `if (xe_once_mode)`
+# guards every line in it.
+ONCE_LOCALS = ("xe_once_steps", "xe_once_done", "xe_once_prime", "xe_once_trust",
+               "xe_once_full", "xe_once_trip", "xe_once_extra")
 for line in SOLVE_CODE.splitlines():
-    if "xe_once_fired" not in line:
+    if not any(name in line for name in ONCE_LOCALS):
         continue
-    if re.search(r"xe_once_fired\s*=[^=]", line):
+    if re.search(r"xe_once_\w+\s*=[^=]", line):
         continue    # a write; a dead store on the default path by construction
-    if "xe_once_mode" not in line:
-        fail(f"xe_once_fired is read without xe_once_mode guarding it: {line.strip()!r}")
+    if "xe_once_mode" in line or line in trust_block:
+        continue
+    fail(f"a once-mode local is read without xe_once_mode guarding it: {line.strip()!r}")
+
+# ---------------------------------------------------------------------------
+# 8. ONCE telemetry: two additive counters, accumulated into the run totals and
+#    published by both receipts with placeholders and arguments still in step.
+#    (The holes-vs-arguments audit itself lives in section 4, over the same two
+#    print sites; these checks pin the fields.)
+# ---------------------------------------------------------------------------
+for counter in ("xe_once_extra_steps", "xe_once_trust_trips"):
+    if f"long long {counter}" not in DRIVER:
+        fail(f"sptelem::Counters has no {counter} field")
+    if f"{counter}  += step.{counter};" not in DRIVER:
+        fail(f"{counter} is not folded into the run totals by Counters::accumulate")
+    if DRIVER.count(f'\\"{counter}\\":{{}}') != 2:
+        fail(f"{counter} is not published by both SPTELEM receipts")
+    if DRIVER.count(f"c.{counter}") != 2:
+        fail(f"{counter} is not passed as an argument at both receipt sites")
 
 py_compile.compile(str(Path(__file__).resolve()), doraise=True)
 print("xe mode contract: PASS")
