@@ -296,6 +296,36 @@ inline void report(std::ostream& out) {
 //                over -- the library initialization, the restart file, or the
 //                previous statepoint's depletion -- and the XS reconstruction
 //                uses them as they stand.
+//   once         The middle mode.  The iteration still runs, but every cascade
+//                is capped at ONE step: the flux converges, the closed-form
+//                equilibrium is applied exactly once (undamped), the flux
+//                re-converges, and Xe does not fire again until the next
+//                cascade -- a T/H commit, a search commit, or the next
+//                SolveLoop entry, the same three sites the cascade counters
+//                and RASBERY_XE_CASCADE_BUDGET already open a segment at.
+//                There is no convergence requirement on the Xe residual: the
+//                single Picard step is accepted as it stands.
+//
+// WHY "once" EXISTS.  Frozen mode's two measured failures are the same defect,
+// that the held Xe is not consistent with the statepoint's own flux: a fresh
+// core never equilibrates at all (Xe sits at the library's fresh-fuel trace,
+// worth ~250 ppm of critical boron against MASTER), and a restart deck whose
+// later statepoints move far from the restart state can drive the macro-XS
+// reconstruction out of the fitted range (the Xe-135 density is a
+// spectral-history coordinate) until BiCGSTAB returns a non-finite iterate.
+// One step per segment costs ~6-12 Xe updates per statepoint instead of ~100
+// and leaves Xe equilibrated against the most recent converged flux, so both
+// failures are structurally out of reach while nearly all of the cascade
+// multiplicity -- which is where the outer budget goes -- is still retired.
+//
+// WHAT once IS NOT.  It is still not the equilibrium fixed point: one Picard
+// step from a moved macro-XS state lands near it, not on it, so results move
+// at the pcm level and this is a campaign mode compared against the exact run,
+// never an acceptance path.  The damper and the interim-flux probe are both
+// bypassed -- a single undamped step per segment cannot limit-cycle, so there
+// is nothing for the oscillation detector to detect, and the interim probe
+// exists to spend cascade steps on a loose flux, which is the opposite of what
+// this mode does.
 //
 // WHY.  Measured on KNGR CY1: 17,564 of 21,271 outer iterations (82.6 %) were
 // Xe-update reconvergence cascades.  Retiring them is the single largest lever
@@ -316,7 +346,7 @@ inline void report(std::ostream& out) {
 // equilibrium formula -- ApplyXeEquilibrium writes the three Xe-chain rows and
 // nothing else), and frozen mode leaves depletion running.  MASTER's
 // SAMARIUM=2 deck flag therefore has no RASBERY analogue to hold.
-enum class XeMode { EQUILIBRIUM, FROZEN };
+enum class XeMode { EQUILIBRIUM, FROZEN, ONCE };
 
 inline XeMode xeMode() {
     static const XeMode mode = [] {
@@ -330,10 +360,12 @@ inline XeMode xeMode() {
             return XeMode::EQUILIBRIUM;
         if (s == "frozen")
             return XeMode::FROZEN;
+        if (s == "once")
+            return XeMode::ONCE;
         // A typo must not silently buy the default: this is a campaign switch
-        // whose two arms produce different physics.
+        // whose arms produce different physics.
         std::cerr << "[RASBERY][WARN][xe] RASBERY_XE_MODE=\"" << value
-                  << "\" is not a mode (equilibrium|frozen); using equilibrium\n";
+                  << "\" is not a mode (equilibrium|frozen|once); using equilibrium\n";
         return XeMode::EQUILIBRIUM;
     }();
     return mode;
@@ -342,9 +374,22 @@ inline XeMode xeMode() {
 /// True when the in-core Xe<->flux fixed-point iteration is switched off.
 inline bool xeFrozen() { return xeMode() == XeMode::FROZEN; }
 
+/// True when the iteration still runs but every cascade is capped at one
+/// undamped step.  Deliberately NOT folded into xeFrozen(): frozen mode's
+/// short-circuit (has_eq_xe) must stay a frozen-only property, because once
+/// mode needs every arm of the machinery that gate feeds.
+inline bool xeOnce() { return xeMode() == XeMode::ONCE; }
+
 /// The mode as the [RASBERY][PHYSICS_MODE] and [RASBERY][SPTELEM] receipts
 /// publish it, so a run can be sorted by mode without re-reading the env.
-inline const char* xeModeName() { return xeFrozen() ? "frozen" : "equilibrium"; }
+inline const char* xeModeName() {
+    switch (xeMode()) {
+        case XeMode::FROZEN: return "frozen";
+        case XeMode::ONCE:   return "once";
+        case XeMode::EQUILIBRIUM: break;
+    }
+    return "equilibrium";
+}
 
 class Driver {
 private:
@@ -490,19 +535,51 @@ private:
 
     // Frozen-Xe startup guard (RASBERY_XE_MODE=frozen), one line, once per run.
     //
-    // Frozen mode publishes whatever Xe-135 the deck handed over.  A restart
-    // hands over a real inventory, so the mode does what it says.  A fresh core
-    // at BOC hands over nothing -- the library initialization leaves the
-    // Xe-chain rows at zero -- and a deck that asked for equilibrium Xe would
-    // then run its first statepoint (and, until depletion makes some, the ones
-    // after it) completely Xe-free.  That is a misconfigured run far more often
-    // than it is an experiment, and it is invisible in the results: a Xe-free
-    // core simply reads a few hundred pcm reactive.
+    // Frozen mode publishes whatever Xe-135 the deck handed over.  A restart or
+    // a shuffle hands over a real, once-equilibrated inventory, so the mode does
+    // what it says.  A run that starts from the library hands over no in-core
+    // inventory at all -- the fresh-fuel depletion point of an XSLIB carries no
+    // Xe worth the name -- and a deck that asked for equilibrium Xe then runs
+    // its first statepoint (and, until depletion makes some, the ones after it)
+    // effectively Xe-free.  That is a misconfigured run far more often than it
+    // is an experiment, and it is invisible in the results: a Xe-free core
+    // simply reads a few hundred pcm reactive (measured: ~250 ppm of critical
+    // boron against MASTER on a fresh core).
+    //
+    // TWO THINGS WENT WRONG IN THE FIRST VERSION, and both are fixed here.
+    //
+    // (1) WHAT IT TESTED.  `peak_xe == 0.0` is a bit-exact equality on the MAX
+    //     over every fuel node, so one node holding any nonzero value at all --
+    //     including the trace the library's own fresh-fuel point hands over --
+    //     suppressed the warning for the whole core.  That is exactly the case
+    //     the guard exists for, and it is the case that got past it.  The
+    //     emptiness test is now structural instead: a run that did not inherit
+    //     state from another run has, by construction, never equilibrated Xe
+    //     against a core flux, whatever number happens to sit in the row.  The
+    //     bit-zero test is kept as the second arm, for an inherited inventory
+    //     that really is empty, and the measured peak is printed either way so
+    //     the operator can see which arm fired.
+    //
+    // (2) WHEN IT LOOKED.  It was called from SolveLoop and latched on the
+    //     FIRST call, whatever that call happened to be.  On a deck whose first
+    //     schedule entry is a depletion step, the first SolveLoop runs AFTER
+    //     PredictorStep, and PredictorStep's own Deplete -> ApplyXeEquilibrium
+    //     has already written the Xe-chain rows at the depletion rates.  The
+    //     guard then measured a full inventory, burned its one-shot latch on
+    //     it, and never looked again.  It now runs once in Drive(), straight
+    //     after InitXS, which is the only moment the "incoming" inventory means
+    //     anything: the library values are in, the restart/shuffle values are
+    //     in, and no schedule entry has touched them yet.
     //
     // Deliberately a warning and not a refusal: a zero-Xe frozen run is a
     // legitimate, if unusual, thing to ask for, and the mode switch is supposed
     // to be reversible without also being opinionated.
-    static void WarnFrozenXeIfEmpty(SolverContext& ctx, const Schedule& schedule) {
+    //
+    // FROZEN ONLY, by design.  RASBERY_XE_MODE=once computes the equilibrium
+    // itself at every segment, so it cannot inherit an empty inventory and has
+    // nothing to warn about; xeFrozen() is false there and this returns.
+    static void WarnFrozenXeIfEmpty(SolverContext& ctx, const Schedule& schedule,
+                                    bool inherited_inventory) {
         if (!xeFrozen() || schedule.xenon_transient || ctx.xe_frozen_checked)
             return;
         ctx.xe_frozen_checked = true;
@@ -517,13 +594,21 @@ private:
                 peak_xe,
                 std::abs(ctx.cross_sections.iden(Chiffon::Isotope::iXe135, l)));
         }
-        if (fuel_nodes > 0 && peak_xe == 0.0)
-            std::cerr << std::format(
-                "[RASBERY][WARN][xe] RASBERY_XE_MODE=frozen and the incoming Xe-135 "
-                "inventory is identically zero over all {} fuel nodes at statepoint {} "
-                "(EFPD {:.3f}): the in-core equilibrium iteration is off, so this run "
-                "stays Xe-free until depletion makes some\n",
-                fuel_nodes, ctx.statepoint, ctx.efpd);
+        if (fuel_nodes == 0)
+            return;
+        const bool empty_inventory = (peak_xe == 0.0);
+        if (!empty_inventory && inherited_inventory)
+            return;
+        std::cerr << std::format(
+            "[RASBERY][WARN][xe] RASBERY_XE_MODE=frozen with no in-core Xe-135 to "
+            "hold: {} over {} fuel nodes (peak incoming Xe-135 {:.3e} /barn-cm). "
+            "The in-core equilibrium iteration is off, so nothing will equilibrate "
+            "the Xe chain against this core's flux and the run stays effectively "
+            "Xe-free until depletion makes some\n",
+            empty_inventory ? "the incoming inventory is identically zero"
+                            : "this run starts from the library (no restart, no "
+                              "shuffle), so no inventory was ever equilibrated",
+            fuel_nodes, peak_xe);
     }
 
     // Single-loop eigenvalue solve following PARCS Fig 10.1. One outer iteration performs a
@@ -550,6 +635,13 @@ private:
         // process, so an unset variable leaves this expression exactly what it
         // was: !schedule.xenon_transient.
         const bool   has_eq_xe      = !schedule.xenon_transient && !xeFrozen();
+        // RASBERY_XE_MODE=once keeps has_eq_xe -- it needs the cascade
+        // counters, the step itself and the cascade re-arm -- and caps each
+        // cascade at one undamped step instead.  This is the only place the
+        // mode is read (xeOnce() is a cached lookup of an env var resolved once
+        // per process), and every once-specific term below short-circuits on
+        // it, so an unset variable leaves all of them exactly what they were.
+        const bool   xe_once_mode   = xeOnce();
         // Optional multi-fidelity GA screening mode.  A positive value limits
         // the expensive Xe and T/H fixed-point feedback passes, while the
         // default (0/unset) preserves the production solver exactly.  Screened
@@ -563,9 +655,6 @@ private:
         const bool   trace_sl       = (std::getenv("RASBERY_SL_TRACE") != nullptr);
         const int    sl_outer0      = total_outer;
         const int    sl_th0         = total_th;
-
-        // Frozen mode + a deck carrying no Xe at all: warn once. See WarnFrozenXeIfEmpty.
-        WarnFrozenXeIfEmpty(ctx, schedule);
 
         if (has_search) {
             if (keepSearch) {
@@ -646,7 +735,14 @@ private:
         // kick the axial Xe map into another basin.  Default off.
         static const bool xe_interim_damp =
             std::getenv("RASBERY_XE_INTERIM_DAMP") != nullptr;
-        double    xe_relax        = xe_interim_damp ? XE_DAMPED_RELAX : 1.0;
+        // ONCE mode is undamped by definition: relax rescales the applied step
+        // of an ITERATION, and one step per segment is not an iteration.  A
+        // damped single step would simply publish half of the equilibrium move
+        // and call it the segment's answer, so the companion knob is ignored
+        // there and the damper below is switched off with it.
+        double    xe_relax        = (xe_interim_damp && !xe_once_mode)
+                                        ? XE_DAMPED_RELAX
+                                        : 1.0;
         // Per-cascade Xe budget (RASBERY_XE_CASCADE_BUDGET, default off = exact old
         // path).  See XE_CASCADE_TOTAL_MULTIPLIER for why one shared counter starves
         // the late cascades of a search-heavy statepoint.
@@ -668,6 +764,13 @@ private:
         // cascade per SolveLoop, so this latches after the first event -- which is the
         // pre-existing behaviour, just now counted.
         bool   xe_cap_charged = false;
+        // ONCE mode: has this cascade already spent its single Xe step?  Cleared
+        // at the three cascade starts -- SolveLoop entry (this initializer) and
+        // the T/H and search commits, the same sites the cascade counter and the
+        // RASBERY_XE_CASCADE_BUDGET re-arm use, because they are the same events.
+        // Written unconditionally and read only under xe_once_mode, so the
+        // default path gains a dead store and nothing else.
+        bool   xe_once_fired  = false;
         SolveExit exit_reason = SolveExit::ITER_EXHAUSTED;
         // Telemetry only (plan Rev.4 Sec 8).  The cause of the segment the NEXT
         // outer belongs to; see the attribution rules in the sptelem comment.
@@ -772,7 +875,11 @@ private:
             const bool xe_pending = has_eq_xe && !xe_starved &&
                                     (xe_count + xe_interim_count == 0 ||
                                      prev_xe_change >= XE_EQUILIBRIUM_TOLERANCE);
-            const bool xe_interim = xe_interim_l2 > 0.0 && xe_pending &&
+            // ONCE mode takes its one step on a CONVERGED flux -- that is the
+            // whole point of the mode, an inventory consistent with the flux the
+            // segment actually publishes -- so the interim probe is excluded
+            // there rather than left to be spent by the single step.
+            const bool xe_interim = xe_interim_l2 > 0.0 && !xe_once_mode && xe_pending &&
                                     xe_interim_count < 10 * xe_budget_probe &&
                                     !flux_converged && residual < xe_interim_l2;
             if (xe_interim)
@@ -834,7 +941,12 @@ private:
             // 3. Equilibrium xenon feedback.  Previously equilibrium Xe was
             // only overwritten inside depletion, so a BOC STANDARD step
             // silently ran with zero Xe despite "xenon":"equilibrium".
-            if (has_eq_xe && !xe_starved &&
+            // ONCE mode's cap lives here, as one term on the gate the step
+            // already hangs off: `(!xe_once_mode || !xe_once_fired)` is
+            // identically true with the mode unset, and in the mode it lets
+            // exactly one step through per cascade, with no test on the Xe
+            // residual -- the single Picard step is the segment's answer.
+            if (has_eq_xe && !xe_starved && (!xe_once_mode || !xe_once_fired) &&
                 (flux_converged || xe_interim || stall_sample)) {
                 const double xe_change =
                     ctx.cross_sections.UpdateEquilibriumXenon(schedule.thermalPower(), xe_relax);
@@ -850,6 +962,8 @@ private:
                     ++xe_total;
                     ++ctx.telemetry.xe_updates;
                 }
+                // This cascade has now spent its ONCE step.  See xe_once_fired.
+                xe_once_fired = true;
                 // Not contracting?  The undamped Xe<->flux map is limit-cycling rather than
                 // converging.  Measured on APR1400 cy01 at 195-225 EFPD: [XE] rel bounces
                 // between 8e-x and 11e-x for 80+ iterations, eigv swinging +-30 pcm, until
@@ -861,7 +975,11 @@ private:
                     ++xe_no_progress;
                 else
                     xe_no_progress = 0;
-                if (xe_relax == 1.0 && xe_no_progress >= xe_streak_limit) {
+                // Unreachable in ONCE mode: xe_no_progress compares consecutive
+                // steps of one iteration, and there is no iteration to compare
+                // -- the streak would be assembled out of single steps taken
+                // against DIFFERENT macro-XS states, which is not a limit cycle.
+                if (!xe_once_mode && xe_relax == 1.0 && xe_no_progress >= xe_streak_limit) {
                     xe_relax = XE_DAMPED_RELAX;
                     if (trace_sl)
                         std::cout << std::format(
@@ -1009,6 +1127,12 @@ private:
             // gated, since that is what changes the trajectory.
             if (xe_restart && has_eq_xe) {
                 ++ctx.telemetry.xe_cascades;
+                // The fresh cascade gets its ONCE step: the macro-XS just moved,
+                // so the inventory equilibrated against the previous state is
+                // stale and one step against the new one is exactly what this
+                // mode owes the segment.  Unconditional; only read under
+                // xe_once_mode, so the default path is unchanged.
+                xe_once_fired = false;
                 // xe_interim_count is re-armed with it so the fresh cascade is allowed
                 // its first interim step: xe_pending's "nothing has fired yet" term
                 // reads the pair.  Interim spins stay bounded by max_iter.
@@ -1170,6 +1294,15 @@ public:
                               initial_schedule.tmod,
                               initial_schedule.pressure,
                               0.0, !is_restart_run);
+
+        // Frozen mode + a deck carrying no in-core Xe: warn once, here and
+        // nowhere else.  This is the only moment "the incoming inventory" is
+        // well defined -- the library values are in, a restart's or a shuffle's
+        // values have replaced them where they apply, and no schedule entry has
+        // run yet, so nothing has overwritten the Xe rows.  See
+        // WarnFrozenXeIfEmpty for why it used to be called from SolveLoop and
+        // why that was the wrong place.
+        WarnFrozenXeIfEmpty(ctx, initial_schedule, is_restart_run || is_shuffle_run);
 
         if (!is_restart_run)
             cross_sections.ResetFluxAndCurrents(1.0);

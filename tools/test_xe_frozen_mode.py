@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Static contract for the frozen equilibrium-Xe mode (RASBERY_XE_MODE).
+"""Static contract for the in-core equilibrium-Xe modes (RASBERY_XE_MODE).
 
-The mode is a runtime switch on a GPU solver, so the properties that make it
+The modes are a runtime switch on a GPU solver, so the properties that make them
 safe cannot be observed from a Python test run -- they have to be checked in the
-source.  Five things are guarded here:
+source.  Seven things are guarded here:
 
   1. BYTE-GOLDENNESS.  With RASBERY_XE_MODE unset (or `equilibrium`) the solver
      path must be what it was: the env var is read exactly once, cached in a
-     function-local static, and the only thing it feeds in the solve path is one
-     extra `&& !xeFrozen()` term on `has_eq_xe`, evaluated before any state
-     moves.  No getenv, no mode lookup, anywhere inside the outer loop.
-  2. ONE SHORT-CIRCUIT POINT.  `has_eq_xe` is the single gate the whole in-core
-     Xe machinery hangs off, so clearing it must be enough: the cascade
+     function-local static, and the only things it feeds in the solve path are
+     one extra `&& !xeFrozen()` term on `has_eq_xe` and one cached `xeOnce()`
+     read whose every consumer short-circuits to the old expression when it is
+     false.  No getenv, no mode lookup, anywhere inside the outer loop.
+  2. ONE SHORT-CIRCUIT POINT (frozen).  `has_eq_xe` is the single gate the whole
+     in-core Xe machinery hangs off, so clearing it must be enough: the cascade
      counters, the pending/interim probe, the starvation charge, the
      UpdateEquilibriumXenon call and the cascade re-arm are ALL gated on it, and
      there is no second, ungated call site.
@@ -19,12 +20,22 @@ source.  Five things are guarded here:
      identically zero, so the derived steps-per-cascade must not divide by them.
   4. RECEIPTS.  Both the [RASBERY][PHYSICS_MODE] line and the two
      [RASBERY][SPTELEM] receipts publish `xe_mode`, fed from xeModeName(), with
-     format placeholders and arguments still in step.
-  5. DEPLETION AND SAMARIUM UNTOUCHED.  Frozen mode stops the in-SolveLoop
-     refresh only.  XSSet's Bateman/CRAM advance and its own equilibrium
-     overwrite at the depletion rates stay gated on the deck's `xe_transient`
-     alone, and nothing in XSSet knows the mode exists.  Sm-149 has no in-core
-     equilibrium to freeze -- if one is ever added, this test fails on purpose.
+     format placeholders and arguments still in step -- and xeModeName() can
+     produce every mode the parser accepts, no more and no fewer.
+  5. DEPLETION AND SAMARIUM UNTOUCHED.  The modes stop the in-SolveLoop refresh
+     only.  XSSet's Bateman/CRAM advance and its own equilibrium overwrite at
+     the depletion rates stay gated on the deck's `xe_transient` alone, and
+     nothing in XSSet knows the modes exist.  Sm-149 has no in-core equilibrium
+     to freeze -- if one is ever added, this test fails on purpose.
+  6. ONCE = ONE STEP PER CASCADE.  `xe_once_fired` is set by the Xe step, gates
+     the Xe step, and is cleared at exactly the three cascade starts the
+     cascade counter itself opens a segment at (SolveLoop entry, T/H commit,
+     search commit).  The cap carries no test on the Xe residual: one Picard
+     step per segment, accepted as it stands.
+  7. ONCE HAS NO DAMPER AND NO INTERIM PATH.  A single undamped step cannot
+     limit-cycle, so both the oscillation damper and the RASBERY_XE_INTERIM_*
+     probe -- including the RASBERY_XE_INTERIM_DAMP primer that would start the
+     step at relax=0.5 -- must be unreachable in the mode.
 """
 from __future__ import annotations
 
@@ -40,7 +51,7 @@ XSSET_H = (ROOT / "src" / "XSSet.h").read_text(encoding="utf-8-sig")
 
 
 def fail(message: str) -> None:
-    raise SystemExit(f"xe frozen-mode contract: FAIL: {message}")
+    raise SystemExit(f"xe mode contract: FAIL: {message}")
 
 
 def region(text: str, start: str, end: str, what: str) -> str:
@@ -82,24 +93,46 @@ null_at = gate.find("if (value == nullptr)")
 if null_at < 0 or "return XeMode::EQUILIBRIUM;" not in gate[null_at:null_at + 120]:
     fail("an unset RASBERY_XE_MODE does not return EQUILIBRIUM before anything else; "
          "the default path would not be byte-golden")
-for token in ('s == "equilibrium"', 's == "frozen"', "std::tolower"):
+MODES = ("equilibrium", "frozen", "once")
+for token in tuple(f's == "{m}"' for m in MODES) + ("std::tolower",):
     if token not in gate:
-        fail(f"xeMode() is missing {token!r} (both modes, case-insensitively)")
+        fail(f"xeMode() is missing {token!r} (every mode, case-insensitively)")
 if "[RASBERY][WARN][xe]" not in gate:
     fail("xeMode() silently swallows an unrecognised value; a typo must be reported")
+for m in MODES:
+    if m not in gate[gate.index("[RASBERY][WARN][xe]"):]:
+        fail(f"the unrecognised-value warning does not name the {m!r} mode; a typo must be "
+             "told what the alternatives are")
 if "inline bool xeFrozen() { return xeMode() == XeMode::FROZEN; }" not in DRIVER:
     fail("xeFrozen() is not the single predicate over xeMode()")
-if 'inline const char* xeModeName() { return xeFrozen() ? "frozen" : "equilibrium"; }' \
-        not in DRIVER:
-    fail("xeModeName() does not publish exactly the two mode names")
+if "inline bool xeOnce() { return xeMode() == XeMode::ONCE; }" not in DRIVER:
+    fail("xeOnce() is not the single predicate over xeMode()")
+# once must NOT be folded into xeFrozen(): frozen clears has_eq_xe, and once
+# needs every arm of the machinery that gate feeds.
+if "XeMode::ONCE" in region(DRIVER, "inline bool xeFrozen()", "inline bool xeOnce()",
+                            "xeFrozen"):
+    fail("xeFrozen() answers true for once mode; the frozen short-circuit would then "
+         "bypass the very machinery once mode drives")
+
+name_fn = region(DRIVER, "inline const char* xeModeName() {", "\nclass Driver", "xeModeName")
+if "switch (xeMode())" not in name_fn:
+    fail("xeModeName() does not dispatch on xeMode(); it must publish every mode")
+published = set(re.findall(r'return "([a-z]+)";', name_fn))
+if published != set(MODES):
+    fail(f"xeModeName() publishes {sorted(published)}; the parser accepts {sorted(MODES)}")
+enum_decl = "enum class XeMode { EQUILIBRIUM, FROZEN, ONCE };"
+if enum_decl not in DRIVER:
+    fail(f"the mode enum is not {enum_decl!r}")
 
 # Nothing may look the mode up inside the iteration: SolveLoop sees it only
-# through xeFrozen(), whose static is resolved once per process.
+# through xeFrozen()/xeOnce(), whose static is resolved once per process.
 for banned in ('getenv("RASBERY_XE_MODE")', "xeMode()", "xeModeName()"):
     if banned in SOLVE_CODE:
         fail(f"SolveLoop reaches {banned!r}; the mode must be one cached read outside the loop")
 if SOLVE_CODE.count("xeFrozen()") != 1:
     fail("xeFrozen() must be consulted exactly once in SolveLoop (the has_eq_xe term)")
+if SOLVE_CODE.count("xeOnce()") != 1:
+    fail("xeOnce() must be consulted exactly once in SolveLoop (the xe_once_mode term)")
 
 # ---------------------------------------------------------------------------
 # 2. The short-circuit point: has_eq_xe, and nothing else.
@@ -207,12 +240,23 @@ for anchor, what in (('"[RASBERY][SPTELEM] {{', "per-statepoint receipt"),
         fail(f"{what}: {holes} format placeholders but {args} arguments")
 
 # ---------------------------------------------------------------------------
-# 5. The startup guard: warns, does not block, fires once.
+# 5. The startup guard: warns, does not block, fires once, FROZEN only, and
+#    reads the incoming inventory at the one moment that phrase means anything.
+#
+#    The first version measured `max|Xe| == 0.0` from inside SolveLoop and
+#    latched on whichever call came first.  Both halves failed on a real deck:
+#    the library's fresh-fuel point hands over a trace, so a bit-exact zero is
+#    never seen, and on a depletion-first deck the first SolveLoop runs after
+#    PredictorStep has already written the Xe rows at the depletion rates.  Both
+#    regressions are pinned below.
 # ---------------------------------------------------------------------------
 warn = region(DRIVER, "    static void WarnFrozenXeIfEmpty(",
               "    // Single-loop eigenvalue solve", "WarnFrozenXeIfEmpty")
 if "if (!xeFrozen() || schedule.xenon_transient || ctx.xe_frozen_checked)" not in warn:
     fail("the startup guard is not short-circuited on mode/deck/one-shot latch")
+if "xeOnce()" in warn:
+    fail("the startup guard consults xeOnce(); once mode computes its own Xe and has "
+         "nothing to warn about, so the guard is scoped to frozen by xeFrozen() alone")
 if "ctx.xe_frozen_checked = true;" not in warn:
     fail("the startup guard does not latch; it would warn at every statepoint")
 if "bool   xe_frozen_checked = false;" not in DRIVER:
@@ -223,13 +267,48 @@ if "ctx.geometry.IsFuel(l)" not in warn:
     fail("the startup guard does not restrict itself to fuel nodes")
 if "peak_xe == 0.0" not in warn:
     fail("the startup guard does not test for an identically-zero Xe inventory")
+# REGRESSION (1): a bit-exact zero cannot be the only way in, or a single trace
+# density anywhere in the core suppresses the warning for the whole core.
+if "inherited_inventory" not in warn:
+    fail("the startup guard has no arm for a run that never inherited an inventory; "
+         "`peak_xe == 0.0` alone is defeated by the library's fresh-fuel trace")
+if "!empty_inventory && inherited_inventory" not in warn:
+    fail("the startup guard does not fire on `no inherited inventory OR bit-zero`; "
+         "one of the two ways to hold no in-core Xe would go unreported")
+if "{:.3e}" not in warn:
+    fail("the startup guard does not print the measured peak; neither arm would be "
+         "diagnosable from the warning alone")
 if "[RASBERY][WARN][xe]" not in warn:
     fail("the startup guard does not emit a [RASBERY][WARN][xe] line")
 for banned in ("throw ", "std::exit", "return 2;", "runtime_error"):
     if banned in warn:
         fail(f"the startup guard uses {banned!r}; a zero-Xe frozen run must warn, not block")
-if "WarnFrozenXeIfEmpty(ctx, schedule);" not in SOLVE_CODE:
-    fail("SolveLoop never calls the startup guard")
+
+# REGRESSION (2): the hook point.  Not SolveLoop -- Drive(), straight after
+# InitXS, before any schedule entry (a depletion step's PredictorStep above all)
+# can overwrite the Xe rows the guard is supposed to be reading.
+if "WarnFrozenXeIfEmpty(" in SOLVE_CODE:
+    fail("SolveLoop calls the startup guard again; on a depletion-first deck its first "
+         "call lands after PredictorStep's own equilibrium overwrite and the one-shot "
+         "latch is spent on a full inventory")
+CALL = "WarnFrozenXeIfEmpty(ctx, initial_schedule, is_restart_run || is_shuffle_run);"
+if CALL not in DRIVE:
+    fail(f"Drive() does not call the startup guard as {CALL!r}")
+if DRIVER.count("WarnFrozenXeIfEmpty(ctx,") != 1:
+    fail("the startup guard has more than one call site; the latch makes the extra ones "
+         "silent, so the surviving one must be the right one")
+init_at = DRIVE.index("cross_sections.InitXS(")
+call_at = DRIVE.index(CALL)
+if call_at < init_at:
+    fail("the startup guard runs before InitXS; there is no incoming inventory to read yet")
+for later in ("cross_sections.PredictorStep(", "SolveLoop(ctx, eigv, schedule",
+              "cross_sections.SetPowerRate(power_fraction);"):
+    j = DRIVE.find(later)
+    if j < 0:
+        fail(f"ordering anchor vanished from Drive: {later!r}")
+    if j < call_at:
+        fail(f"the startup guard runs after {later!r}; the Xe rows it reads are no longer "
+             "the ones the deck handed over")
 
 # ---------------------------------------------------------------------------
 # 6. Depletion and samarium: not this mode's business.
@@ -262,5 +341,88 @@ for sm in ("iSm149", "iPm149"):
         fail(f"{sm} now appears in the solver: RASBERY has grown an in-core samarium "
              "treatment, and RASBERY_XE_MODE=frozen must be extended to hold it")
 
+# ---------------------------------------------------------------------------
+# 7. ONCE mode: one undamped step per cascade, cleared at the three cascade
+#    starts, with no damper and no interim path reachable.
+# ---------------------------------------------------------------------------
+ONCE_GATE = "const bool   xe_once_mode   = xeOnce();"
+if ONCE_GATE not in SOLVE_LOOP:
+    fail(f"the once gate is not read once into a local: {ONCE_GATE!r}")
+once_at = SOLVE_LOOP.index(ONCE_GATE)
+# Decided before anything moves, exactly like the frozen term it sits beside.
+for after in ("ctx.cmfd_solver.resetIteration();", "++ctx.telemetry.solve_loops;",
+              "for (int iout = 0;"):
+    j = SOLVE_LOOP.find(after)
+    if j < 0:
+        fail(f"ordering anchor vanished from SolveLoop: {after!r}")
+    if j < once_at:
+        fail(f"the once gate is decided after {after!r}; it must be checked before any "
+             "behaviour change")
+
+# The cap: one term on the gate the step already hangs off, and no test on the
+# Xe residual anywhere in it -- one Picard step per segment, accepted as-is.
+STEP_GATE = ("if (has_eq_xe && !xe_starved && (!xe_once_mode || !xe_once_fired) &&\n"
+             "                (flux_converged || xe_interim || stall_sample)) {")
+if STEP_GATE not in SOLVE_LOOP:
+    fail("the Xe step gate does not carry `(!xe_once_mode || !xe_once_fired)`; the cap "
+         "must be one term on the existing gate, not a second branch")
+if "XE_EQUILIBRIUM_TOLERANCE" in STEP_GATE:
+    fail("the once cap tests the Xe residual; the single step is accepted as it stands")
+
+# The flag: declared false at SolveLoop entry (cascade start 1), set by the
+# step, cleared at the commit re-arm (cascade starts 2 and 3 -- T/H and search
+# are one restart, the tie-break the sptelem comment describes).
+if "bool   xe_once_fired  = false;" not in SOLVE_LOOP:
+    fail("xe_once_fired is not initialised false at SolveLoop entry, which IS the first "
+         "cascade start")
+if SOLVE_CODE.count("xe_once_fired = true;") != 1:
+    fail("xe_once_fired must be set in exactly one place: the Xe step that spends it")
+set_at = SOLVE_LOOP.index("xe_once_fired = true;")
+step_at = SOLVE_LOOP.index("UpdateEquilibriumXenon(")
+if set_at < step_at:
+    fail("xe_once_fired is set before the Xe step it accounts for")
+if SOLVE_LOOP.rfind(STEP_GATE, 0, set_at) < 0:
+    fail("xe_once_fired is set outside the gated Xe step")
+if SOLVE_CODE.count("xe_once_fired = false;") != 1:
+    fail("xe_once_fired must be cleared in exactly one place inside the loop: the cascade "
+         "re-arm.  SolveLoop entry is the declaration; T/H and search commits share the "
+         "re-arm because they are one restart, not two")
+rearm = region(SOLVE_LOOP, "if (xe_restart && has_eq_xe) {",
+               "\n        }\n", "cascade re-arm")
+if "xe_once_fired = false;" not in rearm:
+    fail("the cascade re-arm does not clear xe_once_fired; the T/H and search commits "
+         "would not start a new once segment")
+if "if (xe_cascade_budget)" not in rearm:
+    fail("the cascade re-arm lost its budget branch")
+budget_at = rearm.index("if (xe_cascade_budget)")
+if rearm.index("xe_once_fired = false;") > budget_at:
+    fail("xe_once_fired is cleared inside the RASBERY_XE_CASCADE_BUDGET branch; the once "
+         "cap must not depend on an unrelated experiment gate")
+
+# No damper, no interim, in the mode.
+damper = "if (!xe_once_mode && xe_relax == 1.0 && xe_no_progress >= xe_streak_limit) {"
+if damper not in SOLVE_LOOP:
+    fail("the oscillation damper is reachable in once mode; a streak assembled from "
+         "single steps against different macro-XS states is not a limit cycle")
+relax0 = "double    xe_relax        = (xe_interim_damp && !xe_once_mode)"
+if relax0 not in SOLVE_LOOP:
+    fail("RASBERY_XE_INTERIM_DAMP can still start once mode's single step at relax=0.5; "
+         "the mode is undamped by definition")
+if "const bool xe_interim = xe_interim_l2 > 0.0 && !xe_once_mode && xe_pending &&" \
+        not in SOLVE_LOOP:
+    fail("the interim-flux probe is reachable in once mode; the single step has to be "
+         "taken on the converged flux the segment publishes")
+
+# Byte-goldenness of the once terms: every one of them short-circuits to the
+# pre-once expression when xe_once_mode is false.  `xe_once_fired` is a dead
+# store on that path, so it may only ever be READ next to xe_once_mode.
+for line in SOLVE_CODE.splitlines():
+    if "xe_once_fired" not in line:
+        continue
+    if re.search(r"xe_once_fired\s*=[^=]", line):
+        continue    # a write; a dead store on the default path by construction
+    if "xe_once_mode" not in line:
+        fail(f"xe_once_fired is read without xe_once_mode guarding it: {line.strip()!r}")
+
 py_compile.compile(str(Path(__file__).resolve()), doraise=True)
-print("xe frozen-mode contract: PASS")
+print("xe mode contract: PASS")
