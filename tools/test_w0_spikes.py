@@ -299,6 +299,29 @@ for typ in ("cudaGraphNodeParams", "cudaLaunchAttributeValue"):
     if not re.search(rf"\b{typ}\s+\w+\{{\}}\s*;", CONDGRAPH_CODE):
         fail(f"probe_conditional_graph: no aggregate-initialised {typ}")
 
+# FIX 6 -- cudaGraphAddNode's signature changed in CUDA 13.0: an edge-data
+# pointer was inserted BEFORE numDependencies, so the 12.x 5-argument form does
+# not compile there.  Both forms must be present behind a CUDART_VERSION guard,
+# because the authoring box is on 12.6 and the target on 13.0.
+add_node_calls = re.findall(r"cudaGraphAddNode\s*\(([^;]*?)\)\s*;", CONDGRAPH_CODE,
+                            re.DOTALL)
+if len(add_node_calls) != 2:
+    fail(f"probe_conditional_graph: expected exactly 2 cudaGraphAddNode call sites "
+         f"(the CUDA 13 form and the 12.x form behind a version guard), found "
+         f"{len(add_node_calls)}")
+if not re.search(r"CUDART_VERSION\s*>=\s*13000", CONDGRAPH_CODE):
+    fail("probe_conditional_graph: no CUDART_VERSION >= 13000 guard around "
+         "cudaGraphAddNode")
+guarded = CONDGRAPH_CODE[CONDGRAPH_CODE.find("CUDART_VERSION >= 13000"):]
+guarded = guarded[:guarded.find("#endif")]
+if "deps, nullptr, ndeps" not in guarded:
+    fail("probe_conditional_graph: the CUDA 13 branch does not pass the edge-data "
+         "argument (deps, nullptr, ndeps)")
+# The unchanged sibling API must not be "fixed" to match.
+if re.search(r"cudaGraphAddKernelNode\s*\([^;]*?nullptr\s*,\s*\w*ndeps", CONDGRAPH_CODE):
+    fail("probe_conditional_graph: cudaGraphAddKernelNode was given an edge-data "
+         "argument; its signature did NOT change in CUDA 13")
+
 # FIX 2a -- a conditional body graph may never be empty; an empty body wedges
 # the runtime and the probe hangs holding the GPU.
 require(CONDGRAPH, "effective_body_nodes",

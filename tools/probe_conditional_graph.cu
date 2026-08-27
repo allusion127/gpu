@@ -341,7 +341,19 @@ static cudaError_t add_conditional(cudaGraph_t parent, const cudaGraphNode_t* de
     np.conditional.type    = type;
     np.conditional.size    = size;
 
+    // CUDA 13.0 changed cudaGraphAddNode's signature: an edge-data pointer was
+    // inserted BEFORE numDependencies, so the 12.x 5-argument form no longer
+    // compiles.  nullptr edge data means "default dependency type", which is
+    // what the 12.x form implied.
+    //
+    // This is the ONLY cudaGraphAddNode call site in the file.  The seven
+    // cudaGraphAddKernelNode calls are a different entry point whose signature
+    // did NOT change -- do not "fix" them to match.
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+    const cudaError_t e = cudaGraphAddNode(out_node, parent, deps, nullptr, ndeps, &np);
+#else
     const cudaError_t e = cudaGraphAddNode(out_node, parent, deps, ndeps, &np);
+#endif
     if (e != cudaSuccess) return e;
     for (unsigned i = 0; i < size; ++i) out_bodies[i] = np.conditional.phGraph_out[i];
     return cudaSuccess;
