@@ -44,6 +44,7 @@ if (RASBERY_ENABLE_CUDA)
     list(APPEND RASBERY_SOURCES
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaBICGBackend.cu"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaXsReconBackend.cu"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/GpuPhysicsArenaCuda.cu"
     )
     # The xsrecon kernel's contract is bit-identical reproduction of the host
     # loop; nvcc must not contract a*b+c into fma where the host compiler did
@@ -131,6 +132,19 @@ if (RASBERY_ENABLE_TESTS)
     endif ()
 
     add_test(NAME xsrecon_consistency COMMAND rasbery_xsrecon_consistency 4096)
+
+    # Arena layout gate (Rev.7.1 Task 2 Step 1).  The layout calculator is pure
+    # host arithmetic, so alignment, non-overlap, slot isolation and the
+    # per-slot-per-phase scratch aliasing rule are all checkable with no device
+    # -- which is the only place they get checked at all.  Includes
+    # GpuPhysicsArenaLayout.h and nothing else, so it builds everywhere.
+    add_executable(rasbery_gpu_arena_layout
+            "${CMAKE_CURRENT_SOURCE_DIR}/test/gpu_physics_arena_layout.cpp")
+    target_compile_features(rasbery_gpu_arena_layout PRIVATE cxx_std_20)
+    target_include_directories(rasbery_gpu_arena_layout PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+    add_test(NAME gpu_arena_layout COMMAND rasbery_gpu_arena_layout)
 
     # Device arm of the same gate: nvcc's floating point vs g++'s, elementwise
     # on one call.  This is what the full-deck A/B cannot localize.
