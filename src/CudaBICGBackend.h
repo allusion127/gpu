@@ -94,6 +94,15 @@ struct BackendCounters {
     /// complete: it is nonzero on every run where the inner loop converges
     /// early, and the accepted solution is unchanged by those iterations.
     std::uint64_t overrun_iterations                   = 0;
+    /// 1 when the run DECLARED the mixed-precision inner BiCGSTAB
+    /// (RASBERY_GPU_CMFD_FP32), 0 for the historical all-FP64 path.  It records
+    /// the configuration, not the outcome: read it together with the next field.
+    std::uint64_t fp32_active                          = 0;
+    /// FP32 inner solves whose non-finite guard fired.  Each one was discarded
+    /// (the flux kept its last finite iterate) and the arena reverted to the
+    /// FP64 kernels for the rest of the process, so a nonzero value means the
+    /// run FINISHED in fp64 whatever fp32_active says.
+    std::uint64_t fp32_fallbacks                       = 0;
 };
 
 /**

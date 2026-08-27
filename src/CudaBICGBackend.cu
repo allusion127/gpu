@@ -116,6 +116,23 @@ bool cmfdScalarFusionEnabled() {
     return enabled;
 }
 
+/// Opt-IN counterpart of envFlagDisabled: unset means off.
+bool envFlagEnabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) return false;
+    const std::string s(value);
+    return !(s.empty() || s == "0" || s == "off" || s == "OFF" ||
+             s == "false" || s == "FALSE");
+}
+
+/// Mixed-precision inner BiCGSTAB (see the FP32 section below).  Read ONCE and
+/// cached: the choice fixes the captured graph topology, so it must not be able
+/// to change between two outers of the same run.
+bool cmfdFp32InnerEnabled() {
+    static const bool enabled = envFlagEnabled("RASBERY_GPU_CMFD_FP32");
+    return enabled;
+}
+
 // ---------------------------------------------------------------------------
 // Device-side inner-loop control.
 //
@@ -957,6 +974,537 @@ __global__ void finalize_status(const double* scalars,
     status[m].flux_gen        = cm[kSolveCount];
 }
 
+// ===========================================================================
+// Mixed-precision inner iteration (RASBERY_GPU_CMFD_FP32, default OFF).
+//
+// On the measured card FP64 is throttled to 1/64 of FP32, so the natural
+// reading is "the inner loop is ALU-starved in double".  That is half the
+// story: every kernel in this solver is a stencil or a BLAS-1 sweep with an
+// arithmetic intensity of 0.1 - 0.3 FLOP/byte, so what FP32 actually buys is
+// HALVED TRAFFIC on the operator and the Krylov vectors, with the FP64 issue
+// pressure removed as a bonus.  Either way the lever is the same one.
+//
+// The structure is classic iterative refinement / mixed-precision Krylov, and
+// it maps onto the two levels this solver already has:
+//
+//   FP64, unchanged   the stored operator (diag / cc / udiag), the flux phi,
+//                     the source, psi, the Wielandt terms and the eigenvalue,
+//                     the 2x2 block inversion, the TRUE residual r = b - A*phi
+//                     recomputed at the top of every outer, the reference norm
+//                     r20 taken from that FP64 residual, every entry of
+//                     `scalars` (rho, alpha, omega, the norms), every
+//                     convergence and non-finite test, and the correction
+//                     accumulation phi += (double)dx.
+//   FP32              the Krylov working vectors (r, r0, p, v, s, t, y, z),
+//                     the colour Gauss-Seidel sweeps, the preconditioner's
+//                     inverted diagonal blocks (dinv), and the operator
+//                     application A*y / A*z inside the inner loop -- through
+//                     per-slot FLOAT MIRRORS of diag/cc that feed nothing else.
+//
+// One outer is therefore: FP64 residual -> FP32 inner solve for the correction
+// -> FP64 correction update, which is the refinement scheme exactly.  The
+// inner loop's job is to take one or two orders off the residual (nmaxbicg = 3
+// captured iterations against _epsbicg = 0.1), comfortably inside what FP32
+// BiCGSTAB delivers before it stagnates; the accuracy comes from the outer
+// Wielandt loop, which never leaves FP64.
+//
+// DETERMINISM.  The FP32 path keeps every rule the FP64 path rests on: `chunk`
+// still depends only on (n, gridDim.x), the per-thread traversal, the fixed
+// binary tree and the strict index-order stage-2 fold are unchanged, and the
+// batch axis is still gridDim.y alone.  The one deliberate difference is the
+// PAYLOAD / ACCUMULATOR SPLIT: stage 1 loads FLOAT operands and folds them into
+// a DOUBLE accumulator -- float x float widened to double is EXACT, so stage 1
+// sums exact products -- and stage 2 is the existing double kernel, reused
+// unmodified.  A run is thus bit-reproducible run to run and independent of
+// batch composition, exactly as before; it is simply not bit-equal to the FP64
+// path, which is what the Gate A/B numeric gates (not the bit-golden gate)
+// validate.  The dots are memory bound at these sizes, so the double
+// accumulator is free and buys back the scalar accuracy BiCGSTAB is most
+// sensitive to.
+//
+// WHY A PARALLEL KERNEL SET rather than template<typename T>.  Three of the
+// kernels below are precision-MIXED at their boundary (the prologue reads a
+// double operator and writes a float Krylov state; update_solution reads float
+// vectors and accumulates into a double flux), so one template would need an
+// `if constexpr` at precisely the sites that matter and would still have to be
+// launched from a branch, because the pointer types differ.  Duplicating
+// instead leaves every FP64 kernel and the whole FP64 enqueue path TEXTUALLY
+// UNTOUCHED, which is the property the byte-identity gate on the OFF path
+// actually needs, and it keeps the capture trivial: the two sets are in 1:1
+// kernel correspondence, so the graph has the same shape either way (plus the
+// one mirror-refresh node), and the choice is made once, before capture.
+// ===========================================================================
+
+/// Refresh the per-slot FLOAT MIRRORS of the operator from the authoritative
+/// double arrays.
+///
+/// This runs at the top of every outer, right after initialize_solver_state and
+/// before anything can read diag_f/cc_f.  That single site DOMINATES every
+/// mutation of the double operator -- the H2D pushes in issueUploads and
+/// issueSweepUploads, the device assembly in cmfd_assemble_operator_2g, and the
+/// per-sweep Wielandt rewrite in cmfd_updls all complete before the next
+/// enqueue_outer -- so the mirror cannot go stale by CONSTRUCTION rather than by
+/// an audit of call sites.  It is the only writer of diag_f and cc_f.
+__global__ void refresh_operator_mirror_f32(const int nxyz,
+                                            const long long mat_stride,
+                                            const long long cpl_stride,
+                                            const double* __restrict__ diag,
+                                            const double* __restrict__ cc,
+                                            float* __restrict__ diag_f,
+                                            float* __restrict__ cc_f,
+                                            const std::uint32_t* __restrict__ halt) {
+    const int m = static_cast<int>(blockIdx.y);
+    HALT_GUARD(halt + m);
+    const int l = blockIdx.x * blockDim.x + threadIdx.x;
+    if (l >= nxyz) return;
+
+    const double* dm = diag + m * mat_stride;
+    float*        df = diag_f + m * mat_stride;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) df[4 * l + k] = static_cast<float>(dm[4 * l + k]);
+
+    const double* cm = cc + m * cpl_stride;
+    float*        cf = cc_f + m * cpl_stride;
+#pragma unroll
+    for (int k = 0; k < 12; ++k) cf[12 * l + k] = static_cast<float>(cm[12 * l + k]);
+}
+
+/// FP32 twin of begin_outer_fused, and the FP64 half of the refinement step.
+///
+/// Everything that decides accuracy stays in double: the 2x2 block inversion
+/// (its determinant is the one cancellation-prone quantity in the whole inner
+/// loop, and it is computed once per outer, not once per iteration), the A*phi
+/// application and the residual b - A*phi.  Only the RESULT is narrowed -- the
+/// inverted blocks into dinv_f and the residual into the FP32 Krylov state.
+///
+/// The double residual is still written to `r` because the reference norm r20,
+/// the fixed denominator of the inner-loop exit test, must be the FP64 one; the
+/// prologue reduction that follows is the unmodified FP64 pair.
+__global__ void begin_outer_fused_f32(const int nxyz,
+                                      const long long vec_stride,
+                                      const long long mat_stride,
+                                      const long long cpl_stride,
+                                      const int* __restrict__ neighbors,
+                                      const double* __restrict__ diag,
+                                      const double* __restrict__ cc,
+                                      const double* __restrict__ x,
+                                      const double* __restrict__ src,
+                                      float* __restrict__ dinv_f,
+                                      double* __restrict__ ax,
+                                      double* __restrict__ r,
+                                      float* __restrict__ r_f,
+                                      float* __restrict__ r0_f,
+                                      float* __restrict__ p_f,
+                                      float* __restrict__ v_f,
+                                      const std::uint32_t* __restrict__ halt) {
+    const int m = static_cast<int>(blockIdx.y);
+    HALT_GUARD(halt + m);
+    const int l = blockIdx.x * blockDim.x + threadIdx.x;
+    if (l >= nxyz) return;
+
+    const double* dm = diag + m * mat_stride;
+
+    // ---- invert_two_group_blocks, evaluated in FP64, stored narrowed ----
+    {
+        float* im = dinv_f + m * mat_stride;
+
+        const double a00  = dm[4 * l + 0];
+        const double a01  = dm[4 * l + 1];
+        const double a10  = dm[4 * l + 2];
+        const double a11  = dm[4 * l + 3];
+        const double rdet = 1.0 / (a00 * a11 - a10 * a01);
+
+        im[4 * l + 0] = static_cast<float>(rdet * a11);
+        im[4 * l + 1] = static_cast<float>(-rdet * a01);
+        im[4 * l + 2] = static_cast<float>(-rdet * a10);
+        im[4 * l + 3] = static_cast<float>(rdet * a00);
+    }
+
+    // ---- matvec_two_group(x = phi -> y = ax), in FP64 ----
+    const double* cm = cc + m * cpl_stride;
+    const double* xm = x + m * vec_stride;
+    double*       ym = ax + m * vec_stride;
+
+    const double x0 = xm[2 * l + 0];
+    const double x1 = xm[2 * l + 1];
+    double       y0 = dm[4 * l + 0] * x0 + dm[4 * l + 1] * x1;
+    double       y1 = dm[4 * l + 2] * x0 + dm[4 * l + 3] * x1;
+
+#pragma unroll
+    for (int slot = 0; slot < 6; ++slot) {
+        const int neighbor = neighbors[6 * l + slot];
+        if (neighbor >= 0) {
+            y0 += cm[12 * l + slot] * xm[2 * neighbor + 0];
+            y1 += cm[12 * l + 6 + slot] * xm[2 * neighbor + 1];
+        }
+    }
+
+    ym[2 * l + 0] = y0;
+    ym[2 * l + 1] = y1;
+
+    // ---- initial residual: FP64 for the reference norm, FP32 for the loop ----
+    const long long base   = m * vec_stride;
+    const double    value0 = src[base + 2 * l + 0] - y0;
+    const double    value1 = src[base + 2 * l + 1] - y1;
+    r[base + 2 * l + 0]    = value0;
+    r[base + 2 * l + 1]    = value1;
+
+    const float f0 = static_cast<float>(value0);
+    const float f1 = static_cast<float>(value1);
+    r_f[base + 2 * l + 0]  = f0;
+    r0_f[base + 2 * l + 0] = f0;
+    p_f[base + 2 * l + 0]  = 0.0f;
+    v_f[base + 2 * l + 0]  = 0.0f;
+    r_f[base + 2 * l + 1]  = f1;
+    r0_f[base + 2 * l + 1] = f1;
+    p_f[base + 2 * l + 1]  = 0.0f;
+    v_f[base + 2 * l + 1]  = 0.0f;
+}
+
+/// FP32 payload, FP64 accumulator.  Partition, traversal order and reduction
+/// tree are those of reduce_dot_stage1, verbatim; only the operand loads are
+/// narrowed and the products are widened back before they are summed.  Stage 2
+/// is the existing double kernel -- there is no _f32 stage 2.
+__global__ void reduce_dot_stage1_f32(const int n,
+                                      const long long vec_stride,
+                                      const float* __restrict__ a,
+                                      const float* __restrict__ b,
+                                      double* __restrict__ partial,
+                                      const std::uint32_t* __restrict__ halt) {
+    const int m = static_cast<int>(blockIdx.y);
+    HALT_GUARD(halt + m);
+    __shared__ double shared[kReduceThreads];
+
+    const float* am = a + m * vec_stride;
+    const float* bm = b + m * vec_stride;
+    double*      pm = partial + static_cast<long long>(m) * kMaxReduceBlocks;
+
+    const int chunk = (n + static_cast<int>(gridDim.x) - 1) / static_cast<int>(gridDim.x);
+    const int begin = static_cast<int>(blockIdx.x) * chunk;
+    const int end   = min(begin + chunk, n);
+
+    double sum = 0.0;
+    for (int i = begin + static_cast<int>(threadIdx.x); i < end;
+         i += static_cast<int>(blockDim.x))
+        sum += static_cast<double>(am[i]) * static_cast<double>(bm[i]);
+
+    shared[threadIdx.x] = sum;
+    __syncthreads();
+
+    for (int stride = kReduceThreads / 2; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride)
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) pm[blockIdx.x] = shared[0];
+}
+
+/// Two independent FP32-payload dots in one pair of nodes; same argument as
+/// reduce_dot2_stage1, same double accumulators as reduce_dot_stage1_f32.
+__global__ void reduce_dot2_stage1_f32(const int n,
+                                       const long long vec_stride,
+                                       const float* __restrict__ a0,
+                                       const float* __restrict__ b0,
+                                       const float* __restrict__ a1,
+                                       const float* __restrict__ b1,
+                                       double* __restrict__ partial0,
+                                       double* __restrict__ partial1,
+                                       const std::uint32_t* __restrict__ halt) {
+    const int m = static_cast<int>(blockIdx.y);
+    HALT_GUARD(halt + m);
+    __shared__ double shared0[kReduceThreads];
+    __shared__ double shared1[kReduceThreads];
+
+    const float* a0m = a0 + m * vec_stride;
+    const float* b0m = b0 + m * vec_stride;
+    const float* a1m = a1 + m * vec_stride;
+    const float* b1m = b1 + m * vec_stride;
+    double*      p0m = partial0 + static_cast<long long>(m) * kMaxReduceBlocks;
+    double*      p1m = partial1 + static_cast<long long>(m) * kMaxReduceBlocks;
+
+    const int chunk = (n + static_cast<int>(gridDim.x) - 1) / static_cast<int>(gridDim.x);
+    const int begin = static_cast<int>(blockIdx.x) * chunk;
+    const int end   = min(begin + chunk, n);
+
+    double sum0 = 0.0;
+    double sum1 = 0.0;
+    for (int i = begin + static_cast<int>(threadIdx.x); i < end;
+         i += static_cast<int>(blockDim.x)) {
+        sum0 += static_cast<double>(a0m[i]) * static_cast<double>(b0m[i]);
+        sum1 += static_cast<double>(a1m[i]) * static_cast<double>(b1m[i]);
+    }
+
+    shared0[threadIdx.x] = sum0;
+    shared1[threadIdx.x] = sum1;
+    __syncthreads();
+
+    for (int stride = kReduceThreads / 2; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride) {
+            shared0[threadIdx.x] += shared0[threadIdx.x + stride];
+            shared1[threadIdx.x] += shared1[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        p0m[blockIdx.x] = shared0[0];
+        p1m[blockIdx.x] = shared1[0];
+    }
+}
+
+/// FP32 twin of matvec_two_group, reading the float operator mirrors.
+__global__ void matvec_two_group_f32(const int nxyz,
+                                     const long long vec_stride,
+                                     const long long mat_stride,
+                                     const long long cpl_stride,
+                                     const int* __restrict__ neighbors,
+                                     const float* __restrict__ diag_f,
+                                     const float* __restrict__ cc_f,
+                                     const float* __restrict__ x,
+                                     float* __restrict__ y,
+                                     const std::uint32_t* __restrict__ halt) {
+    const int m = static_cast<int>(blockIdx.y);
+    HALT_GUARD(halt + m);
+    const int l = blockIdx.x * blockDim.x + threadIdx.x;
+    if (l >= nxyz) return;
+
+    const float* dm = diag_f + m * mat_stride;
+    const float* cm = cc_f + m * cpl_stride;
+    const float* xm = x + m * vec_stride;
+    float*       ym = y + m * vec_stride;
+
+    const float x0 = xm[2 * l + 0];
+    const float x1 = xm[2 * l + 1];
+    float       y0 = dm[4 * l + 0] * x0 + dm[4 * l + 1] * x1;
+    float       y1 = dm[4 * l + 2] * x0 + dm[4 * l + 3] * x1;
+
+#pragma unroll
+    for (int slot = 0; slot < 6; ++slot) {
+        const int neighbor = neighbors[6 * l + slot];
+        if (neighbor >= 0) {
+            y0 += cm[12 * l + slot] * xm[2 * neighbor + 0];
+            y1 += cm[12 * l + 6 + slot] * xm[2 * neighbor + 1];
+        }
+    }
+
+    ym[2 * l + 0] = y0;
+    ym[2 * l + 1] = y1;
+}
+
+/// FP32 twin of colored_block_sweep.  The colour order IS the Gauss-Seidel
+/// semantics and the kernel boundary IS the grid-wide barrier, so the sweep
+/// structure is untouched; only the arithmetic narrows.
+__global__ void colored_block_sweep_f32(const int nxyz,
+                                        const long long vec_stride,
+                                        const long long mat_stride,
+                                        const long long cpl_stride,
+                                        const int target_color,
+                                        const int* __restrict__ colors,
+                                        const int* __restrict__ neighbors,
+                                        const float* __restrict__ cc_f,
+                                        const float* __restrict__ dinv_f,
+                                        const float* __restrict__ b,
+                                        float* __restrict__ x,
+                                        const std::uint32_t* __restrict__ halt) {
+    const int m = static_cast<int>(blockIdx.y);
+    HALT_GUARD(halt + m);
+    const int l = blockIdx.x * blockDim.x + threadIdx.x;
+    if (l >= nxyz || colors[l] != target_color) return;
+
+    const float* cm = cc_f + m * cpl_stride;
+    const float* im = dinv_f + m * mat_stride;
+    const float* bm = b + m * vec_stride;
+    float*       xm = x + m * vec_stride;
+
+    float b0 = bm[2 * l + 0];
+    float b1 = bm[2 * l + 1];
+#pragma unroll
+    for (int slot = 0; slot < 6; ++slot) {
+        const int neighbor = neighbors[6 * l + slot];
+        if (neighbor >= 0) {
+            b0 -= cm[12 * l + slot] * xm[2 * neighbor + 0];
+            b1 -= cm[12 * l + 6 + slot] * xm[2 * neighbor + 1];
+        }
+    }
+
+    xm[2 * l + 0] = im[4 * l + 0] * b0 + im[4 * l + 1] * b1;
+    xm[2 * l + 1] = im[4 * l + 2] * b0 + im[4 * l + 3] * b1;
+}
+
+/// FP32 twin of prepare_p_jacobi.  The breakdown test and beta itself are
+/// evaluated in FP64 from the FP64 `scalars` -- they are the numbers the whole
+/// iteration hangs on and they cost one thread's worth of work -- and only the
+/// vector update runs narrowed.
+__global__ void prepare_p_jacobi_f32(const int nxyz,
+                                     const long long vec_stride,
+                                     const long long mat_stride,
+                                     double* scalars,
+                                     std::uint32_t* flags,
+                                     const float* __restrict__ dinv_f,
+                                     const float* __restrict__ r_f,
+                                     const float* __restrict__ v_f,
+                                     float* __restrict__ p_f,
+                                     float* __restrict__ y_f,
+                                     const std::uint32_t* __restrict__ halt) {
+    const int m = static_cast<int>(blockIdx.y);
+    HALT_GUARD(halt + m);
+    const int l = blockIdx.x * blockDim.x + threadIdx.x;
+    if (l >= nxyz) return;
+
+    const double*   sm   = scalars + static_cast<long long>(m) * kScalarCount;
+    const long long base = m * vec_stride;
+    const int       i0   = 2 * l + 0;
+    const int       i1   = 2 * l + 1;
+
+    const double rho_new = sm[kRhoNew];
+    const double rho_old = sm[kRho];
+    const double alpha   = sm[kAlpha];
+    const double omega   = sm[kOmega];
+    const double denom   = rho_old * omega;
+    const bool breakdown = !isfinite(rho_new) || !isfinite(denom) ||
+                           fabs(denom) < 1.0e-30;
+    float b0, b1;
+    if (breakdown) {
+        atomicOr(flags + m, static_cast<std::uint32_t>(BICGSTAB_BREAKDOWN));
+        b0 = r_f[base + i0];
+        b1 = r_f[base + i1];
+    } else {
+        const float beta   = static_cast<float>(rho_new * alpha / denom);
+        const float omegaf = static_cast<float>(omega);
+        b0 = r_f[base + i0] + beta * (p_f[base + i0] - omegaf * v_f[base + i0]);
+        b1 = r_f[base + i1] + beta * (p_f[base + i1] - omegaf * v_f[base + i1]);
+    }
+    p_f[base + i0] = b0;
+    p_f[base + i1] = b1;
+
+    // ---- block_jacobi(b = p, x = y) ----
+    const float* im = dinv_f + m * mat_stride;
+    float*       xm = y_f + m * vec_stride;
+
+    xm[2 * l + 0] = im[4 * l + 0] * b0 + im[4 * l + 1] * b1;
+    xm[2 * l + 1] = im[4 * l + 2] * b0 + im[4 * l + 3] * b1;
+}
+
+/// FP32 twin of update_s_jacobi.  rho, r0.v and alpha are the FP64 dot results
+/// and every test on them keeps its FP64 form and its FP64 threshold; alpha is
+/// narrowed once, at the point it multiplies a vector.
+__global__ void update_s_jacobi_f32(const int nxyz,
+                                    const long long vec_stride,
+                                    const long long mat_stride,
+                                    double* scalars,
+                                    std::uint32_t* flags,
+                                    const float* __restrict__ dinv_f,
+                                    const float* __restrict__ r_f,
+                                    const float* __restrict__ v_f,
+                                    float* __restrict__ s_f,
+                                    float* __restrict__ z_f,
+                                    const std::uint32_t* __restrict__ halt) {
+    const int m = static_cast<int>(blockIdx.y);
+    HALT_GUARD(halt + m);
+    const int l = blockIdx.x * blockDim.x + threadIdx.x;
+    if (l >= nxyz) return;
+
+    double*         sm   = scalars + static_cast<long long>(m) * kScalarCount;
+    const long long base = m * vec_stride;
+    const int       i0   = 2 * l + 0;
+    const int       i1   = 2 * l + 1;
+
+    const double rho = sm[kRhoNew];
+    const double r0v = sm[kR0V];
+    float b0, b1;
+    if (!isfinite(rho) || !isfinite(r0v)) {
+        atomicOr(flags + m, static_cast<std::uint32_t>(NONFINITE_DETECTED));
+        b0 = r_f[base + i0];
+        b1 = r_f[base + i1];
+    } else {
+        if (l == 0) sm[kRho] = rho;
+
+        if (fabs(r0v) < 1.0e-10) {
+            atomicOr(flags + m, static_cast<std::uint32_t>(FLUX_CONVERGED));
+            b0 = r_f[base + i0];
+            b1 = r_f[base + i1];
+        } else {
+            const double alpha  = rho / r0v;
+            const float  alphaf = static_cast<float>(alpha);
+            b0 = r_f[base + i0] - alphaf * v_f[base + i0];
+            b1 = r_f[base + i1] - alphaf * v_f[base + i1];
+            if (l == 0) sm[kAlpha] = alpha;
+        }
+    }
+    s_f[base + i0] = b0;
+    s_f[base + i1] = b1;
+
+    // ---- block_jacobi(b = s, x = z) ----
+    const float* im = dinv_f + m * mat_stride;
+    float*       xm = z_f + m * vec_stride;
+
+    xm[2 * l + 0] = im[4 * l + 0] * b0 + im[4 * l + 1] * b1;
+    xm[2 * l + 1] = im[4 * l + 2] * b0 + im[4 * l + 3] * b1;
+}
+
+/// THE REFINEMENT STEP.  The correction dx = alpha*y + omega*z is formed in
+/// FP32 from the FP32 search directions and then WIDENED before it is added to
+/// the FP64 flux, so the flux accumulates in double for the whole run and only
+/// the increment ever lives in single.  The recursive residual stays FP32; the
+/// true FP64 residual is re-established by begin_outer_fused_f32 at the next
+/// outer, which is what makes this refinement rather than a plain FP32 solve.
+///
+/// The non-finite guards are the FP64 ones, and they still refuse to WRITE a
+/// bad flux: on failure the element keeps its last finite value, so a slot that
+/// trips this exits the inner loop with the iterate it entered with rather than
+/// with garbage.  That is what lets the host absorb one FP32 failure and fall
+/// back to the FP64 path instead of failing the deck (see BatchCore::drain).
+__global__ void update_solution_f32(const int n,
+                                    const long long vec_stride,
+                                    double* scalars,
+                                    std::uint32_t* flags,
+                                    const float* __restrict__ y_f,
+                                    const float* __restrict__ z_f,
+                                    const float* __restrict__ s_f,
+                                    const float* __restrict__ t_f,
+                                    double* __restrict__ phi,
+                                    float* __restrict__ r_f,
+                                    const std::uint32_t* __restrict__ halt) {
+    const int m = static_cast<int>(blockIdx.y);
+    HALT_GUARD(halt + m);
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    if ((flags[m] & static_cast<std::uint32_t>(FLUX_CONVERGED)) != 0) return;
+
+    double*         sm   = scalars + static_cast<long long>(m) * kScalarCount;
+    const long long base = m * vec_stride;
+
+    const double alpha = sm[kAlpha];
+    const double pts   = sm[kPts];
+    const double ptt   = sm[kPtt];
+    if (!isfinite(alpha) || !isfinite(pts) || !isfinite(ptt)) {
+        atomicOr(flags + m, static_cast<std::uint32_t>(NONFINITE_DETECTED));
+        return;
+    }
+
+    const double omega  = (ptt != 0.0) ? pts / ptt : 0.0;
+    const float  alphaf = static_cast<float>(alpha);
+    const float  omegaf = static_cast<float>(omega);
+
+    const float  dx       = alphaf * y_f[base + i] + omegaf * z_f[base + i];
+    const double next_phi = phi[base + i] + static_cast<double>(dx);
+    const float  next_r   = s_f[base + i] - omegaf * t_f[base + i];
+    // The residual test is written on the widened value so the overload picked
+    // here is the same isfinite(double) the FP64 kernel uses; widening a float
+    // preserves inf and NaN exactly, so the two tests agree by construction.
+    if (!isfinite(next_phi) || !isfinite(static_cast<double>(next_r))) {
+        atomicOr(flags + m, static_cast<std::uint32_t>(NONFINITE_DETECTED));
+        return;
+    }
+    if (next_phi < 0.0)
+        atomicOr(flags + m, static_cast<std::uint32_t>(NEGATIVE_FLUX));
+    phi[base + i] = next_phi;
+    r_f[base + i] = next_r;
+    if (i == 0) sm[kOmega] = omega;
+}
+
 // ---------------------------------------------------------------------------
 // Device-resident CMFD sweep (RASBERY_GPU_CMFD_SWEEP).
 //
@@ -1442,6 +1990,8 @@ public:
                 if (requested > 0) iter_batch_request = requested;
             }
             scalar_fusion = cmfdScalarFusionEnabled();
+            fp32_inner    = cmfdFp32InnerEnabled();
+            telemetry.fp32_active = fp32_inner ? 1u : 0u;
             status += " (block=" + std::to_string(block_size) +
                       ", RB sweeps=" + std::to_string(rb_sweeps) +
                       ", graph=" + (use_graph ? "on" : "off") +
@@ -1450,6 +2000,10 @@ public:
                                               : std::string("auto")) +
                       ", assembly=" + (cmfdAssemblyEnabled() ? "on" : "off") +
                       ", scalar fusion=" + (scalar_fusion ? "on" : "off") +
+                      // The [PHYSICS_MODE] receipt for the inner-solve precision.
+                      // fp64 = the historical all-double path; mixed = FP32 inner
+                      // BiCGSTAB under an FP64 outer correction.
+                      ", precision=" + (fp32_inner ? "mixed" : "fp64") +
                       ", slots=" + std::to_string(slots) + ")";
 
             const size_t S = static_cast<size_t>(slots);
@@ -1517,6 +2071,23 @@ public:
             allocate(reinterpret_cast<void**>(&node_vol), S * static_cast<size_t>(nxyz) * sizeof(double));
             allocate(reinterpret_cast<void**>(&udiag_dev), S * matrix_count * sizeof(double));
             allocate(reinterpret_cast<void**>(&psi_dev), S * static_cast<size_t>(nxyz) * sizeof(double));
+            // The FP32 working set exists only when the mixed-precision inner
+            // loop is armed, so the default configuration pays neither the
+            // allocation nor the footprint.
+            if (fp32_inner) {
+                const size_t vec_f_bytes = S * static_cast<size_t>(n) * sizeof(float);
+                allocate(reinterpret_cast<void**>(&diag_f), S * matrix_count * sizeof(float));
+                allocate(reinterpret_cast<void**>(&dinv_f), S * matrix_count * sizeof(float));
+                allocate(reinterpret_cast<void**>(&cc_f), S * coupling_count * sizeof(float));
+                allocate(reinterpret_cast<void**>(&r_f), vec_f_bytes);
+                allocate(reinterpret_cast<void**>(&r0_f), vec_f_bytes);
+                allocate(reinterpret_cast<void**>(&p_f), vec_f_bytes);
+                allocate(reinterpret_cast<void**>(&v_f), vec_f_bytes);
+                allocate(reinterpret_cast<void**>(&s_f), vec_f_bytes);
+                allocate(reinterpret_cast<void**>(&t_f), vec_f_bytes);
+                allocate(reinterpret_cast<void**>(&y_f), vec_f_bytes);
+                allocate(reinterpret_cast<void**>(&z_f), vec_f_bytes);
+            }
             allocate(reinterpret_cast<void**>(&sweep_halt), S * sizeof(std::uint32_t));
             allocate(reinterpret_cast<void**>(&device_assembly_active),
                      S * sizeof(std::uint32_t));
@@ -1594,6 +2165,19 @@ public:
         cudaFree(psi_dev);
         cudaFree(sweep_halt);
         cudaFree(device_assembly_active);
+        cudaFree(diag_f);
+        cudaFree(dinv_f);
+        cudaFree(cc_f);
+        cudaFree(r_f);
+        cudaFree(r0_f);
+        cudaFree(p_f);
+        cudaFree(v_f);
+        cudaFree(s_f);
+        cudaFree(t_f);
+        cudaFree(y_f);
+        cudaFree(z_f);
+        diag_f = dinv_f = cc_f = nullptr;
+        r_f = r0_f = p_f = v_f = s_f = t_f = y_f = z_f = nullptr;
         xs_chif = xs_xsnf = xs_xsrf = xs_xssm = dtil_dev = dhat_dev = nullptr;
         node_vol = udiag_dev = psi_dev = nullptr;
         sweep_halt = device_assembly_active = nullptr;
@@ -1795,6 +2379,88 @@ public:
             blocks, partials, partials2, scalars, scalar_slot0, scalar_slot1, device_halt);
     }
 
+    /// Is the mixed-precision inner loop armed right now?  The env gate minus
+    /// the sticky safety latch (see latchFp32Off).  Every enqueue and every
+    /// graph-validity test asks this one question, so the captured topology and
+    /// the kernels inside it can never disagree.
+    [[nodiscard]] bool fp32Active() const { return fp32_inner && !fp32_latched_off; }
+
+    /// FP32-payload counterpart of dot(): _f32 stage 1, unmodified double
+    /// stage 2.  The partial array, its stride and the fold order are shared
+    /// with the FP64 path, which is why no _f32 stage 2 exists.
+    void dot_f32(const float* a, const float* b, int scalar_slot) {
+        const int blocks = reduce_blocks_for(n);
+        reduce_dot_stage1_f32<<<dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(slots)),
+                                kReduceThreads, 0, stream>>>(
+            n, vec_stride(), a, b, partials, device_halt);
+        reduce_dot_stage2<<<scalar_grid(), 1, 0, stream>>>(
+            blocks, partials, scalars, scalar_slot, false, device_halt);
+    }
+
+    void dot2_f32(const float* a0, const float* b0, int scalar_slot0,
+                  const float* a1, const float* b1, int scalar_slot1) {
+        const int blocks = reduce_blocks_for(n);
+        reduce_dot2_stage1_f32<<<dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(slots)),
+                                 kReduceThreads, 0, stream>>>(
+            n, vec_stride(), a0, b0, a1, b1, partials, partials2, device_halt);
+        reduce_dot2_stage2<<<scalar_grid(), 1, 0, stream>>>(
+            blocks, partials, partials2, scalars, scalar_slot0, scalar_slot1, device_halt);
+    }
+
+    void precondition_sweeps_f32(const float* b, float* x) {
+        for (int sweep = 0; sweep < rb_sweeps; ++sweep)
+            colored_block_sweep_f32<<<node_grid(), block_size, 0, stream>>>(
+                nxyz, vec_stride(), mat_stride(), cpl_stride(), sweep % ncolors, colors,
+                neighbors, cc_f, dinv_f, b, x, device_halt);
+    }
+
+    /// One mixed-precision BiCGSTAB iteration.  Kernel for kernel, node for
+    /// node, this is enqueue_iteration with the FP32 twins substituted: the two
+    /// scalar stage-2 kernels, the halt/telemetry bookkeeping and the fusion
+    /// switch are the SAME kernels the FP64 path launches, so the captured
+    /// topology is identical and the counters mean the same thing.
+    void enqueue_iteration_f32(int allow_halt, int force_halt = 0) {
+        dot_f32(r0_f, r_f, kRhoNew);
+        prepare_p_jacobi_f32<<<node_grid(), block_size, 0, stream>>>(
+            nxyz, vec_stride(), mat_stride(), scalars, iter_flags, dinv_f, r_f, v_f,
+            p_f, y_f, device_halt);
+        precondition_sweeps_f32(p_f, y_f);
+        matvec_two_group_f32<<<node_grid(), block_size, 0, stream>>>(
+            nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag_f, cc_f,
+            y_f, v_f, device_halt);
+
+        dot_f32(r0_f, v_f, kR0V);
+        update_s_jacobi_f32<<<node_grid(), block_size, 0, stream>>>(
+            nxyz, vec_stride(), mat_stride(), scalars, iter_flags, dinv_f, r_f, v_f,
+            s_f, z_f, device_halt);
+        precondition_sweeps_f32(s_f, z_f);
+        matvec_two_group_f32<<<node_grid(), block_size, 0, stream>>>(
+            nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag_f, cc_f,
+            z_f, t_f, device_halt);
+
+        dot2_f32(s_f, t_f, kPts, t_f, t_f, kPtt);
+
+        update_solution_f32<<<vector_grid(), block_size, 0, stream>>>(
+            n, vec_stride(), scalars, iter_flags, y_f, z_f, s_f, t_f, phi, r_f,
+            device_halt);
+        const int norm_blocks = reduce_blocks_for(n);
+        reduce_dot_stage1_f32<<<
+            dim3(static_cast<unsigned>(norm_blocks), static_cast<unsigned>(slots)),
+            kReduceThreads, 0, stream>>>(
+            n, vec_stride(), r_f, r_f, partials, device_halt);
+        if (scalar_fusion) {
+            reduce_norm_accumulate_stage2<<<scalar_grid(), 1, 0, stream>>>(
+                norm_blocks, allow_halt, force_halt, partials, scalars, iter_flags,
+                device_flags, device_counters, device_halt, device_active);
+        } else {
+            reduce_dot_stage2<<<scalar_grid(), 1, 0, stream>>>(
+                norm_blocks, partials, scalars, kInitialNorm, true, device_halt);
+            accumulate_iteration<<<scalar_grid(), 1, 0, stream>>>(
+                allow_halt, force_halt, scalars, iter_flags, device_flags,
+                device_counters, device_halt, device_active);
+        }
+    }
+
     /// The COLOUR SWEEPS of the block-Jacobi preconditioner.
     ///
     /// The diagonal solve that used to open this chain (block_jacobi) is now
@@ -1890,11 +2556,27 @@ public:
         initialize_solver_state<<<scalar_grid(), 1, 0, stream>>>(
             scalars, device_flags, device_halt, device_counters, iter_flags,
             device_active, sweep_halt);
-        // One node for what used to be three: the block inversion (independent
-        // of the other two), the A*phi matvec and the residual it feeds.
-        begin_outer_fused<<<node_grid(), block_size, 0, stream>>>(
-            nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag, cc, phi,
-            src, dinv, ax, r, r0, p, v, device_halt);
+        if (fp32Active()) {
+            // The only added node of the mixed-precision topology, and the one
+            // that makes a stale operator mirror impossible: it dominates every
+            // write to the double diag/cc -- the H2D pushes, the device
+            // assembly and the per-sweep cmfd_updls all precede this point.
+            refresh_operator_mirror_f32<<<node_grid(), block_size, 0, stream>>>(
+                nxyz, mat_stride(), cpl_stride(), diag, cc, diag_f, cc_f, device_halt);
+            // Same three fused steps as below, but only the RESULTS narrow: the
+            // block inversion, A*phi and b - A*phi are FP64, and `r` still
+            // receives the FP64 residual so the reference norm harvested by the
+            // unmodified reduction below is the FP64 one.
+            begin_outer_fused_f32<<<node_grid(), block_size, 0, stream>>>(
+                nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag, cc,
+                phi, src, dinv_f, ax, r, r_f, r0_f, p_f, v_f, device_halt);
+        } else {
+            // One node for what used to be three: the block inversion (independent
+            // of the other two), the A*phi matvec and the residual it feeds.
+            begin_outer_fused<<<node_grid(), block_size, 0, stream>>>(
+                nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag, cc, phi,
+                src, dinv, ax, r, r0, p, v, device_halt);
+        }
         const int reference_blocks = reduce_blocks_for(n);
         reduce_dot_stage1<<<
             dim3(static_cast<unsigned>(reference_blocks), static_cast<unsigned>(slots)),
@@ -1915,11 +2597,15 @@ public:
         // first instruction in every kernel, and is counted as an over-run.
         const int algorithmic = 1 + nmax;
         const int captured    = captured_iterations(nmax);
-        for (int i = 0; i < captured; ++i)
-            enqueue_iteration(/*allow_halt=*/i == 0 ? 0 : 1,
-                              /*force_halt=*/(i == algorithmic - 1 && captured > algorithmic)
-                                  ? 1
-                                  : 0);
+        for (int i = 0; i < captured; ++i) {
+            const int allow_halt = i == 0 ? 0 : 1;
+            const int force_halt =
+                (i == algorithmic - 1 && captured > algorithmic) ? 1 : 0;
+            if (fp32Active())
+                enqueue_iteration_f32(allow_halt, force_halt);
+            else
+                enqueue_iteration(allow_halt, force_halt);
+        }
         // A property of the capture, not a tally: assigned, never accumulated.
         // Set here rather than at launch so it is right on the graph-off path
         // too, where there is no launch to hang it off.
@@ -1945,7 +2631,11 @@ public:
             enqueue_outer(nmax);
             return;
         }
-        if (graph_exec == nullptr || graph_nmax != nmax) {
+        // The precision mode is part of the captured topology (different
+        // kernels, one extra node), so a latched fallback invalidates the graph
+        // exactly the way a changed nmax does.
+        if (graph_exec == nullptr || graph_nmax != nmax ||
+            graph_precision != precisionTag()) {
             if (graph_exec != nullptr) {
                 CUDA_CHECK(cudaGraphExecDestroy(graph_exec));
                 graph_exec = nullptr;
@@ -1994,7 +2684,8 @@ public:
                 enqueue_outer(nmax);
                 return;
             }
-            graph_nmax = nmax;
+            graph_nmax      = nmax;
+            graph_precision = precisionTag();
             // The capture itself enqueued nothing: replay it now.
         }
         CUDA_CHECK(cudaGraphLaunch(graph_exec, stream));
@@ -2051,7 +2742,8 @@ public:
             return;
         }
         if (sweep_graph_exec == nullptr || sweep_graph_nmax != nmax ||
-            sweep_graph_unroll != unroll) {
+            sweep_graph_unroll != unroll ||
+            sweep_graph_precision != precisionTag()) {
             if (sweep_graph_exec != nullptr) {
                 CUDA_CHECK(cudaGraphExecDestroy(sweep_graph_exec));
                 sweep_graph_exec = nullptr;
@@ -2077,8 +2769,9 @@ public:
                 enqueue_sweeps(nmax, unroll);
                 return;
             }
-            sweep_graph_nmax   = nmax;
-            sweep_graph_unroll = unroll;
+            sweep_graph_nmax      = nmax;
+            sweep_graph_unroll    = unroll;
+            sweep_graph_precision = precisionTag();
         }
         CUDA_CHECK(cudaGraphLaunch(sweep_graph_exec, stream));
         ++telemetry.graph_launches;
@@ -2301,6 +2994,9 @@ public:
         CUDA_CHECK(cudaGetLastError());
         commitAssemblyMirrors(active_slots, count);
 
+        const bool fp32_was_active = fp32Active();
+        bool       fp32_failed     = false;
+
         for (int i = 0; i < count; ++i) {
             const int m = active_slots[i];
             // The flux mirror is NOT recorded here: count*n double copies on
@@ -2316,9 +3012,59 @@ public:
             // out of solve().  The old batch-fatal throw took every batch-mate
             // down with the diverging deck, which turned one bad candidate in
             // a GA screen into a build-dependent set of collateral failures.
-            slot[static_cast<size_t>(m)].nonfinite =
-                (host_status[m].flags & NONFINITE_DETECTED) != 0;
+            const bool nonfinite = (host_status[m].flags & NONFINITE_DETECTED) != 0;
+            if (nonfinite && fp32_was_active) {
+                // MIXED-PRECISION SAFETY VALVE, deliberately env-independent.
+                //
+                // The FP32 kernels refuse to write a non-finite flux, so the
+                // slot comes back holding the iterate it entered the outer
+                // with: the failed FP32 attempt is DISCARDED, never accepted.
+                // Absorb it once, move the whole arena back to FP64 and let the
+                // outer Wielandt loop carry on from that last good iterate --
+                // which is the same self-healing the BiCGSTAB restart
+                // convention already relies on.  If the flux is genuinely
+                // diverging, the FP64 path hits it on the very next outer and
+                // raises it the historical way, because fp32 is off by then.
+                ++telemetry.fp32_fallbacks;
+                fp32_failed                            = true;
+                slot[static_cast<size_t>(m)].nonfinite = false;
+            } else {
+                slot[static_cast<size_t>(m)].nonfinite = nonfinite;
+            }
         }
+
+        if (fp32_failed) latchFp32Off();
+    }
+
+    /// Retire the mixed-precision path for the rest of the process.
+    ///
+    /// Arena-wide rather than per slot, and that is a property of the design
+    /// rather than an omission: one captured graph serves every slot of a
+    /// launch, so a per-slot precision would mean carrying BOTH kernel sets in
+    /// the graph and masking one of them -- doubling the node count, which is
+    /// the cost this whole campaign is trying to remove.  Dropping the cached
+    /// graphs is what makes the switch take effect; the next launch re-captures
+    /// the FP64 topology.  Called from drain(), i.e. with the stream already
+    /// synchronised, so destroying the executables here is safe.
+    void latchFp32Off() {
+        if (fp32_latched_off) return;
+        fp32_latched_off = true;
+        if (graph_exec != nullptr) {
+            cudaGraphExecDestroy(graph_exec);
+            graph_exec = nullptr;
+            graph_nmax = -1;
+            ++telemetry.graph_reinstantiations;
+        }
+        if (sweep_graph_exec != nullptr) {
+            cudaGraphExecDestroy(sweep_graph_exec);
+            sweep_graph_exec   = nullptr;
+            sweep_graph_nmax   = -1;
+            sweep_graph_unroll = -1;
+            ++telemetry.graph_reinstantiations;
+        }
+        std::cerr << "[RASBERY][CUDA][FP32_FALLBACK] {\"reason\":\"nonfinite\","
+                  << "\"fp32_fallbacks\":" << telemetry.fp32_fallbacks
+                  << ",\"precision\":\"fp64\"}" << std::endl;
     }
 
     /// Host and device agree on slot m's flux once its batch drained; record
@@ -2380,6 +3126,27 @@ public:
     int           iter_batch_used = 0;
     cudaGraphExec_t graph_exec = nullptr;
     int           graph_nmax = -1;
+
+    // ---- mixed-precision inner loop (RASBERY_GPU_CMFD_FP32) ----
+    /// The env gate, resolved once in the constructor.
+    bool          fp32_inner = false;
+    /// Sticky safety fallback: set by drain() when an FP32 launch reported a
+    /// non-finite, never cleared.
+    bool          fp32_latched_off = false;
+    /// Which kernel set the cached graphs were captured with.
+    [[nodiscard]] int precisionTag() const { return fp32Active() ? 1 : 0; }
+    int           graph_precision = -1;
+    int           sweep_graph_precision = -1;
+    /// Float mirrors of the operator.  Written ONLY by
+    /// refresh_operator_mirror_f32; the double diag/cc stay authoritative.
+    float*        diag_f = nullptr;
+    float*        cc_f   = nullptr;
+    /// Narrowed inverted diagonal blocks, written by begin_outer_fused_f32.
+    float*        dinv_f = nullptr;
+    /// The FP32 Krylov working set.  The flux, the source and `r` (the FP64
+    /// residual that fixes the reference norm) are NOT here: they stay double.
+    float *r_f = nullptr, *r0_f = nullptr, *p_f = nullptr, *v_f = nullptr;
+    float *s_f = nullptr, *t_f = nullptr, *y_f = nullptr, *z_f = nullptr;
 
     // ---- device-resident CMFD sweep state (RASBERY_GPU_CMFD_SWEEP) ----
     double*        xs_chif    = nullptr; ///< [slot][ig*nxyz+l]
@@ -2968,7 +3735,9 @@ void rasberyReleaseBatchArena() {
               << "\"graph_fallbacks\":" << c.graph_fallbacks << ','
               << "\"iter_batch\":" << c.iter_batch << ','
               << "\"batched_graph_launches\":" << c.batched_graph_launches << ','
-              << "\"overrun_iterations\":" << c.overrun_iterations << '}' << std::endl;
+              << "\"overrun_iterations\":" << c.overrun_iterations << ','
+              << "\"fp32_active\":" << c.fp32_active << ','
+              << "\"fp32_fallbacks\":" << c.fp32_fallbacks << '}' << std::endl;
     g_arena.reset();
 }
 

@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""Static contract for the mixed-precision CMFD inner solve.
+
+RASBERY_GPU_CMFD_FP32 runs the inner BiCGSTAB in FP32 under an FP64 outer
+correction (iterative refinement).  It changes the numerical trajectory on
+purpose, so it is validated by the Gate A/B numeric gates rather than by the
+bit-golden gate -- which makes these five properties the ones a reviewer cannot
+check by diffing an h5:
+
+  1. the env gate is read ONCE and cached, so the captured graph topology and
+     the kernels inside it can never disagree;
+  2. with the gate off, no FP32 code is REACHABLE -- every _f32 launch sits
+     behind fp32Active(), and the FP64 enqueue path still launches the FP64
+     kernels;
+  3. the float operator mirrors are refreshed downstream of every mutation of
+     the double operator (host upload, device assembly, per-sweep updls);
+  4. the FP32 reductions use a float payload with a DOUBLE accumulator and reuse
+     the unmodified double stage-2 folds;
+  5. the non-finite fallback to FP64 exists, is env-independent, and invalidates
+     the cached graphs.
+"""
+from __future__ import annotations
+
+import py_compile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+CUDA = (ROOT / "src" / "CudaBICGBackend.cu").read_text(encoding="utf-8-sig")
+CUDA_H = (ROOT / "src" / "CudaBICGBackend.h").read_text(encoding="utf-8-sig")
+SOLVER = (ROOT / "src" / "BICGSolver.cpp").read_text(encoding="utf-8-sig")
+
+
+def fail(message: str) -> None:
+    raise SystemExit(f"cmfd fp32 contract: FAIL: {message}")
+
+
+def body_after(anchor: str, *, text: str = CUDA) -> str:
+    """The brace-matched block that opens at the first '{' after `anchor`."""
+    start = text.find(anchor)
+    if start < 0:
+        fail(f"anchor not found: {anchor!r}")
+    open_at = text.find("{", start)
+    if open_at < 0:
+        fail(f"no block after {anchor!r}")
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_at : i + 1]
+    fail(f"unbalanced block after {anchor!r}")
+    return ""
+
+
+def signature(kernel: str) -> str:
+    """The parameter list of `__global__ void <kernel>(...)`."""
+    anchor = f"__global__ void {kernel}("
+    start = CUDA.find(anchor)
+    if start < 0:
+        fail(f"kernel not found: {kernel}")
+    open_at = start + len(anchor) - 1
+    depth = 0
+    for i in range(open_at, len(CUDA)):
+        if CUDA[i] == "(":
+            depth += 1
+        elif CUDA[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return CUDA[open_at + 1 : i]
+    fail(f"unbalanced parameter list for {kernel}")
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# 1. The env gate: opt-in, cached once, never consulted per launch.
+# ---------------------------------------------------------------------------
+gate = body_after("bool cmfdFp32InnerEnabled()")
+if "RASBERY_GPU_CMFD_FP32" not in gate:
+    fail("cmfdFp32InnerEnabled does not read RASBERY_GPU_CMFD_FP32")
+if "static const bool enabled" not in gate:
+    fail("the FP32 env gate is not cached in a function-local static")
+if 'envFlagEnabled("RASBERY_GPU_CMFD_FP32")' not in gate:
+    fail("the FP32 gate must be opt-IN (envFlagEnabled), not opt-out")
+if CUDA.count('envFlagEnabled("RASBERY_GPU_CMFD_FP32")') != 1:
+    fail("RASBERY_GPU_CMFD_FP32 is read outside the single cached gate")
+if 'getenv("RASBERY_GPU_CMFD_FP32")' in CUDA:
+    fail("RASBERY_GPU_CMFD_FP32 is read raw somewhere, bypassing the cache")
+if CUDA.count("cmfdFp32InnerEnabled()") != 2:  # the definition and one call
+    fail("the cached FP32 gate is consulted more than once")
+if "fp32_inner    = cmfdFp32InnerEnabled();" not in CUDA:
+    fail("BatchCore does not resolve the FP32 gate once at construction")
+if "bool fp32Active() const { return fp32_inner && !fp32_latched_off; }" not in CUDA:
+    fail("fp32Active() is not the single (gate AND NOT latched) predicate")
+
+# ---------------------------------------------------------------------------
+# 2. OFF path: every FP32 kernel is reachable only through fp32Active().
+# ---------------------------------------------------------------------------
+FP32_KERNELS = (
+    "refresh_operator_mirror_f32",
+    "begin_outer_fused_f32",
+    "reduce_dot_stage1_f32",
+    "reduce_dot2_stage1_f32",
+    "matvec_two_group_f32",
+    "colored_block_sweep_f32",
+    "prepare_p_jacobi_f32",
+    "update_s_jacobi_f32",
+    "update_solution_f32",
+)
+for kernel in FP32_KERNELS:
+    if f"__global__ void {kernel}(" not in CUDA:
+        fail(f"missing FP32 kernel {kernel}")
+
+FP32_ENQUEUE = ("dot_f32", "dot2_f32", "precondition_sweeps_f32", "enqueue_iteration_f32")
+guarded = "".join(body_after(f"void {name}(") for name in FP32_ENQUEUE)
+
+outer = body_after("void enqueue_outer(int nmax)")
+fp32_arm = body_after("if (fp32Active()) {", text=outer)
+fp64_arm = body_after("} else {", text=outer)
+if "refresh_operator_mirror_f32<<<" not in fp32_arm or "begin_outer_fused_f32<<<" not in fp32_arm:
+    fail("the FP32 prologue is not inside the fp32Active() arm of enqueue_outer")
+if "begin_outer_fused<<<" not in fp64_arm:
+    fail("the FP64 prologue arm no longer launches begin_outer_fused")
+if "_f32" in fp64_arm:
+    fail("FP32 code leaked into the FP64 arm of enqueue_outer")
+if "if (fp32Active())\n                enqueue_iteration_f32(" not in outer:
+    fail("the iteration loop does not select the FP32 body through fp32Active()")
+if "enqueue_iteration(allow_halt, force_halt);" not in outer:
+    fail("the FP64 iteration body is no longer reachable")
+
+reachable = guarded + fp32_arm
+for kernel in FP32_KERNELS:
+    total = CUDA.count(f"{kernel}<<<")
+    if total == 0:
+        fail(f"{kernel} is never launched")
+    if reachable.count(f"{kernel}<<<") != total:
+        fail(f"{kernel} is launched outside an fp32Active()-guarded region")
+
+# The FP64 inner loop must still launch the FP64 kernels, untouched.
+iteration = body_after("void enqueue_iteration(int allow_halt")
+for kernel in ("prepare_p_jacobi<<<", "matvec_two_group<<<", "update_s_jacobi<<<",
+               "update_solution<<<", "reduce_dot_stage1<<<"):
+    if kernel not in iteration:
+        fail(f"the FP64 iteration no longer launches {kernel}")
+if "_f32" in iteration:
+    fail("FP32 code leaked into the FP64 iteration body")
+if "colored_block_sweep<<<" not in body_after("void precondition_sweeps(const double* b"):
+    fail("the FP64 colour sweeps were disturbed")
+
+# The FP32 working set must not be allocated when the gate is off.
+if "if (fp32_inner) {" not in CUDA:
+    fail("the FP32 device allocations are not gated on the env flag")
+alloc = body_after("if (fp32_inner) {")
+for name in ("diag_f", "cc_f", "dinv_f", "r_f", "r0_f", "p_f", "v_f", "s_f", "t_f",
+             "y_f", "z_f"):
+    if f"&{name})" not in alloc:
+        fail(f"{name} is not allocated inside the gated FP32 block")
+
+# ---------------------------------------------------------------------------
+# 3. Mirror freshness: one writer, and it dominates every mutation site.
+# ---------------------------------------------------------------------------
+refresh = body_after("__global__ void refresh_operator_mirror_f32(")
+if "static_cast<float>(dm[" not in refresh or "static_cast<float>(cm[" not in refresh:
+    fail("the mirror kernel does not narrow both diag and cc")
+# Only the refresh kernel may WRITE the mirrors: every other appearance of
+# diag_f/cc_f is a const pointer parameter, an allocation, a free or an argument.
+for mirror in ("diag_f", "cc_f"):
+    writers = [line.strip() for line in CUDA.splitlines()
+               if f"{mirror}[" in line and "const float" not in line]
+    if [line for line in writers if not line.startswith(("df[", "cf[", "float*"))]:
+        fail(f"{mirror} is written outside refresh_operator_mirror_f32: {writers}")
+
+refresh_at = outer.find("refresh_operator_mirror_f32<<<")
+consume_at = outer.find("begin_outer_fused_f32<<<")
+if not 0 <= refresh_at < consume_at:
+    fail("the mirror refresh does not precede the first FP32 consumer of the outer")
+
+sweeps = body_after("void enqueue_sweeps(int nmax, int unroll)")
+assembly_at = sweeps.find("cmfd_assemble_operator_2g<<<")
+outer_at = sweeps.find("enqueue_outer(nmax);")
+updls_at = sweeps.find("cmfd_updls<<<")
+if not 0 <= assembly_at < outer_at:
+    fail("the device assembly does not precede the outer that refreshes the mirror")
+if not 0 <= outer_at < updls_at:
+    fail("cmfd_updls is not inside the sweep loop that re-enters enqueue_outer")
+if "for (int sweep = 0; sweep < unroll; ++sweep)" not in sweeps:
+    fail("the sweep loop no longer re-enters enqueue_outer after each updls")
+# The host-side uploads of diag/cc are likewise upstream of the launch that
+# replays enqueue_outer; assert both upload sites still exist so the dominance
+# argument keeps naming real code.
+for site in ("void issueUploads(const int* active_slots, int count)",
+             "void issueSweepUploads(const int* active_slots, int count)"):
+    if site not in CUDA:
+        fail(f"missing operator upload site {site}")
+if "_f32" in body_after("void issueUploads(const int* active_slots, int count)"):
+    fail("the FP32 mirrors must not be refreshed from the upload path "
+         "(the in-graph refresh is the single site)")
+
+# ---------------------------------------------------------------------------
+# 4. Reductions: float payload, double accumulator, unmodified double stage 2.
+# ---------------------------------------------------------------------------
+for stage1 in ("reduce_dot_stage1_f32", "reduce_dot2_stage1_f32"):
+    block = body_after(f"__global__ void {stage1}(")
+    if "__shared__ double" not in block:
+        fail(f"{stage1} does not fold through a double shared accumulator")
+    if "float sum" in block or "__shared__ float" in block:
+        fail(f"{stage1} accumulates in float")
+    if "static_cast<double>(" not in block:
+        fail(f"{stage1} does not widen its float payload before multiplying")
+    partition = ("const int chunk = (n + static_cast<int>(gridDim.x) - 1) / "
+                 "static_cast<int>(gridDim.x);")
+    if partition not in block:
+        fail(f"{stage1} changed the deterministic partition")
+    if "for (int stride = kReduceThreads / 2; stride > 0; stride >>= 1)" not in block:
+        fail(f"{stage1} changed the fixed reduction tree")
+for duplicated in ("reduce_dot_stage2_f32", "reduce_dot2_stage2_f32"):
+    if f"__global__ void {duplicated}" in CUDA:
+        fail("a duplicated FP32 stage 2 exists; the double stage 2 must be reused")
+if "reduce_dot_stage2<<<" not in body_after("void dot_f32(const float* a"):
+    fail("dot_f32 does not reuse the double stage-2 fold")
+if "reduce_dot2_stage2<<<" not in body_after("void dot2_f32(const float* a0"):
+    fail("dot2_f32 does not reuse the double stage-2 fold")
+fp32_iter = body_after("void enqueue_iteration_f32(int allow_halt")
+for scalar_kernel in ("reduce_norm_accumulate_stage2<<<", "accumulate_iteration<<<",
+                      "reduce_dot_stage2<<<"):
+    if scalar_kernel not in fp32_iter:
+        fail(f"the FP32 iteration does not reuse the double scalar kernel {scalar_kernel}")
+
+# The FP64 boundary of the refinement step: the flux stays double and only the
+# correction is narrowed.
+step = body_after("__global__ void update_solution_f32(")
+if "double* __restrict__ phi" not in signature("update_solution_f32"):
+    fail("update_solution_f32 does not keep the flux in FP64")
+if "const float  dx" not in step:
+    fail("the correction is not formed in FP32")
+if "phi[base + i] + static_cast<double>(dx)" not in step:
+    fail("the correction is not widened before it is accumulated into the flux")
+prologue = signature("begin_outer_fused_f32")
+if "double* __restrict__ r," not in prologue:
+    fail("the FP64 residual is no longer written for the reference norm")
+for double_input in ("const double* __restrict__ diag",
+                     "const double* __restrict__ cc",
+                     "const double* __restrict__ x",
+                     "const double* __restrict__ src"):
+    if double_input not in prologue:
+        fail(f"the FP32 prologue no longer reads the FP64 operand {double_input}")
+if "float* __restrict__ dinv_f" not in prologue:
+    fail("the FP32 prologue does not narrow the inverted diagonal blocks")
+if "reduce_dot_stage1<<<" not in outer:
+    fail("the reference norm no longer uses the FP64 reduction over the FP64 residual")
+
+# ---------------------------------------------------------------------------
+# 5. The non-finite fallback: env-independent, counted, graph-invalidating.
+# ---------------------------------------------------------------------------
+drain = body_after("void drain(const int* active_slots, int count)")
+if "++telemetry.fp32_fallbacks;" not in drain:
+    fail("drain() does not count an FP32 fallback")
+if "if (fp32_failed) latchFp32Off();" not in drain:
+    fail("drain() does not latch the arena back to FP64 after an FP32 failure")
+if "nonfinite && fp32_was_active" not in drain:
+    fail("the fallback is not conditioned on the FP32 path having been active")
+latch = body_after("void latchFp32Off()")
+if "fp32_latched_off = true;" not in latch:
+    fail("latchFp32Off does not set the sticky latch")
+if latch.count("cudaGraphExecDestroy") != 2:
+    fail("latchFp32Off does not drop BOTH cached graphs")
+if "std::getenv" in latch or "envFlag" in latch:
+    fail("the fallback must be env-independent")
+if "atomicOr(flags + m, static_cast<std::uint32_t>(NONFINITE_DETECTED));" not in step:
+    fail("update_solution_f32 dropped the non-finite guard")
+if step.count("return;") < 2:
+    fail("update_solution_f32 must refuse to write on a non-finite result")
+launch_outer = body_after("void launch_outer(int nmax)")
+if "graph_precision != precisionTag()" not in launch_outer:
+    fail("the plain-solve graph is not invalidated when the precision changes")
+launch_sweeps = body_after("void launch_sweeps(int nmax, int unroll)")
+if "sweep_graph_precision != precisionTag()" not in launch_sweeps:
+    fail("the sweep graph is not invalidated when the precision changes")
+
+# ---------------------------------------------------------------------------
+# 6. Telemetry and the [PHYSICS_MODE] receipt.
+# ---------------------------------------------------------------------------
+for field in ("std::uint64_t fp32_active", "std::uint64_t fp32_fallbacks"):
+    if field not in CUDA_H:
+        fail(f"BackendCounters is missing {field}")
+for emitter, name in ((CUDA, "arena"), (SOLVER, "single-instance")):
+    for key in ("fp32_active", "fp32_fallbacks"):
+        if f'\\"{key}\\":' not in emitter or f"c.{key}" not in emitter:
+            fail(f"the {name} BACKEND_COUNTERS dump omits {key}")
+if 'telemetry.fp32_active = fp32_inner ? 1u : 0u;' not in CUDA:
+    fail("fp32_active reports something other than the declared env gate")
+if '", precision=" + (fp32_inner ? "mixed" : "fp64")' not in CUDA:
+    fail("the [RASBERY][CUDA] banner does not carry the cmfd precision receipt")
+if "BATCH_OCCUPANCY" not in CUDA:
+    fail("the batch occupancy line disappeared")
+if "_f32" in body_after("void CudaBatchArena::reportBatchOccupancy"):
+    fail("BATCH_OCCUPANCY must be unchanged by the precision mode")
+
+py_compile.compile(str(Path(__file__).resolve()), doraise=True)
+print("cmfd fp32 contract: PASS")

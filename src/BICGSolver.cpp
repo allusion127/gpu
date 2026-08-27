@@ -120,7 +120,9 @@ BICGSolver::~BICGSolver() {
         << "\"graph_fallbacks\":" << c.graph_fallbacks << ','
         << "\"iter_batch\":" << c.iter_batch << ','
         << "\"batched_graph_launches\":" << c.batched_graph_launches << ','
-        << "\"overrun_iterations\":" << c.overrun_iterations
+        << "\"overrun_iterations\":" << c.overrun_iterations << ','
+        << "\"fp32_active\":" << c.fp32_active << ','
+        << "\"fp32_fallbacks\":" << c.fp32_fallbacks
         << "}" << std::endl;
 }
 
