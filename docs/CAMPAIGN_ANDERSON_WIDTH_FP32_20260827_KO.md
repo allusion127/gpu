@@ -108,6 +108,12 @@ pin 수명 앨리어싱(폭>64 붕괴의 원인)이 HostPinLease+page-exclusive�
 
 이는 §4의 폭 96 실험과 정확히 같은 곱 구조(폭 비용 × 반복 수)의 다른 단면이다. **설계된 해법은 slot compaction**(Phase 5 계획, `docs/PLAN_PHASE5_PERSISTENT_RESIDENCY_KO.md`) — grid 비용을 **선언된 폭이 아니라 실제 점유**에 묶는다. 그것이 착지하기 전까지 배치 기본값은 OFF로 두고, `RASBERY_XE_ANDERSON=1`로 배치 A/B 실험은 계속 가능하게 남긴다. 반대로 단일덱에서 `=0`은 레거시 Picard 궤적(v1 기준선) 재현용이다.
 
+**env 값 해석 (채택과 함께 바뀐 것).** 값은 **트림 후 case-fold**된다(CRLF env 파일에 이미 물린 적이 있다 — 후행 `\r` 하나가 `0`을 미인식 값으로 바꿔 단일 실행에서 **반대 상태**를 사줄 수 있다). 인정되는 어휘는 `0|off|false|no` → OFF, `1|on|true|yes` → ON이며, **그 밖의 값은 상태가 아니다** — 해당 값을 이름과 함께 경고로 찍고 **모드 기본값으로 폴백**한다.
+
+> ⚠️ **빈 값의 의미가 바뀌었다.** 채택 이전에는 `RASBERY_XE_ANDERSON=""`(또는 공백만)이 **OFF**였다. 이제는 "요청 없음"으로 읽혀 **모드 기본값**이 적용된다 — 즉 단일 실행에서는 **ON**이다. 상속된 빈 변수로 OFF를 기대하던 스크립트는 반드시 `RASBERY_XE_ANDERSON=0`으로 명시해야 한다.
+
+**v1(채택 이전) 궤적 재현 방법**: `RASBERY_XE_ANDERSON=0` **하나면 된다**. `RASBERY_IO_WRITER`는 건드릴 필요가 없다 — writer 스레드는 산출물을 바꾸지 않으며(단일덱 500/500, M64 **45,312/45,312** bit 게이트가 그 근거), 배치 경로의 출력 동일성도 같은 게이트 위에 서 있다. 이 이유로 `.regress.sh`의 Tier 2·3(단일덱, 채택 이전 baseline)은 `RASBERY_XE_ANDERSON=0`만 export한다.
+
 **모드 판별 방식.** 결정점이 "지금 배치인가"를 알아야 하는데 Driver는 그것을 알 수 없다(`--batch-mode`는 argv, 배치 폭은 CUDA 백엔드 뒤 — stub 빌드에는 없음). 그래서 `main()`이 **배치 분기를 선택하는 바로 그 술어**(`batch_width > 0 && !rasbery_inputs.empty()`)를 한 번 계산해 `rasbery::declareExecutionMode()`로 **선언**하고, 그 술어로 분기도 한다(실행과 보고가 어긋날 수 없음). 선언은 첫 수신증보다 **앞**에 온다 — 모드 의존 기본값은 첫 읽기에서 캐시되고 그 첫 읽기가 수신증이기 때문. 기본은 `Single`이므로 단위 테스트·툴·직접 Driver 생성은 선언을 잊어도 단일 실행으로 취급된다.
 
 `[RASBERY][PHYSICS_MODE]`에 세 필드 추가: `"exec_mode":"single|batch"`, `"xe_anderson":true|false`, `"xe_anderson_source":"default|env"`. 상태만으로는 실행을 식별할 수 없기 때문이다(기본으로 켜진 것과 누가 켠 것은 다른 사실이다).
@@ -119,6 +125,7 @@ pin 수명 앨리어싱(폭>64 붕괴의 원인)이 HostPinLease+page-exclusive�
 - **문턱은 불변**: v1의 값은 노이즈 유래가 아니라 엔지니어링 바닥값(plan §3.4)이므로 궤적이 바뀌어도 움직이지 않는다.
 - **바뀌는 것은 궤적**: v2 기준선은 **Anderson-ON 단일덱**을 포함한다. `derivation` 필드에 그 이유(정정 개선, 1.970→1.905 pcm, v1의 ~2~3 pcm 미수렴-Xe 인공오차)를 명시했다.
 - **골든 SHA·wall 등은 전부 `TBD_REFREEZE`** 자리표시자 — 238 검증 에이전트가 재동결 실행으로 채운다.
+- **`"frozen": false`** 필드가 기계 판독 가능한 가드다. 소비자는 이 값이 `false`인 동안 파일을 **거부**해야 한다(자리표시자로 캠페인을 게이팅하는 사고 방지). 마지막 자리표시자를 채우는 같은 커밋에서 `true`로 뒤집는다.
 - **실행 유효성 조건**: 기준선 실행은 `xe_anderson_source="default"` 이고 `mode_source="default"` 여야 한다. env가 붙은 실행은 실험이지 기준이 아니다.
 
 ### 8.4 재동결 프로토콜 (238 검증 에이전트용)
@@ -134,8 +141,10 @@ pin 수명 앨리어싱(폭>64 붕괴의 원인)이 HostPinLease+page-exclusive�
 | R4 | **MASTER 재비교** (`tools/compare_master_rasbery.py`) | 반응도/CBC/AO/BOC pin RMS·max 기록 (기대 ~1.905 pcm, AO ~0.013) |
 | R5 | **Anderson 건전성** — `RASBERY_STATEPOINT_TELEMETRY=1` **별도 실행**(타이밍과 섞지 말 것) | `xe_aa_proposed/accepted/rejected/history_resets`, 수용률 ≥ ~90 % |
 | R6 | **M64 앵커**(기본값 그대로 = writer thread ON, 배치 Anderson OFF) | cases/h, FAIL 0/64, `[IO_WRITER][SUMMARY]` `failures=0`·`skipped=0` |
-| R7 | v2 파일의 `TBD_REFREEZE` 채우기 + `frozen_utc` 기입 | manifest·thresholds 커밋, threshold 파일 sha256 기록 |
+| R7 | v2 파일의 `TBD_REFREEZE` 채우기 + `frozen_utc` 기입 + **`"frozen": true`** 로 전환 | manifest·thresholds 커밋, threshold 파일 sha256 기록. 자리표시자가 하나라도 남았으면 `frozen`을 뒤집지 말 것 |
 
 v1 파일 2개는 **수정 금지**(이력). v2가 동결되기 전까지는 v1이 유일한 동결 기준이다.
+
+**`.regress.sh` Tier 2·3은 이 재동결의 대상이 아니다.** 두 티어는 채택 이전 baseline에 고정된 **코드 회귀 게이트**이며 `RASBERY_XE_ANDERSON=0`을 export한다(스크립트 헤더 참조). 채택 때문에 붉어졌다고 baseline을 **재기록하지 말 것** — 재기록은 같은 창에 들어온 진짜 회귀를 함께 묻는다.
 
 **우선순위 갱신**: §7 표의 1번(writer 분리)·2번(Anderson)은 채택으로 종결. 다음은 **Phase 5 slot compaction** — 배치 Anderson의 −38 % outer 감축을 처리량으로 회수하는 유일한 설계된 경로이자, 폭 확장 기각(§4)의 원인도 같은 것이다.

@@ -489,9 +489,15 @@ inline const char* executionModeName() { return batchExecution() ? "batch" : "si
 inline void declareExecutionMode(ExecutionMode requested) {
     if (exec_detail::observed().load(std::memory_order_relaxed) &&
         exec_detail::modeCell().load(std::memory_order_relaxed) != requested) {
+        // REFUSE the late change rather than record it.  A mode-dependent
+        // default has already cached against the old value, so storing the new
+        // one would leave the cell disagreeing with the state the run is
+        // actually in -- and the receipt reads the cell.  Keeping the old value
+        // means what ran and what is reported stay the same thing.
         std::cerr << "[RASBERY][WARN][exec] execution mode declared after it was already "
                      "read; a mode-dependent default has resolved against the previous "
-                     "value and will not change\n";
+                     "value, so the declaration is refused and the mode stays as it was\n";
+        return;
     }
     exec_detail::modeCell().store(requested, std::memory_order_relaxed);
 }
@@ -505,7 +511,15 @@ inline void declareExecutionMode(ExecutionMode requested) {
 //
 //   single run (no --batch-mode)  -> ON  by default
 //   --batch-mode                  -> OFF by default
-//   RASBERY_XE_ANDERSON=1/0       -> overrides the default in BOTH modes
+//   RASBERY_XE_ANDERSON           -> overrides the default in BOTH modes:
+//                                    0|off|false|no -> OFF, 1|on|true|yes -> ON
+//                                    (trimmed and case-folded), anything else
+//                                    warns and falls back to the mode default
+//
+// NOTE, THE EMPTY VALUE CHANGED MEANING.  Before the adoption an empty
+// RASBERY_XE_ANDERSON meant OFF; it now means "no request", so a single run
+// takes the default and gets ON.  A script that relied on an inherited empty
+// variable to disable the arm has to say RASBERY_XE_ANDERSON=0 out loud.
 //
 // ON for a single deck because the 238 validation measured 1.69x (93.6 -> 55.5
 // s, outers -51 %, 95 % acceptance) with the MASTER agreement IMPROVING, not
@@ -566,17 +580,48 @@ struct XeAndersonGate {
 inline const XeAndersonGate& xeAndersonGate() {
     static const XeAndersonGate resolved = [] {
         const char* value = std::getenv("RASBERY_XE_ANDERSON");
-        // Unset AND empty are both "no request"; the other RASBERY gates use
-        // that same rule, and an inherited empty var must not read as "off".
-        const bool             from_env = (value != nullptr && *value != '\0');
-        const XeAndersonSource source =
-            from_env ? XeAndersonSource::Env : XeAndersonSource::Default;
+        std::string requested = (value != nullptr) ? std::string(value) : std::string();
 
-        bool want;
-        if (from_env) {
-            const std::string s(value);
-            want = !(s == "0" || s == "off" || s == "OFF" || s == "false" || s == "FALSE");
-        } else {
+        // TRIM, THEN CASE-FOLD, before anything looks at the value.  This tree
+        // has been bitten by CRLF-terminated env files more than once, and a
+        // trailing '\r' turning "0" into an unrecognised word would buy the
+        // OPPOSITE state of the one the operator wrote.  Same folding rule as
+        // xeMode(), which is the precedent for every RASBERY mode switch.
+        constexpr const char*        kBlank = " \t\r\n\v\f";
+        const std::string::size_type first  = requested.find_first_not_of(kBlank);
+        if (first == std::string::npos)
+            requested.clear();
+        else
+            requested =
+                requested.substr(first, requested.find_last_not_of(kBlank) - first + 1);
+        for (char& c : requested)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+        // Unset, empty and all-whitespace are the same thing: no request.  An
+        // inherited empty variable must not read as an explicit "off" and
+        // suppress the default.
+        bool             want   = false;
+        XeAndersonSource source = XeAndersonSource::Default;
+        if (!requested.empty()) {
+            if (requested == "0" || requested == "off" || requested == "false" ||
+                requested == "no") {
+                want   = false;
+                source = XeAndersonSource::Env;
+            } else if (requested == "1" || requested == "on" || requested == "true" ||
+                       requested == "yes") {
+                want   = true;
+                source = XeAndersonSource::Env;
+            } else {
+                // A typo is not a state.  Name the value that was rejected --
+                // that is the difference between a two-second fix and an A/B
+                // whose two arms were secretly the same run -- and fall through
+                // to the mode default rather than guessing at an intent.
+                std::cerr << "[RASBERY][WARN][xe] RASBERY_XE_ANDERSON=\"" << value
+                          << "\" is not a state (0|off|false|no or 1|on|true|yes); using "
+                             "the mode default\n";
+            }
+        }
+        if (source == XeAndersonSource::Default) {
             // The adoption default: ON for a single run, OFF under --batch-mode
             // (arrival-width starvation -- see the block above).
             want = (executionMode() == ExecutionMode::Single);
@@ -587,7 +632,7 @@ inline const XeAndersonGate& xeAndersonGate() {
         // request in those modes is a misconfiguration and is reported; the
         // default silently declines, because nobody asked for anything.
         if (want && xeMode() != XeMode::EQUILIBRIUM) {
-            if (from_env)
+            if (source == XeAndersonSource::Env)
                 std::cerr << "[RASBERY][WARN][xe] RASBERY_XE_ANDERSON is set with "
                              "RASBERY_XE_MODE="
                           << xeModeName()

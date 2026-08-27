@@ -65,7 +65,19 @@ def strip_comments(text: str) -> str:
     return re.sub(r"//[^\n]*", "", text)
 
 
+def squash(text: str) -> str:
+    """All runs of whitespace collapsed to one space.
+
+    Anchors that span a line break or sit behind alignment padding are checked
+    through this, so a clang-format pass or a rename that shifts a column does
+    not fail a contract about SEMANTICS.  Never used where the whitespace itself
+    is the property being pinned.
+    """
+    return re.sub(r"\s+", " ", text)
+
+
 WRITER_CODE = strip_comments(WRITER)
+WRITER_FLAT = squash(WRITER)
 IO_CPP_CODE = strip_comments(IO_CPP)
 
 # ---------------------------------------------------------------------------
@@ -78,13 +90,14 @@ IO_CPP_CODE = strip_comments(IO_CPP)
 # and a deliberate A/B arm are indistinguishable in a log.
 # ---------------------------------------------------------------------------
 gate = body_after("inline const Resolution& resolution()")
+GATE_FLAT = squash(gate)
 if 'std::getenv("RASBERY_IO_WRITER")' not in gate:
     fail("resolution() does not read RASBERY_IO_WRITER")
 if "static const Resolution resolved" not in gate:
     fail("the RASBERY_IO_WRITER gate is not cached in a function-local static")
 # State 1: unset (and empty) is the ADOPTED DEFAULT -- the writer thread.
-if ("if (value == nullptr || *value == '\\0')\n            return Resolution{Mode::Thread, "
-        "ModeSource::Default};") not in gate:
+if ("if (value == nullptr || *value == '\\0') return Resolution{Mode::Thread, "
+        "ModeSource::Default};") not in GATE_FLAT:
     fail("an unset/empty RASBERY_IO_WRITER does not default to thread(default); the writer "
          "thread was adopted as the default on 2026-08-27")
 # State 2: the explicit thread request -- same mode, different provenance.
@@ -117,11 +130,12 @@ for other in (IO_CPP_CODE, strip_comments(MAIN), strip_comments(DRIVER), strip_c
         fail("RASBERY_IO_WRITER is read outside IoWriter.h")
 
 # mode()/modeSource() are thin views on ONE cached answer -- two statics could
-# disagree after an env change between them.
-for accessor, expected in (("inline Mode       mode()", "return resolution().mode;"),
-                           ("inline ModeSource modeSource()", "return resolution().source;")):
-    if expected not in body_after(accessor):
-        fail(f"{accessor} does not read through the single cached resolution()")
+# disagree after an env change between them.  Matched whitespace-insensitively:
+# these two are column-aligned, and alignment is not a contract.
+for signature, expected in (("inline Mode mode()", "return resolution().mode;"),
+                            ("inline ModeSource modeSource()", "return resolution().source;")):
+    if f"{signature} {{ {expected} }}" not in WRITER_FLAT:
+        fail(f"{signature} does not read through the single cached resolution()")
 source_name = body_after("inline const char* modeSourceName()")
 for token in ('"env"', '"default"'):
     if token not in source_name:

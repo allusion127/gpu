@@ -1,8 +1,10 @@
 {
   "schema_version": 2,
+  "frozen": false,
   "frozen_utc": "TBD_REFREEZE",
   "supersedes": "validation_baseline_manifest_v1.json",
-  "status": "TEMPLATE - not yet frozen. Every TBD_REFREEZE field is filled by the validation agent from the re-freeze run on 238 (protocol in docs/CAMPAIGN_ANDERSON_WIDTH_FP32_20260827_KO.md s8). Until frozen_utc is a date, validation_baseline_manifest_v1.json remains the only frozen baseline.",
+  "status": "TEMPLATE - not yet frozen. Every TBD_REFREEZE field is filled by the validation agent from the re-freeze run on 238 (protocol in docs/CAMPAIGN_ANDERSON_WIDTH_FP32_20260827_KO.md s8.4). Until frozen_utc is a date, validation_baseline_manifest_v1.json remains the only frozen baseline.",
+  "frozen_field_note": "MACHINE-CHECKABLE GUARD. Any consumer of this file must refuse it while \"frozen\" is false - a template read as authoritative would gate a campaign on TBD_REFREEZE placeholders. The re-freeze fill-in flips it to true in the same commit that replaces the last placeholder.",
   "baseline_commit_sha": "TBD_REFREEZE",
   "branch": "codex/exact-throughput-campaign",
   "compiler": "TBD_REFREEZE (v1: x86_64-conda-linux-gnu-g++ (conda-forge) 14.3.0 at /home/kmk/codex/tools/gcc13/bin)",

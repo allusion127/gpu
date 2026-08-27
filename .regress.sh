@@ -12,6 +12,24 @@
 #     therefore asserts that the fitted terms are actually present, so a silently
 #     empty library fails loudly instead of scoring as "traditional".
 #
+# WHY TIERS 2 AND 3 PIN RASBERY_XE_ANDERSON=0 (adoption 2026-08-27).
+#
+# Both tiers run SINGLE decks with no --batch-mode, and the adopted default for
+# a single run is Anderson ON. That is a deliberate trajectory change -- it
+# converges the Xe fixed point the old default truncated -- so it moves keff by
+# ~2 pcm and moves the whole output file. Tier 2 tolerates 1 pcm and Tier 3
+# h5diffs at -p 1e-9, so both would go red on the adoption itself, and the
+# obvious "fix" is to re-record the baseline: exactly the destructive move these
+# tiers exist to prevent, because a re-record buries any REAL regression that
+# lands in the same window.
+#
+# These are CODE regression gates, not physics-acceptance gates. Their baselines
+# (.regress_baseline, .golden_cpu) were recorded pre-adoption, so they are
+# pinned to the pre-adoption Xe trajectory and keep answering the one question
+# they were built for: "did this commit change anything it did not mean to?"
+# Physics acceptance of the adopted default is a separate gate with its own
+# frozen reference -- test/reference/validation_*_v2.json, plan Rev.4 s3.4.
+#
 # Usage:
 #   .regress.sh [--nobuild] [--tier 0|1|2|all]
 #
@@ -161,6 +179,10 @@ PY
 # ---------------------------------------------------------------------------
 tier2() {
   echo "=== T2: core cycles CY01-CY04 (rod search) ==="
+  # Pinned to the pre-adoption Xe trajectory the baseline was recorded on (see
+  # the header). Exported, not prefixed, so a run added to this tier later
+  # cannot quietly escape the pin.
+  export RASBERY_XE_ANDERSON=0
   local base="${BASELINE:-$ROOT/test/7_i-SMR_Validation/.regress_baseline}"
   local deck_dir="$ROOT/test/7_i-SMR_Validation"
   if [ ! -d "$base" ]; then
@@ -207,6 +229,9 @@ PY
 # ---------------------------------------------------------------------------
 tier3() {
   echo "=== T3: CPU golden h5diff (whole output) ==="
+  # Same pin as Tier 2, and it matters more here: -p 1e-9 fails on ANY
+  # trajectory change, so without this the adoption alone reds the gate.
+  export RASBERY_XE_ANDERSON=0
   command -v h5diff >/dev/null || { note SKIP "h5diff not on PATH"; return; }
   local golden="${GOLDEN:-$ROOT/test/7_i-SMR_Validation/.golden_cpu}"
   local deck_dir="$ROOT/test/7_i-SMR_Validation"

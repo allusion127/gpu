@@ -89,6 +89,17 @@ def code_lines(text: str) -> str:
     return "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("//"))
 
 
+def squash(text: str) -> str:
+    """All runs of whitespace collapsed to one space.
+
+    Anchors that span a line break or sit behind alignment padding are checked
+    through this, so a clang-format pass or a rename that shifts a column does
+    not fail a contract about SEMANTICS.  Never used for checks where the
+    whitespace itself is the property being pinned.
+    """
+    return re.sub(r"\s+", " ", text)
+
+
 SOLVE_LOOP = region(DRIVER, "    static void SolveLoop(",
                     "    /// Where this run's restart_", "SolveLoop")
 SOLVE_CODE = code_lines(SOLVE_LOOP)
@@ -120,33 +131,65 @@ for other in (ROOT / "src").rglob("*"):
 
 gate = region(DRIVER, "inline const XeAndersonGate& xeAndersonGate() {",
               "\n/// The effective state", "xeAndersonGate")
+GATE_FLAT = squash(gate)
 if "static const XeAndersonGate resolved = [] {" not in gate:
     fail("xeAndersonGate() does not cache the resolution in a function-local static")
-# The env is a REQUEST, and unset/empty is the absence of one -- an inherited
-# empty variable must not read as an explicit "off" and suppress the default.
-if "const bool             from_env = (value != nullptr && *value != '\\0');" not in gate:
-    fail("an unset OR EMPTY RASBERY_XE_ANDERSON is not treated as 'no request'; the other "
-         "RASBERY gates all use that rule")
-for off in ('s == "0"', 's == "off"', 's == "false"'):
-    if off not in gate:
-        fail(f"the env override does not treat {off!r} as off; the other Xe gates all do")
-# The env branch decides ALONE when it is present -- an explicit request must
-# beat the default in BOTH directions, or a batch A/B is impossible.
-env_branch = region(gate, "if (from_env) {", "} else {", "env override")
-if "want = !(" not in env_branch:
-    fail("an explicit RASBERY_XE_ANDERSON does not decide the state on its own; the "
-         "override must beat the mode default in BOTH directions")
-if "executionMode()" in env_branch:
-    fail("the explicit env override consults the execution mode; an operator who asked for "
-         "a state must get that state in either mode")
-# The default branch is the mode-dependent one, and it is the ONLY consumer of
-# the execution mode in this gate.
-default_branch = region(gate, "} else {", "\n        }", "mode default")
-if "want = (executionMode() == ExecutionMode::Single);" not in default_branch:
-    fail("the default is not 'ON for a single run, OFF under --batch-mode'")
+
+# TRIMMED AND CASE-FOLDED before anything reads it.  A CRLF-terminated env file
+# is how this tree has been bitten before, and a trailing '\r' would turn "0"
+# into an unrecognised word -- i.e. into the OPPOSITE state in single mode.
+if "find_first_not_of(kBlank)" not in GATE_FLAT or "find_last_not_of(kBlank)" not in GATE_FLAT:
+    fail("the value is not trimmed on BOTH ends before it is parsed; a trailing CR would "
+         "buy the opposite state of the one that was written")
+if "\\r" not in GATE_FLAT:
+    fail("the trim set does not include the carriage return, which is the whole point")
+if "std::tolower" not in GATE_FLAT:
+    fail("the value is not case-folded; xeMode() sets the precedent for every RASBERY "
+         "mode switch")
+
+# The two accepted vocabularies, and the fact that the env decides ALONE when it
+# is present -- an explicit request must beat the mode default in BOTH
+# directions, or a batch A/B is impossible and a single deck cannot go legacy.
+OFF_WORDS = ('requested == "0"', 'requested == "off"', 'requested == "false"',
+             'requested == "no"')
+ON_WORDS = ('requested == "1"', 'requested == "on"', 'requested == "true"',
+            'requested == "yes"')
+for word in OFF_WORDS + ON_WORDS:
+    if word not in GATE_FLAT:
+        fail(f"the env override does not accept {word!r}; both vocabularies must be complete")
+off_at = GATE_FLAT.index(OFF_WORDS[0])
+on_at = GATE_FLAT.index(ON_WORDS[0])
+for arm, at, state in (("off", off_at, "want = false;"), ("on", on_at, "want = true;")):
+    window = GATE_FLAT[at:at + 260]
+    if state not in window:
+        fail(f"the {arm!r} arm does not set {state!r}")
+    if "source = XeAndersonSource::Env;" not in window:
+        fail(f"the {arm!r} arm does not record Env provenance; an explicit request would be "
+             "reported as a default")
+
+# A value in neither vocabulary is NOT a state: it warns, names itself, and
+# falls through to the mode default rather than being guessed at.
+if 'is not a state (0|off|false|no or 1|on|true|yes)' not in GATE_FLAT:
+    fail("an unrecognised RASBERY_XE_ANDERSON value is accepted silently; the warning must "
+         "also name the accepted vocabularies")
+if '<< value' not in GATE_FLAT:
+    fail("the warning does not name the rejected value; without it a typo is invisible")
+typo_at = GATE_FLAT.index("is not a state (0|off")
+if "source = XeAndersonSource::Env;" in GATE_FLAT[typo_at:]:
+    fail("an unrecognised value still claims Env provenance; it must fall through to the "
+         "mode default")
+
+# The mode default is the fallback for EVERY non-request, and the execution mode
+# is consulted at exactly one place.
+DEFAULT_ARM = ("if (source == XeAndersonSource::Default) { "
+               "want = (executionMode() == ExecutionMode::Single); }")
+if DEFAULT_ARM not in squash(code_lines(gate)):
+    fail("the default is not 'ON for a single run, OFF under --batch-mode', applied to every "
+         f"path that did not come from the env: {DEFAULT_ARM!r}")
 if gate.count("executionMode()") != 1:
     fail("the execution mode is consulted more than once in the gate; the default has one "
          "decision point")
+
 # EQUILIBRIUM ONLY, and said out loud when it was ASKED for.  frozen has no
 # cascade to accelerate and once is deliberately not converging one.
 if "xeMode() != XeMode::EQUILIBRIUM" not in gate:
@@ -155,8 +198,8 @@ if "xeMode() != XeMode::EQUILIBRIUM" not in gate:
 if "[RASBERY][WARN][xe]" not in gate:
     fail("the gate silently swallows a mode conflict; a misconfiguration must be "
          "reported, not quietly honoured as 'off'")
-conflict = gate[gate.index("xeMode() != XeMode::EQUILIBRIUM"):]
-if "if (from_env)" not in conflict.split("return")[0]:
+conflict = GATE_FLAT[GATE_FLAT.index("xeMode() != XeMode::EQUILIBRIUM"):]
+if "if (source == XeAndersonSource::Env)" not in conflict.split("return")[0]:
     fail("the mode-conflict warning fires for the DEFAULT too; nobody asked for Anderson in "
          "that run, so there is no misconfiguration to report")
 if "return XeAndersonGate{false, source};" not in conflict:
@@ -204,23 +247,43 @@ if "[RASBERY][WARN][exec]" not in declare:
          "was supposed to feed has already cached the wrong answer")
 if "observed().load" not in declare:
     fail("declareExecutionMode does not check whether the mode was already read")
+# ...and it REFUSES the late change instead of recording it.  Storing a value a
+# cached gate has already resolved against would leave the cell -- which is what
+# the receipt reads -- describing a run that is not the one executing.
+warn_at = declare.index("[RASBERY][WARN][exec]")
+store_at = declare.index("modeCell().store(")
+if store_at < warn_at:
+    fail("the late-declare guard runs after the store it is supposed to prevent")
+if "return;" not in declare[warn_at:store_at]:
+    fail("the late-declare path warns and then stores anyway; it must return first, or the "
+         "cell disagrees with the state the cached gate resolved against")
+if declare.count("modeCell().store(") != 1:
+    fail("declareExecutionMode has more than one store; the refusal path could be bypassed")
 
 MAIN_CODE = code_lines(MAIN)
-PREDICATE = ("const bool batch_execution = (batch_width > 0 && !rasbery_inputs.empty());")
-if PREDICATE not in MAIN_CODE:
-    fail(f"main() does not compute the batch predicate once: {PREDICATE!r}")
-if MAIN_CODE.count("batch_execution") != 3:
-    fail("the batch predicate is not used exactly three times (defined, declared, branched); "
-         "a second predicate could disagree with the branch it is supposed to describe")
-if ("rasbery::declareExecutionMode(batch_execution ? rasbery::ExecutionMode::Batch"
-        not in MAIN_CODE):
-    fail("main() does not declare the execution mode from the batch predicate")
-if "if (batch_execution) {" not in MAIN_CODE:
+MAIN_FLAT = squash(MAIN_CODE)
+# THREE sites, named individually: the definition, the declaration and the
+# branch.  (A bare occurrence count would also be satisfied by three mentions in
+# the wrong places, and would break on an unrelated fourth use.)
+DEFINITION = "const bool batch_execution = (batch_width > 0 && !rasbery_inputs.empty());"
+DECLARATION = ("rasbery::declareExecutionMode(batch_execution ? rasbery::ExecutionMode::Batch "
+               ": rasbery::ExecutionMode::Single);")
+BRANCH = "if (batch_execution) {"
+if DEFINITION not in MAIN_FLAT:
+    fail(f"main() does not compute the batch predicate once: {DEFINITION!r}")
+if DECLARATION not in MAIN_FLAT:
+    fail("main() does not declare the execution mode from the batch predicate: "
+         f"{DECLARATION!r}")
+if BRANCH not in MAIN_FLAT:
     fail("the batch branch is not selected by the SAME predicate that was declared; the run "
          "could do one thing and report another")
-declare_at = MAIN_CODE.index("rasbery::declareExecutionMode(")
-receipt_at = MAIN_CODE.index("[RASBERY][PHYSICS_MODE]")
-branch_at = MAIN_CODE.index("if (batch_execution) {")
+# ...and no SECOND predicate that could disagree with the one that was declared.
+if "batch_width > 0 && !rasbery_inputs.empty()" in MAIN_FLAT.replace(DEFINITION, "", 1):
+    fail("the batch predicate is spelled out a second time; the declared mode and the branch "
+         "that runs must come from ONE expression")
+declare_at = MAIN_FLAT.index("rasbery::declareExecutionMode(")
+receipt_at = MAIN_FLAT.index("[RASBERY][PHYSICS_MODE]")
+branch_at = MAIN_FLAT.index(BRANCH)
 if not declare_at < receipt_at < branch_at:
     fail("the execution mode is declared after the [PHYSICS_MODE] receipt; the receipt is the "
          "first read of the mode-dependent default, so it would cache the wrong answer")
