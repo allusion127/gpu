@@ -123,8 +123,23 @@ __global__ void k_barrier_rmw(int iters, double* sink) {
 }
 
 // One timed cooperative launch series.  Returns total ms for kReps launches.
-static int time_arm(void* func, int blocks, int iters, double* d_sink,
-                    cudaStream_t stream, double* out_ms) {
+// Returns a cudaError_t, NOT an exit code.  A cooperative launch can be refused
+// for reasons that are specific to one grid shape -- cudaErrorCooperativeLaunchTooLarge
+// above all -- and a refusal at 4224 blocks says nothing about 34.  Exiting the
+// process there would throw away the measurements the gate actually depends on,
+// so a refusal is data: the caller records {"supported": false} with the driver's
+// own reason and the sweep continues.
+#define TRY_E(expr)                                                            \
+    do {                                                                       \
+        const cudaError_t _e = (expr);                                         \
+        if (_e != cudaSuccess) {                                               \
+            cudaGetLastError();  /* clear so the next shape starts clean */    \
+            return _e;                                                         \
+        }                                                                      \
+    } while (0)
+
+static cudaError_t time_arm(void* func, int blocks, int iters, double* d_sink,
+                            cudaStream_t stream, double* out_ms) {
     void* args[2];
     int iters_local = iters;
     args[0] = &iters_local;
@@ -134,43 +149,44 @@ static int time_arm(void* func, int blocks, int iters, double* d_sink,
     const dim3 block(static_cast<unsigned>(kThreads), 1, 1);
 
     // Warm: first cooperative launch pays module/JIT costs the gate must not see.
-    TRY(cudaLaunchCooperativeKernel(func, grid, block, args, 0, stream));
-    TRY(cudaStreamSynchronize(stream));
+    // This is also where a too-large grid is refused, before any event exists.
+    TRY_E(cudaLaunchCooperativeKernel(func, grid, block, args, 0, stream));
+    TRY_E(cudaStreamSynchronize(stream));
 
     cudaEvent_t e0 = nullptr, e1 = nullptr;
-    TRY(cudaEventCreate(&e0));
-    TRY(cudaEventCreate(&e1));
-    TRY(cudaEventRecord(e0, stream));
+    TRY_E(cudaEventCreate(&e0));
+    TRY_E(cudaEventCreate(&e1));
+    TRY_E(cudaEventRecord(e0, stream));
     for (int r = 0; r < kReps; ++r) {
-        TRY(cudaLaunchCooperativeKernel(func, grid, block, args, 0, stream));
+        TRY_E(cudaLaunchCooperativeKernel(func, grid, block, args, 0, stream));
     }
-    TRY(cudaEventRecord(e1, stream));
-    TRY(cudaEventSynchronize(e1));
+    TRY_E(cudaEventRecord(e1, stream));
+    TRY_E(cudaEventSynchronize(e1));
 
     float ms = 0.0f;
-    TRY(cudaEventElapsedTime(&ms, e0, e1));
+    TRY_E(cudaEventElapsedTime(&ms, e0, e1));
     *out_ms = static_cast<double>(ms);
 
-    TRY(cudaEventDestroy(e0));
-    TRY(cudaEventDestroy(e1));
-    return 0;
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    return cudaSuccess;
 }
 
 // c_barrier in us, with per-launch overhead differenced out.
-static int measure(void* func, int blocks, double* d_sink, cudaStream_t stream,
-                   double* out_us_corrected, double* out_us_raw) {
+static cudaError_t measure(void* func, int blocks, double* d_sink, cudaStream_t stream,
+                           double* out_us_corrected, double* out_us_raw) {
     double ms_k = 0.0, ms_1 = 0.0;
-    int rc = time_arm(func, blocks, kIters, d_sink, stream, &ms_k);
-    if (rc != 0) return rc;
+    cudaError_t rc = time_arm(func, blocks, kIters, d_sink, stream, &ms_k);
+    if (rc != cudaSuccess) return rc;
     rc = time_arm(func, blocks, 1, d_sink, stream, &ms_1);
-    if (rc != 0) return rc;
+    if (rc != cudaSuccess) return rc;
 
     const double per_launch_k = ms_k / static_cast<double>(kReps);
     const double per_launch_1 = ms_1 / static_cast<double>(kReps);
     *out_us_raw = per_launch_k * 1000.0 / static_cast<double>(kIters);
     *out_us_corrected =
         (per_launch_k - per_launch_1) * 1000.0 / static_cast<double>(kIters - 1);
-    return 0;
+    return cudaSuccess;
 }
 
 int main() {
@@ -239,31 +255,54 @@ int main() {
         }
 
         double only_us = -1.0, only_raw = -1.0, rmw_us = -1.0, rmw_raw = -1.0;
+        cudaError_t only_err = cudaSuccess, rmw_err = cudaSuccess;
         if (fits_only) {
             // C-style cast on a __global__ function is the CUDA-sample idiom
             // for the cudaLaunchCooperativeKernel void* parameter.
-            const int rc = measure((void*)k_barrier_only, blocks,
-                                   d_sink, stream, &only_us, &only_raw);
-            if (rc != 0) return rc;
+            only_err = measure((void*)k_barrier_only, blocks,
+                               d_sink, stream, &only_us, &only_raw);
+            if (only_err != cudaSuccess) only_us = only_raw = -1.0;
         }
         if (fits_rmw) {
-            const int rc = measure((void*)k_barrier_rmw, blocks,
-                                   d_sink, stream, &rmw_us, &rmw_raw);
-            if (rc != 0) return rc;
+            rmw_err = measure((void*)k_barrier_rmw, blocks,
+                              d_sink, stream, &rmw_us, &rmw_raw);
+            if (rmw_err != cudaSuccess) rmw_us = rmw_raw = -1.0;
+        }
+
+        // The occupancy query said it fits and the driver disagreed.  That is a
+        // finding about this shape, not a reason to abandon the sweep: record
+        // the driver's own reason and carry on to the next grid.
+        if (only_err != cudaSuccess && rmw_err != cudaSuccess) {
+            std::printf("{\"probe\":\"gridsync_cost\",\"record\":\"sweep\","
+                        "\"blocks\":%d,\"supported\":false,"
+                        "\"reason\":\"cooperative launch refused: %s (%d): %s\","
+                        "\"max_coresident_blocks\":%d}\n",
+                        blocks, cudaGetErrorName(only_err),
+                        static_cast<int>(only_err), cudaGetErrorString(only_err),
+                        resident_only);
+            std::fflush(stdout);
+            continue;
         }
 
         if (blocks == 34) only_at_34 = only_us;
         if (blocks == 67) only_at_67 = only_us;
+
+        // "unknown", not "false": an arm that never ran did not fail the gate.
+        const char* passes = (only_us < 0.0) ? "\"unknown\""
+                           : (only_us <= kBarrierGateUs) ? "true" : "false";
 
         std::printf("{\"probe\":\"gridsync_cost\",\"record\":\"sweep\","
                     "\"blocks\":%d,\"supported\":true,"
                     "\"c_barrier_us\":%.4f,\"c_barrier_us_raw\":%.4f,"
                     "\"c_barrier_rmw_us\":%.4f,\"c_barrier_rmw_us_raw\":%.4f,"
                     "\"rmw_minus_barrier_us\":%.4f,"
+                    "\"barrier_only_error\":\"%s\",\"barrier_rmw_error\":\"%s\","
                     "\"passes_gate\":%s}\n",
                     blocks, only_us, only_raw, rmw_us, rmw_raw,
                     (rmw_us >= 0.0 && only_us >= 0.0) ? rmw_us - only_us : -1.0,
-                    (only_us >= 0.0 && only_us <= kBarrierGateUs) ? "true" : "false");
+                    (only_err == cudaSuccess) ? "" : cudaGetErrorName(only_err),
+                    (rmw_err == cudaSuccess) ? "" : cudaGetErrorName(rmw_err),
+                    passes);
         std::fflush(stdout);
     }
 
@@ -279,10 +318,15 @@ int main() {
 
     // Removable seconds at the measured barrier cost, so the verdict can be
     // re-derived against any end-to-end wall rather than trusted blind.
+    //
+    // -1 when unmeasured, NOT 0.  Substituting 0 for an unmeasured barrier would
+    // print the full 9.4 s of dispatch as "removable" -- the most optimistic
+    // number the arithmetic can produce -- on a run that measured nothing.
     const double removable_s =
-        (kNodeExecutions * kDispatchUs -
-         kNodeExecutions * kBarrierRatio * ((gate_value >= 0.0) ? gate_value : 0.0)) *
-        1.0e-6;
+        (gate_value >= 0.0)
+            ? (kNodeExecutions * kDispatchUs -
+               kNodeExecutions * kBarrierRatio * gate_value) * 1.0e-6
+            : -1.0;
 
     const char* verdict = "UNKNOWN";
     if (gate_value >= 0.0) {
@@ -290,12 +334,13 @@ int main() {
     }
 
     std::printf("{\"probe\":\"gridsync_cost\",\"record\":\"summary\","
-                "\"supported\":true,"
+                "\"supported\":%s,"
                 "\"c_barrier_us_at_34\":%.4f,\"c_barrier_us_at_67\":%.4f,"
                 "\"c_barrier_us_gate_value\":%.4f,"
                 "\"gate_c_barrier_us\":%.4f,\"gate_c_barrier_us_rev4\":%.4f,"
                 "\"removable_seconds_at_measured\":%.3f,"
                 "\"verdict\":\"%s\"}\n",
+                (gate_value >= 0.0) ? "true" : "false",
                 only_at_34, only_at_67, gate_value, kBarrierGateUs,
                 kBarrierGateUsRev4, removable_s, verdict);
     std::fflush(stdout);

@@ -27,10 +27,14 @@
 //                  clock (instantiation is host work; a cudaEvent would not see
 //                  it).  Rev.7 Task 10 rebuilds the scheduler graph on shape
 //                  changes, so this is the cost of every re-plan.
-//   (c) control    us per iteration of the WHILE evaluation with empty bodies,
-//                  10k iterations, and separately of WHILE+SWITCH, so the
-//                  SWITCH evaluation cost is the difference of two measurements
-//                  rather than an attribution.
+//   (c) control    us per iteration of the WHILE evaluation over 10k iterations,
+//                  and separately of WHILE+SWITCH, so the SWITCH evaluation cost
+//                  is the difference of two measurements rather than an
+//                  attribution.  Bodies are MINIMAL (one trivial node), not
+//                  empty: an empty conditional body graph wedges the runtime.
+//                  The difference therefore also carries 1 (SWITCH) or 3
+//                  (nested IF) kernel-node dispatches; subtract probe 1's
+//                  c_dispatch to isolate the conditional evaluation itself.
 //   (d) coop       cooperative kernel node inside a conditional body: set
 //                  cudaLaunchAttributeCooperative on it, instantiate, launch.
 //                  Whichever step refuses, its error name and string are kept.
@@ -60,7 +64,10 @@
 #include <cooperative_groups.h>
 #include <cuda_runtime.h>
 
+#include <unistd.h>
+
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 
@@ -97,12 +104,35 @@ static int*    g_counter = nullptr;
 struct ErrSlot {
     char text[320];
 };
-static ErrSlot g_err[10];
 
-static const char* const kSlotName[10] = {
+// One slot per failure SITE.  Two sites sharing a slot means the second
+// overwrites the first and one of the two failures is lost -- which is the same
+// as swallowing it.  Every arm that can fail independently gets its own index.
+enum ErrSlotId {
+    ERR_WHILE_BUILD = 0,
+    ERR_SWITCH_BUILD,
+    ERR_NESTED_IF_BUILD,
+    ERR_COOP_ATTR,
+    ERR_COOP_INSTANTIATE,
+    ERR_COOP_LAUNCH,
+    ERR_INSTANTIATE_SWITCH,
+    ERR_INSTANTIATE_NESTED_IF,
+    ERR_CONTROL_WHILE,
+    ERR_CONTROL_WHILE_SWITCH,
+    ERR_CONTROL_WHILE_NESTED_IF,
+    ERR_HANDLE_SCOPE,
+    ERR_RUN_SWITCH,
+    ERR_RUN_NESTED_IF,
+    ERR_SLOT_COUNT
+};
+
+static ErrSlot g_err[ERR_SLOT_COUNT];
+
+static const char* const kSlotName[ERR_SLOT_COUNT] = {
     "while_build", "switch_build", "nested_if_build", "coop_attr",
-    "coop_instantiate", "coop_launch", "instantiate", "control",
-    "handle_scope", "launch"
+    "coop_instantiate", "coop_launch", "instantiate_switch",
+    "instantiate_nested_if", "control_while", "control_while_switch",
+    "control_while_nested_if", "handle_scope", "run_switch", "run_nested_if"
 };
 
 static void note(int slot, const char* what, cudaError_t e) {
@@ -136,7 +166,7 @@ static void json_escape(const char* in, char* out, size_t out_cap) {
 
 static void print_errors() {
     char esc[640];
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0; i < ERR_SLOT_COUNT; ++i) {
         if (g_err[i].text[0] == '\0') continue;
         json_escape(g_err[i].text, esc, sizeof(esc));
         std::printf("{\"probe\":\"conditional_graph\",\"record\":\"error\","
@@ -144,6 +174,46 @@ static void print_errors() {
     }
     std::fflush(stdout);
 }
+
+// --------------------------------------------------------------------------
+// Watchdog.
+//
+// A conditional graph that wedges does not fail -- it hangs, and it hangs
+// holding the GPU, which turns one bad probe into a stuck W0 run and a runner
+// script that never returns.  A malformed WHILE condition, a body the runtime
+// will not schedule, or a device-side handle that is never lowered all present
+// the same way.  So the probe bounds its own life: SIGALRM fires, an error
+// record goes out, and the process exits non-zero.
+//
+// The handler must be async-signal-safe, so it uses write(2) on a preformatted
+// buffer -- not printf, which may hold a lock the interrupted code owns.
+// --------------------------------------------------------------------------
+static const unsigned kWatchdogSeconds = 120;
+
+extern "C" void w0_watchdog(int) {
+    static const char kMsg[] =
+        "{\"probe\":\"conditional_graph\",\"record\":\"error\","
+        "\"slot\":\"watchdog\",\"error\":\"probe exceeded 120 s and was killed by "
+        "SIGALRM; a conditional graph is wedged (most likely an empty conditional "
+        "body or a condition handle that is never lowered)\"}\n"
+        "{\"probe\":\"conditional_graph\",\"record\":\"summary\",\"while_ok\":false,"
+        "\"switch_ok\":false,\"nested_if_fallback\":false,"
+        "\"coop_in_conditional\":false,\"instantiate_ms\":{},"
+        "\"control_overhead_us_per_iter\":{},\"handle_scope\":\"unknown\","
+        "\"error\":\"watchdog timeout\"}\n";
+    ssize_t rc = write(STDOUT_FILENO, kMsg, sizeof(kMsg) - 1);
+    (void)rc;
+    _exit(4);
+}
+
+static void arm_watchdog() {
+    std::signal(SIGALRM, w0_watchdog);
+    alarm(kWatchdogSeconds);
+}
+
+// Push the deadline back after a sub-probe finishes, so the budget is per-stage
+// rather than per-run and a slow-but-progressing machine is not shot.
+static void kick_watchdog() { alarm(kWatchdogSeconds); }
 
 // --------------------------------------------------------------------------
 // Kernels
@@ -245,7 +315,7 @@ static cudaError_t make_handle(cudaGraph_t preferred, cudaGraph_t root,
         if (g_handle_scope < 0) g_handle_scope = (preferred == root) ? 1 : 0;
         return e;
     }
-    note(8, "cudaGraphConditionalHandleCreate(body graph)", e);
+    note(ERR_HANDLE_SCOPE, "cudaGraphConditionalHandleCreate(body graph)", e);
     e = cudaGraphConditionalHandleCreate(out, root, default_value,
                                          cudaGraphCondAssignDefault);
     if (e == cudaSuccess && g_handle_scope < 0) g_handle_scope = 1;
@@ -256,7 +326,15 @@ static cudaError_t add_conditional(cudaGraph_t parent, const cudaGraphNode_t* de
                                    size_t ndeps, cudaGraphConditionalHandle handle,
                                    cudaGraphConditionalNodeType type, unsigned size,
                                    cudaGraphNode_t* out_node, cudaGraph_t* out_bodies) {
-    cudaGraphNodeParams np;
+    // MUST be aggregate-initialised, not default-initialised.
+    // cudaGraphNodeParams holds an anonymous union whose members include
+    // cudaKernelNodeParamsV2, which holds dim3, which has a user-provided
+    // constructor.  A union member with a non-trivial default constructor
+    // deletes the union's -- and therefore the enclosing struct's -- implicit
+    // default constructor, so `cudaGraphNodeParams np;` does not compile.
+    // `np{}` value-initialises instead; the memset then guarantees the padding
+    // is zero too, which the conditional-node API requires.
+    cudaGraphNodeParams np{};
     std::memset(&np, 0, sizeof(np));
     np.type                = cudaGraphNodeTypeConditional;
     np.conditional.handle  = handle;
@@ -281,8 +359,18 @@ static void destroy(Built* b) {
     if (b->root) { cudaGraphDestroy(b->root); b->root = nullptr; }
 }
 
-// WHILE { ctl -> SWITCH(kCases) { body_nodes each } }.  body_nodes == 0 builds
-// the empty-body form used by sub-probe (c).
+// A conditional body graph may NEVER be left empty.  An empty body wedges the
+// runtime -- the probe hangs holding the GPU rather than failing -- so
+// sub-probe (c), which wants "empty" bodies, gets exactly one trivial node per
+// body instead.  Every caller goes through this so the rule cannot be forgotten
+// at one site.
+static int effective_body_nodes(int requested) {
+    return (requested > 0) ? requested : 1;
+}
+
+// WHILE { ctl -> SWITCH(kCases) { body_nodes each } }.  body_nodes == 0 gives
+// the minimal-body form used by sub-probe (c): one trivial node per case, not
+// zero -- see effective_body_nodes().
 static cudaError_t build_while_switch(int body_nodes, int limit, Built* out,
                                       int err_slot) {
 #if !RASBERY_HAS_COND_SWITCH
@@ -334,8 +422,9 @@ static cudaError_t build_while_switch(int body_nodes, int limit, Built* out,
                         static_cast<unsigned>(kCases), &switch_node, cases);
     if (e != cudaSuccess) { note(err_slot, "addNode(SWITCH)", e); return e; }
 
-    for (int c = 0; c < kCases && body_nodes > 0; ++c) {
-        e = add_kernel_chain(cases[c], nullptr, 0, body_nodes, nullptr);
+    const int body = effective_body_nodes(body_nodes);
+    for (int c = 0; c < kCases; ++c) {
+        e = add_kernel_chain(cases[c], nullptr, 0, body, nullptr);
         if (e != cudaSuccess) { note(err_slot, "addKernelChain(case body)", e); return e; }
     }
 
@@ -345,7 +434,8 @@ static cudaError_t build_while_switch(int body_nodes, int limit, Built* out,
     if (e != cudaSuccess) { note(err_slot, "cudaGraphInstantiate(while+switch)", e); return e; }
     out->instantiate_ms =
         std::chrono::duration<double, std::milli>(t1 - t0).count();
-    out->nodes = static_cast<size_t>(2 + kCases * body_nodes);
+    // WHILE node + ctl kernel node + SWITCH node = 3, plus the case bodies.
+    out->nodes = static_cast<size_t>(3 + kCases * body);
     return cudaSuccess;
 #endif
 }
@@ -395,6 +485,7 @@ static cudaError_t build_while_nested_if(int body_nodes, int limit, Built* out,
     e = cudaGraphAddKernelNode(&ctl, while_body, nullptr, 0, &cp);
     if (e != cudaSuccess) { note(err_slot, "addKernelNode(ctl)", e); return e; }
 
+    const int body = effective_body_nodes(body_nodes);
     cudaGraphNode_t prev = ctl;
     for (int i = 0; i < 3; ++i) {
         cudaGraphNode_t if_node = nullptr;
@@ -402,10 +493,9 @@ static cudaError_t build_while_nested_if(int body_nodes, int limit, Built* out,
         e = add_conditional(while_body, &prev, 1, h[i], cudaGraphCondTypeIf, 1,
                             &if_node, &if_body);
         if (e != cudaSuccess) { note(err_slot, "addNode(IF)", e); return e; }
-        if (body_nodes > 0) {
-            e = add_kernel_chain(if_body, nullptr, 0, body_nodes, nullptr);
-            if (e != cudaSuccess) { note(err_slot, "addKernelChain(if body)", e); return e; }
-        }
+        // Never empty -- see effective_body_nodes().
+        e = add_kernel_chain(if_body, nullptr, 0, body, nullptr);
+        if (e != cudaSuccess) { note(err_slot, "addKernelChain(if body)", e); return e; }
         prev = if_node;
     }
 
@@ -415,7 +505,8 @@ static cudaError_t build_while_nested_if(int body_nodes, int limit, Built* out,
     if (e != cudaSuccess) { note(err_slot, "cudaGraphInstantiate(while+nested if)", e); return e; }
     out->instantiate_ms =
         std::chrono::duration<double, std::milli>(t1 - t0).count();
-    out->nodes = static_cast<size_t>(1 + 3 + 3 * body_nodes);
+    // WHILE node + ctl kernel node = 2, plus 3 IF nodes, plus their bodies.
+    out->nodes = static_cast<size_t>(2 + 3 + 3 * body);
     return cudaSuccess;
 }
 
@@ -453,17 +544,17 @@ static cudaError_t run_timed(Built* b, cudaStream_t stream, double* out_ms) {
 static int probe_coop_in_conditional(cudaStream_t stream) {
     Built b;
     cudaError_t e = cudaGraphCreate(&b.root, 0);
-    if (e != cudaSuccess) { note(3, "cudaGraphCreate(coop root)", e); return 0; }
+    if (e != cudaSuccess) { note(ERR_COOP_ATTR, "cudaGraphCreate(coop root)", e); return 0; }
 
     cudaGraphConditionalHandle h_while;
     e = cudaGraphConditionalHandleCreate(&h_while, b.root, 1, cudaGraphCondAssignDefault);
-    if (e != cudaSuccess) { note(3, "handleCreate(coop while)", e); destroy(&b); return 0; }
+    if (e != cudaSuccess) { note(ERR_COOP_ATTR, "handleCreate(coop while)", e); destroy(&b); return 0; }
 
     cudaGraphNode_t while_node = nullptr;
     cudaGraph_t     while_body = nullptr;
     e = add_conditional(b.root, nullptr, 0, h_while, cudaGraphCondTypeWhile, 1,
                         &while_node, &while_body);
-    if (e != cudaSuccess) { note(3, "addNode(coop WHILE)", e); destroy(&b); return 0; }
+    if (e != cudaSuccess) { note(ERR_COOP_ATTR, "addNode(coop WHILE)", e); destroy(&b); return 0; }
 
     int   limit_local = 4;
     void* ctl_args[3];
@@ -480,7 +571,7 @@ static int probe_coop_in_conditional(cudaStream_t stream) {
 
     cudaGraphNode_t ctl = nullptr;
     e = cudaGraphAddKernelNode(&ctl, while_body, nullptr, 0, &cp);
-    if (e != cudaSuccess) { note(3, "addKernelNode(coop ctl)", e); destroy(&b); return 0; }
+    if (e != cudaSuccess) { note(ERR_COOP_ATTR, "addKernelNode(coop ctl)", e); destroy(&b); return 0; }
 
     void* body_args[1];
     body_args[0] = &g_sink;
@@ -493,24 +584,26 @@ static int probe_coop_in_conditional(cudaStream_t stream) {
 
     cudaGraphNode_t coop = nullptr;
     e = cudaGraphAddKernelNode(&coop, while_body, &ctl, 1, &bp);
-    if (e != cudaSuccess) { note(3, "addKernelNode(coop body)", e); destroy(&b); return 0; }
+    if (e != cudaSuccess) { note(ERR_COOP_ATTR, "addKernelNode(coop body)", e); destroy(&b); return 0; }
 
     // The attribute is what makes the node a cooperative launch.  Without it
     // the grid.sync() in k_coop_body is undefined, so a "pass" that skipped
     // this step would be a false pass.
-    cudaLaunchAttributeValue attr;
+    // Aggregate-initialised for the same reason as cudaGraphNodeParams above:
+    // cudaLaunchAttributeValue IS a union, and one of its members is dim3.
+    cudaLaunchAttributeValue attr{};
     std::memset(&attr, 0, sizeof(attr));
     attr.cooperative = 1;
     e = cudaGraphKernelNodeSetAttribute(coop, cudaLaunchAttributeCooperative, &attr);
     if (e != cudaSuccess) {
-        note(3, "cudaGraphKernelNodeSetAttribute(cooperative) on a node inside a conditional body", e);
+        note(ERR_COOP_ATTR, "cudaGraphKernelNodeSetAttribute(cooperative) on a node inside a conditional body", e);
         destroy(&b);
         return 0;
     }
 
     e = cudaGraphInstantiate(&b.exec, b.root, 0ull);
     if (e != cudaSuccess) {
-        note(4, "cudaGraphInstantiate with a cooperative node inside a conditional body", e);
+        note(ERR_COOP_INSTANTIATE, "cudaGraphInstantiate with a cooperative node inside a conditional body", e);
         destroy(&b);
         return 0;
     }
@@ -519,7 +612,7 @@ static int probe_coop_in_conditional(cudaStream_t stream) {
     if (e == cudaSuccess) e = cudaGraphLaunch(b.exec, stream);
     if (e == cudaSuccess) e = cudaStreamSynchronize(stream);
     if (e != cudaSuccess) {
-        note(5, "launch of a cooperative node inside a conditional body", e);
+        note(ERR_COOP_LAUNCH, "launch of a cooperative node inside a conditional body", e);
         destroy(&b);
         return 0;
     }
@@ -531,7 +624,12 @@ static int probe_coop_in_conditional(cudaStream_t stream) {
 #endif  // RASBERY_HAS_COND_NODES
 
 int main() {
-    for (int i = 0; i < 10; ++i) g_err[i].text[0] = '\0';
+    for (int i = 0; i < ERR_SLOT_COUNT; ++i) g_err[i].text[0] = '\0';
+
+    // Bound the probe's own life before touching the driver: a wedged
+    // conditional graph otherwise hangs holding the GPU and takes the whole W0
+    // run with it.  kick_watchdog() re-arms between stages.
+    arm_watchdog();
 
     int device = 0;
     if (cudaGetDevice(&device) != cudaSuccess) {
@@ -580,9 +678,10 @@ int main() {
     // ---- (a) legality -----------------------------------------------------
     bool switch_ok = false, nested_ok = false, while_ok = false;
 
+    kick_watchdog();
     {
         Built b;
-        const cudaError_t e = build_while_switch(kBodyNodes, 16, &b, 1);
+        const cudaError_t e = build_while_switch(kBodyNodes, 16, &b, ERR_SWITCH_BUILD);
         if (e == cudaSuccess) {
             double ms = 0.0;
             const cudaError_t r = run_timed(&b, stream, &ms);
@@ -594,7 +693,7 @@ int main() {
                             "\"instantiate_ms\":%.3f,\"replay_ms\":%.3f}\n",
                             b.nodes, b.instantiate_ms, ms);
             } else {
-                note(9, "run(while+switch)", r);
+                note(ERR_RUN_SWITCH, "run(while+switch)", r);
             }
         }
         destroy(&b);
@@ -602,7 +701,7 @@ int main() {
 
     {
         Built b;
-        const cudaError_t e = build_while_nested_if(kBodyNodes, 16, &b, 2);
+        const cudaError_t e = build_while_nested_if(kBodyNodes, 16, &b, ERR_NESTED_IF_BUILD);
         if (e == cudaSuccess) {
             double ms = 0.0;
             const cudaError_t r = run_timed(&b, stream, &ms);
@@ -614,7 +713,7 @@ int main() {
                             "\"instantiate_ms\":%.3f,\"replay_ms\":%.3f}\n",
                             b.nodes, b.instantiate_ms, ms);
             } else {
-                note(9, "run(while+nested if)", r);
+                note(ERR_RUN_NESTED_IF, "run(while+nested if)", r);
             }
         }
         destroy(&b);
@@ -627,10 +726,11 @@ int main() {
     double inst_ms[3] = {-1.0, -1.0, -1.0};
     double inst_if_ms[3] = {-1.0, -1.0, -1.0};
     for (int i = 0; i < kNumInstCounts; ++i) {
+        kick_watchdog();
         const int per_case = kInstNodeCounts[i] / kCases;
         if (switch_ok) {
             Built b;
-            if (build_while_switch(per_case, 4, &b, 6) == cudaSuccess) {
+            if (build_while_switch(per_case, 4, &b, ERR_INSTANTIATE_SWITCH) == cudaSuccess) {
                 inst_ms[i] = b.instantiate_ms;
                 std::printf("{\"probe\":\"conditional_graph\",\"record\":\"instantiate\","
                             "\"form\":\"while_switch\",\"target_nodes\":%d,"
@@ -641,7 +741,7 @@ int main() {
         }
         if (nested_ok) {
             Built b;
-            if (build_while_nested_if(per_case, 4, &b, 6) == cudaSuccess) {
+            if (build_while_nested_if(per_case, 4, &b, ERR_INSTANTIATE_NESTED_IF) == cudaSuccess) {
                 inst_if_ms[i] = b.instantiate_ms;
                 std::printf("{\"probe\":\"conditional_graph\",\"record\":\"instantiate\","
                             "\"form\":\"while_nested_if\",\"target_nodes\":%d,"
@@ -653,8 +753,18 @@ int main() {
         std::fflush(stdout);
     }
 
-    // ---- (c) per-iteration control overhead, empty bodies ------------------
+    // ---- (c) per-iteration control overhead, MINIMAL bodies ----------------
+    //
+    // Not empty bodies: an empty conditional body graph wedges the runtime, so
+    // every body here carries exactly one trivial kernel node
+    // (effective_body_nodes()).  That changes what the differences mean and the
+    // difference is NOT free:
+    //   switch_eval_us     = SWITCH node evaluation + 1 kernel-node dispatch
+    //   nested_if_eval_us  = 3 IF node evaluations  + 3 kernel-node dispatches
+    // Subtract probe 1's measured c_dispatch (1x and 3x respectively) to isolate
+    // the conditional-node evaluation itself.
     double us_while = -1.0, us_while_switch = -1.0, us_while_if = -1.0;
+    kick_watchdog();
     {
         // WHILE alone (ctl node only): the floor.
         Built b;
@@ -681,33 +791,45 @@ int main() {
         if (e == cudaSuccess) e = cudaGraphAddKernelNode(&ctl, wb, nullptr, 0, &cp);
         if (e == cudaSuccess) e = cudaGraphInstantiate(&b.exec, b.root, 0ull);
         if (e != cudaSuccess) {
-            note(7, "build(while only, empty body)", e);
+            note(ERR_CONTROL_WHILE, "build(while only, minimal body)", e);
         } else {
             double ms = 0.0;
             const cudaError_t r = run_timed(&b, stream, &ms);
             if (r == cudaSuccess) us_while = ms * 1000.0 / kControlIters;
-            else note(7, "run(while only)", r);
+            else note(ERR_CONTROL_WHILE, "run(while only)", r);
         }
         destroy(&b);
     }
+    kick_watchdog();
     if (switch_ok) {
         Built b;
-        if (build_while_switch(0, kControlIters, &b, 7) == cudaSuccess) {
+        const cudaError_t e = build_while_switch(0, kControlIters, &b,
+                                                 ERR_CONTROL_WHILE_SWITCH);
+        if (e == cudaSuccess) {
             double ms = 0.0;
-            if (run_timed(&b, stream, &ms) == cudaSuccess)
-                us_while_switch = ms * 1000.0 / kControlIters;
+            // The run result is CAPTURED: a control-overhead arm that failed to
+            // replay must show its error, not silently leave -1 in the receipt.
+            const cudaError_t r = run_timed(&b, stream, &ms);
+            if (r == cudaSuccess) us_while_switch = ms * 1000.0 / kControlIters;
+            else note(ERR_CONTROL_WHILE_SWITCH, "run(while+switch, minimal bodies)", r);
         }
         destroy(&b);
     }
+    kick_watchdog();
     if (nested_ok) {
         Built b;
-        if (build_while_nested_if(0, kControlIters, &b, 7) == cudaSuccess) {
+        const cudaError_t e = build_while_nested_if(0, kControlIters, &b,
+                                                    ERR_CONTROL_WHILE_NESTED_IF);
+        if (e == cudaSuccess) {
             double ms = 0.0;
-            if (run_timed(&b, stream, &ms) == cudaSuccess)
-                us_while_if = ms * 1000.0 / kControlIters;
+            const cudaError_t r = run_timed(&b, stream, &ms);
+            if (r == cudaSuccess) us_while_if = ms * 1000.0 / kControlIters;
+            else note(ERR_CONTROL_WHILE_NESTED_IF,
+                      "run(while+nested if, minimal bodies)", r);
         }
         destroy(&b);
     }
+    kick_watchdog();
 
     std::printf("{\"probe\":\"conditional_graph\",\"record\":\"control\","
                 "\"iters\":%d,\"while_us_per_iter\":%.4f,"

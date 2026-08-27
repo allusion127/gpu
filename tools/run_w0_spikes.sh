@@ -106,12 +106,27 @@ $run"
     fi
 
     note "$name: running"
-    if CUDA_VISIBLE_DEVICES="$GPU" "$exe" > "$OUTDIR/$name.jsonl" 2> "$OUTDIR/run_$name.log"; then
+    # Outer bound on top of probe 3's own SIGALRM watchdog.  A wedged conditional
+    # graph must never be able to hang this script: if the probe's internal
+    # watchdog is itself blocked (or the probe is one without one), `timeout`
+    # ends it.  180 s > the probe's 120 s so the probe's own error record wins
+    # when it can produce one.
+    local rc=0
+    if timeout --kill-after=10 180 \
+           env CUDA_VISIBLE_DEVICES="$GPU" "$exe" \
+           > "$OUTDIR/$name.jsonl" 2> "$OUTDIR/run_$name.log"; then
         set_status "$name" "ok"; set_reason "$name" ""
     else
-        set_status "$name" "run_failed"
-        set_reason "$name" "$(tail -n 20 "$OUTDIR/run_$name.log" | tr '\n' ' ')"
-        note "$name: RUN FAILED (see $OUTDIR/run_$name.log)"
+        rc=$?
+        if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+            set_status "$name" "timeout"
+            set_reason "$name" "killed by timeout after 180 s (rc=$rc); the probe hung"
+            note "$name: TIMED OUT after 180 s"
+        else
+            set_status "$name" "run_failed"
+            set_reason "$name" "rc=$rc $(tail -n 20 "$OUTDIR/run_$name.log" | tr '\n' ' ')"
+            note "$name: RUN FAILED rc=$rc (see $OUTDIR/run_$name.log)"
+        fi
     fi
 }
 

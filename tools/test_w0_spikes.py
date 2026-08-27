@@ -49,6 +49,18 @@ def require(text: str, needle: str, what: str) -> None:
         fail(f"{what}: expected to find {needle!r}")
 
 
+def strip_comments(text: str) -> str:
+    """C/C++ source with comments blanked out.
+
+    Checks that forbid a CODE pattern have to run on code.  Several of the
+    comments in these probes quote the very construct they warn against -- e.g.
+    "`cudaGraphNodeParams np;` does not compile" -- and a naive whole-file regex
+    fires on the warning instead of on a real defect.
+    """
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    return re.sub(r"//[^\n]*", "", text)
+
+
 DISPATCH = read("probe_dispatch_floor.cu")
 GRIDSYNC = read("probe_gridsync_cost.cu")
 CONDGRAPH = read("probe_conditional_graph.cu")
@@ -56,6 +68,11 @@ L2SH = read("probe_l2_width.sh")
 L2PY = read("parse_ncu_l2.py")
 SCHED = read("scheduler_trace_replay.py")
 RUNNER = read("run_w0_spikes.sh")
+
+# Comment-stripped views, for checks that forbid a code construct which the
+# comments deliberately quote.
+CONDGRAPH_CODE = strip_comments(CONDGRAPH)
+GRIDSYNC_CODE = strip_comments(GRIDSYNC)
 
 # The five real kernel shapes.  Probes 1 and 2 must sweep the same list or their
 # numbers are not comparable, which is the whole point of running them together.
@@ -170,6 +187,36 @@ if "resident_only" not in GRIDSYNC or "fits_only" not in GRIDSYNC:
     fail("probe_gridsync_cost: no residency guard around the launch")
 require(GRIDSYNC, "prop.cooperativeLaunch", "probe_gridsync_cost: device capability unchecked")
 
+# FIX 4 -- a cooperative-launch refusal must not end the process.  The occupancy
+# query can say a shape fits and the driver still refuse it
+# (cudaErrorCooperativeLaunchTooLarge); exiting there throws away the 34/67
+# measurements the gate is actually quoted at.
+if "static int measure(" in GRIDSYNC_CODE or "static int time_arm(" in GRIDSYNC_CODE:
+    fail("probe_gridsync_cost: measure/time_arm still return an exit code; a launch "
+         "refusal at one grid would abort the whole sweep")
+require(GRIDSYNC, "static cudaError_t time_arm(",
+        "probe_gridsync_cost: time_arm must return cudaError_t")
+require(GRIDSYNC, "static cudaError_t measure(",
+        "probe_gridsync_cost: measure must return cudaError_t")
+sweep_loop = GRIDSYNC[GRIDSYNC.find("for (int i = 0; i < kNumGrids; ++i)"):
+                      GRIDSYNC.find("// The gate is quoted at")]
+if not sweep_loop:
+    fail("probe_gridsync_cost: sweep loop not found")
+if re.search(r"return\s+(rc|only_err|rmw_err)\s*;", sweep_loop):
+    fail("probe_gridsync_cost: the sweep loop returns on a launch error instead of "
+         "recording it and continuing")
+require(sweep_loop, "cooperative launch refused",
+        "probe_gridsync_cost: a driver refusal is not reported as unsupported")
+require(sweep_loop, "continue;",
+        "probe_gridsync_cost: the sweep does not continue past a refused shape")
+# An arm that never ran did not fail the gate.
+require(GRIDSYNC, '\\"unknown\\"',
+        "probe_gridsync_cost: an unmeasured arm still reports passes_gate:false")
+if not re.search(r"removable_s\s*=\s*\n?\s*\(gate_value >= 0\.0\)", GRIDSYNC):
+    fail("probe_gridsync_cost: removable_seconds must be -1 when unmeasured, not "
+         "computed with a substituted 0 barrier (which prints the most optimistic "
+         "number the arithmetic can produce)")
+
 # The gate.
 m = re.search(r"kBarrierGateUs\s*=\s*([0-9.]+)", GRIDSYNC)
 if not m:
@@ -227,7 +274,7 @@ if CONDGRAPH.count("note(") < 12:
     fail("probe_conditional_graph: too few error-capture sites; some failure path is silent")
 require(CONDGRAPH, '\\"record\\":\\"error\\"', "probe_conditional_graph: errors are never printed")
 require(CONDGRAPH, "json_escape", "probe_conditional_graph: error text is not JSON-escaped")
-if re.search(r"\(void\)\s*cuda[A-Za-z]+\(", CONDGRAPH):
+if re.search(r"\(void\)\s*cuda[A-Za-z]+\(", CONDGRAPH_CODE):
     fail("probe_conditional_graph: a CUDA call result is cast to void, i.e. swallowed")
 
 # The summary must carry every key the task asked the probe to answer.
@@ -238,6 +285,84 @@ for key in ("while_ok", "switch_ok", "nested_if_fallback", "coop_in_conditional"
 # Version guards, so an older CUDART reports rather than fails to compile.
 require(CONDGRAPH, "CUDART_VERSION", "probe_conditional_graph: no runtime-version guard")
 require(CONDGRAPH, "RASBERY_HAS_COND_SWITCH", "probe_conditional_graph: no SWITCH guard")
+
+# FIX 1 -- aggregate initialisation is mandatory, not stylistic.
+# cudaGraphNodeParams and cudaLaunchAttributeValue both contain a union with a
+# dim3 member; dim3 has a user-provided constructor, which deletes the union's
+# implicit default constructor and therefore the enclosing struct's.  Plain
+# `T x;` does not compile -- this was the 238 build failure.
+for typ in ("cudaGraphNodeParams", "cudaLaunchAttributeValue"):
+    if re.search(rf"\b{typ}\s+\w+\s*;", CONDGRAPH_CODE):
+        fail(f"probe_conditional_graph: `{typ} x;` is default-initialised and will "
+             f"not compile (deleted default ctor via a dim3 union member); use "
+             f"`{typ} x{{}};`")
+    if not re.search(rf"\b{typ}\s+\w+\{{\}}\s*;", CONDGRAPH_CODE):
+        fail(f"probe_conditional_graph: no aggregate-initialised {typ}")
+
+# FIX 2a -- a conditional body graph may never be empty; an empty body wedges
+# the runtime and the probe hangs holding the GPU.
+require(CONDGRAPH, "effective_body_nodes",
+        "probe_conditional_graph: no guard forcing a non-empty conditional body")
+eff = CONDGRAPH[CONDGRAPH.find("static int effective_body_nodes("):]
+eff = eff[:eff.find("}") + 1]
+if "> 0) ? requested : 1" not in eff:
+    fail("probe_conditional_graph: effective_body_nodes does not floor the body at 1")
+# Every body-population site must go through it, not through a raw body_nodes.
+for site in ("add_kernel_chain(cases[c], nullptr, 0, body, nullptr)",
+             "add_kernel_chain(if_body, nullptr, 0, body, nullptr)"):
+    require(CONDGRAPH, site,
+            "probe_conditional_graph: a conditional body is populated without the "
+            "non-empty guarantee")
+if "kCases && body_nodes > 0" in CONDGRAPH_CODE or \
+        "if (body_nodes > 0) {" in CONDGRAPH_CODE:
+    fail("probe_conditional_graph: a case body is still skipped when body_nodes == 0")
+
+# FIX 2b -- the host-side watchdog, so a wedged graph exits with an error record
+# rather than hanging the runner.
+require(CONDGRAPH, "SIGALRM", "probe_conditional_graph: no watchdog signal")
+require(CONDGRAPH, "alarm(", "probe_conditional_graph: no watchdog timer")
+require(CONDGRAPH_CODE, "static void arm_watchdog()",
+        "probe_conditional_graph: no arm_watchdog definition")
+watchdog = CONDGRAPH[CONDGRAPH.find("extern \"C\" void w0_watchdog("):]
+watchdog = watchdog[:watchdog.find("static void arm_watchdog")]
+if "write(STDOUT_FILENO" not in watchdog:
+    fail("probe_conditional_graph: the watchdog handler must use write(2); printf is "
+         "not async-signal-safe and can deadlock on a lock the interrupted code holds")
+if "_exit(" not in watchdog:
+    fail("probe_conditional_graph: the watchdog does not exit non-zero")
+if '\\"record\\":\\"summary\\"' not in watchdog:
+    fail("probe_conditional_graph: a watchdog kill emits no summary record, so the "
+         "runner would see a probe with no verdict at all")
+# Called from main, in CODE -- a commented-out call arms nothing.
+main_at = CONDGRAPH_CODE.find("int main()")
+if main_at < 0 or CONDGRAPH_CODE.find("arm_watchdog();", main_at) < 0:
+    fail("probe_conditional_graph: arm_watchdog() is not called from main")
+if CONDGRAPH_CODE.count("kick_watchdog();") < 3:
+    fail("probe_conditional_graph: the watchdog deadline is not re-armed between "
+         "stages; a slow-but-progressing run would be shot at 120 s")
+
+# FIX 3 -- node counts include the WHILE and ctl nodes.
+require(CONDGRAPH, "3 + kCases * body",
+        "probe_conditional_graph: while+switch node count is wrong "
+        "(WHILE + ctl + SWITCH = 3)")
+require(CONDGRAPH, "2 + 3 + 3 * body",
+        "probe_conditional_graph: while+nested-if node count is wrong "
+        "(WHILE + ctl = 2, plus 3 IF nodes)")
+
+# FIX 5 -- one error slot per failure site, and no discarded run results.
+if re.search(r"\bnote\(\s*\d+\s*,", CONDGRAPH_CODE):
+    fail("probe_conditional_graph: a numeric error-slot literal remains; two sites "
+         "sharing a slot lose one of the two failures")
+require(CONDGRAPH, "ERR_SLOT_COUNT", "probe_conditional_graph: no error-slot enum")
+control = CONDGRAPH[CONDGRAPH.find("// ---- (c) per-iteration control overhead"):
+                    CONDGRAPH.find("// ---- (d) cooperative launch")]
+if not control:
+    fail("probe_conditional_graph: control-overhead section not found")
+if re.search(r"if\s*\(run_timed\([^)]*\)\s*==\s*cudaSuccess\)", control):
+    fail("probe_conditional_graph: a control arm discards run_timed's error instead "
+         "of note()ing it")
+for slot in ("ERR_CONTROL_WHILE_SWITCH", "ERR_CONTROL_WHILE_NESTED_IF"):
+    require(control, slot, f"probe_conditional_graph: control arm lacks {slot}")
 
 # ---------------------------------------------------------------------------
 # 4. probe_l2_width.sh + parse_ncu_l2.py -- widths, fallback, gate.
@@ -385,9 +510,19 @@ for gate in ("c_dispatch_us", "c_barrier_us", "conditional_scheduler",
         fail(f"run_w0_spikes.sh: the receipt has no gate entry for {gate}")
 
 # A skipped probe must say why, and a failed build must not read as a pass.
-for status in ("build_failed", "run_failed", "skipped"):
+for status in ("build_failed", "run_failed", "skipped", "timeout"):
     require(RUNNER, status, f"run_w0_spikes.sh: no {status} status")
 require(RUNNER, "reason_", "run_w0_spikes.sh: a skipped probe never records a reason")
+
+# FIX 2c -- the runner must bound every probe itself.  Probe 3's own SIGALRM is
+# the first line of defence; this is the second, for the case where the probe is
+# wedged somewhere its own handler cannot run.
+if not re.search(r"timeout\s+--kill-after=\d+\s+180", RUNNER):
+    fail("run_w0_spikes.sh: probe invocations are not wrapped in `timeout 180`; a "
+         "hung probe would hang the whole W0 run")
+if "124" not in RUNNER or "137" not in RUNNER:
+    fail("run_w0_spikes.sh: a timeout kill (rc 124/137) is not distinguished from a "
+         "normal run failure")
 
 # Gate constants, one number per gate across every file that quotes it.
 m = re.search(r"C_BARRIER_GATE_US\s*=\s*([0-9.]+)", RUNNER)
