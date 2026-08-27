@@ -2183,7 +2183,13 @@ public:
                     c.xe_cascades > 0
                         ? static_cast<double>(c.xe_updates) / static_cast<double>(c.xe_cascades)
                         : 0.0;
-                std::cout << std::format(
+                // Through the buffered line sink, not std::cout directly: this
+                // is 35-51 lines per deck x 64 decks through a stdio-synced
+                // stream, i.e. a lock (and often a write(2)) per line on the
+                // very threads the writer thread was freed from.  The sink
+                // appends under one mutex, so a line still cannot be split, and
+                // flushes per line in inline mode -- same bytes, same order.
+                iowriter::appendLine(std::format(
                     "[RASBERY][SPTELEM] {{\"schema_version\":1,\"job_id\":\"{}\",\"slot\":{},"
                     "\"statepoint\":{},\"efpd\":{:.4f},\"outers\":{},\"outers_attributed\":{},"
                     "\"outers_initial\":{},\"xe_mode\":\"{}\","
@@ -2218,7 +2224,7 @@ public:
                     c.wall, c.io_wall, c.phase[sptelem::PH_UPDPSI],
                     c.phase[sptelem::PH_SETLS], c.phase[sptelem::PH_DRIVE],
                     c.phase[sptelem::PH_UPDJNET], c.phase[sptelem::PH_NODAL],
-                    c.phase[sptelem::PH_CUSPING], c.phase[sptelem::PH_UPDDHAT]);
+                    c.phase[sptelem::PH_CUSPING], c.phase[sptelem::PH_UPDDHAT]));
                 sp_run.accumulate(c);
             }
 
@@ -2276,7 +2282,7 @@ public:
                 c.xe_cascades > 0
                     ? static_cast<double>(c.xe_updates) / static_cast<double>(c.xe_cascades)
                     : 0.0;
-            std::cout << std::format(
+            iowriter::appendLine(std::format(
                 "[RASBERY][SPTELEM][SUMMARY] {{\"schema_version\":1,\"job_id\":\"{}\","
                 "\"slot\":{},\"statepoints\":{},\"outers\":{},\"outers_attributed\":{},"
                 "\"outers_initial\":{},\"xe_mode\":\"{}\","
@@ -2316,7 +2322,7 @@ public:
                 c.phase[sptelem::PH_UPDPSI], c.phase[sptelem::PH_SETLS],
                 c.phase[sptelem::PH_DRIVE], c.phase[sptelem::PH_UPDJNET],
                 c.phase[sptelem::PH_NODAL], c.phase[sptelem::PH_CUSPING],
-                c.phase[sptelem::PH_UPDDHAT]);
+                c.phase[sptelem::PH_UPDDHAT]));
         }
         return 0;
     }

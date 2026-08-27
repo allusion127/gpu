@@ -16,6 +16,7 @@
 #include "Geometry.h"
 #include "XSSet.h"
 #include "Scheduler.h"
+#include "IoWriter.h"
 
 namespace rasbery {
 
@@ -43,10 +44,28 @@ private:
     };
     std::vector<ShuffleSpec> _shuffle_specs;
 
-    std::unique_ptr<HighFive::File> _result_file;
+    /// The result file's writer session.  Non-null between OpenResult() and
+    /// CloseResult(); the HighFive::File inside it belongs to whichever thread
+    /// is allowed inside HDF5 for it (this one in inline mode, the writer thread
+    /// otherwise) -- never read it here without fencing first.
+    std::shared_ptr<iowriter::FileSession> _result_session;
+    /// Restart snapshots are fire-and-forget on the thread path, so their
+    /// sessions are kept to be fenced and error-checked at job end: a restart
+    /// write that failed must fail ITS job, not vanish into a process counter.
+    mutable std::vector<std::shared_ptr<iowriter::FileSession>> _restart_sessions;
     std::filesystem::path _result_path;
     std::filesystem::path _pin_power_csv_path;
     bool _pin_power_csv_started = false;
+
+    /// Wait for every write this job queued and rethrow the writer's error.
+    /// No-op in inline mode (nothing is ever in flight).
+    void FenceJobWrites() const;
+
+    /// The old `if (!_result_file)` precondition.  The handle is only
+    /// inspectable on the inline path -- in thread mode the writer owns it, so
+    /// the session's existence is the test: OpenResult queued the open ahead of
+    /// anything recorded later, and the queue is FIFO.
+    bool HasOpenResult() const;
 
     static bool TryParseShuffleEntry(const std::string& entry,
                                      int tgt_row, int tgt_col,

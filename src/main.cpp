@@ -11,6 +11,7 @@
 #include "plog/Log.h"
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -487,6 +488,10 @@ int main(int argc, char* argv[]) {
                   << ",\"pin_lease\":true"
                   << ",\"legacy_pinning_criterion\":"
                   << (legacy_pinning_criterion ? "true" : "false") << "}" << std::endl;
+        // Which I/O path this run is on, published BEFORE the first deck for the
+        // same reason [BATCH_HOST] is: it is the declared configuration, and an
+        // A/B whose two arms cannot be told apart from the log is void.
+        rasbery::iowriter::reportConfig(std::cout);
         if (host_pinning && !legacy_pinning_criterion)
             std::cout << "[RASBERY][BATCH_HOST] concurrent Driver workers("
                       << concurrent_workers << ") < jobs(" << jobs
@@ -527,6 +532,13 @@ int main(int argc, char* argv[]) {
                 job_error[static_cast<std::size_t>(i)]  = "unknown exception";
             }
         }
+
+        // Same rule as the CUDA teardown below: every Driver has joined, so the
+        // writer queue can only shrink from here.  Drain and join it BEFORE the
+        // per-job verdicts are read, so a write that failed after its Driver
+        // returned still reaches this exit code instead of a static destructor.
+        const std::uint64_t io_writer_failures = rasbery::iowriter::shutdown();
+        if (io_writer_failures > 0 && exit_code == 0) exit_code = 1;
 
         for (int i = 0; i < jobs; ++i) {
             if (job_status[static_cast<std::size_t>(i)] == 0) continue;
@@ -571,6 +583,12 @@ int main(int argc, char* argv[]) {
                   << hdf5_stats.acquisitions << ",\"wait_ms\":"
                   << static_cast<double>(hdf5_stats.wait_nanoseconds) / 1.0e6
                   << "}" << std::endl;
+        // Final writer counters.  Read together with [HDF5][LOCK] above, but
+        // note the ACQUISITION count does not move: inline already took the
+        // guard once per write function.  What the thread path changes is who
+        // waits -- so the signals here are enqueue_block_ms (what the Drivers
+        // still pay) and writer_busy_ms (whether the writer is the new floor).
+        rasbery::iowriter::reportSummary(std::cout);
         return exit_code;
     }
 
@@ -583,6 +601,8 @@ int main(int argc, char* argv[]) {
     // RASBERY_HOST_PINNING does.
     rasbery::rasberySetHostPinningEnabled(rasbery::rasberyHostPinningMode() !=
                                           rasbery::HostPinningMode::Off);
+    // Same tag in both branches, deliberately: one parser rule.
+    if (!rasbery_inputs.empty()) rasbery::iowriter::reportConfig(std::cout);
 
     for (std::size_t i = 0; i < rasbery_inputs.size(); ++i) {
         const fs::path rasbery_input_path  = rasbery_inputs[i];
@@ -603,6 +623,7 @@ int main(int argc, char* argv[]) {
     // Same explicit shutdown order as the batch branch (plan Sec 6.6): the
     // Drivers are gone, so release the leases that outlived them before the
     // CUDA context does.  Same receipt tag too, deliberately: one parser rule.
+    if (rasbery::iowriter::shutdown() > 0 && exit_code == 0) exit_code = 1;
     rasbery::rasberyDrainPinnedRegistry();
     std::cout << "[RASBERY][BATCH_HOST][PIN] {";
     rasbery::rasberyAppendHostPinReceiptFields(std::cout);
@@ -624,5 +645,6 @@ int main(int argc, char* argv[]) {
               << hdf5_stats.acquisitions << ",\"wait_ms\":"
               << static_cast<double>(hdf5_stats.wait_nanoseconds) / 1.0e6
               << "}" << std::endl;
+    rasbery::iowriter::reportSummary(std::cout);
     return exit_code;
 }

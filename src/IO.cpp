@@ -224,7 +224,7 @@ void ApplyScheduleOverrides(const nlohmann::ordered_json& item, Schedule& entry)
 }
 
 /// @brief Write spectral-history macro delta-sigma terms for one monitored node.
-void writeTermContrib(HighFive::Group& ngrp, const XSSet& xs, int lk, int ng) {
+void writeTermContrib(const iowriter::Node& ngrp, const XSSet& xs, int lk, int ng) {
     std::vector<XSSet::TermContribution> terms;
     xs.ResolveTermContributions(lk, terms);
     const size_t nt    = terms.size();
@@ -238,8 +238,8 @@ void writeTermContrib(HighFive::Group& ngrp, const XSSet& xs, int lk, int ng) {
             terms[t].iso >= 0 ? std::string(Chiffon::Isotope::isotopeIds[terms[t].iso]) : "unknown";
     }
     tc_grp.createDataSet("isotope", isotope);
-    HighFive::DataSpace tc_space({nt, ng_sz});
-    auto                emit_term = [&](const std::string& name, Chiffon::XSTYPE xt) {
+    const iowriter::Dims tc_space{nt, ng_sz};
+    auto                 emit_term = [&](const std::string& name, Chiffon::XSTYPE xt) {
         std::vector<double> v(nt * ng_sz, 0.0);
         for (size_t t = 0; t < nt; ++t)
             for (int ig = 0; ig < ng; ++ig)
@@ -262,9 +262,15 @@ IO::IO(Geometry& g, XSSet& xs, Scheduler& sched)
 
 IO::~IO() {
     // HighFive::File destruction also enters the non-thread-safe HDF5 runtime.
-    // Keep exception paths safe when a Driver fails before CloseResult().
+    // Keep exception paths safe when a Driver fails before CloseResult().  On
+    // the writer-thread path the queued batches must drain FIRST -- the session
+    // outlives this object through its shared_ptr, but the file handle may not
+    // be touched here while a batch for it is still in flight.
+    iowriter::fence(_result_session);
+    for (const auto& session : _restart_sessions) iowriter::fence(session);
     Chiffon::Hdf5Guard hdf5_guard;
-    _result_file.reset();
+    if (_result_session) _result_session->file.reset();
+    _restart_sessions.clear();
 }
 
 // Parse the JSON "print" block of a schedule entry into a PrintOpt.
@@ -1297,7 +1303,6 @@ void IO::AddResult(Geometry& g, double keff,
 
 /// @brief Create the result HDF5 file and write the geometry group.
 void IO::OpenResult(const std::string& filepath) {
-    Chiffon::Hdf5Guard hdf5_guard;
     _result_path                     = filepath;
     std::filesystem::path result_dir = _result_path.parent_path();
     if (result_dir.empty()) result_dir = ".";
@@ -1307,9 +1312,13 @@ void IO::OpenResult(const std::string& filepath) {
     std::error_code ec;
     std::filesystem::remove(_pin_power_csv_path, ec);
 
-    _result_file = std::make_unique<HighFive::File>(filepath, HighFive::File::Overwrite);
+    _result_session      = std::make_shared<iowriter::FileSession>();
+    _result_session->job = result_stem;
 
-    auto geo = _result_file->createGroup("geometry");
+    iowriter::Recorder rec(_result_session);
+    rec.openOverwrite(filepath);
+
+    auto geo = rec.root().createGroup("geometry");
 
     const int nx = _g.nx(), ny = _g.ny(), nxy = _g.nxy();
     const int nxa = _g.nxa(), nya = _g.nya(), nxya = _g.nxya();
@@ -1363,20 +1372,27 @@ void IO::OpenResult(const std::string& filepath) {
     geo.createDataSet("node_i", node_i);
     geo.createDataSet("node_j", node_j);
 
+    rec.submit();
     PLOG_INFO << "Result file opened: " << filepath;
+}
+
+/// @brief Whether OpenResult() has a live result file for this job.
+bool IO::HasOpenResult() const {
+    if (!_result_session) return false;
+    return iowriter::mode() != iowriter::Mode::Inline || _result_session->file != nullptr;
 }
 
 /// @brief Write one step's data to the open HDF5 result file.
 void IO::WriteStepToResult(Geometry& g, const XSSet& xs, int schedule_index) {
-    Chiffon::Hdf5Guard hdf5_guard;
-    if (!_result_file || schedule_index < 0 ||
+    if (!HasOpenResult() || schedule_index < 0 ||
         schedule_index >= static_cast<int>(_s.schedule().size()))
         return;
 
     const Schedule& d = _s.schedule()[schedule_index];
     if (d.step <= 0) return;
 
-    auto step_grp = _result_file->createGroup(std::format("steps/{:04d}", d.step));
+    iowriter::Recorder rec(_result_session);
+    auto step_grp = rec.root().createGroup(std::format("steps/{:04d}", d.step));
 
     // Assembly data
     {
@@ -1463,12 +1479,12 @@ void IO::WriteStepToResult(Geometry& g, const XSSet& xs, int schedule_index) {
         auto grp = step_grp.createGroup("node");
         // Geometry stores only active row spans: use [z, compact-node] and
         // `/geometry/node_i,node_j` rather than pretending nxy == nx*ny.
-        HighFive::DataSpace scalar_space(
+        const iowriter::Dims scalar_space(
             {static_cast<size_t>(g.nz()), static_cast<size_t>(g.nxy())});
         grp.createDataSet<double>("power", scalar_space).write_raw(power.data());
         grp.createDataSet<double>("burnup", scalar_space).write_raw(burnup.data());
         grp.createDataSet<double>("kinf", scalar_space).write_raw(kinf.data());
-        HighFive::DataSpace flux_space(
+        const iowriter::Dims flux_space(
             {static_cast<size_t>(g.nz()), static_cast<size_t>(g.nxy()),
              static_cast<size_t>(ng)});
         grp.createDataSet<double>("flux", flux_space).write_raw(flux.data());
@@ -1510,10 +1526,10 @@ void IO::WriteStepToResult(Geometry& g, const XSSet& xs, int schedule_index) {
             }
         }
 
-        HighFive::DataSpace space({static_cast<size_t>(nz),
-                                   static_cast<size_t>(nxya),
-                                   static_cast<size_t>(npins),
-                                   static_cast<size_t>(npins)});
+        const iowriter::Dims space({static_cast<size_t>(nz),
+                                    static_cast<size_t>(nxya),
+                                    static_cast<size_t>(npins),
+                                    static_cast<size_t>(npins)});
         step_grp.createDataSet<double>("pin_power", space).write_raw(pin_data.data());
 
         if (d.print_opt.pin_flux) {
@@ -1543,11 +1559,11 @@ void IO::WriteStepToResult(Geometry& g, const XSSet& xs, int schedule_index) {
                 }
             }
 
-            HighFive::DataSpace flux_space({static_cast<size_t>(nz),
-                                            static_cast<size_t>(nxya),
-                                            static_cast<size_t>(ng),
-                                            static_cast<size_t>(npins),
-                                            static_cast<size_t>(npins)});
+            const iowriter::Dims flux_space({static_cast<size_t>(nz),
+                                             static_cast<size_t>(nxya),
+                                             static_cast<size_t>(ng),
+                                             static_cast<size_t>(npins),
+                                             static_cast<size_t>(npins)});
             step_grp.createDataSet<double>("pin_flux", flux_space).write_raw(flux_data.data());
         }
 
@@ -1666,8 +1682,8 @@ void IO::WriteStepToResult(Geometry& g, const XSSet& xs, int schedule_index) {
             grp.createDataSet("tful", tful);
             grp.createDataSet("dmod", dmod);
 
-            HighFive::DataSpace xs_space({static_cast<size_t>(nfuel),
-                                          static_cast<size_t>(ng)});
+            const iowriter::Dims xs_space({static_cast<size_t>(nfuel),
+                                           static_cast<size_t>(ng)});
             grp.createDataSet<double>("xsdf", xs_space).write_raw(xsdf.data());
             grp.createDataSet<double>("xsaf", xs_space).write_raw(xsaf.data());
             grp.createDataSet<double>("xsnf", xs_space).write_raw(xsnf.data());
@@ -1763,9 +1779,9 @@ void IO::WriteStepToResult(Geometry& g, const XSSet& xs, int schedule_index) {
             ngrp.createDataSet("ref_xssf", ref_xssf);
 
             // Isotope-wise microscopic XS dump for delta-correction diagnostics.
-            const size_t        niso = Chiffon::Isotope::niso;
-            HighFive::DataSpace mic_space({niso, static_cast<size_t>(ng)});
-            auto                dump_mic = [&](const std::string& name, Chiffon::XSTYPE xt) {
+            const size_t         niso = Chiffon::Isotope::niso;
+            const iowriter::Dims mic_space({niso, static_cast<size_t>(ng)});
+            auto                 dump_mic = [&](const std::string& name, Chiffon::XSTYPE xt) {
                 std::vector<double> cur(niso * static_cast<size_t>(ng), 0.0);
                 std::vector<double> ref(niso * static_cast<size_t>(ng), 0.0);
                 std::vector<double> baseline(niso * static_cast<size_t>(ng), 0.0);
@@ -1835,14 +1851,19 @@ void IO::WriteStepToResult(Geometry& g, const XSSet& xs, int schedule_index) {
             }
         }
     }
+
+    // One statepoint == one batch: the queue is FIFO and this Driver thread is
+    // the only recorder for this file, so the file's batches replay in the same
+    // order the run produced them.
+    rec.submit();
 }
 
 /// @brief Write accumulated summary arrays and close the HDF5 result file.
 void IO::CloseResult() {
-    Chiffon::Hdf5Guard hdf5_guard;
-    if (!_result_file) return;
+    if (!HasOpenResult()) return;
 
-    auto sum = _result_file->createGroup("summary");
+    iowriter::Recorder rec(_result_session);
+    auto sum = rec.root().createGroup("summary");
 
     std::vector<int>    steps;
     std::vector<double> efpd, bu_avg, ppm, keff, reactivity;
@@ -1948,26 +1969,63 @@ void IO::CloseResult() {
             ++row;
         }
 
-        auto rods = _result_file->createGroup("rods");
+        auto rods = rec.root().createGroup("rods");
         rods.createDataSet("groups", rod_groups);
-        HighFive::DataSpace rod_space({nsteps, ngroups});
+        const iowriter::Dims rod_space({nsteps, ngroups});
         rods.createDataSet<double>("insertions", rod_space).write_raw(rod_depths.data());
     }
 
-    _result_file.reset();
+    rec.closeFile();
+    rec.submit();
+
+    // End of the job's output: block here until everything this deck queued has
+    // actually landed, and re-raise a writer-thread failure on the Driver thread
+    // so it fails THIS job rather than disappearing into a process counter.
+    FenceJobWrites();
+    _result_session.reset();
+    _restart_sessions.clear();
     PLOG_INFO << "Result HDF5 closed.";
+}
+
+/// @brief Drain this job's queued writes and rethrow the first writer error.
+void IO::FenceJobWrites() const {
+    iowriter::fence(_result_session);
+    for (const auto& session : _restart_sessions) iowriter::fence(session);
+
+    const iowriter::FileSession* failed = nullptr;
+    if (_result_session && _result_session->failed) failed = _result_session.get();
+    if (failed == nullptr)
+        for (const auto& session : _restart_sessions)
+            if (session->failed) {
+                failed = session.get();
+                break;
+            }
+    if (failed == nullptr) return;
+    throw std::runtime_error("IO: HDF5 writer thread failed for '" + failed->path +
+                             "' (job " + failed->job + "): " + failed->error);
 }
 
 /// @brief Save a restart snapshot to an HDF5 file.
 void IO::SaveRestart(const std::string& filepath,
                      Geometry& g, XSSet& xs,
                      double eigv, double efpd, int step) const {
-    Chiffon::Hdf5Guard hdf5_guard;
     const int nxyz = g.nxyz();
     const int ng   = g.ng();
     const int niso = static_cast<int>(Chiffon::Isotope::niso);
 
-    HighFive::File file(filepath, HighFive::File::Overwrite);
+    // A restart snapshot is a whole file: open, write, close, all in ONE batch,
+    // so it can never interleave with another file's ops.  Its namespace is
+    // job-local by construction (Driver::RestartPath derives it from the OUTPUT
+    // path, plan Rev.4 Sec 7), and nothing in a run reads back a restart the
+    // same run wrote -- restart INPUTS come from the deck and are read during
+    // ReadInput, before any write is queued.
+    auto session  = std::make_shared<iowriter::FileSession>();
+    session->job  = result_stem().empty() ? _input_dir : result_stem();
+    _restart_sessions.push_back(session);
+
+    iowriter::Recorder rec(session);
+    rec.openOverwrite(filepath);
+    auto file = rec.root();
 
     // /metadata
     {
@@ -2057,8 +2115,8 @@ void IO::SaveRestart(const std::string& filepath,
             for (size_t i = 0; i < static_cast<size_t>(niso); ++i)
                 iden_flat[static_cast<size_t>(l) * niso + i] = xs.iden(i, l);
         }
-        HighFive::DataSpace space({static_cast<size_t>(nxyz), static_cast<size_t>(niso)});
-        auto                ds = file.createDataSet<double>("isotope_density", space);
+        const iowriter::Dims space({static_cast<size_t>(nxyz), static_cast<size_t>(niso)});
+        auto                 ds = file.createDataSet<double>("isotope_density", space);
         ds.write_raw(iden_flat.data());
     }
 
@@ -2095,6 +2153,9 @@ void IO::SaveRestart(const std::string& filepath,
         std::vector<double> flux(g.Phif(), g.Phif() + sz);
         file.createDataSet("flux", flux);
     }
+
+    rec.closeFile();
+    rec.submit();
 
     PLOG_INFO << "Restart file saved: " << filepath
               << "  (step=" << step << ", efpd=" << efpd << ", keff=" << eigv << ")";
