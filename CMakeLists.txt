@@ -210,6 +210,24 @@ if (RASBERY_ENABLE_TESTS)
         target_compile_options(rasbery_nodal_replay PRIVATE -march=native -O3)
     endif ()
 
+    # GPU updateConstant mapping gate + contraction miner (Rev.7.1 Task 4).
+    # Needs no device and no capture: it drives the SHIPPED per-thread body from
+    # CudaNodalConstantKernel.h against a verbatim quotation of
+    # Nodal::updateConstant, so the packing order, the (node, dir, group) index
+    # and the node-scoped early-out are all checked on the host.  -march=native
+    # is required, not cosmetic: without FMA in the ISA gcc contracts nothing and
+    # the mined NODAL_CONST_FORMS cannot be scored.
+    add_executable(rasbery_nodal_constant_gpu_replay
+            "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_constant_gpu_replay.cpp")
+    target_compile_features(rasbery_nodal_constant_gpu_replay PRIVATE cxx_std_20)
+    target_include_directories(rasbery_nodal_constant_gpu_replay PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    if (NOT MSVC)
+        target_compile_options(rasbery_nodal_constant_gpu_replay PRIVATE -march=native -O3)
+    endif ()
+
+    add_test(NAME nodal_constant_gpu_replay COMMAND rasbery_nodal_constant_gpu_replay 2048)
+
     # Device arm of the same gate: the CUDA build of the shared body against
     # the same capture, elementwise.  Compiled with --fmad=false exactly like
     # the production TU.
@@ -259,6 +277,47 @@ if (RASBERY_ENABLE_TESTS)
                 CUDA_SEPARABLE_COMPILATION ON)
         set_source_files_properties(
                 "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_mine_device.cu"
+                PROPERTIES COMPILE_OPTIONS "--fmad=false")
+
+        # Rev.7.1 Task 4 Step 0: the B0-rescue spike.  Sweeps device sqrt/exp
+        # against baked glibc anchors and against this host's libm, and FAILS if
+        # the recorded N1 verdict stops holding in either direction (sqrt stops
+        # being exact, or exp starts matching everywhere and the rescue would now
+        # succeed).  --fmad=false so it is built exactly like the production TU.
+        add_executable(rasbery_nodal_constant_exp_probe
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_constant_exp_probe.cu")
+        target_compile_features(rasbery_nodal_constant_exp_probe PRIVATE cxx_std_20)
+        target_include_directories(rasbery_nodal_constant_exp_probe PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(rasbery_nodal_constant_exp_probe PRIVATE CUDA::cudart)
+        set_target_properties(rasbery_nodal_constant_exp_probe PROPERTIES
+                CUDA_STANDARD 17
+                CUDA_STANDARD_REQUIRED YES
+                CUDA_ARCHITECTURES "${RASBERY_CUDA_ARCHITECTURES}"
+                CUDA_SEPARABLE_COMPILATION ON)
+        set_source_files_properties(
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_constant_exp_probe.cu"
+                PROPERTIES COMPILE_OPTIONS "--fmad=false")
+
+        add_test(NAME nodal_constant_exp_probe
+                COMMAND rasbery_nodal_constant_exp_probe 1000000)
+
+        # Device arm of the Task 4 gate: the real phase kernels over the CPU
+        # reference dump rasbery_nodal_constant_gpu_replay --dump writes.  Not an
+        # add_test: it needs that dump on disk first.
+        add_executable(rasbery_nodal_constant_device_replay
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_constant_device_replay.cu")
+        target_compile_features(rasbery_nodal_constant_device_replay PRIVATE cxx_std_20)
+        target_include_directories(rasbery_nodal_constant_device_replay PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(rasbery_nodal_constant_device_replay PRIVATE CUDA::cudart)
+        set_target_properties(rasbery_nodal_constant_device_replay PROPERTIES
+                CUDA_STANDARD 17
+                CUDA_STANDARD_REQUIRED YES
+                CUDA_ARCHITECTURES "${RASBERY_CUDA_ARCHITECTURES}"
+                CUDA_SEPARABLE_COMPILATION ON)
+        set_source_files_properties(
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_constant_device_replay.cu"
                 PROPERTIES COMPILE_OPTIONS "--fmad=false")
     endif ()
 endif ()

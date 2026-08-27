@@ -16,9 +16,19 @@ and it is allowed to use whatever CUDA offers.
 
 WHAT IS ALLOWED.  Warp/subgroup operations go through the GpuSubgroup.h /
 GpuBackend.h wrappers (Sec 1.5 naming), not through the intrinsic.  Guards on
-`__CUDA_ARCH__` / `__CUDACC__` are fine and necessary -- that is how a pure body
-picks `fma` over `std::fma` (XsReconKernel.h) -- so the check is for CUDA API
-CALLS and for the intrinsics themselves, not for the feature-test macros.
+`__CUDA_ARCH__` / `__CUDA_ARCH__` are fine and necessary -- that is how a pure
+body picks `fma` over `std::fma` (XsReconKernel.h) -- so the check is for CUDA
+API CALLS and for the intrinsics themselves, not for the feature-test macros.
+
+CODE INSIDE `#if defined(__CUDACC__)` IS NOT SHARED, so the CUDA API check does
+not apply there.  Rev.7.1 Task 4 added the first header that needs this:
+CudaNodalConstantKernel.h holds the phase's per-thread body ABOVE the guard --
+CUDA-free, so test/nodal_constant_gpu_replay.cpp can drive it on the host with
+no device -- and the `__global__` wrappers plus the enqueue BELOW it.  Without
+the exemption the only way to keep the shared half checkable would be to split
+the file, which puts the kernel and the body it wraps in two places and invites
+them to drift.  The intrinsic ban still covers the whole file: reaching for
+`__shfl` under the guard is the same later-port cost as reaching for it above.
 """
 from __future__ import annotations
 
@@ -33,7 +43,7 @@ SRC = ROOT / "src"
 # Every shared pure body, present or planned.  Missing files are skipped, so the
 # list can name Task 3's scheduler core before Task 3 lands; a file that appears
 # is checked from that moment on.
-PURE_BODIES = sorted(SRC.glob("*Kernel.h")) + [
+PURE_BODIES = sorted(set(SRC.glob("*Kernel.h")) | set(SRC.glob("*Kernels.h"))) + [
     SRC / "GpuPhaseSchedulerCore.h",
     SRC / "GpuPhaseScheduler.h",
     SRC / "GpuPhysicsArenaLayout.h",
@@ -67,6 +77,41 @@ def strip_comments(text: str) -> str:
     return re.sub(r"//[^\n]*", "", text)
 
 
+CUDACC_OPEN = re.compile(r"^\s*#\s*if\s+defined\s*\(\s*__CUDACC__\s*\)\s*$")
+ANY_IF = re.compile(r"^\s*#\s*if")
+ANY_ENDIF = re.compile(r"^\s*#\s*endif")
+
+
+def strip_cudacc_regions(code: str) -> str:
+    """Blank the lines inside `#if defined(__CUDACC__)` ... `#endif`.
+
+    Nesting-aware, and it blanks rather than deletes so a reported line number
+    still means something.  Only the exact one-condition form opens a region:
+    anything more complicated is left in, on the principle that a check should
+    refuse to guess.
+    """
+    out: list[str] = []
+    depth = 0     # nesting depth inside the guarded region, 0 = outside
+    stack: list[bool] = []
+    for line in code.splitlines():
+        if ANY_IF.match(line):
+            opening = depth == 0 and CUDACC_OPEN.match(line) is not None
+            stack.append(opening)
+            if opening or depth:
+                depth += 1
+            out.append("")
+            continue
+        if ANY_ENDIF.match(line):
+            if stack:
+                stack.pop()
+            if depth:
+                depth -= 1
+            out.append("")
+            continue
+        out.append("" if depth else line)
+    return "\n".join(out)
+
+
 def main() -> int:
     problems: list[str] = []
     checked: list[str] = []
@@ -80,10 +125,16 @@ def main() -> int:
                 problems.append(
                     f"{path.name}: uses the CUDA-only intrinsic {token!r}; "
                     "route it through GpuSubgroup.h / GpuBackend.h (constraint 35)")
-        for match in CUDA_API_CALL.finditer(code):
+        # The CUDA API check applies to the SHARED text only: what sits inside
+        # `#if defined(__CUDACC__)` is the CUDA arm and never reaches another
+        # compiler.  The intrinsic scan above is deliberately not narrowed the
+        # same way.
+        shared = strip_cudacc_regions(code)
+        for match in CUDA_API_CALL.finditer(shared):
             call = match.group(0).rstrip("(").strip()
             problems.append(
-                f"{path.name}: calls the CUDA API {call}(); a shared pure body must not "
+                f"{path.name}: calls the CUDA API {call}() outside any "
+                "`#if defined(__CUDACC__)` guard; a shared pure body must not "
                 "(constraint 35)")
         # ALLOWED_MACROS are deliberately NOT scanned: `#if defined(__CUDACC__)`
         # is how a pure body picks its device spelling (XsReconKernel.h), so

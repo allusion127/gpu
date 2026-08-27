@@ -341,10 +341,61 @@ struct DeviceSlotView {
 };
 
 // ---------------------------------------------------------------------------
+// Sec 5.9 / Sec 4.1  What a phase kernel is handed  -- [Rev.7.1 Task 4]
+// ---------------------------------------------------------------------------
+
+/// The device-side face of the arena: the per-slot views plus the contiguous
+/// Sec 3.2 control block.  ONE of these is built by the host after reserve()
+/// and passed by value into every phase kernel.
+///
+/// WHY A TABLE OF VIEWS AND NOT A STRIDE.  slotView(s) on the host is a pure
+/// index rebase, so a kernel could recompute it from a slot-0 view and a byte
+/// stride.  It must not: the stride is layout knowledge, and a kernel that
+/// carries layout knowledge is a second opinion about the arena that will drift
+/// from GpuPhysicsArenaLayout.h.  The arena fixes every per-slot address in
+/// reserve() and never allocates again, so the host builds this table once,
+/// uploads it once, and a captured graph's baked argument stays valid for the
+/// whole run -- which is the entire reason the arena has that property.
+///
+/// THE RESOLUTION ORDER IS PART OF THE CONTRACT.  Every phase kernel does:
+///
+///     if (gpuDispatchIsPadding(logical, queue.count)) return;
+///     const int slot = queue.slots[logical];        // NEVER blockIdx as a slot
+///     const DeviceSlotView v = arena.slotView(slot);
+///
+/// `logical` is the lane's index into the queue; the queue is dispatched at the
+/// BUCKET width, so lanes past `count` read kQueueEmptySlot and must return
+/// before touching it.
+///
+/// WHAT A PHASE KERNEL MAY WRITE.  `states[slot]` and the slot's bulk arrays.
+/// It may NOT write `phases[slot].queued_phase` or `.queued_epoch`: those are
+/// captured by classify and are what makes a stale queue entry go stale by
+/// itself (Sec 5.2).  A phase kernel that stamps them re-validates the entry it
+/// is currently consuming, and the slot is queued twice on the next epoch.
+struct DeviceArenaView {
+    const DeviceSlotView* slot_views; ///< [slot_count], built once after reserve()
+
+    // Sec 3.2 control block, four dense arrays below slot_base.
+    DeviceSlotPhase*      phases;
+    DeviceSlotState*      states;
+    DeviceSearchState*    searches;
+    DeviceScheduleParams* params;
+
+    int slot_count;
+
+    RASBERY_GPU_HD const DeviceSlotView& slotView(int slot) const {
+        return slot_views[slot];
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Device view contract.  These are the properties that make a view safe to hand
 // to a kernel; asserting them here means a bad member is a compile error in
 // every build, not a grep miss.
 // ---------------------------------------------------------------------------
+
+static_assert(std::is_trivially_copyable_v<DeviceArenaView>);
+static_assert(std::is_standard_layout_v<DeviceArenaView>);
 
 static_assert(std::is_trivially_copyable_v<DeviceGeometryView>);
 static_assert(std::is_trivially_copyable_v<DeviceXsLibraryView>);
