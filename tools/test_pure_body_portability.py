@@ -35,6 +35,7 @@ SRC = ROOT / "src"
 # is checked from that moment on.
 PURE_BODIES = sorted(SRC.glob("*Kernel.h")) + [
     SRC / "GpuPhaseSchedulerCore.h",
+    SRC / "GpuPhaseScheduler.h",
     SRC / "GpuPhysicsArenaLayout.h",
     SRC / "GpuSlotControl.h",
     SRC / "GpuPhysicsTypes.h",

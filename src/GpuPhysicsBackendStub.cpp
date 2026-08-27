@@ -14,6 +14,7 @@
 // would 64 slots need" exactly, which is what the layout contract test asks it.
 // Only the allocation and the transfers are absent.
 
+#include "GpuPhaseScheduler.h"
 #include "GpuPhysicsArena.h"
 #include "GpuPhysicsTypes.h"
 
@@ -209,5 +210,21 @@ std::string GpuPhysicsArena::receiptJson() const {
 void GpuPhysicsArena::emitReceipt(std::ostream& os) const {
     os << "[RASBERY][GPU_ARENA] " << receiptJson() << "\n";
 }
+
+// ---------------------------------------------------------------------------
+// GpuPhaseScheduler, no-CUDA arm.
+//
+// The launchers refuse; the CLASSIFICATION SEMANTICS do not live here at all.
+// gpuClassifySerial() in GpuPhaseScheduler.h is the definition, it is pure, and
+// it runs on the host in any build -- which is what lets the queue ordering,
+// the padding, the bucket choice and both Sec 5.2 fatal faults be checked with
+// no device (test/gpu_phase_compaction.cpp).
+// ---------------------------------------------------------------------------
+
+bool gpuLaunchClassify(DeviceSlotPhase*, int, DevicePhaseQueues*, GpuSchedulerStream) {
+    return false;
+}
+
+bool gpuLaunchRefill(const GpuRefillArgs&, GpuSchedulerStream) { return false; }
 
 } // namespace rasbery::gpu

@@ -45,6 +45,7 @@ if (RASBERY_ENABLE_CUDA)
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaBICGBackend.cu"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaXsReconBackend.cu"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/GpuPhysicsArenaCuda.cu"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/GpuPhaseScheduler.cu"
     )
     # The xsrecon kernel's contract is bit-identical reproduction of the host
     # loop; nvcc must not contract a*b+c into fma where the host compiler did
@@ -145,6 +146,18 @@ if (RASBERY_ENABLE_TESTS)
             "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
     add_test(NAME gpu_arena_layout COMMAND rasbery_gpu_arena_layout)
+
+    # Case-phase compaction gate (Rev.7.1 Task 3).  gpuClassifySerial is pure,
+    # so the queue ordering, the padding, the bucket choice, both Sec 5.2 fatal
+    # faults and the Sec 8.2 recycled-slot reset are all checkable exhaustively
+    # without a device -- and that is the only place they get checked.
+    add_executable(rasbery_gpu_phase_compaction
+            "${CMAKE_CURRENT_SOURCE_DIR}/test/gpu_phase_compaction.cpp")
+    target_compile_features(rasbery_gpu_phase_compaction PRIVATE cxx_std_20)
+    target_include_directories(rasbery_gpu_phase_compaction PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+    add_test(NAME gpu_phase_compaction COMMAND rasbery_gpu_phase_compaction)
 
     # Device arm of the same gate: nvcc's floating point vs g++'s, elementwise
     # on one call.  This is what the full-deck A/B cannot localize.

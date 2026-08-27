@@ -131,8 +131,15 @@ need("DepletionPredictor" in LAYOUT_CODE and "DepletionCorrector" in LAYOUT_CODE
 # factor or a "compress" spelling; neither may exist.
 for token in ("compress", "Compress", "COMPRESS"):
     need(token not in LAYOUT_CODE, f"GpuPhysicsArenaLayout.h mentions {token}; Sec 3.6 removed the tier")
-need(re.search(r"kArenaPerSlotByteCeiling\s*=\s*225", LAYOUT_CODE) is not None,
-     "the Sec 4.4 per-slot ceiling is not 225 MiB")
+# Raised from 225 to 256 MiB in Task 3: the measured layout is 224.06 MiB, so
+# the old ceiling left 0.4% of headroom and any W2 array would have tripped
+# admission on arithmetic alone.  The band the LAYOUT must stay in (200-225 MiB,
+# checked below by the layout gate) is unchanged -- only the refusal threshold
+# moved, and it must stay above the band or the check would be vacuous.
+need(re.search(r"kArenaPerSlotByteCeiling\s*=\s*256", LAYOUT_CODE) is not None,
+     "the Sec 4.4 per-slot ceiling is not 256 MiB (Task 3 raised it, reserving W2 growth)")
+need("256" in LAYOUT_CODE and "W2" in LAYOUT,
+     "the raised ceiling is not documented as W2 growth headroom")
 need(re.search(r"kArenaDriverReserveFraction\s*=\s*0\.10", LAYOUT_CODE) is not None
      and re.search(r"kArenaFragmentationReserveFraction\s*=\s*0\.10", LAYOUT_CODE) is not None,
      "the Sec 4.4 10% + 10% reserves are missing")

@@ -72,9 +72,19 @@ inline constexpr std::size_t kArenaAlignment = 256;
 inline constexpr double kArenaDriverReserveFraction        = 0.10;
 inline constexpr double kArenaFragmentationReserveFraction = 0.10;
 
-/// Sec 3.6 / 4.4 per-slot ceiling.  The measured budget is 200-225 MiB; this is
-/// the top of that band and the number admission is computed against.
-inline constexpr std::size_t kArenaPerSlotByteCeiling = 225ull * 1024ull * 1024ull;
+/// Sec 3.6 / 4.4 per-slot ceiling.
+///
+/// The MEASURED layout at APR1400 size is 224.06 MiB/slot, at the very top of
+/// Sec 3.6's 200-225 MiB band -- 0.4% of headroom, which is not headroom.  Any
+/// array W2 adds (Task 12a's resolved delta stream, Task 13's Xe staging) would
+/// trip admission on arithmetic alone, before a single kernel ran.  The ceiling
+/// is therefore 256 MiB: the measured footprint plus room for the W2 additions,
+/// still 16 GiB at 64 slots and still ~17% of a 96 GiB RTX PRO 6000.
+///
+/// This is a budget, not a target.  If the layout ever approaches 256 MiB the
+/// question to ask is which array stopped being necessary, not whether the
+/// number can move again.
+inline constexpr std::size_t kArenaPerSlotByteCeiling = 256ull * 1024ull * 1024ull;
 
 inline constexpr std::size_t arenaAlignUp(std::size_t bytes) {
     return (bytes + kArenaAlignment - 1) / kArenaAlignment * kArenaAlignment;

@@ -427,7 +427,26 @@ inline constexpr int kDevXeAndersonTriples = 6 + 2 * kDevXeAndersonDepth;
 // structs and not with the scheduler.
 // ---------------------------------------------------------------------------
 
+/// Zero every byte, PADDING INCLUDED.  Each reset below starts here.
+///
+/// Resetting only the declared fields is not enough and the difference is not
+/// academic: alignas(128) gives DeviceSlotState 120 bytes of tail padding, and
+/// every uint32-before-double pair adds four more.  Those bytes still belong to
+/// the previous tenant, so a byte-level audit -- which is exactly what the
+/// Task 20 `k_audit_tenant_reset` does, and what any snapshot hash or
+/// determinism comparison does -- sees a recycled slot that is not clean.
+/// Caught by test/gpu_phase_compaction.cpp's two-fill reset postcondition.
+///
+/// Written as a byte loop rather than memset so the header needs no <cstring>
+/// and compiles identically under nvcc; these run once per refill, never on a
+/// hot path.
+RASBERY_GPU_HD inline void deviceZeroBytes(void* p, unsigned int bytes) {
+    unsigned char* b = static_cast<unsigned char*>(p);
+    for (unsigned int i = 0; i < bytes; ++i) b[i] = 0u;
+}
+
 RASBERY_GPU_HD inline void deviceSlotPhaseReset(DeviceSlotPhase& p, std::uint32_t next_epoch) {
+    deviceZeroBytes(&p, static_cast<unsigned int>(sizeof(p)));
     p.phase        = static_cast<std::uint8_t>(DevicePhase::Empty);
     p.queued_phase = static_cast<std::uint8_t>(DevicePhase::Empty);
     p.escape       = static_cast<std::uint8_t>(DeviceEscape::None);
@@ -444,6 +463,7 @@ RASBERY_GPU_HD inline void deviceSlotPhaseReset(DeviceSlotPhase& p, std::uint32_
 }
 
 RASBERY_GPU_HD inline void deviceSlotStateReset(DeviceSlotState& s) {
+    deviceZeroBytes(&s, static_cast<unsigned int>(sizeof(s)));
     s.schedule_index     = 0u;
     s.statepoint         = 0u;
     s.substep            = 1u;
@@ -494,6 +514,7 @@ RASBERY_GPU_HD inline void deviceSlotStateReset(DeviceSlotState& s) {
 /// SearchMemory is carried across statepoints WITHIN a deck and must never
 /// survive into a different deck's tenancy: this resets it with everything else.
 RASBERY_GPU_HD inline void deviceSearchStateReset(DeviceSearchState& q) {
+    deviceZeroBytes(&q, static_cast<unsigned int>(sizeof(q)));
     q.has_boron_secant  = 0u;
     q.boron_secant_dkdx = 0.0;
     q.has_rod_secant    = 0u;
@@ -528,6 +549,7 @@ RASBERY_GPU_HD inline void deviceSearchStateReset(DeviceSearchState& q) {
 /// Reset still runs first so a field the importer forgets is a Scheduler.h
 /// default rather than the previous tenant's value.
 RASBERY_GPU_HD inline void deviceScheduleParamsReset(DeviceScheduleParams& d) {
+    deviceZeroBytes(&d, static_cast<unsigned int>(sizeof(d)));
     d.search_type          = static_cast<std::uint32_t>(DeviceSearchType::Keff);
     d.schedule_type        = static_cast<std::uint32_t>(DeviceScheduleType::Standard);
     d.th_mode              = static_cast<std::uint32_t>(DeviceThMode::Steady);
