@@ -51,6 +51,12 @@ replay는 **inline 호출열 그 자체**를 나중에 다른 스레드에서 �
 
 수용 시험은 기존 bit-golden 게이트다(단일덱 500/500 데이터셋, 배치 708/708). `RASBERY_IO_WRITER=inline`(기본값)은 문자 그대로 종전 경로이므로 자명하게 불변이다.
 
+**적용 범위 — 성공 경로에 한정.** 위 논증은 모든 op가 성공적으로 replay된 실행에 대한 것이다. **오류 경로의 부분 파일은 두 모드가 다를 수 있고, 그것이 의도된 설계다**: inline은 예외가 난 그 지점까지 쓰고 멈추는 반면, thread 모드는 세션을 poison하고 **그 파일의 이후 batch를 전부 건너뛴다**(§2.5). 실패한 job의 산출물은 어느 모드에서도 유효하지 않으므로 게이트 대상이 아니다 — 대신 그 job이 반드시 **loud하게 실패**하는 것이 계약이다.
+
+### 2.5 실패 격리 — poison된 세션은 흡수성(absorbing)
+
+파일 생성이 실패하면(권한 없는 출력 디렉터리 등) 그 세션은 `failed`로 표시된다. 이후 그 세션 앞으로 제출된 batch는 **replay되지 않고 건너뛰어진다**. 그렇게 하지 않으면 열리지 않은 파일을 역참조해 **writer 스레드가 SIGSEGV로 죽고 64덱 전부가 함께 죽는다**. 건너뛴 batch는 수신증의 `skipped`로 계수되고(조용한 손실이 아니다), 최초 실패는 job id와 함께 즉시 보고되며, `CloseResult()`의 fence가 그것을 **그 job의 예외**로 되돌린다. 다층 방어로 op를 열지 않는 batch는 replay 진입 시 `file` 널 여부를 먼저 검사하고, 슬롯 참조는 전부 경계 검사(`groupAt`/`dataSetAt`/`fileOf`)를 거친다.
+
 ### 2.3 교착 없음
 
 유일한 blocking edge는 `solver → 가득 찬 큐`이고, writer는 solver를 기다리지 않는다(큐와 `Hdf5Guard`만 기다리며, solver는 큐 없이도 guard를 놓는다). thread 모드의 recorder는 **어떤 HDF5 락도 잡지 않으므로**, 큐에서 블록된 Driver가 guard를 쥔 채 멈추는 상황이 없다.
@@ -101,7 +107,8 @@ h5diff가 볼 수 **없는** 성질만 정적으로 고정한다.
 | **G2** | **thread byte-identity (단일덱)**: 같은 덱을 `inline`/`thread`로 각각 실행 후 `h5diff` | out.h5 및 모든 `*_restart_*.h5` 차이 0 |
 | **G3** | **thread byte-identity (배치)**: M64 골든 세트 | 708/708 데이터셋 Δ=0, FAIL 0/64 |
 | **G4** | **처리량 A/B (M64)**: 동일 덱 세트를 `inline` vs `thread` | thread ≥ inline; 목표 250~300 c/h. `[HDF5][LOCK].acquires` 대폭 감소 + `[IO_WRITER][SUMMARY].failures=0` 동반 확인 |
-| **G5** | 수신증 무결성 | 두 실행 모두 config/summary 1줄씩, `mode`가 의도한 값 |
+| **G5** | 수신증 무결성 | 두 실행 모두 config/summary 1줄씩, `mode`가 의도한 값, `failures=0`·`skipped=0` |
+| **G6** | **음성 게이트**: 1덱의 `--raso`를 쓰기 불가 디렉터리로 | exit≠0, `[IO_WRITER][FAIL]`에 job id, 크래시/행 없음, 나머지 63덱 무영향 |
 
 **주의 1**: G4는 SPTELEM을 끈 상태로 측정한다(telemetry 자체가 배치에서 I/O 경합을 증폭해 처리량을 왜곡한다).
 
@@ -118,6 +125,8 @@ CUDA 없는 g++ 13.3 빌드에서 `--batch-mode`는 막혀 있으므로 배치 �
 | 한 프로세스 6덱 직렬 (세션 6개가 한 writer를 통과) | 6개 결과 파일 + restart, **h5diff 0 차이** (파일당 객체 4,912개) |
 | 백프레셔 (`RASBERY_IO_WRITER_QUEUE=1`, `_QUEUE_MB=1`) | 결과 동일, `enqueue_block_ms=149.5`로 청구, `requests/ops/bytes`는 기본 큐와 완전히 동일 |
 | 계약 테스트 | `tools/test_io_writer_contract.py` PASS |
+| **음성 게이트** — 쓰기 불가 출력 디렉터리(0555) | exit=1, `[IO_WRITER][FAIL]`에 job id·경로·사유, **크래시/행 없음** |
+| **음성 게이트 (6덱 중 1덱 불량)** | 불량 덱만 실패, **나머지 5덱 전부 정상 산출·기준과 h5diff 0 차이** |
 
 부수 관측: 8덱을 한 프로세스에서 동시에 띄우면 `[HDF5][LOCK].wait_ms`가 24회 획득에 **8.4~9.6 s**에 달한다. 이 대기는 statepoint 쓰기가 아니라 **94 MB XSLIB 읽기 동시 진입**이다 — writer 스레드가 손대지 않는 부분이므로, G4에서 기대 이득이 SPTELEM `io_wall` 비중(≈40 %)을 넘지 못하는 것이 정상이다. XSLIB 캐시 트랙(plan §14)이 그 나머지 절반을 겨냥한다.
 

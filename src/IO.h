@@ -61,6 +61,13 @@ private:
     /// No-op in inline mode (nothing is ever in flight).
     void FenceJobWrites() const;
 
+    /// Rethrow a writer error that has ALREADY happened, without waiting.  One
+    /// mutex-protected bool read per statepoint: it stops a deck whose output
+    /// file could not even be created from computing its whole run before
+    /// CloseResult() finds out.  Fencing here instead would re-serialise the
+    /// very hand-off this class exists to make asynchronous.
+    void ThrowIfWritesFailed() const;
+
     /// The old `if (!_result_file)` precondition.  The handle is only
     /// inspectable on the inline path -- in thread mode the writer owns it, so
     /// the session's existence is the test: OpenResult queued the open ahead of

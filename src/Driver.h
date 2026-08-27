@@ -2323,6 +2323,10 @@ public:
                 c.phase[sptelem::PH_DRIVE], c.phase[sptelem::PH_UPDJNET],
                 c.phase[sptelem::PH_NODAL], c.phase[sptelem::PH_CUSPING],
                 c.phase[sptelem::PH_UPDDHAT]));
+            // The summary is the last line this deck emits, so flush here: an
+            // abnormal exit then loses at most the lines of the decks still
+            // running, never a finished deck's telemetry.
+            iowriter::flushLines();
         }
         return 0;
     }

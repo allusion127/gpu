@@ -1391,6 +1391,11 @@ void IO::WriteStepToResult(Geometry& g, const XSSet& xs, int schedule_index) {
     const Schedule& d = _s.schedule()[schedule_index];
     if (d.step <= 0) return;
 
+    // Cheap, non-blocking: if a write this deck already queued has failed (the
+    // result file could not be created at all, say), stop here rather than
+    // compute another statepoint whose output can never land.
+    ThrowIfWritesFailed();
+
     iowriter::Recorder rec(_result_session);
     auto step_grp = rec.root().createGroup(std::format("steps/{:04d}", d.step));
 
@@ -1991,18 +1996,32 @@ void IO::CloseResult() {
 void IO::FenceJobWrites() const {
     iowriter::fence(_result_session);
     for (const auto& session : _restart_sessions) iowriter::fence(session);
+    ThrowIfWritesFailed();
+}
+
+/// @brief Rethrow an already-recorded writer error, without waiting for the queue.
+void IO::ThrowIfWritesFailed() const {
+    const auto broke = [](const std::shared_ptr<iowriter::FileSession>& session) {
+        if (!session) return false;
+        std::lock_guard<std::mutex> lock(session->mtx);
+        return session->failed;
+    };
 
     const iowriter::FileSession* failed = nullptr;
-    if (_result_session && _result_session->failed) failed = _result_session.get();
+    if (broke(_result_session)) failed = _result_session.get();
     if (failed == nullptr)
         for (const auto& session : _restart_sessions)
-            if (session->failed) {
+            if (broke(session)) {
                 failed = session.get();
                 break;
             }
     if (failed == nullptr) return;
-    throw std::runtime_error("IO: HDF5 writer thread failed for '" + failed->path +
-                             "' (job " + failed->job + "): " + failed->error);
+
+    // `error`/`path` are only read after `failed` was observed set under the
+    // same mutex that published them, so they are stable by then.
+    std::lock_guard<std::mutex> lock(const_cast<iowriter::FileSession*>(failed)->mtx);
+    throw std::runtime_error("IO: HDF5 writer failed for '" + failed->path + "' (job " +
+                             failed->job + "): " + failed->error);
 }
 
 /// @brief Save a restart snapshot to an HDF5 file.

@@ -62,6 +62,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <functional>
@@ -71,6 +72,7 @@
 #include <mutex>
 #include <optional>
 #include <ostream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -146,6 +148,10 @@ struct Counters {
     std::atomic<std::uint64_t> block_ns{0};    ///< total time Drivers spent blocked on a full queue
     std::atomic<std::uint64_t> writer_ns{0};   ///< total time the writer spent inside HDF5
     std::atomic<std::uint64_t> failures{0};    ///< batches that threw on the writer thread
+    /// Batches dropped because their session was ALREADY failed.  Separate from
+    /// `failures` on purpose: one failure plus N skips says "this job's output
+    /// is gone from here on", which one failure alone would not.
+    std::atomic<std::uint64_t> skipped{0};
 };
 
 inline Counters& counters() {
@@ -187,38 +193,95 @@ struct ReplayCtx {
 
 using Op = std::function<void(ReplayCtx&)>;
 
+/// Bounds-checked slot lookup.  A recorded op names its parent by slot, and the
+/// slot is only correct if creates and replays stayed in lockstep.  If they ever
+/// did not, this must be a thrown error -- which poisons the session and fails
+/// the job -- and never an out-of-range read on the writer thread.
+inline HighFive::Group& groupAt(ReplayCtx& ctx, int slot) {
+    if (slot < 0 || static_cast<std::size_t>(slot) >= ctx.groups.size())
+        throw std::runtime_error("IO writer: group slot " + std::to_string(slot) +
+                                 " out of range (" + std::to_string(ctx.groups.size()) + ")");
+    return ctx.groups[static_cast<std::size_t>(slot)];
+}
+
+inline HighFive::DataSet& dataSetAt(ReplayCtx& ctx, int slot) {
+    if (slot < 0 || static_cast<std::size_t>(slot) >= ctx.datasets.size())
+        throw std::runtime_error("IO writer: dataset slot " + std::to_string(slot) +
+                                 " out of range (" + std::to_string(ctx.datasets.size()) + ")");
+    return ctx.datasets[static_cast<std::size_t>(slot)];
+}
+
+/// The open file every non-opening op dereferences.  Never a raw `->` on the
+/// unique_ptr: a batch whose file failed to open would otherwise walk a null
+/// pointer on the writer thread and take all 64 decks down with it.
+inline HighFive::File& fileOf(ReplayCtx& ctx) {
+    if (!ctx.session.file)
+        throw std::runtime_error("IO writer: '" + ctx.session.path + "' is not open");
+    return *ctx.session.file;
+}
+
 struct Batch {
     std::shared_ptr<FileSession> session;
     std::vector<Op>              ops;
     std::size_t                  bytes = 0;
+    /// True for the batch that carries the file's open op.  Every other batch
+    /// requires the file to be open already, and says so before it touches it.
+    bool                         opens_file = false;
 };
+
+/// Mark a session failed, publish it against its job id, and count it.  ONE
+/// emitter of the FAIL receipt, so the paths that can fail cannot drift apart.
+inline void poison(FileSession& session, const std::string& what) {
+    counters().failures.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(session.mtx);
+        session.failed = true;
+        if (session.error.empty()) session.error = what;
+    }
+    std::cout << "[RASBERY][IO_WRITER][FAIL] {\"job\":\"" << session.job << "\",\"path\":\""
+              << session.path << "\",\"what\":\"" << what << "\"}" << std::endl;
+}
 
 /// Execute one batch's ops against its file.  The ONLY place HDF5 write calls
 /// happen on the thread path; `ctx` is declared inside the guard scope because
 /// Group/DataSet destructors re-enter the runtime too.
 inline void replay(Batch& batch) {
     const auto started = std::chrono::steady_clock::now();
-    try {
-        Chiffon::Hdf5Guard hdf5_guard;
-        ReplayCtx          ctx{*batch.session, {}, {}};
-        for (Op& op : batch.ops) op(ctx);
-    } catch (const std::exception& error) {
-        counters().failures.fetch_add(1, std::memory_order_relaxed);
+
+    // A POISONED SESSION IS ABSORBING.  Once a file's open -- or any earlier
+    // batch for it -- has failed, every later batch is SKIPPED rather than
+    // replayed: its ops would dereference a file that was never opened, and a
+    // segfault on the writer thread takes all 64 decks down instead of one.
+    // This is a skip, not a swallow: the failure was published when it
+    // happened, the receipt counts the skips, and CloseResult()'s fence still
+    // turns it into THAT job's exception.
+    bool poisoned = false;
+    {
         std::lock_guard<std::mutex> lock(batch.session->mtx);
-        batch.session->failed = true;
-        if (batch.session->error.empty()) batch.session->error = error.what();
-        std::cout << "[RASBERY][IO_WRITER][FAIL] {\"job\":\"" << batch.session->job
-                  << "\",\"path\":\"" << batch.session->path << "\",\"what\":\""
-                  << error.what() << "\"}" << std::endl;
-    } catch (...) {
-        counters().failures.fetch_add(1, std::memory_order_relaxed);
-        std::lock_guard<std::mutex> lock(batch.session->mtx);
-        batch.session->failed = true;
-        if (batch.session->error.empty()) batch.session->error = "unknown exception";
-        std::cout << "[RASBERY][IO_WRITER][FAIL] {\"job\":\"" << batch.session->job
-                  << "\",\"path\":\"" << batch.session->path
-                  << "\",\"what\":\"unknown exception\"}" << std::endl;
+        poisoned = batch.session->failed;
     }
+
+    if (poisoned) {
+        counters().skipped.fetch_add(1, std::memory_order_relaxed);
+        batch.ops.clear();
+    } else {
+        try {
+            Chiffon::Hdf5Guard hdf5_guard;
+            ReplayCtx          ctx{*batch.session, {}, {}};
+            // The file must already be open unless THIS batch is the one that
+            // opens it.  Checked before any op runs, so even a poisoning this
+            // thread somehow missed cannot reach a null dereference.
+            if (!batch.opens_file && !ctx.session.file)
+                throw std::runtime_error("IO writer: '" + ctx.session.path +
+                                         "' is not open (its create must have failed)");
+            for (Op& op : batch.ops) op(ctx);
+        } catch (const std::exception& error) {
+            poison(*batch.session, error.what());
+        } catch (...) {
+            poison(*batch.session, "unknown exception");
+        }
+    }
+
     counters().writer_ns.fetch_add(
         static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                        std::chrono::steady_clock::now() - started)
@@ -241,11 +304,47 @@ class Queue {
 public:
     Queue() = default;
 
-    /// Belt and braces only.  main() drains this explicitly in both branches
-    /// (that is the contract), but a joinable std::thread destroyed anyway calls
-    /// std::terminate -- so an early `return` that never reached the teardown
-    /// must not turn into a crash on the way out.
-    ~Queue() { shutdown(); }
+    /// LAST RESORT, AND IT DOES NO I/O.  main() drains this explicitly in both
+    /// branches; that is the contract and the only supported path.  This runs
+    /// only when an early `return` skipped the teardown, and by then we are in
+    /// static destruction: replaying here would enter HDF5, std::cout and the
+    /// counters at a point where none of them is guaranteed to still exist.
+    /// So it ABANDONS whatever is queued, says so on stderr, and joins -- a
+    /// joinable std::thread destroyed instead would call std::terminate.
+    ~Queue() {
+        std::thread worker;
+        std::deque<Batch> abandoned;
+        {
+            std::lock_guard<std::mutex> lock(_mtx);
+            _stopped = true;
+            abandoned.swap(_queue);
+            _bytes   = 0;
+            worker   = std::move(_worker);
+            _started = false;
+        }
+        _not_empty.notify_all();
+        _not_full.notify_all();
+        if (worker.joinable()) worker.join();
+
+        if (abandoned.empty()) return;
+        // Release anyone waiting in fence() and record the loss on the sessions
+        // (they are heap objects held by the batches, so they are still alive).
+        for (Batch& batch : abandoned) {
+            if (!batch.session) continue;
+            {
+                std::lock_guard<std::mutex> lock(batch.session->mtx);
+                batch.session->failed = true;
+                if (batch.session->error.empty())
+                    batch.session->error = "writer queue torn down before this batch ran";
+                if (batch.session->pending > 0) --batch.session->pending;
+            }
+            batch.session->cv.notify_all();
+        }
+        std::fprintf(stderr,
+                     "[RASBERY][IO_WRITER][FAIL] {\"what\":\"writer torn down with %zu batch(es) "
+                     "undrained -- iowriter::shutdown() was not called\"}\n",
+                     abandoned.size());
+    }
 
     Queue(const Queue&)            = delete;
     Queue& operator=(const Queue&) = delete;
@@ -259,28 +358,37 @@ public:
             // Post-shutdown submit (a late destructor, a serial-branch tail).
             // Nothing is dropped: run it here, on this thread, under the guard.
             lock.unlock();
-            replay(batch);
-            counters().requests.fetch_add(1, std::memory_order_relaxed);
-            counters().bytes.fetch_add(batch.bytes, std::memory_order_relaxed);
+            replayHere(batch);
             return;
         }
         if (!_started) {
-            _started = true;
+            // Construct FIRST, then latch.  A throwing std::thread ctor with the
+            // flag already set would leave a queue nobody ever services, and
+            // every fence() on it would hang forever.
             _worker  = std::thread([this] { run(); });
+            _started = true;
         }
         const bool full = _queue.size() >= queueDepthLimit() ||
                           (_bytes + batch.bytes > queueByteLimit() && !_queue.empty());
         if (full) {
             const auto blocked = std::chrono::steady_clock::now();
+            // `|| _stopped` so a teardown while we are blocked wakes us instead
+            // of leaving us parked on a queue that will never drain again.
             _not_full.wait(lock, [this, &batch] {
-                return _queue.size() < queueDepthLimit() &&
-                       (_bytes + batch.bytes <= queueByteLimit() || _queue.empty());
+                return _stopped ||
+                       (_queue.size() < queueDepthLimit() &&
+                        (_bytes + batch.bytes <= queueByteLimit() || _queue.empty()));
             });
             counters().block_ns.fetch_add(
                 static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                std::chrono::steady_clock::now() - blocked)
                                                .count()),
                 std::memory_order_relaxed);
+            if (_stopped) {
+                lock.unlock();
+                replayHere(batch);
+                return;
+            }
         }
         _bytes += batch.bytes;
         counters().requests.fetch_add(1, std::memory_order_relaxed);
@@ -304,12 +412,23 @@ public:
             }
             _stopped = true;
             worker   = std::move(_worker);
+            _started = false;
         }
         _not_empty.notify_all();
+        _not_full.notify_all();
         if (worker.joinable()) worker.join();
     }
 
 private:
+    /// Run a batch on the CALLING thread, with the same accounting the writer
+    /// would have done.  Used only when the queue is already stopped.
+    static void replayHere(Batch& batch) {
+        const std::size_t bytes = batch.bytes;
+        replay(batch);
+        counters().requests.fetch_add(1, std::memory_order_relaxed);
+        counters().bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+
     void run() {
         for (;;) {
             Batch batch;
@@ -489,6 +608,7 @@ public:
             _session->file = std::make_unique<HighFive::File>(path, HighFive::File::Overwrite);
             return;
         }
+        _batch.opens_file = true;
         push([path](ReplayCtx& ctx) {
             ctx.session.file =
                 std::make_unique<HighFive::File>(path, HighFive::File::Overwrite);
@@ -506,16 +626,30 @@ public:
 
     void submit() {
         if (_inline || _batch.ops.empty()) {
-            _batch.ops.clear();
+            resetBatch();
             return;
         }
         {
             std::lock_guard<std::mutex> lock(_session->mtx);
             ++_session->pending;
         }
-        queue().submit(std::move(_batch));
-        _batch = Batch{};
-        _batch.session = _session;
+        try {
+            queue().submit(std::move(_batch));
+        } catch (const std::exception& error) {
+            // The hand-off itself failed (a std::thread that could not start is
+            // the realistic case).  `pending` is already counted, so undo it
+            // here or every fence() on this session waits for a batch that will
+            // never run; then fail the job loudly rather than silently.
+            {
+                std::lock_guard<std::mutex> lock(_session->mtx);
+                if (_session->pending > 0) --_session->pending;
+            }
+            _session->cv.notify_all();
+            resetBatch();
+            poison(*_session, std::string("writer hand-off failed: ") + error.what());
+            throw;
+        }
+        resetBatch();
     }
 
     // -- recording plumbing, used by Node/RawDataSet --------------------------
@@ -528,6 +662,17 @@ public:
     int nextDataSetSlot() { return _dataset_slots++; }
 
 private:
+    /// Start a fresh batch.  The SLOT COUNTERS RESET WITH IT: slots index the
+    /// replay context, which is per batch, so a recorder reused across two
+    /// submits would otherwise hand the second batch indices that only existed
+    /// in the first.
+    void resetBatch() {
+        _batch         = Batch{};
+        _batch.session = _session;
+        _group_slots   = 0;
+        _dataset_slots = 0;
+    }
+
     std::shared_ptr<FileSession>      _session;
     bool                              _inline = true;
     std::optional<Chiffon::Hdf5Guard> _guard;
@@ -546,9 +691,8 @@ inline Node Node::createGroup(const std::string& name) const {
     const int slot = _recorder->nextGroupSlot();
     const int parent = _slot;
     _recorder->push([parent, name](ReplayCtx& ctx) {
-        ctx.groups.push_back(parent < 0 ? ctx.session.file->createGroup(name)
-                                        : ctx.groups[static_cast<std::size_t>(parent)]
-                                              .createGroup(name));
+        ctx.groups.push_back(parent < 0 ? fileOf(ctx).createGroup(name)
+                                        : groupAt(ctx, parent).createGroup(name));
     });
     return Node(_recorder, slot);
 }
@@ -566,9 +710,9 @@ inline void Node::createDataSet(const std::string& name, const T& value) const {
     _recorder->push(
         [parent, name, payload = value](ReplayCtx& ctx) {
             if (parent < 0)
-                ctx.session.file->createDataSet(name, payload);
+                fileOf(ctx).createDataSet(name, payload);
             else
-                ctx.groups[static_cast<std::size_t>(parent)].createDataSet(name, payload);
+                groupAt(ctx, parent).createDataSet(name, payload);
         },
         payloadBytes(value));
 }
@@ -584,10 +728,8 @@ inline RawDataSet Node::createDataSet(const std::string& name, const Dims& dims)
     const int parent = _slot;
     _recorder->push([parent, name, extent = dims.extent](ReplayCtx& ctx) {
         HighFive::DataSpace space(extent);
-        ctx.datasets.push_back(
-            parent < 0
-                ? ctx.session.file->createDataSet<T>(name, space)
-                : ctx.groups[static_cast<std::size_t>(parent)].createDataSet<T>(name, space));
+        ctx.datasets.push_back(parent < 0 ? fileOf(ctx).createDataSet<T>(name, space)
+                                          : groupAt(ctx, parent).createDataSet<T>(name, space));
     });
     return RawDataSet(_recorder, slot, dims.count());
 }
@@ -603,7 +745,7 @@ inline void RawDataSet::write_raw(const T* buffer) const {
     const int         slot  = _slot;
     _recorder->push(
         [slot, payload = std::move(owned)](ReplayCtx& ctx) {
-            ctx.datasets[static_cast<std::size_t>(slot)].write_raw(payload.data());
+            dataSetAt(ctx, slot).write_raw(payload.data());
         },
         bytes);
 }
@@ -674,7 +816,8 @@ inline void reportSummary(std::ostream& os) {
        << ",\"max_queue_bytes\":" << c.max_bytes.load()
        << ",\"enqueue_block_ms\":" << static_cast<double>(c.block_ns.load()) / 1.0e6
        << ",\"writer_busy_ms\":" << static_cast<double>(c.writer_ns.load()) / 1.0e6
-       << ",\"failures\":" << c.failures.load() << "}" << std::endl;
+       << ",\"failures\":" << c.failures.load()
+       << ",\"skipped\":" << c.skipped.load() << "}" << std::endl;
 }
 
 /// Drain the queue, join the writer, flush the line sink.  Called explicitly

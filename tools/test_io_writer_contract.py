@@ -121,12 +121,21 @@ for match in re.finditer(r"HighFive::File[^;]*;", IO_CPP_CODE, flags=re.S):
     if "ReadOnly" not in match.group(0):
         fail(f"a non-ReadOnly HighFive::File survives in IO.cpp: {match.group(0)!r}")
 
-# 2b. Every HDF5 write call in the process lives in IoWriter.h, and inside it
-#     only in the inline arms (guarded by the recorder) or in a recorded op.
-if "write_raw" in IO_CPP_CODE and "createDataSet" not in IO_CPP_CODE:
-    fail("write_raw without createDataSet in IO.cpp")
+# 2b. Every write_raw in the write path goes through RawDataSet, never through a
+#     bare HighFive handle -- and IO.cpp keeps none, so every write_raw call site
+#     it has is a proxy call.  (2a already proved no HighFive handle types
+#     survive there; this pins the call FORM too.)
 if "->write_raw(" in IO_CPP_CODE:
     fail("IO.cpp writes through a raw HighFive handle")
+raw_writes = re.findall(r"(\w+)\s*\.\s*write_raw\s*\(", IO_CPP_CODE)
+if not raw_writes:
+    fail("IO.cpp has no write_raw call sites at all; the write path moved somewhere unexpected")
+for receiver in set(raw_writes):
+    # Every receiver must be a RawDataSet: either the temporary returned by
+    # createDataSet<T>(name, dims), or a local bound from one.
+    if not re.search(rf"createDataSet<[^>]+>\([^;]*\)\s*\.\s*write_raw\(", IO_CPP_CODE) and \
+       not re.search(rf"\b{re.escape(receiver)}\s*=\s*\w+\.createDataSet<", IO_CPP_CODE):
+        fail(f"write_raw receiver {receiver!r} in IO.cpp is not a RawDataSet from createDataSet")
 
 # 2c. The single replay site, and it holds the guard for the whole batch: the
 #     Driver threads still READ HDF5, so one thread inside the runtime is still
@@ -135,15 +144,64 @@ replay = body_after("inline void replay(Batch& batch)")
 if "Chiffon::Hdf5Guard hdf5_guard;" not in replay:
     fail("replay() does not take the HDF5 guard; concurrent reads would race it")
 guard_at = replay.find("Chiffon::Hdf5Guard hdf5_guard;")
-ctx_at = replay.find("ReplayCtx          ctx{")
-loop_at = replay.find("for (Op& op : batch.ops) op(ctx);")
-if not 0 <= guard_at < ctx_at < loop_at:
+ctx_m = re.search(r"ReplayCtx\s+ctx\{", replay)
+loop_m = re.search(r"for\s*\(Op&\s*op\s*:\s*batch\.ops\)\s*op\(ctx\);", replay)
+if ctx_m is None:
+    fail("replay() no longer builds a ReplayCtx")
+if loop_m is None:
+    fail("replay() no longer runs the recorded ops")
+if not 0 <= guard_at < ctx_m.start() < loop_m.start():
     fail("the replay context is not constructed and destroyed inside the guard scope "
          "(Group/DataSet destructors re-enter HDF5 too)")
-if WRITER_CODE.count("for (Op& op : batch.ops) op(ctx);") != 1:
+if len(re.findall(r"for\s*\(Op&\s*op\s*:\s*batch\.ops\)\s*op\(ctx\);", WRITER_CODE)) != 1:
     fail("recorded ops are executed from more than one site")
-if WRITER_CODE.count("replay(batch)") != 2:  # the drain loop and the post-shutdown fallback
+# replay() is entered from exactly two places: the drain loop, and the
+# post-shutdown in-place fallback.  Anything else is a second writer.
+if len(re.findall(r"(?<!inline void )\breplay\(batch\)", WRITER_CODE)) != 2:
     fail("replay() is called from an unexpected number of sites")
+
+# 2e. FAILURE ISOLATION.  A session whose file failed to open must be ABSORBING:
+#     later batches are skipped, never replayed, or their ops walk a null file
+#     and the writer thread segfaults -- taking all 64 decks down, not one.
+poison_at = replay.find("batch.session->failed")
+if poison_at < 0:
+    fail("replay() does not consult session->failed before replaying")
+if not 0 <= poison_at < guard_at:
+    fail("the poisoned-session check runs AFTER the ops; it must gate them")
+if "counters().skipped.fetch_add(" not in replay:
+    fail("skipped batches are not counted; that is silent data loss")
+if "batch.ops.clear();" not in replay:
+    fail("a poisoned batch's ops are not dropped")
+null_guard = re.search(r"if\s*\(!batch\.opens_file\s*&&\s*!ctx\.session\.file\)", replay)
+if null_guard is None:
+    fail("replay() has no null-file guard for batches that do not open the file")
+if not null_guard.start() < loop_m.start():
+    fail("the null-file guard runs after the ops it is supposed to protect")
+if not re.search(r"bool\s+opens_file\s*=\s*false;", WRITER_CODE):
+    fail("Batch does not carry the opens_file flag the null guard reads")
+if not re.search(r"_batch\.opens_file\s*=\s*true;", WRITER_CODE):
+    fail("openOverwrite does not mark its batch as the one that opens the file")
+
+# Slot lookups are bounds-checked, and nothing indexes the vectors raw.
+for signature, helper in (("inline HighFive::Group& groupAt(", "groupAt"),
+                          ("inline HighFive::DataSet& dataSetAt(", "dataSetAt")):
+    block = body_after(signature)
+    if "out of range" not in block:
+        fail(f"{helper}() does not bounds-check the slot")
+    if "throw std::runtime_error" not in block:
+        fail(f"{helper}() does not throw on an out-of-range slot")
+# The accessors themselves are the one place allowed to index raw -- that is
+# what they are.  Everywhere else must go through them.
+outside_accessors = WRITER_CODE
+for signature in ("inline HighFive::Group& groupAt(", "inline HighFive::DataSet& dataSetAt("):
+    outside_accessors = outside_accessors.replace(body_after(signature), "")
+if re.search(r"ctx\.(groups|datasets)\[", outside_accessors):
+    fail("a replay op indexes the handle vectors directly instead of via the checked accessor")
+file_of = body_after("inline HighFive::File& fileOf(ReplayCtx& ctx)")
+if "if (!ctx.session.file)" not in file_of or "throw std::runtime_error" not in file_of:
+    fail("fileOf() does not refuse a closed/never-opened file")
+if re.search(r"ctx\.session\.file->", WRITER_CODE):
+    fail("a replay op dereferences session.file directly instead of via fileOf()")
 
 # 2d. The recorder is the ONLY thing that takes the guard on a Driver thread,
 #     and only in inline mode -- a thread-mode Driver must hold no HDF5 lock
@@ -189,7 +247,7 @@ if "H5Screate_simple" not in dims_doc:
 write_raw = body_after("inline void RawDataSet::write_raw(const T* buffer) const")
 if "std::vector<T> owned(buffer, buffer + _count);" not in write_raw:
     fail("write_raw does not copy the caller's block into an owned buffer")
-if "ctx.datasets[static_cast<std::size_t>(slot)].write_raw(payload.data());" not in write_raw:
+if not re.search(r"dataSetAt\(ctx,\s*slot\)\s*\.\s*write_raw\(payload\.data\(\)\);", write_raw):
     fail("the recorded write_raw does not target the slot its creation reserved")
 if "_recorder->nextDataSetSlot()" in write_raw:
     fail("write_raw reserves its own slot; it must reuse the creation's")
@@ -205,7 +263,7 @@ for capture in ("[&]", "[&,", "[=, &"):
         fail("a recorded op captures by reference; the payload must be owned")
 
 # 3d. One FIFO queue, and a file's batches ride it in submission order.
-if "std::deque<Batch>       _queue;" not in WRITER_CODE:
+if not re.search(r"std::deque<Batch>\s+_queue;", WRITER_CODE):
     fail("the queue is not a FIFO deque")
 run = body_after("void run()")
 if "_queue.front()" not in run or "_queue.pop_front()" not in run:
@@ -239,6 +297,26 @@ if "_not_full.notify_all();" not in run:
 if submit.find("const bool full =") > submit.find("_bytes += batch.bytes;"):
     fail("submit() admits the batch before testing the bound")
 
+# A teardown while an enqueuer is parked must WAKE it, or it waits on a queue
+# that will never drain again.
+wait_pred = submit[submit.find("_not_full.wait(lock,"):]
+wait_pred = wait_pred[: wait_pred.find("});") + 3]
+if "_stopped" not in wait_pred:
+    fail("the _not_full predicate ignores _stopped; a teardown would strand a blocked Driver")
+if not re.search(r"if\s*\(_stopped\)\s*\{[^}]*replayHere\(batch\);", submit, flags=re.S):
+    fail("a Driver woken by shutdown does not fall back to running its batch in place")
+
+# The writer thread is CONSTRUCTED before the started flag is latched: a throwing
+# std::thread ctor with the flag already set leaves a queue nobody services and
+# every fence() on it hangs forever.
+start_block = body_after("if (!_started)", text=submit)
+ctor_at = start_block.find("std::thread([this] { run(); })")
+latch_at = start_block.find("_started = true;")
+if ctor_at < 0 or latch_at < 0:
+    fail("submit() no longer starts the writer thread the way the contract describes")
+if not ctor_at < latch_at:
+    fail("_started is latched before the std::thread ctor can throw")
+
 # ---------------------------------------------------------------------------
 # 5. Shutdown, failure reporting, receipts.
 # ---------------------------------------------------------------------------
@@ -256,13 +334,39 @@ if "queue().shutdown();" not in top_shutdown or "flushLines();" not in top_shutd
 if "return counters().failures.load();" not in top_shutdown:
     fail("shutdown() does not hand the failure count back to main()")
 
-# A failure names its job and its file, and it is never swallowed.
-if replay.count("[RASBERY][IO_WRITER][FAIL]") != 2:  # std::exception and (...)
-    fail("a writer-thread failure is not reported on both exception paths")
-if replay.count("batch.session->job") != 2 or replay.count("batch.session->failed = true;") != 2:
-    fail("a writer-thread failure does not name its job / mark its session")
-if "counters().failures.fetch_add(" not in replay:
+# ~Queue() runs during STATIC DESTRUCTION.  It must not replay (that would enter
+# HDF5, std::cout and counters() when none of them is guaranteed to exist).
+dtor = body_after("~Queue()")
+for banned in ("replay(", "replayHere(", "counters()", "std::cout", "std::cerr"):
+    if banned in dtor:
+        fail(f"~Queue() touches {banned} -- no late I/O is allowed during static destruction")
+if "std::fprintf(stderr" not in dtor:
+    fail("~Queue() abandons batches without warning on stderr")
+if "worker.join()" not in dtor:
+    fail("~Queue() does not join the writer; a joinable thread would std::terminate")
+if "abandoned.swap(_queue);" not in dtor and "_queue.clear();" not in dtor:
+    fail("~Queue() does not clear the undrained queue")
+if "--batch.session->pending;" not in dtor or "cv.notify_all();" not in dtor:
+    fail("~Queue() leaves sessions with pending batches; a fence() would hang")
+
+# A failure names its job and its file, is counted, and is never swallowed.
+# One emitter, poison(), so the two catch arms cannot drift apart.
+poison_fn = body_after("inline void poison(FileSession& session, const std::string& what)")
+if "[RASBERY][IO_WRITER][FAIL]" not in poison_fn:
+    fail("poison() does not emit the FAIL receipt")
+if "session.job" not in poison_fn or "session.path" not in poison_fn:
+    fail("the FAIL receipt does not name its job and its file")
+if "session.failed = true;" not in poison_fn:
+    fail("poison() does not mark the session failed")
+if "counters().failures.fetch_add(" not in poison_fn:
     fail("writer-thread failures are not counted")
+if WRITER_CODE.count("[RASBERY][IO_WRITER][FAIL]") != 2:  # poison() and ~Queue()'s stderr note
+    fail("the FAIL receipt is emitted from an unexpected number of sites")
+# Both exception arms of replay() must reach it -- std::exception AND (...).
+if "catch (const std::exception& error)" not in replay or "catch (...)" not in replay:
+    fail("replay() does not catch both exception forms")
+if replay.count("poison(*batch.session,") != 2:
+    fail("a writer-thread failure is not reported on both exception paths")
 
 # ...and it lands on the job, through the fence, and on the process exit code.
 fence = body_after("inline void fence(const std::shared_ptr<FileSession>& session)")
@@ -275,8 +379,24 @@ if "iowriter::fence(_result_session);" not in job_fence:
     fail("FenceJobWrites does not fence the result file")
 if "_restart_sessions" not in job_fence:
     fail("FenceJobWrites ignores the restart snapshots")
-if "throw std::runtime_error" not in job_fence:
+if "ThrowIfWritesFailed();" not in job_fence:
+    fail("FenceJobWrites drains but never checks the result")
+
+# The failure lands on the job that owns it, and it is checked at BOTH the
+# blocking fence and the cheap per-statepoint probe.
+job_check = body_after("void IO::ThrowIfWritesFailed() const", text=IO_CPP_CODE)
+if "throw std::runtime_error" not in job_check:
     fail("a writer failure does not fail its own job")
+if "_restart_sessions" not in job_check:
+    fail("the failure probe ignores the restart snapshots")
+if "iowriter::fence(" in job_check:
+    fail("ThrowIfWritesFailed blocks; it must be the NON-waiting probe")
+if "std::lock_guard<std::mutex> lock(session->mtx);" not in job_check:
+    fail("the failure probe reads session->failed without its mutex")
+# ...and the probe is what stops a doomed deck from computing a whole run.
+write_step = body_after("void IO::WriteStepToResult", text=IO_CPP_CODE)
+if "ThrowIfWritesFailed();" not in write_step:
+    fail("a deck whose output file could not be created keeps computing statepoints")
 close_result = body_after("void IO::CloseResult()", text=IO_CPP_CODE)
 if "FenceJobWrites();" not in close_result:
     fail("CloseResult does not fence the job's writes before returning")
@@ -297,6 +417,23 @@ if "if (io_writer_failures > 0 && exit_code == 0) exit_code = 1;" not in main_co
     fail("a lost write does not reach the batch branch's exit code")
 if "if (rasbery::iowriter::shutdown() > 0 && exit_code == 0) exit_code = 1;" not in main_code:
     fail("a lost write does not reach the serial branch's exit code")
+
+# BOTH deck loops isolate a failing deck.  The serial loop used to let the
+# exception escape main(), which aborted the process and killed every deck after
+# the bad one -- the exact collateral the batch loop already refuses.
+if main_code.count("driver.Drive()") != 2:
+    fail("main() no longer drives decks from exactly the two expected loops")
+for loop, anchor in (("batch", "job_status[static_cast<std::size_t>(i)] = driver.Drive();"),
+                     ("serial", "driver_exit_code = driver.Drive();")):
+    at = main_code.find(anchor)
+    if at < 0:
+        fail(f"the {loop} deck loop does not call Drive() the way the contract describes")
+    window = main_code[max(0, at - 400):at]
+    if "try {" not in window:
+        fail(f"the {loop} deck loop does not guard Drive(); one bad deck would abort the process")
+    after = main_code[at:at + 500]
+    if "catch (const std::exception& error)" not in after or "catch (...)" not in after:
+        fail(f"the {loop} deck loop does not catch both exception forms")
 # The drain must precede the verdicts it can change.
 batch_shutdown = main_code.find("const std::uint64_t io_writer_failures")
 verdicts = main_code.find('"[RASBERY][FAIL] exit_code="')
@@ -308,7 +445,7 @@ if '"[RASBERY][IO_WRITER] {\\"mode\\":\\""' not in config:
     fail("the configuration receipt does not publish the mode")
 summary = body_after("inline void reportSummary(std::ostream& os)")
 for field in ("requests", "bytes", "max_queue_depth", "enqueue_block_ms",
-              "writer_busy_ms", "failures", "ops", "max_queue_bytes"):
+              "writer_busy_ms", "failures", "ops", "max_queue_bytes", "skipped"):
     if f'\\"{field}\\":' not in summary:
         fail(f"the summary receipt omits {field}")
 if '"[RASBERY][IO_WRITER][SUMMARY]' not in summary:
@@ -320,6 +457,27 @@ if '"[RASBERY][IO_WRITER][SUMMARY]' not in summary:
 recorder_submit = body_after("void submit()", text=WRITER_CODE)
 if "if (_inline || _batch.ops.empty()) {" not in recorder_submit:
     fail("submit() queues something in inline mode; inline must execute in place")
+# Slots index the PER-BATCH replay context, so they must reset with the batch --
+# otherwise a reused recorder hands its second batch indices from the first.
+if recorder_submit.count("resetBatch();") < 2:
+    fail("submit() does not reset the batch on both return paths")
+reset = body_after("void resetBatch()")
+for field in ("_group_slots", "_dataset_slots"):
+    if not re.search(rf"{field}\s*=\s*0;", reset):
+        fail(f"resetBatch() does not reset {field}")
+if not re.search(r"_batch\s*=\s*Batch\{\};", reset):
+    fail("resetBatch() does not start a fresh batch")
+# A failed hand-off must undo the pending it already counted, or fence() hangs.
+if "queue().submit(std::move(_batch));" not in recorder_submit:
+    fail("submit() does not hand the batch to the queue")
+if "catch (const std::exception& error)" not in recorder_submit:
+    fail("submit() does not guard the hand-off; a throwing thread ctor would strand pending")
+if "--_session->pending;" not in recorder_submit:
+    fail("a failed hand-off does not release the pending count it took")
+if "poison(*_session," not in recorder_submit:
+    fail("a failed hand-off does not fail its job")
+if "throw;" not in recorder_submit:
+    fail("a failed hand-off is swallowed instead of reaching the Driver")
 open_overwrite = body_after("void openOverwrite(const std::string& path)")
 if "if (_inline) {" not in open_overwrite:
     fail("openOverwrite has no inline arm")
@@ -354,6 +512,13 @@ if append.find("std::lock_guard") > append.find("std::cout.write("):
 flush = body_after("inline void flushLines()")
 if "sink.buffer.clear();" not in flush:
     fail("flushLines does not clear what it wrote")
+# A finished deck's telemetry must be durable: flush at the run-summary site so
+# an abnormal exit loses only the lines of decks still running.
+summary_at = driver_code.find("[RASBERY][SPTELEM][SUMMARY]")
+if summary_at < 0:
+    fail("the SPTELEM summary receipt disappeared")
+if "iowriter::flushLines();" not in driver_code[summary_at:summary_at + 3000]:
+    fail("the SPTELEM run summary is not flushed; an abnormal exit would lose finished decks")
 
 py_compile.compile(str(Path(__file__).resolve()), doraise=True)
 print("io writer contract: PASS")

@@ -611,12 +611,30 @@ int main(int argc, char* argv[]) {
         std::cout << "\n[RASBERY] " << rasbery_input_path.string()
                   << " -> " << rasbery_output_path.string() << std::endl;
 
-        rasbery::Driver driver(rasbery_input_path.string(), rasbery_output_path.string());
-        const int       driver_exit_code = driver.Drive();
-        if (driver_exit_code != 0 && exit_code == 0) {
+        // Same rule as the batch branch above: one bad deck must fail only its
+        // own job.  This loop used to let an exception escape main() -- an
+        // unwritable output directory aborted the process and took every deck
+        // AFTER the bad one with it, which is exactly the collateral the batch
+        // branch already refuses.  Reported for every failure, not just the
+        // first, so a multi-deck run's log names all of them.
+        int         driver_exit_code = 0;
+        std::string driver_error;
+        try {
+            rasbery::Driver driver(rasbery_input_path.string(), rasbery_output_path.string());
+            driver_exit_code = driver.Drive();
+        } catch (const std::exception& error) {
+            driver_exit_code = 1;
+            driver_error     = error.what();
+        } catch (...) {
+            driver_exit_code = 1;
+            driver_error     = "unknown exception";
+        }
+        if (driver_exit_code != 0) {
             std::cout << "[RASBERY][FAIL] exit_code=" << driver_exit_code
-                      << " path=" << rasbery_input_path.string() << std::endl;
-            exit_code = driver_exit_code;
+                      << " path=" << rasbery_input_path.string()
+                      << (driver_error.empty() ? std::string() : " what=" + driver_error)
+                      << std::endl;
+            if (exit_code == 0) exit_code = driver_exit_code;
         }
     }
 
