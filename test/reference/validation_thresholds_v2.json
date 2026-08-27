@@ -1,9 +1,9 @@
 {
   "schema_version": 2,
-  "frozen": false,
-  "frozen_utc": "TBD_REFREEZE",
+  "frozen": true,
+  "frozen_utc": "2026-08-27T12:10:48Z",
   "supersedes": "validation_thresholds_v1.json",
-  "status": "TEMPLATE - not yet frozen. Every TBD_REFREEZE field is filled by the validation agent from the v2 re-freeze run on 238; nothing here is authoritative until frozen_utc is a date.",
+  "status": "FROZEN. Filled in by the validation agent from the v2 re-freeze run on 238 (binary e64794f69d03c384c48d5c6c4e40129887d5285a).",
   "frozen_field_note": "MACHINE-CHECKABLE GUARD. Any consumer of this file must refuse it while \"frozen\" is false - a template read as authoritative would gate a campaign on TBD_REFREEZE placeholders. The re-freeze fill-in flips it to true in the same commit that replaces the last placeholder.",
   "derivation": "Thresholds are UNCHANGED from v1 (same engineering floors, same reasoning, plan Rev.4 s3.4): the numbers below were never noise-derived, so a new baseline trajectory does not move them. What changes in v2 is the TRAJECTORY they are measured against. v1 was frozen on binary ae5965d with RASBERY_XE_ANDERSON unset == Anderson OFF, i.e. on a plain Picard Xe cascade that TRUNCATED before the fixed point on part of the statepoints; the audit put that unconverged-Xe artifact at ~2-3 pcm of reactivity (same signature as the QW2 finding). The v2 baseline trajectory includes Anderson-ON single-deck execution, which is now the default for a single run (RASBERY_XE_ANDERSON unset, non --batch-mode; commit of 2026-08-27). Anderson was adopted as a CORRECTNESS improvement that happens to be 1.69x faster, not as an optimization: it converges the SAME fixed point to the SAME XE_EQUILIBRIUM_TOLERANCE, and the MASTER agreement IMPROVED - reactivity 1.970 -> 1.905 pcm, AO 0.022 -> 0.013 (Gate B, tools/compare_master_rasbery.py). The 2.27 pcm Gate A delta that AA1 showed against the v1 baseline is therefore the v1 baseline's own defect being exposed, and re-freezing on the converged trajectory is the correct response - not loosening a threshold. Batch mode (--batch-mode) keeps Anderson OFF by default (arrival-width starvation, 202 vs 216 cases/h at M64), so a batch golden's trajectory is the v1 one; RASBERY_XE_ANDERSON=0/1 overrides the default in both modes and any run that sets it is NOT a baseline run. The [RASBERY][PHYSICS_MODE] receipt publishes exec_mode / xe_anderson / xe_anderson_source, and a v2 baseline run is only valid if it reads exec_mode=single, xe_anderson=true, xe_anderson_source=default.",
   "gate_a_vs_rasbery_baseline": {
@@ -28,7 +28,7 @@
   "gate_a_master_nondegradation": {
     "delta_RMS_pctpt": 0.02,
     "delta_max_pctpt": 0.10,
-    "reference": "MASTER_pin_RMS(candidate) <= MASTER_pin_RMS(baseline) + delta_RMS; same for max. Baseline BOC pin RMS/max to be re-measured on the v2 baseline: TBD_REFREEZE (v1 values were 0.239 pct / 0.79 pct, fig20, MASTER_vs_RASBERY_COMPARISON_20260824)."
+    "reference": "MASTER_pin_RMS(candidate) <= MASTER_pin_RMS(baseline) + delta_RMS; same for max. Baseline BOC pin RMS/max re-measured on the v2 baseline: 0.238 pct / 0.80 pct (measured 2026-08-27 on e64794f, gateA_v2_rep1.h5 vs kngr_mas_ppi_boc.txt; v1 values were 0.239 pct / 0.79 pct, fig20, MASTER_vs_RASBERY_COMPARISON_20260824)."
   },
   "gate_b_master_envelope": {
     "reactivity_pcm": 2.0,

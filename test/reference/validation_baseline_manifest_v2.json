@@ -1,20 +1,20 @@
 {
   "schema_version": 2,
-  "frozen": false,
-  "frozen_utc": "TBD_REFREEZE",
+  "frozen": true,
+  "frozen_utc": "2026-08-27T12:10:48Z",
   "supersedes": "validation_baseline_manifest_v1.json",
-  "status": "TEMPLATE - not yet frozen. Every TBD_REFREEZE field is filled by the validation agent from the re-freeze run on 238 (protocol in docs/CAMPAIGN_ANDERSON_WIDTH_FP32_20260827_KO.md s8.4). Until frozen_utc is a date, validation_baseline_manifest_v1.json remains the only frozen baseline.",
+  "status": "FROZEN. Filled in by the validation agent from the re-freeze run on 238 (protocol in docs/CAMPAIGN_ANDERSON_WIDTH_FP32_20260827_KO.md s8.4), binary e64794f69d03c384c48d5c6c4e40129887d5285a.",
   "frozen_field_note": "MACHINE-CHECKABLE GUARD. Any consumer of this file must refuse it while \"frozen\" is false - a template read as authoritative would gate a campaign on TBD_REFREEZE placeholders. The re-freeze fill-in flips it to true in the same commit that replaces the last placeholder.",
-  "baseline_commit_sha": "TBD_REFREEZE",
+  "baseline_commit_sha": "e64794f69d03c384c48d5c6c4e40129887d5285a",
   "branch": "codex/exact-throughput-campaign",
-  "compiler": "TBD_REFREEZE (v1: x86_64-conda-linux-gnu-g++ (conda-forge) 14.3.0 at /home/kmk/codex/tools/gcc13/bin)",
-  "cuda_compiler": "TBD_REFREEZE (v1: nvcc 13.0.88 (/usr/local/cuda-13.0))",
-  "release_flags": "TBD_REFREEZE (v1: -O3 -DNDEBUG -std=gnu++20 -march=native -Wall -Wextra -Wpedantic -fopenmp, CMAKE_BUILD_TYPE=Release, RASBERY_CUDA_ARCHITECTURES=120, per-TU --fmad=false on CudaXsReconBackend.cu)",
+  "compiler": "x86_64-conda-linux-gnu-g++ (conda-forge) 14.3.0 at /home/kmk/codex/tools/gcc13/bin (unchanged from v1)",
+  "cuda_compiler": "nvcc 13.0.88 (/usr/local/cuda-13.0) (unchanged from v1)",
+  "release_flags": "-O3 -DNDEBUG -std=gnu++20 -march=native -Wall -Wextra -Wpedantic -fopenmp, CMAKE_BUILD_TYPE=Release, RASBERY_CUDA_ARCHITECTURES=120 (verified via compile_commands.json: --generate-code=arch=compute_120,code=[compute_120,sm_120]), per-TU --fmad=false on CudaXsReconBackend.cu (unchanged from v1)",
   "gpu": {
     "model": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
     "uuid": "GPU-e73893d2-bd77-cccc-bf09-c0b3016cbe13",
-    "driver": "TBD_REFREEZE (v1: 590.48.01)",
-    "cuda_runtime": "TBD_REFREEZE (v1: 13.1)",
+    "driver": "590.48.01",
+    "cuda_runtime": "13.1",
     "host": "166.104.40.238 (GPU0)"
   },
   "benchmark_input": {
@@ -30,35 +30,35 @@
     "receipt_fields": "[RASBERY][PHYSICS_MODE] {... \"exec_mode\":\"single|batch\",\"xe_anderson\":true|false,\"xe_anderson_source\":\"default|env\"} and [RASBERY][IO_WRITER] {\"mode\":\"thread|inline\",\"mode_source\":\"default|env\"}"
   },
   "golden_outputs": {
-    "single_deck_h5_sha256": "TBD_REFREEZE (= gateA_v2_rep1.h5)",
+    "single_deck_h5_sha256": "1e453af898750dc4c0694cfe3f9f49bd78ae9eb64bc246b1fd0e37ffa45f6108 (= gateA_v2_rep1.h5)",
     "repeats": 4,
-    "repeat_walls_s": "TBD_REFREEZE (4 values; v1 was [93.29, 92.84, 92.99, 92.69] pre-Anderson, expect ~55 s with the adopted single-deck default)",
-    "determinism": "TBD_REFREEZE (required: N/N datasets bit-exact across all 4 repeats, keff/ppm max_abs_delta 0.0; container md5 may differ - HDF5 object-header timestamps only, never use cmp)",
-    "dataset_count": "TBD_REFREEZE (v1: 500)"
+    "repeat_walls_s": [55.314718, 55.397932, 55.424922, 55.278588],
+    "determinism": "500/500 datasets bit-exact (h5diff -r) across all 4 repeats: rep1 vs rep2/rep3/rep4 each report 0 differences on all 500 datasets. Container-level sha256 of rep2-4 not compared to rep1 - HDF5 object-header timestamps differ by construction; h5diff -r is the determinism proof, per protocol (never use cmp).",
+    "dataset_count": 500
   },
   "master_comparison_data_version": "kngr_mas_sum.txt + mas_ppi_{boc,0060..0420} (MASTER 4.0 KNGQ01, campaign 2026-08-22..24); comparator tools/compare_master_rasbery.py",
   "master_agreement_at_freeze": {
-    "reactivity_pcm": "TBD_REFREEZE (expected ~1.905; v1 was 1.970)",
-    "cbc_ppm": "TBD_REFREEZE (v1: 15.309)",
-    "ao_abs": "TBD_REFREEZE (expected ~0.013; v1 was 0.022)",
-    "boc_pin_rms_pct": "TBD_REFREEZE (v1: 0.239)",
-    "boc_pin_max_pct": "TBD_REFREEZE (v1: 0.79)"
+    "reactivity_pcm": 1.905,
+    "cbc_ppm": 15.309,
+    "ao_abs": 0.013,
+    "boc_pin_rms_pct": 0.238,
+    "boc_pin_max_pct": 0.80
   },
   "anderson_health_at_freeze": {
-    "aa_proposed": "TBD_REFREEZE",
-    "aa_accepted": "TBD_REFREEZE",
-    "aa_rejected": "TBD_REFREEZE",
-    "aa_history_resets": "TBD_REFREEZE",
-    "acceptance_rate_pct": "TBD_REFREEZE (v1-era single-deck measurement: 95.0)",
+    "aa_proposed": 1223,
+    "aa_accepted": 1162,
+    "aa_rejected": 61,
+    "aa_history_resets": 139,
+    "acceptance_rate_pct": 95.01,
     "source": "[RASBERY][SPTELEM][SUMMARY] counters; requires RASBERY_STATEPOINT_TELEMETRY=1, which must be run SEPARATELY from the timing repeats (telemetry perturbs I/O contention)"
   },
   "throughput_baselines": {
-    "single_deck_wall_s": "TBD_REFREEZE (v1: 92.9 pre-Anderson)",
-    "m64_exact_cases_per_hour": "TBD_REFREEZE (v1: 213.9; measured with the adopted defaults = writer thread ON, Anderson OFF in batch)",
+    "single_deck_wall_s": 55.354,
+    "m64_exact_cases_per_hour": 216.10,
     "master_w16_cases_per_hour": 217.0
   },
   "threshold_file": "validation_thresholds_v2.json",
-  "threshold_file_sha256": "TBD_REFREEZE",
+  "threshold_file_sha256": "548b5a4c7b37a80cf04133e36bf371ff6c3e2bd49c62f852a156bcddba474a51",
   "threshold_file_note": "sha256 of the frozen threshold file recorded in the campaign report at each gate evaluation",
   "v1_retention": "validation_thresholds_v1.json and validation_baseline_manifest_v1.json are kept UNTOUCHED as history. v1 remains the correct reference for any comparison against a pre-2026-08-27 result."
 }
