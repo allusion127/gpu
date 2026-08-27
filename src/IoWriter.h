@@ -239,6 +239,17 @@ inline void replay(Batch& batch) {
 // ---------------------------------------------------------------------------
 class Queue {
 public:
+    Queue() = default;
+
+    /// Belt and braces only.  main() drains this explicitly in both branches
+    /// (that is the contract), but a joinable std::thread destroyed anyway calls
+    /// std::terminate -- so an early `return` that never reached the teardown
+    /// must not turn into a crash on the way out.
+    ~Queue() { shutdown(); }
+
+    Queue(const Queue&)            = delete;
+    Queue& operator=(const Queue&) = delete;
+
     /// Hand a batch over.  Blocks (and accounts the block) while the queue is at
     /// either bound -- backpressure is correct and simple; dropping or growing
     /// without limit is neither.
