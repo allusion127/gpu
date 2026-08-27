@@ -46,6 +46,7 @@ if (RASBERY_ENABLE_CUDA)
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaXsReconBackend.cu"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/GpuPhysicsArenaCuda.cu"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/GpuPhaseScheduler.cu"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/GpuPhysicsBackendCuda.cu"
     )
     # The xsrecon kernel's contract is bit-identical reproduction of the host
     # loop; nvcc must not contract a*b+c into fma where the host compiler did

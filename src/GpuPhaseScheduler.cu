@@ -19,10 +19,10 @@
 // scheduling.  Queue order is the order phase kernels touch slot arrays, so a
 // nondeterministic queue makes the memory access pattern -- and any reduction
 // written in queue order -- vary run to run.  The ballot gives each eligible
-// slot its rank among lower-numbered eligible slots of the same phase, which is
-// exactly gpuQueueRank() in the header, so the queue is ascending by
-// construction and identical to the serial reference that
-// test/gpu_phase_compaction.cpp checks without a GPU.
+// slot its rank among the lower-numbered eligible slots of the same phase, so
+// the queue is ascending by construction and identical to what
+// gpuClassifySerial() in the header produces -- which is the reference
+// test/gpu_phase_compaction.cpp checks exhaustively, without a GPU.
 //
 // The counters (active_count, free_count, phase totals) ARE order-insensitive
 // sums, so those use shared-memory atomics; nothing here uses a float atomic.
@@ -187,6 +187,15 @@ __global__ __launch_bounds__(kClassifyBlock) void k_classify_case_phases(
             out->selected_count  = out->queue[out->selected_phase].count;
             out->selected_bucket = out->queue[out->selected_phase].bucket;
         }
+
+        // CONSUME the fault.  Without this the bits were written and nobody
+        // read them: the offending slot would keep running with two bodies
+        // driving it, which is the corruption the check exists to stop.  One
+        // slot dies (Sec 9.2), the rest of the fleet continues.
+        if (gpuSchedulerFaultIsFatal(out->fault_flags) &&
+            out->fault_slot < static_cast<unsigned int>(slot_count) &&
+            out->fault_slot < static_cast<unsigned int>(kMaxSchedulerSlots))
+            gpuMarkSlotFailed(phases[out->fault_slot], out->fault_flags);
     }
 }
 
@@ -219,18 +228,29 @@ __global__ void k_refill_free_slots(DeviceSlotPhase* __restrict__ phases,
     // Resetting before the claim is what makes an exhausted claim safe -- the
     // previous tenant is gone either way, so a slot can never be left holding
     // half of one deck and half of another.
-    const std::uint32_t next_epoch = p.state_epoch + 1u;
-    deviceSlotPhaseReset(p, next_epoch);
-    deviceSlotStateReset(states[s]);
-    deviceSearchStateReset(searches[s]);
-    deviceScheduleParamsReset(params[s]);
+    //
+    // An ALREADY-Empty slot is skipped: it was reset by a previous pass and is
+    // already clean, so re-running four resets on it every epoch is work that
+    // buys nothing.
+    if (finished) {
+        const std::uint32_t next_epoch = p.state_epoch + 1u;
+        deviceSlotPhaseReset(p, next_epoch);
+        deviceSlotStateReset(states[s]);
+        deviceSearchStateReset(searches[s]);
+        deviceScheduleParamsReset(params[s]);
+    }
 
-    // The cursor is monotone and only ever COMPARED against input_count; it is
-    // not a count of claimed inputs, so over-advancing it on an exhausted pass
-    // is harmless.  What must never happen is reading inputs[claim] when the
-    // claim is out of range.
+    // Read the cursor BEFORE touching it.  Once the inputs are exhausted every
+    // later pass would otherwise issue one atomicAdd per free slot per epoch --
+    // an unbounded cursor and an `exhausted` count that grows with the number
+    // of PASSES rather than the number of starved slots.  This early return
+    // makes the counter mean "slots that lost a race for the last inputs".
+    if (*next_input >= input_count) return; // draining; the slot stays Empty
+
     const int claim = atomicAdd(next_input, 1);
-    if (claim >= input_count) {
+    if (claim < 0 || claim >= input_count) {
+        // claim < 0 is the cursor having wrapped, which only a runaway loop can
+        // do; treat it exactly like exhaustion rather than indexing on it.
         atomicAdd(&counters->exhausted, 1u);
         return; // stays Empty and inactive; the fleet is draining
     }
@@ -276,12 +296,24 @@ bool gpuLaunchRefill(const GpuRefillArgs& a, GpuSchedulerStream stream) {
         a.params == nullptr || a.next_input == nullptr || a.counters == nullptr ||
         a.slot_count <= 0)
         return false;
+    // A null descriptor array with a positive count would have the kernel index
+    // nullptr the moment a slot won a claim.
+    if (a.inputs == nullptr && a.input_count > 0) return false;
     const int block = 128;
     const int grid  = (a.slot_count + block - 1) / block;
     k_refill_free_slots<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
         a.phases, a.states, a.searches, a.params, a.slot_count, a.inputs, a.input_count,
         a.next_input, a.counters);
     return !launchFailed("k_refill_free_slots");
+}
+
+bool gpuLaunchRefillThenClassify(const GpuRefillArgs& a, DevicePhaseQueues* queues,
+                                 GpuSchedulerStream stream) {
+    // One stream, in order.  Classify must see the slots refill just stamped
+    // Active/Import; taking a single stream parameter is what makes that
+    // structural rather than a convention someone has to remember.
+    if (!gpuLaunchRefill(a, stream)) return false;
+    return gpuLaunchClassify(a.phases, a.slot_count, queues, stream);
 }
 
 } // namespace rasbery::gpu

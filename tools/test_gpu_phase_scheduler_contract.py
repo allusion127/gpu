@@ -124,6 +124,22 @@ need("queued_epoch" in classify and "state_epoch" in classify,
 need("kSchedFaultInFlightRequeue" in classify and "kSchedFaultDuplicateQueue" in classify,
      "the classify kernel does not raise both Sec 5.2 fatal faults")
 
+# THE FAULT MUST HAVE A CONSUMER.  Bits written to a struct nobody reads are not
+# a check: the offending slot would keep running with two bodies driving it.
+need("gpuSchedulerFaultIsFatal" in HEADER_CODE, "there is no fatal-fault predicate")
+need("gpuMarkSlotFailed" in HEADER_CODE, "there is no consumer for a fatal fault")
+need("gpuSchedulerFaultIsFatal" in classify and "gpuMarkSlotFailed" in classify,
+     "the classify kernel raises faults but never acts on them")
+mark = body_after("inline void gpuMarkSlotFailed(", HEADER_CODE)
+need("error_code" in mark, "gpuMarkSlotFailed does not record the reason")
+need("kSlotFlagFatal" in mark, "gpuMarkSlotFailed does not set the fatal flag")
+need("DevicePhase::Failed" in mark, "gpuMarkSlotFailed does not fail the slot")
+need("state_epoch" in mark,
+     "gpuMarkSlotFailed does not bump the epoch; the stale queue entry would survive")
+serial = body_after("inline void gpuClassifySerial(", HEADER_CODE)
+need("gpuMarkSlotFailed" in serial,
+     "the serial reference does not consume faults, so the CPU gate cannot check it")
+
 # Deterministic compaction: ballot + prefix, never an atomic bump for the index.
 need("__ballot_sync" in classify, "the classify kernel does not use a warp ballot")
 need("__popc" in classify, "the classify kernel does not use a population count for the rank")
@@ -234,6 +250,16 @@ need("atomicAdd(next_input" in refill.replace(" ", "").replace("atomicAdd(next_i
      "the refill kernel does not claim its input with an atomic cursor")
 need("claim >= input_count" in refill,
      "the refill kernel does not guard the claim against the input count")
+need("claim < 0" in refill,
+     "the refill kernel does not guard against a wrapped cursor before indexing")
+need("*next_input >= input_count" in refill,
+     "the refill kernel bumps the cursor even when the inputs are exhausted; the "
+     "cursor would grow without bound and `exhausted` would count passes, not slots")
+need("if (finished) {" in refill,
+     "the refill kernel re-resets already-Empty slots every pass")
+launch_refill = body_after("bool gpuLaunchRefill(", KERNEL_CODE)
+need("a.inputs == nullptr" in launch_refill,
+     "gpuLaunchRefill does not reject a null descriptor array with a positive count")
 # Reset must precede the claim: a slot may never hold half of two decks.
 need(refill.find("deviceScheduleParamsReset") < refill.find("atomicAdd(next_input"),
      "the refill kernel claims an input before resetting the tenant (Sec 8.2 order)")
@@ -268,7 +294,10 @@ def anchor_line(anchor: str, lo: int = 1, hi: int | None = None) -> int | None:
     return None
 
 
-def function_range(signature: str) -> tuple[int, int]:
+DRIVER_SCAN = strip_literals(strip_comments(DRIVER))
+
+
+def function_range(signature_pattern: str) -> tuple[int, int]:
     """1-based [first, last] line of the brace-matched body of `signature`.
 
     The Outer-quantum anchors must be located INSIDE SolveLoop, not just
@@ -276,26 +305,34 @@ def function_range(signature: str) -> tuple[int, int]:
     call sequence for the flux-only path, so a whole-file search would find the
     helper's copy and never see SolveLoop's convergence test at all.
     """
-    start = DRIVER.find(signature)
-    if start < 0:
-        problems.append(f"Driver.h no longer contains {signature!r}")
+    # Braces are counted over source with comments AND string literals removed:
+    # a `{` inside either would close the range early or never, and the range is
+    # what makes the anchor search find SolveLoop's copy of the call sequence
+    # rather than ReconvergeFlux's (Driver.h:829-851 replays the same calls).
+    match = re.search(signature_pattern, DRIVER_SCAN)
+    if match is None:
+        problems.append(f"Driver.h no longer has a function matching {signature_pattern!r}")
         return (1, len(driver_lines))
-    open_at = DRIVER.find("{", start)
-    depth = 0
-    end_at = len(DRIVER)
-    for i in range(open_at, len(DRIVER)):
-        if DRIVER[i] == "{":
+    start   = match.start()
+    open_at = DRIVER_SCAN.find("{", match.end() - 1)
+    if open_at < 0:
+        problems.append("SolveLoop has no body")
+        return (1, len(driver_lines))
+    depth  = 0
+    end_at = len(DRIVER_SCAN)
+    for i in range(open_at, len(DRIVER_SCAN)):
+        if DRIVER_SCAN[i] == "{":
             depth += 1
-        elif DRIVER[i] == "}":
+        elif DRIVER_SCAN[i] == "}":
             depth -= 1
             if depth == 0:
                 end_at = i
                 break
-    return (DRIVER.count("\n", 0, start) + 1, DRIVER.count("\n", 0, end_at) + 1)
+    # Stripping preserves newlines, so line numbers still line up with the file.
+    return (DRIVER_SCAN.count("\n", 0, start) + 1, DRIVER_SCAN.count("\n", 0, end_at) + 1)
 
 
-SOLVE_LO, SOLVE_HI = function_range(
-    "static void SolveLoop(SolverContext& ctx, double& eigv, Schedule& schedule,")
+SOLVE_LO, SOLVE_HI = function_range(r"\bstatic\s+void\s+SolveLoop\s*\(")
 
 
 outer_block = HEADER[HEADER.find("kOuterQuantumSteps[] = "):]
@@ -356,6 +393,20 @@ for launcher in ("gpuLaunchClassify", "gpuLaunchRefill"):
          f"GpuPhysicsBackendStub.cpp does not define {launcher}")
 need("cuda_runtime.h" not in STUB_CODE and re.search(r"\bcuda[A-Z]\w*\s*\(", STUB_CODE) is None,
      "the stub translation unit reaches for CUDA")
+
+# Stream ordering: classify must observe the refill's writes.
+need("gpuLaunchRefillThenClassify" in HEADER_CODE,
+     "there is no ordered entry point; refill and classify could be issued on "
+     "different streams and race on the same phases array")
+ordered = body_after("bool gpuLaunchRefillThenClassify(", KERNEL_CODE)
+need("gpuLaunchRefill(a, stream)" in ordered and "queues, stream" in ordered,
+     "the ordered launcher does not put both kernels on the SAME stream")
+need("same stream or separated by an event" in HEADER or "same stream" in HEADER,
+     "the classify/refill ordering requirement is not documented")
+
+# gpuQueueRank is gone: it was untested and its semantics did not match the
+# kernel's (it counted inactive slots and ignored the ownership predicates).
+need("gpuQueueRank" not in HEADER_CODE, "gpuQueueRank is still present")
 
 need("GpuPhaseScheduler.cu" in CMAKE, "CMakeLists.txt does not compile the scheduler kernels")
 need("rasbery_gpu_phase_compaction" in CMAKE, "CMakeLists.txt does not build the compaction gate")

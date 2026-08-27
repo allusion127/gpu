@@ -103,9 +103,14 @@ void checkOneLayout(int slots, bool print) {
     std::vector<Span> inside;
     for (int i = 0; i < kSlotRegionCount; ++i) {
         const ArenaRegion& r = o.slot[i];
+        // A zero-byte region is still PLACED (its offset is inside the stride
+        // and 256-aligned); it simply spans nothing, so it is trivially
+        // disjoint from everything.  Dropping it from the sweep entirely would
+        // hide a region that silently lost its elements.
+        CHECK(r.offset <= o.per_slot_bytes);
+        CHECK(r.offset + r.bytes <= o.per_slot_bytes);
         if (r.bytes == 0) continue;
         inside.push_back({r.offset, r.offset + r.bytes, "slot_region"});
-        CHECK(r.offset + r.bytes <= o.per_slot_bytes);
     }
     for (int b = 0; b < kScratchBandCount; ++b) {
         const ArenaRegion& r = o.scratch[b];
@@ -119,8 +124,38 @@ void checkOneLayout(int slots, bool print) {
             CHECK(disjoint(inside[i], inside[j]));
 
     // ---- 3. slot isolation, and immutables out of reach -------------------
-    const std::size_t immutable_end = o.shared_geometry_bytes + o.shared_library_bytes;
+    const std::size_t immutable_end =
+        o.shared_geometry_bytes + o.shared_library_bytes + o.control_block_bytes;
     CHECK(immutable_end <= o.slot_base);
+
+    // THE CONTROL BLOCK IS OUT OF clearSlotAsync's REACH.  This is the whole
+    // reason the four structs left the slot stride: a bulk clear memsets
+    // [slotBase, slotBase + per_slot_bytes) and, while they lived inside it,
+    // wiped the defaults a refill had just written.
+    for (int i = 0; i < kControlRegionCount; ++i) {
+        const ArenaRegion& r = o.control[i];
+        CHECK(r.offset % kArenaAlignment == 0);
+        CHECK(r.offset + r.bytes <= o.slot_base);
+        CHECK(r.bytes == static_cast<std::size_t>(slots) *
+                             arenaControlElementBytes(static_cast<ControlRegion>(i)));
+        for (int s = 0; s < slots; ++s) CHECK(!o.insideSlotStride(s, r.offset, r.bytes));
+    }
+    // Control arrays are dense and pairwise disjoint, and every slot's element
+    // sits inside its own array -- the property `phases[tid]` depends on.
+    for (int i = 0; i < kControlRegionCount; ++i) {
+        const ControlRegion r     = static_cast<ControlRegion>(i);
+        const std::size_t   width = arenaControlElementBytes(r);
+        for (int s = 0; s < slots; ++s) {
+            const std::size_t at = o.controlOffset(s, r);
+            CHECK(at == o.control[i].offset + static_cast<std::size_t>(s) * width);
+            CHECK(at + width <= o.control[i].offset + o.control[i].bytes);
+            if (s > 0) CHECK(at == o.controlOffset(s - 1, r) + width);
+        }
+    }
+    // The 32-byte hot struct exists so 64 of them are 2 KiB of CONTIGUOUS
+    // memory.  Strided by the slot pitch that claim was simply false.
+    if (slots == 64)
+        CHECK(o.control[static_cast<int>(ControlRegion::SlotPhase)].bytes == 2048);
     for (int i = 0; i < kGeometryRegionCount; ++i)
         CHECK(o.geometry[i].offset + o.geometry[i].bytes <= o.slot_base);
     for (int i = 0; i < kLibraryRegionCount; ++i)
@@ -135,6 +170,10 @@ void checkOneLayout(int slots, bool print) {
         if (o.library[i].bytes > 0)
             immutable.push_back({o.library[i].offset, o.library[i].offset + o.library[i].bytes,
                                  "library"});
+    for (int i = 0; i < kControlRegionCount; ++i)
+        if (o.control[i].bytes > 0)
+            immutable.push_back({o.control[i].offset, o.control[i].offset + o.control[i].bytes,
+                                 "control"});
     for (std::size_t i = 0; i < immutable.size(); ++i)
         for (std::size_t j = i + 1; j < immutable.size(); ++j)
             CHECK(disjoint(immutable[i], immutable[j]));
@@ -160,23 +199,71 @@ void checkOneLayout(int slots, bool print) {
     }
 
     // ---- 4. alias lifetime, per slot per phase ---------------------------
+    //
+    // THE RULE, corrected.  This test used to assert that ALL users of a band
+    // share one offset -- which pinned a bug as expected behaviour: bicg_ax and
+    // bicg_s are both owned by Outer and are live in the same BiCGSTAB
+    // iteration, as are the nodal trl and matrix scratches.  Sharing bytes
+    // there means the solver reads its own overwritten intermediates.
+    //
+    // So: users that can be live together (their owner-phase sets intersect)
+    // must be DISJOINT; only users that can never be live together may alias.
     for (int s = 0; s < slots; ++s) {
-        // Users of one band share the same bytes -- that IS the aliasing.
         for (int u = 0; u < kScratchIdCount; ++u) {
             for (int v = u + 1; v < kScratchIdCount; ++v) {
                 const ScratchId a = static_cast<ScratchId>(u);
                 const ScratchId b = static_cast<ScratchId>(v);
-                if (arenaScratchBand(a) == arenaScratchBand(b))
-                    CHECK(o.scratchOffset(s, a) == o.scratchOffset(s, b));
-                else
-                    CHECK(o.scratchOffset(s, a) != o.scratchOffset(s, b));
+                const std::size_t abeg = o.scratchOffset(s, a);
+                const std::size_t aend = abeg + o.scratchBytes(a);
+                const std::size_t bbeg = o.scratchOffset(s, b);
+                const std::size_t bend = bbeg + o.scratchBytes(b);
+                const bool overlap = abeg < bend && bbeg < aend;
+
+                if (arenaScratchBand(a) != arenaScratchBand(b)) {
+                    CHECK(!overlap); // different bands never share bytes
+                } else if (arenaScratchCoResident(a, b)) {
+                    // Same band, same owner phase -> simultaneously live.
+                    if (overlap) {
+                        std::fprintf(stderr,
+                                     "FAIL: %s and %s share an owner phase AND overlap "
+                                     "[%zu,%zu) vs [%zu,%zu)\n",
+                                     arenaScratchName(a), arenaScratchName(b), abeg, aend, bbeg,
+                                     bend);
+                        ++g_failures;
+                    }
+                } else {
+                    // Same band, disjoint phases -> aliasing is the point.
+                    CHECK(overlap);
+                }
             }
         }
-        // Every user fits in its band.
+        // Every user fits inside its band.
         for (int u = 0; u < kScratchIdCount; ++u) {
-            const ScratchId id = static_cast<ScratchId>(u);
+            const ScratchId   id   = static_cast<ScratchId>(u);
+            const ScratchBand band = arenaScratchBand(id);
+            const std::size_t band_begin = o.slotBase(s) + o.scratch[static_cast<int>(band)].offset;
+            const std::size_t band_end   = band_begin + o.scratch[static_cast<int>(band)].bytes;
+            CHECK(o.scratchOffset(s, id) >= band_begin);
+            CHECK(o.scratchOffset(s, id) + o.scratchBytes(id) <= band_end);
             CHECK(arenaScratchUserElements(id, d) * sizeof(double) <= o.scratchBytes(id));
         }
+    }
+
+    // Band size == max over phases of that phase's summed users, computed here
+    // independently of arenaScratchBandBytes' greedy assignment.
+    for (int b = 0; b < kScratchBandCount; ++b) {
+        std::size_t widest = 0;
+        for (int p = 0; p < kDevicePhaseCount; ++p) {
+            std::size_t sum = 0;
+            for (int u = 0; u < kScratchIdCount; ++u) {
+                if (static_cast<int>(kScratchSpecs[u].band) != b) continue;
+                if (!arenaScratchPhaseAllowed(kScratchSpecs[u].id, static_cast<DevicePhase>(p)))
+                    continue;
+                sum += arenaScratchUserBytes(kScratchSpecs[u].id, d);
+            }
+            if (sum > widest) widest = sum;
+        }
+        CHECK(o.scratch[b].bytes == widest);
     }
 
     // Every user is owned by at least one phase, and only by phases that make
@@ -228,6 +315,8 @@ void checkOneLayout(int slots, bool print) {
     // Sec 6.18: FOUR microscopic BOS slots, not eleven.
     CHECK(o.slotRegionBytes(SlotRegion::BosMicx) * 11 / 4 ==
           o.slotRegionBytes(SlotRegion::Micx));
+    // The four control structs are NOT slot regions any more.
+    CHECK(o.control_block_bytes > 0);
     // The burn key is an int array, not a double one.
     CHECK(o.slotRegionBytes(SlotRegion::BurnKey) == 8451ull * sizeof(int));
 
@@ -249,11 +338,11 @@ void checkOneLayout(int slots, bool print) {
     CHECK(!ok.per_slot_over_ceiling);
 
     if (print) {
-        std::printf("slots=%d  geometry=%.3f MiB  library=%.3f MiB  per_slot=%.3f MiB "
-                    "(scratch %.3f MiB)  total=%.3f GiB\n",
+        std::printf("slots=%d  geometry=%.3f MiB  library=%.3f MiB  control=%zu B  "
+                    "per_slot=%.3f MiB (scratch %.3f MiB)  total=%.3f GiB\n",
                     slots, static_cast<double>(o.shared_geometry_bytes) / kMiB,
-                    static_cast<double>(o.shared_library_bytes) / kMiB, per_slot_mib,
-                    static_cast<double>(o.per_slot_scratch_bytes) / kMiB,
+                    static_cast<double>(o.shared_library_bytes) / kMiB, o.control_block_bytes,
+                    per_slot_mib, static_cast<double>(o.per_slot_scratch_bytes) / kMiB,
                     static_cast<double>(o.total_bytes) / (kMiB * 1024.0));
         if (slots == 64) {
             for (int i = 0; i < kSlotRegionCount; ++i) {
@@ -281,6 +370,17 @@ int main(int argc, char** argv) {
     const ArenaOffsets empty = arenaComputeLayout(arenaDims(8451, 26692, 313, 5000, 0));
     CHECK(empty.slot_count == 0);
     CHECK(empty.total_bytes == empty.slot_base);
+    CHECK(empty.valid);
+    CHECK(!empty.slots_exceed_cap);
+    for (int i = 0; i < kControlRegionCount; ++i) CHECK(empty.control[i].bytes == 0);
+
+    // More slots than the scheduler can classify is a REFUSAL, not a truncation.
+    const ArenaOffsets too_wide =
+        arenaComputeLayout(arenaDims(8451, 26692, 313, 5000, kMaxDeviceSlots + 1));
+    CHECK(!too_wide.valid);
+    CHECK(too_wide.slots_exceed_cap);
+    CHECK(too_wide.slot_count == 0);
+    CHECK(!arenaAdmit(too_wide, ~0ull / 2, ~0ull / 2).granted);
 
     // The scratch table has no orphan: every ScratchId belongs to a real band
     // and every band has at least one user.

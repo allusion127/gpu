@@ -50,6 +50,7 @@ SRC = ROOT / "src"
 SLOT_CONTROL = (SRC / "GpuSlotControl.h").read_text(encoding="utf-8-sig")
 PHYSICS_TYPES = (SRC / "GpuPhysicsTypes.h").read_text(encoding="utf-8-sig")
 STUB = (SRC / "GpuPhysicsBackendStub.cpp").read_text(encoding="utf-8-sig")
+CUDA_ARM = (SRC / "GpuPhysicsBackendCuda.cu").read_text(encoding="utf-8-sig")
 SCHEDULER = (SRC / "Scheduler.h").read_text(encoding="utf-8-sig")
 CMAKE = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8-sig")
 
@@ -63,6 +64,7 @@ def strip_comments(text: str) -> str:
 SLOT_CODE = strip_comments(SLOT_CONTROL)
 TYPES_CODE = strip_comments(PHYSICS_TYPES)
 STUB_CODE = strip_comments(STUB)
+CUDA_ARM_CODE = strip_comments(CUDA_ARM)
 
 
 def struct_body(name: str, text: str) -> str:
@@ -173,8 +175,23 @@ for helper in ("slotActive", "slotInFlight", "slotAlreadyQueued"):
 
 state_fields = members(struct_body("DeviceSlotState", SLOT_CODE))
 generations = [f for f in state_fields if f.endswith("_generation")]
-need(len(generations) == 10,
-     f"DeviceSlotState carries {len(generations)} generation counters, Sec 3.2(B) lists 10")
+# The four that mirror a counter that EXISTS on the host today.  A device
+# generation with no host counter behind it can never go stale, so gating an
+# upload on one is a silent "never re-upload"; the header says which is which and
+# this pins the four real ones.
+for real, host_file, host_field in (
+        ("micx_generation", "XSSet.h", "_micx_generation"),
+        ("ref_generation", "XSSet.h", "_ref_generation"),
+        ("hoststate_generation", "XSSet.h", "_hoststate_generation"),
+        ("nodal_constant_generation", "Nodal.h", "_const_generation")):
+    need(real in state_fields, f"DeviceSlotState lacks the host-backed counter {real}")
+    host_text = (SRC / host_file).read_text(encoding="utf-8-sig")
+    need(host_field in host_text,
+         f"{host_file} no longer declares {host_field}; the device mirror {real} is now dead")
+need(len(generations) == 12,
+     f"DeviceSlotState carries {len(generations)} generation counters, Sec 3.2(B) lists 12")
+need("SPECULATIVE" in SLOT_CONTROL,
+     "the generation block does not say which counters have no host backing yet")
 for field in ("substep", "substep_index", "clean_iters", "stall_sample_taken",
               "xe_aa_ncol", "xe_aa_have_prev", "xe_relax", "eigv_before_segment"):
     need(field in state_fields, f"DeviceSlotState lacks {field}")
@@ -365,6 +382,19 @@ for pointer in ("DeviceSlotPhase*", "DeviceSlotState*", "DeviceSearchState*", "D
 for array in ("ref_micx", "ref_lmpx", "xe_aa_history", "bos_micx"):
     need(array in slot_view, f"DeviceSlotView lacks the Rev.7.1 array {array} (Sec 3.5)")
 
+# Every pointer in the library view must have an arena region behind it.  A view
+# field with no backing reads as available and dereferences to whatever the
+# arena last wrote there.
+library_view = struct_body("DeviceXsLibraryView", TYPES_CODE)
+need("knot_offsets" not in library_view,
+     "DeviceXsLibraryView still declares knot_offsets, which no host array backs "
+     "(the offsets are an int field inside the branch descriptors)")
+LAYOUT = (SRC / "GpuPhysicsArenaLayout.h").read_text(encoding="utf-8-sig")
+for backed in ("lib_flux", "lib_chix"):
+    need(backed in library_view, f"DeviceXsLibraryView lost {backed}")
+need("LibraryRegion::LibFlux" in LAYOUT and "LibraryRegion::LibChix" in LAYOUT,
+     "lib_flux / lib_chix have no arena region behind them")
+
 # The BOS microscopic snapshot is FOUR slots, not eleven (Sec 6.18).
 need("kBosMicroXtCount = 4" in TYPES_CODE,
      "GpuPhysicsTypes.h does not pin the BOS microscopic snapshot at 4 slots")
@@ -412,13 +442,35 @@ need("cooperative" not in TYPES_CODE.lower(),
 backend_body = struct_body("GpuPhysicsBackend", TYPES_CODE)
 declared = set(re.findall(r"\b(\w+)\s*\([^)]*\)\s*(?:const\s*)?;", backend_body))
 declared.discard("GpuPhysicsBackend")
-for method in sorted(declared):
-    need(re.search(r"GpuPhysicsBackend::" + method + r"\s*\(", STUB_CODE) is not None,
-         f"GpuPhysicsBackendStub.cpp does not define GpuPhysicsBackend::{method}")
-for ctor in ("GpuPhysicsBackend::GpuPhysicsBackend(", "GpuPhysicsBackend::~GpuPhysicsBackend("):
-    need(ctor in STUB_CODE, f"GpuPhysicsBackendStub.cpp does not define {ctor})")
-need("rasberyGpuPhysicsEnabled" in STUB_CODE,
-     "GpuPhysicsBackendStub.cpp does not define rasberyGpuPhysicsEnabled")
+# BOTH arms, not just the stub.  A CUDA build REMOVES the stub from the source
+# list, so a symbol defined only there is an undefined reference at the end of a
+# twenty-minute build -- which is exactly what happened.
+ARMS = (("GpuPhysicsBackendStub.cpp", STUB_CODE), ("GpuPhysicsBackendCuda.cu", CUDA_ARM_CODE))
+for arm_name, arm in ARMS:
+    for method in sorted(declared):
+        need(re.search(r"GpuPhysicsBackend::" + method + r"\s*\(", arm) is not None,
+             f"{arm_name} does not define GpuPhysicsBackend::{method}")
+    for ctor in ("GpuPhysicsBackend::GpuPhysicsBackend(",
+                 "GpuPhysicsBackend::~GpuPhysicsBackend("):
+        need(ctor in arm, f"{arm_name} does not define {ctor})")
+    need("rasberyGpuPhysicsEnabled" in arm,
+         f"{arm_name} does not define rasberyGpuPhysicsEnabled")
+    need("struct GpuPhysicsBackend::Impl" in arm, f"{arm_name} has no Impl definition")
+
+# The CUDA arm reports what it MEASURED, not what it hopes.
+need("cudaGetDeviceCount" in CUDA_ARM_CODE,
+     "the CUDA backend does not probe for a device")
+need("cudaGetDeviceProperties" in CUDA_ARM_CODE,
+     "the CUDA backend does not read the device properties it reports")
+need("cudaDevAttrMemoryPoolsSupported" in CUDA_ARM_CODE,
+     "the CUDA backend infers memory-pool support instead of asking the driver; "
+     "the arena's single allocation depends on it")
+need("GpuSupportTier::G3" in CUDA_ARM_CODE and "GpuSupportTier::G2" in CUDA_ARM_CODE,
+     "the CUDA backend does not report the two Sec 1.5 CUDA tiers")
+need("CUDART_VERSION" in CUDA_ARM_CODE,
+     "conditional-graph support is claimed without a runtime-version check")
+need("cooperative" not in CUDA_ARM_CODE.lower(),
+     "the CUDA backend exposes a cooperative-launch capability; W0 closed that track")
 need(re.search(r"bool GpuPhysicsBackend::available\(\)\s*const\s*\{\s*return false;\s*\}",
                STUB_CODE) is not None,
      "the stub's available() does not return false")
@@ -432,6 +484,8 @@ remove_block = CMAKE[CMAKE.find("list(REMOVE_ITEM RASBERY_SOURCES"):]
 remove_block = remove_block[: remove_block.find(")")]
 need("GpuPhysicsBackendStub.cpp" in remove_block,
      "GpuPhysicsBackendStub.cpp is not removed from the sources in a CUDA build")
+need("GpuPhysicsBackendCuda.cu" in CMAKE,
+     "the CUDA build removes the stub but never compiles GpuPhysicsBackendCuda.cu")
 
 # ---------------------------------------------------------------------------
 # 8. Compiled behaviour.

@@ -147,6 +147,38 @@ need(re.search(r"kArenaDriverReserveFraction\s*=\s*0\.10", LAYOUT_CODE) is not N
 # The Rev.7.1 arrays Rev.7's table omitted.
 for region in ("RefMicx", "RefLmpx", "XeAaHistory", "BosMicx"):
     need(region in LAYOUT_CODE, f"the slot region {region} is missing (Sec 3.5/3.6)")
+
+# THE CONTROL BLOCK IS OUT OF THE SLOT STRIDE.  Both kernels index the control
+# structs densely (`phases[tid]`); while they were slot-strided that was a
+# different address, and clearSlotAsync's memset ran straight over them.
+need("enum class ControlRegion" in LAYOUT_CODE,
+     "the four control structs are not a separate contiguous block")
+for control in ("SlotPhase", "SlotState", "SearchState", "ScheduleParams"):
+    need(f"ControlRegion::{control}" in LAYOUT_CODE, f"ControlRegion lacks {control}")
+slot_enum = LAYOUT_CODE[LAYOUT_CODE.find("enum class SlotRegion"):]
+slot_enum = slot_enum[: slot_enum.find("};")]
+for control in ("SlotPhase", "SlotState", "SearchState", "ScheduleParams"):
+    need(control not in slot_enum,
+         f"{control} is still a per-slot region; it must live in the contiguous control block")
+need("control_base" in LAYOUT_CODE and "control_block_bytes" in LAYOUT_CODE,
+     "ArenaOffsets does not expose the control block")
+need("controlOffset" in LAYOUT_CODE,
+     "there is no dense control accessor; slotView would have to compute it itself")
+need("insideSlotStride" in LAYOUT_CODE,
+     "the layout offers no way to assert the control block is outside every slot stride")
+
+# Scratch users that can be live together must not share bytes.
+need("arenaScratchCoResident" in LAYOUT_CODE,
+     "nothing expresses whether two scratch users can be live at the same moment")
+need("arenaScratchSubOffset" in LAYOUT_CODE,
+     "scratch users have no sub-offset within their band, so same-phase users collide")
+need("arenaScratchBandBytes" in LAYOUT_CODE, "band sizing is not a named rule")
+
+# Slot cap, enforced rather than truncated.
+need("slots_exceed_cap" in LAYOUT_CODE,
+     "arenaComputeLayout does not refuse more slots than the scheduler can classify")
+need("kMaxDeviceSlots" in LAYOUT_CODE,
+     "the layout does not share the slot cap with the scheduler")
 need("kBosMicroXtCount * niso * ng * nxyz" in LAYOUT_CODE,
      "the BOS microscopic snapshot is not sized at the four Sec 6.18 slots")
 
@@ -192,6 +224,14 @@ need(reserve_body.find("cudaMallocFromPoolAsync") < reserve_body.find("cudaStrea
 # 4. Sec 4.4 admission: present, loud, and not a silent narrowing.
 # ---------------------------------------------------------------------------
 need("cudaMemGetInfo" in reserve_body, "reserve() does not ask the driver what is free")
+need("kArenaAlignment" in reserve_body,
+     "reserve() does not check the pool block's alignment; every region offset "
+     "assumes a 256-aligned base")
+need("abort_reserve" in reserve_body,
+     "reserve()'s failure paths do not release the stream/pool/block they acquired")
+need("reserve() called twice" in ARENA_CU, "reserve() does not reject a second call")
+need("slots_exceed_cap" in reserve_body,
+     "reserve() does not surface the slot-cap refusal")
 need("arenaAdmit" in reserve_body, "reserve() does not run Sec 4.4 admission")
 need("[RASBERY][GPU_ARENA][FAIL]" in ARENA_CU,
      "an admission refusal is not announced; Sec 4.4 requires it to fail loud")
@@ -210,7 +250,8 @@ need("driver_reserve_bytes" in admit_body and "fragmentation_reserve_bytes" in a
 # ---------------------------------------------------------------------------
 # 5. Receipt schema (Sec 9.3).
 # ---------------------------------------------------------------------------
-RECEIPT_KEYS = ("shared_geometry_bytes", "shared_library_bytes", "per_slot_bytes", "slot_count",
+RECEIPT_KEYS = ("shared_geometry_bytes", "shared_library_bytes", "control_block_bytes",
+                "per_slot_bytes", "slot_count",
                 "scratch_bytes", "total_bytes", "alignment", "driver_reserve_bytes",
                 "fragmentation_reserve_bytes", "per_slot_ceiling_bytes", "admitted")
 for key in RECEIPT_KEYS:
@@ -220,6 +261,13 @@ for key in RECEIPT_KEYS:
          f"the stub arena receipt lacks {key}")
 need("[RASBERY][GPU_ARENA] " in ARENA_CU and "[RASBERY][GPU_ARENA] " in STUB,
      "the [RASBERY][GPU_ARENA] receipt tag is missing from one of the arms")
+
+clear_body = body_after("bool GpuPhysicsArena::clearSlotAsync(", CU_CODE)
+need("slotBase" in clear_body,
+     "clearSlotAsync does not clear from the slot base")
+for control in ("ControlRegion", "SlotPhase", "ScheduleParams"):
+    need(control not in clear_body,
+         f"clearSlotAsync references {control}; the bulk clear must not touch the control block")
 
 # ---------------------------------------------------------------------------
 # 6. Stub parity.

@@ -287,6 +287,23 @@ void testOwnershipFaults() {
         CHECK(q.fault_slot == 2u);
         CHECK(q.queue[static_cast<int>(DevicePhase::Outer)].count == 3); // the other three
         for (int i = 0; i < 3; ++i) CHECK(q.queue[static_cast<int>(DevicePhase::Outer)].slots[i] != 2);
+
+        // THE FAULT IS CONSUMED.  Without this the bits went into a struct
+        // nobody read and slot 2 kept running with two bodies driving it.
+        CHECK(gpuSchedulerFaultIsFatal(q.fault_flags));
+        CHECK(phases[2].phase == static_cast<std::uint8_t>(DevicePhase::Failed));
+        CHECK(slotFatal(phases[2]));
+        CHECK(!slotInFlight(phases[2]));
+        CHECK(phases[2].error_code == q.fault_flags);
+        // ...and only that slot: the other three are untouched and still queued.
+        for (int s : {0, 1, 3}) {
+            CHECK(phases[s].phase == static_cast<std::uint8_t>(DevicePhase::Outer));
+            CHECK(!slotFatal(phases[s]));
+        }
+        // A failed slot is no longer schedulable; it is the refill kernel's now.
+        DevicePhaseQueues again;
+        gpuClassifySerial(phases.data(), 4, again);
+        CHECK(again.free_count == 1);
     }
 
     // (b) in_flight: a slot being driven right now.  Reported in preference to
@@ -303,6 +320,11 @@ void testOwnershipFaults() {
         CHECK((q.fault_flags & kSchedFaultInFlightRequeue) != 0u);
         CHECK((q.fault_flags & kSchedFaultDuplicateQueue) == 0u);
         CHECK(q.fault_slot == 1u);
+        // Consumed: failed, and the in-flight bit cleared so nothing waits on a
+        // body that is never going to finish.
+        CHECK(phases[1].phase == static_cast<std::uint8_t>(DevicePhase::Failed));
+        CHECK(slotFatal(phases[1]));
+        CHECK(!slotInFlight(phases[1]));
     }
 
     // (c) The epoch rule invalidates a stale entry with no queue walk: bump
@@ -317,6 +339,12 @@ void testOwnershipFaults() {
         gpuClassifySerial(phases.data(), 1, q);
         CHECK((q.fault_flags & kSchedFaultDuplicateQueue) != 0u);
 
+        // The consumer failed it, so rebuild a clean slot to show the epoch
+        // rule on its own: a bumped state_epoch makes a stale entry insertable
+        // again with no queue walk.
+        phases[0]              = makeReady(DevicePhase::Outer, 9u);
+        phases[0].queued_phase = phases[0].phase;
+        phases[0].queued_epoch = phases[0].state_epoch;
         ++phases[0].state_epoch; // a phase transition happened
         CHECK(!slotAlreadyQueued(phases[0]));
         gpuClassifySerial(phases.data(), 1, q);
@@ -341,6 +369,27 @@ void testOwnershipFaults() {
         gpuClassifySerial(phases.data(), 2, q);
         CHECK((q.fault_flags & kSchedFaultBadPhase) != 0u);
         CHECK(q.fault_slot == 1u);
+        CHECK(phases[1].phase == static_cast<std::uint8_t>(DevicePhase::Failed));
+    }
+
+    // (f) every fault this scheduler raises is fatal -- there is no
+    //     recoverable class, so nothing may quietly continue.
+    {
+        CHECK(!gpuSchedulerFaultIsFatal(kSchedFaultNone));
+        for (const std::uint32_t bit : {kSchedFaultDuplicateQueue, kSchedFaultInFlightRequeue,
+                                        kSchedFaultSlotOverflow, kSchedFaultBadPhase}) {
+            CHECK(gpuSchedulerFaultIsFatal(bit));
+            CHECK(std::strcmp(gpuSchedulerFaultName(bit), "none") != 0);
+        }
+        // Marking is idempotent and preserves the epoch-invalidation property.
+        DeviceSlotPhase p = makeReady(DevicePhase::Outer, 11u);
+        p.flags |= kSlotFlagInFlight;
+        const std::uint32_t before = p.state_epoch;
+        gpuMarkSlotFailed(p, kSchedFaultDuplicateQueue);
+        CHECK(p.state_epoch == before + 1u);
+        CHECK(p.error_code == kSchedFaultDuplicateQueue);
+        CHECK(slotFatal(p) && !slotInFlight(p));
+        CHECK(!gpuPhaseIsSchedulable(static_cast<DevicePhase>(p.phase)));
     }
 
     // (e) Done/Failed/Empty are not schedulable; they are the refill kernel's
@@ -445,42 +494,50 @@ struct ExpectedEdge {
 /// Driver.h's statepoint loop actually does.  If the two disagree, one of them
 /// is wrong and the test says which edge.
 const ExpectedEdge kExpectedEdges[] = {
+    // Grouped by DESTINATION, deliberately not in the header table's order:
+    // an expected list with the same shape as the thing it checks will pass a
+    // copy-paste error without noticing it.
+    // -> Empty        (Sec 8.2 recycle)
+    {DevicePhase::Done, DevicePhase::Empty, PhaseEdgeGuard::Always},
+    {DevicePhase::Failed, DevicePhase::Empty, PhaseEdgeGuard::Always},
+    // -> Import / Material  (admission and XS rebuild)
     {DevicePhase::Empty, DevicePhase::Import, PhaseEdgeGuard::Always},
     {DevicePhase::Import, DevicePhase::Material, PhaseEdgeGuard::Always},
-    {DevicePhase::Material, DevicePhase::Outer, PhaseEdgeGuard::Always},
-
-    {DevicePhase::Outer, DevicePhase::Outer, PhaseEdgeGuard::FluxNotConverged},
-    {DevicePhase::Outer, DevicePhase::Xenon, PhaseEdgeGuard::XePending},
-    {DevicePhase::Xenon, DevicePhase::Outer, PhaseEdgeGuard::Always},
-    {DevicePhase::Outer, DevicePhase::ThermalHydraulics, PhaseEdgeGuard::ThPending},
     {DevicePhase::ThermalHydraulics, DevicePhase::Material, PhaseEdgeGuard::Always},
-    {DevicePhase::Outer, DevicePhase::Search, PhaseEdgeGuard::SearchPending},
     {DevicePhase::Search, DevicePhase::Material, PhaseEdgeGuard::Always},
-
+    {DevicePhase::RodOp, DevicePhase::Material, PhaseEdgeGuard::Always},
+    // -> Outer        (everything that re-enters the flux segment)
+    {DevicePhase::Material, DevicePhase::Outer, PhaseEdgeGuard::Always},
+    {DevicePhase::Outer, DevicePhase::Outer, PhaseEdgeGuard::FluxNotConverged},
+    {DevicePhase::Xenon, DevicePhase::Outer, PhaseEdgeGuard::Always},
+    {DevicePhase::DepletionPredictor, DevicePhase::Outer, PhaseEdgeGuard::Always},
+    {DevicePhase::DepletionCorrector, DevicePhase::Outer, PhaseEdgeGuard::Always},
+    // -> the three feedbacks, in Sec 5.4's PERTURBATION order
+    {DevicePhase::Outer, DevicePhase::Xenon, PhaseEdgeGuard::XePending},
+    {DevicePhase::Outer, DevicePhase::ThermalHydraulics, PhaseEdgeGuard::ThPending},
+    {DevicePhase::Outer, DevicePhase::Search, PhaseEdgeGuard::SearchPending},
+    // -> statepoint level
     {DevicePhase::Outer, DevicePhase::NormalizeFluxSign, PhaseEdgeGuard::FluxConverged},
     {DevicePhase::NormalizeFluxSign, DevicePhase::DepletionPredictor,
-     PhaseEdgeGuard::ScheduleIsDepletion},
-    {DevicePhase::DepletionPredictor, DevicePhase::Outer, PhaseEdgeGuard::Always},
+     PhaseEdgeGuard::DepletionPredictorPending},
     {DevicePhase::NormalizeFluxSign, DevicePhase::DepletionCorrector,
-     PhaseEdgeGuard::ScheduleIsDepletion},
-    {DevicePhase::DepletionCorrector, DevicePhase::Outer, PhaseEdgeGuard::Always},
+     PhaseEdgeGuard::DepletionCorrectorPending},
     {DevicePhase::NormalizeFluxSign, DevicePhase::Derivative, PhaseEdgeGuard::ScheduleIsDerivative},
     {DevicePhase::NormalizeFluxSign, DevicePhase::RodOp, PhaseEdgeGuard::ScheduleIsRod},
-    {DevicePhase::RodOp, DevicePhase::Material, PhaseEdgeGuard::Always},
     {DevicePhase::Derivative, DevicePhase::RodOp, PhaseEdgeGuard::DerivativeCollapsed},
+    // -> PPR / output.  NormalizeFluxSign -> Ppr carries the COMPLEMENT guard of
+    // its four siblings, not Always: an unconditional edge beside conditional
+    // ones is an ambiguity, not a state machine.
+    {DevicePhase::NormalizeFluxSign, DevicePhase::Ppr, PhaseEdgeGuard::StatepointSolveComplete},
     {DevicePhase::Derivative, DevicePhase::Ppr, PhaseEdgeGuard::DerivativeOk},
-    {DevicePhase::NormalizeFluxSign, DevicePhase::Ppr, PhaseEdgeGuard::Always},
     {DevicePhase::Ppr, DevicePhase::Ppr, PhaseEdgeGuard::IterationRemaining},
     {DevicePhase::Ppr, DevicePhase::ResultAggregate, PhaseEdgeGuard::IterationComplete},
     {DevicePhase::ResultAggregate, DevicePhase::OutputPack, PhaseEdgeGuard::Always},
     {DevicePhase::OutputPack, DevicePhase::Done, PhaseEdgeGuard::Always},
-
+    // -> Failed
     {DevicePhase::Outer, DevicePhase::Failed, PhaseEdgeGuard::Fatal},
     {DevicePhase::DepletionPredictor, DevicePhase::Failed, PhaseEdgeGuard::Fatal},
     {DevicePhase::DepletionCorrector, DevicePhase::Failed, PhaseEdgeGuard::Fatal},
-
-    {DevicePhase::Done, DevicePhase::Empty, PhaseEdgeGuard::Always},
-    {DevicePhase::Failed, DevicePhase::Empty, PhaseEdgeGuard::Always},
 };
 constexpr int kExpectedEdgeCount =
     static_cast<int>(sizeof(kExpectedEdges) / sizeof(kExpectedEdges[0]));
@@ -555,6 +612,40 @@ void testTransitionTable() {
     for (int j = 0; j < kPhaseTransitionCount; ++j)
         if (kPhaseTransitions[j].from == DevicePhase::Outer) ++out_of_outer;
     CHECK(out_of_outer == 6); // requeue, Xe, TH, Search, NormalizeFluxSign, Failed
+
+    // DETERMINISM, as an invariant rather than a spot check.
+    //   (a) no two edges out of one phase share a guard -- otherwise which one
+    //       fires depends on evaluation order;
+    //   (b) `Always` may only appear when it is the ONLY non-fatal edge out of
+    //       that phase.  Fatal is an escape, not an alternative, so it does not
+    //       count against the rule.
+    for (int p = 0; p < kDevicePhaseCount; ++p) {
+        const DevicePhase from = static_cast<DevicePhase>(p);
+        int non_fatal = 0, has_always = 0;
+        for (int j = 0; j < kPhaseTransitionCount; ++j) {
+            if (kPhaseTransitions[j].from != from) continue;
+            if (kPhaseTransitions[j].guard == PhaseEdgeGuard::Fatal) continue;
+            ++non_fatal;
+            if (kPhaseTransitions[j].guard == PhaseEdgeGuard::Always) ++has_always;
+            for (int k = j + 1; k < kPhaseTransitionCount; ++k) {
+                if (kPhaseTransitions[k].from != from) continue;
+                if (kPhaseTransitions[k].guard == PhaseEdgeGuard::Fatal) continue;
+                if (kPhaseTransitions[k].guard == kPhaseTransitions[j].guard) {
+                    std::fprintf(stderr,
+                                 "FAIL: phase %d has two non-fatal edges with guard %u\n", p,
+                                 static_cast<unsigned>(kPhaseTransitions[j].guard));
+                    ++g_failures;
+                }
+            }
+        }
+        if (has_always > 0 && non_fatal != 1) {
+            std::fprintf(stderr,
+                         "FAIL: phase %d has an Always edge beside %d other non-fatal edges; "
+                         "which one fires is then undefined\n",
+                         p, non_fatal - 1);
+            ++g_failures;
+        }
+    }
 }
 
 void testOuterQuantum() {

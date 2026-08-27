@@ -65,7 +65,9 @@ std::string GpuPhysicsBackend::receiptJson() const {
     std::string out;
     out += "{\"backend\":\"";
     out += r.backend_name;
-    out += "\",\"tier\":";
+    out += "\",\"tier\":\"";
+    out += gpuSupportTierName(r.tier);
+    out += "\",\"tier_ordinal\":";
     out += std::to_string(static_cast<unsigned>(r.tier));
     out += ",\"available\":false,\"device\":\"";
     out += r.device_name;
@@ -181,6 +183,8 @@ std::string GpuPhysicsArena::receiptJson() const {
     out += std::to_string(o.shared_geometry_bytes);
     out += ",\"shared_library_bytes\":";
     out += std::to_string(o.shared_library_bytes);
+    out += ",\"control_block_bytes\":";
+    out += std::to_string(o.control_block_bytes);
     out += ",\"per_slot_bytes\":";
     out += std::to_string(o.per_slot_bytes);
     out += ",\"slot_count\":";
@@ -226,5 +230,10 @@ bool gpuLaunchClassify(DeviceSlotPhase*, int, DevicePhaseQueues*, GpuSchedulerSt
 }
 
 bool gpuLaunchRefill(const GpuRefillArgs&, GpuSchedulerStream) { return false; }
+
+bool gpuLaunchRefillThenClassify(const GpuRefillArgs&, DevicePhaseQueues*,
+                                 GpuSchedulerStream) {
+    return false;
+}
 
 } // namespace rasbery::gpu

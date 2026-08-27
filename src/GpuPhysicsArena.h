@@ -118,8 +118,15 @@ public:
     bool exportSnapshotAsync(int slot, SlotRegion region, void* host, std::size_t bytes,
                              GpuStreamHandle stream);
 
-    /// Zero one slot's whole stride.  Sec 8.2 refill: the four control structs
-    /// are reset by the audit path, the bulk arrays by this.
+    /// Zero one slot's whole stride: the BULK arrays and the scratch bands.
+    ///
+    /// It cannot reach the four control structs, and that is structural rather
+    /// than careful: they live in the contiguous control block below slot_base,
+    /// outside every slot's stride.  While they were inside it, this memset ran
+    /// straight over the defaults a refill had just written -- the schedule
+    /// parameters, the reset epoch, the whole tenant identity -- so a refilled
+    /// slot came back zeroed instead of initialised.  The layout gate asserts
+    /// the control regions are disjoint from every slot stride.
     bool clearSlotAsync(int slot, GpuStreamHandle stream);
 
     // --- receipts ----------------------------------------------------------

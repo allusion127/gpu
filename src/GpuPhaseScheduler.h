@@ -46,9 +46,10 @@
 
 namespace rasbery::gpu {
 
-/// Sec 5.9: physical slots are a fixed, dense range.  64 is the campaign width
-/// and also the widest conditional-graph bucket (Sec 5.5).
-inline constexpr int kMaxSchedulerSlots = 64;
+/// Sec 5.9: physical slots are a fixed, dense range.  The cap is defined once,
+/// in GpuSlotControl.h, so the arena's control block and the scheduler's queues
+/// cannot disagree about how wide the fleet may be.
+inline constexpr int kMaxSchedulerSlots = kMaxDeviceSlots;
 
 /// Padding value in every queue.  A lane that reads one has no work; it must
 /// return, never dereference.
@@ -150,6 +151,30 @@ inline constexpr std::uint32_t kSchedFaultBadPhase        = 0x8u;
 /// device kernel take the SMALLEST offending slot (atomicMin on the device),
 /// so the receipt names the first failure in slot order, not in warp order.
 inline constexpr std::uint32_t kSchedNoFaultSlot = 0xFFFFFFFFu;
+
+/// Every fault this scheduler can raise is fatal -- there is no recoverable
+/// class.  A duplicate insert or an in-flight requeue means two bodies would
+/// drive one slot; an overflow means work was dropped; a bad phase word means
+/// the slot's state is not interpretable.  None of those becomes correct on a
+/// retry, so the consumer below fails the slot rather than continuing.
+RASBERY_GPU_HD inline bool gpuSchedulerFaultIsFatal(std::uint32_t flags) {
+    return (flags & (kSchedFaultDuplicateQueue | kSchedFaultInFlightRequeue |
+                     kSchedFaultSlotOverflow | kSchedFaultBadPhase)) != 0u;
+}
+
+/// THE CONSUMER.  Without this the fault bits were written to a struct nobody
+/// read: classify would flag a duplicate insertion and the offending slot would
+/// keep running, which is exactly the corruption the check exists to stop.
+///
+/// Failing the slot -- not the fleet -- is the Sec 9.2 policy: one case dies,
+/// the other 63 keep going, and the receipt names what happened.  Bumping
+/// state_epoch is what invalidates whatever stale queue entry caused the fault.
+RASBERY_GPU_HD inline void gpuMarkSlotFailed(DeviceSlotPhase& p, std::uint32_t flags) {
+    p.error_code = flags;
+    p.flags      = static_cast<std::uint8_t>((p.flags | kSlotFlagFatal) & ~kSlotFlagInFlight);
+    p.phase      = static_cast<std::uint8_t>(DevicePhase::Failed);
+    ++p.state_epoch;
+}
 
 /// Everything one classify epoch produces.  Written once per epoch; read by the
 /// dispatch path and by the receipt.
@@ -403,9 +428,22 @@ enum class PhaseEdgeGuard : std::uint32_t {
     XePending,
     ThPending,
     SearchPending,
-    ScheduleIsDepletion,
+    /// Depletion has TWO edges out of NormalizeFluxSign and they are not
+    /// interchangeable: Driver.h normalises after the pre-solve and then runs
+    /// PredictorStep, normalises after the predictor solve and then runs
+    /// CorrectorStep.  One shared "schedule is depletion" guard made which edge
+    /// fires depend on evaluation order.  The distinguishing state already
+    /// exists -- DeviceSlotState::solve_call_kind (Sec 3.2(B)).
+    DepletionPredictorPending, ///< solve_call_kind == pre-solve
+    DepletionCorrectorPending, ///< solve_call_kind == predictor
     ScheduleIsDerivative,
     ScheduleIsRod,
+    /// The COMPLEMENT of the three above: no statepoint pre-work is pending, so
+    /// the converged solve is the final one and PPR follows.  Spelled as its own
+    /// guard rather than `Always` because an `Always` edge sitting beside four
+    /// conditional siblings is not a state machine -- it is an ambiguity, and
+    /// which edge fires would depend on evaluation order.
+    StatepointSolveComplete,
     DerivativeCollapsed, ///< k_eff halved/doubled or non-finite: one retry only
     DerivativeOk,
     IterationRemaining,  ///< PPR corner-balance budget not exhausted
@@ -449,10 +487,12 @@ inline constexpr PhaseEdge kPhaseTransitions[] = {
     {DevicePhase::Outer, DevicePhase::NormalizeFluxSign, PhaseEdgeGuard::FluxConverged,
      "cross_sections.NormalizeFluxSign();"},
     {DevicePhase::NormalizeFluxSign, DevicePhase::DepletionPredictor,
-     PhaseEdgeGuard::ScheduleIsDepletion, "cross_sections.PredictorStep(sub_dt, thermal_power,"},
+     PhaseEdgeGuard::DepletionPredictorPending,
+     "cross_sections.PredictorStep(sub_dt, thermal_power,"},
     {DevicePhase::DepletionPredictor, DevicePhase::Outer, PhaseEdgeGuard::Always, ""},
     {DevicePhase::NormalizeFluxSign, DevicePhase::DepletionCorrector,
-     PhaseEdgeGuard::ScheduleIsDepletion, "cross_sections.CorrectorStep(sub_dt, thermal_power,"},
+     PhaseEdgeGuard::DepletionCorrectorPending,
+     "cross_sections.CorrectorStep(sub_dt, thermal_power,"},
     {DevicePhase::DepletionCorrector, DevicePhase::Outer, PhaseEdgeGuard::Always, ""},
     {DevicePhase::NormalizeFluxSign, DevicePhase::Derivative,
      PhaseEdgeGuard::ScheduleIsDerivative, "cross_sections.UpdateDerivative(schedule.delta_bppm,"},
@@ -464,7 +504,7 @@ inline constexpr PhaseEdge kPhaseTransitions[] = {
     {DevicePhase::Derivative, DevicePhase::RodOp, PhaseEdgeGuard::DerivativeCollapsed,
      "schedule.type == ScheduleType::DERIVATIVE &&"},
     {DevicePhase::Derivative, DevicePhase::Ppr, PhaseEdgeGuard::DerivativeOk, ""},
-    {DevicePhase::NormalizeFluxSign, DevicePhase::Ppr, PhaseEdgeGuard::Always,
+    {DevicePhase::NormalizeFluxSign, DevicePhase::Ppr, PhaseEdgeGuard::StatepointSolveComplete,
      "pin_power_reconstruction.reset(1.0 / eigv, geometry.Jnet(), geometry.Phif(), geometry.Phis());"},
     {DevicePhase::Ppr, DevicePhase::Ppr, PhaseEdgeGuard::IterationRemaining,
      "pin_power_reconstruction.drive(ppr_iters);"},
@@ -516,21 +556,9 @@ struct GpuRefillCounters {
 // ordering, the padding, the bucket choice and both fatal faults without a GPU.
 // ---------------------------------------------------------------------------
 
-/// Rank of `slot` within its phase queue: how many LOWER-numbered slots share
-/// its phase.  The device kernel computes this with a warp ballot plus a
-/// deterministic cross-warp prefix; both must give this answer, which is what
-/// makes the queue ascending and reproducible.
-RASBERY_GPU_HD inline int gpuQueueRank(const DeviceSlotPhase* phases, int slot) {
-    const std::uint8_t want = phases[slot].phase;
-    int                rank = 0;
-    for (int i = 0; i < slot; ++i)
-        if (phases[i].phase == want && slotActive(phases[i])) ++rank;
-    return rank;
-}
-
 /// Reset a queue set to empty.  Padding is written across the whole array so a
 /// stale entry from a previous epoch can never be read as a slot id.
-inline void gpuQueuesClear(DevicePhaseQueues& q) {
+RASBERY_GPU_HD inline void gpuQueuesClear(DevicePhaseQueues& q) {
     for (int p = 0; p < kDevicePhaseCount; ++p) {
         for (int i = 0; i < kMaxSchedulerSlots; ++i) q.queue[p].slots[i] = kQueueEmptySlot;
         q.queue[p].count  = 0;
@@ -558,7 +586,8 @@ inline void gpuQueuesClear(DevicePhaseQueues& q) {
 ///   * inserting captures the epoch (queued_epoch = state_epoch,
 ///     queued_phase = phase), which is what makes the entry go stale by itself
 ///     at the next transition without walking any queue.
-inline void gpuClassifySerial(DeviceSlotPhase* phases, int slot_count, DevicePhaseQueues& out) {
+RASBERY_GPU_HD inline void gpuClassifySerial(DeviceSlotPhase* phases, int slot_count,
+                                             DevicePhaseQueues& out) {
     gpuQueuesClear(out);
     if (slot_count > kMaxSchedulerSlots) {
         out.fault_flags |= kSchedFaultSlotOverflow;
@@ -614,6 +643,9 @@ inline void gpuClassifySerial(DeviceSlotPhase* phases, int slot_count, DevicePha
         out.selected_count  = out.queue[out.selected_phase].count;
         out.selected_bucket = out.queue[out.selected_phase].bucket;
     }
+
+    if (gpuSchedulerFaultIsFatal(out.fault_flags) && out.fault_slot < static_cast<std::uint32_t>(slot_count))
+        gpuMarkSlotFailed(phases[out.fault_slot], out.fault_flags);
 }
 
 // ---------------------------------------------------------------------------
@@ -626,6 +658,14 @@ using GpuSchedulerStream = void*;
 
 /// One classify/compact epoch.  Level-1: ONE CTA of 128 threads, one thread per
 /// slot, reading only `phases`.
+///
+/// ORDERING: classify must observe the refill's writes.  Both kernels write the
+/// same `phases` array -- refill stamps a recycled slot Active/Import, classify
+/// queues it -- so issuing them on different streams without an event races,
+/// and the symptom is a slot that sits Empty for an epoch or is queued before
+/// its control structs are reset.  Use gpuLaunchRefillThenClassify below, which
+/// puts both on one stream; if you must call these separately, they have to be
+/// on the same stream or separated by an event.
 bool gpuLaunchClassify(DeviceSlotPhase* phases, int slot_count, DevicePhaseQueues* queues,
                        GpuSchedulerStream stream);
 
@@ -643,6 +683,13 @@ struct GpuRefillArgs {
 
 /// Sec 8.2 immediate refill: one thread per slot, free slots only.
 bool gpuLaunchRefill(const GpuRefillArgs& args, GpuSchedulerStream stream);
+
+/// One scheduler epoch: refill, then classify, ON THE SAME STREAM.  This is the
+/// supported entry point precisely because the ordering is not optional -- a
+/// function that takes one stream and issues both in order cannot be called
+/// with them on different streams.
+bool gpuLaunchRefillThenClassify(const GpuRefillArgs& args, DevicePhaseQueues* queues,
+                                 GpuSchedulerStream stream);
 
 /// Human-readable fault decode, for receipts and test failures.
 inline const char* gpuSchedulerFaultName(std::uint32_t bit) {

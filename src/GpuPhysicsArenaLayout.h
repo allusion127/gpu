@@ -168,6 +168,14 @@ enum class GeometryRegion : int {
 
 /// Immutable shared XS library (Sec 3.4): also one copy, re-uploaded only when
 /// the library file itself changes.
+///
+/// Every region here has a host array behind it -- LibFlux and LibChix are
+/// XSSet.cpp:705-706 `_lib_flux`/`_lib_chix`, both [dpt*ng].  There is
+/// deliberately no `knot_offsets` region: the knot offsets are an `int` field
+/// inside the per-branch descriptor structs (XSSet.cpp:419, 451), not a
+/// standalone array, so a device pointer for them would have nothing to point
+/// at.  A view field with no backing is worse than a missing one -- it reads as
+/// available and dereferences to whatever the arena last wrote.
 enum class LibraryRegion : int {
     LibMicxScalar = 0,
     LibMicxScatter,
@@ -180,6 +188,8 @@ enum class LibraryRegion : int {
     LibIden,
     LibBurn,
     LibWvfr,
+    LibFlux,
+    LibChix,
     Knots,
     DepDecay,
     DepTrans,
@@ -188,16 +198,37 @@ enum class LibraryRegion : int {
     Count
 };
 
-/// Per-slot mutable state (Sec 3.5).  Every one of these repeats once per slot
-/// at a uniform stride.
-enum class SlotRegion : int {
-    // Sec 3.2 control packet
+/// Sec 3.2 control packet, hoisted OUT of the per-slot stride.
+///
+/// THE BUG THIS FIXES.  These four were laid out inside the slot block, so
+/// slot s's DeviceSlotPhase sat at `slot_base + s*224MiB`.  Every kernel indexes
+/// them densely -- `phases[tid]`, `states[s]` -- which is not merely a different
+/// spelling of the same address, it is a different address.  It also destroyed
+/// the entire reason DeviceSlotPhase is 32 bytes: "64 slots = 2 KiB resident in
+/// L1" is only true if the 64 structs are CONTIGUOUS.  Strided by 224 MiB they
+/// are 64 separate cache lines in 64 separate pages, which is the traffic
+/// pattern the split was built to remove.
+///
+/// So the control block is four dense arrays, sized `slots` each, placed with
+/// geometry and library BELOW slot_base.  Two consequences worth stating:
+/// `slotView` is a dense index, and `clearSlotAsync` -- which memsets the whole
+/// slot stride -- can no longer reach the control structs, so a bulk clear
+/// cannot wipe the defaults a refill just wrote.
+enum class ControlRegion : int {
     SlotPhase = 0,
     SlotState,
     SearchState,
     ScheduleParams,
+    Count
+};
+
+/// Per-slot mutable state (Sec 3.5).  Every one of these repeats once per slot
+/// at a uniform stride.
+enum class SlotRegion : int {
+    // NOTE: the four Sec 3.2 control structs are NOT here -- they live in the
+    // contiguous control block below slot_base (ControlRegion above).
     // flux / current
-    Phif,
+    Phif = 0,
     Phis,
     Jnet,
     Psi,
@@ -290,6 +321,7 @@ enum class ScratchId : int {
 
 inline constexpr int kGeometryRegionCount = static_cast<int>(GeometryRegion::Count);
 inline constexpr int kLibraryRegionCount  = static_cast<int>(LibraryRegion::Count);
+inline constexpr int kControlRegionCount  = static_cast<int>(ControlRegion::Count);
 inline constexpr int kSlotRegionCount     = static_cast<int>(SlotRegion::Count);
 inline constexpr int kScratchBandCount    = static_cast<int>(ScratchBand::Count);
 inline constexpr int kScratchIdCount      = static_cast<int>(ScratchId::Count);
@@ -353,6 +385,13 @@ inline constexpr bool arenaScratchPhaseAllowed(ScratchId id, DevicePhase phase) 
 
 inline constexpr ScratchBand arenaScratchBand(ScratchId id) {
     return kScratchSpecs[static_cast<int>(id)].band;
+}
+
+/// Do two scratch users ever have the same owner phase?  If so they can be live
+/// at the same moment in the same slot and MUST NOT share bytes.
+inline constexpr bool arenaScratchCoResident(ScratchId a, ScratchId b) {
+    return (kScratchSpecs[static_cast<int>(a)].owner_phases &
+            kScratchSpecs[static_cast<int>(b)].owner_phases) != 0u;
 }
 
 // ---------------------------------------------------------------------------
@@ -419,6 +458,9 @@ inline constexpr std::size_t arenaLibraryElements(LibraryRegion r, const ArenaDi
         case LibraryRegion::LibIden:          return ref * niso;
         case LibraryRegion::LibBurn:          return ref;
         case LibraryRegion::LibWvfr:          return ref;
+        // XSSet.cpp:705-706  _lib_flux / _lib_chix, both [dpt*ng].
+        case LibraryRegion::LibFlux:          return ref * ng;
+        case LibraryRegion::LibChix:          return ref * ng;
         case LibraryRegion::Knots:            return static_cast<std::size_t>(d.n_knots);
         case LibraryRegion::DepDecay:         return niso * niso;
         case LibraryRegion::DepTrans:         return niso * niso;
@@ -439,11 +481,6 @@ inline constexpr std::size_t arenaSlotElements(SlotRegion r, const ArenaDims& d)
     const std::size_t ng2    = ng * ng;
     const std::size_t niso   = static_cast<std::size_t>(d.niso);
     switch (r) {
-        case SlotRegion::SlotPhase:      return 1;
-        case SlotRegion::SlotState:      return 1;
-        case SlotRegion::SearchState:    return 1;
-        case SlotRegion::ScheduleParams: return 1;
-
         case SlotRegion::Phif: return ng * nxyz;                                // Geometry.h:390
         case SlotRegion::Phis: return kDevLr * ng * kDevNdirMax * nxyz;         // Geometry.h:392
         case SlotRegion::Jnet: return kDevLr * ng * kDevNdirMax * nxyz;         // Geometry.h:391
@@ -519,20 +556,46 @@ inline constexpr std::size_t arenaSlotElements(SlotRegion r, const ArenaDims& d)
 
 inline constexpr std::size_t arenaSlotElementBytes(SlotRegion r) {
     switch (r) {
-        case SlotRegion::SlotPhase:      return sizeof(DeviceSlotPhase);
-        case SlotRegion::SlotState:      return sizeof(DeviceSlotState);
-        case SlotRegion::SearchState:    return sizeof(DeviceSearchState);
-        case SlotRegion::ScheduleParams: return sizeof(DeviceScheduleParams);
         case SlotRegion::BosBurnKey:
         case SlotRegion::BurnKey:
-        case SlotRegion::CtypKey:        return sizeof(int);
-        default:                         return sizeof(double);
+        case SlotRegion::CtypKey: return sizeof(int);
+        default:                  return sizeof(double);
     }
 }
 
-/// Band size = the largest of its users.  That IS the aliasing: one range,
-/// sized for whoever needs the most, shared by users that are never live at the
-/// same time in the same slot.
+inline constexpr std::size_t arenaControlElementBytes(ControlRegion r) {
+    switch (r) {
+        case ControlRegion::SlotPhase:      return sizeof(DeviceSlotPhase);
+        case ControlRegion::SlotState:      return sizeof(DeviceSlotState);
+        case ControlRegion::SearchState:    return sizeof(DeviceSearchState);
+        case ControlRegion::ScheduleParams: return sizeof(DeviceScheduleParams);
+        case ControlRegion::Count:          break;
+    }
+    return 0;
+}
+
+inline constexpr const char* arenaControlRegionName(ControlRegion r) {
+    switch (r) {
+        case ControlRegion::SlotPhase:      return "slot_phase";
+        case ControlRegion::SlotState:      return "slot_state";
+        case ControlRegion::SearchState:    return "search_state";
+        case ControlRegion::ScheduleParams: return "schedule_params";
+        case ControlRegion::Count:          break;
+    }
+    return "?";
+}
+
+/// Byte size of one scratch user's own range.
+///
+/// A band is NOT simply "the largest of its users" -- that was wrong, and the
+/// old layout gate pinned the bug as expected behaviour.  bicg_ax and bicg_s
+/// are both owned by Outer and are live in the SAME BiCGSTAB iteration; so are
+/// the nodal trl and matrix scratches.  Giving them one shared range meant the
+/// solver would have been reading its own overwritten intermediates.
+///
+/// The rule is therefore: users that share an owner phase get DISJOINT
+/// sub-ranges within the band; only users whose owner-phase sets are disjoint
+/// may overlap.  See arenaScratchSubOffset below.
 inline constexpr std::size_t arenaScratchUserElements(ScratchId id, const ArenaDims& d) {
     const std::size_t nxyz = static_cast<std::size_t>(d.nxyz);
     const std::size_t ng   = static_cast<std::size_t>(d.ng);
@@ -563,6 +626,62 @@ inline constexpr std::size_t arenaScratchUserElements(ScratchId id, const ArenaD
     return 0;
 }
 
+inline constexpr std::size_t arenaScratchUserBytes(ScratchId id, const ArenaDims& d) {
+    return arenaAlignUp(arenaScratchUserElements(id, d) * sizeof(double));
+}
+
+/// Offset of a user's range WITHIN its band.
+///
+/// Greedy interval assignment over the owner-phase sets, in enum order: a user
+/// starts after everything already placed that shares one of its phases, and at
+/// zero when nothing does.  Two users overlap exactly when their phase sets are
+/// disjoint, which is the aliasing rule stated as an algorithm.
+///
+/// At the current table this gives, per band:
+///   krylov_outer     ax | s | wielandt | partials      all Outer -> all disjoint
+///   nodal_depletion  trl | matrix   (Outer, disjoint)
+///                    depletion_temp (Depletion*, overlaps both -- never co-live)
+///   th_output_ppr    th | outpack | ppr    three phases -> all at offset 0
+///   cram             predictor | corrector two phases -> both at offset 0
+inline constexpr std::size_t arenaScratchSubOffset(ScratchId id, const ArenaDims& d) {
+    const ScratchBand band  = arenaScratchBand(id);
+    const int         target = static_cast<int>(id);
+
+    std::size_t phase_end[kDevicePhaseCount] = {};
+    for (int u = 0; u < kScratchIdCount; ++u) {
+        const ScratchSpec& spec = kScratchSpecs[u];
+        if (spec.band != band) continue;
+
+        std::size_t start = 0;
+        for (int p = 0; p < kDevicePhaseCount; ++p)
+            if ((spec.owner_phases & (1u << static_cast<std::uint32_t>(p))) != 0u &&
+                phase_end[p] > start)
+                start = phase_end[p];
+
+        if (u == target) return start;
+
+        const std::size_t end = start + arenaScratchUserBytes(spec.id, d);
+        for (int p = 0; p < kDevicePhaseCount; ++p)
+            if ((spec.owner_phases & (1u << static_cast<std::uint32_t>(p))) != 0u)
+                phase_end[p] = end;
+    }
+    return 0;
+}
+
+/// Band size: the widest any single phase's co-resident set gets.  Equivalently
+/// max over phases of the summed sizes of that phase's users in the band, which
+/// the layout gate asserts against this independently.
+inline constexpr std::size_t arenaScratchBandBytes(ScratchBand band, const ArenaDims& d) {
+    std::size_t widest = 0;
+    for (int u = 0; u < kScratchIdCount; ++u) {
+        if (kScratchSpecs[u].band != band) continue;
+        const ScratchId   id  = kScratchSpecs[u].id;
+        const std::size_t end = arenaScratchSubOffset(id, d) + arenaScratchUserBytes(id, d);
+        if (end > widest) widest = end;
+    }
+    return widest;
+}
+
 // ---------------------------------------------------------------------------
 // The computed layout
 // ---------------------------------------------------------------------------
@@ -580,20 +699,29 @@ struct ArenaOffsets {
 
     ArenaRegion geometry[kGeometryRegionCount]{};
     ArenaRegion library[kLibraryRegionCount]{};
+    /// Dense arrays of `slots` entries each, OUTSIDE the slot stride.
+    ArenaRegion control[kControlRegionCount]{};
     /// Slot-RELATIVE: absolute offset is slot_base + slot*slot_stride + offset.
     ArenaRegion slot[kSlotRegionCount]{};
     ArenaRegion scratch[kScratchBandCount]{};
 
     std::size_t geometry_base = 0;
     std::size_t library_base  = 0;
+    std::size_t control_base  = 0;
     std::size_t slot_base     = 0;
 
     std::size_t shared_geometry_bytes = 0;
     std::size_t shared_library_bytes  = 0;
+    std::size_t control_block_bytes   = 0;
     std::size_t per_slot_bytes        = 0; ///< the uniform slot stride
     std::size_t per_slot_scratch_bytes = 0;
     std::size_t slot_count            = 0;
     std::size_t total_bytes           = 0;
+
+    /// False when the request was rejected outright (see arenaComputeLayout).
+    /// A caller must not use any offset from an invalid layout.
+    bool valid            = true;
+    bool slots_exceed_cap = false;
 
     [[nodiscard]] constexpr std::size_t slotBase(int s) const {
         return slot_base + static_cast<std::size_t>(s) * per_slot_bytes;
@@ -604,11 +732,25 @@ struct ArenaOffsets {
     [[nodiscard]] constexpr std::size_t slotRegionBytes(SlotRegion r) const {
         return slot[static_cast<int>(r)].bytes;
     }
+    /// Dense: element `s` of the control array, not a slot-strided address.
+    [[nodiscard]] constexpr std::size_t controlOffset(int s, ControlRegion r) const {
+        return control[static_cast<int>(r)].offset +
+               static_cast<std::size_t>(s) * arenaControlElementBytes(r);
+    }
     [[nodiscard]] constexpr std::size_t scratchOffset(int s, ScratchId id) const {
-        return slotBase(s) + scratch[static_cast<int>(arenaScratchBand(id))].offset;
+        return slotBase(s) + scratch[static_cast<int>(arenaScratchBand(id))].offset +
+               arenaScratchSubOffset(id, dims);
     }
     [[nodiscard]] constexpr std::size_t scratchBytes(ScratchId id) const {
-        return scratch[static_cast<int>(arenaScratchBand(id))].bytes;
+        return arenaScratchUserBytes(id, dims);
+    }
+    /// True when `bytes` at `offset` lies inside slot `s`'s stride.  Used by the
+    /// gate to prove the control block is out of clearSlotAsync's reach.
+    [[nodiscard]] constexpr bool insideSlotStride(int s, std::size_t offset,
+                                                  std::size_t bytes) const {
+        const std::size_t lo = slotBase(s);
+        const std::size_t hi = lo + per_slot_bytes;
+        return offset < hi && (offset + bytes) > lo;
     }
 };
 
@@ -622,6 +764,17 @@ inline constexpr ArenaOffsets arenaComputeLayout(const ArenaDims& d) {
     ArenaOffsets o{};
     o.dims       = d;
     o.slot_count = static_cast<std::size_t>(d.slots < 0 ? 0 : d.slots);
+
+    // Fail loud rather than truncate.  The scheduler classifies at most
+    // kMaxDeviceSlots slots in one CTA, so a wider arena would silently run
+    // slots nothing ever schedules -- which looks like a throughput result and
+    // is not one.
+    if (d.slots > kMaxDeviceSlots) {
+        o.valid            = false;
+        o.slots_exceed_cap = true;
+        o.slot_count       = 0;
+        return o;
+    }
 
     std::size_t cursor = 0;
 
@@ -645,6 +798,20 @@ inline constexpr ArenaOffsets arenaComputeLayout(const ArenaDims& d) {
     }
     o.shared_library_bytes = cursor - o.library_base;
 
+    // The control block: four DENSE arrays of `slots` entries, below slot_base.
+    // Contiguity is the point -- 64 DeviceSlotPhase in 2 KiB is what keeps
+    // Level-1's classify pass in L1, and being outside the slot stride is what
+    // keeps clearSlotAsync from wiping a refill's freshly written defaults.
+    o.control_base = cursor;
+    for (int i = 0; i < kControlRegionCount; ++i) {
+        const ControlRegion r     = static_cast<ControlRegion>(i);
+        const std::size_t   bytes = o.slot_count * arenaControlElementBytes(r);
+        o.control[i].offset       = cursor;
+        o.control[i].bytes        = bytes;
+        cursor += arenaAlignUp(bytes);
+    }
+    o.control_block_bytes = cursor - o.control_base;
+
     o.slot_base = arenaAlignUp(cursor);
 
     // One slot, laid out at offset 0; every slot repeats it at slot_base +
@@ -660,16 +827,10 @@ inline constexpr ArenaOffsets arenaComputeLayout(const ArenaDims& d) {
 
     const std::size_t scratch_begin = rel;
     for (int b = 0; b < kScratchBandCount; ++b) {
-        std::size_t widest = 0;
-        for (int u = 0; u < kScratchIdCount; ++u) {
-            if (static_cast<int>(kScratchSpecs[u].band) != b) continue;
-            const std::size_t bytes =
-                arenaScratchUserElements(kScratchSpecs[u].id, d) * sizeof(double);
-            if (bytes > widest) widest = bytes;
-        }
-        o.scratch[b].offset = rel;
-        o.scratch[b].bytes  = widest;
-        rel += arenaAlignUp(widest);
+        const std::size_t bytes = arenaScratchBandBytes(static_cast<ScratchBand>(b), d);
+        o.scratch[b].offset     = rel;
+        o.scratch[b].bytes      = bytes;
+        rel += arenaAlignUp(bytes);
     }
     o.per_slot_scratch_bytes = rel - scratch_begin;
 
@@ -714,7 +875,7 @@ inline constexpr ArenaAdmission arenaAdmit(const ArenaOffsets& o, std::size_t fr
     a.requested_bytes = o.total_bytes + a.fragmentation_reserve_bytes;
     a.usable_bytes    = (free_bytes > a.driver_reserve_bytes) ? free_bytes - a.driver_reserve_bytes : 0;
 
-    a.granted = !a.per_slot_over_ceiling && a.requested_bytes <= a.usable_bytes;
+    a.granted = o.valid && !a.per_slot_over_ceiling && a.requested_bytes <= a.usable_bytes;
     return a;
 }
 

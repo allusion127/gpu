@@ -81,6 +81,15 @@ bool GpuPhysicsArena::reserve(const ArenaDims& dims) {
     if (d.ready) return d.fail("reserve() called twice; the arena is allocated once");
 
     d.offsets = arenaComputeLayout(dims);
+    if (d.offsets.slots_exceed_cap) {
+        char why[192];
+        std::snprintf(why, sizeof(why),
+                      "%d slots requested but the scheduler classifies at most %d; "
+                      "the extra slots would never be scheduled",
+                      dims.slots, kMaxDeviceSlots);
+        return d.fail(why);
+    }
+    if (!d.offsets.valid) return d.fail("layout was rejected");
     if (d.offsets.slot_count == 0 || d.offsets.total_bytes == 0)
         return d.fail("layout is empty (slots == 0 or dimensions are zero)");
 
@@ -121,6 +130,15 @@ bool GpuPhysicsArena::reserve(const ArenaDims& dims) {
     rc = cudaStreamCreateWithFlags(&d.setup, cudaStreamNonBlocking);
     if (rc != cudaSuccess) return d.fail(cudaWhy("cudaStreamCreateWithFlags", rc));
 
+    // From here on the arena owns a stream, and soon a pool and a block.  Every
+    // failure below therefore tears them down before reporting: a refused
+    // reserve() must leave the object exactly as constructed, not holding a
+    // stream and a 14 GiB reservation nobody will ever free.
+    const auto abort_reserve = [this, &d](std::string why) {
+        release();
+        return d.fail(std::move(why));
+    };
+
     // A dedicated pool, so the release threshold below cannot disturb anything
     // else on the device.  If pool creation is unavailable, fall back to the
     // device's default pool rather than to a non-pooled allocation: the
@@ -137,7 +155,7 @@ bool GpuPhysicsArena::reserve(const ArenaDims& dims) {
         d.pool      = nullptr;
         d.owns_pool = false;
         rc          = cudaDeviceGetDefaultMemPool(&d.pool, d.device);
-        if (rc != cudaSuccess) return d.fail(cudaWhy("cudaDeviceGetDefaultMemPool", rc));
+        if (rc != cudaSuccess) return abort_reserve(cudaWhy("cudaDeviceGetDefaultMemPool", rc));
     }
 
     // Hold the pages for the life of the run.  With the default threshold of 0
@@ -145,26 +163,41 @@ bool GpuPhysicsArena::reserve(const ArenaDims& dims) {
     // for a block this size is a fault storm at the next statepoint.
     std::uint64_t threshold = static_cast<std::uint64_t>(d.offsets.total_bytes);
     rc = cudaMemPoolSetAttribute(d.pool, cudaMemPoolAttrReleaseThreshold, &threshold);
-    if (rc != cudaSuccess) return d.fail(cudaWhy("cudaMemPoolSetAttribute(ReleaseThreshold)", rc));
+    if (rc != cudaSuccess)
+        return abort_reserve(cudaWhy("cudaMemPoolSetAttribute(ReleaseThreshold)", rc));
 
     void* raw = nullptr;
     rc = cudaMallocFromPoolAsync(&raw, d.offsets.total_bytes, d.pool, d.setup);
-    if (rc != cudaSuccess) return d.fail(cudaWhy("cudaMallocFromPoolAsync", rc));
+    if (rc != cudaSuccess) return abort_reserve(cudaWhy("cudaMallocFromPoolAsync", rc));
 
     // The one synchronisation: after this the base address is final, which is
     // the precondition for capturing a graph over any pointer derived from it.
     rc = cudaStreamSynchronize(d.setup);
-    if (rc != cudaSuccess) return d.fail(cudaWhy("cudaStreamSynchronize(reserve)", rc));
+    if (rc != cudaSuccess) return abort_reserve(cudaWhy("cudaStreamSynchronize(reserve)", rc));
 
     d.base = static_cast<unsigned char*>(raw);
-    if (d.base == nullptr) return d.fail("pool returned a null block");
+    if (d.base == nullptr) return abort_reserve("pool returned a null block");
+
+    // Every region offset is a multiple of 256, so the whole layout is only
+    // 256-aligned if the BASE is.  cudaMallocFromPoolAsync gives at least 256
+    // in practice; refusing rather than assuming means a driver that ever gives
+    // less produces a clear failure instead of misaligned vector loads.
+    if ((reinterpret_cast<std::uintptr_t>(d.base) % kArenaAlignment) != 0) {
+        char why[160];
+        std::snprintf(why, sizeof(why),
+                      "pool block is not %zu-byte aligned (base %% %zu = %zu)", kArenaAlignment,
+                      kArenaAlignment,
+                      static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(d.base) %
+                                               kArenaAlignment));
+        return abort_reserve(why);
+    }
 
     // Deterministic initial contents: a slot that is read before it is imported
     // reads zeros, not a previous run's bytes.
     rc = cudaMemsetAsync(d.base, 0, d.offsets.total_bytes, d.setup);
-    if (rc != cudaSuccess) return d.fail(cudaWhy("cudaMemsetAsync(arena)", rc));
+    if (rc != cudaSuccess) return abort_reserve(cudaWhy("cudaMemsetAsync(arena)", rc));
     rc = cudaStreamSynchronize(d.setup);
-    if (rc != cudaSuccess) return d.fail(cudaWhy("cudaStreamSynchronize(memset)", rc));
+    if (rc != cudaSuccess) return abort_reserve(cudaWhy("cudaStreamSynchronize(memset)", rc));
 
     d.ready  = true;
     d.status = "ok";
@@ -254,6 +287,22 @@ T* at(unsigned char* base, std::size_t offset) {
     return reinterpret_cast<T*>(base + offset);
 }
 
+/// A region with no elements gets a NULL pointer, not a pointer to the next
+/// region's first byte.  An empty library (no deck loaded yet) or an empty
+/// fuel-node set would otherwise hand a kernel an address that is valid memory
+/// belonging to something ELSE, so the guard against reading it would have to
+/// be repeated at every call site instead of living here once.
+template <typename T>
+T* atOrNull(unsigned char* base, const ArenaRegion& r) {
+    return r.bytes == 0 ? nullptr : reinterpret_cast<T*>(base + r.offset);
+}
+
+/// Same rule for a per-slot region, whose stored offset is slot-relative.
+template <typename T>
+T* slotPtr(unsigned char* base, std::size_t slot_base, const ArenaRegion& r) {
+    return r.bytes == 0 ? nullptr : reinterpret_cast<T*>(base + slot_base + r.offset);
+}
+
 } // namespace
 
 DeviceGeometryView GpuPhysicsArena::geometryView() const {
@@ -262,25 +311,27 @@ DeviceGeometryView GpuPhysicsArena::geometryView() const {
     if (!d.ready) return v;
     unsigned char*     b = d.base;
     const ArenaOffsets& o = d.offsets;
-    const auto go = [&](GeometryRegion r) { return o.geometry[static_cast<int>(r)].offset; };
+    const auto go = [&](GeometryRegion r) -> const ArenaRegion& {
+        return o.geometry[static_cast<int>(r)];
+    };
 
-    v.hmesh   = at<double>(b, go(GeometryRegion::Hmesh));
-    v.hz      = at<double>(b, go(GeometryRegion::Hz));
-    v.vol     = at<double>(b, go(GeometryRegion::Vol));
-    v.vola    = at<double>(b, go(GeometryRegion::Vola));
-    v.albedo  = at<double>(b, go(GeometryRegion::Albedo));
-    v.neib    = at<int>(b, go(GeometryRegion::Neib));
-    v.neibr   = at<int>(b, go(GeometryRegion::Neibr));
-    v.neibrb  = at<int>(b, go(GeometryRegion::Neibrb));
-    v.lklr    = at<int>(b, go(GeometryRegion::Lklr));
-    v.idirlr  = at<int>(b, go(GeometryRegion::Idirlr));
-    v.sgnlr   = at<int>(b, go(GeometryRegion::Sgnlr));
-    v.lktosfc = at<int>(b, go(GeometryRegion::Lktosfc));
-    v.ltola   = at<int>(b, go(GeometryRegion::Ltola));
-    v.ltolc   = at<int>(b, go(GeometryRegion::Ltolc));
-    v.comps   = at<int>(b, go(GeometryRegion::Comps));
-    v.fuel_nodes = at<int>(b, go(GeometryRegion::FuelNodes));
-    v.is_fuel    = at<int>(b, go(GeometryRegion::IsFuel));
+    v.hmesh   = atOrNull<double>(b, go(GeometryRegion::Hmesh));
+    v.hz      = atOrNull<double>(b, go(GeometryRegion::Hz));
+    v.vol     = atOrNull<double>(b, go(GeometryRegion::Vol));
+    v.vola    = atOrNull<double>(b, go(GeometryRegion::Vola));
+    v.albedo  = atOrNull<double>(b, go(GeometryRegion::Albedo));
+    v.neib    = atOrNull<int>(b, go(GeometryRegion::Neib));
+    v.neibr   = atOrNull<int>(b, go(GeometryRegion::Neibr));
+    v.neibrb  = atOrNull<int>(b, go(GeometryRegion::Neibrb));
+    v.lklr    = atOrNull<int>(b, go(GeometryRegion::Lklr));
+    v.idirlr  = atOrNull<int>(b, go(GeometryRegion::Idirlr));
+    v.sgnlr   = atOrNull<int>(b, go(GeometryRegion::Sgnlr));
+    v.lktosfc = atOrNull<int>(b, go(GeometryRegion::Lktosfc));
+    v.ltola   = atOrNull<int>(b, go(GeometryRegion::Ltola));
+    v.ltolc   = atOrNull<int>(b, go(GeometryRegion::Ltolc));
+    v.comps   = atOrNull<int>(b, go(GeometryRegion::Comps));
+    v.fuel_nodes = atOrNull<int>(b, go(GeometryRegion::FuelNodes));
+    v.is_fuel    = atOrNull<int>(b, go(GeometryRegion::IsFuel));
 
     v.nxyz   = o.dims.nxyz;
     v.nsurf  = o.dims.nsurf;
@@ -299,27 +350,28 @@ DeviceXsLibraryView GpuPhysicsArena::libraryView() const {
     if (!d.ready) return v;
     unsigned char*      b = d.base;
     const ArenaOffsets& o = d.offsets;
-    const auto lo = [&](LibraryRegion r) { return o.library[static_cast<int>(r)].offset; };
+    const auto lo = [&](LibraryRegion r) -> const ArenaRegion& {
+        return o.library[static_cast<int>(r)];
+    };
 
-    v.lib_lmpx        = at<double>(b, lo(LibraryRegion::LibLmpxScalar));
-    v.lib_lmpx_ssm    = at<double>(b, lo(LibraryRegion::LibLmpxScatter));
-    v.lib_micx        = at<double>(b, lo(LibraryRegion::LibMicxScalar));
-    v.lib_micx_ssm    = at<double>(b, lo(LibraryRegion::LibMicxScatter));
-    v.lib_iden        = at<double>(b, lo(LibraryRegion::LibIden));
-    v.lib_burn        = at<double>(b, lo(LibraryRegion::LibBurn));
-    v.lib_wvfr        = at<double>(b, lo(LibraryRegion::LibWvfr));
-    v.lib_flux        = nullptr;
-    v.lib_chix        = nullptr;
-    v.coeff_lmpx      = at<double>(b, lo(LibraryRegion::CoeffLmpxScalar));
-    v.coeff_lmpx_ssm  = at<double>(b, lo(LibraryRegion::CoeffLmpxScatter));
-    v.coeff_micx      = at<double>(b, lo(LibraryRegion::CoeffMicxScalar));
-    v.coeff_micx_ssm  = at<double>(b, lo(LibraryRegion::CoeffMicxScatter));
-    v.knots           = at<double>(b, lo(LibraryRegion::Knots));
-    v.knot_offsets    = nullptr;
-    v.dep_decay       = at<double>(b, lo(LibraryRegion::DepDecay));
-    v.dep_trans       = at<double>(b, lo(LibraryRegion::DepTrans));
-    v.cram_alpha      = at<double>(b, lo(LibraryRegion::CramAlpha));
-    v.cram_theta      = at<double>(b, lo(LibraryRegion::CramTheta));
+    v.lib_lmpx        = atOrNull<double>(b, lo(LibraryRegion::LibLmpxScalar));
+    v.lib_lmpx_ssm    = atOrNull<double>(b, lo(LibraryRegion::LibLmpxScatter));
+    v.lib_micx        = atOrNull<double>(b, lo(LibraryRegion::LibMicxScalar));
+    v.lib_micx_ssm    = atOrNull<double>(b, lo(LibraryRegion::LibMicxScatter));
+    v.lib_iden        = atOrNull<double>(b, lo(LibraryRegion::LibIden));
+    v.lib_burn        = atOrNull<double>(b, lo(LibraryRegion::LibBurn));
+    v.lib_wvfr        = atOrNull<double>(b, lo(LibraryRegion::LibWvfr));
+    v.lib_flux        = atOrNull<double>(b, lo(LibraryRegion::LibFlux));
+    v.lib_chix        = atOrNull<double>(b, lo(LibraryRegion::LibChix));
+    v.coeff_lmpx      = atOrNull<double>(b, lo(LibraryRegion::CoeffLmpxScalar));
+    v.coeff_lmpx_ssm  = atOrNull<double>(b, lo(LibraryRegion::CoeffLmpxScatter));
+    v.coeff_micx      = atOrNull<double>(b, lo(LibraryRegion::CoeffMicxScalar));
+    v.coeff_micx_ssm  = atOrNull<double>(b, lo(LibraryRegion::CoeffMicxScatter));
+    v.knots           = atOrNull<double>(b, lo(LibraryRegion::Knots));
+    v.dep_decay       = atOrNull<double>(b, lo(LibraryRegion::DepDecay));
+    v.dep_trans       = atOrNull<double>(b, lo(LibraryRegion::DepTrans));
+    v.cram_alpha      = atOrNull<double>(b, lo(LibraryRegion::CramAlpha));
+    v.cram_theta      = atOrNull<double>(b, lo(LibraryRegion::CramTheta));
     v.cram_alpha0     = 0.0;
 
     v.n_ref_points   = o.dims.n_ref_points;
@@ -340,74 +392,81 @@ DeviceSlotView GpuPhysicsArena::slotView(int slot) const {
 
     unsigned char*      b = d.base;
     const ArenaOffsets& o = d.offsets;
-    const auto so = [&](SlotRegion r) { return o.slotRegionOffset(slot, r); };
+    const std::size_t slot_base = o.slotBase(slot);
+    const auto        so = [&](SlotRegion r) -> const ArenaRegion& {
+        return o.slot[static_cast<int>(r)];
+    };
 
-    v.phase  = at<DeviceSlotPhase>(b, so(SlotRegion::SlotPhase));
-    v.state  = at<DeviceSlotState>(b, so(SlotRegion::SlotState));
-    v.search = at<DeviceSearchState>(b, so(SlotRegion::SearchState));
-    v.params = at<DeviceScheduleParams>(b, so(SlotRegion::ScheduleParams));
+    // DENSE, out of the contiguous control block -- element `slot` of each
+    // array, NOT slot_base + offset.  This is exactly what the scheduler
+    // kernels' `phases[tid]` / `states[s]` indexing means, and it is why the
+    // four control structs are not in the slot stride.
+    v.phase  = at<DeviceSlotPhase>(b, o.controlOffset(slot, ControlRegion::SlotPhase));
+    v.state  = at<DeviceSlotState>(b, o.controlOffset(slot, ControlRegion::SlotState));
+    v.search = at<DeviceSearchState>(b, o.controlOffset(slot, ControlRegion::SearchState));
+    v.params = at<DeviceScheduleParams>(b, o.controlOffset(slot, ControlRegion::ScheduleParams));
 
-    v.phif = at<double>(b, so(SlotRegion::Phif));
-    v.phis = at<double>(b, so(SlotRegion::Phis));
-    v.jnet = at<double>(b, so(SlotRegion::Jnet));
-    v.psi  = at<double>(b, so(SlotRegion::Psi));
-    v.phic = at<double>(b, so(SlotRegion::Phic));
+    v.phif = slotPtr<double>(b, slot_base, so(SlotRegion::Phif));
+    v.phis = slotPtr<double>(b, slot_base, so(SlotRegion::Phis));
+    v.jnet = slotPtr<double>(b, slot_base, so(SlotRegion::Jnet));
+    v.psi  = slotPtr<double>(b, slot_base, so(SlotRegion::Psi));
+    v.phic = slotPtr<double>(b, slot_base, so(SlotRegion::Phic));
 
-    v.dtil      = at<double>(b, so(SlotRegion::Dtil));
-    v.dhat      = at<double>(b, so(SlotRegion::Dhat));
-    v.diag      = at<double>(b, so(SlotRegion::Diag));
-    v.cc        = at<double>(b, so(SlotRegion::Cc));
-    v.src       = at<double>(b, so(SlotRegion::Src));
-    v.cmfd_psi  = at<double>(b, so(SlotRegion::CmfdPsi));
-    v.bicg_vec  = at<double>(b, so(SlotRegion::BicgVec));
-    v.bicg_dinv = at<double>(b, so(SlotRegion::BicgDinv));
+    v.dtil      = slotPtr<double>(b, slot_base, so(SlotRegion::Dtil));
+    v.dhat      = slotPtr<double>(b, slot_base, so(SlotRegion::Dhat));
+    v.diag      = slotPtr<double>(b, slot_base, so(SlotRegion::Diag));
+    v.cc        = slotPtr<double>(b, slot_base, so(SlotRegion::Cc));
+    v.src       = slotPtr<double>(b, slot_base, so(SlotRegion::Src));
+    v.cmfd_psi  = slotPtr<double>(b, slot_base, so(SlotRegion::CmfdPsi));
+    v.bicg_vec  = slotPtr<double>(b, slot_base, so(SlotRegion::BicgVec));
+    v.bicg_dinv = slotPtr<double>(b, slot_base, so(SlotRegion::BicgDinv));
 
-    v.trlcff      = at<double>(b, so(SlotRegion::Trlcff));
-    v.nodal_const = at<double>(b, so(SlotRegion::NodalConst));
-    v.constant_xs = at<double>(b, so(SlotRegion::ConstantXs));
-    v.dsncff      = at<double>(b, so(SlotRegion::Dsncff));
-    v.mutau       = at<double>(b, so(SlotRegion::MuTau));
-    v.matm        = at<double>(b, so(SlotRegion::MatM));
+    v.trlcff      = slotPtr<double>(b, slot_base, so(SlotRegion::Trlcff));
+    v.nodal_const = slotPtr<double>(b, slot_base, so(SlotRegion::NodalConst));
+    v.constant_xs = slotPtr<double>(b, slot_base, so(SlotRegion::ConstantXs));
+    v.dsncff      = slotPtr<double>(b, slot_base, so(SlotRegion::Dsncff));
+    v.mutau       = slotPtr<double>(b, slot_base, so(SlotRegion::MuTau));
+    v.matm        = slotPtr<double>(b, slot_base, so(SlotRegion::MatM));
 
-    v.iden     = at<double>(b, so(SlotRegion::Iden));
-    v.xs       = at<double>(b, so(SlotRegion::Xs));
-    v.xs_ssm   = at<double>(b, so(SlotRegion::XsSsm));
-    v.lmpx     = at<double>(b, so(SlotRegion::Lmpx));
-    v.lmpx_ssm = at<double>(b, so(SlotRegion::LmpxSsm));
-    v.micx     = at<double>(b, so(SlotRegion::Micx));
-    v.micx_ssm = at<double>(b, so(SlotRegion::MicxSsm));
+    v.iden     = slotPtr<double>(b, slot_base, so(SlotRegion::Iden));
+    v.xs       = slotPtr<double>(b, slot_base, so(SlotRegion::Xs));
+    v.xs_ssm   = slotPtr<double>(b, slot_base, so(SlotRegion::XsSsm));
+    v.lmpx     = slotPtr<double>(b, slot_base, so(SlotRegion::Lmpx));
+    v.lmpx_ssm = slotPtr<double>(b, slot_base, so(SlotRegion::LmpxSsm));
+    v.micx     = slotPtr<double>(b, slot_base, so(SlotRegion::Micx));
+    v.micx_ssm = slotPtr<double>(b, slot_base, so(SlotRegion::MicxSsm));
 
-    v.ref_micx     = at<double>(b, so(SlotRegion::RefMicx));
-    v.ref_micx_ssm = at<double>(b, so(SlotRegion::RefMicxSsm));
-    v.ref_lmpx     = at<double>(b, so(SlotRegion::RefLmpx));
-    v.ref_lmpx_ssm = at<double>(b, so(SlotRegion::RefLmpxSsm));
-    v.ref_iden     = at<double>(b, so(SlotRegion::RefIden));
+    v.ref_micx     = slotPtr<double>(b, slot_base, so(SlotRegion::RefMicx));
+    v.ref_micx_ssm = slotPtr<double>(b, slot_base, so(SlotRegion::RefMicxSsm));
+    v.ref_lmpx     = slotPtr<double>(b, slot_base, so(SlotRegion::RefLmpx));
+    v.ref_lmpx_ssm = slotPtr<double>(b, slot_base, so(SlotRegion::RefLmpxSsm));
+    v.ref_iden     = slotPtr<double>(b, slot_base, so(SlotRegion::RefIden));
 
-    v.bos_micx     = at<double>(b, so(SlotRegion::BosMicx));
-    v.bos_xskf     = at<double>(b, so(SlotRegion::BosXskf));
-    v.bos_iden     = at<double>(b, so(SlotRegion::BosIden));
-    v.bos_flux     = at<double>(b, so(SlotRegion::BosFlux));
-    v.bos_burn_key = at<int>(b, so(SlotRegion::BosBurnKey));
+    v.bos_micx     = slotPtr<double>(b, slot_base, so(SlotRegion::BosMicx));
+    v.bos_xskf     = slotPtr<double>(b, slot_base, so(SlotRegion::BosXskf));
+    v.bos_iden     = slotPtr<double>(b, slot_base, so(SlotRegion::BosIden));
+    v.bos_flux     = slotPtr<double>(b, slot_base, so(SlotRegion::BosFlux));
+    v.bos_burn_key = slotPtr<int>(b, slot_base, so(SlotRegion::BosBurnKey));
 
-    v.xe_aa_history = at<double>(b, so(SlotRegion::XeAaHistory));
+    v.xe_aa_history = slotPtr<double>(b, slot_base, so(SlotRegion::XeAaHistory));
 
-    v.bppm         = at<double>(b, so(SlotRegion::Bppm));
-    v.tful         = at<double>(b, so(SlotRegion::Tful));
-    v.tmod         = at<double>(b, so(SlotRegion::Tmod));
-    v.dmod         = at<double>(b, so(SlotRegion::Dmod));
-    v.rod_fraction = at<double>(b, so(SlotRegion::RodFraction));
-    v.node_wvfr    = at<double>(b, so(SlotRegion::NodeWvfr));
+    v.bppm         = slotPtr<double>(b, slot_base, so(SlotRegion::Bppm));
+    v.tful         = slotPtr<double>(b, slot_base, so(SlotRegion::Tful));
+    v.tmod         = slotPtr<double>(b, slot_base, so(SlotRegion::Tmod));
+    v.dmod         = slotPtr<double>(b, slot_base, so(SlotRegion::Dmod));
+    v.rod_fraction = slotPtr<double>(b, slot_base, so(SlotRegion::RodFraction));
+    v.node_wvfr    = slotPtr<double>(b, slot_base, so(SlotRegion::NodeWvfr));
 
-    v.ppr_p  = at<double>(b, so(SlotRegion::PprP));
-    v.ppr_a  = at<double>(b, so(SlotRegion::PprA));
-    v.ppr_c  = at<double>(b, so(SlotRegion::PprC));
-    v.ppr_q  = at<double>(b, so(SlotRegion::PprQ));
-    v.ppr_l  = at<double>(b, so(SlotRegion::PprL));
-    v.ppr_bt = at<double>(b, so(SlotRegion::PprBt));
+    v.ppr_p  = slotPtr<double>(b, slot_base, so(SlotRegion::PprP));
+    v.ppr_a  = slotPtr<double>(b, slot_base, so(SlotRegion::PprA));
+    v.ppr_c  = slotPtr<double>(b, slot_base, so(SlotRegion::PprC));
+    v.ppr_q  = slotPtr<double>(b, slot_base, so(SlotRegion::PprQ));
+    v.ppr_l  = slotPtr<double>(b, slot_base, so(SlotRegion::PprL));
+    v.ppr_bt = slotPtr<double>(b, slot_base, so(SlotRegion::PprBt));
 
-    v.burn_key = at<int>(b, so(SlotRegion::BurnKey));
-    v.ctyp_key = at<int>(b, so(SlotRegion::CtypKey));
-    v.out_pack = at<double>(b, so(SlotRegion::OutPack));
+    v.burn_key = slotPtr<int>(b, slot_base, so(SlotRegion::BurnKey));
+    v.ctyp_key = slotPtr<int>(b, slot_base, so(SlotRegion::CtypKey));
+    v.out_pack = slotPtr<double>(b, slot_base, so(SlotRegion::OutPack));
 
     v.nxyz   = o.dims.nxyz;
     v.nsurf  = o.dims.nsurf;
@@ -501,11 +560,14 @@ bool GpuPhysicsArena::clearSlotAsync(int slot, GpuStreamHandle stream) {
 std::string GpuPhysicsArena::receiptJson() const {
     const Impl&         d = *_impl;
     const ArenaOffsets& o = d.offsets;
-    char                buf[1400];
+    // Sized for the longest status string this class produces (the admission
+    // refusal, ~380 chars) plus every numeric field at full width.
+    char buf[2048];
     std::snprintf(
         buf, sizeof(buf),
         "{\"backend\":\"cuda\",\"available\":%s,\"shared_geometry_bytes\":%llu,"
-        "\"shared_library_bytes\":%llu,\"per_slot_bytes\":%llu,\"slot_count\":%llu,"
+        "\"shared_library_bytes\":%llu,\"control_block_bytes\":%llu,"
+        "\"per_slot_bytes\":%llu,\"slot_count\":%llu,"
         "\"scratch_bytes\":%llu,\"per_slot_scratch_bytes\":%llu,\"total_bytes\":%llu,"
         "\"alignment\":%llu,\"slot_base\":%llu,\"vram_free_bytes\":%lld,"
         "\"vram_total_bytes\":%lld,\"driver_reserve_bytes\":%llu,"
@@ -514,6 +576,7 @@ std::string GpuPhysicsArena::receiptJson() const {
         d.ready ? "true" : "false",
         static_cast<unsigned long long>(o.shared_geometry_bytes),
         static_cast<unsigned long long>(o.shared_library_bytes),
+        static_cast<unsigned long long>(o.control_block_bytes),
         static_cast<unsigned long long>(o.per_slot_bytes),
         static_cast<unsigned long long>(o.slot_count),
         static_cast<unsigned long long>(o.per_slot_scratch_bytes * o.slot_count),

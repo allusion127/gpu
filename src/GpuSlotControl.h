@@ -71,6 +71,17 @@
 
 namespace rasbery::gpu {
 
+/// Physical slot cap, shared by the arena layout and the scheduler so the two
+/// cannot disagree about how wide the fleet may be.  64 is the campaign width
+/// and the widest conditional-graph bucket (Sec 5.5).
+///
+/// It lives here, with the control structs, because both consumers already
+/// include this header and neither includes the other: the arena sizes the
+/// control block by it, the scheduler sizes its queues by it, and a layout that
+/// asked for more slots than the scheduler can classify would be a silent
+/// truncation.
+inline constexpr int kMaxDeviceSlots = 64;
+
 // ---------------------------------------------------------------------------
 // Sec 3.1  Phase and exit states
 // ---------------------------------------------------------------------------
@@ -233,20 +244,47 @@ struct alignas(128) DeviceSlotState {
     double keff_tolerance;
     double flux_tolerance;
 
-    // --- generation counters: all eight of the solver's, plus the two the
-    //     Rev.7 list omitted (isotope, hoststate).  Every one of these is a
-    //     refill reset target; a survivor here suppresses a rebuild the new
-    //     tenant needs.
+    // --- generation counters ------------------------------------------------
+    //
+    // FOUR OF THESE MIRROR A COUNTER THAT EXISTS ON THE HOST TODAY.  The rest
+    // are placeholders for state the device phases will need to invalidate once
+    // they exist, and they are called out as such so nobody wires an upload
+    // decision to a counter that nothing ever bumps:
+    //
+    //   REAL, host-backed (the device MUST keep these in step):
+    //     micx_generation      <- XSSet.h:180  _micx_generation
+    //                             (host rebuilt _micx/_lmpx; re-run reconstruct)
+    //     ref_generation       <- XSSet.h:198  _ref_generation
+    //                             (PrecomputeBranchCoefficients rebuilt the
+    //                              reference blocks; re-upload _ref_micx/_ref_lmpx)
+    //     hoststate_generation <- XSSet.h:190  _hoststate_generation
+    //                             (host wrote _xs/_iden outside the device path)
+    //     nodal_constant_generation <- Nodal.h:124 _const_generation
+    //                             (updateConstant products are stale)
+    //
+    //   SPECULATIVE (no host counter yet; device-side only until a phase owns
+    //   one).  Do not gate an upload on these until the owning task lands.
+    //     geometry_generation   Task 4    material_generation  Task 12a
+    //     operator_generation   Task 5    flux_generation      Task 9
+    //     current_generation    Task 5    dhat_generation      Task 7
+    //     isotope_generation    Task 16   th_generation        Task 14
+    //
+    // Every one of them is a refill reset target either way: a survivor here
+    // suppresses a rebuild the NEW tenant needs, which is the failure mode the
+    // whole four-struct reset exists to prevent.
+    std::uint64_t micx_generation;
+    std::uint64_t ref_generation;
+    std::uint64_t hoststate_generation;
+    std::uint64_t nodal_constant_generation;
+
     std::uint64_t geometry_generation;
     std::uint64_t material_generation;
     std::uint64_t operator_generation;
     std::uint64_t flux_generation;
     std::uint64_t current_generation;
     std::uint64_t dhat_generation;
-    std::uint64_t nodal_constant_generation;
     std::uint64_t isotope_generation;
     std::uint64_t th_generation;
-    std::uint64_t hoststate_generation; ///< XSSet.cpp:4043 _hoststate_generation
 };
 
 #if defined(_MSC_VER)
@@ -499,16 +537,18 @@ RASBERY_GPU_HD inline void deviceSlotStateReset(DeviceSlotState& s) {
     s.flux_l2             = 0.0;
     s.keff_tolerance      = kDevEigvTol;
     s.flux_tolerance      = kDevEigvTol;
+    s.micx_generation            = 0u;
+    s.ref_generation             = 0u;
+    s.hoststate_generation       = 0u;
+    s.nodal_constant_generation  = 0u;
     s.geometry_generation        = 0u;
     s.material_generation        = 0u;
     s.operator_generation        = 0u;
     s.flux_generation            = 0u;
     s.current_generation         = 0u;
     s.dhat_generation            = 0u;
-    s.nodal_constant_generation  = 0u;
     s.isotope_generation         = 0u;
     s.th_generation              = 0u;
-    s.hoststate_generation       = 0u;
 }
 
 /// SearchMemory is carried across statepoints WITHIN a deck and must never

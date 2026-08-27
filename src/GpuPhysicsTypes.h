@@ -71,6 +71,22 @@ enum class GpuSupportTier : std::uint32_t {
     G4               ///< reserved (Sec 1.5 top rung)
 };
 
+/// "U" / "G0".."G4".  The receipt carries this as well as the numeric value,
+/// because the ordinal and the label do NOT agree -- Unsupported is 0, so G2 is
+/// ordinal 3 -- and a receipt reading `"tier":3` invites exactly the wrong
+/// conclusion.
+inline const char* gpuSupportTierName(GpuSupportTier tier) {
+    switch (tier) {
+        case GpuSupportTier::Unsupported: return "U";
+        case GpuSupportTier::G0:          return "G0";
+        case GpuSupportTier::G1:          return "G1";
+        case GpuSupportTier::G2:          return "G2";
+        case GpuSupportTier::G3:          return "G3";
+        case GpuSupportTier::G4:          return "G4";
+    }
+    return "U";
+}
+
 /// What the process learned about the device it is actually running on.  Emitted
 /// once into the final receipt (Sec 9.3) so a run can be told apart from a run
 /// on different silicon without reading the log body.
@@ -192,7 +208,11 @@ struct DeviceXsLibraryView {
     const double* coeff_micx;     ///< branch delta coefficients, microscopic
     const double* coeff_micx_ssm;
     const double* knots;          ///< concatenated spline knots
-    const int*    knot_offsets;
+    // No `knot_offsets`: the per-branch knot offset is an int FIELD inside the
+    // branch descriptor structs (XSSet.cpp:419, 451), not a standalone array.
+    // A view pointer with no host array behind it is worse than a missing one --
+    // it reads as available and dereferences to whatever the arena last wrote
+    // there.  Add it when a descriptor block exists to point at.
 
     const double* dep_decay;      ///< [niso*niso] decay matrix
     const double* dep_trans;      ///< [niso*niso] transmutation topology
