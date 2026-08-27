@@ -335,7 +335,12 @@ int main(int argc, char* argv[]) {
               << (screening ? "ga_screen_feedback_limited" : "full_exact_nodal")
               << "\",\"screening\":" << (screening ? "true" : "false")
               << ",\"feedback_pass_limit\":" << ga_feedback_passes
-              << ",\"full_hdf5\":" << (light_result ? "false" : "true") << "}" << std::endl;
+              << ",\"full_hdf5\":" << (light_result ? "false" : "true")
+              // Additive field: which in-core xenon treatment this run used
+              // (RASBERY_XE_MODE).  "equilibrium" is the default and the only
+              // value the exact-only acceptance path produces; "frozen" marks a
+              // same-mode MASTER comparison run, not an acceptance measurement.
+              << ",\"xe_mode\":\"" << rasbery::xeModeName() << "\"}" << std::endl;
 
     if (screening) {
         std::cout << "[RASBERY][GA][SCREEN] {\"physics_mode\":"

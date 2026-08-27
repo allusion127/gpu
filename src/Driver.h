@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -282,6 +283,69 @@ inline void report(std::ostream& out) {
 }
 } // namespace outer_timing
 
+// In-core equilibrium-xenon mode (RASBERY_XE_MODE), resolved once per process.
+//
+//   equilibrium  (default, and what an unset variable means)  The production
+//                solver: SolveLoop drives the Xe<->flux fixed point down to
+//                XE_EQUILIBRIUM_TOLERANCE at every cascade, and the damper,
+//                the interim-flux probe (RASBERY_XE_INTERIM_*) and the
+//                per-cascade budget (RASBERY_XE_CASCADE_BUDGET) all hang off
+//                that iteration.
+//   frozen       The in-core iteration is not run at all.  The I-135/Xe-135/
+//                Xe-135m rows of XSSet::_iden keep whatever the deck handed
+//                over -- the library initialization, the restart file, or the
+//                previous statepoint's depletion -- and the XS reconstruction
+//                uses them as they stand.
+//
+// WHY.  Measured on KNGR CY1: 17,564 of 21,271 outer iterations (82.6 %) were
+// Xe-update reconvergence cascades.  Retiring them is the single largest lever
+// on N_outer in the Sec 1 Amdahl model, projected at ~3.5-4x on a single run.
+//
+// WHAT IT IS NOT.  Frozen mode changes the physics -- the published Xe is no
+// longer in equilibrium with the published flux -- so it is a deliberately
+// selected comparison mode (MASTER is run in its matching mode and the two are
+// compared same-mode), never an acceptance path.  It does NOT touch depletion:
+// Deplete / PredictorStep / CorrectorStep still run their Bateman/CRAM advance
+// and still apply their own equilibrium overwrite at the depletion rates, so
+// the I/Xe/Sm inventory bookkeeping between statepoints is unchanged.  Only the
+// in-SolveLoop refresh stops.
+//
+// NO SAMARIUM COUNTERPART.  There is nothing symmetric to switch: RASBERY has
+// no in-core Sm equilibrium iteration.  Sm-149 and Pm-149 move only through the
+// depletion Bateman/CRAM solve (Chiffon::Isotope::iSm149 appears in no
+// equilibrium formula -- ApplyXeEquilibrium writes the three Xe-chain rows and
+// nothing else), and frozen mode leaves depletion running.  MASTER's
+// SAMARIUM=2 deck flag therefore has no RASBERY analogue to hold.
+enum class XeMode { EQUILIBRIUM, FROZEN };
+
+inline XeMode xeMode() {
+    static const XeMode mode = [] {
+        const char* value = std::getenv("RASBERY_XE_MODE");
+        if (value == nullptr)
+            return XeMode::EQUILIBRIUM;
+        std::string s(value);
+        for (char& c : s)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (s.empty() || s == "equilibrium")
+            return XeMode::EQUILIBRIUM;
+        if (s == "frozen")
+            return XeMode::FROZEN;
+        // A typo must not silently buy the default: this is a campaign switch
+        // whose two arms produce different physics.
+        std::cerr << "[RASBERY][WARN][xe] RASBERY_XE_MODE=\"" << value
+                  << "\" is not a mode (equilibrium|frozen); using equilibrium\n";
+        return XeMode::EQUILIBRIUM;
+    }();
+    return mode;
+}
+
+/// True when the in-core Xe<->flux fixed-point iteration is switched off.
+inline bool xeFrozen() { return xeMode() == XeMode::FROZEN; }
+
+/// The mode as the [RASBERY][PHYSICS_MODE] and [RASBERY][SPTELEM] receipts
+/// publish it, so a run can be sorted by mode without re-reading the env.
+inline const char* xeModeName() { return xeFrozen() ? "frozen" : "equilibrium"; }
+
 class Driver {
 private:
     std::string _input;
@@ -392,6 +456,9 @@ private:
         /// top of the schedule loop; nothing in the solve path reads them.
         int    statepoint = 0;
         double efpd       = 0.0;
+        /// One-shot latch for the frozen-Xe startup guard, so the warning is a
+        /// property of the run rather than of every statepoint in it.
+        bool   xe_frozen_checked = false;
     };
 
     // Flux-only re-convergence (CMFD/BiCGSTAB + nodal/CNCC + cusping), with every feedback
@@ -421,6 +488,44 @@ private:
         }
     }
 
+    // Frozen-Xe startup guard (RASBERY_XE_MODE=frozen), one line, once per run.
+    //
+    // Frozen mode publishes whatever Xe-135 the deck handed over.  A restart
+    // hands over a real inventory, so the mode does what it says.  A fresh core
+    // at BOC hands over nothing -- the library initialization leaves the
+    // Xe-chain rows at zero -- and a deck that asked for equilibrium Xe would
+    // then run its first statepoint (and, until depletion makes some, the ones
+    // after it) completely Xe-free.  That is a misconfigured run far more often
+    // than it is an experiment, and it is invisible in the results: a Xe-free
+    // core simply reads a few hundred pcm reactive.
+    //
+    // Deliberately a warning and not a refusal: a zero-Xe frozen run is a
+    // legitimate, if unusual, thing to ask for, and the mode switch is supposed
+    // to be reversible without also being opinionated.
+    static void WarnFrozenXeIfEmpty(SolverContext& ctx, const Schedule& schedule) {
+        if (!xeFrozen() || schedule.xenon_transient || ctx.xe_frozen_checked)
+            return;
+        ctx.xe_frozen_checked = true;
+        const int nxyz       = ctx.geometry.nxyz();
+        int       fuel_nodes = 0;
+        double    peak_xe    = 0.0;
+        for (int l = 0; l < nxyz; ++l) {
+            if (!ctx.geometry.IsFuel(l))
+                continue;
+            ++fuel_nodes;
+            peak_xe = std::max(
+                peak_xe,
+                std::abs(ctx.cross_sections.iden(Chiffon::Isotope::iXe135, l)));
+        }
+        if (fuel_nodes > 0 && peak_xe == 0.0)
+            std::cerr << std::format(
+                "[RASBERY][WARN][xe] RASBERY_XE_MODE=frozen and the incoming Xe-135 "
+                "inventory is identically zero over all {} fuel nodes at statepoint {} "
+                "(EFPD {:.3f}): the in-core equilibrium iteration is off, so this run "
+                "stays Xe-free until depletion makes some\n",
+                fuel_nodes, ctx.statepoint, ctx.efpd);
+    }
+
     // Single-loop eigenvalue solve following PARCS Fig 10.1. One outer iteration performs a
     // CMFD/BiCGSTAB flux update (Wielandt inside drive), then the nodal correction + CNCC
     // (d-hat) + rod cusping, then — once the flux is meaningful — one damped critical-search
@@ -434,7 +539,17 @@ private:
         const double power_fraction = schedule.powerFraction();
         const bool   has_th         = schedule.usesTHFeedback();
         const bool   has_search     = schedule.hasCriticalSearch();
-        const bool   has_eq_xe      = !schedule.xenon_transient;
+        // RASBERY_XE_MODE=frozen retires the in-core Xe<->flux fixed point here
+        // and nowhere else.  has_eq_xe is the single gate the whole machinery
+        // hangs off -- the cascade counters, xe_pending and its interim probe,
+        // the starvation charge, the UpdateEquilibriumXenon call itself, and
+        // the cascade re-arm after a committed perturbation -- so clearing it
+        // bypasses all of them at once, with no second branch that could ever
+        // disagree with this one, and no reachable path left to the equilibrium
+        // update.  xeFrozen() is a cached read of an env var resolved once per
+        // process, so an unset variable leaves this expression exactly what it
+        // was: !schedule.xenon_transient.
+        const bool   has_eq_xe      = !schedule.xenon_transient && !xeFrozen();
         // Optional multi-fidelity GA screening mode.  A positive value limits
         // the expensive Xe and T/H fixed-point feedback passes, while the
         // default (0/unset) preserves the production solver exactly.  Screened
@@ -448,6 +563,9 @@ private:
         const bool   trace_sl       = (std::getenv("RASBERY_SL_TRACE") != nullptr);
         const int    sl_outer0      = total_outer;
         const int    sl_th0         = total_th;
+
+        // Frozen mode + a deck carrying no Xe at all: warn once. See WarnFrozenXeIfEmpty.
+        WarnFrozenXeIfEmpty(ctx, schedule);
 
         if (has_search) {
             if (keepSearch) {
@@ -1264,7 +1382,8 @@ public:
                 std::cout << std::format(
                     "[RASBERY][SPTELEM] {{\"schema_version\":1,\"job_id\":\"{}\",\"slot\":{},"
                     "\"statepoint\":{},\"efpd\":{:.4f},\"outers\":{},\"outers_attributed\":{},"
-                    "\"outers_initial\":{},\"xe_updates\":{},\"xe_interim_updates\":{},"
+                    "\"outers_initial\":{},\"xe_mode\":\"{}\","
+                    "\"xe_updates\":{},\"xe_interim_updates\":{},"
                     "\"xe_cascades\":{},\"xe_steps_per_cascade\":{:.3f},"
                     "\"xe_budget_exhausted\":{},"
                     "\"xe_outers\":{},\"search_trials\":{},\"search_outers\":{},"
@@ -1277,8 +1396,8 @@ public:
                     "\"setls\":{:.6f},\"drive\":{:.6f},\"updjnet\":{:.6f},\"nodal\":{:.6f},"
                     "\"cusping\":{:.6f},\"upddhat\":{:.6f}}}}}\n",
                     sp_job_id, sp_slot, step_number, efpd, total_outer, c.outers(),
-                    c.outers_by_cause[sptelem::CAUSE_INITIAL], c.xe_updates,
-                    c.xe_interim_updates, c.xe_cascades, xe_per_cascade,
+                    c.outers_by_cause[sptelem::CAUSE_INITIAL], xeModeName(),
+                    c.xe_updates, c.xe_interim_updates, c.xe_cascades, xe_per_cascade,
                     c.xe_budget_exhausted, c.outers_by_cause[sptelem::CAUSE_XE],
                     c.search_trials, c.outers_by_cause[sptelem::CAUSE_SEARCH],
                     c.th_updates, c.outers_by_cause[sptelem::CAUSE_TH],
@@ -1350,7 +1469,8 @@ public:
             std::cout << std::format(
                 "[RASBERY][SPTELEM][SUMMARY] {{\"schema_version\":1,\"job_id\":\"{}\","
                 "\"slot\":{},\"statepoints\":{},\"outers\":{},\"outers_attributed\":{},"
-                "\"outers_initial\":{},\"xe_updates\":{},\"xe_interim_updates\":{},"
+                "\"outers_initial\":{},\"xe_mode\":\"{}\","
+                "\"xe_updates\":{},\"xe_interim_updates\":{},"
                 "\"xe_cascades\":{},\"xe_steps_per_cascade\":{:.3f},"
                 "\"xe_budget_exhausted\":{},"
                 "\"xe_outers\":{},\"search_trials\":{},\"search_outers\":{},"
@@ -1366,7 +1486,8 @@ public:
                 "\"upddhat\":{:.6f}}}}}\n",
                 sp_job_id, sp_slot, static_cast<int>(scheduler.schedule().size()),
                 c.outers_driver, c.outers(), c.outers_by_cause[sptelem::CAUSE_INITIAL],
-                c.xe_updates, c.xe_interim_updates, c.xe_cascades, xe_per_cascade,
+                xeModeName(), c.xe_updates, c.xe_interim_updates, c.xe_cascades,
+                xe_per_cascade,
                 c.xe_budget_exhausted, c.outers_by_cause[sptelem::CAUSE_XE],
                 c.search_trials, c.outers_by_cause[sptelem::CAUSE_SEARCH],
                 c.th_updates, c.outers_by_cause[sptelem::CAUSE_TH],
