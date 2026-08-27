@@ -228,6 +228,29 @@ if (RASBERY_ENABLE_TESTS)
 
     add_test(NAME nodal_constant_gpu_replay COMMAND rasbery_nodal_constant_gpu_replay 2048)
 
+    # CMFD outer boundary gates (Rev.7.1 Task 5).  Both link the verbatim CPU
+    # reference as its OWN object: with the quotation and the shipped body in one
+    # translation unit, gcc common-subexpressions across them and changes the
+    # QUOTATION's contraction, so the gate fails against a reference that is no
+    # longer the production one.  That is not hypothetical -- Task 4 hit it, on
+    # m264.  -march=native for the same reason as above: no FMA in the ISA means
+    # gcc contracts nothing and the mined mask cannot be scored.
+    foreach (cmfd_gate cmfd_outer_form_probe cmfd_outer_replay)
+        add_executable(rasbery_${cmfd_gate}
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/${cmfd_gate}.cpp"
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/cmfd_outer_reference.cpp")
+        target_compile_features(rasbery_${cmfd_gate} PRIVATE cxx_std_20)
+        target_include_directories(rasbery_${cmfd_gate} PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/src"
+                "${CMAKE_CURRENT_SOURCE_DIR}/test")
+        if (NOT MSVC)
+            target_compile_options(rasbery_${cmfd_gate} PRIVATE -march=native -O3 -fno-lto)
+        endif ()
+    endforeach ()
+
+    add_test(NAME cmfd_outer_form_probe COMMAND rasbery_cmfd_outer_form_probe 512)
+    add_test(NAME cmfd_outer_replay COMMAND rasbery_cmfd_outer_replay 1024)
+
     # Device arm of the same gate: the CUDA build of the shared body against
     # the same capture, elementwise.  Compiled with --fmad=false exactly like
     # the production TU.
@@ -264,20 +287,34 @@ if (RASBERY_ENABLE_TESTS)
                 "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_device_replay.cu"
                 PROPERTIES COMPILE_OPTIONS "--fmad=false")
 
-        add_executable(rasbery_nodal_mine_device
-                "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_mine_device.cu")
-        target_compile_features(rasbery_nodal_mine_device PRIVATE cxx_std_20)
-        target_include_directories(rasbery_nodal_mine_device PRIVATE
-                "${CMAKE_CURRENT_SOURCE_DIR}/src")
-        target_link_libraries(rasbery_nodal_mine_device PRIVATE CUDA::cudart)
-        set_target_properties(rasbery_nodal_mine_device PROPERTIES
-                CUDA_STANDARD 17
-                CUDA_STANDARD_REQUIRED YES
-                CUDA_ARCHITECTURES "${RASBERY_CUDA_ARCHITECTURES}"
-                CUDA_SEPARABLE_COMPILATION ON)
-        set_source_files_properties(
-                "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_mine_device.cu"
-                PROPERTIES COMPILE_OPTIONS "--fmad=false")
+        # The nodal contraction miner is the tool that produced the mask in
+        # NodalKernel.h, but the .cu itself was never committed -- test/ is
+        # .gitignore'd except for a short allow-list, and this one was missed.
+        # Unguarded, RASBERY_ENABLE_TESTS=ON then fails to CONFIGURE on any
+        # fresh clone, which takes every other gate in this file down with it
+        # (the 238 run found it exactly that way).  Guard rather than delete:
+        # the target is correct and the miner is wanted back.
+        if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_mine_device.cu")
+            add_executable(rasbery_nodal_mine_device
+                    "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_mine_device.cu")
+            target_compile_features(rasbery_nodal_mine_device PRIVATE cxx_std_20)
+            target_include_directories(rasbery_nodal_mine_device PRIVATE
+                    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+            target_link_libraries(rasbery_nodal_mine_device PRIVATE CUDA::cudart)
+            set_target_properties(rasbery_nodal_mine_device PROPERTIES
+                    CUDA_STANDARD 17
+                    CUDA_STANDARD_REQUIRED YES
+                    CUDA_ARCHITECTURES "${RASBERY_CUDA_ARCHITECTURES}"
+                    CUDA_SEPARABLE_COMPILATION ON)
+            set_source_files_properties(
+                    "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_mine_device.cu"
+                    PROPERTIES COMPILE_OPTIONS "--fmad=false")
+        else ()
+            message(WARNING
+                    "test/nodal_mine_device.cu is absent, so rasbery_nodal_mine_device is "
+                    "not built.  It is the miner behind NODAL_FORMS in src/NodalKernel.h; "
+                    "re-mining that mask needs it back.")
+        endif ()
 
         # Rev.7.1 Task 4 Step 0: the B0-rescue spike.  Sweeps device sqrt/exp
         # against baked glibc anchors and against this host's libm, and FAILS if
@@ -319,5 +356,33 @@ if (RASBERY_ENABLE_TESTS)
         set_source_files_properties(
                 "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_constant_device_replay.cu"
                 PROPERTIES COMPILE_OPTIONS "--fmad=false")
+
+        # Device arm of the Task 5 gate.  The Sec 6.12 counter reduction -- warp
+        # reduce, one atomic per block, atomicMax over the ratio's bit pattern --
+        # has no host equivalent, so this is the only place it is checked at all.
+        # It links the same verbatim CPU reference object the host gates use.
+        add_executable(rasbery_cmfd_outer_device_replay
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/cmfd_outer_device_replay.cu"
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/cmfd_outer_reference.cpp")
+        target_compile_features(rasbery_cmfd_outer_device_replay PRIVATE cxx_std_20)
+        target_include_directories(rasbery_cmfd_outer_device_replay PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/src"
+                "${CMAKE_CURRENT_SOURCE_DIR}/test")
+        target_link_libraries(rasbery_cmfd_outer_device_replay PRIVATE CUDA::cudart)
+        set_target_properties(rasbery_cmfd_outer_device_replay PROPERTIES
+                CUDA_STANDARD 17
+                CUDA_STANDARD_REQUIRED YES
+                CUDA_ARCHITECTURES "${RASBERY_CUDA_ARCHITECTURES}"
+                CUDA_SEPARABLE_COMPILATION ON)
+        if (NOT MSVC)
+            target_compile_options(rasbery_cmfd_outer_device_replay PRIVATE
+                    $<$<COMPILE_LANGUAGE:CXX>:-march=native>)
+        endif ()
+        set_source_files_properties(
+                "${CMAKE_CURRENT_SOURCE_DIR}/test/cmfd_outer_device_replay.cu"
+                PROPERTIES COMPILE_OPTIONS "--fmad=false")
+
+        add_test(NAME cmfd_outer_device_replay
+                COMMAND rasbery_cmfd_outer_device_replay 4096)
     endif ()
 endif ()
