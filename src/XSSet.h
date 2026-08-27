@@ -449,6 +449,48 @@ public:
     /// in which case the caller runs the unchanged CPU loop.
     bool TryUpdateEquilibriumXenonGpu(double power, double relax, double& max_change);
 
+    // --- Raw fixed-point API (plan Rev.4 Sec 10.1) ------------------------
+    //
+    // UpdateEquilibriumXenon above evaluates the map, damps it, writes the
+    // three Xe-chain rows and reconstructs, all in one call.  These three take
+    // that apart so a caller can look at F(x) BEFORE committing anything --
+    // which is what the safeguarded Anderson arm in Driver.h needs.  Nothing
+    // in the default solve path calls them, and UpdateEquilibriumXenon is
+    // unchanged, so RASBERY_XE_ANDERSON unset is byte-golden.
+    //
+    // All three index their vectors by FUEL-NODE ORDINAL -- position in
+    // fuel_nodes(), NOT node index -- so the caller never touches the SoA
+    // stride and the halves cannot disagree about the layout.
+
+    /// Read the current Xe-chain inventory on fuel nodes: the iterate x.
+    /// Resizes the three outputs to fuel_nodes().size().
+    void SnapshotXenon(std::vector<double>& iodine_out, std::vector<double>& xenon_out,
+                       std::vector<double>& xe135m_out);
+
+    /// Evaluate the equilibrium map F(x) at the current inventory and flux
+    /// WITHOUT applying it: no _iden row, no _xs entry, no node reconstruction
+    /// and no generation bump.  Returns the same RAW (pre-damping) maximum
+    /// relative Xe-135 change UpdateEquilibriumXenon reports, so the two
+    /// numbers are directly comparable.  Always the host closed form, even
+    /// with RASBERY_GPU_XSRECON set: the device kernel fuses evaluate and
+    /// apply and has no evaluate-only entry point (see the XSSet.cpp header).
+    double EvaluateEquilibriumXenon(double power, std::vector<double>& iodine_out,
+                                    std::vector<double>& xenon_out,
+                                    std::vector<double>& xe135m_out);
+
+    /// Commit an accepted Xe-chain state: write the I-135/Xe-135/Xe-135m rows
+    /// of every fuel node, reconstruct those nodes, and bump the host-state
+    /// generation so the device arms re-upload.  Writes those three rows and
+    /// nothing else.  Throws if a vector length does not match fuel_nodes().
+    void CommitXenon(const std::vector<double>& iodine, const std::vector<double>& xenon,
+                     const std::vector<double>& xe135m);
+
+    /// Fuel-node index list in ascending node order; built once on first use
+    /// and geometry-fixed.  The single owner of the list -- the xsrecon device
+    /// arm batches over it too, so an independently built copy would be a
+    /// silent layout fork.
+    [[nodiscard]] const std::vector<int>& fuel_nodes();
+
     void PredictorStep(double dt, double power, bool xe_transient);
     void CorrectorStep(double dt, double power, bool xe_transient);
     void DecayIsotopeDensityFlat(std::vector<double>& iden_flat,

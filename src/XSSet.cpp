@@ -3407,9 +3407,23 @@ void XSSet::BuildTransitionMatrix(const std::vector<double>& cond, double sumflu
     mat(iNp237, iU238) += cond[iU238 * N_XS_SCALAR + XS2N] * sumflux;
 }
 
-/// Apply Xe-135 equilibrium overwrite on the isotope density vector.
-static void ApplyXeEquilibrium(milk::Vector<double>& iden, const std::vector<double>& cond,
-                               double sumflux) {
+/// The closed-form equilibrium image of the I-135/Xe-135/Xe-135m chain at one
+/// node.  COMPUTE ONLY: it writes nothing at all.
+///
+/// Split out of ApplyXeEquilibrium -- which is now the three-line wrapper below
+/// and keeps every one of its callers -- so the safeguarded Anderson arm of the
+/// Xe fixed point (Driver.h, plan Rev.4 Sec 10.1) can look at F(x) BEFORE
+/// deciding what to commit.  The arithmetic and the order it is evaluated in are
+/// unchanged, so every applied path is bit-for-bit what it was.
+struct XeEquilibriumImage {
+    double i135   = 0.0;
+    double xe135  = 0.0;
+    double xe135m = 0.0;
+};
+
+static XeEquilibriumImage ComputeXeEquilibrium(const milk::Vector<double>& iden,
+                                               const std::vector<double>& cond,
+                                               double sumflux) {
     using namespace Chiffon::Isotope;
     constexpr double lambdaI     = 2.930607e-05;
     constexpr double lambdaXe    = 2.106574e-05;
@@ -3428,9 +3442,21 @@ static void ApplyXeEquilibrium(milk::Vector<double>& iden, const std::vector<dou
     double Ieq    = fissSourceI / lambdaI;
     double Xeeq   = (lambdaI * Ieq + fissSourceXe) / (lambdaXe + sigaXe);
 
-    iden[iI135]   = Ieq;
-    iden[iXe135]  = Xeeq;
-    iden[iXe135m] = brItoXe135m * lambdaI * Ieq / lambdaXem;
+    XeEquilibriumImage img;
+    img.i135   = Ieq;
+    img.xe135  = Xeeq;
+    img.xe135m = brItoXe135m * lambdaI * Ieq / lambdaXem;
+    return img;
+}
+
+/// Apply Xe-135 equilibrium overwrite on the isotope density vector.
+static void ApplyXeEquilibrium(milk::Vector<double>& iden, const std::vector<double>& cond,
+                               double sumflux) {
+    using namespace Chiffon::Isotope;
+    const XeEquilibriumImage img = ComputeXeEquilibrium(iden, cond, sumflux);
+    iden[iI135]   = img.i135;
+    iden[iXe135]  = img.xe135;
+    iden[iXe135m] = img.xe135m;
 }
 
 // Divergence probe for the xsrecon A/B, behind RASBERY_XSRECON_DEBUG_HASH:
@@ -3535,13 +3561,11 @@ bool XSSet::TryUpdateEquilibriumXenonGpu(double power, double relax, double& max
     }
 
     const int nxyz = _g.nxyz();
-    if (_fuel_nodes.empty()) {
-        for (int l = 0; l < nxyz; ++l)
-            if (_g.IsFuel(l))
-                _fuel_nodes.push_back(l);
-        if (_fuel_nodes.empty())
-            return false; // no fuel: the CPU loop is an equally empty pass
-    }
+    // One owner for the list (see XSSet::fuel_nodes): the Anderson arm indexes
+    // its Xe-chain vectors by the SAME ordinals this kernel batches over, so a
+    // second, independently-built list would be a silent layout fork.
+    if (fuel_nodes().empty())
+        return false; // no fuel: the CPU loop is an equally empty pass
 
     // Page-lock the host arrays every call memcpys (~6 MB/call, thousands of
     // calls per case); pageable async copies block, pinned ones stream.
@@ -3735,6 +3759,200 @@ double XSSet::UpdateEquilibriumXenon(double power, double relax) {
     ++_hoststate_generation; // CPU arm wrote _xs and the Xe-chain _iden rows
     xsreconDebugHash(_xs, _iden, ng, nxyz, max_change);
     return max_change;
+}
+
+// ---------------------------------------------------------------------------
+// Raw fixed-point API for the safeguarded Anderson arm (plan Rev.4 Sec 10.1).
+//
+// UpdateEquilibriumXenon above is ONE fused operation: it evaluates the
+// closed-form image F(x), damps it, writes the three Xe-chain _iden rows and
+// reconstructs the touched nodes.  Anderson needs those halves apart, because it
+// has to see F(x) before it can decide what to commit:
+//
+//   SnapshotXenon             the current iterate x, read-only
+//   EvaluateEquilibriumXenon  F(x) and the raw residual, SIDE-EFFECT FREE
+//   CommitXenon               write an accepted x and reconstruct
+//
+// UpdateEquilibriumXenon itself is untouched, so with the Anderson gate unset
+// (the default) not one byte of the production path changes -- these three are
+// simply never called.
+//
+// FUEL-NODE ORDINALS, NOT NODE INDICES.  The three vectors all of them take and
+// return are indexed 0 .. fuel_nodes().size()-1, in the order fuel_nodes() lists
+// them (ascending node index, built once, geometry-fixed).  A caller therefore
+// never has to know the SoA stride, and Evaluate and Commit cannot disagree
+// about the layout because they read the same list.
+//
+// HOST ONLY, DELIBERATELY.  The device arm (XsReconKernel.h) fuses evaluate +
+// damp + apply + reconstruct into a single kernel, so there is no evaluate-only
+// device entry point to borrow and splitting the kernel would fork the bit-exact
+// A/B this campaign already gated.  Evaluate therefore always runs the host
+// closed form, even with RASBERY_GPU_XSRECON set.  That is affordable: the map
+// is ~8.5k nodes of micro-XS condensation, one to two orders below the flux
+// re-convergence an accelerated cascade removes.  Commit writes the host _iden
+// and bumps _hoststate_generation, which is exactly the signal the device
+// backend re-uploads its resident copy on, so the two arms cannot drift.
+// ---------------------------------------------------------------------------
+
+const std::vector<int>& XSSet::fuel_nodes() {
+    if (_fuel_nodes.empty()) {
+        const int nxyz = _g.nxyz();
+        for (int l = 0; l < nxyz; ++l)
+            if (_g.IsFuel(l))
+                _fuel_nodes.push_back(l);
+    }
+    return _fuel_nodes;
+}
+
+void XSSet::SnapshotXenon(std::vector<double>& iodine_out, std::vector<double>& xenon_out,
+                          std::vector<double>& xe135m_out) {
+    using namespace Isotope;
+
+    const std::vector<int>& fuel = fuel_nodes();
+    const size_t            nf   = fuel.size();
+    const size_t            nxyz = static_cast<size_t>(_g.nxyz());
+    iodine_out.resize(nf);
+    xenon_out.resize(nf);
+    xe135m_out.resize(nf);
+    for (size_t k = 0; k < nf; ++k) {
+        const size_t l = static_cast<size_t>(fuel[k]);
+        iodine_out[k]  = _iden[iI135 * nxyz + l];
+        xenon_out[k]   = _iden[iXe135 * nxyz + l];
+        xe135m_out[k]  = _iden[iXe135m * nxyz + l];
+    }
+}
+
+double XSSet::EvaluateEquilibriumXenon(double power, std::vector<double>& iodine_out,
+                                       std::vector<double>& xenon_out,
+                                       std::vector<double>& xe135m_out) {
+    using namespace Isotope;
+
+    // Identity seed.  F(x) = x on every node the production loop SKIPS -- no
+    // depletion data, zero power, or a node whose normalized flux is not
+    // positive -- so committing this image writes back exactly what is already
+    // there, and a skipped node contributes nothing to the residual.  Same
+    // no-op semantics the fused update has, expressed as data.
+    SnapshotXenon(iodine_out, xenon_out, xe135m_out);
+    if (depDecay.size() == 0 || power <= 0.0)
+        return 0.0;
+
+    const std::vector<int>& fuel = fuel_nodes();
+    const int               nf   = static_cast<int>(fuel.size());
+    if (nf == 0)
+        return 0.0;
+
+    xsphase::Scope eqxe_scope(xsphase::tallies().eqxe, static_cast<std::uint64_t>(nf));
+
+    const int    ng          = _g.ng();
+    const int    nxyz        = _g.nxyz();
+    const size_t niso        = Isotope::niso;
+    const double norm_factor = NormFactor(power);
+    double       max_change  = 0.0;
+
+#pragma omp parallel if (nf > OMP_THRESHOLD) reduction(max : max_change)
+    {
+        static thread_local DepletionWorkspace  ws_tls;
+        static thread_local std::vector<double> abs_flux_tls;
+
+        ws_tls.ensure(niso);
+        if (abs_flux_tls.size() != static_cast<size_t>(ng))
+            abs_flux_tls.resize(static_cast<size_t>(ng));
+        if (ws_tls.condensed.size() < niso * N_XS_SCALAR)
+            ws_tls.condensed.resize(niso * N_XS_SCALAR, 0.0);
+
+        const double* mic_ptrs[N_XS_SCALAR] = {
+            _micx.xstf.data(), _micx.xsdf.data(), _micx.xsaf.data(), _micx.xsff.data(),
+            _micx.xsnf.data(), _micx.xskf.data(), _micx.xssf.data(), _micx.xsrf.data(),
+            _micx.fyld.data(), _micx.xs2n.data(), _micx.xs3n.data()};
+
+#pragma omp for schedule(dynamic, 8)
+        for (int k = 0; k < nf; ++k) {
+            const int l = fuel[static_cast<size_t>(k)];
+
+            double raw_sumflux = 0.0;
+            for (int ig = 0; ig < ng; ++ig) {
+                abs_flux_tls[static_cast<size_t>(ig)] =
+                    _g.Phif()[l * ng + ig] * norm_factor;
+                raw_sumflux += abs_flux_tls[static_cast<size_t>(ig)];
+            }
+            if (raw_sumflux <= 0.0)
+                continue;
+
+            const double invflux = 1.0 / raw_sumflux;
+            xsphase::Scope condense_scope(xsphase::tallies().eqxe_condense, 1);
+            for (size_t iso = 0; iso < niso; ++iso) {
+                double* dst = ws_tls.condensed.data() + iso * N_XS_SCALAR;
+                for (size_t xt = 0; xt < N_XS_SCALAR; ++xt) {
+                    double sum = 0.0;
+                    for (int ig = 0; ig < ng; ++ig) {
+                        const size_t off =
+                            (iso * static_cast<size_t>(ng) + static_cast<size_t>(ig)) *
+                                static_cast<size_t>(nxyz) +
+                            static_cast<size_t>(l);
+                        sum += mic_ptrs[xt][off] * abs_flux_tls[static_cast<size_t>(ig)];
+                    }
+                    dst[xt] = sum * invflux;
+                }
+                ws_tls.iden[iso] = _iden[iso * static_cast<size_t>(nxyz) +
+                                         static_cast<size_t>(l)];
+            }
+
+            const double             old_xe = ws_tls.iden[iXe135];
+            const XeEquilibriumImage img =
+                ComputeXeEquilibrium(ws_tls.iden, ws_tls.condensed,
+                                     FluxScale(abs_flux_tls.data(), ng));
+            const double scale = std::max(std::abs(img.xe135), 1.0e-30);
+            // THE SAME metric UpdateEquilibriumXenon returns: raw, measured on
+            // the undamped image, |F(x)-x|/|F(x)| over Xe-135.  The Anderson
+            // trust region compares its candidate against this number, so the
+            // two have to be the same measurement or the comparison is meaningless.
+            max_change = std::max(max_change, std::abs(img.xe135 - old_xe) / scale);
+
+            iodine_out[static_cast<size_t>(k)] = img.i135;
+            xenon_out[static_cast<size_t>(k)]  = img.xe135;
+            xe135m_out[static_cast<size_t>(k)] = img.xe135m;
+        }
+    }
+    // Nothing was written: no _iden row, no _xs entry, no generation bump, no
+    // node reconstructed.  That is the whole contract of this function -- a
+    // caller that rejects the image leaves the solver exactly as it found it.
+    return max_change;
+}
+
+void XSSet::CommitXenon(const std::vector<double>& iodine, const std::vector<double>& xenon,
+                        const std::vector<double>& xe135m) {
+    using namespace Isotope;
+
+    const std::vector<int>& fuel = fuel_nodes();
+    const size_t            nf   = fuel.size();
+    if (nf == 0)
+        return;
+    // A short vector would commit a partial inventory and leave the rest of the
+    // core on the previous iterate -- a silently mixed Xe state that no
+    // downstream check could attribute.  Refuse instead of publishing it.
+    if (iodine.size() != nf || xenon.size() != nf || xe135m.size() != nf)
+        throw std::runtime_error(
+            "XSSet::CommitXenon: Xe-chain vector length does not match the fuel-node count");
+
+    const int    nfi  = static_cast<int>(nf);
+    const size_t nxyz = static_cast<size_t>(_g.nxyz());
+
+#pragma omp parallel for schedule(dynamic, 8) if (nfi > OMP_THRESHOLD)
+    for (int k = 0; k < nfi; ++k) {
+        const size_t idx = static_cast<size_t>(k);
+        const size_t l   = static_cast<size_t>(fuel[idx]);
+        // EXACTLY the three Xe-chain rows ApplyXeEquilibrium owns, and nothing
+        // else: the rest of the isotope vector belongs to depletion.
+        _iden[iI135 * nxyz + l]   = iodine[idx];
+        _iden[iXe135 * nxyz + l]  = xenon[idx];
+        _iden[iXe135m * nxyz + l] = xe135m[idx];
+        // The same per-node reconstruction the fused update does, into the same
+        // timing bucket: only fuel-node Xe-chain densities moved, and
+        // ReconstructNode reads nothing but node l.
+        xsphase::Scope recon_scope(xsphase::tallies().eqxe_recon, 1);
+        ReconstructNode(l);
+    }
+    ++_hoststate_generation; // host wrote _xs and the Xe-chain _iden rows
 }
 
 void XSSet::DepleteNode(DepletionWorkspace& ws, size_t l,

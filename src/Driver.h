@@ -18,6 +18,7 @@
 #include "CompatFormat.h"
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace rasbery {
 
@@ -162,6 +163,21 @@ struct Counters {
     /// XE_ONCE_TRUST.  Counted at the cap too, so a cascade that ran out of steps
     /// while still outside the region is visible as trips == XE_ONCE_MAX_STEPS.
     long long xe_once_trust_trips  = 0;
+    /// RASBERY_XE_ANDERSON only (plan Rev.4 Sec 10.5).  A cascade step where the
+    /// history held at least one residual difference and the residual was still
+    /// above tolerance, so an extrapolated candidate was actually built:
+    /// proposed == accepted + rejected, exactly.
+    long long xe_aa_proposed       = 0;
+    /// Candidates that passed every safeguard and were committed.
+    long long xe_aa_accepted       = 0;
+    /// Candidates that failed one, and fell back to the production Picard step.
+    /// ONE counter with the reason folded in; RASBERY_XE_ANDERSON_DEBUG prints
+    /// the per-rejection reason so the distribution is recoverable when wanted.
+    long long xe_aa_rejected       = 0;
+    /// History discards: the cascade re-arm after a committed T/H or search
+    /// perturbation, and damper activation.  A reset with nothing stored is not
+    /// charged, so this counts real discards rather than outers.
+    long long xe_aa_history_resets = 0;
     long long search_trials        = 0;  ///< committed AND applied trial points
     long long th_updates           = 0;
     long long flux_limit_retries   = 0;  ///< flux limit-cycle events ([WARN][flux])
@@ -218,6 +234,10 @@ struct Counters {
         xe_budget_exhausted  += step.xe_budget_exhausted;
         xe_once_extra_steps  += step.xe_once_extra_steps;
         xe_once_trust_trips  += step.xe_once_trust_trips;
+        xe_aa_proposed       += step.xe_aa_proposed;
+        xe_aa_accepted       += step.xe_aa_accepted;
+        xe_aa_rejected       += step.xe_aa_rejected;
+        xe_aa_history_resets += step.xe_aa_history_resets;
         search_trials        += step.search_trials;
         th_updates           += step.th_updates;
         flux_limit_retries   += step.flux_limit_retries;
@@ -417,6 +437,61 @@ inline const char* xeModeName() {
     return "equilibrium";
 }
 
+// Safeguarded Anderson acceleration of the in-core Xe fixed point
+// (RASBERY_XE_ANDERSON, plan Rev.4 Sec 10).  Default OFF, and OFF means the
+// plain Picard cascade byte for byte: the gate is one cached env read, the
+// solver holds one extra bool, and the only new call in the step is short-
+// circuited by it.
+//
+// WHAT IT IS.  Anderson does NOT change the map, the acceptance semantics or
+// the convergence test.  The same F(x) is evaluated at the same points, the
+// same XE_EQUILIBRIUM_TOLERANCE decides when the cascade is done, and the
+// same damping machinery is in charge whenever it engages.  What changes is
+// the ITERATE: instead of x_{k+1} = F(x_k) it takes the extrapolation the
+// least-squares fit of the last two residual differences predicts, which on a
+// contraction of rho 0.4-0.75 (measured: fresh-core cascades of 10-15 Picard
+// steps, restart decks ~97 Xe updates per statepoint) reaches the SAME
+// tolerance in 2-4 steps.  83.5 % of outers on both fleets are Xe
+// re-convergence, so the cascade multiplicity is the whole lever.
+//
+// WHY IT IS NOT THE STEP HEURISTICS.  RASBERY_XE_MODE=frozen/once cap the
+// cascade -- they publish an inventory that is NOT the fixed point, which is
+// why both failed on the restart fleet (shock, then trust-loop overhead).
+// Anderson converges the same fixed point to the same tolerance; the published
+// state is the one the production test accepted.
+//
+// EQUILIBRIUM MODE ONLY.  frozen has no cascade to accelerate and once is
+// deliberately not converging one, so asking for Anderson in either is a
+// misconfiguration and is reported rather than silently honoured.
+inline bool xeAnderson() {
+    static const bool on = [] {
+        const char* value = std::getenv("RASBERY_XE_ANDERSON");
+        if (value == nullptr)
+            return false;
+        const std::string s(value);
+        if (s.empty() || s == "0" || s == "off" || s == "OFF" || s == "false" || s == "FALSE")
+            return false;
+        if (xeMode() != XeMode::EQUILIBRIUM) {
+            std::cerr << "[RASBERY][WARN][xe] RASBERY_XE_ANDERSON is set with "
+                         "RASBERY_XE_MODE="
+                      << xeModeName()
+                      << "; Anderson accelerates the equilibrium cascade and has nothing "
+                         "to accelerate in that mode -- staying off\n";
+            return false;
+        }
+        return true;
+    }();
+    return on;
+}
+
+/// Per-rejection reason trace for the Anderson arm (RASBERY_XE_ANDERSON_DEBUG).
+/// Off by default; the counters in the SPTELEM receipt carry the totals, and
+/// this is the only thing that resolves them into a reason distribution.
+inline bool xeAndersonDebug() {
+    static const bool on = std::getenv("RASBERY_XE_ANDERSON_DEBUG") != nullptr;
+    return on;
+}
+
 class Driver {
 private:
     std::string _input;
@@ -479,6 +554,34 @@ private:
     // one-step fast path is exactly what it was.
     static constexpr int    XE_ONCE_MAX_STEPS = 3;
     static constexpr double XE_ONCE_TRUST     = 0.10;
+    // --- Safeguarded Anderson (RASBERY_XE_ANDERSON, plan Rev.4 Sec 10) -------
+    //
+    // Window depth.  Sec 10.5 says start at 2 and try 3 only after the Gate:
+    // two residual differences is the smallest window that can see curvature,
+    // and every extra column is another chance for an ill-conditioned normal
+    // matrix on a map whose residual is already near the noise floor.
+    static constexpr int    XE_ANDERSON_DEPTH = 2;
+    // Trust region, as a MULTIPLE of the Picard step this candidate replaces,
+    // in the same raw |dXe|/|Xe| metric UpdateEquilibriumXenon returns
+    // (RASBERY_XE_ANDERSON_MAX_STEP overrides).  Anderson's whole failure mode
+    // is a long extrapolation off a nearly-singular fit, and the measured
+    // consequence of an oversized Xe step on this solver is not a wrong answer
+    // but a dead run: an absorption-XS jolt the converged flux cannot absorb,
+    // which killed 17 of 64 i-SMR CY02 restart jobs at M64 with a non-finite
+    // BiCGSTAB iterate.  1.25 lets the extrapolation overshoot the Picard step
+    // enough to be worth taking -- an AA(1) secant step on a rho=0.5 contraction
+    // is ~2x the Picard step in RESIDUAL but well inside this in step norm --
+    // while leaving the shock bounded by something the flux already survives.
+    static constexpr double XE_ANDERSON_MAX_STEP = 1.25;
+    // Conditioning floor for the least-squares fit, as a normalized Gram
+    // determinant: a two-column solve needs det(G) > this * G00 * G11, i.e. the
+    // two residual differences must not be within ~1e-4 rad of parallel, and a
+    // one-column solve needs <d,d> > this * <g,g>, i.e. the residual must
+    // actually have MOVED relative to its own size.  Both are scale-free, so
+    // the same number works at 1e-1 and at 1e-6 residual.  Failing the
+    // two-column test drops to the newest column alone rather than rejecting;
+    // failing the one-column test rejects.
+    static constexpr double XE_ANDERSON_MIN_GRAM = 1.0e-8;
     // A damped iteration legitimately needs about twice the steps for the same contraction,
     // so it gets about twice the budget.  Without this the damping trades a limit cycle for
     // a cap-exhausted, still-unconverged Xe state -- a different way to publish the wrong
@@ -579,6 +682,373 @@ private:
             if (converged)
                 return;
         }
+    }
+
+    // =====================================================================
+    // Safeguarded Anderson acceleration of the in-core Xe fixed point
+    // (RASBERY_XE_ANDERSON, plan Rev.4 Sec 10).
+    //
+    // Everything from here to TryAndersonXeStep is unreachable with the gate
+    // unset: SolveLoop's single entry point short-circuits on a cached bool
+    // before the call is formed.  The one cost the default path pays is
+    // constructing an empty XeAndersonState -- nine empty std::vectors, no
+    // allocation, no clock read, no branch inside the outer loop.
+    //
+    // THE FORMULA, EXACTLY AS IMPLEMENTED.  Type-II Anderson with window
+    // m = XE_ANDERSON_DEPTH and mixing beta = 1 -- no extra relaxation on top,
+    // because Sec 10.5 forbids damping an Anderson candidate and the damper's
+    // own engagement switches the whole arm off instead.
+    //
+    // At step k the map has been evaluated at the current iterate x_k:
+    //
+    //     F_k = F(x_k)        g_k = F_k - x_k
+    //
+    // and the history holds the last n <= m difference columns, taken between
+    // CONSECUTIVE evaluations (j = n-1 is the newest):
+    //
+    //     dF_j = F_{j+1} - F_j        dG_j = g_{j+1} - g_j
+    //
+    // Solve the small least squares in residual space,
+    //
+    //     min_gamma || g_k - sum_j gamma_j dG_j ||_2
+    //
+    // through its explicit normal equations.  For n = 2, with
+    //
+    //     a = <dG_0,dG_0>   b = <dG_0,dG_1>   c = <dG_1,dG_1>
+    //     p = <dG_0,g_k>    q = <dG_1,g_k>    det = a*c - b*b
+    //
+    //     gamma_0 = (c*p - b*q) / det        gamma_1 = (a*q - b*p) / det
+    //
+    // and for n = 1 -- also the fallback when the two-column Gram matrix is
+    // ill-conditioned -- with d the NEWEST column,
+    //
+    //     gamma = <d,g_k> / <d,d>
+    //
+    // which is the secant / Aitken extrapolation written as AA(1).  The
+    // candidate is
+    //
+    //     x_{k+1} = F_k - sum_j gamma_j dF_j
+    //
+    // and the same normal equations give the model's predicted squared residual
+    //
+    //     ||g_pred||^2 = <g_k,g_k> - sum_j gamma_j <dG_j,g_k>
+    //
+    // which is what the predicted-decrease safeguard tests.  Setting every
+    // gamma to zero reproduces x_{k+1} = F_k, the plain undamped Picard step,
+    // so the acceleration is a strict generalization of the map it replaces and
+    // never a different map.
+    //
+    // TWO DEVIATIONS FROM SEC 10, BOTH DELIBERATE AND BOTH DOCUMENTED HERE.
+    //
+    // (a) NO FULL-EXACT TRUE-RESIDUAL ACCEPTANCE.  Sec 10.4 wants a candidate
+    //     accepted only after a subsequent full-exact evaluation confirms the
+    //     true residual fell, and Sec 10.2/10.3 want that trial to run on a
+    //     side-effect-free coupled snapshot with transactional rollback.  That
+    //     is a large, separate piece of machinery -- CoupledStateSnapshot has
+    //     to carry flux, fission source, eigenvalue, current, d-hat, cusping
+    //     state and the XS generation -- and it is deferred to a later
+    //     hardening pass.  What stands in for it here is the trust cap: a
+    //     candidate may not move the inventory further than
+    //     XE_ANDERSON_MAX_STEP times the Picard step it replaces, in the same
+    //     raw metric, so the worst an accepted candidate can do is the shock a
+    //     1.25x Picard step delivers -- and the cascade then re-converges the
+    //     flux and re-measures the residual at the very next outer, which is
+    //     the production convergence test doing the checking one step late.
+    //
+    // (b) NO AXIAL BRANCH GUARD.  Sec 10.4's |AO_candidate - AO_picard| test
+    //     needs the candidate's converged axial power, i.e. exactly the trial
+    //     solve (a) defers.  Until then the axial-branch property is a
+    //     VALIDATION-level obligation, not a runtime one: Gate A/B compare AO
+    //     against the frozen exact baseline, and the arm is not adoptable on a
+    //     run whose AO moved.  The damper interlock below is the runtime half
+    //     of the same concern -- when the damper engages it is SELECTING a root
+    //     (see the xe_relax initializer's cy02 case), and an extrapolation
+    //     built from the pre-damping map would fight that choice, so Anderson
+    //     stands down for the rest of the solve and its history goes with it.
+    // =====================================================================
+
+    /// One (I-135, Xe-135, Xe-135m) field over the fuel nodes, indexed by
+    /// fuel-node ORDINAL (XSSet::fuel_nodes()).  The Anderson algebra treats
+    /// the three rows as one vector of length 3*n_fuel; keeping them as three
+    /// arrays is what lets Evaluate/Commit take them with no repack.
+    struct XeTriple {
+        std::vector<double> i135;
+        std::vector<double> xe135;
+        std::vector<double> xe135m;
+        [[nodiscard]] size_t size() const { return xe135.size(); }
+        void resize(size_t n) {
+            i135.resize(n);
+            xe135.resize(n);
+            xe135m.resize(n);
+        }
+    };
+
+    /// <a,b> over the concatenated 3*n_fuel vector.
+    static double XeDot(const XeTriple& a, const XeTriple& b) {
+        const size_t n   = a.size();
+        double       sum = 0.0;
+        for (size_t i = 0; i < n; ++i)
+            sum += a.i135[i] * b.i135[i] + a.xe135[i] * b.xe135[i] +
+                   a.xe135m[i] * b.xe135m[i];
+        return sum;
+    }
+
+    /// out = a - b over all three rows.
+    static void XeSub(const XeTriple& a, const XeTriple& b, XeTriple& out) {
+        const size_t n = a.size();
+        out.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            out.i135[i]   = a.i135[i] - b.i135[i];
+            out.xe135[i]  = a.xe135[i] - b.xe135[i];
+            out.xe135m[i] = a.xe135m[i] - b.xe135m[i];
+        }
+    }
+
+    static void XeSwap(XeTriple& a, XeTriple& b) {
+        a.i135.swap(b.i135);
+        a.xe135.swap(b.xe135);
+        a.xe135m.swap(b.xe135m);
+    }
+
+    /// The raw relative Xe-135 change of `cand` against `base`, in EXACTLY the
+    /// metric UpdateEquilibriumXenon returns -- max over fuel nodes of
+    /// |new - old| / max(|new|, 1e-30) -- so the trust region compares the
+    /// candidate against the Picard step in one and the same measurement.
+    static double XeRelativeChange(const XeTriple& cand, const XeTriple& base) {
+        const size_t n     = cand.size();
+        double       worst = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const double scale = std::max(std::abs(cand.xe135[i]), 1.0e-30);
+            worst = std::max(worst, std::abs(cand.xe135[i] - base.xe135[i]) / scale);
+        }
+        return worst;
+    }
+
+    /// Anderson history for ONE Xe cascade.  Declared as a SolveLoop local, so
+    /// it is destroyed at every exit and no history can outlive a depletion
+    /// step (Drive() runs PredictorStep/CorrectorStep BETWEEN SolveLoop calls).
+    struct XeAndersonState {
+        XeTriple x;      ///< x_k, the iterate the map was evaluated at
+        XeTriple f;      ///< F(x_k)
+        XeTriple g;      ///< g_k = F(x_k) - x_k
+        XeTriple f_prev; ///< F at the previous evaluation
+        XeTriple g_prev; ///< g at the previous evaluation
+        XeTriple df[XE_ANDERSON_DEPTH];
+        XeTriple dg[XE_ANDERSON_DEPTH];
+        XeTriple cand; ///< the proposed x_{k+1}
+        int      ncol      = 0;     ///< usable difference columns, newest last
+        bool     have_prev = false; ///< an evaluation is on record to difference against
+
+        /// Is there anything to discard?  So that a reset at a cascade boundary
+        /// the arm never stepped in is not charged to the telemetry.
+        [[nodiscard]] bool holds_history() const { return have_prev || ncol > 0; }
+        /// Drop the history, keep the buffers: the next cascade has the same
+        /// fuel-node count, so freeing them would be pure allocator churn.
+        void forget() {
+            have_prev = false;
+            ncol      = 0;
+        }
+    };
+
+    /// Discard the Anderson history (Sec 10.5).  The history is only meaningful
+    /// while the MAP is fixed, so every event that moves the macro-XS -- a
+    /// committed T/H step, a committed search trial -- invalidates it, and so
+    /// does damper activation, which changes which root the cascade is heading
+    /// for.  Cheap and idempotent; charges the counter only for a real discard.
+    static void ResetXeAndersonHistory(SolverContext& ctx, XeAndersonState& aa) {
+        if (!aa.holds_history())
+            return;
+        aa.forget();
+        ++ctx.telemetry.xe_aa_history_resets;
+    }
+
+    /// Charge one rejection and, only under RASBERY_XE_ANDERSON_DEBUG, say why.
+    /// ONE counter with the reason folded in (Sec 10.5 lists the reasons
+    /// separately; the receipt stays one field and this trace resolves it).
+    static void RejectXeAnderson(SolverContext& ctx, const char* reason, int cols,
+                                 double picard, double value) {
+        ++ctx.telemetry.xe_aa_rejected;
+        if (xeAndersonDebug())
+            std::cerr << std::format(
+                "[RASBERY][DEBUG][xe-aa] rejected ({}) cols={} picard={:.3e} value={:.3e}\n",
+                reason, cols, picard, value);
+    }
+
+    /// One safeguarded Anderson step on the Xe fixed point.
+    ///
+    /// Returns TRUE only when a candidate passed every safeguard and was
+    /// committed; `xe_change` then carries the RAW residual measured at x_k,
+    /// which is the same number UpdateEquilibriumXenon would have returned, so
+    /// every downstream consumer of it (the convergence test, the damper's
+    /// contraction streak, the trace line) reads exactly what it always read.
+    ///
+    /// Returns FALSE having written NOTHING -- no _iden row, no reconstruction,
+    /// no generation bump.  The caller then runs the production Picard step on
+    /// a solver state that is byte-for-byte what that step expects.  A refusal
+    /// costs one extra HOST map evaluation and no flux solve; buying the
+    /// property that the fallback is literally the production path, rather than
+    /// a second near-copy of it, is worth that on a cascade whose every step
+    /// otherwise pays a full flux re-convergence.
+    static bool TryAndersonXeStep(SolverContext& ctx, XeAndersonState& aa, double power,
+                                  double max_step, double& xe_change) {
+        XSSet& xs = ctx.cross_sections;
+
+        // 1. Evaluate the map without applying it (plan Sec 10.1).
+        xs.SnapshotXenon(aa.x.i135, aa.x.xe135, aa.x.xe135m);
+        const double picard =
+            xs.EvaluateEquilibriumXenon(power, aa.f.i135, aa.f.xe135, aa.f.xe135m);
+        const size_t n = aa.x.size();
+        if (n == 0 || aa.f.size() != n)
+            return false;
+        XeSub(aa.f, aa.x, aa.g);
+
+        // 2. Roll the history forward BEFORE deciding anything.  A refused step
+        //    still contributes its pair: the Picard step the caller falls back
+        //    to advances the SAME iteration on the SAME map, so the next
+        //    evaluation's difference column is only meaningful if this one was
+        //    recorded.  Sec 10.5: raw, undamped (x, F(x)) pairs only.
+        if (aa.have_prev) {
+            if (aa.ncol == XE_ANDERSON_DEPTH) {
+                for (int j = 0; j + 1 < XE_ANDERSON_DEPTH; ++j) {
+                    XeSwap(aa.df[j], aa.df[j + 1]);
+                    XeSwap(aa.dg[j], aa.dg[j + 1]);
+                }
+                --aa.ncol; // the oldest column falls out of the window
+            }
+            XeSub(aa.f, aa.f_prev, aa.df[aa.ncol]);
+            XeSub(aa.g, aa.g_prev, aa.dg[aa.ncol]);
+            ++aa.ncol;
+        }
+        aa.f_prev    = aa.f;
+        aa.g_prev    = aa.g;
+        aa.have_prev = true;
+
+        // The fuel-node count is geometry-fixed for the whole run, so a column
+        // of the wrong length can only be a bug -- but the dot products below
+        // index one vector by the other's length, so start the window over
+        // rather than run off the end of it.
+        for (int j = 0; j < aa.ncol; ++j)
+            if (aa.dg[j].size() != n || aa.df[j].size() != n) {
+                aa.forget();
+                return false;
+            }
+
+        // 3. Arming -- NOT a rejection, so neither counter moves.  There is
+        //    nothing to extrapolate from on a cascade's first step; and below
+        //    the convergence tolerance the cascade is finished, so an
+        //    extrapolation buys no steps and would put a state the production
+        //    test never measured into the published inventory.  With this test
+        //    in place, what a cascade PUBLISHES is always a plain Picard image.
+        if (aa.ncol == 0 || picard < XE_EQUILIBRIUM_TOLERANCE)
+            return false;
+
+        ++ctx.telemetry.xe_aa_proposed;
+
+        // 4. The least squares, through explicit normal equations.
+        //    SAFEGUARD 1/4: conditioning.  A two-column Gram matrix within
+        //    ~1e-4 rad of singular drops to the newest column alone; a
+        //    one-column fit whose residual barely moved is refused outright,
+        //    because gamma = <d,g>/<d,d> is then an arbitrarily long lever.
+        static_assert(XE_ANDERSON_DEPTH == 2,
+                      "the normal equations below are written out for a two-column window; "
+                      "Sec 10.5 allows trying depth 3 after the Gate, and that needs a "
+                      "general small least-squares solve, not just a wider array");
+        const double gg = XeDot(aa.g, aa.g);
+        double       gamma[XE_ANDERSON_DEPTH] = {};
+        double       proj                     = 0.0; // sum_j gamma_j <dG_j, g_k>
+        bool         solved                   = false;
+        if (aa.ncol == XE_ANDERSON_DEPTH) {
+            const double a   = XeDot(aa.dg[0], aa.dg[0]);
+            const double b   = XeDot(aa.dg[0], aa.dg[1]);
+            const double c   = XeDot(aa.dg[1], aa.dg[1]);
+            const double p   = XeDot(aa.dg[0], aa.g);
+            const double q   = XeDot(aa.dg[1], aa.g);
+            const double det = a * c - b * b;
+            if (a > 0.0 && c > 0.0 && std::isfinite(det) && std::isfinite(p) &&
+                std::isfinite(q) && det > XE_ANDERSON_MIN_GRAM * a * c) {
+                gamma[0] = (c * p - b * q) / det;
+                gamma[1] = (a * q - b * p) / det;
+                proj     = gamma[0] * p + gamma[1] * q;
+                solved   = true;
+            }
+        }
+        if (!solved) {
+            const int    j = aa.ncol - 1; // the newest column
+            const double a = XeDot(aa.dg[j], aa.dg[j]);
+            const double p = XeDot(aa.dg[j], aa.g);
+            if (a > 0.0 && std::isfinite(a) && std::isfinite(p) &&
+                a > XE_ANDERSON_MIN_GRAM * gg) {
+                for (double& gj : gamma)
+                    gj = 0.0;
+                gamma[j] = p / a;
+                proj     = gamma[j] * p;
+                solved   = true;
+            }
+        }
+        if (!solved) {
+            RejectXeAnderson(ctx, "condition", aa.ncol, picard, gg);
+            return false;
+        }
+
+        // SAFEGUARD 2/4: the fit must predict a residual DECREASE.  With an
+        // exact least squares this holds unless gamma is zero, but the
+        // one-column fallback and finite precision can both break it, and a fit
+        // that predicts no progress has no business moving the iterate.
+        const double pred2 = gg - proj;
+        if (!(std::isfinite(pred2) && pred2 >= 0.0 && pred2 < gg)) {
+            RejectXeAnderson(ctx, "residual", aa.ncol, picard, pred2);
+            return false;
+        }
+
+        // x_{k+1} = F_k - sum_j gamma_j dF_j.
+        aa.cand.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            double vi = aa.f.i135[i];
+            double vx = aa.f.xe135[i];
+            double vm = aa.f.xe135m[i];
+            for (int j = 0; j < aa.ncol; ++j) {
+                vi -= gamma[j] * aa.df[j].i135[i];
+                vx -= gamma[j] * aa.df[j].xe135[i];
+                vm -= gamma[j] * aa.df[j].xe135m[i];
+            }
+            aa.cand.i135[i]   = vi;
+            aa.cand.xe135[i]  = vx;
+            aa.cand.xe135m[i] = vm;
+        }
+
+        // SAFEGUARD 3/4: physics.  Every density finite and non-negative.  A
+        // negative Xe-135 is not a slightly wrong inventory -- it is a negative
+        // absorption cross section handed to the flux solve.
+        for (size_t i = 0; i < n; ++i) {
+            const double vi = aa.cand.i135[i];
+            const double vx = aa.cand.xe135[i];
+            const double vm = aa.cand.xe135m[i];
+            if (!(std::isfinite(vi) && std::isfinite(vx) && std::isfinite(vm)) ||
+                vi < 0.0 || vx < 0.0 || vm < 0.0) {
+                RejectXeAnderson(ctx, "physics", aa.ncol, picard, vx);
+                return false;
+            }
+        }
+
+        // SAFEGUARD 4/4: the trust region.  The candidate may not move the
+        // inventory further than max_step times the Picard step it replaces,
+        // measured the same way.  This is what stands in for the deferred
+        // full-exact true-residual acceptance (see the deviation note above):
+        // it bounds the shock the converged flux is asked to absorb by a factor
+        // of a step it already survives.  Written as !(<=) so a NaN rejects.
+        const double step = XeRelativeChange(aa.cand, aa.x);
+        if (!(step <= max_step * picard)) {
+            RejectXeAnderson(ctx, "step", aa.ncol, picard, step);
+            return false;
+        }
+
+        // Accepted.  Commit writes exactly the three Xe-chain rows, reconstructs
+        // the fuel nodes and bumps the host-state generation, which is what the
+        // device arms re-upload on.
+        xs.CommitXenon(aa.cand.i135, aa.cand.xe135, aa.cand.xe135m);
+        ++ctx.telemetry.xe_aa_accepted;
+        xe_change = picard;
+        return true;
     }
 
     // Frozen-Xe startup guard (RASBERY_XE_MODE=frozen), one line, once per run.
@@ -692,6 +1162,15 @@ private:
         // process), and every once-specific term below short-circuits on it, so
         // an unset variable leaves all of them exactly what they were.
         const bool   xe_once_mode   = xeOnce();
+        // Safeguarded Anderson acceleration of the SAME cascade
+        // (RASBERY_XE_ANDERSON, plan Rev.4 Sec 10; see the comment block above
+        // TryAndersonXeStep for the formula and the two deviations).  Read once
+        // here, exactly like the two mode terms beside it, and decided before
+        // anything in the solve moves.  xeAnderson() is a cached lookup of an
+        // env var resolved once per process and already refuses every mode but
+        // equilibrium, so an unset variable leaves this false and the single
+        // consumer below short-circuits to the pre-Anderson expression.
+        const bool   xe_anderson    = xeAnderson();
         // Optional multi-fidelity GA screening mode.  A positive value limits
         // the expensive Xe and T/H fixed-point feedback passes, while the
         // default (0/unset) preserves the production solver exactly.  Screened
@@ -815,6 +1294,26 @@ private:
             const double t     = (value != nullptr) ? std::atof(value) : XE_ONCE_TRUST;
             return (t > 0.0) ? t : XE_ONCE_TRUST;
         }();
+        // Anderson trust region (RASBERY_XE_ANDERSON_MAX_STEP, default
+        // XE_ANDERSON_MAX_STEP): the largest step, as a multiple of the Picard
+        // step it replaces, an extrapolated candidate is allowed to take.
+        // Cached in a function-local static like every other knob here, so the
+        // loop never reaches getenv, and read only under xe_anderson.  A
+        // non-positive or unparsable override would refuse every candidate and
+        // silently turn the feature off, so it falls back to the default.
+        static const double xe_aa_max_step = [] {
+            const char*  value = std::getenv("RASBERY_XE_ANDERSON_MAX_STEP");
+            const double t     = (value != nullptr) ? std::atof(value) : XE_ANDERSON_MAX_STEP;
+            return (t > 0.0) ? t : XE_ANDERSON_MAX_STEP;
+        }();
+        // Anderson history for the cascade (plan Rev.4 Sec 10.5).  Declared
+        // HERE, which IS cascade start 1 -- the same site the cascade counter
+        // and the once-mode allowance are armed at -- and, being a SolveLoop
+        // local, destroyed at every exit, so no history can survive a depletion
+        // step: Drive() runs PredictorStep/CorrectorStep BETWEEN SolveLoop
+        // calls.  Constructed unconditionally (nine empty vectors, no
+        // allocation) and touched only under xe_anderson.
+        XeAndersonState xe_aa{};
         double prev_xe_change = std::numeric_limits<double>::infinity();
         int    xe_no_progress = 0;   // consecutive Xe steps that did not shrink
         int    xe_interim_count = 0; // loose-flux Xe steps (RASBERY_XE_INTERIM_L2)
@@ -1041,8 +1540,41 @@ private:
                 // safe direction and is nowhere near binding at a cap of three.
                 const bool xe_once_full = xe_once_mode && xe_once_steps == 0 && !xe_once_prime;
                 if (xe_once_mode) xe_relax = xe_once_full ? 1.0 : XE_DAMPED_RELAX;
-                const double xe_change =
-                    ctx.cross_sections.UpdateEquilibriumXenon(schedule.thermalPower(), xe_relax);
+                // Safeguarded Anderson attempt on the SAME map, at the SAME
+                // point, with the SAME acceptance semantics -- only the iterate
+                // differs (see TryAndersonXeStep).  Three terms guard it, and
+                // all three short-circuit, so with the feature unset the
+                // initializer below is exactly the pre-Anderson one and nothing
+                // else is evaluated:
+                //
+                //   xe_anderson       the cached feature gate.
+                //   xe_relax == 1.0   the oscillation damper is not engaged.
+                //                     Once it is, it is SELECTING a root, and an
+                //                     extrapolation built off the pre-damping
+                //                     map must not fight that choice.
+                //   flux_converged    the step is being taken on the converged
+                //                     flux.  What Anderson iterates is the
+                //                     COMPOSITE map x -> (converge the flux at
+                //                     x) -> equilibrium Xe, and only a
+                //                     converged-flux evaluation is a point of
+                //                     that map.  The other two ways into this
+                //                     block -- the RASBERY_XE_INTERIM_L2 probe's
+                //                     loose flux and the flux-limit-cycle
+                //                     fall-through -- evaluate something else,
+                //                     so they take the plain step and are never
+                //                     recorded in the history.  On the default
+                //                     configuration this term is already true
+                //                     wherever the step fires.
+                //
+                // The attempt writes nothing unless it accepts, so the fallback
+                // is the production step running on an untouched solver state.
+                double     xe_change   = 0.0;
+                const bool xe_aa_taken = xe_anderson && xe_relax == 1.0 && flux_converged &&
+                                         TryAndersonXeStep(ctx, xe_aa, schedule.thermalPower(),
+                                                           xe_aa_max_step, xe_change);
+                if (!xe_aa_taken)
+                    xe_change =
+                        ctx.cross_sections.UpdateEquilibriumXenon(schedule.thermalPower(), xe_relax);
                 // An Xe step moves the macro-XS whatever it returns, so it opens
                 // an XE segment even when the change is under tolerance and the
                 // loop falls through to the search/T-H checks below.
@@ -1089,6 +1621,15 @@ private:
                 // against DIFFERENT macro-XS states, which is not a limit cycle.
                 if (!xe_once_mode && xe_relax == 1.0 && xe_no_progress >= xe_streak_limit) {
                     xe_relax = XE_DAMPED_RELAX;
+                    // Anderson stands down here for the rest of the solve --
+                    // xe_relax never goes back up -- because the damper is a
+                    // ROOT SELECTOR, not a speed knob (see the xe_relax
+                    // initializer's cy02 case): it is choosing which fixed point
+                    // the cascade lands on, and residual differences collected
+                    // off the undamped map would pull straight back toward the
+                    // branch it just walked away from.  Sec 10.5 asks for the
+                    // history to go with the relaxation change, so it does.
+                    ResetXeAndersonHistory(ctx, xe_aa);
                     if (trace_sl)
                         std::cout << std::format(
                             "        [XE] no contraction for {} steps ({:.3e} -> {:.3e}); "
@@ -1255,6 +1796,14 @@ private:
                 xe_once_steps = 0;
                 xe_once_done  = false;
                 xe_once_prime = false;
+                // The macro-XS just moved, so the map whose residual differences
+                // the Anderson history was built from no longer exists (Sec
+                // 10.5: boron / rod / T-H change -> history reset).  Extrapolating
+                // across that boundary would fit the OLD map's curvature onto the
+                // new one.  Unconditional and idempotent; it charges the counter
+                // only when there was something to discard, and with the feature
+                // off there never is.
+                ResetXeAndersonHistory(ctx, xe_aa);
                 // xe_interim_count is re-armed with it so the fresh cascade is allowed
                 // its first interim step: xe_pending's "nothing has fired yet" term
                 // reads the pair.  Interim spins stay bounded by max_iter.
@@ -1642,6 +2191,8 @@ public:
                     "\"xe_cascades\":{},\"xe_steps_per_cascade\":{:.3f},"
                     "\"xe_budget_exhausted\":{},"
                     "\"xe_once_extra_steps\":{},\"xe_once_trust_trips\":{},"
+                    "\"xe_aa_proposed\":{},\"xe_aa_accepted\":{},"
+                    "\"xe_aa_rejected\":{},\"xe_aa_history_resets\":{},"
                     "\"xe_outers\":{},\"search_trials\":{},\"search_outers\":{},"
                     "\"th_updates\":{},\"th_outers\":{},\"settle_outers\":{},"
                     "\"fallback_outers\":{},\"th_search_coincident\":{},"
@@ -1655,6 +2206,8 @@ public:
                     c.outers_by_cause[sptelem::CAUSE_INITIAL], xeModeName(),
                     c.xe_updates, c.xe_interim_updates, c.xe_cascades, xe_per_cascade,
                     c.xe_budget_exhausted, c.xe_once_extra_steps, c.xe_once_trust_trips,
+                    c.xe_aa_proposed, c.xe_aa_accepted, c.xe_aa_rejected,
+                    c.xe_aa_history_resets,
                     c.outers_by_cause[sptelem::CAUSE_XE],
                     c.search_trials, c.outers_by_cause[sptelem::CAUSE_SEARCH],
                     c.th_updates, c.outers_by_cause[sptelem::CAUSE_TH],
@@ -1731,6 +2284,8 @@ public:
                 "\"xe_cascades\":{},\"xe_steps_per_cascade\":{:.3f},"
                 "\"xe_budget_exhausted\":{},"
                 "\"xe_once_extra_steps\":{},\"xe_once_trust_trips\":{},"
+                "\"xe_aa_proposed\":{},\"xe_aa_accepted\":{},"
+                "\"xe_aa_rejected\":{},\"xe_aa_history_resets\":{},"
                 "\"xe_outers\":{},\"search_trials\":{},\"search_outers\":{},"
                 "\"th_updates\":{},\"th_outers\":{},\"settle_outers\":{},"
                 "\"fallback_outers\":{},\"th_search_coincident\":{},"
@@ -1747,6 +2302,8 @@ public:
                 xeModeName(), c.xe_updates, c.xe_interim_updates, c.xe_cascades,
                 xe_per_cascade,
                 c.xe_budget_exhausted, c.xe_once_extra_steps, c.xe_once_trust_trips,
+                c.xe_aa_proposed, c.xe_aa_accepted, c.xe_aa_rejected,
+                c.xe_aa_history_resets,
                 c.outers_by_cause[sptelem::CAUSE_XE],
                 c.search_trials, c.outers_by_cause[sptelem::CAUSE_SEARCH],
                 c.th_updates, c.outers_by_cause[sptelem::CAUSE_TH],
