@@ -2,6 +2,11 @@
 
 **작성일**: 2026-08-27 | **브랜치**: `codex/exact-throughput-campaign` | **대상**: 배치 처리량 (M64 214.8 → 250~300 cases/h 목표)
 
+> **채택 상태 (2026-08-27): 기본값 = `thread`, 전 실행 모드 공통.**
+> 238 검증에서 시도한 **모든 구성에서 byte-identical**(단일덱 500/500, M64 **45,312/45,312 데이터셋**, restart 스냅샷 포함) + M64 **+0.6 %**. 따라서 `inline`은 더 이상 "안전한 선택"이 아니라 **레거시 경로**이며, `RASBERY_IO_WRITER=inline`로만 도달한다(bisect·A/B용). 오타 값은 경고 후 **기본값(thread)** 으로 떨어진다 — 골든이 동결된 경로가 기본값이기 때문.
+> 수신증에 **provenance**가 추가되었다: `{"mode":"thread","mode_source":"default"}` / `"env"`. `thread(default)`·`thread(env)`·`inline(env)` 세 실행이 로그에서 구분되지 않으면 A/B가 무효이므로, config·summary **양쪽** 수신증에 모두 실린다.
+> 관련: `docs/CAMPAIGN_ANDERSON_WIDTH_FP32_20260827_KO.md` §8(채택 결정), `test/reference/validation_*_v2.json`(baseline 재동결 준비).
+
 ## 1. 문제 — 왜 지금 I/O가 1순위 지렛대인가
 
 - HDF5 1.10.x 빌드는 thread-safe가 아니므로 `Chiffon::Hdf5Guard`(프로세스 전역 recursive mutex)가 **모든** 런타임 진입을 직렬화한다. `--batch-mode 64`가 성립하는 근거이지만, 그 비용을 전부 **solver 스레드**에 청구한다.
@@ -49,7 +54,7 @@ replay는 **inline 호출열 그 자체**를 나중에 다른 스레드에서 �
 3. **값**: payload는 기록 시점에 복사된다. solver는 반환 즉시 Geometry/XSSet을 변경해도 무방하다.
 4. **생성/쓰기 분리**: inline에서 `createDataSet<T>(name, space)`는 `write_raw`가 뒤따르지 않아도 link를 만든다. 녹화도 같아야 하므로 생성과 `write_raw`를 별개 op로 둔다.
 
-수용 시험은 기존 bit-golden 게이트다(단일덱 500/500 데이터셋, 배치 708/708). `RASBERY_IO_WRITER=inline`(기본값)은 문자 그대로 종전 경로이므로 자명하게 불변이다.
+수용 시험은 기존 bit-golden 게이트다(단일덱 500/500 데이터셋, 배치 45,312/45,312 — 전 구성 통과가 채택 근거). `RASBERY_IO_WRITER=inline`(레거시 경로, 이제 명시적으로만 선택)은 문자 그대로 종전 경로이므로 자명하게 불변이다.
 
 **적용 범위 — 성공 경로에 한정.** 위 논증은 모든 op가 성공적으로 replay된 실행에 대한 것이다. **오류 경로의 부분 파일은 두 모드가 다를 수 있고, 그것이 의도된 설계다**: inline은 예외가 난 그 지점까지 쓰고 멈추는 반면, thread 모드는 세션을 poison하고 **그 파일의 이후 batch를 전부 건너뛴다**(§2.5). 실패한 job의 산출물은 어느 모드에서도 유효하지 않으므로 게이트 대상이 아니다 — 대신 그 job이 반드시 **loud하게 실패**하는 것이 계약이다.
 
@@ -73,7 +78,7 @@ replay는 **inline 호출열 그 자체**를 나중에 다른 스레드에서 �
 
 h5diff가 볼 수 **없는** 성질만 정적으로 고정한다.
 
-1. **env 게이트 3상태**: 미설정/`inline` → inline, `thread` → thread, 그 외 → 경고 후 inline. 함수 지역 static 1회 캐시, `RASBERY_IO_WRITER` 독자는 `IoWriter.h` 한 곳뿐.
+1. **env 게이트 = 2모드 × 2 provenance** (채택 후 갱신): 미설정/빈 값 → **thread(default)**, `thread` → thread(env), `inline` → inline(env), 그 외 → 경고 후 **thread(default)**. 함수 지역 static 1회 캐시(`resolution()`), `mode()`/`modeSource()`는 그 1개 답을 보는 얇은 접근자, `RASBERY_IO_WRITER` 독자는 `IoWriter.h` 한 곳뿐. config·summary 수신증 양쪽이 `mode_source`를 싣는다.
 2. **writer가 쓰기 전부를 소유**: `IO.cpp`에 `HighFive::Group/DataSet/DataSpace`와 `_result_file`이 하나도 남아 있지 않고, 남은 `HighFive::File`은 전부 `ReadOnly`. replay 사이트는 1곳이며 `Hdf5Guard`를 batch 전체에 대해 잡고, `ReplayCtx`는 guard 스코프 **안에서** 생성·소멸한다(Group/DataSet 소멸자도 런타임 재진입).
 3. **순서·소유권**: 슬롯 `push_back` 순서, 생성/`write_raw` 분리, payload 값 복사(참조 캡처 금지), FIFO(`front`/`pop_front`).
 4. **경계 큐**: 개수·바이트 **양쪽** 상한, 초과 시 대기(드롭 없음), 대기 시간을 `enqueue_block_ms`에 청구, high-water 기록. 단일 batch가 바이트 상한을 넘어도 교착하지 않음(`|| _queue.empty()`).
@@ -83,16 +88,18 @@ h5diff가 볼 수 **없는** 성질만 정적으로 고정한다.
 ## 4. 수신증
 
 ```
-[RASBERY][IO_WRITER] {"mode":"thread","queue_limit":64,"queue_bytes":536870912}
+[RASBERY][IO_WRITER] {"mode":"thread","mode_source":"default","queue_limit":64,
+  "queue_bytes":536870912}
 ...
 [RASBERY][HDF5][LOCK] {"acquires":...,"wait_ms":...}
-[RASBERY][IO_WRITER][SUMMARY] {"mode":"thread","requests":...,"ops":...,"bytes":...,
-  "max_queue_depth":...,"max_queue_bytes":...,"enqueue_block_ms":...,
-  "writer_busy_ms":...,"failures":0}
+[RASBERY][IO_WRITER][SUMMARY] {"mode":"thread","mode_source":"default","requests":...,
+  "ops":...,"bytes":...,"max_queue_depth":...,"max_queue_bytes":...,
+  "enqueue_block_ms":...,"writer_busy_ms":...,"failures":0,"skipped":0}
 ```
 
 `[BATCH_HOST]`(선언된 구성, 첫 덱 이전) / `[BATCH_HOST][PIN]`(최종 카운터, teardown)과 같은 계열 규칙이다. 읽는 법:
 
+- `mode_source`는 **그 값이 어디서 왔는지**다. `thread`+`default`는 프로덕션 실행, `thread`+`env`는 명시적 A/B 팔, `inline`+`env`는 레거시 비교 팔. baseline 재동결 실행은 반드시 `mode_source="default"`여야 한다(env가 붙은 실행은 실험이지 기준이 아니다).
 - `requests=0`인데 `mode="thread"`면 → 게이트가 실제로 켜지지 않았거나 쓰기가 없었다. A/B의 thread 팔에서 이 값이 0이면 그 측정은 무효다.
 - `enqueue_block_ms`가 크면 → writer가 병목(큐 상한 상향 또는 I/O 자체가 한계).
 - `writer_busy_ms` ≈ 총 wall 이면 → HDF5 작업량 자체가 한계이고, 겹침으로 얻을 것이 남지 않았다(그때는 데이터셋 축소/압축이 다음 지렛대).
@@ -103,7 +110,8 @@ h5diff가 볼 수 **없는** 성질만 정적으로 고정한다.
 | 게이트 | 내용 | 합격 기준 |
 |---|---|---|
 | **G0** | 계약 테스트 `python3 tools/test_io_writer_contract.py` | PASS |
-| **G1** | inline 기본값 회귀: 기존 단일덱 골든 | 500/500 데이터셋 Δ=0 |
+| **G1** | 레거시 arm 회귀: `RASBERY_IO_WRITER=inline`로 기존 단일덱 골든 | 500/500 데이터셋 Δ=0 (**채택 후 이 arm은 기본값이 아니라 명시적 env로만 도달**) |
+| **G1b** | **기본값 provenance**: env 미설정 실행 | `mode="thread"`, `mode_source="default"`, `failures=0`·`skipped=0` |
 | **G2** | **thread byte-identity (단일덱)**: 같은 덱을 `inline`/`thread`로 각각 실행 후 `h5diff` | out.h5 및 모든 `*_restart_*.h5` 차이 0 |
 | **G3** | **thread byte-identity (배치)**: M64 골든 세트 | 708/708 데이터셋 Δ=0, FAIL 0/64 |
 | **G4** | **처리량 A/B (M64)**: 동일 덱 세트를 `inline` vs `thread` | thread ≥ inline; 목표 250~300 c/h. `[HDF5][LOCK].acquires` 대폭 감소 + `[IO_WRITER][SUMMARY].failures=0` 동반 확인 |

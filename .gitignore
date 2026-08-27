@@ -75,11 +75,16 @@ build-*/
 # Benchmark fixture corpus.  test/ is ~3.9 GB of CHIFFON libraries, HGC/BRCH
 # tables and recorded .out/.sum baselines distributed out of band; the
 # consolidated snapshot excludes it for the same reason.  Only C++ contract
-# tests that live beside the fixtures are tracked.
+# tests that live beside the fixtures -- and the frozen validation reference
+# manifests, which are a few KB of JSON and ARE the campaign's acceptance
+# contract -- are tracked.  The directory itself has to be re-included first:
+# git does not descend into an ignored directory to find a negated file.
 /test/**
 !/test/*.cpp
 !/test/*.h
 !/test/.gitignore
+!/test/reference/
+!/test/reference/*.json
 
 # Local scratch left by review passes (not an artifact of the build).
 /.cleanup_findings.txt

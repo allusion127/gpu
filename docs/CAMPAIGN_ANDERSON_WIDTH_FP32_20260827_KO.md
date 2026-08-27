@@ -6,10 +6,10 @@
 
 | 항목 | 결과 | 판정 |
 |---|---|---|
-| **Xe Anderson (단일덱)** | 93.6→**55.5 s = 1.69×**, outers −51 %, 수용률 95 % | **채택 권고** |
+| **Xe Anderson (단일덱)** | 93.6→**55.5 s = 1.69×**, outers −51 %, 수용률 95 % | **채택 — 단일덱 기본 ON** (§8.2) |
 | **Anderson 정확도 (Gate B)** | MASTER 반응도 1.970→**1.905 pcm 개선**, AO 0.022→0.013 | 물리 개선 (QW2 패턴 재현) |
 | Anderson 정확도 (Gate A) | Δkeff 2.27 pcm > 1 pcm 문턱 | 기준선의 미수렴 Xe 인공오차 방향 — baseline 재동결 대상 |
-| Anderson M64 배치 | 199.1 c/h (BASE 215.0 대비 −7 %) | outers −38 % 실재하나 **HDF5 I/O 직렬화가 은폐** |
+| Anderson M64 배치 | 199.1 c/h (BASE 215.0 대비 −7 %). writer 스레드 채택 후 재측정 202 vs 216 c/h | **배치 기본 OFF** — 잔존 원인은 I/O가 아니라 **도착 폭 기아**(§8.2) |
 | **FP32 혼합정밀 (M64)** | +2.6 % | 채택 (대역폭 바운드 0.13 FLOP/B — ALU 여유 무의미) |
 | **아레나 폭 96/128** | **무붕괴**(pin 수정 유효 입증), 그러나 BASE 77.4 c/h (−62 %) | **기각 — 폭 64 rolling 유지** |
 | 배치 생산 구성 | **폭 64 rolling, 214.8 c/h** (1,280+ 케이스 무실패) | 유지 |
@@ -82,3 +82,60 @@ pin 수명 앨리어싱(폭>64 붕괴의 원인)이 HostPinLease+page-exclusive�
 | 4 | 멀티GPU dispatcher | 수십배 목표의 구조적 경로(프로세스당 GPU 1 + 상위 큐) — 장비 확보 시 |
 
 **수십배 목표 현황**: 단일 GPU 정직한 상한 재확인 — 현재 CPU(9950X W16) 대비 단일덱 1.69× 달성, 1~3번 완주 시 단일 GPU 3~5× 영역. 10~20×+는 멀티GPU 필요(4번).
+
+## 8. 채택 결정 (2026-08-27) — 기본값 확정
+
+238 검증이 끝난 두 기능의 **기본값을 코드에 반영**했다. 두 결정 모두 "빠르니까"가 아니라 **측정된 근거의 방향**으로 갈렸다.
+
+### 8.1 HDF5 writer 스레드 — 전 모드 기본 ON
+
+`RASBERY_IO_WRITER` 기본값을 `inline` → **`thread`** 로 변경. 근거는 하나뿐이다: **시도한 모든 구성에서 byte-identical**(단일덱 500/500, M64 **45,312/45,312 데이터셋**, restart 스냅샷 포함)이고 M64 **+0.6 %**. 산출물이 바뀌지 않는 변경에는 "안전을 위해 기본값을 유지한다"는 논거가 성립하지 않으므로, `inline`은 기본값이 아니라 **레거시 경로**가 된다 — `RASBERY_IO_WRITER=inline`로 여전히 도달하며 bisect·A/B 팔에 필요하다. 오타 값은 경고 후 **기본값(thread)** 으로 떨어진다(골든이 동결된 경로가 기본값이므로).
+
+수신증에 **provenance**를 추가했다: `{"mode":"thread","mode_source":"default"}`. `thread(default)`·`thread(env)`·`inline(env)` 세 실행이 로그에서 구분되지 않으면 A/B가 무효이기 때문이며, config·summary 양쪽에 싣는다. 상세는 `docs/IO_WRITER_THREAD_DESIGN_20260827_KO.md`.
+
+### 8.2 Xe Anderson — 단일덱 기본 ON / 배치 기본 OFF
+
+| 실행 형태 | `RASBERY_XE_ANDERSON` 미설정 | 명시 설정 |
+|---|---|---|
+| 단일 실행(`--batch-mode` 없음) | **ON** | `0`/`1` 모두 존중 |
+| `--batch-mode M` | **OFF** | `0`/`1` 모두 존중 |
+
+**단일덱 ON의 근거는 속도가 아니라 정확도다.** 1.69×(93.6→55.5 s)는 부수 효과이고, 채택을 정당화한 것은 **MASTER 일치가 개선**되었다는 사실이다 — 반응도 1.970 → **1.905 pcm**, AO 0.022 → 0.013. Anderson은 같은 사상(map)을 같은 허용오차(`XE_EQUILIBRIUM_TOLERANCE`)까지 수렴시키므로 물리를 바꾸지 않는다. 즉 **v1 기준선 쪽이 잘린(미수렴) Xe로 ~2~3 pcm 인공오차를 내장**하고 있었고, Anderson은 그 고정점을 제대로 수렴시켜 MASTER 쪽으로 이동시킨 것이다(QW2 감사와 동일 구조). 따라서 §2의 Gate A 2.27 pcm 이탈은 **후보의 결함이 아니라 기준선의 결함이 드러난 것**이며, 올바른 대응은 문턱 완화가 아니라 **baseline 재동결**이다.
+
+**배치 OFF의 근거 — 도착 폭 기아(arrival-width starvation).** 배치에서는 순손해였다: **202 vs 216 cases/h**(M64). 원인은 I/O가 아니고(§3의 io_wall 지배는 writer 스레드가 제거했다) 알고리즘도 아니다(배치 수용률 95.6 % ≈ solo 95.0 %). 구조는 이렇다:
+
+> Anderson이 **잡당 outer를 −38 %** 줄인다 → 각 잡이 solve 안에 머무는 시간이 짧아진다 → **어느 순간에도 배치 CMFD 랑데부 안에 동시에 들어와 있는 잡 수(실효 폭)가 줄어든다** → 커널은 선언된 슬롯 수에 비례해 grid를 잡으므로 **비어 있는 슬롯 비용을 전 커널이 지불**한다 → 잡당 이득을 총계가 잃는다.
+
+이는 §4의 폭 96 실험과 정확히 같은 곱 구조(폭 비용 × 반복 수)의 다른 단면이다. **설계된 해법은 slot compaction**(Phase 5 계획, `docs/PLAN_PHASE5_PERSISTENT_RESIDENCY_KO.md`) — grid 비용을 **선언된 폭이 아니라 실제 점유**에 묶는다. 그것이 착지하기 전까지 배치 기본값은 OFF로 두고, `RASBERY_XE_ANDERSON=1`로 배치 A/B 실험은 계속 가능하게 남긴다. 반대로 단일덱에서 `=0`은 레거시 Picard 궤적(v1 기준선) 재현용이다.
+
+**모드 판별 방식.** 결정점이 "지금 배치인가"를 알아야 하는데 Driver는 그것을 알 수 없다(`--batch-mode`는 argv, 배치 폭은 CUDA 백엔드 뒤 — stub 빌드에는 없음). 그래서 `main()`이 **배치 분기를 선택하는 바로 그 술어**(`batch_width > 0 && !rasbery_inputs.empty()`)를 한 번 계산해 `rasbery::declareExecutionMode()`로 **선언**하고, 그 술어로 분기도 한다(실행과 보고가 어긋날 수 없음). 선언은 첫 수신증보다 **앞**에 온다 — 모드 의존 기본값은 첫 읽기에서 캐시되고 그 첫 읽기가 수신증이기 때문. 기본은 `Single`이므로 단위 테스트·툴·직접 Driver 생성은 선언을 잊어도 단일 실행으로 취급된다.
+
+`[RASBERY][PHYSICS_MODE]`에 세 필드 추가: `"exec_mode":"single|batch"`, `"xe_anderson":true|false`, `"xe_anderson_source":"default|env"`. 상태만으로는 실행을 식별할 수 없기 때문이다(기본으로 켜진 것과 누가 켠 것은 다른 사실이다).
+
+### 8.3 baseline 재동결 — v2 준비 완료, 실행 대기
+
+`test/reference/validation_thresholds_v2.json` · `validation_baseline_manifest_v2.json`을 **템플릿으로 추가**했다(v1은 이력으로 **무수정 보존**).
+
+- **문턱은 불변**: v1의 값은 노이즈 유래가 아니라 엔지니어링 바닥값(plan §3.4)이므로 궤적이 바뀌어도 움직이지 않는다.
+- **바뀌는 것은 궤적**: v2 기준선은 **Anderson-ON 단일덱**을 포함한다. `derivation` 필드에 그 이유(정정 개선, 1.970→1.905 pcm, v1의 ~2~3 pcm 미수렴-Xe 인공오차)를 명시했다.
+- **골든 SHA·wall 등은 전부 `TBD_REFREEZE`** 자리표시자 — 238 검증 에이전트가 재동결 실행으로 채운다.
+- **실행 유효성 조건**: 기준선 실행은 `xe_anderson_source="default"` 이고 `mode_source="default"` 여야 한다. env가 붙은 실행은 실험이지 기준이 아니다.
+
+### 8.4 재동결 프로토콜 (238 검증 에이전트용)
+
+**전제**: 어떤 단계에서도 `RASBERY_IO_WRITER` / `RASBERY_XE_ANDERSON`을 **설정하지 않는다**. 이번 동결의 목적은 *기본값 경로*를 고정하는 것이므로, env가 붙는 순간 그 실행은 실험이 된다.
+
+| 단계 | 내용 | 합격/기록 |
+|---|---|---|
+| R0 | 계약 테스트 3종: `test_io_writer_contract.py`, `test_xe_anderson.py`, `test_exact_only_contract.py` | 전부 PASS |
+| R1 | 재빌드 후 **수신증 확인 실행** 1회 | `[PHYSICS_MODE]` `exec_mode="single"`·`xe_anderson=true`·`xe_anderson_source="default"`, `[IO_WRITER]` `mode="thread"`·`mode_source="default"` |
+| R2 | **골든 4회 반복**(단일덱 `kngr_238.json`, 동일 명령) | 4회 상호 `h5diff` **전 데이터셋 Δ=0**, keff/ppm `max_abs_delta=0.0`. `cmp` 금지(HDF5 objheader 타임스탬프) |
+| R3 | **노이즈 점검** | 4회 wall의 spread 기록. Δ=0이면 v1과 같이 문턱은 노이즈 유래가 아닌 엔지니어링 바닥값으로 유지 |
+| R4 | **MASTER 재비교** (`tools/compare_master_rasbery.py`) | 반응도/CBC/AO/BOC pin RMS·max 기록 (기대 ~1.905 pcm, AO ~0.013) |
+| R5 | **Anderson 건전성** — `RASBERY_STATEPOINT_TELEMETRY=1` **별도 실행**(타이밍과 섞지 말 것) | `xe_aa_proposed/accepted/rejected/history_resets`, 수용률 ≥ ~90 % |
+| R6 | **M64 앵커**(기본값 그대로 = writer thread ON, 배치 Anderson OFF) | cases/h, FAIL 0/64, `[IO_WRITER][SUMMARY]` `failures=0`·`skipped=0` |
+| R7 | v2 파일의 `TBD_REFREEZE` 채우기 + `frozen_utc` 기입 | manifest·thresholds 커밋, threshold 파일 sha256 기록 |
+
+v1 파일 2개는 **수정 금지**(이력). v2가 동결되기 전까지는 v1이 유일한 동결 기준이다.
+
+**우선순위 갱신**: §7 표의 1번(writer 분리)·2번(Anderson)은 채택으로 종결. 다음은 **Phase 5 slot compaction** — 배치 Anderson의 −38 % outer 감축을 처리량으로 회수하는 유일한 설계된 경로이자, 폭 확장 기각(§4)의 원인도 같은 것이다.

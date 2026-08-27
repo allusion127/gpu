@@ -5,12 +5,18 @@ Plan Rev.4 Sec 10.  The arm is a runtime switch on a GPU solver, so the
 properties that make it safe cannot be observed from a Python test run -- they
 have to be checked in the source.  Ten things are guarded here:
 
-  1. BYTE-GOLDENNESS.  With RASBERY_XE_ANDERSON unset the solve path must be
-     what it was: the env var is read exactly once, cached in a function-local
-     static, hoisted into ONE local at SolveLoop entry, and the single call it
-     feeds short-circuits on that local before anything is evaluated.  No
-     getenv inside the outer loop, and the production UpdateEquilibriumXenon
-     call still sits where it always sat.
+  1. BYTE-GOLDENNESS OF THE OFF PATH, AND THE MODE-DEPENDENT DEFAULT.  Whenever
+     the gate resolves OFF -- the batch default, or an explicit
+     RASBERY_XE_ANDERSON=0 in either mode -- the solve path must be what it was:
+     the env var is read exactly once, cached in a function-local static,
+     hoisted into ONE local at SolveLoop entry, and the single call it feeds
+     short-circuits on that local before anything is evaluated.  No getenv
+     inside the outer loop, and the production UpdateEquilibriumXenon call still
+     sits where it always sat.  As of the 2026-08-27 adoption the DEFAULT is
+     mode-dependent (single ON, --batch-mode OFF) with an explicit env
+     overriding it in BOTH directions, so this also pins how the execution mode
+     reaches the decision and that the receipt publishes both the effective
+     state and its provenance.
   2. THE SPLIT IS A SPLIT, NOT A COPY.  ApplyXeEquilibrium keeps every caller
      and every write it had; the arithmetic moved wholesale into a compute-only
      ComputeXeEquilibrium that writes NOTHING, and ApplyXeEquilibrium is the
@@ -60,6 +66,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DRIVER = (ROOT / "src" / "Driver.h").read_text(encoding="utf-8-sig")
 XSSET = (ROOT / "src" / "XSSet.cpp").read_text(encoding="utf-8-sig")
 XSSET_H = (ROOT / "src" / "XSSet.h").read_text(encoding="utf-8-sig")
+MAIN = (ROOT / "src" / "main.cpp").read_text(encoding="utf-8-sig")
 
 
 def fail(message: str) -> None:
@@ -91,7 +98,14 @@ AA = region(DRIVER, "    static bool TryAndersonXeStep(",
 AA_CODE = code_lines(AA)
 
 # ---------------------------------------------------------------------------
-# 1. The env gate: one read, cached, default = the old behaviour.
+# 1. The gate: one read, cached, MODE-DEPENDENT default, env overrides both ways.
+#
+# ADOPTION 2026-08-27.  Default ON for a single run (1.69x with the MASTER
+# agreement IMPROVING, 1.970 -> 1.905 pcm -- adopted as a correctness fix that
+# happens to be faster), default OFF under --batch-mode (net-negative there:
+# 202 vs 216 cases/h, arrival-width starvation).  RASBERY_XE_ANDERSON=1/0
+# overrides in BOTH modes, so batch A/B experiments stay possible and a single
+# deck can still reproduce a legacy Picard trajectory.
 # ---------------------------------------------------------------------------
 if DRIVER.count('std::getenv("RASBERY_XE_ANDERSON")') != 1:
     fail("RASBERY_XE_ANDERSON must be read through exactly one cached gate")
@@ -104,27 +118,122 @@ for other in (ROOT / "src").rglob("*"):
         if var in body:
             fail(f"{other.name} reads {var}; the arm has one home (Driver.h)")
 
-gate = region(DRIVER, "inline bool xeAnderson() {", "\n/// Per-rejection reason trace",
-              "xeAnderson")
-if "static const bool on = [] {" not in gate:
-    fail("xeAnderson() does not cache the env lookup in a function-local static")
-null_at = gate.find("if (value == nullptr)")
-if null_at < 0 or "return false;" not in gate[null_at:null_at + 80]:
-    fail("an unset RASBERY_XE_ANDERSON does not return false before anything else; "
-         "the default path would not be byte-golden")
-for off in ('s == "0"', 's == "off"', 's == "false"', "s.empty()"):
+gate = region(DRIVER, "inline const XeAndersonGate& xeAndersonGate() {",
+              "\n/// The effective state", "xeAndersonGate")
+if "static const XeAndersonGate resolved = [] {" not in gate:
+    fail("xeAndersonGate() does not cache the resolution in a function-local static")
+# The env is a REQUEST, and unset/empty is the absence of one -- an inherited
+# empty variable must not read as an explicit "off" and suppress the default.
+if "const bool             from_env = (value != nullptr && *value != '\\0');" not in gate:
+    fail("an unset OR EMPTY RASBERY_XE_ANDERSON is not treated as 'no request'; the other "
+         "RASBERY gates all use that rule")
+for off in ('s == "0"', 's == "off"', 's == "false"'):
     if off not in gate:
-        fail(f"xeAnderson() does not treat {off!r} as off; the other Xe gates all do")
-# EQUILIBRIUM ONLY, and said out loud.  frozen has no cascade to accelerate and
-# once is deliberately not converging one.
+        fail(f"the env override does not treat {off!r} as off; the other Xe gates all do")
+# The env branch decides ALONE when it is present -- an explicit request must
+# beat the default in BOTH directions, or a batch A/B is impossible.
+env_branch = region(gate, "if (from_env) {", "} else {", "env override")
+if "want = !(" not in env_branch:
+    fail("an explicit RASBERY_XE_ANDERSON does not decide the state on its own; the "
+         "override must beat the mode default in BOTH directions")
+if "executionMode()" in env_branch:
+    fail("the explicit env override consults the execution mode; an operator who asked for "
+         "a state must get that state in either mode")
+# The default branch is the mode-dependent one, and it is the ONLY consumer of
+# the execution mode in this gate.
+default_branch = region(gate, "} else {", "\n        }", "mode default")
+if "want = (executionMode() == ExecutionMode::Single);" not in default_branch:
+    fail("the default is not 'ON for a single run, OFF under --batch-mode'")
+if gate.count("executionMode()") != 1:
+    fail("the execution mode is consulted more than once in the gate; the default has one "
+         "decision point")
+# EQUILIBRIUM ONLY, and said out loud when it was ASKED for.  frozen has no
+# cascade to accelerate and once is deliberately not converging one.
 if "xeMode() != XeMode::EQUILIBRIUM" not in gate:
-    fail("xeAnderson() does not refuse the non-equilibrium modes; Anderson accelerates "
+    fail("the gate does not refuse the non-equilibrium modes; Anderson accelerates "
          "the equilibrium cascade and there is nothing to accelerate in frozen/once")
 if "[RASBERY][WARN][xe]" not in gate:
-    fail("xeAnderson() silently swallows a mode conflict; a misconfiguration must be "
+    fail("the gate silently swallows a mode conflict; a misconfiguration must be "
          "reported, not quietly honoured as 'off'")
-if "return false;" not in gate[gate.index("xeMode() != XeMode::EQUILIBRIUM"):]:
+conflict = gate[gate.index("xeMode() != XeMode::EQUILIBRIUM"):]
+if "if (from_env)" not in conflict.split("return")[0]:
+    fail("the mode-conflict warning fires for the DEFAULT too; nobody asked for Anderson in "
+         "that run, so there is no misconfiguration to report")
+if "return XeAndersonGate{false, source};" not in conflict:
     fail("the mode conflict warns but still enables the arm")
+
+# PROVENANCE.  With a mode-dependent default, the state alone does not identify
+# a run: `on` plus "who decided it" is the fact a measurement needs.
+if "enum class XeAndersonSource { Default, Env };" not in DRIVER:
+    fail("there is no provenance type; default-ON and env-ON would be indistinguishable")
+if not re.search(r"struct XeAndersonGate\s*\{\s*bool\s+on;\s*XeAndersonSource\s+source;\s*\};",
+                 DRIVER):
+    fail("XeAndersonGate does not carry BOTH the effective state and its provenance")
+eff = region(DRIVER, "inline bool xeAnderson() {", "\n/// \"default\" or \"env\"", "xeAnderson")
+if "return xeAndersonGate().on;" not in eff:
+    fail("xeAnderson() does not read through the single cached gate; two statics could "
+         "disagree about a run's state")
+src_name = region(DRIVER, "inline const char* xeAndersonSourceName() {",
+                  "\n/// Per-rejection reason trace", "xeAndersonSourceName")
+for token in ('"env"', '"default"'):
+    if token not in src_name:
+        fail(f"xeAndersonSourceName() does not publish {token}")
+
+# ---------------------------------------------------------------------------
+# 1b. How the decision point learns it is in batch mode.
+#
+# It cannot ask the CUDA backend (rasberyBatchWidth() is absent from a stub
+# build) and it cannot re-parse argv, so main() DECLARES the mode -- once, from
+# the same predicate that selects the batch branch, before the first receipt.
+# ---------------------------------------------------------------------------
+if "enum class ExecutionMode { Single, Batch };" not in DRIVER:
+    fail("Driver.h has no ExecutionMode; the mode-dependent default has nothing to read")
+exec_read = region(DRIVER, "inline ExecutionMode executionMode() {", "\n/// True under",
+                   "executionMode")
+if "ExecutionMode::Single" not in region(DRIVER, "inline std::atomic<ExecutionMode>& modeCell()",
+                                         "\n/// Latched by the first READ", "modeCell"):
+    fail("the execution-mode latch does not default to Single; a unit test or a tool that "
+         "never declares a mode would be treated as a batch run")
+if "observed().store(true" not in exec_read:
+    fail("reading the execution mode does not latch 'observed'; a late declaration could not "
+         "be detected")
+declare = region(DRIVER, "inline void declareExecutionMode(ExecutionMode requested) {",
+                 "\n// Safeguarded Anderson", "declareExecutionMode")
+if "[RASBERY][WARN][exec]" not in declare:
+    fail("a declaration that arrives after the mode was already read is silent; the gate it "
+         "was supposed to feed has already cached the wrong answer")
+if "observed().load" not in declare:
+    fail("declareExecutionMode does not check whether the mode was already read")
+
+MAIN_CODE = code_lines(MAIN)
+PREDICATE = ("const bool batch_execution = (batch_width > 0 && !rasbery_inputs.empty());")
+if PREDICATE not in MAIN_CODE:
+    fail(f"main() does not compute the batch predicate once: {PREDICATE!r}")
+if MAIN_CODE.count("batch_execution") != 3:
+    fail("the batch predicate is not used exactly three times (defined, declared, branched); "
+         "a second predicate could disagree with the branch it is supposed to describe")
+if ("rasbery::declareExecutionMode(batch_execution ? rasbery::ExecutionMode::Batch"
+        not in MAIN_CODE):
+    fail("main() does not declare the execution mode from the batch predicate")
+if "if (batch_execution) {" not in MAIN_CODE:
+    fail("the batch branch is not selected by the SAME predicate that was declared; the run "
+         "could do one thing and report another")
+declare_at = MAIN_CODE.index("rasbery::declareExecutionMode(")
+receipt_at = MAIN_CODE.index("[RASBERY][PHYSICS_MODE]")
+branch_at = MAIN_CODE.index("if (batch_execution) {")
+if not declare_at < receipt_at < branch_at:
+    fail("the execution mode is declared after the [PHYSICS_MODE] receipt; the receipt is the "
+         "first read of the mode-dependent default, so it would cache the wrong answer")
+# The receipt publishes the EFFECTIVE state and its provenance, and the mode
+# that chose it.  Without all three, two runs of the same binary are not
+# distinguishable in a log.
+for field, expr in (('\\"exec_mode\\":', "rasbery::executionModeName()"),
+                    ('\\"xe_anderson\\":', "rasbery::xeAnderson()"),
+                    ('\\"xe_anderson_source\\":', "rasbery::xeAndersonSourceName()")):
+    if field not in MAIN_CODE:
+        fail(f"the [RASBERY][PHYSICS_MODE] receipt omits {field}")
+    if expr not in MAIN_CODE:
+        fail(f"the {field} receipt field is not the resolved value ({expr})")
 
 debug = region(DRIVER, "inline bool xeAndersonDebug() {", "\nclass Driver", "xeAndersonDebug")
 if "static const bool on" not in debug:

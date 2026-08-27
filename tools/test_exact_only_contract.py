@@ -43,7 +43,11 @@ problems += [f"src/main.cpp: missing {token!r}" for token in required_main
 # emitted before the batch branch and before the serial deck loop.
 receipt_at = main_cpp.find("[RASBERY][PHYSICS_MODE]")
 gate_at = main_cpp.find("if (screening && !allow_screening)")
-batch_at = main_cpp.find("if (batch_width > 0 && !rasbery_inputs.empty())")
+# The batch branch is now selected by `batch_execution`, the predicate main()
+# computes once at startup and latches as the execution mode before any receipt
+# (adoption 2026-08-27, mode-dependent RASBERY_XE_ANDERSON default). Same
+# branch, one anchor.
+batch_at = main_cpp.find("if (batch_execution) {")
 serial_at = main_cpp.find("rasbery::Driver driver(rasbery_input_path.string()")
 if -1 in (receipt_at, gate_at, batch_at, serial_at):
     problems.append("src/main.cpp: could not locate the startup ordering anchors")

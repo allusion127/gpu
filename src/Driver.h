@@ -437,11 +437,99 @@ inline const char* xeModeName() {
     return "equilibrium";
 }
 
+// ---------------------------------------------------------------------------
+// Execution mode: one deck at a time, or --batch-mode.
+//
+// WHY THIS EXISTS.  The Anderson adoption default (below) is mode-dependent,
+// and the decision point has to know which kind of run it is in.  Nothing in
+// Driver could answer that: `--batch-mode M` is an argv flag, the batch width
+// lives behind the CUDA backend (rasberyBatchWidth(), absent in a stub build),
+// and neither is a legal dependency for a header the CPU-only build compiles.
+//
+// SO main() DECLARES IT.  One latch, set once from the SAME predicate that
+// selects the batch branch (`batch_width > 0 && !rasbery_inputs.empty()`), and
+// set BEFORE the first receipt is emitted -- which is before any Driver exists
+// and before any mode-dependent gate can resolve.  The default is Single, so a
+// unit test, a tool, or a direct Driver construction is a single run by
+// construction rather than by remembering to declare it.
+//
+// A declaration that arrives after somebody already read the mode is a
+// programming error, not a runtime condition: the gate it was supposed to feed
+// has already cached the wrong answer.  It says so on stderr rather than
+// pretending the late value took effect.
+// ---------------------------------------------------------------------------
+enum class ExecutionMode { Single, Batch };
+
+namespace exec_detail {
+inline std::atomic<ExecutionMode>& modeCell() {
+    static std::atomic<ExecutionMode> cell{ExecutionMode::Single};
+    return cell;
+}
+/// Latched by the first READ, so a late declaration can be detected.
+inline std::atomic<bool>& observed() {
+    static std::atomic<bool> seen{false};
+    return seen;
+}
+} // namespace exec_detail
+
+/// The mode this process runs in.  Reading it latches it.
+inline ExecutionMode executionMode() {
+    exec_detail::observed().store(true, std::memory_order_relaxed);
+    return exec_detail::modeCell().load(std::memory_order_relaxed);
+}
+
+/// True under `--batch-mode M` with decks to run; false for a single run.
+inline bool batchExecution() { return executionMode() == ExecutionMode::Batch; }
+
+/// The mode as the receipts publish it.
+inline const char* executionModeName() { return batchExecution() ? "batch" : "single"; }
+
+/// main() declares this once, from the batch-branch predicate, before anything
+/// reads it.
+inline void declareExecutionMode(ExecutionMode requested) {
+    if (exec_detail::observed().load(std::memory_order_relaxed) &&
+        exec_detail::modeCell().load(std::memory_order_relaxed) != requested) {
+        std::cerr << "[RASBERY][WARN][exec] execution mode declared after it was already "
+                     "read; a mode-dependent default has resolved against the previous "
+                     "value and will not change\n";
+    }
+    exec_detail::modeCell().store(requested, std::memory_order_relaxed);
+}
+
 // Safeguarded Anderson acceleration of the in-core Xe fixed point
-// (RASBERY_XE_ANDERSON, plan Rev.4 Sec 10).  Default OFF, and OFF means the
-// plain Picard cascade byte for byte: the gate is one cached env read, the
-// solver holds one extra bool, and the only new call in the step is short-
-// circuited by it.
+// (RASBERY_XE_ANDERSON, plan Rev.4 Sec 10).  OFF means the plain Picard cascade
+// byte for byte: the gate is one cached read, the solver holds one extra bool,
+// and the only new call in the step is short-circuited by it.
+//
+// ADOPTION (2026-08-27): THE DEFAULT IS MODE-DEPENDENT.
+//
+//   single run (no --batch-mode)  -> ON  by default
+//   --batch-mode                  -> OFF by default
+//   RASBERY_XE_ANDERSON=1/0       -> overrides the default in BOTH modes
+//
+// ON for a single deck because the 238 validation measured 1.69x (93.6 -> 55.5
+// s, outers -51 %, 95 % acceptance) with the MASTER agreement IMPROVING, not
+// degrading: reactivity 1.970 -> 1.905 pcm, AO 0.022 -> 0.013.  That direction
+// is the whole argument -- the v1 baseline carried a ~2-3 pcm artifact of a
+// TRUNCATED (unconverged) Xe fixed point, and converging it properly moves
+// RASBERY toward MASTER.  So this is adopted as a CORRECTNESS improvement that
+// happens to be faster, and the Gate A delta against the v1 baseline is the old
+// baseline's defect being exposed (hence the v2 re-freeze).
+//
+// OFF in batch because it measured NET-NEGATIVE there: 202 vs 216 cases/h at
+// M64.  The cause is not I/O (the writer thread removed that term) and not the
+// algorithm (batch acceptance 95.6 % matches solo 95.0 %) -- it is ARRIVAL-WIDTH
+// STARVATION.  Anderson makes each job need ~38 % fewer outers, so a job spends
+// less wall in the solve, so fewer jobs are concurrently inside the batched CMFD
+// rendezvous at any instant; the measured mean width falls and every batched
+// kernel pays for slots nobody is using.  The per-job win is real and the
+// aggregate loses it.  The designed fix is slot compaction (Phase 5 plan), which
+// decouples grid cost from declared width; until that lands the batch default
+// stays OFF, and RASBERY_XE_ANDERSON=1 keeps the batch A/B experiments running.
+//
+// The env override is deliberately symmetric: batch runs can force it ON to
+// re-measure, and a single deck can force it OFF to reproduce a legacy (v1
+// baseline) trajectory.
 //
 // WHAT IT IS.  Anderson does NOT change the map, the acceptance semantics or
 // the convergence test.  The same F(x) is evaluated at the same points, the
@@ -463,25 +551,61 @@ inline const char* xeModeName() {
 // EQUILIBRIUM MODE ONLY.  frozen has no cascade to accelerate and once is
 // deliberately not converging one, so asking for Anderson in either is a
 // misconfiguration and is reported rather than silently honoured.
-inline bool xeAnderson() {
-    static const bool on = [] {
+
+/// Where the effective Anderson state came from: the mode-dependent adoption
+/// default, or an explicit RASBERY_XE_ANDERSON.  Published in the
+/// [RASBERY][PHYSICS_MODE] receipt, because "AA was on" and "AA was on because
+/// somebody asked for it" are different facts about a measurement.
+enum class XeAndersonSource { Default, Env };
+
+struct XeAndersonGate {
+    bool             on;
+    XeAndersonSource source;
+};
+
+inline const XeAndersonGate& xeAndersonGate() {
+    static const XeAndersonGate resolved = [] {
         const char* value = std::getenv("RASBERY_XE_ANDERSON");
-        if (value == nullptr)
-            return false;
-        const std::string s(value);
-        if (s.empty() || s == "0" || s == "off" || s == "OFF" || s == "false" || s == "FALSE")
-            return false;
-        if (xeMode() != XeMode::EQUILIBRIUM) {
-            std::cerr << "[RASBERY][WARN][xe] RASBERY_XE_ANDERSON is set with "
-                         "RASBERY_XE_MODE="
-                      << xeModeName()
-                      << "; Anderson accelerates the equilibrium cascade and has nothing "
-                         "to accelerate in that mode -- staying off\n";
-            return false;
+        // Unset AND empty are both "no request"; the other RASBERY gates use
+        // that same rule, and an inherited empty var must not read as "off".
+        const bool             from_env = (value != nullptr && *value != '\0');
+        const XeAndersonSource source =
+            from_env ? XeAndersonSource::Env : XeAndersonSource::Default;
+
+        bool want;
+        if (from_env) {
+            const std::string s(value);
+            want = !(s == "0" || s == "off" || s == "OFF" || s == "false" || s == "FALSE");
+        } else {
+            // The adoption default: ON for a single run, OFF under --batch-mode
+            // (arrival-width starvation -- see the block above).
+            want = (executionMode() == ExecutionMode::Single);
         }
-        return true;
+
+        // EQUILIBRIUM MODE ONLY, in both provenances.  frozen has no cascade to
+        // accelerate and once is deliberately not converging one.  An explicit
+        // request in those modes is a misconfiguration and is reported; the
+        // default silently declines, because nobody asked for anything.
+        if (want && xeMode() != XeMode::EQUILIBRIUM) {
+            if (from_env)
+                std::cerr << "[RASBERY][WARN][xe] RASBERY_XE_ANDERSON is set with "
+                             "RASBERY_XE_MODE="
+                          << xeModeName()
+                          << "; Anderson accelerates the equilibrium cascade and has nothing "
+                             "to accelerate in that mode -- staying off\n";
+            return XeAndersonGate{false, source};
+        }
+        return XeAndersonGate{want, source};
     }();
-    return on;
+    return resolved;
+}
+
+/// The effective state, and the ONLY thing the solve path consults.
+inline bool xeAnderson() { return xeAndersonGate().on; }
+
+/// "default" or "env" -- the provenance of the state above.
+inline const char* xeAndersonSourceName() {
+    return xeAndersonGate().source == XeAndersonSource::Env ? "env" : "default";
 }
 
 /// Per-rejection reason trace for the Anderson arm (RASBERY_XE_ANDERSON_DEBUG).

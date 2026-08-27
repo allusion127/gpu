@@ -5,9 +5,10 @@ The writer thread is validated end-to-end by the bit-golden gates -- the whole
 claim is that `thread` and `inline` produce the same file -- so this contract
 covers the properties an h5diff CANNOT see:
 
-  1. the env gate has exactly three outcomes (unset/inline -> inline, thread ->
-     thread, anything else -> warn + inline), is read ONCE, and is the only
-     reader of the variable;
+  1. the env gate resolves to exactly four outcomes over two modes and two
+     provenances (unset/garbage -> thread(default), thread -> thread(env),
+     inline -> inline(env)), is read ONCE, is the only reader of the variable,
+     and publishes its PROVENANCE in the receipt;
   2. the writer thread OWNS the write path: no HighFive write call site and no
      DataSpace construction survives outside IoWriter.h, every remaining
      HighFive::File in IO.cpp is ReadOnly, and the single replay site holds
@@ -68,26 +69,45 @@ WRITER_CODE = strip_comments(WRITER)
 IO_CPP_CODE = strip_comments(IO_CPP)
 
 # ---------------------------------------------------------------------------
-# 1. The env gate: three states, cached once, single reader.
+# 1. The env gate: two modes x two provenances, cached once, single reader.
+#
+# ADOPTION 2026-08-27: `thread` is the DEFAULT in every mode of execution
+# (byte-identical in all validated configurations, +0.6 % M64), and `inline` is
+# the legacy path an explicit env still selects.  The receipt must be able to
+# tell thread(default) from thread(env) from inline(env), or an adopted default
+# and a deliberate A/B arm are indistinguishable in a log.
 # ---------------------------------------------------------------------------
-gate = body_after("inline Mode mode()")
+gate = body_after("inline const Resolution& resolution()")
 if 'std::getenv("RASBERY_IO_WRITER")' not in gate:
-    fail("mode() does not read RASBERY_IO_WRITER")
-if "static const Mode resolved" not in gate:
+    fail("resolution() does not read RASBERY_IO_WRITER")
+if "static const Resolution resolved" not in gate:
     fail("the RASBERY_IO_WRITER gate is not cached in a function-local static")
-# State 1: unset (and empty) is the production default.
-if "if (value == nullptr || *value == '\\0') return Mode::Inline;" not in gate:
-    fail("an unset RASBERY_IO_WRITER does not default to inline")
-# State 2: the opt-in.
-if 'if (requested == "thread") return Mode::Thread;' not in gate:
-    fail("RASBERY_IO_WRITER=thread does not select the writer thread")
-# State 3: the explicit legacy value, and the typo guard that shares its answer.
-if 'if (requested != "inline")' not in gate:
-    fail("RASBERY_IO_WRITER=inline is not an accepted explicit state")
+# State 1: unset (and empty) is the ADOPTED DEFAULT -- the writer thread.
+if ("if (value == nullptr || *value == '\\0')\n            return Resolution{Mode::Thread, "
+        "ModeSource::Default};") not in gate:
+    fail("an unset/empty RASBERY_IO_WRITER does not default to thread(default); the writer "
+         "thread was adopted as the default on 2026-08-27")
+# State 2: the explicit thread request -- same mode, different provenance.
+if 'if (requested == "thread") return Resolution{Mode::Thread, ModeSource::Env};' not in gate:
+    fail("RASBERY_IO_WRITER=thread does not resolve to thread(env)")
+# State 3: the legacy path, reachable only on purpose.
+if 'if (requested == "inline") return Resolution{Mode::Inline, ModeSource::Env};' not in gate:
+    fail("RASBERY_IO_WRITER=inline is not an accepted explicit state; the legacy path must "
+         "stay reachable for a bisect or an A/B arm")
+# State 4: a typo falls back to the DEFAULT (not to inline), and says so.
 if "[RASBERY][WARN][IO_WRITER] unknown RASBERY_IO_WRITER=" not in gate:
     fail("an unknown RASBERY_IO_WRITER value is accepted silently")
-if gate.count("return Mode::Inline;") != 2 or gate.count("return Mode::Thread;") != 1:
-    fail("mode() has outcomes other than the three declared states")
+warn_at = gate.find("[RASBERY][WARN][IO_WRITER] unknown")
+if "Resolution{Mode::Thread, ModeSource::Default}" not in gate[warn_at:]:
+    fail("an unknown RASBERY_IO_WRITER value does not fall back to the default; a typo must "
+         "buy the path the goldens were frozen on, not the legacy one")
+if gate.count("return Resolution{Mode::Inline,") != 1:
+    fail("inline is reachable from more than the one explicit state")
+if gate.count("return Resolution{Mode::Thread,") != 3:
+    fail("resolution() has thread outcomes other than the three declared states "
+         "(unset, explicit, typo-fallback)")
+if "ModeSource::Env" not in gate or "ModeSource::Default" not in gate:
+    fail("resolution() does not record where the mode came from")
 if "std::tolower" not in gate:
     fail("the mode string is not case-folded (RASBERY_HOST_PINNING sets the precedent)")
 if WRITER_CODE.count('getenv("RASBERY_IO_WRITER")') != 1:
@@ -95,6 +115,17 @@ if WRITER_CODE.count('getenv("RASBERY_IO_WRITER")') != 1:
 for other in (IO_CPP_CODE, strip_comments(MAIN), strip_comments(DRIVER), strip_comments(IO_H)):
     if "RASBERY_IO_WRITER" in other and "RASBERY_IO_WRITER_" not in other:
         fail("RASBERY_IO_WRITER is read outside IoWriter.h")
+
+# mode()/modeSource() are thin views on ONE cached answer -- two statics could
+# disagree after an env change between them.
+for accessor, expected in (("inline Mode       mode()", "return resolution().mode;"),
+                           ("inline ModeSource modeSource()", "return resolution().source;")):
+    if expected not in body_after(accessor):
+        fail(f"{accessor} does not read through the single cached resolution()")
+source_name = body_after("inline const char* modeSourceName()")
+for token in ('"env"', '"default"'):
+    if token not in source_name:
+        fail(f"modeSourceName() does not publish {token}")
 
 # The two queue bounds are gated the same way: cached, opt-in, with a default.
 for env, fn, default in (("RASBERY_IO_WRITER_QUEUE", "queueDepthLimit", "64"),
@@ -450,9 +481,25 @@ for field in ("requests", "bytes", "max_queue_depth", "enqueue_block_ms",
         fail(f"the summary receipt omits {field}")
 if '"[RASBERY][IO_WRITER][SUMMARY]' not in summary:
     fail("the summary receipt does not use the [SUMMARY] tag of the receipt family")
+# PROVENANCE, on BOTH receipts.  With thread as the default, `mode":"thread"`
+# alone no longer says whether a run was configured or merely defaulted -- and
+# an A/B whose arms cannot be told apart from the log is void.
+for receipt, block in (("configuration", config), ("summary", summary)):
+    if '\\"mode_source\\":\\""' not in block:
+        fail(f"the {receipt} receipt does not publish mode_source; thread(default), "
+             "thread(env) and inline(env) would be indistinguishable")
+    if "modeSourceName()" not in block:
+        fail(f"the {receipt} receipt's mode_source is not the resolved provenance")
+    if "modeName()" not in block:
+        fail(f"the {receipt} receipt's mode is not the resolved mode")
 
 # ---------------------------------------------------------------------------
-# 6. Inline is the default path, and it is the OLD path.
+# 6. Inline is no longer the DEFAULT, but it is still the OLD path.
+#
+# The adoption moved the default; it must not have moved the legacy arm.  A
+# bisect that sets RASBERY_IO_WRITER=inline has to get literally the
+# pre-writer-thread code, so every property that made inline trivially
+# byte-golden is still asserted here.
 # ---------------------------------------------------------------------------
 recorder_submit = body_after("void submit()", text=WRITER_CODE)
 if "if (_inline || _batch.ops.empty()) {" not in recorder_submit:

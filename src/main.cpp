@@ -285,6 +285,20 @@ int main(int argc, char* argv[]) {
     }
 
     // -----------------------------------------------------------------------
+    // Execution mode, declared ONCE, here.
+    //
+    // This is the same predicate that selects the batch branch further down --
+    // it is computed once and both sites use it, so "what the run does" and
+    // "what the run says it does" cannot drift.  It has to be latched HERE,
+    // before the [PHYSICS_MODE] receipt: the mode-dependent Anderson default
+    // (Driver.h) resolves on first read and caches, and the receipt is the
+    // first read.
+    // -----------------------------------------------------------------------
+    const bool batch_execution = (batch_width > 0 && !rasbery_inputs.empty());
+    rasbery::declareExecutionMode(batch_execution ? rasbery::ExecutionMode::Batch
+                                                  : rasbery::ExecutionMode::Single);
+
+    // -----------------------------------------------------------------------
     // Exact-only hard contract (plan Rev.4 Sec 2).
     //
     // The campaign accepts full-exact results and nothing else, so the two
@@ -341,7 +355,17 @@ int main(int argc, char* argv[]) {
               // (RASBERY_XE_MODE).  "equilibrium" is the default and the only
               // value the exact-only acceptance path produces; "frozen" marks a
               // same-mode MASTER comparison run, not an acceptance measurement.
-              << ",\"xe_mode\":\"" << rasbery::xeModeName() << "\"}" << std::endl;
+              << ",\"xe_mode\":\"" << rasbery::xeModeName() << "\""
+              // Additive fields (adoption 2026-08-27).  The Anderson default is
+              // MODE-DEPENDENT (single ON, batch OFF), so the state alone does
+              // not identify a run: exec_mode says which default applied and
+              // xe_anderson_source says whether the default is what actually
+              // decided it.  A comparison whose two arms differ here is not an
+              // A/B of the thing it claims to be.
+              << ",\"exec_mode\":\"" << rasbery::executionModeName() << "\""
+              << ",\"xe_anderson\":" << (rasbery::xeAnderson() ? "true" : "false")
+              << ",\"xe_anderson_source\":\"" << rasbery::xeAndersonSourceName() << "\"}"
+              << std::endl;
 
     if (screening) {
         std::cout << "[RASBERY][GA][SCREEN] {\"physics_mode\":"
@@ -431,7 +455,7 @@ int main(int argc, char* argv[]) {
     // the batched solver does not care who rides along, because per-instance
     // results do not depend on the batch composition.
     // -----------------------------------------------------------------------
-    if (batch_width > 0 && !rasbery_inputs.empty()) {
+    if (batch_execution) {
         rasbery::rasberySetBatchWidth(batch_width);
         // Same width, published to the nodal arm.  The two arenas are separate
         // (different phases, different rendezvous), but they are the same M.

@@ -36,9 +36,11 @@
 //     may mutate Geometry/XSSet the instant it returns without touching it.
 //
 // So the replay IS the inline call sequence, executed later on another thread.
-// The bit-golden gates (single-deck 500/500 datasets, batch 708/708) are the
-// acceptance test for that claim, and RASBERY_IO_WRITER=inline (the default)
-// keeps today's path literally unchanged for the runs that must not move.
+// The bit-golden gates (single-deck 500/500 datasets, batch 45,312/45,312) are
+// the acceptance test for that claim; they passed in every configuration, which
+// is why `thread` is the default as of 2026-08-27.  RASBERY_IO_WRITER=inline
+// still keeps the pre-writer-thread path literally unchanged, for a bisect or
+// an A/B arm that needs it.
 //
 // READS ARE NOT MOVED.  Deck parse, XSLIB load, restart load and shuffle still
 // read HDF5 on the Driver thread under Hdf5Guard, so the writer thread takes
@@ -84,32 +86,67 @@
 namespace rasbery::iowriter {
 
 // ---------------------------------------------------------------------------
-// The env gate.  Three states and nothing else: unset and "inline" are the
-// production path (byte-identical to the pre-writer-thread code because it IS
-// that code), "thread" opts into the dedicated writer.  Anything else warns and
-// falls back to inline -- a typo must never silently change how a deck is
-// written.  Read ONCE into a function-local static so the recorder and the
-// queue can never disagree about which mode a run is in.
+// The env gate.  Two modes, and a provenance for the receipt.
+//
+// ADOPTION (2026-08-27).  `thread` is now the DEFAULT for every mode of
+// execution.  The 238 validation ran the writer thread byte-identical in every
+// configuration it was tried in -- single deck 500/500 datasets, M64
+// 45,312/45,312 datasets, restart snapshots included -- and measured +0.6 % on
+// M64 throughput, so `inline` stopped being the safe choice and became the
+// legacy one.  It is still reachable, because a bisect, an A/B and a
+// "is the writer thread doing this?" question all need it:
+//
+//   RASBERY_IO_WRITER unset      -> thread, source=default   (production)
+//   RASBERY_IO_WRITER=thread     -> thread, source=env       (explicit)
+//   RASBERY_IO_WRITER=inline     -> inline, source=env       (legacy path)
+//   RASBERY_IO_WRITER=<garbage>  -> thread, source=default + a warning
+//
+// An empty value is not a request; it reads as unset, the same rule the other
+// RASBERY gates use.  A typo resolves to the DEFAULT rather than to inline: the
+// operator asked for something this build does not have, and the answer to that
+// is the path the goldens were frozen on, said out loud.
+//
+// Read ONCE into a function-local static so the recorder, the queue and the
+// receipt can never disagree about which mode a run is in.
 // ---------------------------------------------------------------------------
 enum class Mode { Inline, Thread };
 
-inline Mode mode() {
-    static const Mode resolved = [] {
+/// Where the mode came from.  Published next to the mode so `thread(default)`,
+/// `thread(env)` and `inline(env)` are three distinguishable runs in a log --
+/// without it, an adopted default and a deliberate A/B arm look identical.
+enum class ModeSource { Default, Env };
+
+struct Resolution {
+    Mode       mode;
+    ModeSource source;
+};
+
+inline const Resolution& resolution() {
+    static const Resolution resolved = [] {
         const char* value = std::getenv("RASBERY_IO_WRITER");
-        if (value == nullptr || *value == '\0') return Mode::Inline;
+        if (value == nullptr || *value == '\0')
+            return Resolution{Mode::Thread, ModeSource::Default};
         std::string requested(value);
         std::transform(requested.begin(), requested.end(), requested.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (requested == "thread") return Mode::Thread;
-        if (requested != "inline")
-            std::cerr << "[RASBERY][WARN][IO_WRITER] unknown RASBERY_IO_WRITER=" << value
-                      << " -- using inline.\n";
-        return Mode::Inline;
+        if (requested == "thread") return Resolution{Mode::Thread, ModeSource::Env};
+        if (requested == "inline") return Resolution{Mode::Inline, ModeSource::Env};
+        std::cerr << "[RASBERY][WARN][IO_WRITER] unknown RASBERY_IO_WRITER=" << value
+                  << " -- using thread (the default).\n";
+        return Resolution{Mode::Thread, ModeSource::Default};
     }();
     return resolved;
 }
 
+inline Mode       mode() { return resolution().mode; }
+inline ModeSource modeSource() { return resolution().source; }
+
 inline const char* modeName() { return mode() == Mode::Thread ? "thread" : "inline"; }
+
+/// "default" or "env" -- the second half of the receipt's mode field.
+inline const char* modeSourceName() {
+    return modeSource() == ModeSource::Env ? "env" : "default";
+}
 
 /// Bounded queue, batch count.  RASBERY_IO_WRITER_QUEUE overrides.
 inline std::size_t queueDepthLimit() {
@@ -802,13 +839,15 @@ inline void appendLine(const std::string& line) {
 // the first deck) and [RASBERY][BATCH_HOST][PIN] (final counters, at teardown).
 // ---------------------------------------------------------------------------
 inline void reportConfig(std::ostream& os) {
-    os << "[RASBERY][IO_WRITER] {\"mode\":\"" << modeName() << "\",\"queue_limit\":"
-       << queueDepthLimit() << ",\"queue_bytes\":" << queueByteLimit() << "}" << std::endl;
+    os << "[RASBERY][IO_WRITER] {\"mode\":\"" << modeName() << "\",\"mode_source\":\""
+       << modeSourceName() << "\",\"queue_limit\":" << queueDepthLimit()
+       << ",\"queue_bytes\":" << queueByteLimit() << "}" << std::endl;
 }
 
 inline void reportSummary(std::ostream& os) {
     const Counters& c = counters();
     os << "[RASBERY][IO_WRITER][SUMMARY] {\"mode\":\"" << modeName()
+       << "\",\"mode_source\":\"" << modeSourceName()
        << "\",\"requests\":" << c.requests.load()
        << ",\"ops\":" << c.ops.load()
        << ",\"bytes\":" << c.bytes.load()

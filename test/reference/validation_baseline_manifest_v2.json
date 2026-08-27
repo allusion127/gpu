@@ -1,0 +1,62 @@
+{
+  "schema_version": 2,
+  "frozen_utc": "TBD_REFREEZE",
+  "supersedes": "validation_baseline_manifest_v1.json",
+  "status": "TEMPLATE - not yet frozen. Every TBD_REFREEZE field is filled by the validation agent from the re-freeze run on 238 (protocol in docs/CAMPAIGN_ANDERSON_WIDTH_FP32_20260827_KO.md s8). Until frozen_utc is a date, validation_baseline_manifest_v1.json remains the only frozen baseline.",
+  "baseline_commit_sha": "TBD_REFREEZE",
+  "branch": "codex/exact-throughput-campaign",
+  "compiler": "TBD_REFREEZE (v1: x86_64-conda-linux-gnu-g++ (conda-forge) 14.3.0 at /home/kmk/codex/tools/gcc13/bin)",
+  "cuda_compiler": "TBD_REFREEZE (v1: nvcc 13.0.88 (/usr/local/cuda-13.0))",
+  "release_flags": "TBD_REFREEZE (v1: -O3 -DNDEBUG -std=gnu++20 -march=native -Wall -Wextra -Wpedantic -fopenmp, CMAKE_BUILD_TYPE=Release, RASBERY_CUDA_ARCHITECTURES=120, per-TU --fmad=false on CudaXsReconBackend.cu)",
+  "gpu": {
+    "model": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "uuid": "GPU-e73893d2-bd77-cccc-bf09-c0b3016cbe13",
+    "driver": "TBD_REFREEZE (v1: 590.48.01)",
+    "cuda_runtime": "TBD_REFREEZE (v1: 13.1)",
+    "host": "166.104.40.238 (GPU0)"
+  },
+  "benchmark_input": {
+    "deck": "kngr_238.json (APR1400/KNGR CY1 PSAR, 35-state natural EOC, quarter core 8451 nodes NG=2)",
+    "input_sha256": "ac6a28bae361dcd072abb742c1610bd05c03337b7a8a114cee488550231b51c7",
+    "env": "RASBERY_PPR_MODE=master RASBERY_PC_MODE=decart RASBERY_GPU=1 RASBERY_GPU_CMFD_SWEEP=1 RASBERY_GPU_XSRECON=1 RASBERY_GPU_FLATXS=1 RASBERY_GPU_NODAL=1 RASBERY_GPU_NODAL_FULL=1 (assembly/fusion default ON)",
+    "env_note": "RASBERY_IO_WRITER and RASBERY_XE_ANDERSON are DELIBERATELY ABSENT. Both are adopted defaults as of 2026-08-27 and a baseline must exercise the default path; setting either makes the run an experiment, not a baseline. The [RASBERY][PHYSICS_MODE] and [RASBERY][IO_WRITER] receipts prove which path ran (see adopted_defaults below)."
+  },
+  "adopted_defaults": {
+    "io_writer": "thread (RASBERY_IO_WRITER unset). Adopted 2026-08-27: byte-identical in every validated configuration (single deck 500/500 datasets, M64 45,312/45,312), +0.6 pct M64 throughput. The v1 baseline was written by the inline path; because the writer thread is byte-identical, this does NOT by itself change the golden.",
+    "xe_anderson_single": "ON (RASBERY_XE_ANDERSON unset, non --batch-mode). Adopted 2026-08-27 as a CORRECTNESS improvement: same fixed point, same tolerance, MASTER reactivity 1.970 -> 1.905 pcm and AO 0.022 -> 0.013, at 1.69x. THIS is what moves the golden - the v1 baseline carried a ~2-3 pcm unconverged-Xe artifact and the v2 trajectory does not.",
+    "xe_anderson_batch": "OFF (RASBERY_XE_ANDERSON unset, --batch-mode). Net-negative in batch (202 vs 216 cases/h at M64) from arrival-width starvation; revisit after Phase 5 slot compaction. A batch golden therefore keeps the v1 Xe trajectory.",
+    "receipt_fields": "[RASBERY][PHYSICS_MODE] {... \"exec_mode\":\"single|batch\",\"xe_anderson\":true|false,\"xe_anderson_source\":\"default|env\"} and [RASBERY][IO_WRITER] {\"mode\":\"thread|inline\",\"mode_source\":\"default|env\"}"
+  },
+  "golden_outputs": {
+    "single_deck_h5_sha256": "TBD_REFREEZE (= gateA_v2_rep1.h5)",
+    "repeats": 4,
+    "repeat_walls_s": "TBD_REFREEZE (4 values; v1 was [93.29, 92.84, 92.99, 92.69] pre-Anderson, expect ~55 s with the adopted single-deck default)",
+    "determinism": "TBD_REFREEZE (required: N/N datasets bit-exact across all 4 repeats, keff/ppm max_abs_delta 0.0; container md5 may differ - HDF5 object-header timestamps only, never use cmp)",
+    "dataset_count": "TBD_REFREEZE (v1: 500)"
+  },
+  "master_comparison_data_version": "kngr_mas_sum.txt + mas_ppi_{boc,0060..0420} (MASTER 4.0 KNGQ01, campaign 2026-08-22..24); comparator tools/compare_master_rasbery.py",
+  "master_agreement_at_freeze": {
+    "reactivity_pcm": "TBD_REFREEZE (expected ~1.905; v1 was 1.970)",
+    "cbc_ppm": "TBD_REFREEZE (v1: 15.309)",
+    "ao_abs": "TBD_REFREEZE (expected ~0.013; v1 was 0.022)",
+    "boc_pin_rms_pct": "TBD_REFREEZE (v1: 0.239)",
+    "boc_pin_max_pct": "TBD_REFREEZE (v1: 0.79)"
+  },
+  "anderson_health_at_freeze": {
+    "aa_proposed": "TBD_REFREEZE",
+    "aa_accepted": "TBD_REFREEZE",
+    "aa_rejected": "TBD_REFREEZE",
+    "aa_history_resets": "TBD_REFREEZE",
+    "acceptance_rate_pct": "TBD_REFREEZE (v1-era single-deck measurement: 95.0)",
+    "source": "[RASBERY][SPTELEM][SUMMARY] counters; requires RASBERY_STATEPOINT_TELEMETRY=1, which must be run SEPARATELY from the timing repeats (telemetry perturbs I/O contention)"
+  },
+  "throughput_baselines": {
+    "single_deck_wall_s": "TBD_REFREEZE (v1: 92.9 pre-Anderson)",
+    "m64_exact_cases_per_hour": "TBD_REFREEZE (v1: 213.9; measured with the adopted defaults = writer thread ON, Anderson OFF in batch)",
+    "master_w16_cases_per_hour": 217.0
+  },
+  "threshold_file": "validation_thresholds_v2.json",
+  "threshold_file_sha256": "TBD_REFREEZE",
+  "threshold_file_note": "sha256 of the frozen threshold file recorded in the campaign report at each gate evaluation",
+  "v1_retention": "validation_thresholds_v1.json and validation_baseline_manifest_v1.json are kept UNTOUCHED as history. v1 remains the correct reference for any comparison against a pre-2026-08-27 result."
+}
