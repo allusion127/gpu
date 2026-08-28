@@ -1035,6 +1035,58 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     // latches is a sequence of no-ops rather than a sequence of wrong answers.
     // The host never enqueues the NEXT one: it reads the exit word that rode the
     // stream behind the transition at the top of every pass.
+    //
+    // =======================================================================
+    // WHAT STILL STOPS TASK 10 FROM CAPTURING THIS LOOP AS A CONDITIONAL WHILE
+    // =======================================================================
+    //
+    // Surveyed 2026-08-29, after W3 item 2 removed the nodal drive's terminal
+    // drain.  A stream in capture mode RECORDS work; it may not be
+    // synchronised, and a host call that reads device memory inside the body is
+    // not a node, it is a hole.  The body below still has both, and the list is
+    // ordered by what has to be fixed FIRST, because each entry subsumes the
+    // ones under it.
+    //
+    //  (1) THE EIGENVALUE ROUND TRIP.  :1302's synchronise exists so that
+    //      finish_cmfd_sweep (Driver.h:998, BICGCMFD::finishDrive) and the nodal
+    //      reset's `1.0 / eigv` (Driver.h:1020) can read an eigenvalue the sweep
+    //      produced on the DEVICE.  The verdict kernel already publishes it into
+    //      DeviceOuterProbe, and the nodal solve already takes it from device
+    //      memory (`v.reigv_dev`, CudaXsReconBackend.cu) -- via a captured H2D
+    //      out of a pinned host slot the host writes each drive.  So the whole
+    //      of the reciprocal's journey is device -> host -> pinned slot ->
+    //      device, and a one-thread kernel writing 1/probe.eigv straight into
+    //      that device slot removes the second and third hops.  That is Task 8,
+    //      and it is the smallest of these.
+    //
+    //  (2) THE SWEEP OBSERVATION.  finishDrive also adopts the flux into
+    //      Geometry::Phif, answers lastDriveLeftDeviceFlux(), and -- on the
+    //      exceptional launches (sweep state 0 or 2) -- runs the remaining
+    //      blocking launches and republishes a probe the verdict kernel had to
+    //      guess at.  Only the exceptional branch genuinely needs the host; the
+    //      normal one is already device-to-device.  Splitting them is what makes
+    //      (1) worth doing.
+    //
+    //  (3) THE HOST-DECIDED UPLOAD ELISIONS.  :1083, :1096, :1143 and :1388 read
+    //      generations and byte shadows on the host to decide whether three
+    //      cudaMemcpyAsync nodes exist this outer.  A captured body has a FIXED
+    //      node set, so inside a segment they have to become either
+    //      unconditional (correct, and pure waste on the ~98% of outers that
+    //      elide today) or device-gated copies.
+    //
+    //  (4) apply_cusping (:1484) IS A HOST CALL ON EVERY OUTER, and it must stay
+    //      one until Task 11: i-SMR CY02 proved the question has to be asked per
+    //      outer, and ApplyRodCusping answers it from host scratch.
+    //
+    // MEASURED ON THE LOCAL BOX (tools/probe_conditional_graph.cu, CUDA 12.6,
+    // sm_61, GTX 1080 Ti): WHILE conditional nodes are legal and the handle
+    // scope the runtime accepts is the BODY graph, not the root; SWITCH is not
+    // available below CUDA 12.8 and the nested-IF fallback costs 8.44 us per
+    // iteration against WHILE's own 4.55 us; a cooperative kernel node inside a
+    // conditional body is accepted; instantiation of 1505 nodes takes 3.24 ms,
+    // against the plan's 250 ms gate.  At 4.55 us per outer a WHILE over this
+    // deck's 12017 outers costs 55 ms of a 60 s run, so the control flow is not
+    // what decides this -- the four holes above are.
     for (unsigned int i = 0; i < budget; ++i) {
         // THE PREVIOUS OUTER'S EXIT, AND WHY IT COSTS A SYNCHRONISE.
         //
