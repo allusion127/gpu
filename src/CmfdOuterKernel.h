@@ -57,7 +57,8 @@
 //
 // Must stay compilable by g++ and nvcc: no STL, no allocation, no exceptions.
 
-#include "XsReconKernel.h" // xsrFma / xsrMul, the two rounding primitives
+#include "GpuFormMask.h"    // the runtime override + receipt (host only)
+#include "XsReconKernel.h"  // xsrFma / xsrMul, the two rounding primitives
 
 #include <cmath>
 
@@ -83,27 +84,62 @@ constexpr double DHAT_RATIO_LIMIT      = 1.0;
 // Contraction policy
 // ---------------------------------------------------------------------------
 
-/// Mined contraction mask: CO_PSI_ACC = 0 (not fused), CO_DHAT_NUM = 1 (fused),
-/// CO2_JNET_INTERNAL = 1 (second product rounded first).
-///
-/// TWO INDEPENDENT DERIVATIONS AGREE.  The assembly quotations in the file
-/// header were read first, from CMFD.cpp / BICGCMFD.cpp at the release flags;
-/// test/cmfd_outer_form_probe.cpp --mine then coordinate-descended the mask
-/// against a separately compiled verbatim reference and landed on the same
-/// 0x6 with ZERO mismatching words.  The probe also checks that every site is
-/// DECISIVE on its fixture -- flipping any one of the three moves 285, 319 and
-/// 300 words respectively -- so none of the three is a guess that happened to
-/// go unpunished.
-///
-/// 1-bit sites: 1 = single-rounding fma.  2-bit sites over A*B + C*D:
-/// 0 = both products rounded, 1 = fma(A, B, round(C*D)), 2 = fma(C, D,
-/// round(A*B)).
+// ===========================================================================
+// THE MASK IS PER BUILD HOST.  IT IS NOT A UNIVERSAL CONSTANT.
+// ===========================================================================
+//
+// This mask records which multiply-adds THE HOST COMPILER ON THIS MACHINE
+// fused, so that the device build can reproduce them.  Both halves of that
+// sentence are host-specific: a different CPU (different -march=native ISA), a
+// different gcc, or different flags can move a site, and then a fixed constant
+// is wrong on one of the two machines.
+//
+// Measured, not hypothesised:
+//
+//     WSL2 / g++ 13.3 / Xeon-class dev box   ->  0x6   (CO_PSI_ACC NOT fused)
+//     238 / Xeon Gold 5317                   ->  0x7   (CO_PSI_ACC     fused)
+//
+// So the value below is a DEFAULT FOR THE BUILD IT SHIPPED WITH, and the tests
+// that police it MINE IT FIRST rather than asserting this literal -- see
+// test/cmfd_outer_form_probe.cpp.  RASBERY_CMFD_OUTER_FORMS overrides it at run
+// time (hex or decimal) for the case where a binary is built on one host and
+// run against a reference produced on another.
+//
+// WHAT DOES NOT CHANGE: on any single host, the device build must reproduce
+// that host's contraction exactly.  Class B0 is a per-build-host contract, and
+// the mask is how it is kept.  Task 22's v3 freeze pins the 238 value.
+//
+// 1-bit sites: 1 = single-rounding fma.  2-bit sites over A*B + C*D:
+// 0 = both products rounded, 1 = fma(A, B, round(C*D)), 2 = fma(C, D,
+// round(A*B)).
+//
+// How 0x6 was established on the authoring host -- the method, which travels
+// even though the value does not: the assembly quotations in the file header
+// were read first, from CMFD.cpp / BICGCMFD.cpp at the release flags; then
+// test/cmfd_outer_form_probe.cpp --mine coordinate-descended the mask against a
+// separately compiled verbatim reference and landed on the same value with ZERO
+// mismatching words.  The probe also checks every site is DECISIVE on its
+// fixture, so no bit is a guess that happened to go unpunished.
 inline constexpr unsigned long long CMFD_OUTER_FORMS = 0x6ull;
 
-/// Same value as a function, for the nvcc reason XsReconKernel.h documents for
-/// ACTIVE_XT: device code cannot always address a namespace-scope constant.
+/// The BUILD DEFAULT as a function, for the nvcc reason XsReconKernel.h
+/// documents for ACTIVE_XT: device code cannot always address a namespace-scope
+/// constant.  Device code that needs a mask should take it as a kernel argument
+/// (see cmfdOuterFormsRuntime); this is the compile-time fallback.
 RASBERY_CMFD_HD constexpr unsigned long long cmfdOuterForms() {
     return 0x6ull;
+}
+
+/// HOST-SIDE resolved mask: the build default unless RASBERY_CMFD_OUTER_FORMS
+/// overrides it.  Read once, receipt-logged once.
+///
+/// Every enqueue in CudaCmfdOuterKernels.h takes `forms` as a parameter, so the
+/// value crosses to the device as a kernel ARGUMENT and no device code ever has
+/// to reach for an environment variable.
+inline unsigned long long cmfdOuterFormsRuntime() {
+    static const unsigned long long value = gpu::resolveFormMask(
+        "RASBERY_CMFD_OUTER_FORMS", CMFD_OUTER_FORMS, "cmfd_outer");
+    return value;
 }
 
 enum : int {

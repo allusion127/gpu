@@ -180,7 +180,7 @@ RASBERY_GPU_HD inline long long nodalConstStride(int nxyz, int ng) {
 /// consuming and the slot is queued twice on the next epoch.
 RASBERY_GPU_HD inline bool nodalConstantUpdateThread(const DeviceSlotView& v,
                                                      const DeviceGeometryView& geom, int lk,
-                                                     int ig) {
+                                                     int ig, unsigned long long forms) {
     const int ng   = v.ng;
     const int nxyz = v.nxyz;
 
@@ -213,7 +213,7 @@ RASBERY_GPU_HD inline bool nodalConstantUpdateThread(const DeviceSlotView& v,
         // The one and only arithmetic site: the shared pure body.  No formula
         // is spelled out in this file, by contract.
         const nodal::NodalConstantCoefficients c =
-            nodal::nodalConstantCoefficients(xsrf, xsdf, hmesh);
+            nodal::nodalConstantCoefficients(xsrf, xsdf, hmesh, forms);
 
         const long long idx = nodalConstIndex(lk, idir, ig, ng);
         v.nodal_const[kNcEta1 * stride + idx]   = c.eta1;
@@ -256,7 +256,8 @@ RASBERY_GPU_HD inline bool nodalConstantSlotIsCurrent(const DeviceSlotState& st)
 
 /// Sec 6.1.  One thread per (node, group) of one queued slot.
 __global__ __launch_bounds__(kNodalConstantBlock) void k_nodal_update_constant(
-    DeviceArenaView arena, DevicePhaseQueue queue, DeviceGeometryView geom) {
+    DeviceArenaView arena, DevicePhaseQueue queue, DeviceGeometryView geom,
+    unsigned long long forms) {
     // 1. The dispatch is at the bucket width; padding lanes must not read the
     //    queue at all (the value there is kQueueEmptySlot).
     const int logical = static_cast<int>(blockIdx.y);
@@ -276,7 +277,7 @@ __global__ __launch_bounds__(kNodalConstantBlock) void k_nodal_update_constant(
     const int lk = tid / v.ng;
     const int ig = tid - lk * v.ng;
 
-    nodalConstantUpdateThread(v, geom, lk, ig);
+    nodalConstantUpdateThread(v, geom, lk, ig, forms);
 }
 
 /// Publish pass 1: the xsrf/xsdf cache, AFTER the compute kernel has finished
@@ -334,13 +335,15 @@ inline int nodalConstantGridX(int nxyz, int ng) {
 inline cudaError_t enqueueNodalUpdateConstant(const DeviceArenaView& arena,
                                               const DevicePhaseQueue& queue,
                                               const DeviceGeometryView& geom, int nxyz,
-                                              int ng, cudaStream_t stream) {
+                                              int ng, cudaStream_t stream,
+                                              unsigned long long forms =
+                                                  nodal::nodalConstFormsRuntime()) {
     if (queue.count <= 0) return cudaSuccess;
 
     const dim3 block(kNodalConstantBlock, 1, 1);
     const dim3 grid(static_cast<unsigned>(nodalConstantGridX(nxyz, ng)),
                     static_cast<unsigned>(queue.bucket), 1);
-    k_nodal_update_constant<<<grid, block, 0, stream>>>(arena, queue, geom);
+    k_nodal_update_constant<<<grid, block, 0, stream>>>(arena, queue, geom, forms);
     if (const cudaError_t rc = cudaGetLastError(); rc != cudaSuccess) return rc;
 
     k_nodal_constant_publish_cache<<<grid, block, 0, stream>>>(arena, queue);

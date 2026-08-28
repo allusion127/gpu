@@ -53,6 +53,7 @@
 // EDITING RULE.  Changing a form bit changes the CPU baseline.  Do not "tidy"
 // one; re-mine and re-record.
 
+#include "GpuFormMask.h"   // the runtime override + receipt (host only)
 #include "XsReconKernel.h" // xsrFma / xsrMul, the two rounding primitives
 
 #include <cmath>
@@ -65,25 +66,59 @@
 
 namespace rasbery::nodal {
 
-/// Mined contraction mask for nodalConstantCoefficients.
-///
-/// Provenance: test/nodal_constant_gpu_replay.cpp --mine, coordinate descent to
-/// ZERO mismatches against a verbatim quotation of the pre-policy body over a
-/// 2-group PWR/SMR sweep, g++ 13.3.0 -O3 -march=native -DNDEBUG (Ubuntu 24.04).
-/// Cross-checked against the 20 fma instructions gcc emits for
-/// Nodal::updateConstant.
-///
-/// 1-bit sites: 1 = single-rounding fma.  2-bit sites over A*B + C*D:
-/// 0 = both products rounded, 1 = fma(A, B, round(C*D)), 2 = fma(C, D,
-/// round(A*B)).
+// ===========================================================================
+// THE MASK IS PER BUILD HOST.  IT IS NOT A UNIVERSAL CONSTANT.
+// ===========================================================================
+//
+// It records which multiply-adds THE HOST COMPILER ON THIS MACHINE fused, so
+// the device build can reproduce them.  A different CPU (a different
+// -march=native ISA), a different gcc or different flags can move a site, and a
+// fixed literal is then wrong on one of the two machines.  This is not
+// theoretical: CMFD_OUTER_FORMS was measured at 0x6 on the authoring host and
+// 0x7 on 238 (Xeon Gold 5317), where CO_PSI_ACC IS fused.
+//
+// Provenance of the value below: test/nodal_constant_gpu_replay.cpp --mine,
+// coordinate descent to ZERO mismatches against a verbatim quotation of the
+// pre-policy body over a 2-group PWR/SMR sweep, g++ 13.3.0 -O3 -march=native
+// -DNDEBUG (Ubuntu 24.04 / WSL2).  Cross-checked against the 20 fma
+// instructions gcc emits for Nodal::updateConstant on that host.
+//
+// 238 HAS NOT RE-MINED THIS ONE YET.  CMFD's mask moved between the two hosts,
+// so this one plausibly does too; it is a Task 22 validation step, and until it
+// is done the 238 number is unknown rather than assumed equal.  The gates do not
+// depend on the answer: they MINE the host's mask and assert against that
+// (test/nodal_constant_gpu_replay.cpp), so they pass on either host and report
+// which value they found.
+//
+// RASBERY_NODAL_CONST_FORMS overrides it at run time (hex or decimal) for a
+// binary built on one host and scored against a reference from another.
+//
+// WHAT DOES NOT CHANGE: on any single host the device build must reproduce that
+// host's contraction exactly.  Class B0/N1 attribution is a per-build-host
+// contract and the mask is how it is kept.
+//
+// 1-bit sites: 1 = single-rounding fma.  2-bit sites over A*B + C*D:
+// 0 = both products rounded, 1 = fma(A, B, round(C*D)), 2 = fma(C, D,
+// round(A*B)).
 inline constexpr unsigned long long NODAL_CONST_FORMS = 0x55545FFFull;
 
-/// Device code cannot address a namespace-scope constant's storage in every
-/// context (same finding as xsrecon's ACTIVE_XT), and a default argument reads
-/// better than a policy object for a body with one call site.  Keep identical
-/// to NODAL_CONST_FORMS.
+/// The BUILD DEFAULT as a function.  Device code cannot address a
+/// namespace-scope constant's storage in every context (same finding as
+/// xsrecon's ACTIVE_XT); device paths should take the mask as a kernel
+/// ARGUMENT (see nodalConstFormsRuntime), and this is the fallback.
+/// Keep identical to NODAL_CONST_FORMS.
 RASBERY_NODAL_CONST_HD constexpr unsigned long long nodalConstForms() {
     return 0x55545FFFull;
+}
+
+/// HOST-SIDE resolved mask: the build default unless RASBERY_NODAL_CONST_FORMS
+/// overrides it.  Read once, receipt-logged once.  getenv has no device
+/// implementation, which is why the resolved value travels to the device as a
+/// kernel argument instead.
+inline unsigned long long nodalConstFormsRuntime() {
+    static const unsigned long long value = rasbery::gpu::resolveFormMask(
+        "RASBERY_NODAL_CONST_FORMS", NODAL_CONST_FORMS, "nodal_const");
+    return value;
 }
 
 // Site bit offsets.  Named so a diff of the mask is readable and so the miner

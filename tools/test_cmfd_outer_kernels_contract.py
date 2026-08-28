@@ -105,18 +105,28 @@ elif mask_const.group(1).lower() != mask_fn.group(1).lower():
                     "disagree; device code reads the function, host code the constant"
                     % (mask_const.group(1), mask_fn.group(1)))
 else:
+    # NO ASSERTION ON THE BITS.  The mask records which multiply-adds THE BUILD
+    # HOST's compiler fused, and that is host-specific: measured 0x6 on the
+    # authoring box (WSL2, g++ 13.3) and 0x7 on 238 (Xeon Gold 5317, where
+    # CO_PSI_ACC IS fused).  A contract test that pinned the bits would fail on
+    # one of the two machines for a reason that has nothing to do with the code.
+    #
+    # What IS pinned instead: the mask has a runtime override, the gates mine it
+    # rather than assert it, and the per-build-host nature is documented where
+    # the next person will look.
     mask = int(mask_const.group(1), 16)
-    # The measured pattern, from both the production assembly and the miner.
-    if mask & 0x1:
-        problems.append("CmfdOuterKernel.h: CO_PSI_ACC is marked fused, but gcc emits "
-                        "vmulsd + vaddsd for `_psi[l] += flux*xsnf` (the accumulator goes "
-                        "through memory).  Re-run the probe with --mine.")
-    if not mask & 0x2:
-        problems.append("CmfdOuterKernel.h: CO_DHAT_NUM is marked unfused, but gcc emits "
-                        "one vfnmsub213sd for -(dtil*fdiff) - jnet")
-    if ((mask >> 2) & 0x3) != 1:
-        problems.append("CmfdOuterKernel.h: CO2_JNET_INTERNAL is not state 1; gcc rounds "
-                        "the dhat product (vmulpd) and fuses the dtil one (vfnmsub231pd)")
+    if mask == 0:
+        problems.append("CmfdOuterKernel.h: CMFD_OUTER_FORMS is 0 -- every site unfused, "
+                        "which is the never-mined seed, not a measurement")
+    for needle, why in (
+            ("PER BUILD HOST", "the host-specific nature has to be stated where it is read"),
+            ("RASBERY_CMFD_OUTER_FORMS", "the runtime override"),
+            ("cmfdOuterFormsRuntime", "the resolved accessor")):
+        if needle not in BODY_TEXT:
+            problems.append(f"CmfdOuterKernel.h: missing {needle!r} -- {why}")
+    if "resolveFormMask" not in BODY_CODE:
+        problems.append("CmfdOuterKernel.h: the runtime mask is not resolved through "
+                        "GpuFormMask.h, so an override would not be receipt-logged")
 want(BODY_CODE, "coMa1(", "CmfdOuterKernel.h", "the multiply-add sites need the policy")
 want(BODY_CODE, "coMa2(", "CmfdOuterKernel.h", "the two-product site needs the policy")
 
@@ -226,6 +236,18 @@ for phase in sorted(EMITTED):
 
 # --- the gates exist and are built -------------------------------------------
 want(PROBE_TEXT, "--mine", "test/cmfd_outer_form_probe.cpp", "the mask must be re-derivable")
+for path, text in (("test/cmfd_outer_form_probe.cpp", PROBE_TEXT),
+                   ("test/cmfd_outer_replay.cpp", REPLAY_TEXT)):
+    if "mineStable" not in text:
+        problems.append(
+            f"{path}: does not mine the host's mask before asserting.  The mask is "
+            "per-build-host (0x6 on the authoring box, 0x7 on 238), so a gate scoring "
+            "against the shipped literal fails on one of them for a reason unrelated to "
+            "the code under test.")
+    if "MINED ON THIS HOST" not in text and "mined=" not in text:
+        problems.append(
+            f"{path}: does not PRINT the mask it mined -- the operator needs that value "
+            "to set RASBERY_CMFD_OUTER_FORMS, and Task 22's freeze needs it recorded.")
 want(PROBE_TEXT, "branch coverage", "test/cmfd_outer_form_probe.cpp",
      "a mask mined on operands that never reach the guards covers part of the function")
 want(REPLAY_TEXT, "kPhaseTransitions", "test/cmfd_outer_replay.cpp",

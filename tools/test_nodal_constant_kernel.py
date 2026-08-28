@@ -121,6 +121,50 @@ static bool same(double a, double b) {
     return std::bit_cast<std::uint64_t>(a) == std::bit_cast<std::uint64_t>(b);
 }
 
+/// Words on which the shipped body under `mask` disagrees with the reference.
+static long score(const std::vector<double>& ops, int cases,
+                  const std::vector<double>& want, unsigned long long mask) {
+    long bad = 0;
+    for (int i = 0; i < cases; ++i) {
+        const NodalConstantCoefficients b = nodalConstantCoefficients(
+            ops[3 * i], ops[3 * i + 1], ops[3 * i + 2], mask);
+        const double bv[9] = {b.eta1, b.eta2, b.m260, b.m251, b.m253,
+                              b.m262, b.m264, b.diagD, b.diagDI};
+        for (int k = 0; k < 9; ++k)
+            if (!same(want[static_cast<std::size_t>(i) * 9 + k], bv[k])) ++bad;
+    }
+    return bad;
+}
+
+/// Coordinate descent over the form sites, exactly as the replay's miner does.
+/// The reference lives in the other translation unit, so nothing here can
+/// perturb it.
+static unsigned long long mineMask(const std::vector<double>& ops, int cases,
+                                   const std::vector<double>& want) {
+    using namespace rasbery::nodal;
+    struct Site { int bit; int states; };
+    std::vector<Site> sites;
+    for (int b = 0; b < NC_ONE_BIT_COUNT; ++b) sites.push_back({b, 2});
+    for (int b = NC_ONE_BIT_COUNT; b < NC_BIT_COUNT; b += 2) sites.push_back({b, 3});
+
+    unsigned long long best = 0ull;
+    long best_score = score(ops, cases, want, best);
+    for (int pass = 0; pass < 8 && best_score > 0; ++pass) {
+        const long before = best_score;
+        for (const Site& s : sites)
+            for (int st = 0; st < s.states; ++st) {
+                const unsigned long long m =
+                    (best & ~(static_cast<unsigned long long>(s.states == 2 ? 1 : 3) << s.bit)) |
+                    (static_cast<unsigned long long>(st) << s.bit);
+                if (m == best) continue;
+                const long sc = score(ops, cases, want, m);
+                if (sc < best_score) { best_score = sc; best = m; }
+            }
+        if (best_score == before) break;
+    }
+    return best;
+}
+
 int main() {
 #if !defined(__FMA__)
     // Without FMA in the ISA gcc contracts nothing, so the reference is not the
@@ -148,9 +192,20 @@ int main() {
     std::vector<double> want(static_cast<std::size_t>(cases) * 9);
     legacyBatch(ops.data(), cases, want.data());
 
+    // SELF-CALIBRATING.  The mask records which multiply-adds THIS HOST's
+    // compiler fused, which is host-specific -- the CMFD mask was measured at
+    // 0x6 on the authoring box and 0x7 on 238's Xeon Gold 5317.  Asserting the
+    // shipped literal would therefore fail on one of the two hosts for a reason
+    // that has nothing to do with the code.  So: mine the mask that reproduces
+    // THIS host's legacy body, report it, and assert against that.
+    const unsigned long long mined = mineMask(ops, cases, want);
+    std::printf("MINED ON THIS HOST: NODAL_CONST_FORMS = 0x%llX (build default 0x%llX)\n",
+                mined,
+                static_cast<unsigned long long>(rasbery::nodal::NODAL_CONST_FORMS));
+
     for (int i = 0; i < cases; ++i) {
-        const NodalConstantCoefficients b =
-            nodalConstantCoefficients(ops[3 * i], ops[3 * i + 1], ops[3 * i + 2]);
+        const NodalConstantCoefficients b = nodalConstantCoefficients(
+            ops[3 * i], ops[3 * i + 1], ops[3 * i + 2], mined);
         const double bv[9] = {b.eta1, b.eta2, b.m260, b.m251, b.m253,
                               b.m262, b.m264, b.diagD, b.diagDI};
         for (int k = 0; k < 9; ++k) {

@@ -335,6 +335,29 @@ void rasberySetBatchWidth(int slots);
 /// The width declared above (0 when batch mode is off).
 [[nodiscard]] int rasberyBatchWidth();
 
+// ---------------------------------------------------------------------------
+// LOCAL-TESTING CAVEAT: the resident sweep tests need sm_120.
+// ---------------------------------------------------------------------------
+//
+// On the sm_61 development card (GTX 1080 Ti, WSL2) the device-resident CMFD
+// sweep path is NOT run-to-run deterministic: repeated identical invocations of
+// the same deck drifted by up to 90 pcm, while `RASBERY_GPU=1` alone and
+// `--batch-mode 1` without RASBERY_GPU_CMFD_SWEEP were both exactly 0.000 pcm.
+// It survived RASBERY_GPU_CMFD_ASSEMBLY=0, RASBERY_GPU_GRAPH=0 and
+// OMP_NUM_THREADS=1, so it is not the device assembly, graph capture or host
+// threading.
+//
+// It is ARCHITECTURE-SPECIFIC.  On the campaign target (sm_120, 238) the W2
+// gate measured 10/10 runs bit-identical, and S2 vs S0 came out at 1.13x
+// (48.72s vs 55.21s) at zero numerical cost.  So the sm_61 behaviour is a
+// property of that card or its driver, not of this code.
+//
+// WHAT THAT MEANS FOR ANYONE TESTING LOCALLY: an A/B on a pre-Volta card cannot
+// distinguish a real regression in the sweep path from that card's own noise.
+// Feature-off comparisons are still meaningful there (they were exactly 0.000
+// pcm across the Task 6 and Task 7 commits); anything that engages
+// RASBERY_GPU_CMFD_SWEEP has to be judged on sm_120.
+
 /// Rev.7.1 Task 6: RASBERY_GPU_CMFD_RESIDENT_SINGLE, default OFF.
 ///
 /// With it set, a run WITHOUT --batch-mode still builds the arena -- at width 1

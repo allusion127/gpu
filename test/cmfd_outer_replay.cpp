@@ -30,6 +30,7 @@
 #include "CmfdOuterKernel.h"
 #include "CudaCmfdOuterKernels.h"
 
+#include "cmfd_outer_mine.h"
 #include "cmfd_outer_reference.h"
 
 #include <cstdint>
@@ -76,7 +77,8 @@ co::CmfdGeometryView geomOf(const cmfdref::Mesh& m) {
 // (1) arithmetic
 // ---------------------------------------------------------------------------
 
-void replayArithmetic(const cmfdref::Fixture& f, bool clamp_enabled) {
+void replayArithmetic(const cmfdref::Fixture& f, bool clamp_enabled,
+                      unsigned long long forms) {
     const cmfdref::Mesh m = f.mesh();
 
     std::vector<double>   ref_dtil(f.dtil.size()), ref_jnet(f.jnet.size()),
@@ -98,7 +100,6 @@ void replayArithmetic(const cmfdref::Fixture& f, bool clamp_enabled) {
     v.dhat = dhat.data();
     v.psi  = psi.data();
     const co::CmfdGeometryView g     = geomOf(m);
-    const unsigned long long   forms = co::cmfdOuterForms();
 
     long bad_dtil = 0, bad_psi = 0, bad_jnet = 0, bad_dhat = 0;
 
@@ -518,12 +519,24 @@ int main(int argc, char** argv) {
     const int nxyz = argc > 1 ? std::atoi(argv[1]) : 1024;
     const cmfdref::Fixture f = cmfdref::buildFixture(nxyz);
 
-    std::printf("cmfd outer replay: nxyz=%d nsurf=%d ng=%d mask=0x%llX\n", f.nxyz, f.nsurf,
-                cmfdref::NG, co::cmfdOuterForms());
+    // SELF-CALIBRATING (see cmfd_outer_mine.h): the mask records which
+    // multiply-adds THIS HOST's compiler fused -- measured 0x6 on the authoring
+    // box and 0x7 on 238's Xeon Gold 5317 -- so the Class B0 comparison must be
+    // made against the host's own mask, not a literal from another machine.
+    // What is still asserted is that the DERIVATION is stable and that the mined
+    // mask reproduces the reference exactly.
+    bool                     mine_sound = true;
+    const unsigned long long forms       = cmfdmine::mineStable(f, mine_sound);
+    std::printf("cmfd outer replay: nxyz=%d nsurf=%d ng=%d mined=0x%llX (build default "
+                "0x%llX)\n",
+                f.nxyz, f.nsurf, cmfdref::NG, forms, co::CMFD_OUTER_FORMS);
+    check(mine_sound,
+          "a search seed failed to reach zero mismatches -- this fixture does not "
+          "determine the mask, which is a defect on any host");
 
     std::printf(" [1] arithmetic (Class B0, bit-identical)\n");
-    replayArithmetic(f, false);
-    replayArithmetic(f, true);
+    replayArithmetic(f, false, forms);
+    replayArithmetic(f, true, forms);
     checkRatioBitMonotonicity();
 
     std::printf(" [2] convergence / stall state machine (Sec 6.13)\n");
