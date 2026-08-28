@@ -778,6 +778,70 @@ if RESIDENT and "_wiel_sweep" in RESIDENT:
     problems.append("BICGCMFD::deviceSweepResident tests the Wielandt warm-up, which is "
                     "per-drive state the arming site cannot use")
 
+# --- 16. the residency cannot outlive the segment (the kngr_238 crash) ------
+#
+# THE BUG.  setOuterSegmentResident(true) was latched at arm time and never
+# cleared, so the moment the segment stopped running -- an escape, a launch
+# failure, or a deck like kngr_238 where the critical search makes SolveLoop
+# refuse and only ReconvergeFlux ever delegates -- the sweep went on eliding
+# the dhat and psi H2D for the rest of the run while the HOST body wrote the
+# host arrays.  Every subsequent host outer then assembled the CMFD operator
+# from a device dhat nobody was updating: one device outer, an escape, 169 host
+# outers, and a non-finite abort on 238 (k_eff 1.135 -> 0.678 locally).
+#
+# The flag now means "the caller of THIS drive owns dhat and psi on the
+# device", which is the only reading under which it cannot outlive its caller.
+_HOOK = body_of(DRIVER_CODE, "static bool outerSweepHook(", "static bool outerNodalHook(")
+if _HOOK:
+    _on = _HOOK.find("setOuterSegmentResident(true)")
+    _drive = _HOOK.find("cmfd_solver.drive(")
+    _off = _HOOK.find("setOuterSegmentResident(false)")
+    if not (0 <= _on < _drive < _off):
+        problems.append("Driver.h: outerSweepHook must raise the residency BEFORE its drive() "
+                        "and lower it AFTER.  A flag set anywhere else outlives the segment, "
+                        "and the sweep then elides the dhat/psi H2D for every host outer that "
+                        "follows -- which is a stale CMFD operator, not a slow one")
+_ARM = body_of(DRIVER_CODE, "static bool armOuterSegment(", "static void ReconvergeFlux(")
+if _ARM and "setOuterSegmentResident(true)" in _ARM:
+    problems.append("Driver.h: armOuterSegment latches the residency true.  Arming happens "
+                    "once per SolveLoop/ReconvergeFlux entry and the segment may never run "
+                    "there at all (a critical-search deck refuses); the flag belongs to the "
+                    "segment's own drive()")
+
+# --- 17. a host-driven drive publishes no device-only signals ---------------
+#
+# driveDeviceSweeps owns the negative-flux retry and finishes the
+# degenerate-gamma sweep on the Rayleigh branch itself, then keeps looping --
+# it returns only when neither is outstanding.  So after a HOST-driven drive
+# those signals describe nothing live, and worse, they describe something
+# STALE: the latches are written only when a device sweep actually ran, and
+# drive() takes the host loop for the whole Wielandt warm-up.  That is the
+# negative_flux escape kngr_238 raised on its very first device outer.
+if _HOOK and "rasberyPublishOuterProbe(slot, *h.eigv, *h.residual, false, false)" not in _HOOK:
+    problems.append("Driver.h: outerSweepHook publishes device-only signals from a "
+                    "HOST-driven drive.  driveDeviceSweeps resolves the negative-flux retry "
+                    "and the Rayleigh hand-back before it returns, so the probe would report "
+                    "a condition that no longer exists -- or a stale one from an earlier "
+                    "drive.  A bad iterate is still caught by k_outer_refresh_inputs' "
+                    "finiteness test; the signals come back when the sweep is stream-ordered")
+# And the latches must describe the CURRENT drive, so a reader during the
+# warm-up window cannot pick up an older one.
+_DDS = body_of(BICG_CPP, "bool BICGCMFD::driveDeviceSweeps", "while (iout < _ncmfd)")
+for latch in ("_last_sweep_negative", "_last_sweep_state"):
+    if _DDS and not re.search(re.escape(latch) + r"\s*=\s*0;", _DDS):
+        problems.append(f"BICGCMFD.cpp: {latch} is not cleared on entry to "
+                        "driveDeviceSweeps, so a drive that takes the host loop leaves the "
+                        "previous drive's signal readable")
+
+# --- 18. a Failed escape does not carry the device's prev_inner -------------
+_FAILBR = body_of(RECONVERGE, "DevicePhase::Failed", "gpu_outer_armed = false;")
+if _FAILBR and "prev_inner" not in _FAILBR:
+    problems.append("Driver.h: a Failed escape keeps the device's prev_inner.  eigv and "
+                    "residual came back through the sweep hook, which wrote them in place, "
+                    "but prev_inner came out of a DeviceSlotState whose decision reached "
+                    "Failed -- on a non-finite that is not a number this loop should carry. "
+                    "The host body's own rule is prev_inner = eigv")
+
 # --- the gates exist and are built -------------------------------------------
 want(REPLAY_TEXT, "kPhaseTransitions", "test/outer_state_replay.cpp",
      "the emitted edges must be cross-checked against the W1 table")

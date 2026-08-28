@@ -867,11 +867,45 @@ private:
     /// sweep_state == 2.
     static bool outerSweepHook(void* raw, gpu::OuterSegmentStream, int slot, unsigned int) {
         OuterHookCtx& h = *static_cast<OuterHookCtx*>(raw);
+
+        // THE RESIDENCY IS SCOPED TO THIS ONE drive(), and that scope is the
+        // bug fix.  It used to be latched true at arm time and never cleared,
+        // so when the segment stopped running -- a launch failure, an escape,
+        // or a deck where SolveLoop refuses and only ReconvergeFlux delegates
+        // -- the sweep went on eliding the dhat and psi H2D for the rest of the
+        // run while the HOST body wrote the host arrays.  Every subsequent host
+        // outer then drove from a device dhat nobody was updating.
+        //
+        // On kngr_238 that is one device outer, an escape, and then 169 host
+        // outers assembling the CMFD operator from a dhat frozen at outer 1:
+        // k_eff 1.135 -> 0.678 locally, and a non-finite abort on the server.
+        //
+        // Scoped this way the flag says exactly what the sweep needs to know --
+        // 'the caller of THIS drive owns dhat and psi on the device' -- and it
+        // cannot outlive the caller that made it true.
+        h.ctx->cmfd_solver.setOuterSegmentResident(true);
         h.ctx->cmfd_solver.setls(*h.eigv);
         h.ctx->cmfd_solver.drive(*h.eigv, h.ctx->geometry.Phif(), *h.residual);
-        return gpu::rasberyPublishOuterProbe(slot, *h.eigv, *h.residual,
-                                             h.ctx->cmfd_solver.lastSweepNegativeFlux(),
-                                             h.ctx->cmfd_solver.lastSweepRayleigh());
+        h.ctx->cmfd_solver.setOuterSegmentResident(false);
+
+        // NO DEVICE-ONLY SIGNALS FROM A HOST-DRIVEN DRIVE.
+        //
+        // The probe's negative_flux and rayleigh fields mean 'the sweep halted
+        // mid-flight and handed back'.  driveDeviceSweeps never does that: it
+        // owns the negative-flux retry and it finishes the degenerate-gamma
+        // sweep on the Rayleigh branch itself, then keeps looping, and only
+        // returns once neither is outstanding.  Publishing them here reported a
+        // condition the host had already resolved -- and worse, it reported a
+        // STALE one, because the latches are only written when a device sweep
+        // actually ran and drive() takes the host loop for the whole Wielandt
+        // warm-up.  That is the negative_flux escape kngr_238 raised on its
+        // very first device outer.
+        //
+        // A genuinely bad iterate is still caught: k_outer_refresh_inputs tests
+        // eigv and residual for finiteness, which is the check that has meaning
+        // on this path.  The two signals come back when the sweep itself is
+        // stream-ordered and can hand back mid-segment (Task 10 part 2).
+        return gpu::rasberyPublishOuterProbe(slot, *h.eigv, *h.residual, false, false);
     }
 
     /// The nodal drive, exactly as SolveLoop runs it.
@@ -941,10 +975,10 @@ private:
         gpu::rasberyOuterSegment().setHooks(hooks);
 
         if (!gpu::rasberyBindOuterResidency(residency)) return false;
-        // The sweep must stop uploading what the segment now owns.  Setting this
-        // AFTER the bind is deliberate: a run that armed the flags and then
-        // failed to bind would have the sweep reading a dhat nobody wrote.
-        ctx.cmfd_solver.setOuterSegmentResident(true);
+        // The residency flag is NOT set here.  It belongs to the segment's own
+        // drive() and is raised and lowered around it in outerSweepHook; a flag
+        // set at arm time outlives the segment and starves the host path.
+        ctx.cmfd_solver.setOuterSegmentResident(false);
         return true;
     }
 
@@ -1074,9 +1108,19 @@ private:
                         return;
                     if (seg.next_phase ==
                         static_cast<unsigned int>(gpu::DevicePhase::Failed)) {
-                        // A non-finite or negative-flux iterate.  Hand the rest of
-                        // this re-convergence back to the host path rather than
+                        // A non-finite iterate.  Hand the rest of this
+                        // re-convergence back to the host path rather than
                         // inventing an exit ReconvergeFlux never had.
+                        //
+                        // AND DO NOT KEEP THE DEVICE'S prev_inner.  The three
+                        // scalars adopted above came through the sweep hook,
+                        // which wrote eigv and residual in place, so they are
+                        // the host's own -- but prev_inner came out of a
+                        // DeviceSlotState whose decision reached Failed, and on
+                        // a non-finite the value that produced it is not a
+                        // number this loop should carry.  The host body's own
+                        // rule is `prev_inner = eigv`, so use that.
+                        prev_inner      = eigv;
                         gpu_outer_armed = false;
                     }
                     continue;

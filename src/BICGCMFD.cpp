@@ -311,6 +311,15 @@ void BICGCMFD::updpsi(const double* flux) {
 // happens in the Wielandt regime (the caller checks the warm-up), so the
 // Rayleigh branch here is the gamma-degenerate fallback, not the schedule.
 bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
+    // Rev.7.1 Task 10: these describe THIS drive, so clear them on entry.
+    //
+    // They are only written when a device sweep actually ran, and drive() takes
+    // the host loop for the whole Wielandt warm-up and whenever this function
+    // declines -- so a reader that arrived during either window used to see the
+    // signals of some earlier drive.  A stale 'negative flux' is worse than no
+    // signal: it names a condition that has already been resolved.
+    _last_sweep_negative = 0;
+    _last_sweep_state    = 0;
     const int nxyz = _g.nxyz();
     const int ng   = _g.ng();
     const bool use_device_assembly = _device_assembly_pending;
