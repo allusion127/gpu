@@ -65,9 +65,20 @@ Geometry::~Geometry() {
     // address that was never leased is a no-op, so this list is unconditional.
     // Without it the next deck on this worker inherits a live registration at
     // its own fresh addresses -- see HostPinRegistry.h.
+    //
+    // _vol JOINED THE LIST when the CMFD sweep stopped staging a private copy
+    // of it: BICGCMFD::driveDeviceSweeps now aliases &_g.vol(0) and page-locks
+    // it under the OWNER's tag, `geom.vol@sweep`.  The owner is us, so the
+    // release is ours -- and it was missing, which every run reported as
+    // `[RASBERY][WARN][PIN] {"leaked_ranges":1,...}` at shutdown.  Harmless for
+    // a single deck (the process exits), but a --batch-mode worker that
+    // recycles hands the next deck's fresh allocation an address the driver
+    // still holds registered, which is precisely the dead-tenant aliasing the
+    // lease contract exists to prevent.
     rasberyUnpinHost(_phif);
     rasberyUnpinHost(_jnet);
     rasberyUnpinHost(_phis);
+    rasberyUnpinHost(_vol);
 
     delete[] _albedo;
     delete[] _neibr;
@@ -81,7 +92,7 @@ Geometry::~Geometry() {
     delete[] _neib;
     delete[] _hmesh;
     delete[] _lktosfc;
-    delete[] _vol;
+    rasberyPageExclusiveDeleteArray(_vol);
     delete[] _hz;
     delete[] _idirlr;
     delete[] _sgnlr;
@@ -340,7 +351,23 @@ void Geometry::Initialize(const GeometryInput& in) {
     _neib    = new int[NEWSBT * _nxyz];
     _hmesh   = new double[NDIRMAX * _nxyz];
     _lktosfc = new int[NEWSBT * _nxyz];
-    _vol     = new double[_nxyz];
+    // PAGE-EXCLUSIVE, because the CMFD sweep page-locks this array directly
+    // (`geom.vol@sweep`, since BICGCMFD stopped staging a private copy of it).
+    // cudaHostRegister works on whole PAGES, and `new double[]` leaves _vol's
+    // first and last pages shared with its neighbours -- `_lktosfc` above and
+    // `_hz` below, because a general-purpose allocator packs its chunks 16
+    // bytes apart.  Whether the registration then succeeds is ALLOCATOR LUCK:
+    // it is refused as an overlap the moment anything else on one of those two
+    // pages is registered first, and the failure is silent -- the buffer just
+    // takes the pageable path on every launch and the only trace is
+    // overlap_rejections in the shutdown receipt.  Owning our pages outright
+    // makes it deterministic instead of lucky.  Same treatment as
+    // _jnet/_phis/_phif below; see the page-exclusive section of
+    // HostPinRegistry.h.
+    //
+    // Zeroed rather than raw is free here and byte-identical: the loop below
+    // writes every one of the _nxyz elements before anything reads them.
+    _vol = rasberyPageExclusiveZeroedArray<double>(static_cast<size_t>(_nxyz));
 
     for (int z = 0; z < _nz; z++) {
         for (int l2d = 0; l2d < _nxy; l2d++) {

@@ -11,6 +11,7 @@ over the header and the owner destructors.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -403,6 +404,15 @@ STATIC_TOKENS = {
         "rasberyUnpinHost(_phis);",
         "_phif = rasberyPageExclusiveZeroedArray<double>(",
         "rasberyPageExclusiveDeleteArray(_jnet);",
+        # _vol is page-locked as `geom.vol@sweep` since BICGCMFD stopped
+        # staging a private copy of it (it aliases &_g.vol(0) now), so it needs
+        # BOTH halves of the owner contract: page-exclusive storage, or the
+        # registration is refused as an overlap and the buffer quietly falls
+        # back to pageable; and a release in ~Geometry, or the next deck on a
+        # recycled worker inherits a live registration at its own addresses.
+        "rasberyUnpinHost(_vol);",
+        "_vol = rasberyPageExclusiveZeroedArray<double>(",
+        "rasberyPageExclusiveDeleteArray(_vol);",
     ),
     "src/Nodal.cpp": (
         "rasberyUnpinHost(_eta1);",
@@ -466,6 +476,25 @@ STATIC_TOKENS = {
 }
 
 
+# Spellings that MUST NOT come back.  Page-exclusive storage and `new[]` are
+# not interchangeable: rasberyPageExclusiveAlloc hands out a pointer SKEWED
+# into its block, so `delete[]` on it frees an address the allocator never
+# issued, and a plain `new double[]` for a buffer the backends page-lock puts
+# it back on a shared boundary page where cudaHostRegister refuses it.  Both
+# failures are silent -- one is heap corruption nobody sees until later, the
+# other is a performance cliff that only shows up as overlap_rejections in the
+# receipt -- so they are asserted absent rather than looked for by eye.
+# Matched as REGEXES, so a reintroduction cannot slip through on whitespace.
+FORBIDDEN_PATTERNS = {
+    "src/Geometry.cpp": (
+        (r"delete\s*\[\s*\]\s*_vol\s*;",
+         "_vol is page-exclusive; free it with rasberyPageExclusiveDeleteArray"),
+        (r"_vol\s*=\s*new\s+double\s*\[",
+         "_vol is page-locked as geom.vol@sweep and must own its pages"),
+    ),
+}
+
+
 def static_contract() -> list[str]:
     problems: list[str] = []
     for relative, tokens in STATIC_TOKENS.items():
@@ -473,6 +502,12 @@ def static_contract() -> list[str]:
         for token in tokens:
             if token not in text:
                 problems.append(f"{relative}: missing {token!r}")
+    for relative, entries in FORBIDDEN_PATTERNS.items():
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        for pattern, why in entries:
+            found = re.search(pattern, text)
+            if found:
+                problems.append(f"{relative}: {found.group(0)!r} must be gone -- {why}")
     # The permanent-registration contract must be gone from both pin bodies.
     for relative in ("src/CudaXsReconBackend.cu", "src/CudaBICGBackend.cu"):
         text = (ROOT / relative).read_text(encoding="utf-8")
