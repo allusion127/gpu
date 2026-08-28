@@ -325,6 +325,28 @@ inline void cmfdBucketHistogramBump(int lanes) {
         1, std::memory_order_relaxed);
 }
 
+/// Flux-mirror cost, kept OUTSIDE BackendCounters because the two places that
+/// pay it -- stageSlot() and adoptFluxMirror() -- both run UNLOCKED on the
+/// owning instance's thread, by design ("No CUDA call: safe to run
+/// concurrently on every instance thread").  Every other counter in that
+/// struct is bumped on the launcher, which is single-threaded by the
+/// rendezvous; these are not, so they are atomics folded in by counters().
+std::atomic<unsigned long long> g_cmfd_phi_mirror_ns{0};
+std::atomic<unsigned long long> g_cmfd_phi_mirror_calls{0};
+std::atomic<unsigned long long> g_cmfd_phi_mirror_bypassed{0};
+std::atomic<unsigned long long> g_cmfd_phi_h2d_elided_bytes{0};
+
+/// The one place the mirror atomics enter a BackendCounters snapshot.
+inline BackendCounters withPhiMirrorCounters(BackendCounters c) {
+    c.cmfd_phi_mirror_ns = g_cmfd_phi_mirror_ns.load(std::memory_order_relaxed);
+    c.cmfd_phi_mirror_calls = g_cmfd_phi_mirror_calls.load(std::memory_order_relaxed);
+    c.cmfd_phi_mirror_bypassed =
+        g_cmfd_phi_mirror_bypassed.load(std::memory_order_relaxed);
+    c.cmfd_phi_h2d_elided_bytes =
+        g_cmfd_phi_h2d_elided_bytes.load(std::memory_order_relaxed);
+    return c;
+}
+
 constexpr int kReduceThreads   = 256;
 constexpr int kMaxReduceBlocks = 256;
 
@@ -2568,17 +2590,22 @@ public:
     /// mirrorMatches for the flux, with the width gate and the cost clock.
     bool phiMirrorMatches(Slot& sl, const double* host_phi, size_t count) {
         if (!phiMirrorEnabled()) {
-            ++telemetry.cmfd_phi_mirror_bypassed;
+            g_cmfd_phi_mirror_bypassed.fetch_add(1, std::memory_order_relaxed);
             return false; // "does not match" == upload, which is always correct
         }
         const auto t0 = std::chrono::steady_clock::now();
         const bool hit = mirrorMatches(sl.phi_mirror, host_phi, count);
-        telemetry.cmfd_phi_mirror_ns += static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - t0)
-                .count());
-        ++telemetry.cmfd_phi_mirror_calls;
-        if (hit) telemetry.cmfd_phi_h2d_elided_bytes += count * sizeof(double);
+        g_cmfd_phi_mirror_ns.fetch_add(
+            static_cast<unsigned long long>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count()),
+            std::memory_order_relaxed);
+        g_cmfd_phi_mirror_calls.fetch_add(1, std::memory_order_relaxed);
+        if (hit)
+            g_cmfd_phi_h2d_elided_bytes.fetch_add(
+                static_cast<unsigned long long>(count) * sizeof(double),
+                std::memory_order_relaxed);
         return hit;
     }
 
@@ -3513,17 +3540,19 @@ public:
             // Nothing will consult it, and a stale shadow must never be able
             // to elide an upload if the gate is flipped mid-run.
             sl.phi_mirror.valid = false;
-            ++telemetry.cmfd_phi_mirror_bypassed;
+            g_cmfd_phi_mirror_bypassed.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         const auto t0 = std::chrono::steady_clock::now();
         sl.phi_mirror.shadow.assign(sl.out_phi, sl.out_phi + n);
         sl.phi_mirror.valid = true;
-        telemetry.cmfd_phi_mirror_ns += static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - t0)
-                .count());
-        ++telemetry.cmfd_phi_mirror_calls;
+        g_cmfd_phi_mirror_ns.fetch_add(
+            static_cast<unsigned long long>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count()),
+            std::memory_order_relaxed);
+        g_cmfd_phi_mirror_calls.fetch_add(1, std::memory_order_relaxed);
     }
 
     int           slots;
@@ -3684,7 +3713,9 @@ CudaBICGBackend::~CudaBICGBackend() = default;
 
 bool CudaBICGBackend::available() const { return _impl->core.available; }
 const std::string& CudaBICGBackend::status() const { return _impl->core.status; }
-BackendCounters CudaBICGBackend::counters() const { return _impl->core.telemetry; }
+BackendCounters CudaBICGBackend::counters() const {
+    return withPhiMirrorCounters(_impl->core.telemetry);
+}
 DeviceSolveStatus CudaBICGBackend::lastSolveStatus() const {
     return _impl->core.host_status != nullptr ? _impl->core.host_status[0] : DeviceSolveStatus{};
 }
@@ -3825,7 +3856,9 @@ CudaBatchArena::~CudaBatchArena() = default;
 bool CudaBatchArena::available() const { return _impl->core.available; }
 const std::string& CudaBatchArena::status() const { return _impl->core.status; }
 int CudaBatchArena::slots() const { return _impl->core.slots; }
-BackendCounters CudaBatchArena::counters() const { return _impl->core.telemetry; }
+BackendCounters CudaBatchArena::counters() const {
+    return withPhiMirrorCounters(_impl->core.telemetry);
+}
 
 bool CudaBatchArena::compatible(Geometry& geometry) const {
     return _impl->core.compatibleGeometry(geometry);
