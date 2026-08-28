@@ -1046,6 +1046,19 @@ private:
         return true;
     }
 
+    /// The generations the segment's upload elisions are decided from.
+    ///
+    /// Four host reads.  Called at the TOP of every outer, again after the
+    /// sweep observation, and again after a cusping that fired -- the three
+    /// points at which one of them can have moved without the runner looking.
+    static void outerLiveStateHook(void* raw, gpu::OuterSegmentLiveState& out) {
+        OuterHookCtx& h   = *static_cast<OuterHookCtx*>(raw);
+        out.flux_generation = h.ctx->geometry.fluxGeneration();
+        out.xs_generation   = h.ctx->cross_sections.hoststateGeneration();
+        out.dtil_generation = h.ctx->cmfd_solver.dtilGeneration();
+        out.device_owns_flux = h.ctx->cmfd_solver.lastDriveLeftDeviceFlux();
+    }
+
     /// Hand the runner the sweep arena's buffers and install the hooks.
     ///
     /// Called once per SolveLoop/ReconvergeFlux entry, because the arena slot is
@@ -1118,6 +1131,7 @@ private:
         hooks.finish_cmfd_sweep   = stream_sweep ? &outerSweepFinishHook : nullptr;
         hooks.enqueue_nodal_drive = &outerNodalHook;
         hooks.apply_cusping       = &outerCuspingHook;
+        hooks.read_live_state     = &outerLiveStateHook;
         hooks.ctx                 = &hc;
         hooks.sweep_synchronizes  = !stream_sweep;
         gpu::rasberyOuterSegment().setHooks(hooks);

@@ -194,6 +194,10 @@ void BICGCMFD::wiel(const int& icy, const double* flux, double& reigvs, double& 
 }
 
 void BICGCMFD::upddtil() {
+    // The only writer of _dtil.  The device outer segment reads the device twin
+    // every outer; the generation is what lets it skip the copy on the outers
+    // where nothing moved.
+    ++_dtil_generation;
     // Rev.7.1 Task 9: one relaxed increment per SWEEP, so a receipt can say
     // whether the device outer actually replaced this loop (HostOuterBodyCounters.h).
     hostouter::bumpHostBody(hostouter::counters().upddtil);
@@ -510,7 +514,14 @@ bool BICGCMFD::absorbSweepLaunch(CudaBatchArena::CmfdSweepIO& io, double& eigv,
         _last_sweep_negative = io.negative_last;
         _last_sweep_state    = io.state;
 
-        if (io.state == 1 || io.state == 3) return true; // converged / budget spent
+        if (io.state == 1 || io.state == 3) {
+            // issueFluxDownloads wrote Geometry::Phif FROM the device phi, so
+            // the two agree byte for byte.  Only these two states qualify:
+            // state 0 and state 2 hand back to the host loop, which then moves
+            // the host flux without the device seeing it.
+            _last_drive_device_flux = true;
+            return true; // converged / budget spent
+        }
 
         if (io.state == 2) {
             // Degenerate gamma: the device ran this sweep's source/BiCG/psi
@@ -705,6 +716,10 @@ bool BICGCMFD::finishDrive(double& eigv, double* flux, double& errl2,
 
 
 void BICGCMFD::drive(double& eigv, double* flux, double& errl2) {
+    // Assume the HOST will own the flux.  Every path out of this function
+    // leaves that true except the device-sweep states that download it, and
+    // absorbSweepLaunch says so for itself.
+    _last_drive_device_flux = false;
 
     int    icmfd  = 0;
     double reigv  = 1. / eigv;

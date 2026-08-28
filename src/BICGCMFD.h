@@ -23,6 +23,17 @@ protected:
     /// What the last device sweep observed, for the segment's probe.
     int  _last_sweep_negative = 0;
     int  _last_sweep_state    = 0;
+    /// Did the drive that just returned leave the DEVICE flux equal to the host
+    /// one?  True only when the device sweep finished and issueFluxDownloads
+    /// wrote Geometry::Phif FROM the device phi.  False for the Wielandt
+    /// warm-up, a declined enqueue, and the pristine host loop.
+    ///
+    /// NOT SUFFICIENT ON ITS OWN for an upload elision -- it says the device
+    /// downloaded the flux, not that the host has left it alone since -- which
+    /// is why its consumer pairs it with Geometry::fluxGeneration().
+    bool _last_drive_device_flux = false;
+    /// Bumped by upddtil(), the only writer of _dtil.
+    unsigned long long _dtil_generation = 1;
 
     /// @brief Nodal object
     std::unique_ptr<Nodal> _nodal;
@@ -213,6 +224,11 @@ public:
     /// The two device-only signals the segment's transition ranks.
     [[nodiscard]] bool lastSweepNegativeFlux() const { return _last_sweep_negative != 0; }
     [[nodiscard]] bool lastSweepRayleigh() const { return _last_sweep_state == 2; }
+
+    /// See _last_drive_device_flux.
+    [[nodiscard]] bool lastDriveLeftDeviceFlux() const { return _last_drive_device_flux; }
+    /// See _dtil_generation.
+    [[nodiscard]] unsigned long long dtilGeneration() const { return _dtil_generation; }
 
     BICGCMFD(Geometry& g, XSSet& x);
 

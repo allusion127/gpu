@@ -3277,7 +3277,21 @@ bool XSSet::ApplyRodCusping(double eigv, const AxialTransverseLeakageView& leaka
             ResetCuspingNodesToBase(left);
     }
 
-    ++_hoststate_generation; // cusping blends _xs in place
+    // BUMPED ONLY WHEN _xs ACTUALLY MOVED.
+    //
+    // It used to bump unconditionally, on the argument that a redundant
+    // invalidation only costs a redundant upload.  That was true while nothing
+    // gated on it per outer.  The device outer segment now does: it syncs xsnf
+    // when the generation changes, and this function is CALLED every outer -- so
+    // an unconditional bump made every single one of those uploads unskippable.
+    // Measured on kngr_238, which has an axial rod division but no fractional
+    // node: 661 outers, 661 xsnf uploads, 0 elided, on a deck where cusping
+    // never once wrote a cross section.
+    //
+    // The stencil is the only writer here, and ResetCuspingNodesToBase bumps for
+    // itself (:3180), so `the stencil ran` is the complete condition.
+    if (!_rod_cusping_nodes_scratch.empty())
+        ++_hoststate_generation; // cusping blends _xs in place
     return !prev_scratch.empty() || !_rod_cusping_nodes_scratch.empty();
 }
 

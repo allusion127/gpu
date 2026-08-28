@@ -156,6 +156,10 @@ struct AtomicCounters {
     std::atomic<std::uint64_t> host_mirror_bytes{0};
     std::atomic<std::uint64_t> cusping_fired{0};
     std::atomic<std::uint64_t> cusping_dtil_bytes{0};
+    std::atomic<std::uint64_t> device_flux_outers{0};
+    std::atomic<std::uint64_t> flux_uploads_elided{0};
+    std::atomic<std::uint64_t> xsnf_uploads_elided{0};
+    std::atomic<std::uint64_t> dtil_uploads_elided{0};
     std::atomic<std::uint64_t> refusals[static_cast<int>(OuterSegmentRefusal::Count)];
     std::atomic<std::uint64_t> escapes[kDeviceEscapeCount];
 
@@ -225,6 +229,10 @@ OuterSegmentCounters outerSegmentCounters() {
     out.host_mirror_bytes       = a.host_mirror_bytes.load(std::memory_order_relaxed);
     out.cusping_fired           = a.cusping_fired.load(std::memory_order_relaxed);
     out.cusping_dtil_bytes      = a.cusping_dtil_bytes.load(std::memory_order_relaxed);
+    out.device_flux_outers      = a.device_flux_outers.load(std::memory_order_relaxed);
+    out.flux_uploads_elided     = a.flux_uploads_elided.load(std::memory_order_relaxed);
+    out.xsnf_uploads_elided     = a.xsnf_uploads_elided.load(std::memory_order_relaxed);
+    out.dtil_uploads_elided     = a.dtil_uploads_elided.load(std::memory_order_relaxed);
     for (int i = 0; i < static_cast<int>(OuterSegmentRefusal::Count); ++i)
         out.refusals[i] = a.refusals[i].load(std::memory_order_relaxed);
     for (int i = 0; i < kDeviceEscapeCount; ++i)
@@ -245,6 +253,10 @@ std::string outerSegmentReceiptJson() {
                     ",\"host_mirror_bytes\":" + std::to_string(c.host_mirror_bytes) +
                     ",\"cusping_fired\":" + std::to_string(c.cusping_fired) +
                     ",\"cusping_dtil_bytes\":" + std::to_string(c.cusping_dtil_bytes) +
+                    ",\"device_flux_outers\":" + std::to_string(c.device_flux_outers) +
+                    ",\"flux_uploads_elided\":" + std::to_string(c.flux_uploads_elided) +
+                    ",\"xsnf_uploads_elided\":" + std::to_string(c.xsnf_uploads_elided) +
+                    ",\"dtil_uploads_elided\":" + std::to_string(c.dtil_uploads_elided) +
                     ",\"segment_budget\":" + std::to_string(outerSegmentBudget());
 
     // Only the non-zero buckets, so a healthy run's line stays readable and a
@@ -337,6 +349,12 @@ struct CudaOuterSegment::Impl {
     unsigned long long*      d_halted    = nullptr;
 
     OuterSegmentResidency residency{};
+    /// The generation each device copy was last filled AT.  Zero is `never
+    /// uploaded`, which the host generations cannot collide with because they
+    /// start at 1.
+    unsigned long long resident_flux_generation = 0;
+    unsigned long long resident_xs_generation   = 0;
+    unsigned long long resident_dtil_generation = 0;
     bool                  residency_bound = false;
     /// The segment exit word, read once per outer with no extra synchronise.
     ///
@@ -536,6 +554,11 @@ bool CudaOuterSegment::bindResidency(const OuterSegmentResidency& residency) {
     _impl->binding.host_psi    = residency.host_psi;
     _impl->binding.device_dhat = residency.dhat;
     _impl->binding.device_psi  = residency.psi;
+    // A rebind may hand over different device memory, so nothing that was
+    // uploaded to the old buffers describes the new ones.
+    _impl->resident_flux_generation = 0;
+    _impl->resident_xs_generation   = 0;
+    _impl->resident_dtil_generation = 0;
     _impl->residency_bound   = true;
     return true;
 }
@@ -783,6 +806,17 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
             if (m.h_seg != nullptr && m.h_seg->exit != 0u) break;
         }
 
+        // THE LIVE STATE, RE-READ PER OUTER.
+        //
+        // Not once per segment: a segment with a budget above one runs outers
+        // 2..N without returning to the host, but the host DID run between
+        // them -- the sweep hook, the nodal drive and cusping are all host
+        // calls -- and each of them can move a generation.  Deciding an
+        // elision from a segment-entry value is what made i-SMR CY02 fail at
+        // b8 and b16 while passing at b1.
+        OuterSegmentLiveState live;
+        if (m.hooks.read_live_state != nullptr) m.hooks.read_live_state(m.hooks.ctx, live);
+
         // (0) the flux the whole outer is computed from.
         //
         // See OuterSegmentBinding::host_flux: drive() takes the HOST loop for
@@ -790,7 +824,15 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         // such a drive the device phi is behind the host flux.  Uploading it
         // here makes the segment independent of which path the previous drive
         // took, which is the difference between a fast path and a correct one.
-        if (bound_.host_flux != nullptr && m.residency.flux != nullptr) {
+        // SKIPPED WHEN THE DEVICE COPY IS ALREADY THE HOST'S.  Two things have
+        // to hold and neither is enough alone: no host writer has touched Phif
+        // since the copy was made (the generation), and the copy was made from
+        // a drive that actually downloaded it (recorded below).
+        const bool flux_current = m.hooks.read_live_state != nullptr &&
+                                  m.resident_flux_generation != 0 &&
+                                  m.resident_flux_generation == live.flux_generation;
+        if (flux_current) bump(counters().flux_uploads_elided);
+        if (bound_.host_flux != nullptr && m.residency.flux != nullptr && !flux_current) {
             const std::size_t flux_bytes =
                 static_cast<std::size_t>(bound_.nxyz) *
                 static_cast<std::size_t>(bound_.ng) * sizeof(double);
@@ -799,7 +841,14 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                 return launchFailed("upload flux", rc);
             bump(counters().flux_sync_bytes, flux_bytes);
         }
-        if (bound_.host_xsnf != nullptr && bound_.device_xsnf != nullptr) {
+        // XSSet bumps hoststateGeneration on every write to _xs, so an
+        // unchanged generation is a proof the bytes are the same rather than a
+        // guess that they probably are.
+        const bool xsnf_current = m.hooks.read_live_state != nullptr &&
+                                  m.resident_xs_generation != 0 &&
+                                  m.resident_xs_generation == live.xs_generation;
+        if (xsnf_current) bump(counters().xsnf_uploads_elided);
+        if (bound_.host_xsnf != nullptr && bound_.device_xsnf != nullptr && !xsnf_current) {
             const std::size_t xsnf_bytes =
                 static_cast<std::size_t>(bound_.nxyz) *
                 static_cast<std::size_t>(bound_.ng) * sizeof(double);
@@ -807,8 +856,16 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                                       cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
                 return launchFailed("upload xsnf", rc);
             bump(counters().flux_sync_bytes, xsnf_bytes);
+            m.resident_xs_generation = live.xs_generation;
         }
-        if (bound_.host_dtil != nullptr && bound_.device_dtil != nullptr) {
+        // upddtil() is the only writer of _dtil and it runs once per SolveLoop
+        // entry, plus once for every cusping that fires.  On a still deck this
+        // copy happens once and then never again.
+        const bool dtil_current = m.hooks.read_live_state != nullptr &&
+                                  m.resident_dtil_generation != 0 &&
+                                  m.resident_dtil_generation == live.dtil_generation;
+        if (dtil_current) bump(counters().dtil_uploads_elided);
+        if (bound_.host_dtil != nullptr && bound_.device_dtil != nullptr && !dtil_current) {
             const std::size_t dtil_bytes =
                 static_cast<std::size_t>(bound_.geom.nsurf) *
                 static_cast<std::size_t>(bound_.ng) * sizeof(double);
@@ -816,6 +873,7 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                                       cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
                 return launchFailed("upload dtil", rc);
             bump(counters().flux_sync_bytes, dtil_bytes);
+            m.resident_dtil_generation = live.dtil_generation;
         }
 
         // (1) updpsi -- Driver.h:1547
@@ -888,6 +946,27 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         if (stream_sweep && !m.hooks.finish_cmfd_sweep(m.hooks.ctx, m.stream, slot, i))
             return hookFailed("the CMFD sweep observation hook");
 
+        // WHAT THE DRIVE LEFT BEHIND.  This is the only point at which the
+        // host flux and the device flux are known to agree -- the sweep's
+        // observation has just adopted the device phi into Geometry::Phif -- so
+        // it is the only point at which the next outer's elision can be earned.
+        //
+        // The generation is re-read here rather than reused from the top of the
+        // outer because the drive itself bumped it: drive() is handed
+        // PhifMutable(), which is what makes it a declared writer.
+        if (m.hooks.read_live_state != nullptr) {
+            OuterSegmentLiveState after;
+            m.hooks.read_live_state(m.hooks.ctx, after);
+            if (after.device_owns_flux) {
+                m.resident_flux_generation = after.flux_generation;
+                bump(counters().device_flux_outers);
+            } else {
+                // The Wielandt warm-up, or a declined enqueue: the host loop
+                // moved Phif and the device never saw it.  Forget the copy.
+                m.resident_flux_generation = 0;
+            }
+        }
+
         if (!m.hooks.enqueue_nodal_drive(m.hooks.ctx, m.stream, slot, i))
             return hookFailed("the nodal drive hook");
 
@@ -924,6 +1003,16 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                                           cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
                     return launchFailed("re-upload dtil after cusping", rc);
                 bump(counters().cusping_dtil_bytes, dtil_bytes);
+                // upddtil() bumped the generation; the re-upload above made the
+                // device copy current AT the new one.  Re-reading it here is
+                // what stops the top of the next outer copying the same array
+                // again -- on a deck that cusps every outer, that is the whole
+                // d-tilde traffic doubled.
+                if (m.hooks.read_live_state != nullptr) {
+                    OuterSegmentLiveState after_cusp;
+                    m.hooks.read_live_state(m.hooks.ctx, after_cusp);
+                    m.resident_dtil_generation = after_cusp.dtil_generation;
+                }
             }
         }
 

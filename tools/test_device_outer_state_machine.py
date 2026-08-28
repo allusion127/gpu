@@ -1024,6 +1024,75 @@ if _PRED and "e.fractional_rods && !e.have_cusping_hook" not in _PRED:
                     "device outer on it (i-SMR CY02: 857), and refusing none of them "
                     "without the hook is the CY02 wrong answer")
 
+# --- 22. the upload elisions are decided PER OUTER from live generations -----
+#
+# THE BUG THE FIRST ATTEMPT HAD.  The generations went into OuterSegmentScalars,
+# which runSegment reads ONCE.  A segment with a budget above one runs outers
+# 2..N without returning to the host -- but the host DID run between them, in
+# the sweep hook, the nodal drive and cusping, any of which can move a
+# generation.  i-SMR CY02 failed at b8 and b16 and PASSED at b1, because a
+# segment of one cannot have a stale second outer.
+want(GRAPH_H_CODE, "OuterSegmentLiveState", "CudaOuterGraph.h",
+     "the volatile generations need a struct of their own, separate from the scalars "
+     "that are read once per segment")
+want(GRAPH_H_CODE, "read_live_state", "CudaOuterGraph.h", "the per-outer refresh hook")
+want(DRIVER_CODE, "outerLiveStateHook", "Driver.h", "the host side of the refresh")
+want(DRIVER_CODE, "hooks.read_live_state", "Driver.h",
+     "the hook has to be installed, or every elision silently disables itself")
+if "scalars.flux_generation" in GRAPH_CU_CODE or "scalars.xs_generation" in GRAPH_CU_CODE:
+    problems.append("CudaOuterGraph.cu: an elision reads a generation out of "
+                    "OuterSegmentScalars, which is captured once per SEGMENT.  That is the "
+                    "b8/b16 failure -- the value is stale for every outer after the first")
+_LOOP22 = body_of(GRAPH_CU_CODE, "for (unsigned int i = 0", "DeviceOuterSegmentState seg_out")
+if "read_live_state(m.hooks.ctx, live)" not in _LOOP22:
+    problems.append("CudaOuterGraph.cu: the live state is not re-read at the top of the "
+                    "per-outer loop, so outers 2..N of a wide segment decide from values "
+                    "the host has already moved")
+
+# Each of the three uploads is gated, and the flux needs BOTH conditions.
+for _gate, _why in (
+        ("flux_current", "the flux upload has to be gated or it copies 135 KiB per outer "
+                         "onto itself"),
+        ("xsnf_current", "the xsnf upload has to be gated on hoststateGeneration"),
+        ("dtil_current", "the dtil upload has to be gated on the upddtil generation")):
+    want(GRAPH_CU_CODE, _gate, "CudaOuterGraph.cu", _why)
+_FLUXGATE = body_of(GRAPH_CU_CODE, "const bool flux_current", "if (flux_current)")
+if _FLUXGATE and "resident_flux_generation == live.flux_generation" not in _FLUXGATE:
+    problems.append("CudaOuterGraph.cu: the flux elision does not compare generations.  "
+                    "`the device downloaded it` is not `the host has left it alone since` -- "
+                    "the ladder between two outers writes Phif without the device seeing it, "
+                    "and that is what the first attempt got wrong")
+if "after.device_owns_flux" not in GRAPH_CU_CODE:
+    problems.append("CudaOuterGraph.cu: the flux residency is recorded without asking "
+                    "whether the drive downloaded the flux at all.  A drive that fell back "
+                    "to the host loop leaves them DIFFERENT at the same generation")
+# A rebind may hand over different memory; nothing uploaded to the old buffers
+# describes the new ones.
+_BIND22 = body_of(GRAPH_CU_CODE, "bool CudaOuterSegment::bindResidency", "return true;")
+for _r in ("resident_flux_generation = 0", "resident_xs_generation   = 0",
+           "resident_dtil_generation = 0"):
+    if _BIND22 and _r not in _BIND22:
+        problems.append(f"CudaOuterGraph.cu: bindResidency does not clear {_r.split()[0]}; a "
+                        "rebind can point at different device memory and the old generation "
+                        "would claim it is already filled")
+
+# --- 23. the cusping generation bump tells the truth -------------------------
+#
+# ApplyRodCusping used to bump hoststateGeneration unconditionally, on the
+# argument that a redundant invalidation only costs a redundant upload.  That
+# held while nothing gated on it per outer.  The segment now does, and the
+# function is CALLED every outer -- so the unconditional bump made every xsnf
+# upload unskippable: 661 outers, 661 uploads, 0 elided, on kngr_238, a deck
+# where cusping never once wrote a cross section.
+_XS23 = strip_comments(read(SRC / "XSSet.cpp"))
+_CUSP23 = body_of(_XS23, "bool XSSet::ApplyRodCusping", "return !prev_scratch.empty()")
+if _CUSP23 and "if (!_rod_cusping_nodes_scratch.empty())" not in _CUSP23:
+    problems.append("XSSet.cpp: ApplyRodCusping bumps _hoststate_generation "
+                    "unconditionally.  The stencil is the only writer of _xs here and "
+                    "ResetCuspingNodesToBase bumps for itself, so an unconditional bump "
+                    "reports a cross-section change on every outer of every deck that has "
+                    "an axial rod division -- and cancels the xsnf elision entirely")
+
 # --- the gates exist and are built -------------------------------------------
 want(REPLAY_TEXT, "kPhaseTransitions", "test/outer_state_replay.cpp",
      "the emitted edges must be cross-checked against the W1 table")

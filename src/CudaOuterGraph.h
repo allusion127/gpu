@@ -658,6 +658,17 @@ struct OuterSegmentCounters {
     std::uint64_t cusping_fired            = 0;
     /// d-tilde bytes re-uploaded because cusping rebuilt it mid-outer.
     std::uint64_t cusping_dtil_bytes       = 0;
+    /// Outers whose drive left the device flux authoritative.
+    ///
+    /// The ceiling on what the flux elision can save: an outer whose drive fell
+    /// back to the host loop -- the Wielandt warm-up, a declined enqueue -- has
+    /// to be re-uploaded whatever the generations say.  Reported so the answer
+    /// to `how much of this deck is warm-up` is a number and not an estimate.
+    std::uint64_t device_flux_outers       = 0;
+    /// Uploads the generations cancelled, by array.
+    std::uint64_t flux_uploads_elided      = 0;
+    std::uint64_t xsnf_uploads_elided      = 0;
+    std::uint64_t dtil_uploads_elided      = 0;
     std::uint64_t refusals[static_cast<int>(OuterSegmentRefusal::Count)] = {};
     std::uint64_t escapes[kDeviceEscapeCount]                           = {};
 };
@@ -757,6 +768,41 @@ using OuterSegmentStream = void*;
 ///
 /// No stream argument, deliberately: it is pure host work over host arrays and
 /// it must not enqueue anything.  The runner owns the one device consequence.
+/// What can change BETWEEN the outers of one segment.
+///
+/// WHY THIS IS NOT IN OuterSegmentScalars.  That struct is read ONCE, when
+/// runSegment is called.  Everything in it is stale for outers 2..N of a
+/// segment whose budget is above one -- and an upload elision decided from a
+/// stale generation skips a copy that was needed.  That is not hypothetical:
+/// the first attempt at this elision put the generations in OuterSegmentScalars
+/// and i-SMR CY02 failed at b8 and b16 while PASSING at b1, because a segment
+/// of one cannot have a stale second outer.
+///
+/// So the runner asks the host again at the top of every outer.  Three loads
+/// and a bool, against 681 KiB of copies they can cancel.
+struct OuterSegmentLiveState {
+    /// Geometry::fluxGeneration() -- bumped by every HOST writer of Phif.
+    unsigned long long flux_generation = 0;
+    /// XSSet::hoststateGeneration() -- bumped by every host write of _xs.
+    unsigned long long xs_generation = 0;
+    /// BICGCMFD::dtilGeneration() -- bumped by upddtil(), its only writer.
+    unsigned long long dtil_generation = 0;
+
+    /// Did the drive that just returned leave the device flux equal to the host
+    /// one?  Only meaningful immediately after the sweep hook.
+    ///
+    /// BOTH THIS AND THE GENERATION ARE NEEDED, and the first attempt failed
+    /// for using only this one.  It answers `the device downloaded the flux`;
+    /// the question the elision asks is `has the host written it since`, and
+    /// the ladder between two outers -- normalisation, an Xe commit -- writes
+    /// it without the device seeing anything.  The generation catches those,
+    /// this catches the drive that never downloaded at all.
+    bool device_owns_flux = false;
+};
+
+/// Re-read the live state.  Pure host reads; it must not enqueue anything.
+using OuterLiveStateHook = void (*)(void* ctx, OuterSegmentLiveState& out);
+
 using OuterCuspingHook = bool (*)(void* ctx, int slot, unsigned int outer_index);
 
 using OuterSegmentHook = bool (*)(void* ctx, OuterSegmentStream stream, int slot,
@@ -782,6 +828,10 @@ struct OuterSegmentHooks {
     /// runner must do next: a cusping that fired rewrote the host d-tilde, and
     /// the device upddhat two steps later reads the DEVICE one.
     OuterCuspingHook apply_cusping = nullptr;
+
+    /// Re-read the generations at the top of every outer, and again after the
+    /// sweep.  Without it the segment cannot elide a single upload safely.
+    OuterLiveStateHook read_live_state = nullptr;
 
     /// Rev.7.1 Task 10 part 2: the post-synchronise half of the sweep.
     ///
