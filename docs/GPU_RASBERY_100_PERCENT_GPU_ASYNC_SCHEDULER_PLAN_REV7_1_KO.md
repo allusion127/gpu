@@ -1802,6 +1802,60 @@ nonfinite / 음수 밀도      → 기존 가드 (|v|<1e-12 && v<0 → 0)
 
 **[Rev.7.1 수정]** — **W5+ 재판정 대상.** 본문 Rev.7 유지. 단 Step 1의 참조 trace 목록에 **PPR / NormalizeFluxSign / Derivative 재수렴 / RodOp / ResultAggregate**를 포함하고, Step 8 수신증에 §9.3 신규 필드를 추가한다.
 
+### Task 18-lite: `--batch-mode`에서 device outer segment를 사용 가능하게 만들기 — **[완료]**
+
+Task 9는 배치를 무조건 거부했다(`refusals{batch_mode}`). 근거는 구현이었다 — physics arena가 width 1로 서는 단일
+runner가 프로세스 전체를 대표했기 때문이다. 그 구현을 슬롯단위로 바꿔 배치가 M1을 쓰게 했다.
+
+**바뀐 것.**
+
+| 자리 | 이전 | 지금 |
+| --- | --- | --- |
+| physics arena | `arenaDims(..., 1)` | `arenaDims(..., rasberyBatchWidth())` — CMFD/nodal arena와 **동일 슬롯 인덱스 공간** |
+| runner | 프로세스 단일 `rasberyOuterSegment()` | 슬롯당 하나, `rasberyOuterSegment(slot)`; 범위 밖은 미초기화 runner(=`no_runner`) |
+| `OuterHookCtx` | 프로세스 단일 static | 슬롯당 하나 |
+| `residency.arena_slot` | 상수 0 | Driver의 CMFD 슬롯 |
+| canonical nodal set | `slotView(0).jnet/.phis` | `slotView(i)` |
+| `k_outer_seed_slot` | 슬롯 0만 | 전 슬롯 |
+| 카운터 | 프로세스 단일 atomic | 슬롯당(thread로 색인), 수신증에서 합산 + `[OUTER_GPU][SLOT]` 행 |
+| 거부 사다리 | `batch_width > 1 → batch_mode` | `batch_width > arena_slots → batch_mode`, `!slot_admitted → geometry_mismatch` |
+
+**측정으로 드러난 두 가지 제약.** 둘 다 배치에서만 참이고, 둘 다 수치가 아니라 구조다.
+
+1. **batched nodal arena는 canonical binding을 이행하지 않는다.** `adoptCanonical`을 view
+   테이블에 받아놓고도 drive마다 `Geometry::Jnet`을 그 위에 올린다
+   (`[NODAL][CANON] elided_upload_bytes:0` vs per-instance 212 MB). segment은 binding을 믿고 jnet
+   bridge를 끔었기 때문에 arena가 **한 outer 뒤진 호스트 Jnet**을 올렸고, kngr3 statepoint 1이
+   770.15 ppm / 263 outer 대신 800.33 ppm / 290 outer로 갈렸다. → `XsReconBackend::canonicalNodalIsHonoured()`가
+   아니라고 답하는 경우 segment는 bridge를 유지한다(정확, 단 outer당 2×nsurf×ng double).
+2. **arena 스트림은 graph capture 중이다.** `CudaBatchArena`는 CMFD sweep을 슬롯 공용 `core.stream`
+   하나에서 캡처하고, capture는 그 스트림에 들어오는 모든 작업을 샵킨다. M개 Driver가
+   동시에 쓰면 `operation failed due to a previous error during capture`로 4 덱이 1.2초에 죽는다.
+   → 배치에서 segment는 **자기 스트림**을 쓰고 따라서 **동기식 sweep hook**(Task 9 쌍, budget 1)을
+   잡는다. 둘은 한 쌍이며 분리할 수 없다.
+
+**geometry_mismatch 사다리는 지금 도달 불가능하고, 그래도 남긴다.** `rasberyBatchArena`가
+BICGSolver 생성자에서 두 번째 geometry를 던지므로(`batch mode requires every instance to
+share one geometry`) 혼합 배치는 stand-up에 닿기 전에 죽는다. 측정: kngr3 + i-SMR CY01,
+`--batch-mode 2` → i-SMR는 segment을 물고 끝까지 가고 kngr3는 이름으로 거부된다. 사다리를
+남기는 이유는 그가 지키는 가정이 **physics arena 자신의** 것이기 때문이다 — 다른 arena의
+검사에서 조용히 상속받아서는 안 된다.
+
+**결과.** 배치는 Task 9의 segment를 덱당 하나씩 얻는다 — updpsi/updjnet/upddhat가 device에서
+돌고 outer당 416 KiB dhat H2D가 사라진다. 정확성은 bit 단위로 같다. **처리량은 아직 이득이 없다**:
+로컬 4덱 3회 교차 측정에서 OFF 11.34/14.26/11.87 s, ON b8 12.44/12.24/21.33 s — 중앙값 11.87 vs
+12.44로 잡음 안이며 이득도 아니다(로컬 box는 다른 작업과 GPU를 공유했다). budget 1 + jnet
+bridge 복귀 + outer당 동기화가 그 값이다.
+
+**남은 일(진짜 Task 18).**
+
+- [ ] batched nodal arena가 canonical ownership을 이행하게 한다 → bridge 제거, `canonicalNodalIsHonoured()` 삭제.
+- [ ] CMFD sweep을 슬롯당 스트림(또는 capture-safe 제출 경로)로 바꿔 배치에서도 budget 8을 열어준다.
+- [ ] scheduler refill — 한 슬롯이 비면 다음 덱을 넣는 곳. Task 18-lite는 슬롯을 열었을 뿐 채우지 않는다.
+- [ ] M64 메모리 — kngr_238 mesh에서 per-slot 235 MB면 64슬롯은 15 GB다. 사이즈가 안 맞으면 arena가
+      거부하고 사다리가 `batch_mode`를 그대로 말한다(이제는 상수가 아니라 사실이다). 부분 폭
+      수용(K < M 슬롯만 서비스)은 의도적으로 미구현 — 불균일한 배치는 조정자가 결정할 일이다.
+
 ## Task 19: GPU Output Packing and CPU Writer-Only I/O
 
 **[Rev.7.1 수정]** — **W5+ 재판정 대상.** 분류 N1, phase 2종 담당 추가.
