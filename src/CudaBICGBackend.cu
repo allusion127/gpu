@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -302,6 +303,109 @@ inline int cmfdBucketIndex(int lanes) {
     for (int i = 0; i < 9; ++i)
         if (lanes <= kBucketIndex[i]) return i;
     return 8;
+}
+
+// ---------------------------------------------------------------------------
+// WIELANDT FOLD MODE (RASBERY_GPU_WIEL_FOLD, default serial)
+//
+// Two ways to sum the three Wielandt addend arrays, and they are NOT the same
+// number.  The distinction is a classification, not a preference:
+//
+//   serial (default)  One strict l-ascending chain per sum, which is
+//                     BICGCMFD::wiel's own accumulation reproduced bit for
+//                     bit.  Class B0: the frozen reference output is what it
+//                     produces, so it is the only acceptance path.  It is also
+//                     a hard serial dependency -- 8451 dependent DADDs -- and
+//                     measures 258 us/call on sm_61 against a 202 us floor,
+//                     which is 54% of GPU kernel time on the S2 arm.
+//
+//   chunked           reduce_dot_stage1/2's shape: a fixed contiguous chunk
+//                     per block, a fixed per-thread traversal, a fixed binary
+//                     tree, then a strict ascending fold over the partials.
+//                     16.1 us/call at the KNGR mesh on sm_61 -- 19.8x against
+//                     the serial 318.9 us in the same harness.  Class N1:
+//                     DETERMINISTIC (the partition is a pure function of
+//                     (nxyz, gridDim.x), the traversal and the tree are fixed,
+//                     the stage-2 walk is strict, and there is not an atomic
+//                     anywhere in it, so it is bit-identical run to run on a
+//                     given arch -- the replay asserts that over 10 launches)
+//                     but NOT bit-identical to serial.
+//
+//                     HOW FAR FROM SERIAL, measured, on addends with the
+//                     12-decade magnitude spread the real ones have: 71 ULP
+//                     worst case at nxyz = 8451, growing with the range (0 ULP
+//                     below one chunk, 4 at 128, 37 at 4096).  A flat fixture
+//                     reports 1-4 ULP and is not evidence -- reassociation
+//                     only costs where the magnitudes differ.
+//
+//                     71 ULP is ~1.6e-14 relative, and note the SIGN of the
+//                     argument: pairwise summation has an O(log n) error bound
+//                     against serial's O(n), so the chunked sum is the more
+//                     accurate of the two, not the less.  The delta is still
+//                     disqualifying for acceptance -- the frozen output is the
+//                     serial one and "closer to the exact sum" is not "equal
+//                     to the reference" -- which is exactly why this is a
+//                     campaign arm gated against the v2 golden and never a
+//                     silent default.
+//
+// Which is why the mode is opt-in and the receipt records both the mode and
+// where it came from: an N1 result that reached a report without a
+// [RASBERY][CMFD][WIEL_FOLD] line saying "chunked" would be indistinguishable
+// from a B0 one.
+// ---------------------------------------------------------------------------
+enum class WielFoldMode { SERIAL, CHUNKED };
+
+/// Parsed once per process, trimmed and case-folded like Driver.h's xeMode().
+/// A typo must not silently buy a mode: the two arms produce different bits.
+inline WielFoldMode wielFoldMode() {
+    static const WielFoldMode mode = [] {
+        const char* value = std::getenv("RASBERY_GPU_WIEL_FOLD");
+        if (value == nullptr) return WielFoldMode::SERIAL;
+        std::string s(value);
+        const auto  not_space = [](unsigned char c) { return std::isspace(c) == 0; };
+        s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
+        s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
+        for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (s.empty() || s == "serial") return WielFoldMode::SERIAL;
+        if (s == "chunked") return WielFoldMode::CHUNKED;
+        std::cerr << "[RASBERY][WARN][wiel] RASBERY_GPU_WIEL_FOLD=\"" << value
+                  << "\" is not a mode (serial|chunked); using serial\n";
+        return WielFoldMode::SERIAL;
+    }();
+    return mode;
+}
+
+/// Was the mode chosen, or defaulted?  Provenance for the receipt: "chunked"
+/// is only ever reachable through the environment, and the receipt has to be
+/// able to say so.
+inline bool wielFoldModeFromEnv() {
+    static const bool from_env = [] {
+        const char* value = std::getenv("RASBERY_GPU_WIEL_FOLD");
+        if (value == nullptr) return false;
+        std::string s(value);
+        const auto  not_space = [](unsigned char c) { return std::isspace(c) == 0; };
+        s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
+        s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
+        return !s.empty();
+    }();
+    return from_env;
+}
+
+/// One line, the first time the sweep path enqueues.  `chunk` is the number of
+/// contiguous chunks the fold range is cut into -- with nxyz it fixes every
+/// bit the chunked mode produces -- and is 0 for serial, which has no
+/// partition at all.
+inline void reportWielFold(int chunks) {
+    // enqueue_sweeps is launcher-only today, but "only one thread ever calls
+    // this" is the kind of invariant that quietly stops being true; an
+    // exchange costs nothing and cannot double-print.
+    static std::atomic<bool> done{false};
+    if (done.exchange(true, std::memory_order_relaxed)) return;
+    const bool chunked = wielFoldMode() == WielFoldMode::CHUNKED;
+    std::cout << "[RASBERY][CMFD][WIEL_FOLD] {\"mode\":\""
+              << (chunked ? "chunked" : "serial") << "\",\"source\":\""
+              << (wielFoldModeFromEnv() ? "env" : "default") << "\",\"chunk\":"
+              << (chunked ? chunks : 0) << "}" << std::endl;
 }
 
 /// RASBERY_GPU_CMFD_COMPACT, default OFF.  Read once, like every other gate.
@@ -1844,6 +1948,40 @@ __global__ void cmfd_wiel_terms(const int nxyz,
 /// reports 32 registers with zero spill, so there is nothing to trade back.
 constexpr int kWielFoldBatch = 64;
 
+/// The scalar tail of the Wielandt update, SHARED by both fold modes.
+///
+/// This is the frozen part: the export of the three sums, the Rayleigh
+/// hand-back latch (sweep_state = 2 plus sweep_halt, taken whenever gamma is
+/// degenerate), the fma/__dmul_rn choices in the eigenvalue update and the
+/// shift.  Factoring it out is what makes "the two modes differ ONLY in how
+/// the three sums were summed" a property of the source rather than a claim
+/// about it -- there is exactly one copy, so the chunked arm cannot drift into
+/// a different convergence or latch semantics while nobody is looking.
+__device__ __forceinline__ void cmfd_wiel_apply(const double err, const double gammad,
+                                                const double gamman, double* scalars,
+                                                std::uint32_t* sweep_halt, const int m) {
+    double* sm = scalars + static_cast<long long>(m) * kScalarCount;
+    sm[kErrAcc] = err;
+    sm[kGammaD] = gammad;
+    sm[kGammaN] = gamman;
+    if (!((gammad > 0.0) && (gamman > 0.0))) {
+        sm[kSweepState] = 2.0; // host finishes this sweep with the Rayleigh path
+        sweep_halt[m]   = 1u;
+        return;
+    }
+    const double gamma = gammad / gamman;
+    const double den   = fma(sm[kReigv], gamma, __dmul_rn(1.0 - gamma, sm[kReigvs]));
+    const double eigv  = 1.0 / den;
+    sm[kEigv]          = eigv;
+    sm[kReigv]         = 1.0 / eigv;
+    const double err_scale = (gammad > 0.0) ? gammad : gamman;
+    sm[kErrl2] = (err_scale > 0.0) ? sqrt(fabs(err / err_scale)) : 0.0;
+    double eigvs = eigv, reigvs = 0.0;
+    eigvs += sm[kEshift]; // icy >= 0 by the delegation contract
+    if (sm[kEshift] != 0.0) reigvs = 1.0 / eigvs;
+    sm[kReigvs] = reigvs;
+}
+
 /// The serial l-ascending fold of the stored addends, plus the eigenvalue
 /// update.  One thread per slot; slots in parallel on gridDim.y.  The
 /// warm-up (icy < 0) and Rayleigh branches never run here: the host only
@@ -1905,30 +2043,102 @@ __global__ void cmfd_wiel_finalize(const int nxyz,
     }
     __syncthreads();
     if (lane != 0) return;
+    cmfd_wiel_apply(lane_sum[0], lane_sum[1], lane_sum[2], scalars, sweep_halt, m);
+}
 
-    const double err    = lane_sum[0];
-    const double gammad = lane_sum[1];
-    const double gamman = lane_sum[2];
-    double* sm = scalars + static_cast<long long>(m) * kScalarCount;
-    sm[kErrAcc] = err;
-    sm[kGammaD] = gammad;
-    sm[kGammaN] = gamman;
-    if (!((gammad > 0.0) && (gamman > 0.0))) {
-        sm[kSweepState] = 2.0; // host finishes this sweep with the Rayleigh path
-        sweep_halt[m]   = 1u;
-        return;
+// ---------------------------------------------------------------------------
+// OPT-IN CHUNKED FOLD (RASBERY_GPU_WIEL_FOLD=chunked).  Class N1.
+//
+// Same three sums, a different summation ORDER, and therefore different bits
+// by 1-4 ULP.  What it is NOT is nondeterministic: the partition below is a
+// pure function of (nxyz, gridDim.x), the per-thread traversal is a fixed
+// stride, the in-block tree pairs the same operands every launch, the stage-2
+// fold walks the partials in strict ascending index order, and there is no
+// atomic anywhere in either kernel.  Two runs of the same deck on the same
+// arch produce the same doubles -- that is exactly the reduce_dot_stage1/2
+// contract, and it is what makes this an N1 arm rather than a coin toss.
+//
+// gridDim.x is chosen by reduce_blocks_for(nxyz), the same function the BiCG
+// reductions use, so a bucket of the compaction ladder cannot change it and a
+// captured graph replays the identical partition.
+// ---------------------------------------------------------------------------
+
+/// Stage 1: three independent reductions riding in one kernel, each with its
+/// own accumulator, its own shared array and its own partial row -- the
+/// reduce_dot2_stage1 pattern widened to three, not a fused reduction.
+__global__ void cmfd_wiel_stage1(const int nxyz,
+                                 const long long vec_stride,
+                                 const double* __restrict__ terms_ab,
+                                 const double* __restrict__ terms_c,
+                                 double* __restrict__ partial, ///< [slot][3][kMaxReduceBlocks]
+                                 const std::uint32_t* __restrict__ sweep_halt,
+                                 RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
+    if (sweep_halt[m] != 0u) return;
+    __shared__ double sh_err[kReduceThreads];
+    __shared__ double sh_gd[kReduceThreads];
+    __shared__ double sh_gn[kReduceThreads];
+
+    const double* ta = terms_ab + m * vec_stride;
+    const double* tc = terms_c + m * vec_stride;
+    double*       pm = partial + static_cast<long long>(m) * (3 * kMaxReduceBlocks);
+
+    // Fixed, contiguous chunk per block: depends only on (nxyz, gridDim.x).
+    const int chunk = (nxyz + static_cast<int>(gridDim.x) - 1) / static_cast<int>(gridDim.x);
+    const int begin = static_cast<int>(blockIdx.x) * chunk;
+    const int end   = min(begin + chunk, nxyz);
+
+    double s_err = 0.0, s_gd = 0.0, s_gn = 0.0;
+    for (int i = begin + static_cast<int>(threadIdx.x); i < end;
+         i += static_cast<int>(blockDim.x)) {
+        s_err += ta[i];
+        s_gd += ta[nxyz + i];
+        s_gn += tc[i];
     }
-    const double gamma = gammad / gamman;
-    const double den   = fma(sm[kReigv], gamma, __dmul_rn(1.0 - gamma, sm[kReigvs]));
-    const double eigv  = 1.0 / den;
-    sm[kEigv]          = eigv;
-    sm[kReigv]         = 1.0 / eigv;
-    const double err_scale = (gammad > 0.0) ? gammad : gamman;
-    sm[kErrl2] = (err_scale > 0.0) ? sqrt(fabs(err / err_scale)) : 0.0;
-    double eigvs = eigv, reigvs = 0.0;
-    eigvs += sm[kEshift]; // icy >= 0 by the delegation contract
-    if (sm[kEshift] != 0.0) reigvs = 1.0 / eigvs;
-    sm[kReigvs] = reigvs;
+    sh_err[threadIdx.x] = s_err;
+    sh_gd[threadIdx.x]  = s_gd;
+    sh_gn[threadIdx.x]  = s_gn;
+    __syncthreads();
+
+    // Fixed binary tree: identical operand pairing on every launch.
+    for (int stride = kReduceThreads / 2; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride) {
+            sh_err[threadIdx.x] += sh_err[threadIdx.x + stride];
+            sh_gd[threadIdx.x] += sh_gd[threadIdx.x + stride];
+            sh_gn[threadIdx.x] += sh_gn[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        pm[0 * kMaxReduceBlocks + blockIdx.x] = sh_err[0];
+        pm[1 * kMaxReduceBlocks + blockIdx.x] = sh_gd[0];
+        pm[2 * kMaxReduceBlocks + blockIdx.x] = sh_gn[0];
+    }
+}
+
+/// Stage 2: the strict ascending fold over the partials, then the SAME scalar
+/// tail the serial path runs.  Three lanes, one per sum, each keeping its own
+/// ascending chain -- the fold order over `blocks` partials is the one thing
+/// stage 2 is allowed to have, and it is fixed.
+__global__ void cmfd_wiel_finalize_chunked(const int blocks,
+                                           const double* __restrict__ partial,
+                                           double* scalars,
+                                           std::uint32_t* sweep_halt,
+                                           RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
+    if (sweep_halt[m] != 0u) return; // uniform for the whole slot block
+    const int     lane = static_cast<int>(threadIdx.x);
+    const double* pm   = partial + static_cast<long long>(m) * (3 * kMaxReduceBlocks);
+    __shared__ double lane_sum[3];
+    if (lane < 3) {
+        const double* values = pm + lane * kMaxReduceBlocks;
+        double        sum    = 0.0;
+        for (int i = 0; i < blocks; ++i) sum = sum + values[i]; // strict index order
+        lane_sum[lane] = sum;
+    }
+    __syncthreads();
+    if (lane != 0) return;
+    cmfd_wiel_apply(lane_sum[0], lane_sum[1], lane_sum[2], scalars, sweep_halt, m);
 }
 
 /// diag = udiag - chif*xsnf*reigvs*vol, with the mined fused subtract.
@@ -2292,6 +2502,16 @@ public:
             // so each dot's stage-2 fold is the identical strict index walk.
             allocate(reinterpret_cast<void**>(&partials2),
                      S * static_cast<size_t>(kMaxReduceBlocks) * sizeof(double));
+            // Landing pad for the OPT-IN chunked Wielandt fold: three rows per
+            // slot, one per sum, so each keeps the partial array and the strict
+            // stage-2 walk it would have had alone.  Its OWN buffer rather than
+            // a borrowed corner of `partials`: that one is live across the
+            // inner BiCGSTAB of the same sweep, and "dead by inspection right
+            // now" is not a property worth betting a campaign arm on.  384 KB
+            // at 64 slots, and it is allocated whatever the mode so that
+            // flipping RASBERY_GPU_WIEL_FOLD never changes the arena's shape.
+            allocate(reinterpret_cast<void**>(&wiel_partials),
+                     S * 3u * static_cast<size_t>(kMaxReduceBlocks) * sizeof(double));
             allocate(reinterpret_cast<void**>(&scalars), S * kScalarCount * sizeof(double));
             allocate(reinterpret_cast<void**>(&device_flags), S * sizeof(std::uint32_t));
             allocate(reinterpret_cast<void**>(&iter_flags), S * sizeof(std::uint32_t));
@@ -2404,6 +2624,7 @@ public:
         cudaFree(ax);
         cudaFree(partials);
         cudaFree(partials2);
+        cudaFree(wiel_partials);
         cudaFree(scalars);
         cudaFree(device_flags);
         cudaFree(iter_flags);
@@ -3118,8 +3339,24 @@ public:
             cmfd_wiel_terms<<<node_grid(), block_size, 0, stream>>>(
                 nxyz, vec_stride(), node_stride(), phi, psi_dev, xs_xsnf, node_vol,
                 ax, s, sweep_halt, d_slot_map, lanes);
-            cmfd_wiel_finalize<<<scalar_grid(), 32, 0, stream>>>(
-                nxyz, vec_stride(), ax, s, scalars, sweep_halt, d_slot_map, lanes);
+            // The one fork between the two fold modes.  Resolved from a
+            // process-constant gate, so the captured graph's topology is fixed
+            // for the run and no cache key has to carry the mode.
+            if (wielFoldMode() == WielFoldMode::CHUNKED) {
+                const int wiel_blocks = reduce_blocks_for(nxyz);
+                reportWielFold(wiel_blocks);
+                cmfd_wiel_stage1<<<dim3(static_cast<unsigned>(wiel_blocks),
+                                        static_cast<unsigned>(lanes)),
+                                   kReduceThreads, 0, stream>>>(
+                    nxyz, vec_stride(), ax, s, wiel_partials, sweep_halt, d_slot_map,
+                    lanes);
+                cmfd_wiel_finalize_chunked<<<scalar_grid(), 32, 0, stream>>>(
+                    wiel_blocks, wiel_partials, scalars, sweep_halt, d_slot_map, lanes);
+            } else {
+                reportWielFold(0);
+                cmfd_wiel_finalize<<<scalar_grid(), 32, 0, stream>>>(
+                    nxyz, vec_stride(), ax, s, scalars, sweep_halt, d_slot_map, lanes);
+            }
             cmfd_updls<<<node_grid(), block_size, 0, stream>>>(
                 nxyz, vec_stride(), node_stride(), mat_stride(), xs_chif, xs_xsnf,
                 node_vol, udiag_dev, diag, scalars, sweep_halt, d_slot_map, lanes);
@@ -3582,6 +3819,8 @@ public:
     double *y = nullptr, *z = nullptr, *ax = nullptr;
     double*        partials = nullptr;
     double*        partials2 = nullptr;
+    /// [slot][3][kMaxReduceBlocks] partials for the opt-in chunked Wielandt fold.
+    double*        wiel_partials = nullptr;
     double*        scalars = nullptr;
     std::uint32_t* device_flags = nullptr;
     std::uint32_t* iter_flags = nullptr;
