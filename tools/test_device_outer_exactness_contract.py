@@ -243,6 +243,40 @@ arming (gpu::outerSegmentPreArmRefusal) is asked BEFORE the arm, through the
 same outerSegmentRefusal ladder, with this run's batch width.  The post-arm
 refusal() still runs and still reports, so the receipt is unchanged.
 
+-------------------------------------------------------------------------------
+9. ONE DECK, ONE SLOT, ALL THE WAY DOWN
+-------------------------------------------------------------------------------
+
+Invariant 8 stopped `--batch-mode` from being PERTURBED by a segment that never
+ran.  This one is what had to be true before the segment could be allowed to run
+there at all.
+
+The state a segment carries -- residency, hooks, binding, the canonical-nodal
+latch, the reigv latch -- is per DECK, and it lived in one process-wide runner
+holding one process-wide OuterHookCtx, against a physics arena stood up at width
+one whose slotView(0).jnet and .phis were adopted as the nodal backend's
+canonical set.  Four Drivers on four host threads therefore shared: one
+residency, one ctx (a SolverContext* and two pointers into somebody's stack),
+one arena slot, and one pair of canonical buffers.  Any one of those is a wrong
+answer, not a slow one.
+
+There are already TWO batched arenas in this process -- the CMFD sweep's
+(rasberyBatchArena) and the nodal one -- and both index by the slot BICGSolver
+acquired.  A third index space would be a third thing that can disagree, so the
+physics arena is stood up at the same rasberyBatchWidth() and the Driver hands
+its CMFD slot straight through.
+
+RULE, and every clause of it is a place the old code had a singleton:
+  * the arena is sized arenaDims(..., rasberyBatchWidth()), not (..., 1);
+  * there is one runner per slot, reached as rasberyOuterSegment(slot), and an
+    out-of-range index gets an UNINITIALISED runner rather than slot 0's;
+  * each runner's canonical nodal set is ITS slot's jnet and phis;
+  * OuterHookCtx is per slot;
+  * residency.arena_slot is the Driver's CMFD slot;
+  * the ladder's batch test is `batch_width > arena_slots` and a deck whose shape
+    is not the one the arena was stood on is refused `geometry_mismatch` --
+    because one ArenaDims lays out every slot, so a second shape cannot share it.
+
 Run:  python tools/test_device_outer_exactness_contract.py
 """
 
@@ -912,6 +946,111 @@ def check_refused_segment_is_not_armed(problems: list[str]) -> None:
             )
 
 
+def check_batch_slot_is_one_index_space(problems: list[str]) -> None:
+    """Invariant 9: one deck, one slot, all the way down."""
+
+    def maybe_body(code: str, signature: str) -> str:
+        try:
+            return body_of(code, signature)
+        except (ValueError, AssertionError):
+            return ""
+
+    driver = read("src", "Driver.h")
+    graph_cu = read("src", "CudaOuterGraph.cu")
+    graph_h = read("src", "CudaOuterGraph.h")
+
+    # --- the arena is the RUN's width ---------------------------------------
+    if "arenaDims(deck.nxyz, deck.nsurf, deck.nxy, deck.n_fuel, 1)" in graph_cu:
+        problems.append(
+            "CudaOuterGraph.cu: the physics arena is still stood up at width 1.  Every "
+            "Driver in a batch would bind its residency into the same slot")
+    if not re.search(r"arena_width\s*=\s*rasberyBatchWidth\(\)", graph_cu):
+        problems.append(
+            "CudaOuterGraph.cu: the arena width is not rasberyBatchWidth().  A second "
+            "spelling of the batch width is a second slot index space, and there are "
+            "already two arenas keyed on the first one")
+    if not re.search(r"arenaDims\([^)]*arena_width\)", graph_cu):
+        problems.append(
+            "CudaOuterGraph.cu: arenaDims is not given the run's width")
+
+    # --- one runner per slot, and no clamping -------------------------------
+    table = maybe_body(graph_cu, "CudaOuterSegment& rasberyOuterSegment(int slot)")
+    if not table:
+        problems.append("CudaOuterGraph.cu: there is no per-slot runner table")
+    else:
+        if "kMaxDeviceSlots" not in table:
+            problems.append(
+                "CudaOuterGraph.cu: the runner table is not sized by kMaxDeviceSlots")
+        if "unserved" not in table:
+            problems.append(
+                "CudaOuterGraph.cu: rasberyOuterSegment(slot) has no unserved runner for an "
+                "out-of-range index.  Clamping to 0 aliases one Driver's residency onto "
+                "another's, which is the failure the table exists to stop")
+
+    stand_up = maybe_body(graph_cu, "bool rasberyStandUpOuterSegment(")
+    if "initialize(arena, n, i)" not in stand_up:
+        problems.append(
+            "CudaOuterGraph.cu: the stand-up does not initialise one runner per slot")
+    if "slotView(i).jnet" not in stand_up or "slotView(i).phis" not in stand_up:
+        problems.append(
+            "CudaOuterGraph.cu: the canonical nodal set is not per slot.  slotView(0)'s "
+            "jnet and phis handed to every Driver is exactly what left the batched nodal "
+            "drive without a per-deck jnet and phis")
+
+    # --- the Driver's slot IS the CMFD slot ---------------------------------
+    arm = maybe_body(driver, "static bool armOuterSegment(")
+    arm_code = strip_comments(arm)
+    if "residency.arena_slot = slot;" not in arm_code:
+        problems.append(
+            "Driver.h: armOuterSegment does not bind the residency to this Driver's slot")
+    if re.search(r"residency\.arena_slot\s*=\s*0\b", arm_code):
+        problems.append("Driver.h: residency.arena_slot is still hard-coded 0")
+    if "outerHookCtx(slot)" not in arm_code:
+        problems.append(
+            "Driver.h: armOuterSegment does not take a per-slot hook context.  The ctx "
+            "holds a SolverContext* and two pointers into the solve loop's stack, so one "
+            "static is M Drivers writing over each other")
+    ctx_fn = maybe_body(driver, "static OuterHookCtx& outerHookCtx(int slot)")
+    if "[gpu::kMaxDeviceSlots]" not in ctx_fn:
+        problems.append("Driver.h: outerHookCtx is not a per-slot table")
+
+    # --- the scalars carry the slot the caller armed on ---------------------
+    for fn in ("ReconvergeFlux", "SolveLoop"):
+        body = strip_comments(maybe_body(driver, "static void " + fn + "("))
+        if not body:
+            problems.append("Driver.h: " + fn + " not found")
+            continue
+        if "s.slot" not in body or "gpu_outer_claim.slot" not in body:
+            problems.append(
+                "Driver.h: " + fn + " does not tell the segment which slot it is running.  "
+                "OuterSegmentScalars::slot defaults to 0, so every deck in a batch would "
+                "drive slot 0's probe and slot 0's halt word")
+        if "s.slot_admitted" not in body:
+            problems.append(
+                "Driver.h: " + fn + " does not carry the admission the pre-arm gate "
+                "decided.  The runner has no Geometry to re-derive it from, so a "
+                "runSegment that assumed `admitted` could run a deck the arena was not "
+                "laid out for")
+
+    # --- the ladder asks the honest batch question --------------------------
+    ladder = maybe_body(graph_h, "outerSegmentRefusal(const OuterSegmentEligibility& e)")
+    ladder = strip_comments(ladder)
+    if "e.batch_width > 1" in ladder:
+        problems.append(
+            "CudaOuterGraph.h: the ladder still refuses every batch outright.  The question "
+            "is whether the batch fits the arena that was stood up, not whether it is a "
+            "batch")
+    if "e.batch_width > e.arena_slots" not in ladder:
+        problems.append(
+            "CudaOuterGraph.h: the batch refusal does not compare the run's width against "
+            "the arena's")
+    if "e.slot_admitted" not in ladder or "GeometryMismatch" not in ladder:
+        problems.append(
+            "CudaOuterGraph.h: a deck whose shape is not the arena's is not refused by "
+            "name.  One ArenaDims lays out every slot, so a second shape cannot share it "
+            "and must not be served one")
+
+
 def main() -> int:
     problems: list[str] = []
     check_form_mask_is_mined(problems)
@@ -923,6 +1062,7 @@ def main() -> int:
     check_device_reigv_has_one_writer(problems)
     check_staged_uploads_have_one_in_body_writer(problems)
     check_refused_segment_is_not_armed(problems)
+    check_batch_slot_is_one_index_space(problems)
 
     if problems:
         print("FAIL: device outer exactness contract")
@@ -940,6 +1080,8 @@ def main() -> int:
     print("  6. the psi/dhat mirror lands before the host loop that reads it")
     print("  7. the nodal reigv slot has exactly one writer per drive")
     print("  8. a refusal the caller can see coming is not armed for")
+    print("  9. one deck, one slot: arena width, runner, hook ctx, residency,")
+    print("     canonical set and the ladder all index the same way")
     return 0
 
 

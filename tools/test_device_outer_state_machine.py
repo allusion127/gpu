@@ -416,8 +416,19 @@ for arm, code in (("CudaOuterGraph.cu", GRAPH_CU_CODE),
 # Driver.h's branch has to fold away with the feature off.
 want(DRIVER_CODE, "gpu::outerGpuEnabled()", "Driver.h",
      "the delegation branch must be gated on the feature")
-want(DRIVER_CODE, "gpu::rasberyOuterSegment().runSegment(", "Driver.h",
+# Rev.7.1 Task 18-lite: the runner is reached BY SLOT.  There is one per arena
+# slot now, so a call site that spelled `rasberyOuterSegment()` would be reaching
+# slot 0's residency from every deck in a batch -- which is the exact failure the
+# per-slot table replaced.  The spelling is checked, not just the call.
+want(DRIVER_CODE, "gpu::rasberyOuterSegment(gpu_outer_claim.query())", "Driver.h",
+     "the delegation branch must reach the runner for THIS Driver's arena slot; a "
+     "process-wide runner is what made --batch-mode unserveable")
+want(DRIVER_CODE, ".runSegment(", "Driver.h",
      "the delegation branch must actually call the runner")
+if "gpu::rasberyOuterSegment().runSegment(" in DRIVER_CODE:
+    problems.append("Driver.h: a delegation still calls the slot-0 runner by the "
+                    "single-run spelling.  In --batch-mode that is M Drivers sharing one "
+                    "residency, one hook context and one canonical nodal set")
 want(DRIVER_CODE, "gpu::outerDeckHasFractionalRods(", "Driver.h",
      "Stage A eligibility must use the mined cusping predicate")
 want(DRIVER_CODE, "gpu::noteOuterSegmentRefusal(", "Driver.h",
@@ -434,7 +445,7 @@ want(DRIVER_CODE, "gpu::noteOuterSegmentRefusal(", "Driver.h",
 # the deviation a stated one instead of a silent one.
 RECONVERGE = body_of(DRIVER_CODE, "static void ReconvergeFlux(", "static void SolveLoop(")
 SOLVELOOP = DRIVER_CODE[DRIVER_CODE.find("static void SolveLoop("):]
-if "rasberyOuterSegment().runSegment(" not in RECONVERGE:
+if ".runSegment(" not in RECONVERGE:
     problems.append("Driver.h: ReconvergeFlux does not delegate.  It is the only loop in "
                     "Driver.h whose escape set is closed -- every feedback is held fixed -- "
                     "so it is the only Stage A call site that has an exact host resume")
@@ -445,7 +456,7 @@ if "rasberyOuterSegment().runSegment(" not in RECONVERGE:
 # flux_converged and the three scalars behind it, so hoisting one declaration is
 # the entry point.  The delegation is now required, and what has to be guarded
 # is that it stays a hoist rather than a rewrite.
-if "rasberyOuterSegment().runSegment(" not in SOLVELOOP:
+if ".runSegment(" not in SOLVELOOP:
     problems.append("Driver.h: SolveLoop does not delegate.  Task 10's whole M1 claim is "
                     "device_outers == outer count, and ReconvergeFlux is the search "
                     "FALLBACK -- a deck that never falls back would run zero device outers")
@@ -515,8 +526,8 @@ if _deleg and "seg.flux_converged" not in _deleg:
 # own re-check ask the same predicate; giving them different answers arms the
 # loop and then refuses every individual segment, which is the worst of the two
 # behaviours and shows up only as device_outers == 0 with a full refusal count.
-_SL_REFUSAL = body_of(SOLVELOOP, "gpu::rasberyOuterSegment().refusal(", ");")
-_SL_RUN = body_of(SOLVELOOP, "gpu::rasberyOuterSegment().runSegment(", ") {")
+_SL_REFUSAL = body_of(SOLVELOOP, ".refusal(", ");")
+_SL_RUN = body_of(SOLVELOOP, ".runSegment(", ") {")
 if _SL_REFUSAL and "has_search" in _SL_REFUSAL:
     problems.append("Driver.h: SolveLoop still refuses a critical-search deck.  The device "
                     "decision is advisory there -- only flux_converged crosses, and it is "

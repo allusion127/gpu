@@ -107,6 +107,7 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -186,9 +187,30 @@ struct AtomicCounters {
     }
 };
 
-AtomicCounters& counters() {
-    static AtomicCounters c;
+/// ONE COUNTER SET PER SLOT, REACHED THROUGH THE THREAD.
+///
+/// Rev.7.1 Task 18-lite.  The bump sites -- about fifty of them, all inside the
+/// body -- say `bump(counters().x)` and none of them holds a slot index.  A
+/// Driver owns one host thread and one CMFD slot for its whole life, so the
+/// thread is the index: outerSetThreadSlot() stamps it once per solve loop and
+/// this returns that slot's set.  Two consequences, both wanted.  The atomics
+/// stop being contended across M worker threads, and the receipt can print what
+/// each deck did instead of one number that is the sum of four solves.
+///
+/// The run-wide totals are recovered by summing (outerSegmentCounters), so every
+/// field the [OUTER_GPU] line printed before still means exactly what it meant.
+/// A thread that never called the setter reads slot 0, which is what a single
+/// run is.
+thread_local int t_outer_slot = 0;
+
+std::array<AtomicCounters, kMaxDeviceSlots>& slotCounters() {
+    static std::array<AtomicCounters, kMaxDeviceSlots> c;
     return c;
+}
+
+AtomicCounters& counters() {
+    const int s = (t_outer_slot >= 0 && t_outer_slot < kMaxDeviceSlots) ? t_outer_slot : 0;
+    return slotCounters()[static_cast<std::size_t>(s)];
 }
 
 void bump(std::atomic<std::uint64_t>& c, std::uint64_t by = 1) {
@@ -196,6 +218,10 @@ void bump(std::atomic<std::uint64_t>& c, std::uint64_t by = 1) {
 }
 
 } // namespace
+
+void outerSetThreadSlot(int slot) {
+    t_outer_slot = (slot >= 0 && slot < kMaxDeviceSlots) ? slot : 0;
+}
 
 // ---------------------------------------------------------------------------
 // Gates
@@ -233,8 +259,11 @@ unsigned int outerSegmentBudget() {
 // Receipt
 // ---------------------------------------------------------------------------
 
-OuterSegmentCounters outerSegmentCounters() {
-    const AtomicCounters& a = counters();
+namespace {
+
+/// One slot's counters, flattened.  The run-wide totals below are the sum of
+/// these, so nothing that reads the [OUTER_GPU] line has to know slots exist.
+OuterSegmentCounters snapshotSlotCounters(const AtomicCounters& a) {
     OuterSegmentCounters  out;
     out.segment_launches        = a.segment_launches.load(std::memory_order_relaxed);
     out.device_outers           = a.device_outers.load(std::memory_order_relaxed);
@@ -268,6 +297,55 @@ OuterSegmentCounters outerSegmentCounters() {
         out.refusals[i] = a.refusals[i].load(std::memory_order_relaxed);
     for (int i = 0; i < kDeviceEscapeCount; ++i)
         out.escapes[i] = a.escapes[i].load(std::memory_order_relaxed);
+    return out;
+}
+
+/// Add @p add into @p into, field by field.
+void addCounters(OuterSegmentCounters& into, const OuterSegmentCounters& add) {
+    into.segment_launches        += add.segment_launches;
+    into.device_outers           += add.device_outers;
+    into.host_outer_observations += add.host_outer_observations;
+    into.budget_exits            += add.budget_exits;
+    into.halted_outer_launches   += add.halted_outer_launches;
+    into.jnet_bridge_bytes       += add.jnet_bridge_bytes;
+    into.updjnet_reissued        += add.updjnet_reissued;
+    into.flux_sync_bytes         += add.flux_sync_bytes;
+    into.host_mirror_bytes       += add.host_mirror_bytes;
+    into.cusping_fired           += add.cusping_fired;
+    into.cusping_dtil_bytes      += add.cusping_dtil_bytes;
+    into.device_flux_outers      += add.device_flux_outers;
+    into.flux_uploads_elided     += add.flux_uploads_elided;
+    into.xsnf_uploads_elided     += add.xsnf_uploads_elided;
+    into.dtil_uploads_elided     += add.dtil_uploads_elided;
+    into.mirror_exits            += add.mirror_exits;
+    into.canonical_nodal_outers  += add.canonical_nodal_outers;
+    into.nodal_event_waits       += add.nodal_event_waits;
+    into.reigv_device_outers     += add.reigv_device_outers;
+    into.reigv_reissued          += add.reigv_reissued;
+    into.in_body_host_syncs      += add.in_body_host_syncs;
+    into.sync_exit_observation   += add.sync_exit_observation;
+    into.sync_mirror_drain       += add.sync_mirror_drain;
+    into.sync_pre_nodal          += add.sync_pre_nodal;
+    into.sync_sweep_reissue      += add.sync_sweep_reissue;
+    into.sync_segment_exit       += add.sync_segment_exit;
+    into.phis_mirror_bytes       += add.phis_mirror_bytes;
+    into.jnet_mirror_bytes       += add.jnet_mirror_bytes;
+    for (int i = 0; i < static_cast<int>(OuterSegmentRefusal::Count); ++i)
+        into.refusals[i] += add.refusals[i];
+    for (int i = 0; i < kDeviceEscapeCount; ++i)
+        into.escapes[i] += add.escapes[i];
+}
+
+} // namespace
+
+/// The run-wide totals: every slot, summed.
+///
+/// Rev.7.1 Task 18-lite.  A single run has one live slot and this is a copy of
+/// it, which is what keeps the ON-vs-OFF receipt comparison a byte comparison.
+OuterSegmentCounters outerSegmentCounters() {
+    OuterSegmentCounters out;
+    for (int i = 0; i < kMaxDeviceSlots; ++i)
+        addCounters(out, snapshotSlotCounters(slotCounters()[static_cast<std::size_t>(i)]));
     return out;
 }
 
@@ -335,8 +413,14 @@ std::string outerSegmentReceiptJson() {
     // Printed ONLY when nothing ran: on a healthy run the reason is "none" and
     // saying so would be noise, while on an idle run it is the whole message.
     if (c.segment_launches == 0) {
+        // SLOT 0'S LADDER, and that is honest for the reason it always was: this
+        // is a run-wide line printed from a singleton with no Driver to ask, and
+        // the reasons it can still see -- no runner, no arena, unbound, a batch
+        // wider than the arena -- are run-wide.  A per-slot reason that differs
+        // from slot 0's shows up in the per-slot lines below, which is where a
+        // reader who needs it will look.
         s += outerIdleReasonJson(
-            rasberyOuterSegment().refusal(rasberyBatchWidth(), false, false));
+            rasberyOuterSegment().refusal(rasberyBatchWidth(), false, false, true));
         s += ",";
     }
     s += outerHostBodyJson();
@@ -344,9 +428,55 @@ std::string outerSegmentReceiptJson() {
     return s;
 }
 
+/// One slot's line: what THIS deck's runner did.
+///
+/// Rev.7.1 Task 18-lite.  The run-wide line above is a sum, and a sum is exactly
+/// the wrong shape for the question a batch raises -- "did the segment engage
+/// for every deck, or for one of them four times".  Printed only for slots that
+/// were touched, so a single run adds one line and an idle slot adds none.
+static std::string outerSlotReceiptJson(int slot, const OuterSegmentCounters& c) {
+    std::string s = "{\"slot\":" + std::to_string(slot) +
+                    ",\"segment_launches\":" + std::to_string(c.segment_launches) +
+                    ",\"device_outers\":" + std::to_string(c.device_outers) +
+                    ",\"host_outer_observations\":" +
+                    std::to_string(c.host_outer_observations) +
+                    ",\"canonical_nodal_outers\":" +
+                    std::to_string(c.canonical_nodal_outers) +
+                    ",\"jnet_bridge_bytes\":" + std::to_string(c.jnet_bridge_bytes) +
+                    ",\"refusals\":{";
+    bool first = true;
+    for (int i = 0; i < static_cast<int>(OuterSegmentRefusal::Count); ++i) {
+        if (c.refusals[i] == 0) continue;
+        if (!first) s += ",";
+        first = false;
+        s += "\"";
+        s += outerRefusalName(static_cast<OuterSegmentRefusal>(i));
+        s += "\":" + std::to_string(c.refusals[i]);
+    }
+    s += "}}";
+    return s;
+}
+
 void reportOuterSegment(std::ostream& os) {
     if (!outerGpuEnabled()) return;
     os << "[RASBERY][OUTER_GPU] " << outerSegmentReceiptJson() << std::endl;
+    // The per-slot breakdown, and the width it was measured against.  A batch
+    // whose receipt says `device_outers > 0` on the run-wide line and names only
+    // one slot here is a batch where three decks got nothing, which is the
+    // failure this line exists to make impossible to miss.
+    const int arena_slots = rasberyOuterArenaSlots();
+    if (rasberyBatchWidth() <= 1 && arena_slots <= 1) return;
+    os << "[RASBERY][OUTER_GPU][SLOTS] {\"batch_width\":" << rasberyBatchWidth()
+       << ",\"arena_slots\":" << arena_slots << "}" << std::endl;
+    for (int i = 0; i < kMaxDeviceSlots; ++i) {
+        const OuterSegmentCounters c =
+            snapshotSlotCounters(slotCounters()[static_cast<std::size_t>(i)]);
+        bool touched = c.segment_launches != 0 || c.device_outers != 0;
+        for (int r = 0; r < static_cast<int>(OuterSegmentRefusal::Count) && !touched; ++r)
+            touched = c.refusals[r] != 0;
+        if (!touched) continue;
+        os << "[RASBERY][OUTER_GPU][SLOT] " << outerSlotReceiptJson(i, c) << std::endl;
+    }
 }
 
 void noteOuterSegmentRefusal(OuterSegmentRefusal why) {
@@ -380,6 +510,10 @@ struct CudaOuterSegment::Impl {
     std::string     status     = "uninitialised";
     DeviceArenaView arena{};
     int             slot_count = 0;
+    /// Rev.7.1 Task 18-lite: WHICH arena slot this runner serves.  Fixed at
+    /// initialize() and never re-aimed, so a Driver cannot be handed a runner
+    /// that is quietly pointing somewhere else.
+    int             slot       = -1;
 
     /// The stream the segment issues on.  Rev.7.1 Task 10 part 2: normally the
     /// CMFD arena's, so the sweep's kernels and the segment's are ordered by the
@@ -476,14 +610,39 @@ CudaOuterSegment::~CudaOuterSegment() {
     delete _impl;
 }
 
-bool CudaOuterSegment::initialize(const DeviceArenaView& arena, int slot_count) {
+// ---------------------------------------------------------------------------
+// Rev.7.1 Task 18-lite: one runner per arena slot
+// ---------------------------------------------------------------------------
+
+CudaOuterSegment& rasberyOuterSegment(int slot) {
+    // kMaxDeviceSlots objects, constructed on first use and never destroyed
+    // before the process ends -- the arena's own lifetime rule, for the arena's
+    // own reason: the addresses a runner hands out must outlive every Driver.
+    // An empty Impl is a pointer and a short string, so the slots a run never
+    // touches cost nothing but their construction.
+    static std::array<CudaOuterSegment, kMaxDeviceSlots> segments;
+    // THE OUT-OF-RANGE ANSWER IS A RUNNER THAT REFUSES, NOT SLOT 0.  Clamping
+    // would alias one Driver's residency onto another's, which is the exact
+    // failure this table exists to stop; this object is never initialised, so
+    // available() is false and the ladder answers `no_runner`.
+    static CudaOuterSegment unserved;
+    if (slot < 0 || slot >= kMaxDeviceSlots) return unserved;
+    return segments[static_cast<std::size_t>(slot)];
+}
+
+bool CudaOuterSegment::initialize(const DeviceArenaView& arena, int slot_count, int slot) {
     release();
     if (slot_count <= 0 || slot_count > kMaxSchedulerSlots) {
         _impl->status = "slot_count outside [1, kMaxSchedulerSlots]";
         return false;
     }
+    if (slot < 0 || slot >= slot_count) {
+        _impl->status = "slot outside [0, slot_count)";
+        return false;
+    }
     _impl->arena      = arena;
     _impl->slot_count = slot_count;
+    _impl->slot       = slot;
 
     // A PARTIAL initialise MUST NOT KEEP ITS ALLOCATIONS.  The runner is
     // unavailable either way, so nothing will ever free them through the normal
@@ -548,7 +707,10 @@ void CudaOuterSegment::release() {
     _impl->stream      = nullptr;
     _impl->own_stream  = nullptr;
     _impl->ready       = false;
+    _impl->slot        = -1;
 }
+
+int CudaOuterSegment::slot() const { return _impl != nullptr ? _impl->slot : -1; }
 
 bool CudaOuterSegment::useStream(void* stream) {
     if (_impl == nullptr || !_impl->ready) return false;
@@ -785,12 +947,16 @@ bool CudaOuterSegment::republishAfterHostSweep(int slot, double eigv, double res
 }
 
 bool rasberyBindOuterResidency(const OuterSegmentResidency& residency) {
-    return rasberyOuterSegment().bindResidency(residency);
+    // THE RESIDENCY CARRIES ITS OWN SLOT, so this needs no second index space:
+    // the Driver filled arena_slot from the CMFD slot it holds, and that is the
+    // runner it must reach.
+    return rasberyOuterSegment(residency.arena_slot).bindResidency(residency);
 }
 
 bool rasberyPublishOuterProbe(int slot, double eigv, double residual, bool negative_flux,
                               bool rayleigh) {
-    return rasberyOuterSegment().publishProbe(slot, eigv, residual, negative_flux, rayleigh);
+    return rasberyOuterSegment(slot).publishProbe(slot, eigv, residual, negative_flux,
+                                                  rayleigh);
 }
 
 void CudaOuterSegment::bind(const OuterSegmentBinding& binding) {
@@ -804,7 +970,8 @@ void CudaOuterSegment::bind(const OuterSegmentBinding& binding) {
 bool CudaOuterSegment::bound() const { return _impl->is_bound; }
 
 OuterSegmentRefusal CudaOuterSegment::refusal(int batch_width, bool fractional_rods,
-                                              bool critical_search) const {
+                                              bool critical_search,
+                                              bool slot_admitted) const {
     if (!outerGpuEnabled()) return OuterSegmentRefusal::FeatureOff;
     OuterSegmentEligibility e{};
     e.runner_available = available() ? 1 : 0;
@@ -815,6 +982,12 @@ OuterSegmentRefusal CudaOuterSegment::refusal(int batch_width, bool fractional_r
                              : 0;
     e.bound            = _impl->is_bound ? 1 : 0;
     e.batch_width      = batch_width;
+    // THE WIDTH THIS RUNNER WAS STOOD AT, not the one the run asked for.  An
+    // uninitialised runner reports 0, which makes any batch wider than it --
+    // but `runner_available` is ranked above and answers first, so the receipt
+    // still says `no_runner` rather than blaming the batch.
+    e.arena_slots      = _impl->slot_count;
+    e.slot_admitted    = slot_admitted ? 1 : 0;
     e.fractional_rods  = fractional_rods ? 1 : 0;
     e.critical_search  = critical_search ? 1 : 0;
     e.residency_bound  = _impl->residency_bound ? 1 : 0;
@@ -838,12 +1011,17 @@ std::size_t mirrorPairBytes(const OuterSegmentBinding& b) {
 bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_width,
                                   bool fractional_rods, bool critical_search,
                                   OuterSegmentResume& resume) {
-    const OuterSegmentRefusal why = refusal(batch_width, fractional_rods, critical_search);
+    const OuterSegmentRefusal why =
+        refusal(batch_width, fractional_rods, critical_search, scalars.slot_admitted != 0);
     if (why != OuterSegmentRefusal::None) {
         bump(counters().refusals[static_cast<int>(why)]);
         return false;
     }
-    if (scalars.slot < 0 || scalars.slot >= _impl->slot_count) {
+    // AND IT MUST BE THIS RUNNER'S SLOT.  One runner per slot means an index
+    // that does not match is a caller that reached for the wrong object, and
+    // running it anyway would drive somebody else's residency.
+    if (scalars.slot < 0 || scalars.slot >= _impl->slot_count ||
+        scalars.slot != _impl->slot) {
         bump(counters().refusals[static_cast<int>(OuterSegmentRefusal::LaunchFailed)]);
         return false;
     }
@@ -2109,6 +2287,17 @@ struct StandUpTables {
     cmfd::CmfdOuterView* cmfd_views    = nullptr; ///< [slots], derived ON THE DEVICE
     CmfdOuterCounters*   dhat_counters = nullptr; ///< [slots]
     bool                 stood         = false;
+    /// Rev.7.1 Task 18-lite: the width the arena was ACTUALLY stood at, and the
+    /// deck shape it was stood on.
+    ///
+    /// The arena is one allocation whose slot block is replicated from one
+    /// ArenaDims, so every slot carries the FIRST deck's strides.  Recording the
+    /// shape is what lets a later Driver be told `geometry_mismatch` instead of
+    /// being handed a slot indexed with somebody else's mesh.  Written once,
+    /// under the stand-up mutex, before `stood` goes true; read afterwards
+    /// without the lock, which is safe because `stood` is what publishes it.
+    int                   slots = 0;
+    OuterSegmentDeckShape shape{};
 };
 
 StandUpTables& standUpTables() {
@@ -2160,7 +2349,27 @@ bool rasberyStandUpOuterSegment(const OuterSegmentDeck& deck, std::ostream& rece
     static std::mutex stand_up_mutex;
     std::lock_guard<std::mutex> stand_up_lock(stand_up_mutex);
 
-    if (standUpTables().stood) return rasberyOuterSegment().bound();
+    // A LATER ARRIVAL DOES NOT RE-STAND ANYTHING -- it checks that the arena it
+    // is about to share was stood on ITS deck.  The caller ignores this return,
+    // so the enforcing gate is the ladder's `geometry_mismatch`, which
+    // rasberyOuterSlotAdmitted answers from the same recorded shape; saying it
+    // once here, loudly, is what stops that refusal from reading like the
+    // feature quietly doing nothing.
+    if (standUpTables().stood) {
+        if (standUpTables().shape != deck.shape()) {
+            std::fprintf(stderr,
+                         "[RASBERY][OUTER_GPU][WARN] the device outer arena was stood up on "
+                         "nxyz=%d nsurf=%d nxy=%d n_fuel=%d ng=%d and this deck is nxyz=%d "
+                         "nsurf=%d nxy=%d n_fuel=%d ng=%d; one arena layout cannot serve "
+                         "both, so this deck refuses with geometry_mismatch\n",
+                         standUpTables().shape.nxyz, standUpTables().shape.nsurf,
+                         standUpTables().shape.nxy, standUpTables().shape.n_fuel,
+                         standUpTables().shape.ng, deck.nxyz, deck.nsurf, deck.nxy,
+                         deck.n_fuel, deck.ng);
+            return false;
+        }
+        return rasberyOuterSegment().bound();
+    }
 
     if (deck.nxyz <= 0 || deck.nsurf <= 0 || deck.nxy <= 0 || deck.ng <= 0 ||
         deck.surface_node == nullptr || deck.surface_dir == nullptr ||
@@ -2182,7 +2391,30 @@ bool rasberyStandUpOuterSegment(const OuterSegmentDeck& deck, std::ostream& rece
     }
 
     // --- 1. the ONE allocation, with Sec 4.4 admission -----------------------
-    ArenaDims dims = arenaDims(deck.nxyz, deck.nsurf, deck.nxy, deck.n_fuel, 1);
+    // --- 0. how wide ---------------------------------------------------------
+    //
+    // Rev.7.1 Task 18-lite: THE ARENA IS THE RUN'S WIDTH, NOT ONE.
+    //
+    // Link 1 stood this up at width 1 and the refusal ladder then refused every
+    // batch, which is a consistent pair and a dead end: `--batch-mode M` got
+    // nothing from the device outer at all.  The width the run asked for is the
+    // width every other batched arena in this process already uses -- the CMFD
+    // arena (rasberyBatchArena) and the batched nodal arena both size themselves
+    // from rasberyBatchWidth() -- so taking the same number keeps ONE slot index
+    // space across all three, and the Driver can hand its CMFD slot straight to
+    // the physics arena instead of inventing a second mapping.
+    //
+    // A WIDER ARENA IS AN ADMISSION QUESTION, NOT A PROMISE.  reserve() applies
+    // Sec 4.4 exactly as before and nothing is silently shrunk: if M slots do not
+    // fit it refuses, `[RASBERY][GPU_ARENA]` says `admitted:false` and why, and
+    // no runner is ever initialised -- so the ladder answers `no_runner`, which
+    // is ranked above the batch and is the more useful of the two true things.
+    // At the kngr_238 mesh a slot is ~235 MB, so M64 is ~15 GB of arena and this
+    // is the path a wide manifest takes on a card that cannot hold it.  Serving
+    // K < M slots and refusing the rest is deliberately NOT done: an
+    // inhomogeneous batch is a scheduling decision, not an allocator's.
+    const int arena_width = rasberyBatchWidth() > 0 ? rasberyBatchWidth() : 1;
+    ArenaDims dims = arenaDims(deck.nxyz, deck.nsurf, deck.nxy, deck.n_fuel, arena_width);
     dims.ng             = deck.ng;
     const bool reserved = outerArena().reserve(dims);
     // The receipt goes out on BOTH paths.  A refusal that printed nothing is
@@ -2259,16 +2491,37 @@ bool rasberyStandUpOuterSegment(const OuterSegmentDeck& deck, std::ostream& rece
     // UINT64_MAX and leave the constants phase permanently stale.
     const unsigned long long seed_generation =
         deck.material_generation != 0ull ? deck.material_generation : 1ull;
-    k_outer_seed_slot<<<1, 1>>>(arena, 0, seed_generation);
-    if ((rc = cudaGetLastError()) != cudaSuccess) return fail("seed slot state");
+    //
+    // EVERY SLOT, NOT SLOT 0.  Rev.7.1 Task 18-lite: at width 1 the two were the
+    // same statement and this read `..., 0, ...`.  At the run's width they are
+    // not, and an unseeded slot is exactly the failure this kernel's own comment
+    // describes -- cmfdOuterConvergence BRANCHES on flux_stall, stall_events,
+    // clean_iters and xe_interim_count, so a slot whose control packet still
+    // holds pool garbage publishes `prev_inner = eigv + 1.0` and SolveLoop adopts
+    // it.  MEASURED on the 4-deck local batch: 56 datasets per deck differed
+    // against OUTER unset, all four decks, with the receipt saying the segment
+    // engaged cleanly on every slot.  With the loop: 0.
+    for (int i = 0; i < n; ++i) {
+        k_outer_seed_slot<<<1, 1>>>(arena, i, seed_generation);
+        if ((rc = cudaGetLastError()) != cudaSuccess) return fail("seed slot state");
+    }
     if ((rc = cudaDeviceSynchronize()) != cudaSuccess) return fail("stand-up synchronize");
 
-    // --- 6. hand it to the runner --------------------------------------------
-    if (!rasberyOuterSegment().initialize(arena, n)) {
-        std::fprintf(stderr, "[RASBERY][OUTER_GPU][WARN] runner initialise failed: %s\n",
-                     rasberyOuterSegment().status().c_str());
-        rasberyTearDownOuterSegment();
-        return false;
+    // --- 6. hand it to the runners -------------------------------------------
+    //
+    // ONE PER SLOT.  Each holds its own residency, hook set, binding and the two
+    // sticky latches, which is the whole reason a batch can be served at all;
+    // the device scratch each allocates is [slot_count] copies of six small
+    // structs, so even the widest arena this build allows costs a few hundred
+    // kilobytes of it.
+    for (int i = 0; i < n; ++i) {
+        if (!rasberyOuterSegment(i).initialize(arena, n, i)) {
+            std::fprintf(stderr,
+                         "[RASBERY][OUTER_GPU][WARN] runner initialise failed (slot %d): %s\n",
+                         i, rasberyOuterSegment(i).status().c_str());
+            rasberyTearDownOuterSegment();
+            return false;
+        }
     }
 
     OuterSegmentBinding binding{};
@@ -2294,7 +2547,7 @@ bool rasberyStandUpOuterSegment(const OuterSegmentDeck& deck, std::ostream& rece
     // The device end of the jnet bridge.  jnet has no twin in the sweep arena,
     // so it stays in the physics arena and the runner moves it around the host
     // nodal drive.
-    binding.device_jnet   = outerArena().slotView(0).jnet;
+    binding.device_jnet   = outerArena().slotView(0).jnet;  // re-aimed per slot below
     // Rev.7.1 Task 18-lite: the phis half of the canonical nodal set.
     //
     // THE ARENA HAS A phis REGION AND NOTHING ON THE DEVICE READS IT.  Every
@@ -2304,18 +2557,48 @@ bool rasberyStandUpOuterSegment(const OuterSegmentDeck& deck, std::ostream& rece
     // the right buffer to hand the nodal drive: the sharing costs no coupling,
     // and the region is already sized as Geometry sizes it (LR*ng*NDIRMAX*nxyz,
     // GpuPhysicsArenaLayout.h:485).
-    binding.device_phis   = outerArena().slotView(0).phis;
+    binding.device_phis   = outerArena().slotView(0).phis;  // re-aimed per slot below
     binding.nxyz          = dims.nxyz;
     binding.ng            = dims.ng;
-    rasberyOuterSegment().bind(binding);
 
+    // THE CANONICAL NODAL SET IS PER SLOT, AND THAT IS WHAT THIS TASK IS ABOUT.
+    // jnet and phis used to come from slotView(0) for the whole process, so in a
+    // batch every Driver adopted the SAME two device buffers as its backend's
+    // canonical nodal set and the batched nodal drive stopped having a per-deck
+    // jnet and phis.  Each runner now takes its own slot's regions; everything
+    // above -- the geometry, the CMFD view table, the forms, the clamp -- is
+    // genuinely shared and is copied across unchanged.
+    for (int i = 0; i < n; ++i) {
+        OuterSegmentBinding b = binding;
+        b.device_jnet         = outerArena().slotView(i).jnet;
+        b.device_phis         = outerArena().slotView(i).phis;
+        rasberyOuterSegment(i).bind(b);
+    }
+
+    t.slots = n;
+    t.shape = deck.shape();
     t.stood = true;
     return rasberyOuterSegment().bound();
 }
 
+int rasberyOuterArenaSlots() {
+    const StandUpTables& t = standUpTables();
+    return t.stood ? t.slots : 0;
+}
+
+bool rasberyOuterSlotAdmitted(int slot, const OuterSegmentDeckShape& shape) {
+    const StandUpTables& t = standUpTables();
+    // NOT STOOD IS NOT ADMITTED, and it does not have to say so: every reason
+    // ranked above `slot_admitted` in the ladder -- no runner, no arena, unbound
+    // -- is already false in that state and is reported first.
+    if (!t.stood) return false;
+    if (slot < 0 || slot >= t.slots) return false;
+    return t.shape == shape;
+}
+
 void rasberyTearDownOuterSegment() {
     StandUpTables& t = standUpTables();
-    rasberyOuterSegment().release();
+    for (int i = 0; i < kMaxDeviceSlots; ++i) rasberyOuterSegment(i).release();
     if (t.slot_views != nullptr) cudaFree(t.slot_views);
     if (t.cmfd_views != nullptr) cudaFree(t.cmfd_views);
     if (t.dhat_counters != nullptr) cudaFree(t.dhat_counters);
@@ -2323,6 +2606,8 @@ void rasberyTearDownOuterSegment() {
     t.cmfd_views    = nullptr;
     t.dhat_counters = nullptr;
     t.stood         = false;
+    t.slots         = 0;
+    t.shape         = OuterSegmentDeckShape{};
     outerArena().release();
 }
 

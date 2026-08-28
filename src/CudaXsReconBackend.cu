@@ -3350,6 +3350,15 @@ gpu::CanonicalSlotBuffers XsReconBackend::canonicalBuffers() const {
     return _impl->canonical.buffers;
 }
 
+bool XsReconBackend::canonicalNodalIsHonoured() {
+    // nodalArenaWanted() and not `is there an arena object yet`: the slot is
+    // acquired lazily on the FIRST drive, so a question asked at arm time would
+    // answer `per-instance` for a run whose second outer joins the batch.  The
+    // predicate is cached and process-wide, which is the granularity the arena
+    // itself has.
+    return !nodalArenaWanted();
+}
+
 void XsReconBackend::setMaterializeMask(std::uint32_t mask) {
     Impl& d = *_impl;
     // Also a topology change: the mask decides which download NODES exist in the

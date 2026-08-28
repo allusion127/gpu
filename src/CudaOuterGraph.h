@@ -481,7 +481,8 @@ enum class OuterSegmentRefusal : int {
     NoRunner,        ///< no CUDA arm, or the runner failed to initialise
     NoArena,         ///< GpuPhysicsArena is not reserved, so no fixed addresses
     Unbound,         ///< nobody handed the runner the arena-derived views
-    BatchMode,       ///< Sec 3.2 batch integration is Task 10/18
+    BatchMode,       ///< the run's batch is wider than the physics arena stood up
+    GeometryMismatch,///< this Driver's deck is not the deck the arena was stood on
     FractionalRods,  ///< Stage A: cusping would have to escape on outer 1
     CriticalSearch,  ///< see the note on OuterSegmentEligibility::critical_search
     NoSweepHook,     ///< the resident CMFD sweep enqueue was not supplied
@@ -500,6 +501,7 @@ inline const char* outerRefusalName(OuterSegmentRefusal r) {
         case OuterSegmentRefusal::NoArena:         return "no_arena";
         case OuterSegmentRefusal::Unbound:         return "unbound";
         case OuterSegmentRefusal::BatchMode:       return "batch_mode";
+        case OuterSegmentRefusal::GeometryMismatch: return "geometry_mismatch";
         case OuterSegmentRefusal::FractionalRods:  return "fractional_rods";
         case OuterSegmentRefusal::CriticalSearch:  return "critical_search";
         case OuterSegmentRefusal::NoSweepHook:     return "no_sweep_hook";
@@ -518,7 +520,33 @@ struct OuterSegmentEligibility {
     int runner_available; ///< a CUDA arm exists and initialised
     int arena_reserved;   ///< GpuPhysicsArena::available()
     int bound;            ///< bind() was called with the arena-derived views
-    int batch_width;      ///< rasberyBatchWidth(); >1 refuses
+
+    /// Rev.7.1 Task 18-lite: the two halves of "is there a seat for this deck".
+    ///
+    /// WHAT REPLACED `batch_width > 1`.  Task 9 refused every batch outright
+    /// because the physics arena was stood up at width ONE and there was one
+    /// process-wide runner, so an M-wide batch had M Drivers reaching for one
+    /// slot's jnet/phis/flux.  The arena is now stood up at the RUN's width and
+    /// there is one runner per slot, so the honest question is no longer "is
+    /// this a batch" but "is this batch inside the arena that was stood up":
+    ///
+    ///   batch_width > arena_slots -- the arena is narrower than the run.  This
+    ///       is what a VRAM admission that shrank the arena, or a width past
+    ///       kMaxDeviceSlots, looks like from here.  Still `batch_mode`, because
+    ///       that is still the true reason and the receipt vocabulary does not
+    ///       need a second word for it.
+    ///
+    ///   slot_admitted -- this Driver's slot is inside the arena AND the arena
+    ///       holds THIS deck's shape.  The arena is ONE allocation with one
+    ///       layout for every slot (arenaComputeLayout replicates a single slot
+    ///       block), so two decks with different nxyz/nsurf/nxy/n_fuel/ng cannot
+    ///       share it; the first Driver to arrive stands it up and a later one
+    ///       with a different shape is refused by name rather than served a slot
+    ///       whose strides are somebody else's.  See rasberyOuterSlotAdmitted.
+    int batch_width;      ///< rasberyBatchWidth()
+    int arena_slots;      ///< the width the physics arena was actually stood at
+    int slot_admitted;    ///< rasberyOuterSlotAdmitted(slot, this deck's shape)
+
     int fractional_rods;  ///< outerDeckHasFractionalRods()
 
     /// A CRITICAL SEARCH IS REFUSED ONLY WHERE THE DEVICE DECISION IS
@@ -591,7 +619,8 @@ outerSegmentRefusal(const OuterSegmentEligibility& e) {
     if (!e.runner_available) return OuterSegmentRefusal::NoRunner;
     if (!e.arena_reserved) return OuterSegmentRefusal::NoArena;
     if (!e.bound) return OuterSegmentRefusal::Unbound;
-    if (e.batch_width > 1) return OuterSegmentRefusal::BatchMode;
+    if (e.batch_width > e.arena_slots) return OuterSegmentRefusal::BatchMode;
+    if (!e.slot_admitted) return OuterSegmentRefusal::GeometryMismatch;
     if (e.fractional_rods && !e.have_cusping_hook)
         return OuterSegmentRefusal::FractionalRods;
     if (e.critical_search) return OuterSegmentRefusal::CriticalSearch;
@@ -624,14 +653,22 @@ outerSegmentRefusal(const OuterSegmentEligibility& e) {
 ///
 /// The ladder is not restated: this builds an eligibility whose post-arm fields
 /// are all satisfied and asks the SAME function, so the two cannot disagree.
+///
+/// Rev.7.1 Task 18-lite: `arena_slots` and `slot_admitted` join it, because the
+/// batch reason stopped being "this is a batch" and became "this batch does not
+/// fit the arena that was stood up".  Both are properties of the RUN, both are
+/// knowable before the arm, and both are asked through the same ladder.
 [[nodiscard]] inline OuterSegmentRefusal
-outerSegmentPreArmRefusal(int batch_width, bool fractional_rods, bool critical_search) {
+outerSegmentPreArmRefusal(int batch_width, bool fractional_rods, bool critical_search,
+                          int arena_slots, bool slot_admitted) {
     if (!outerGpuEnabled()) return OuterSegmentRefusal::FeatureOff;
     OuterSegmentEligibility e{};
     e.runner_available  = 1;
     e.arena_reserved    = 1;
     e.bound             = 1;
     e.batch_width       = batch_width;
+    e.arena_slots       = arena_slots;
+    e.slot_admitted     = slot_admitted ? 1 : 0;
     e.fractional_rods   = fractional_rods ? 1 : 0;
     e.critical_search   = critical_search ? 1 : 0;
     e.residency_bound   = 1;
@@ -1212,6 +1249,14 @@ struct OuterSegmentBinding {
 struct OuterSegmentScalars {
     int slot = 0;
 
+    /// Rev.7.1 Task 18-lite: the caller's answer to rasberyOuterSlotAdmitted.
+    ///
+    /// CARRIED RATHER THAN RECOMPUTED, so the ladder the body asks and the
+    /// ladder the caller armed on cannot disagree about one outer.  The runner
+    /// has no Geometry to compare shapes with; the Driver does, and it asked
+    /// before it armed.  Defaults to admitted, which is what a single run is.
+    int slot_admitted = 1;
+
     double eigv       = 0.0; ///< at segment entry
     double residual   = 0.0; ///< at segment entry
     double prev_inner = 0.0; ///< Driver.h's `prev_inner` local
@@ -1388,6 +1433,31 @@ bool rasberyBindOuterResidency(const OuterSegmentResidency& residency);
 bool rasberyPublishOuterProbe(int slot, double eigv, double residual, bool negative_flux,
                               bool rayleigh);
 
+/// The five integers that decide an arena LAYOUT, and nothing else.
+///
+/// Rev.7.1 Task 18-lite.  The arena is one allocation whose slot block is
+/// replicated `slots` times from ONE ArenaDims (arenaComputeLayout), so every
+/// slot has the same strides.  A batch may therefore share it only while every
+/// deck agrees on these five; a sixth Driver with a different mesh has to be
+/// told no by name.  Split out of OuterSegmentDeck so the comparison can be made
+/// at the ARM site -- which holds a Geometry and no deck -- against the shape the
+/// stand-up recorded.
+struct OuterSegmentDeckShape {
+    int nxyz   = 0;
+    int nsurf  = 0;
+    int nxy    = 0;
+    int n_fuel = 0;
+    int ng     = 0;
+
+    [[nodiscard]] bool operator==(const OuterSegmentDeckShape& o) const {
+        return nxyz == o.nxyz && nsurf == o.nsurf && nxy == o.nxy &&
+               n_fuel == o.n_fuel && ng == o.ng;
+    }
+    [[nodiscard]] bool operator!=(const OuterSegmentDeckShape& o) const {
+        return !(*this == o);
+    }
+};
+
 /// The one object that runs a segment.
 ///
 /// Defined by the CUDA arm (CudaOuterGraph.cu) and by the no-CUDA stub, so call
@@ -1404,7 +1474,14 @@ public:
     /// Take the device scratch this runner needs (probe, segment state, refreshed
     /// inputs) and the stream it will issue on.  Returns false and leaves the
     /// runner unavailable on any CUDA error, with the reason in status().
-    bool initialize(const DeviceArenaView& arena, int slot_count);
+    ///
+    /// Rev.7.1 Task 18-lite: `slot` says which arena slot THIS runner serves.
+    /// There is one runner per slot now, and the device scratch below is still
+    /// sized [slot_count] because the probe and halt arrays are addressed by the
+    /// slot index the CMFD sweep's verdict kernel is given -- a runner that
+    /// packed its own slot at index 0 would need a second index space, and the
+    /// two would be free to disagree.
+    bool initialize(const DeviceArenaView& arena, int slot_count, int slot);
     void release();
 
     [[nodiscard]] bool               available() const;
@@ -1484,8 +1561,16 @@ public:
 
     /// Would a segment run right now?  Pure query, no CUDA call, so the caller
     /// can hoist it out of the outer loop.  Records nothing.
+    ///
+    /// Rev.7.1 Task 18-lite: `slot_admitted` comes from the caller and
+    /// `arena_slots` from this runner's own slot count, so the pre-arm and
+    /// post-arm spellings of the ladder are asked with the same two facts.
     [[nodiscard]] OuterSegmentRefusal refusal(int batch_width, bool fractional_rods,
-                                              bool critical_search) const;
+                                              bool critical_search,
+                                              bool slot_admitted) const;
+
+    /// Which arena slot this runner serves; -1 until initialize().
+    [[nodiscard]] int slot() const;
 
     /// Run ONE segment.  Returns true when at least one outer was committed on
     /// the device, with `resume` filled; false when the segment was refused or a
@@ -1505,17 +1590,69 @@ private:
 };
 
 
-/// The process-wide runner.
+/// THE RUNNER FOR ONE ARENA SLOT.
 ///
-/// Deliberately an inline function-local static rather than another exported
-/// symbol, for the reason rasberyGpuNodalFullEnabled() documents: both arms
-/// would otherwise have to define it, and the no-CUDA stub has no reason to own
-/// a singleton it can only refuse from.  One static, one process-wide answer,
-/// and no new symbol in either build.
-inline CudaOuterSegment& rasberyOuterSegment() {
-    static CudaOuterSegment segment;
-    return segment;
+/// Rev.7.1 Task 18-lite: THIS USED TO BE ONE OBJECT FOR THE WHOLE PROCESS, and
+/// that is what refused `--batch-mode` outright.  A CudaOuterSegment holds a
+/// residency, a hook set, a binding, a canonical-nodal latch and a reigv latch,
+/// and every one of them is a property of ONE Driver's deck; M Drivers on M host
+/// threads sharing them meant the last arm won and the other M-1 ran against a
+/// residency that was not theirs.  One runner per slot makes every one of those
+/// fields per-slot by construction, which is cheaper to be sure of than M
+/// parallel state tables inside one object.
+///
+/// SLOT 0 IS THE SINGLE-RUN PATH, UNCHANGED.  A run with no batch stands the
+/// arena up at width 1, acquires CMFD slot 0 and therefore uses runner 0 -- the
+/// same object, initialised with the same slot_count of 1, doing the same work.
+/// That is what makes the single-path gate a byte comparison rather than an
+/// argument.
+///
+/// An out-of-range index answers with a runner that was never initialised, so it
+/// refuses `no_runner` instead of aliasing somebody else's slot.  It is an
+/// exported function and not an inline static because the table has to be the
+/// SAME table in the .cu and in whatever else links the header.
+[[nodiscard]] CudaOuterSegment& rasberyOuterSegment(int slot);
+
+/// The single-run spelling.  Slot 0, by definition.
+[[nodiscard]] inline CudaOuterSegment& rasberyOuterSegment() {
+    return rasberyOuterSegment(0);
 }
+
+/// The width the physics arena was actually stood up at; 0 before the stand-up.
+///
+/// Not `rasberyBatchWidth()`: the run ASKS for a width and the arena's Sec 4.4
+/// admission may refuse it, and the refusal ladder has to compare the two.
+[[nodiscard]] int rasberyOuterArenaSlots();
+
+/// Is there a seat in the stood-up arena for this Driver?
+///
+/// True when the slot is inside the arena AND the arena was stood up on a deck
+/// of this shape.  Pure query, no CUDA call, safe to ask before arming -- which
+/// is the whole point: the arm binds residency and adopts a canonical nodal set,
+/// so a Driver that is going to be refused must find out first.
+///
+/// TODAY THIS RUNG IS UNREACHABLE, AND IT IS KEPT ANYWAY.  rasberyBatchArena
+/// throws on the second geometry -- "batch mode requires every instance to share
+/// one geometry" -- inside BICGSolver's constructor, which runs BEFORE
+/// Driver::Run reaches the stand-up, so a mixed-geometry batch dies with that
+/// message and this is never asked.  MEASURED: kngr3 + i-SMR CY01 at
+/// --batch-mode 2 ran i-SMR to completion with the segment engaged and refused
+/// the kngr3 deck by name.  The rung stays because the assumption it guards is
+/// the PHYSICS arena's own -- one ArenaDims lays out every slot -- and it must
+/// not be inherited silently from a check in another arena that a future
+/// heterogeneous batch could relax.
+[[nodiscard]] bool rasberyOuterSlotAdmitted(int slot, const OuterSegmentDeckShape& shape);
+
+/// Tell this thread which slot its refusals and counters belong to.
+///
+/// THE COUNTERS ARE PER SLOT AND THE BUMP SITES DO NOT KNOW IT.  There are ~50
+/// `bump(counters().x)` sites inside the body and threading a slot index through
+/// all of them would be a large diff whose only purpose is bookkeeping.  A
+/// Driver owns one host thread and one slot for its whole life, so the thread IS
+/// the index: this sets it once per solve loop, `counters()` reads it, and the
+/// [OUTER_GPU] receipt sums the slots back into the run-wide totals it always
+/// printed.  Unset means slot 0, which is what a single run is.
+void outerSetThreadSlot(int slot);
 
 // ---------------------------------------------------------------------------
 // Sec 4  Standing the segment up in production  (Rev.7.1 Task 9, link 1)
@@ -1543,6 +1680,16 @@ struct OuterSegmentDeck {
     int nxy    = 0;
     int n_fuel = 0;
     int ng     = 0;
+
+    [[nodiscard]] OuterSegmentDeckShape shape() const {
+        OuterSegmentDeckShape s;
+        s.nxyz   = nxyz;
+        s.nsurf  = nsurf;
+        s.nxy    = nxy;
+        s.n_fuel = n_fuel;
+        s.ng     = ng;
+        return s;
+    }
 
     // --- the CMFD topology cache, uploaded ONCE (CMFD.h base pointers) ---
     //

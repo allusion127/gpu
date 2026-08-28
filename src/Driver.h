@@ -865,9 +865,26 @@ private:
         /// trap deviceSweepResident() documents for the residency gate.
         bool           enqueued = false;
     };
-    static OuterHookCtx& outerHookCtx() {
-        static OuterHookCtx c;
-        return c;
+    /// ONE CONTEXT PER ARENA SLOT.
+    ///
+    /// Rev.7.1 Task 18-lite: THIS WAS PROCESS-WIDE AND IT WAS ONE OF THE TWO
+    /// THINGS THAT MADE `--batch-mode` UNSERVEABLE.  The context holds a
+    /// SolverContext* and pointers to the solve loop's own `eigv` and `residual`
+    /// locals; `--batch-mode M` runs M Drivers on M host threads, so a single
+    /// static meant every hook the runner called reached whichever Driver armed
+    /// last -- its geometry, its CMFD solver, its stack.  Keyed by the CMFD slot
+    /// the Driver already owns, each Driver gets its own and nothing is shared.
+    ///
+    /// A THREAD-LOCAL WOULD ALSO WORK AND IS THE WRONG SHAPE.  The slot is what
+    /// the runner, the residency, the counters and the receipt are all keyed on;
+    /// making this the one thing keyed on the thread instead would leave two
+    /// index spaces that agree only by accident.  An out-of-range index answers
+    /// with slot 0's, which is unreachable: every caller has already been
+    /// through the ladder's `slot_admitted`.
+    static OuterHookCtx& outerHookCtx(int slot) {
+        static OuterHookCtx c[gpu::kMaxDeviceSlots];
+        const int           i = (slot >= 0 && slot < gpu::kMaxDeviceSlots) ? slot : 0;
+        return c[i];
     }
 
     /// setls + drive, then publish what the sweep observed.
@@ -942,7 +959,7 @@ private:
                                       unsigned int) {
         OuterHookCtx& h = *static_cast<OuterHookCtx*>(raw);
         const gpu::CudaOuterSegment::ProbeAddresses a =
-            gpu::rasberyOuterSegment().probeAddresses(slot);
+            gpu::rasberyOuterSegment(slot).probeAddresses(slot);
         h.enqueued = false;
         if (!a.valid) return false;
         CudaBatchArena::CmfdSweepProbeSink sink;
@@ -1006,7 +1023,7 @@ private:
         h.ctx->cmfd_solver.setOuterSegmentResident(false);
         if (!ok) return false;
         if (!host_continued) return true;
-        return gpu::rasberyOuterSegment().republishAfterHostSweep(
+        return gpu::rasberyOuterSegment(slot).republishAfterHostSweep(
             slot, *h.eigv, *h.residual, h.ctx->cmfd_solver.lastSweepNegativeFlux(),
             h.ctx->cmfd_solver.lastSweepRayleigh());
     }
@@ -1152,6 +1169,60 @@ private:
         out.sweep_will_enqueue = h.ctx->cmfd_solver.canEnqueueDrive();
     }
 
+    /// Everything the refusal ladder needs that only a Driver can see.
+    ///
+    /// Rev.7.1 Task 18-lite.  Two of the ladder's reasons became per-Driver when
+    /// the arena stopped being width 1: WHICH slot this deck holds, and whether
+    /// the arena that was stood up has this deck's shape.  Both are asked here,
+    /// once per solve-loop entry, and the answer is carried into the pre-arm
+    /// gate, the post-arm refusal and every segment this loop runs -- so the
+    /// three cannot disagree about one outer.
+    ///
+    /// It also stamps the thread's slot, which is what makes the [OUTER_GPU]
+    /// receipt's per-slot lines say what each deck did rather than what the sum
+    /// of the batch did.
+    struct OuterSlotClaim {
+        int  slot        = -1;
+        int  arena_slots = 0;
+        bool admitted    = false;
+
+        /// Which runner to ASK.  `slot` is -1 when this run has no resident CMFD
+        /// arena at all, and that is a reason the ladder already has a better
+        /// word for -- `no_arena`, recorded by armOuterSegment, which is the
+        /// only place that can see it.  Asking runner 0 there keeps the receipt
+        /// saying what it said before this task: `no_arena` then
+        /// `no_residency`, not `no_runner` from an out-of-range index.
+        [[nodiscard]] int query() const { return slot >= 0 ? slot : 0; }
+    };
+
+    static OuterSlotClaim outerSlotClaim(SolverContext& ctx) {
+        OuterSlotClaim c;
+        c.slot        = ctx.cmfd_solver.residentSlot();
+        c.arena_slots = gpu::rasberyOuterArenaSlots();
+        gpu::OuterSegmentDeckShape shape;
+        shape.nxyz  = ctx.geometry.nxyz();
+        shape.nsurf = ctx.geometry.nsurf();
+        shape.nxy   = ctx.geometry.nxy();
+        shape.ng    = ctx.geometry.ng();
+        // THE FUEL COUNT IS SCANNED, exactly as the stand-up scans it
+        // (Driver::Run), because Geometry keeps the flag per node and no count
+        // beside it.  Two spellings of `how many fuel nodes` that could disagree
+        // is how a deck gets admitted to an arena laid out for a different one.
+        int n_fuel = 0;
+        for (int l = 0; l < ctx.geometry.nxyz(); ++l)
+            if (ctx.geometry.IsFuel(l)) ++n_fuel;
+        shape.n_fuel = n_fuel;
+        // NO SLOT IS NOT A MISMATCH.  A run with no resident CMFD arena has
+        // residentSlot() == -1, and refusing it `geometry_mismatch` here would
+        // skip the arm -- and the arm is the only place that can see, and
+        // record, that there is no arena.  Admitting it lets armOuterSegment
+        // say `no_arena` and the post-arm ladder say `no_residency`, which is
+        // the receipt this configuration produced before the slot existed.
+        c.admitted = c.slot < 0 || gpu::rasberyOuterSlotAdmitted(c.slot, shape);
+        gpu::outerSetThreadSlot(c.slot);
+        return c;
+    }
+
     /// Hand the runner the sweep arena's buffers and install the hooks.
     ///
     /// Called once per SolveLoop/ReconvergeFlux entry, because the arena slot is
@@ -1161,6 +1232,16 @@ private:
     static bool armOuterSegment(SolverContext& ctx, double& eigv, double& residual) {
         if (!gpu::outerGpuEnabled()) return false;
         const CudaBatchArena* arena = ctx.cmfd_solver.residentArena();
+        // Rev.7.1 Task 18-lite: THE CMFD SLOT IS THE PHYSICS-ARENA SLOT.
+        //
+        // It used to be hard-coded 0 with the comment "the physics arena is
+        // width 1 (link 1)", which was true and is what made a batch unservable:
+        // M Drivers bound their residency into one slot table entry and adopted
+        // one slot's jnet/phis as their canonical nodal set.  The arena is now
+        // stood up at the run's width with the SAME index space the CMFD and
+        // nodal arenas use, so this is the slot -- no mapping, no second
+        // allocator, and no way for the three to disagree about which deck slot
+        // m belongs to.
         const int             slot  = ctx.cmfd_solver.residentSlot();
         if (arena == nullptr || slot < 0) {
             gpu::noteOuterSegmentRefusal(gpu::OuterSegmentRefusal::NoArena);
@@ -1192,10 +1273,10 @@ private:
         residency.host_dtil  = ctx.cmfd_solver.dtilData();
         // Rev.7.1 Task 18-lite: the host end of the canonical nodal set's phis.
         residency.host_phis  = ctx.geometry.Phis();
-        residency.arena_slot = 0; // the physics arena is width 1 (link 1)
+        residency.arena_slot = slot;
         residency.valid      = true;
 
-        OuterHookCtx& hc = outerHookCtx();
+        OuterHookCtx& hc = outerHookCtx(slot);
         hc.ctx           = &ctx;
         hc.eigv          = &eigv;
         hc.residual      = &residual;
@@ -1216,9 +1297,50 @@ private:
         // loop and never engage.  What is asked here is the RUN's shape -- is
         // there an arena stream to share -- and the per-outer question is asked
         // per outer, inside the enqueue hook.
-        const bool stream_sweep = ctx.cmfd_solver.sweepStream() != nullptr &&
-                                  gpu::rasberyOuterSegment().useStream(
-                                      ctx.cmfd_solver.sweepStream());
+        //
+        // ============================================================
+        // A BATCH KEEPS ITS OWN STREAM, AND THEREFORE ITS OWN SWEEP HOOK
+        // ============================================================
+        //
+        // Rev.7.1 Task 18-lite.  THE ARENA STREAM IS UNDER GRAPH CAPTURE, and a
+        // batch has other threads doing the capturing.  CudaBatchArena captures
+        // the CMFD sweep on `core.stream` -- ONE stream for every slot -- and a
+        // capture swallows everything enqueued on that stream by anybody.  With
+        // M Drivers, worker A's segment enqueues updpsi while worker B is
+        // capturing, and both die:
+        //
+        //   [RASBERY][FAIL] cudaMemcpyAsync(d_slot_map, ...): operation failed
+        //   due to a previous error during capture
+        //
+        // -- measured on the 4-deck local batch, four failed decks in 1.2 s.
+        //
+        // So sharing the stream is a SINGLE-RUN optimisation, not a general one.
+        // Task 10 adopted it to order the segment's kernels against the sweep
+        // without an event pair, and it still does that wherever exactly one
+        // instance is live.  A batch takes the other arrangement Task 9 already
+        // had: the runner's own private stream, and a sweep hook that BLOCKS.
+        // The two go together and neither is optional --
+        //
+        //   * the private stream means nothing orders the segment's kernels
+        //     against the sweep's except the host, so the sweep hook has to be
+        //     the one that returns having finished (`sweep_synchronizes`), which
+        //     also forces the honest budget of one;
+        //   * the body drains the private stream before every sweep on that arm
+        //     (`!stream_sweep || host_reader_next`), so the psi the drive reads
+        //     and the dhat it assembles from have both landed.
+        //
+        // What a batch therefore gets is exactly Task 9's segment, per deck:
+        // updpsi, updjnet and upddhat on the device, and the 416 KiB/outer dhat
+        // H2D gone -- one outer at a time instead of eight.
+        //
+        // useStream(nullptr) IS NOT REDUNDANT.  The runner is process-lived and
+        // arms many times; a previous arm may have pointed it at an arena
+        // stream, and this restores its own.
+        const bool solo = rasberyBatchWidth() <= 1;
+        const bool stream_sweep =
+            solo && ctx.cmfd_solver.sweepStream() != nullptr &&
+            gpu::rasberyOuterSegment(slot).useStream(ctx.cmfd_solver.sweepStream());
+        if (!stream_sweep) gpu::rasberyOuterSegment(slot).useStream(nullptr);
 
         gpu::OuterSegmentHooks hooks;
         hooks.enqueue_cmfd_sweep =
@@ -1234,7 +1356,7 @@ private:
         hooks.canonical_nodal_eligible = &outerCanonicalNodalEligibleHook;
         hooks.ctx                 = &hc;
         hooks.sweep_synchronizes  = !stream_sweep;
-        gpu::rasberyOuterSegment().setHooks(hooks);
+        gpu::rasberyOuterSegment(slot).setHooks(hooks);
 
         if (!gpu::rasberyBindOuterResidency(residency)) return false;
 
@@ -1279,12 +1401,22 @@ private:
         // OuterSegmentHooks::canonical_nodal_eligible -- and an outer that says
         // no keeps its bridge and gets its ownership handed back before the
         // drive runs.
+        //
+        // AND THE DRIVE HAS TO HONOUR THE BINDING, NOT JUST TAKE IT.  Rev.7.1
+        // Task 18-lite: the batched nodal arena accepts an adopted set into its
+        // view table and then uploads Geometry::Jnet over it on every drive.
+        // The segment, seeing the binding live, stops filling Geometry::Jnet --
+        // so the arena uploads an array that is one outer stale, and the deck
+        // converges somewhere else (kngr3 statepoint 1: 800.33 ppm in 290 outers
+        // against 770.15 in 263).  Asking XsReconBackend which nodal path this
+        // run uses keeps the bridge exactly where the binding would be a lie.
         const bool nodal_on_device =
-            rasberyGpuNodalEnabled() && rasberyGpuNodalFullEnabled();
+            rasberyGpuNodalEnabled() && rasberyGpuNodalFullEnabled() &&
+            XsReconBackend::canonicalNodalIsHonoured();
         bool canonical_nodal = false;
         if (nodal_on_device) {
             const gpu::CanonicalSlotBuffers set =
-                gpu::rasberyOuterSegment().canonicalNodalSet();
+                gpu::rasberyOuterSegment(slot).canonicalNodalSet();
             XsReconBackend* backend = ctx.cross_sections.EnsureBackend();
             if (set.shared() && backend != nullptr && backend->available()) {
                 // Re-adopting the same three pointers is a no-op inside the
@@ -1299,17 +1431,24 @@ private:
                 canonical_nodal = backend->canonicalBuffers().shared();
             }
         }
-        gpu::rasberyOuterSegment().setCanonicalNodalBound(canonical_nodal);
+        gpu::rasberyOuterSegment(slot).setCanonicalNodalBound(canonical_nodal);
         // ONE LINE PER PROCESS, on the first arm, because a receipt that says
         // nothing about a binding that did not engage is the reason a reader
         // cannot tell `off` from `on and refused`.
-        static bool canonical_said = false;
-        if (!canonical_said) {
-            canonical_said = true;
+        //
+        // ATOMIC, because `--batch-mode M` reaches this from M threads at once
+        // and a plain bool would print the line twice or not at all.  It also
+        // carries the slot now: one line per process was enough when there was
+        // one deck, and in a batch the interesting failure is exactly the deck
+        // whose binding did NOT engage.
+        static std::atomic<bool> canonical_said[gpu::kMaxDeviceSlots] = {};
+        const int                said_i =
+            (slot >= 0 && slot < gpu::kMaxDeviceSlots) ? slot : 0;
+        if (!canonical_said[said_i].exchange(true, std::memory_order_relaxed)) {
             std::fprintf(stderr,
-                         "[RASBERY][OUTER_GPU] canonical_nodal=%d nodal_on_device=%d "
+                         "[RASBERY][OUTER_GPU] slot=%d canonical_nodal=%d nodal_on_device=%d "
                          "rod_fallback_at_arm=%d\n",
-                         canonical_nodal ? 1 : 0, nodal_on_device ? 1 : 0,
+                         slot, canonical_nodal ? 1 : 0, nodal_on_device ? 1 : 0,
                          ctx.nodal_solver.DeviceDriveEligible() ? 0 : 1);
         }
         // The residency flag is NOT set here.  It belongs to the segment's own
@@ -1419,17 +1558,22 @@ private:
         // buffers -- while the segment refused every outer and the receipt said
         // so.  A refusal the caller can see coming must not be armed for.  See
         // gpu::outerSegmentPreArmRefusal.
+        const OuterSlotClaim gpu_outer_claim =
+            gpu_outer_enabled ? outerSlotClaim(ctx) : OuterSlotClaim{};
         const bool gpu_outer_may_arm =
             gpu_outer_enabled &&
-            gpu::outerSegmentPreArmRefusal(rasberyBatchWidth(), gpu_outer_rods, false) ==
+            gpu::outerSegmentPreArmRefusal(rasberyBatchWidth(), gpu_outer_rods, false,
+                                           gpu_outer_claim.arena_slots,
+                                           gpu_outer_claim.admitted) ==
                 gpu::OuterSegmentRefusal::None;
         if (gpu_outer_may_arm) armOuterSegment(ctx, eigv, residual);
 
         // ReconvergeFlux runs no critical search by construction, so the
         // search refusal cannot apply here.
         const gpu::OuterSegmentRefusal gpu_outer_why =
-            gpu_outer_enabled ? gpu::rasberyOuterSegment().refusal(rasberyBatchWidth(),
-                                                                   gpu_outer_rods, false)
+            gpu_outer_enabled ? gpu::rasberyOuterSegment(gpu_outer_claim.query())
+                                    .refusal(rasberyBatchWidth(), gpu_outer_rods, false,
+                                             gpu_outer_claim.admitted)
                               : gpu::OuterSegmentRefusal::FeatureOff;
         bool gpu_outer_armed = (gpu_outer_why == gpu::OuterSegmentRefusal::None);
         // The decision is hoisted out of the loop, so nothing below would ever
@@ -1441,6 +1585,8 @@ private:
         for (int i = 0; i < max_iter; ++i) {
             if (gpu_outer_armed) {
                 gpu::OuterSegmentScalars s{};
+                s.slot          = gpu_outer_claim.slot;
+                s.slot_admitted = gpu_outer_claim.admitted ? 1 : 0;
                 s.eigv       = eigv;
                 s.residual   = residual;
                 s.prev_inner = prev_inner;
@@ -1457,8 +1603,8 @@ private:
                 s.th_pending = 0;
 
                 gpu::OuterSegmentResume seg{};
-                if (gpu::rasberyOuterSegment().runSegment(s, rasberyBatchWidth(),
-                                                          gpu_outer_rods, false, seg)) {
+                if (gpu::rasberyOuterSegment(gpu_outer_claim.query())
+                        .runSegment(s, rasberyBatchWidth(), gpu_outer_rods, false, seg)) {
                     eigv        = seg.eigv;
                     residual    = seg.residual;
                     prev_inner  = seg.prev_inner;
@@ -2427,9 +2573,13 @@ private:
         // visible here -- above all `batch_mode` -- must not be armed for.  With
         // the gate the OUTER=1 arm is byte-identical to OUTER unset whenever the
         // receipt says the segment never engaged.
+        const OuterSlotClaim gpu_outer_claim =
+            gpu_outer_enabled ? outerSlotClaim(ctx) : OuterSlotClaim{};
         const bool gpu_outer_may_arm =
             gpu_outer_enabled &&
-            gpu::outerSegmentPreArmRefusal(rasberyBatchWidth(), gpu_outer_rods, false) ==
+            gpu::outerSegmentPreArmRefusal(rasberyBatchWidth(), gpu_outer_rods, false,
+                                           gpu_outer_claim.arena_slots,
+                                           gpu_outer_claim.admitted) ==
                 gpu::OuterSegmentRefusal::None;
         if (gpu_outer_may_arm) armOuterSegment(ctx, eigv, residual);
 
@@ -2455,8 +2605,9 @@ private:
         // from statepoint 1: with the refusal in place APR1400/kngr_238 never
         // saw a device outer at all.
         const gpu::OuterSegmentRefusal gpu_outer_why =
-            gpu_outer_enabled ? gpu::rasberyOuterSegment().refusal(rasberyBatchWidth(),
-                                                                   gpu_outer_rods, false)
+            gpu_outer_enabled ? gpu::rasberyOuterSegment(gpu_outer_claim.query())
+                                    .refusal(rasberyBatchWidth(), gpu_outer_rods, false,
+                                             gpu_outer_claim.admitted)
                               : gpu::OuterSegmentRefusal::FeatureOff;
         bool gpu_outer_armed = (gpu_outer_why == gpu::OuterSegmentRefusal::None);
         if (gpu_outer_enabled && !gpu_outer_armed)
@@ -2513,6 +2664,8 @@ private:
             bool outer_on_device = false;
             if (gpu_outer_armed) {
                 gpu::OuterSegmentScalars s{};
+                s.slot           = gpu_outer_claim.slot;
+                s.slot_admitted  = gpu_outer_claim.admitted ? 1 : 0;
                 s.eigv           = eigv;
                 s.residual       = residual;
                 s.prev_inner     = prev_inner;
@@ -2539,8 +2692,8 @@ private:
                 s.flux_stall      = static_cast<unsigned int>(flux_stall);
 
                 gpu::OuterSegmentResume seg{};
-                if (gpu::rasberyOuterSegment().runSegment(s, rasberyBatchWidth(),
-                                                          gpu_outer_rods, false, seg)) {
+                if (gpu::rasberyOuterSegment(gpu_outer_claim.query())
+                        .runSegment(s, rasberyBatchWidth(), gpu_outer_rods, false, seg)) {
                     eigv           = seg.eigv;
                     residual       = seg.residual;
                     prev_inner     = seg.prev_inner;

@@ -308,12 +308,32 @@ want(NODAL_H_CODE, "void setCanonicalNodalSegmentMode(bool in_segment, bool devi
 ARENA = between(NODAL_CU_CODE, "class NodalArena {", "std::mutex  g_nodal_arena_mutex;")
 if "setCanonicalNodalSegmentMode" in ARENA or "canonical_nodal" in ARENA:
     problems.append("CudaXsReconBackend.cu: the batch arena must not consult the segment "
-                    "mode -- the segment refuses batch mode outright and the rendezvous "
-                    "path has to stay byte-identical")
+                    "mode -- it takes an adopted set into its view table and then uploads "
+                    "and downloads around every drive regardless, so a mode it half-honoured "
+                    "would be worse than one it ignores")
 
-# And the segment itself must still refuse a batch.
+# ...AND THE SEGMENT MUST NOT ADOPT WHERE THAT IS TRUE.
+#
+# Rev.7.1 Task 18-lite retired `the segment refuses batch mode outright`, which
+# is what used to make the line above safe on its own.  The property that
+# replaced it is narrower and has to be checked where it now lives: the segment
+# only takes the canonical binding when the drive that consumes it HONOURS the
+# ownership, and the batched nodal arena does not.  Without this the segment
+# drops its jnet bridge and the arena uploads a one-outer-stale Geometry::Jnet
+# over the jnet updjnet just wrote -- kngr3 statepoint 1 at 800.33 ppm in 290
+# outers against the host's 770.15 in 263.
+want(DRIVER_CODE, "XsReconBackend::canonicalNodalIsHonoured()", "Driver.h",
+     "the arm must ask whether the nodal drive will honour an adopted set before it "
+     "adopts one; the batched nodal arena does not, and the segment drops its jnet bridge "
+     "on the strength of the binding")
+want(NODAL_CU_CODE, "bool XsReconBackend::canonicalNodalIsHonoured()",
+     "CudaXsReconBackend.cu",
+     "the honour question has to be answered by the file that knows which nodal path a run "
+     "takes, not guessed from the batch width at the call site")
+
+# The refusal still exists by name -- it means `wider than the arena` now.
 want(OUTER_H_CODE, "BatchMode", "CudaOuterGraph.h",
-     "the segment's refusal of batch width must still exist by name")
+     "the segment's batch refusal must still exist by name")
 
 
 def main() -> int:

@@ -117,7 +117,7 @@ std::string outerSegmentReceiptJson() {
     // saying so would be noise, while on an idle run it is the whole message.
     if (c.segment_launches == 0) {
         s += outerIdleReasonJson(
-            rasberyOuterSegment().refusal(rasberyBatchWidth(), false, false));
+            rasberyOuterSegment().refusal(rasberyBatchWidth(), false, false, true));
         s += ",";
     }
     s += outerHostBodyJson();
@@ -144,8 +144,9 @@ struct CudaOuterSegment::Impl {
 CudaOuterSegment::CudaOuterSegment() : _impl(new Impl) {}
 CudaOuterSegment::~CudaOuterSegment() { delete _impl; }
 
-bool CudaOuterSegment::initialize(const DeviceArenaView&, int) { return false; }
+bool CudaOuterSegment::initialize(const DeviceArenaView&, int, int) { return false; }
 void CudaOuterSegment::release() {}
+int  CudaOuterSegment::slot() const { return -1; }
 bool CudaOuterSegment::available() const { return false; }
 const std::string& CudaOuterSegment::status() const { return _impl->status; }
 void CudaOuterSegment::bind(const OuterSegmentBinding& binding) { _impl->binding = binding; }
@@ -174,16 +175,42 @@ bool CudaOuterSegment::republishAfterHostSweep(int, double, double, bool, bool) 
     return false;
 }
 
-OuterSegmentRefusal CudaOuterSegment::refusal(int, bool, bool) const {
+OuterSegmentRefusal CudaOuterSegment::refusal(int, bool, bool, bool) const {
     return outerGpuEnabled() ? OuterSegmentRefusal::NoRunner : OuterSegmentRefusal::FeatureOff;
 }
 
-bool CudaOuterSegment::runSegment(const OuterSegmentScalars&, int batch_width,
+bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_width,
                                   bool fractional_rods, bool critical_search,
                                   OuterSegmentResume&) {
-    ++stubRefusals(refusal(batch_width, fractional_rods, critical_search));
+    ++stubRefusals(
+        refusal(batch_width, fractional_rods, critical_search, scalars.slot_admitted != 0));
     return false;
 }
+
+// ---------------------------------------------------------------------------
+// Rev.7.1 Task 18-lite: the per-slot table, with no slots to serve
+// ---------------------------------------------------------------------------
+//
+// ONE OBJECT, NOT kMaxDeviceSlots OF THEM.  The CUDA arm needs a distinct runner
+// per slot because each holds a distinct residency; this arm holds none, refuses
+// every call, and would be paying for 64 identical refusals.  The index is
+// accepted and discarded, which is the same shape every other function here has.
+
+CudaOuterSegment& rasberyOuterSegment(int) {
+    static CudaOuterSegment segment;
+    return segment;
+}
+
+/// No arena was stood up, so it has no width.  The ladder never reaches the
+/// batch test in this build -- `no_runner` is ranked above it -- so this is
+/// reported for the receipt's sake and nothing branches on it.
+int rasberyOuterArenaSlots() { return 0; }
+
+bool rasberyOuterSlotAdmitted(int, const OuterSegmentDeckShape&) { return false; }
+
+/// The counters are process-wide here (stubRefusals), so there is no per-slot
+/// set to aim a thread at.
+void outerSetThreadSlot(int) {}
 
 
 // ---------------------------------------------------------------------------
