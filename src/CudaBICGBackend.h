@@ -421,27 +421,34 @@ void rasberySetBatchWidth(int slots);
 [[nodiscard]] int rasberyBatchWidth();
 
 // ---------------------------------------------------------------------------
-// LOCAL-TESTING CAVEAT: the resident sweep tests need sm_120.
+// RESOLVED (was: "LOCAL-TESTING CAVEAT: the resident sweep tests need sm_120")
 // ---------------------------------------------------------------------------
 //
-// On the sm_61 development card (GTX 1080 Ti, WSL2) the device-resident CMFD
-// sweep path is NOT run-to-run deterministic: repeated identical invocations of
-// the same deck drifted by up to 90 pcm, while `RASBERY_GPU=1` alone and
-// `--batch-mode 1` without RASBERY_GPU_CMFD_SWEEP were both exactly 0.000 pcm.
-// It survived RASBERY_GPU_CMFD_ASSEMBLY=0, RASBERY_GPU_GRAPH=0 and
-// OMP_NUM_THREADS=1, so it is not the device assembly, graph capture or host
-// threading.
+// This block used to say the device-resident CMFD sweep path is not run-to-run
+// deterministic on the sm_61 development card (GTX 1080 Ti, WSL2) -- up to
+// 90 pcm of drift -- while RASBERY_GPU=1 alone and --batch-mode 1 without
+// RASBERY_GPU_CMFD_SWEEP were exactly 0.000 pcm, and concluded that the drift
+// was a property of that card rather than of this code, so the sweep path could
+// only be judged on sm_120.
 //
-// It is ARCHITECTURE-SPECIFIC.  On the campaign target (sm_120, 238) the W2
-// gate measured 10/10 runs bit-identical, and S2 vs S0 came out at 1.13x
-// (48.72s vs 55.21s) at zero numerical cost.  So the sm_61 behaviour is a
-// property of that card or its driver, not of this code.
+// THAT CONCLUSION WAS WRONG, and believing it cost a campaign week.  The drift
+// was ours: issueSweepUploads built the participation mask in the page-locked
+// `host_active`, uploaded it with cudaMemcpyAsync, and then INVERTED THAT SAME
+// BUFFER IN PLACE to make the sweep_halt mask -- a host write to the source of
+// an unsynchronised DMA.  Whether the copy engine had already read the bytes
+// decided whether `device_active` arrived correct or all-zero, so one binary
+// gave different answers on different runs; a zeroed `active` masks that
+// sweep's whole BiCGSTAB inner loop while the Wielandt tail still advances psi
+// and the eigenvalue, and the drive converges to a neighbouring iterate.  The
+// symptom was architecture-CORRELATED only because the driver's decision to
+// stage a small pinned copy inline or defer it depends on the queue state.
 //
-// WHAT THAT MEANS FOR ANYONE TESTING LOCALLY: an A/B on a pre-Volta card cannot
-// distinguish a real regression in the sweep path from that card's own noise.
-// Feature-off comparisons are still meaningful there (they were exactly 0.000
-// pcm across the Task 6 and Task 7 commits); anything that engages
-// RASBERY_GPU_CMFD_SWEEP has to be judged on sm_120.
+// It reproduces on sm_61 in four seconds (i-SMR CY01, resident-single arm: the
+// non-finite abort, 3/3), and with the fix that arm is 5/5 bit-identical AND
+// bit-identical to the RASBERY_GPU_CMFD_SWEEP=0 reference.  So: the sweep path
+// IS testable locally, and an sm_61 A/B on it is meaningful again.  See
+// tools/test_cmfd_async_h2d_snapshot_contract.py for the invariant that keeps
+// it that way.
 
 /// Rev.7.1 Task 6: RASBERY_GPU_CMFD_RESIDENT_SINGLE, default OFF.
 ///
