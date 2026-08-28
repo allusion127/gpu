@@ -53,6 +53,35 @@
 // queued_epoch re-validates the queue entry it is being run from.
 //
 // ---------------------------------------------------------------------------
+// THE HALT GATE  (Rev.7.1 Task 9)
+// ---------------------------------------------------------------------------
+//
+// Every kernel here takes an optional `const std::uint32_t* halt` indexed by
+// SLOT and returns immediately when it is set.  It exists because a device outer
+// SEGMENT (CudaOuterGraph.h) enqueues its whole budget of outers up front and
+// never observes between them: without a gate, a segment that converged at outer
+// 3 of 8 would still run outers 4..8 and move the trajectory, which is the one
+// thing Sec 9.1 Class B0 on trajectory forbids.  This is the same shape
+// CudaBICGBackend.cu's resident sweep already uses (`sweep_halt[m]`), and it is
+// what Task 10's conditional WHILE predicate replaces.
+//
+// nullptr IS THE UNGATED PATH AND IT IS THE DEFAULT.  Every pre-Task-9 call site
+// passes nothing, gets nullptr, and compiles to the branch it had before -- so
+// the feature-off arm is byte-identical by construction rather than by
+// comparison.
+//
+// THE CHECK GOES AFTER THE SLOT IS RESOLVED, never before.  `halt` is indexed by
+// physical slot, and the slot only exists once gpuDispatchIsPadding has cleared
+// the lane and queue.slots[logical] has been read.  A halt test on `logical`
+// would index the wrong tenant at any width below the bucket.
+//
+// IT IS UNIFORM OVER A BLOCK, which k_cmfd_upd_dhat depends on: that kernel's
+// counter reduction contains a __syncthreads(), so a non-uniform early return
+// would leave part of the block waiting on a barrier nobody reaches.  `logical`
+// is blockIdx.y there, so every thread of a block reads the same halt word and
+// the whole block returns together.
+//
+// ---------------------------------------------------------------------------
 // This header is includable WITHOUT nvcc: everything above the
 // `#if defined(__CUDACC__)` line is CUDA-free, so test/cmfd_outer_replay.cpp
 // can drive the same bodies and the same decision encoding on the host.
@@ -260,10 +289,11 @@ __device__ inline void cmfdReduceCounters(unsigned int total, unsigned int fsum_
 /// because the accumulation order is part of the contract.
 __global__ __launch_bounds__(kCmfdOuterBlock) void k_cmfd_upd_psi(
     DeviceArenaView arena, DevicePhaseQueue queue, cmfd::CmfdGeometryView geom,
-    CmfdOuterSlotTable table, unsigned long long forms) {
+    CmfdOuterSlotTable table, unsigned long long forms, const std::uint32_t* halt) {
     const int logical = static_cast<int>(blockIdx.y);
     if (gpuDispatchIsPadding(logical, queue.count)) return;
     const int                slot = queue.slots[logical];
+    if (halt != nullptr && halt[slot] != 0u) return;
     const cmfd::CmfdOuterView& v  = table.views[slot];
     (void)arena;
 
@@ -275,10 +305,11 @@ __global__ __launch_bounds__(kCmfdOuterBlock) void k_cmfd_upd_psi(
 /// Sec 6.2.  One thread per (surface, group).
 __global__ __launch_bounds__(kCmfdOuterBlock) void k_cmfd_upd_dtil(
     DeviceArenaView arena, DevicePhaseQueue queue, cmfd::CmfdGeometryView geom,
-    CmfdOuterSlotTable table) {
+    CmfdOuterSlotTable table, const std::uint32_t* halt) {
     const int logical = static_cast<int>(blockIdx.y);
     if (gpuDispatchIsPadding(logical, queue.count)) return;
     const int                  slot = queue.slots[logical];
+    if (halt != nullptr && halt[slot] != 0u) return;
     const cmfd::CmfdOuterView& v    = table.views[slot];
     (void)arena;
 
@@ -292,10 +323,11 @@ __global__ __launch_bounds__(kCmfdOuterBlock) void k_cmfd_upd_dtil(
 /// Sec 6.6.  One thread per (surface, group).
 __global__ __launch_bounds__(kCmfdOuterBlock) void k_cmfd_upd_jnet(
     DeviceArenaView arena, DevicePhaseQueue queue, cmfd::CmfdGeometryView geom,
-    CmfdOuterSlotTable table, unsigned long long forms) {
+    CmfdOuterSlotTable table, unsigned long long forms, const std::uint32_t* halt) {
     const int logical = static_cast<int>(blockIdx.y);
     if (gpuDispatchIsPadding(logical, queue.count)) return;
     const int                  slot = queue.slots[logical];
+    if (halt != nullptr && halt[slot] != 0u) return;
     const cmfd::CmfdOuterView& v    = table.views[slot];
     (void)arena;
 
@@ -312,13 +344,16 @@ __global__ __launch_bounds__(kCmfdOuterBlock) void k_cmfd_upd_jnet(
 /// the end of the surface list: the reduction contains a __syncthreads(), and a
 /// thread that returned early would leave the rest of the block waiting on a
 /// barrier it can never reach.  Out-of-range threads simply contribute zeros.
+/// The two returns above it are UNIFORM over the block -- both test only
+/// blockIdx.y -- so they take the whole block out together or not at all.
 __global__ __launch_bounds__(kCmfdOuterBlock) void k_cmfd_upd_dhat(
     DeviceArenaView arena, DevicePhaseQueue queue, cmfd::CmfdGeometryView geom,
     CmfdOuterSlotTable table, bool clamp_enabled, CmfdOuterCounters* counters,
-    unsigned long long forms) {
+    unsigned long long forms, const std::uint32_t* halt) {
     const int logical = static_cast<int>(blockIdx.y);
     if (gpuDispatchIsPadding(logical, queue.count)) return;
     const int                  slot = queue.slots[logical];
+    if (halt != nullptr && halt[slot] != 0u) return;
     const cmfd::CmfdOuterView& v    = table.views[slot];
     (void)arena;
 
@@ -351,10 +386,12 @@ __global__ __launch_bounds__(kCmfdOuterBlock) void k_cmfd_upd_dhat(
 /// is a scalar state machine over ~10 words.
 __global__ void k_cmfd_outer_convergence(DeviceArenaView arena, DevicePhaseQueue queue,
                                          const cmfd::CmfdOuterInputs* inputs,
-                                         CmfdOuterDecision* decisions) {
+                                         CmfdOuterDecision* decisions,
+                                         const std::uint32_t* halt) {
     const int logical = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (gpuDispatchIsPadding(logical, queue.count)) return;
     const int        slot = queue.slots[logical];
+    if (halt != nullptr && halt[slot] != 0u) return;
     DeviceSlotState& s    = arena.states[slot];
 
     cmfd::CmfdOuterState       st = cmfdLoadOuterState(s);
@@ -379,31 +416,31 @@ inline dim3 cmfdOuterGrid(int elements, int bucket) {
 inline cudaError_t enqueueUpdPsi(const DeviceArenaView& arena, const DevicePhaseQueue& queue,
                                  const cmfd::CmfdGeometryView& geom,
                                  const CmfdOuterSlotTable& table, unsigned long long forms,
-                                 cudaStream_t stream) {
+                                 cudaStream_t stream, const std::uint32_t* halt = nullptr) {
     if (queue.count <= 0) return cudaSuccess;
     k_cmfd_upd_psi<<<cmfdOuterGrid(geom.nxyz, queue.bucket), kCmfdOuterBlock, 0, stream>>>(
-        arena, queue, geom, table, forms);
+        arena, queue, geom, table, forms, halt);
     return cudaGetLastError();
 }
 
 inline cudaError_t enqueueUpdDtil(const DeviceArenaView& arena, const DevicePhaseQueue& queue,
                                   const cmfd::CmfdGeometryView& geom,
                                   const CmfdOuterSlotTable& table, unsigned long long forms,
-                                  cudaStream_t stream) {
+                                  cudaStream_t stream, const std::uint32_t* halt = nullptr) {
     (void)forms; // upddtil has no contraction site; see CmfdOuterKernel.h
     if (queue.count <= 0) return cudaSuccess;
     k_cmfd_upd_dtil<<<cmfdOuterGrid(geom.nsurf * geom.ng, queue.bucket), kCmfdOuterBlock, 0,
-                      stream>>>(arena, queue, geom, table);
+                      stream>>>(arena, queue, geom, table, halt);
     return cudaGetLastError();
 }
 
 inline cudaError_t enqueueUpdJnet(const DeviceArenaView& arena, const DevicePhaseQueue& queue,
                                   const cmfd::CmfdGeometryView& geom,
                                   const CmfdOuterSlotTable& table, unsigned long long forms,
-                                  cudaStream_t stream) {
+                                  cudaStream_t stream, const std::uint32_t* halt = nullptr) {
     if (queue.count <= 0) return cudaSuccess;
     k_cmfd_upd_jnet<<<cmfdOuterGrid(geom.nsurf * geom.ng, queue.bucket), kCmfdOuterBlock, 0,
-                      stream>>>(arena, queue, geom, table, forms);
+                      stream>>>(arena, queue, geom, table, forms, halt);
     return cudaGetLastError();
 }
 
@@ -411,21 +448,23 @@ inline cudaError_t enqueueUpdDhat(const DeviceArenaView& arena, const DevicePhas
                                   const cmfd::CmfdGeometryView& geom,
                                   const CmfdOuterSlotTable& table, unsigned long long forms,
                                   bool clamp_enabled, CmfdOuterCounters* counters,
-                                  cudaStream_t stream) {
+                                  cudaStream_t stream, const std::uint32_t* halt = nullptr) {
     if (queue.count <= 0) return cudaSuccess;
     k_cmfd_upd_dhat<<<cmfdOuterGrid(geom.nsurf * geom.ng, queue.bucket), kCmfdOuterBlock, 0,
-                      stream>>>(arena, queue, geom, table, clamp_enabled, counters, forms);
+                      stream>>>(arena, queue, geom, table, clamp_enabled, counters, forms,
+                                halt);
     return cudaGetLastError();
 }
 
 inline cudaError_t enqueueOuterConvergence(const DeviceArenaView& arena,
                                            const DevicePhaseQueue& queue,
                                            const cmfd::CmfdOuterInputs* inputs,
-                                           CmfdOuterDecision* decisions, cudaStream_t stream) {
+                                           CmfdOuterDecision* decisions, cudaStream_t stream,
+                                           const std::uint32_t* halt = nullptr) {
     if (queue.count <= 0) return cudaSuccess;
     const int grid = (queue.bucket + kCmfdOuterBlock - 1) / kCmfdOuterBlock;
     k_cmfd_outer_convergence<<<grid, kCmfdOuterBlock, 0, stream>>>(arena, queue, inputs,
-                                                                   decisions);
+                                                                   decisions, halt);
     return cudaGetLastError();
 }
 

@@ -87,6 +87,12 @@ int g_batch_width = 0;
 void rasberySetBatchWidth(int slots) { g_batch_width = slots > 0 ? slots : 0; }
 int  rasberyBatchWidth() { return g_batch_width; }
 
+/// Rev.7.1 Task 6 declared this in CudaBICGBackend.h and defined it only in the
+/// CUDA arm, so BICGSolver's constructor -- which calls it unconditionally --
+/// left the CPU-only link with an undefined reference.  There is no resident
+/// single-instance CMFD without a device, so the answer here is false.
+bool rasberyResidentSingleCmfd() { return false; }
+
 CudaBatchArena* rasberyBatchArena(Geometry&) {
     throw std::runtime_error(
         "RASBERY batch mode requires a CUDA build (-DRASBERY_ENABLE_CUDA=ON)");

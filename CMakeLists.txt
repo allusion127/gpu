@@ -39,15 +39,23 @@ if (RASBERY_ENABLE_CUDA)
     list(REMOVE_ITEM RASBERY_SOURCES
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaBICGBackendStub.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaXsReconBackendStub.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaOuterGraphStub.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/GpuPhysicsBackendStub.cpp"
     )
     list(APPEND RASBERY_SOURCES
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaBICGBackend.cu"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaXsReconBackend.cu"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaOuterGraph.cu"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/GpuPhysicsArenaCuda.cu"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/GpuPhaseScheduler.cu"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/GpuPhysicsBackendCuda.cu"
     )
+    # Task 9 composes the Task 4/5 phase kernels, whose contract is bit-identical
+    # reproduction of the host loops: nvcc must not contract a*b+c into an fma
+    # where the host compiler did not.  Same reason, same flag, same scope as
+    # CudaXsReconBackend.cu above.
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/CudaOuterGraph.cu"
+            PROPERTIES COMPILE_OPTIONS "--fmad=false")
     # The xsrecon kernel's contract is bit-identical reproduction of the host
     # loop; nvcc must not contract a*b+c into fma where the host compiler did
     # not.  Scoped to this one file so the CMFD backend keeps its flags.
@@ -263,6 +271,22 @@ if (RASBERY_ENABLE_TESTS)
             "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
     add_test(NAME canonical_state COMMAND rasbery_canonical_state)
+
+    # Device outer segment state machine (Rev.7.1 Task 9).  The escape ranking,
+    # the budget-vs-convergence precedence and the kPhaseTransitions consistency
+    # are properties of a SEQUENCE of outers, which no single-outer replay and no
+    # converged answer can show -- and the machine is pure by construction, so
+    # this is checked with no device at all.  It drives the SHIPPED
+    # deviceOuterTransition against a verbatim quotation of Driver.h's segment
+    # rule; a test that drove the shipped body against itself would pass on any
+    # body there is.
+    add_executable(rasbery_outer_state_replay
+            "${CMAKE_CURRENT_SOURCE_DIR}/test/outer_state_replay.cpp")
+    target_compile_features(rasbery_outer_state_replay PRIVATE cxx_std_20)
+    target_include_directories(rasbery_outer_state_replay PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+    add_test(NAME outer_state_replay COMMAND rasbery_outer_state_replay)
 
     # Device arm of the same gate: the CUDA build of the shared body against
     # the same capture, elementwise.  Compiled with --fmad=false exactly like

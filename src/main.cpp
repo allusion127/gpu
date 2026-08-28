@@ -600,6 +600,10 @@ int main(int argc, char* argv[]) {
         if (rasbery::rasberyGpuNodalEnabled())
             std::cout << "[RASBERY][NODAL][GPU] {\"drives_solved\":"
                       << rasbery::rasberyGpuNodalDrives() << "}" << std::endl;
+        // Rev.7.1 Task 9.  Printed whenever RASBERY_GPU_OUTER was set, even when
+        // every segment was refused: "on and never engaged" must not look like
+        // "off" (the same G0 rule the three receipts above exist for).
+        rasbery::gpu::reportOuterSegment(std::cout);
         rasbery::xsphase::report(std::cout);
         rasbery::outer_timing::report(std::cout);
         const auto hdf5_stats = Chiffon::GetHdf5LockStats();
@@ -680,6 +684,7 @@ int main(int argc, char* argv[]) {
     if (rasbery::rasberyGpuNodalEnabled())
         std::cout << "[RASBERY][NODAL][GPU] {\"drives_solved\":"
                   << rasbery::rasberyGpuNodalDrives() << "}" << std::endl;
+    rasbery::gpu::reportOuterSegment(std::cout);
     rasbery::xsphase::report(std::cout);
     rasbery::outer_timing::report(std::cout);
     const auto hdf5_stats = Chiffon::GetHdf5LockStats();

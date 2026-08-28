@@ -1,6 +1,7 @@
 #pragma once
 #include "BICGCMFD.h"
 #include "BatchLightResult.h"
+#include "CudaOuterGraph.h"
 #include "IO.h"
 #include "Nodal.h"
 #include "PPR.h"
@@ -834,7 +835,137 @@ private:
         double residual   = 1.0;
         double prev_inner = eigv + 1.0;
         ctx.cmfd_solver.upddtil();
+
+        // ===================================================================
+        // Rev.7.1 Task 9: DEVICE OUTER SEGMENT  (RASBERY_GPU_OUTER, default OFF)
+        // ===================================================================
+        //
+        // THIS LOOP IS THE ELIGIBLE FLUX-RECONVERGENCE SEGMENT, and it is the
+        // only one in Driver.h that is.  Every feedback is held fixed here --
+        // no Xe, no T/H, no search -- so the escape set is closed and every
+        // member of it has an exact host resume:
+        //
+        //     FluxConverged     -> return, which is `if (converged) return;`
+        //     SegmentBudget     -> continue, which is the loop's own next pass
+        //     RayleighFallback  -> continue; the host finishes that sweep
+        //     MaterialChanged   -> unreachable (fractional rods are refused)
+        //     NonFinite /
+        //     NegativeFlux      -> stop delegating; the host loop is the
+        //                          reference and it decides what happens next
+        //
+        // ------------------------------------------------------------------
+        // WHY THE CALL SITE IS HERE AND NOT IN SolveLoop -- A NAMED DEVIATION
+        // ------------------------------------------------------------------
+        //
+        // The plan's Task 9 Step 5b asks for `host_numeric_calls == 0` across
+        // SolveLoop's entry/exit (the M1 half of the W3 gate), and the segment
+        // BODY below is modelled on SolveLoop's outer, step for step.  The
+        // delegating CALL is nevertheless in ReconvergeFlux, and the reason is
+        // structural rather than an oversight.
+        //
+        // A SolveLoop segment exits on the outer whose decision was not a
+        // requeue -- and that outer's BODY has already advanced flux, jnet and
+        // d-hat, because the host's own loop also runs the body before it
+        // decides.  Resuming therefore means re-entering SolveLoop's loop body
+        // PAST the control ladder, at the starvation probe.  There is no
+        // formulation that avoids this: the device cannot know an outer's
+        // decision without running its body, and it cannot un-run one.
+        // Manufacturing the entry point means hoisting flux_converged,
+        // xe_interim, stall_sample, xe_starved and xe_pending out of the body
+        // and guarding 120 lines of the most B0-sensitive loop in the tree.
+        //
+        // That restructure is exactly what Task 10's conditional WHILE removes
+        // the need for: the predicate is evaluated on the device BEFORE the next
+        // body runs, so the graph's exit lands where the host already is and the
+        // resume is a no-op.  Step 5b is therefore a Task 10 gate in practice,
+        // and doing the restructure here -- for a path that cannot execute at
+        // all until the arena is reserved and both hooks exist -- would be
+        // paying the risk before any of the benefit.
+        //
+        // WITH THE FEATURE OFF `gpu_outer_armed` is a false const and every
+        // statement below folds away, so the loop is byte-for-byte the code it
+        // was.  With it ON and no arena bound, the runner refuses and the
+        // [RASBERY][OUTER_GPU] receipt names why.
+        const bool gpu_outer_enabled = gpu::outerGpuEnabled();
+        // Stage A eligibility: a deck that can cusp would have to escape with
+        // MaterialChanged on outer 1, which is a segment of length one.  The
+        // predicate is XSSet::ApplyRodCusping's own (XSSet.cpp:3243, 3266).
+        const bool gpu_outer_rods =
+            gpu_outer_enabled &&
+            gpu::outerDeckHasFractionalRods(ctx.cross_sections.axial_rod_division(),
+                                            ctx.geometry.nxyz() > 0
+                                                ? &ctx.geometry.rod_fraction(0)
+                                                : nullptr,
+                                            ctx.geometry.nxyz(), EPS);
+        // ReconvergeFlux runs no critical search by construction, so the
+        // search refusal cannot apply here.
+        const gpu::OuterSegmentRefusal gpu_outer_why =
+            gpu_outer_enabled ? gpu::rasberyOuterSegment().refusal(rasberyBatchWidth(),
+                                                                   gpu_outer_rods, false)
+                              : gpu::OuterSegmentRefusal::FeatureOff;
+        bool gpu_outer_armed = (gpu_outer_why == gpu::OuterSegmentRefusal::None);
+        // The decision is hoisted out of the loop, so nothing below would ever
+        // record it; say it once here or the receipt cannot tell "off" from "on
+        // and refused every time".
+        if (gpu_outer_enabled && !gpu_outer_armed)
+            gpu::noteOuterSegmentRefusal(gpu_outer_why);
+
         for (int i = 0; i < max_iter; ++i) {
+            if (gpu_outer_armed) {
+                gpu::OuterSegmentScalars s{};
+                s.eigv       = eigv;
+                s.residual   = residual;
+                s.prev_inner = prev_inner;
+                s.keff_tol   = keff_tol;
+                s.flux_tol   = flux_tol;
+                // The stall ladder must not fire inside this loop: ReconvergeFlux
+                // has no limit-cycle handling of its own, it simply runs out of
+                // iterations.  Handing the device the SAME bound makes the two
+                // agree -- the ladder would trip one outer past the last one this
+                // loop can take.
+                s.max_outer_iter = static_cast<unsigned int>(max_iter);
+                // Every feedback is held fixed here; that is what this function is.
+                s.xe_pending = 0;
+                s.th_pending = 0;
+
+                gpu::OuterSegmentResume seg{};
+                if (gpu::rasberyOuterSegment().runSegment(s, rasberyBatchWidth(),
+                                                          gpu_outer_rods, false, seg)) {
+                    eigv        = seg.eigv;
+                    residual    = seg.residual;
+                    prev_inner  = seg.prev_inner;
+                    total_outer += static_cast<int>(seg.device_outers);
+                    // CHARGE THE LOOP BOUND BEFORE ANY EXIT IS TAKEN.  `max_iter`
+                    // is a hard safety bound on OUTERS, and the device just took
+                    // `device_outers` of them; a path that skipped this would
+                    // leave the ON arm with a larger remaining budget than the
+                    // OFF arm at the same point in the solve, which is a
+                    // trajectory difference even when no iterate moved.  The
+                    // loop's own ++ supplies the last one.
+                    i += static_cast<int>(seg.device_outers) - 1;
+                    if (seg.escape ==
+                        static_cast<unsigned int>(gpu::DeviceEscape::FluxConverged))
+                        return;
+                    if (seg.next_phase ==
+                        static_cast<unsigned int>(gpu::DevicePhase::Failed)) {
+                        // A non-finite or negative-flux iterate.  Hand the rest of
+                        // this re-convergence back to the host path rather than
+                        // inventing an exit ReconvergeFlux never had.
+                        gpu_outer_armed = false;
+                    }
+                    continue;
+                }
+                // Refused or failed to launch: fall through to the host outer,
+                // which is the reference path and always correct.
+                //
+                // AND STOP DELEGATING.  Every ELIGIBILITY refusal was decided
+                // once, above the loop, so a false here can only be a launch or
+                // hook failure -- and one that will recur identically on the next
+                // outer.  Re-arming would pay a failed launch, a warning line and
+                // a refusal count per outer for the rest of the re-convergence
+                // and still run the host body every time.
+                gpu_outer_armed = false;
+            }
             ctx.cmfd_solver.updpsi(ctx.geometry.Phif());
             ctx.cmfd_solver.setls(eigv);
             ctx.cmfd_solver.drive(eigv, ctx.geometry.Phif(), residual);
