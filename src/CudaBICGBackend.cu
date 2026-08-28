@@ -2339,6 +2339,17 @@ public:
             CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&host_active),
                                       S * sizeof(std::uint32_t)));
             std::memset(host_active, 0, S * sizeof(std::uint32_t));
+            // SNAPSHOT BUFFER for the sweep mask.  issueSweepUploads used to
+            // build the participation mask in host_active, upload it, and then
+            // INVERT THAT SAME BUFFER IN PLACE for the sweep_halt upload -- a
+            // host write to the source of a cudaMemcpyAsync that had not been
+            // synchronised.  host_active is cudaMallocHost'd, so that copy is a
+            // real asynchronous DMA and the driver is entitled to read the
+            // bytes after the inversion has already landed.  One buffer per
+            // upload is the fix; see issueSweepUploads.
+            CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&host_sweep_halt),
+                                      S * sizeof(std::uint32_t)));
+            std::memset(host_sweep_halt, 0, S * sizeof(std::uint32_t));
 
             // The lane -> slot map.  Allocated once at the FULL fleet width
             // whatever a launch's bucket turns out to be, so d_slot_map is a
@@ -2443,6 +2454,8 @@ public:
         host_status = nullptr;
         if (host_active != nullptr) cudaFreeHost(host_active);
         host_active = nullptr;
+        if (host_sweep_halt != nullptr) cudaFreeHost(host_sweep_halt);
+        host_sweep_halt = nullptr;
         neighbors = nullptr;
         colors = nullptr;
         assembly_node_surface = nullptr;
@@ -3228,17 +3241,42 @@ public:
             host_assembly_active[static_cast<size_t>(m)] =
                 slot[static_cast<size_t>(m)].device_assembly ? 1u : 0u;
         }
+        // participants: sweep_halt = 0; everyone else: 1 (masks their slots
+        // inside every sweep kernel AND the inner reset).
+        //
+        // BUILT BEFORE EITHER UPLOAD, AND IN ITS OWN BUFFER.  This used to be
+        // `for (m) host_active[m] = host_active[m] ? 0 : 1;` placed BETWEEN the
+        // device_active copy and the sweep_halt copy, i.e. a host write to the
+        // source range of a cudaMemcpyAsync that nothing had synchronised.
+        // host_active is cudaMallocHost'd, so that copy is a real DMA with no
+        // guarantee about WHEN it reads: the driver may stage it inline at
+        // call time (in which case the inversion is invisible and the run is
+        // correct) or defer it (in which case device_active receives the
+        // INVERTED mask -- every participant reads active == 0).  Which one it
+        // does depends on the copy engine's queue state, so the same binary
+        // flips between the two: initialize_solver_state then computes
+        // halt[m] = 1 for the participant, the whole BiCGSTAB inner loop of
+        // that sweep is masked off while the Wielandt tail still advances psi
+        // and the eigenvalue from the un-updated flux, and the drive converges
+        // to a neighbouring iterate.  That is the 1e-14..1e-13 run-to-run
+        // drift, and the retry/negative-flux path it occasionally steers into
+        // is the non-finite abort.
+        //
+        // The rule this restores: NO HOST BUFFER THAT IS THE SOURCE OF AN
+        // IN-FLIGHT cudaMemcpyAsync MAY BE WRITTEN BEFORE THAT COPY IS KNOWN
+        // TO HAVE COMPLETED.  One buffer per upload is the cheap way to obey
+        // it (slots uint32s, once per launch); an event or a sync here would
+        // cost the pipeline this path exists to keep full.
+        // tools/test_cmfd_async_h2d_snapshot_contract.py pins it.
+        for (int m = 0; m < slots; ++m) host_sweep_halt[m] = host_active[m] ? 0u : 1u;
+
         CUDA_CHECK(cudaMemcpyAsync(device_active, host_active,
                                    static_cast<size_t>(slots) * sizeof(std::uint32_t),
                                    cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(device_assembly_active, host_assembly_active.data(),
                                    static_cast<size_t>(slots) * sizeof(std::uint32_t),
                                    cudaMemcpyHostToDevice, stream));
-
-        // participants: sweep_halt = 0; everyone else: 1 (masks their slots
-        // inside every sweep kernel AND the inner reset).
-        for (int m = 0; m < slots; ++m) host_active[m] = host_active[m] ? 0u : 1u;
-        CUDA_CHECK(cudaMemcpyAsync(sweep_halt, host_active,
+        CUDA_CHECK(cudaMemcpyAsync(sweep_halt, host_sweep_halt,
                                    static_cast<size_t>(slots) * sizeof(std::uint32_t),
                                    cudaMemcpyHostToDevice, stream));
 
@@ -3591,6 +3629,10 @@ public:
     DeviceSolveStatus* device_status = nullptr;
     DeviceSolveStatus* host_status = nullptr;
     std::uint32_t*     host_active = nullptr;
+    /// Staging for the sweep_halt H2D.  Separate from host_active on purpose:
+    /// both are page-locked and both are memcpyAsync SOURCES in the same
+    /// launcher window, so neither may be rewritten to serve the other.
+    std::uint32_t*     host_sweep_halt = nullptr;
     BackendCounters telemetry{};
     std::vector<Slot> slot;
     std::vector<std::uint32_t> host_assembly_active;
