@@ -102,6 +102,7 @@
 #include "CudaOuterGraph.h"
 
 #include "GpuPhysicsArena.h"
+#include "OuterTrace.h"
 
 #include <cuda_runtime.h>
 
@@ -369,6 +370,11 @@ struct CudaOuterSegment::Impl {
     unsigned long long resident_xs_generation   = 0;
     unsigned long long resident_dtil_generation = 0;
     bool                  residency_bound = false;
+    /// RASBERY_OUTER_TRACE scratch.  The per-step tracer has to hash DEVICE
+    /// memory on this arm -- the host mirrors are elided inside a segment -- so
+    /// it needs somewhere to land the copies.  Grown on first use and only when
+    /// the tracer is on; an untraced run never allocates it.
+    std::vector<double>   trace_scratch;
     /// The segment exit word, read once per outer with no extra synchronise.
     ///
     /// A D2H of it rides the stream right behind the transition, so at the
@@ -874,6 +880,50 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
             return launchFailed("enqueue nodal constants", rc);
     }
 
+    // --- the per-step tracer (RASBERY_OUTER_TRACE) ---------------------------
+    //
+    // IT HASHES DEVICE MEMORY, and that is the whole reason it exists here
+    // rather than at the Driver.h call site.  The per-outer tracer hashes the
+    // HOST arrays on the argument that this arm mirrors psi and dhat back and
+    // bridges jnet every outer -- which stopped being true when the mirrors
+    // moved to the segment exit (01b599b) and the bridge was dropped for the
+    // canonical nodal binding (e5f53bc).  A host hash of this arm is now a hash
+    // of whatever the last mirror left behind, which reads as a difference at
+    // every step and localises nothing.
+    //
+    // IT SYNCHRONISES AND COPIES, PER STEP.  That is a real cost and it is paid
+    // only under the environment gate: `trace_steps` is a cached bool, so an
+    // untraced run pays one predictable branch per step and no allocation.
+    const bool trace_steps = outertrace::enabled();
+    auto traceHash = [&](const double* dev, std::size_t n) -> std::uint64_t {
+        if (dev == nullptr || n == 0) return 0ull;
+        if (cudaStreamSynchronize(m.stream) != cudaSuccess) { cudaGetLastError(); return 0ull; }
+        if (m.trace_scratch.size() < n) m.trace_scratch.resize(n);
+        if (cudaMemcpy(m.trace_scratch.data(), dev, n * sizeof(double),
+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+            cudaGetLastError();
+            return 0ull;
+        }
+        return outertrace::hashDoubles(m.trace_scratch.data(), n);
+    };
+    const std::size_t trace_nn  = static_cast<std::size_t>(bound_.nxyz) *
+                                  static_cast<std::size_t>(bound_.ng);
+    const std::size_t trace_nsg = static_cast<std::size_t>(bound_.geom.nsurf) *
+                                  static_cast<std::size_t>(bound_.ng);
+    /// The eigenvalue this outer's sweep published, read from the device probe
+    /// rather than from the hook context: the runner does not hold Driver.h's
+    /// `eigv` local, and the probe is where the sweep's verdict kernel wrote it.
+    auto traceProbeEigv = [&]() -> double {
+        DeviceOuterProbe p{};
+        if (cudaStreamSynchronize(m.stream) != cudaSuccess) { cudaGetLastError(); return 0.0; }
+        if (cudaMemcpy(&p, m.d_probes + slot, sizeof(p), cudaMemcpyDeviceToHost) !=
+            cudaSuccess) {
+            cudaGetLastError();
+            return 0.0;
+        }
+        return p.eigv;
+    };
+
     // --- the body, budget times, on ONE stream -------------------------------
     //
     // Rev.7.1 Task 10 part 2 CHANGED WHERE THE SYNCHRONISE IS, NOT HOW MANY.
@@ -925,6 +975,16 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         // calls -- and each of them can move a generation.  Deciding an
         // elision from a segment-entry value is what made i-SMR CY02 fail at
         // b8 and b16 while passing at b1.
+        // The tracer's outer index inside the segment.  Driver.h set the context
+        // to the host loop counter before delegating; `base + i` is then the
+        // outer ordinal the OFF arm prints for the same outer, so the two logs
+        // align line for line and a diff names the step.
+        if (trace_steps) {
+            static thread_local int trace_base = 0;
+            if (i == 0) trace_base = outertrace::context().outer;
+            outertrace::context().outer = trace_base + static_cast<int>(i);
+        }
+
         OuterSegmentLiveState live;
         if (m.hooks.read_live_state != nullptr) m.hooks.read_live_state(m.hooks.ctx, live);
 
@@ -991,6 +1051,11 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         if ((rc = enqueueUpdPsi(m.arena, queue, bound_.geom, bound_.table, bound_.forms,
                                 m.stream, m.d_halt)) != cudaSuccess)
             return launchFailed("enqueue updpsi", rc);
+        if (trace_steps)
+            outertrace::emitStep("dev", "updpsi", "psi",
+                                 traceHash(bound_.device_psi,
+                                           static_cast<std::size_t>(bound_.nxyz)),
+                                 nullptr, 0);
 
         // psi AND dhat back to the host -- ONLY when a host reader is about to
         // run, which here means only when this outer's drive will take the HOST
@@ -1103,6 +1168,18 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         // kernel had to guess at.
         if (stream_sweep && !m.hooks.finish_cmfd_sweep(m.hooks.ctx, m.stream, slot, i))
             return hookFailed("the CMFD sweep observation hook");
+        // The sweep and updjnet step lines are emitted HERE, after the
+        // observation, because that is the first point at which the sweep's
+        // output has actually landed -- before it, the enqueue has only been
+        // issued.  updjnet was enqueued behind the sweep on the same stream, so
+        // one synchronise serves both.
+        if (trace_steps) {
+            outertrace::emitStepEigv("dev", "sweep",
+                                     traceHash(bound_.device_flux, trace_nn),
+                                     traceProbeEigv());
+            outertrace::emitStep("dev", "updjnet", "jnet",
+                                 traceHash(bound_.device_jnet, trace_nsg), nullptr, 0);
+        }
 
         // WHAT THE DRIVE LEFT BEHIND.  This is the only point at which the
         // host flux and the device flux are known to agree -- the sweep's
@@ -1150,6 +1227,10 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         }
         if (!m.hooks.enqueue_nodal_drive(m.hooks.ctx, m.stream, slot, i))
             return hookFailed("the nodal drive hook");
+        if (trace_steps)
+            outertrace::emitStep("dev", "nodal", "jnet",
+                                 traceHash(bound_.device_jnet, trace_nsg), "phis",
+                                 traceHash(bound_.device_phis, trace_nsg));
 
         // (7) cusping -- Driver.h, between the nodal drive and upddhat.
         //
@@ -1210,6 +1291,9 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                                  bound_.dhat_clamp, bound_.dhat_counters, m.stream,
                                  m.d_halt)) != cudaSuccess)
             return launchFailed("enqueue upddhat", rc);
+        if (trace_steps)
+            outertrace::emitStep("dev", "upddhat", "dhat",
+                                 traceHash(bound_.device_dhat, trace_nsg), nullptr, 0);
 
         // dhat back to the host, for the same reason psi went back: setls/axb on
         // the host drive path read _dhat, and the segment replaced

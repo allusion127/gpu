@@ -2179,6 +2179,10 @@ private:
             gpu::noteOuterSegmentRefusal(gpu_outer_why);
 
         for (int iout = 0; iout < max_iter; ++iout) {
+            // WHERE THE TRACER IS.  Set before anything of this outer runs, so
+            // the device runner's step lines carry the same (statepoint, outer)
+            // the host arm's do and a single grep aligns the two arms.
+            if (outertrace::enabled()) outertrace::setContext(ctx.statepoint, iout);
             bool stall_sample = false; // limit-cycle fall-through this outer
             bool th_fired     = false; // telemetry: T/H perturbed inside this outer
             bool xe_restart   = false; // a commit below re-fires the Xe cascade
@@ -2251,11 +2255,26 @@ private:
             }
 
             if (!outer_on_device) {
+            // THE PER-STEP TRACE, host arm.  Five hashes at the five points the
+            // device runner also hashes, so a divergence names a STEP and not
+            // just an outer.  hashDoubles over the host arrays is right HERE
+            // because this arm computes into them; the device arm hashes device
+            // memory, for the reason OuterTrace.h states.
+            const bool     tr_step = outertrace::enabled();
+            const int      tr_nxyz = ctx.geometry.nxyz();
+            const int      tr_ng   = ctx.geometry.ng();
+            const size_t   tr_nsg  = static_cast<size_t>(ctx.geometry.nsurf()) * tr_ng;
+            const size_t   tr_nn   = static_cast<size_t>(tr_nxyz) * tr_ng;
             // 1. Flux: CMFD BiCGSTAB iterations + Wielandt shift.
             {
                 outer_timing::Scope t(sptelem::PH_UPDPSI);
                 ctx.cmfd_solver.updpsi(ctx.geometry.Phif());
             }
+            if (tr_step)
+                outertrace::emitStep("host", "updpsi", "psi",
+                                     outertrace::hashDoubles(ctx.cmfd_solver.psiData(),
+                                                             static_cast<size_t>(tr_nxyz)),
+                                     nullptr, 0);
             {
                 outer_timing::Scope t(sptelem::PH_SETLS);
                 ctx.cmfd_solver.setls(eigv);
@@ -2264,6 +2283,10 @@ private:
                 outer_timing::Scope t(sptelem::PH_DRIVE);
                 ctx.cmfd_solver.drive(eigv, ctx.geometry.PhifMutable(), residual);
             }
+            if (tr_step)
+                outertrace::emitStepEigv("host", "sweep",
+                                         outertrace::hashDoubles(ctx.geometry.Phif(), tr_nn),
+                                         eigv);
             ++total_outer;
             // Exactly one cause bucket per outer, charged to the segment this
             // outer belongs to (plan Rev.4 Sec 8 attribution rules).
@@ -2278,12 +2301,21 @@ private:
                 outer_timing::Scope t(sptelem::PH_UPDJNET);
                 ctx.cmfd_solver.updjnet(ctx.geometry.Phif(), ctx.geometry.Jnet());
             }
+            if (tr_step)
+                outertrace::emitStep("host", "updjnet", "jnet",
+                                     outertrace::hashDoubles(ctx.geometry.Jnet(), tr_nsg),
+                                     nullptr, 0);
             {
                 outer_timing::Scope t(sptelem::PH_NODAL);
                 ctx.nodal_solver.reset(1.0 / eigv, ctx.geometry.Jnet(),
                                        ctx.geometry.Phif(), ctx.geometry.Phis());
                 ctx.nodal_solver.drive();
             }
+            if (tr_step)
+                outertrace::emitStep("host", "nodal", "jnet",
+                                     outertrace::hashDoubles(ctx.geometry.Jnet(), tr_nsg),
+                                     "phis",
+                                     outertrace::hashDoubles(ctx.geometry.Phis(), tr_nsg));
             {
                 outer_timing::Scope t(sptelem::PH_CUSPING);
                 if (ctx.cross_sections.ApplyRodCusping(eigv, ctx.nodal_solver.axialTransverseLeakage()))
@@ -2293,6 +2325,10 @@ private:
                 outer_timing::Scope t(sptelem::PH_UPDDHAT);
                 ctx.cmfd_solver.upddhat(ctx.geometry.Phif(), ctx.geometry.Jnet());
             }
+            if (tr_step)
+                outertrace::emitStep("host", "upddhat", "dhat",
+                                     outertrace::hashDoubles(ctx.cmfd_solver.dhatData(), tr_nsg),
+                                     nullptr, 0);
             }
 
             if (outertrace::enabled()) {

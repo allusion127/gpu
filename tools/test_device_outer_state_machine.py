@@ -373,12 +373,19 @@ for bridge, counter in (("mirror psi to the host", "host_mirror_bytes"),
 #   2  the same two again, BLOCKING, on the failure paths, where the segment is
 #      abandoning a stream whose state it can no longer reason about
 #
+# SIXTEEN since the per-step tracer, and the two new ones are named here for
+# the same reason as the rest:
+#
+#   2  the RASBERY_OUTER_TRACE per-step hashes -- one for an array, one for the
+#      probe.  Both are inside `if (trace_steps)`, which is a cached environment
+#      read, so an untraced run issues neither and pays one predicted branch.
+#
 # The invariant this number defends is unchanged: no D2H may appear inside the
-# per-outer loop that is not one of the three named bridges.
-if GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost") > 14:
-    problems.append("CudaOuterGraph.cu: more D2H sites than the three named bridges plus "
-                    "the observation and the four exit mirrors (%d).  Each one is a "
-                    "rendezvous and needs a name"
+# per-outer loop that is not one of the named bridges or a debug-gated hash.
+if GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost") > 16:
+    problems.append("CudaOuterGraph.cu: more D2H sites than the four named bridges plus "
+                    "the observation, the four exit mirrors and the two traced hashes "
+                    "(%d).  Each one is a rendezvous and needs a name"
                     % GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost"))
 if "cudaGraph" in GRAPH_CU_CODE or "cudaGraph" in GRAPH_H_CODE:
     problems.append("CudaOuterGraph: uses the graph API.  The conditional WHILE wrapper is "
