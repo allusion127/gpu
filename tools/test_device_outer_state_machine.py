@@ -441,11 +441,37 @@ if _deleg and "seg.escape" in _deleg:
 if _deleg and "seg.flux_converged" not in _deleg:
     problems.append("Driver.h: the delegation does not adopt the device flux_converged, so "
                     "the ladder would run on the hoisted false")
-# A search deck stays refused here, and the reason is narrower than Task 9's.
-if "has_search" not in body_of(SOLVELOOP, "gpu::rasberyOuterSegment().refusal(", ");"):
-    problems.append("Driver.h: SolveLoop does not pass has_search to the refusal.  The "
-                    "search commits boron/rod BETWEEN outers, which moves the macro-XS the "
-                    "segment's upddhat reads, and nothing re-uploads them mid-loop")
+# A SEARCH DECK IS NO LONGER REFUSED, and the two places that ask have to agree.
+#
+# Task 9 refused it because the DEVICE decision stood in for Driver.h's search
+# terms.  SolveLoop stopped consuming that decision in Task 10 -- it takes
+# flux_converged, which is computed before any search term is read -- so the
+# reason cannot reach the answer there.  This matters because the production
+# workload is a boron-search deck from statepoint 1: with the refusal in place
+# APR1400/kngr_238 never saw a single device outer.
+#
+# BOTH CALL SITES OR NEITHER.  The hoisted eligibility check and runSegment's
+# own re-check ask the same predicate; giving them different answers arms the
+# loop and then refuses every individual segment, which is the worst of the two
+# behaviours and shows up only as device_outers == 0 with a full refusal count.
+_SL_REFUSAL = body_of(SOLVELOOP, "gpu::rasberyOuterSegment().refusal(", ");")
+_SL_RUN = body_of(SOLVELOOP, "gpu::rasberyOuterSegment().runSegment(", ") {")
+if _SL_REFUSAL and "has_search" in _SL_REFUSAL:
+    problems.append("Driver.h: SolveLoop still refuses a critical-search deck.  The device "
+                    "decision is advisory there -- only flux_converged crosses, and it is "
+                    "computed before any search term is read -- while the production deck "
+                    "searches boron from statepoint 1, so the refusal costs every device "
+                    "outer on the workload M1 is measured against")
+if _SL_RUN and "has_search" in _SL_RUN:
+    problems.append("Driver.h: SolveLoop's runSegment call still passes has_search while "
+                    "the hoisted check does not.  runSegment re-asks the same predicate, so "
+                    "disagreeing arms the loop and then refuses every segment inside it")
+# The macro-XS a search commit moves must be covered by the per-outer syncs,
+# which is what replaced the refusal.
+for _need in ("upload xsnf", "upload dtil"):
+    want(GRAPH_CU_CODE, _need, "CudaOuterGraph.cu",
+         "a search commit moves the macro-XS between outers; the per-outer sync is what "
+         "makes the segment safe on a search deck now that it is not refused")
 
 # --- 8d. every device buffer the segment READS is synced first (Task 10) ----
 #

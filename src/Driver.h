@@ -1853,17 +1853,30 @@ private:
                                                 ? &ctx.geometry.rod_fraction(0)
                                                 : nullptr,
                                             ctx.geometry.nxyz(), EPS);
-        // A CRITICAL SEARCH IS STILL REFUSED HERE, and for a narrower reason
-        // than Task 9`s.  Task 9 refused it because the DEVICE decision stood in
-        // for Driver.h`s search terms and the two spellings disagree
-        // (OuterSegmentEligibility::critical_search).  In SolveLoop the device
-        // decision is advisory -- only flux_converged is consumed -- so that
-        // modelling gap cannot reach the answer.  What remains is that the
-        // search commits boron/rod between outers, which moves the macro-XS the
-        // segment`s upddhat reads, and nothing yet re-uploads them mid-loop.
+        // A CRITICAL SEARCH IS NO LONGER REFUSED HERE.
+        //
+        // Task 9 refused it because the DEVICE decision stood in for Driver.h's
+        // search terms and the two spellings disagree
+        // (OuterSegmentEligibility::critical_search).  SolveLoop stopped
+        // consuming that decision in Task 10: it takes flux_converged and the
+        // three carried scalars, and flux_converged is computed before any
+        // search term is read.  The host ladder still evaluates
+        // schedule.searchResidual(eigv) from the eigenvalue the segment
+        // returned, still owns clean_iters and the settle gate, and still
+        // decides FluxLimitCycleSample -- exactly the scalars it read before.
+        //
+        // The one thing the search does to the segment is move the macro-XS
+        // when it commits a trial, and that is covered: xsnf and dtil are
+        // uploaded at the top of every outer, and resetDhat() is called only
+        // from Drive() (2718, 2735), outside this loop, so the arm-time dhat
+        // seed cannot go stale within one SolveLoop.
+        //
+        // This matters because the production workload is a boron-search deck
+        // from statepoint 1: with the refusal in place APR1400/kngr_238 never
+        // saw a device outer at all.
         const gpu::OuterSegmentRefusal gpu_outer_why =
             gpu_outer_enabled ? gpu::rasberyOuterSegment().refusal(rasberyBatchWidth(),
-                                                                   gpu_outer_rods, has_search)
+                                                                   gpu_outer_rods, false)
                               : gpu::OuterSegmentRefusal::FeatureOff;
         bool gpu_outer_armed = (gpu_outer_why == gpu::OuterSegmentRefusal::None);
         if (gpu_outer_enabled && !gpu_outer_armed)
@@ -1922,7 +1935,7 @@ private:
 
                 gpu::OuterSegmentResume seg{};
                 if (gpu::rasberyOuterSegment().runSegment(s, rasberyBatchWidth(),
-                                                          gpu_outer_rods, has_search, seg)) {
+                                                          gpu_outer_rods, false, seg)) {
                     eigv           = seg.eigv;
                     residual       = seg.residual;
                     prev_inner     = seg.prev_inner;

@@ -520,7 +520,28 @@ struct OuterSegmentEligibility {
     int batch_width;      ///< rasberyBatchWidth(); >1 refuses
     int fractional_rods;  ///< outerDeckHasFractionalRods()
 
-    /// A CRITICAL SEARCH IS REFUSED, AND FOR TWO INDEPENDENT REASONS.
+    /// A CRITICAL SEARCH IS REFUSED ONLY WHERE THE DEVICE DECISION IS
+    /// AUTHORITATIVE -- which, since Task 10, is ReconvergeFlux and not
+    /// SolveLoop.
+    ///
+    /// Both reasons below are about the DECISION, and SolveLoop stopped
+    /// consuming it: its delegation takes flux_converged and the three carried
+    /// scalars, and flux_converged is computed at CmfdOuterKernel.h:476-479
+    /// from prev_inner, eigv, residual and the two tolerances -- before any
+    /// search term is read.  The host ladder still evaluates
+    /// schedule.searchResidual(eigv) from the eigenvalue the segment returned,
+    /// still owns clean_iters and the settle gate, and still decides
+    /// FluxLimitCycleSample; the device copies of those drift and nothing reads
+    /// them.  So on that path neither reason can reach the answer.
+    ///
+    /// What the search DOES do to the segment is move the macro-XS when it
+    /// commits a boron trial, and that is handled by the per-outer syncs rather
+    /// than by a refusal: xsnf and dtil are uploaded at the top of every outer,
+    /// and CMFD::resetDhat is called only from Drive() (Driver.h:2718, 2735),
+    /// outside SolveLoop, so the arm-time dhat seed is never stale within one.
+    ///
+    /// THE TWO REASONS, KEPT because ReconvergeFlux still consumes the whole
+    /// decision and Tasks 13/14/17 will bring SolveLoop back to consuming it:
     ///
     /// (1) Driver.h:1864-1871 evaluates `schedule.searchResidual(eigv)` per outer
     ///     from the eigenvalue THAT outer produced, and there is no device Search
