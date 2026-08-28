@@ -108,11 +108,37 @@ for token in ("betal", "betar", "fdiff", "jnet_fdm", "cmfdUpdPsiNode", "cmfdUpdD
 # The convergence DECISION must come from the shared body, not be re-derived.
 want(GRAPH_CU_CODE, "enqueueOuterConvergence", "CudaOuterGraph.cu",
      "the outer decision must come from cmfdOuterConvergence via the W2 kernel")
-if re.search(r"flux_converged\s*=", GRAPH_H_CODE) or re.search(r"flux_converged\s*=",
-                                                               GRAPH_CU_CODE):
-    problems.append("CudaOuterGraph: re-derives flux_converged.  Sec 6.13's decision is "
-                    "cmfdOuterConvergence's; a second copy of the stall ladder is the "
-                    "exact divergence Task 5 exists to prevent")
+# CARRYING the decision's flux_converged is not RE-DERIVING it, and Task 10
+
+# needs the carry: SolveLoop's ladder takes that one bit from the device.  What
+
+# must never appear is the EXPRESSION -- a second copy of
+
+# |prev_inner - eigv| < keff_tol && residual < flux_tol, which is the divergence
+
+# Task 5 exists to prevent.  So the ban is on the arithmetic, not the name.
+
+for _fc_code, _fc_where in ((GRAPH_H_CODE, "CudaOuterGraph.h"),
+
+                            (GRAPH_CU_CODE, "CudaOuterGraph.cu")):
+
+    _fc_hits = (re.search(r"keff_tol\s*&&", _fc_code) is not None or
+                re.search(r"fabs\([^)]*prev_inner", _fc_code) is not None or
+                re.search(r"abs\([^)]*prev_inner", _fc_code) is not None)
+    if _fc_hits:
+        problems.append(f"{_fc_where}: re-derives flux_converged.  Sec 6.13's decision is "
+
+                        "cmfdOuterConvergence's; a second copy of that test is the exact "
+
+                        "divergence Task 5 exists to prevent -- carry the decision's bit "
+
+                        "instead")
+
+want(GRAPH_CU_CODE, "decision_out.flux_converged", "CudaOuterGraph.cu",
+
+     "SolveLoop's ladder needs the decision's own flux_converged carried back, or it "
+
+     "would have to recompute it from scalars the device already judged")
 
 # --- 2. the segment body is Driver.h's order ---------------------------------
 # Scoped to the kOuterSegmentPlan array itself: the prologue table below it has
@@ -302,7 +328,7 @@ for bridge, counter in (("mirror psi to the host", "host_mirror_bytes"),
     if counter not in GRAPH_CU_CODE:
         problems.append(f"CudaOuterGraph.cu: {bridge!r} is not counted by {counter} -- an "
                         "uncounted transfer is one nobody can argue about")
-if GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost") > 6:
+if GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost") > 7:
     problems.append("CudaOuterGraph.cu: more D2H sites than the three named bridges plus "
                     "the segment's three-copy observation (%d).  Each one is a rendezvous "
                     "and needs a name" % GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost"))
@@ -351,12 +377,17 @@ if "rasberyOuterSegment().runSegment(" not in RECONVERGE:
     problems.append("Driver.h: ReconvergeFlux does not delegate.  It is the only loop in "
                     "Driver.h whose escape set is closed -- every feedback is held fixed -- "
                     "so it is the only Stage A call site that has an exact host resume")
-if "runSegment(" in SOLVELOOP:
-    problems.append("Driver.h: SolveLoop delegates a segment.  A segment there exits on the "
-                    "outer whose decision was not a requeue, and that outer's body has "
-                    "already advanced flux/jnet/d-hat -- so the host would have to re-enter "
-                    "PAST the control ladder, which is not an entry point SolveLoop has.  "
-                    "Task 10's conditional WHILE is what makes that resume a no-op")
+# TASK 10 INVERTED THIS.  Task 9 refused to delegate in SolveLoop because the
+# outer whose decision ends the segment has already had its body run and
+# SolveLoop had no entry point past the body.  That was a statement about the
+# LOOP, not the physics: the only thing the ladder needs from the body is
+# flux_converged and the three scalars behind it, so hoisting one declaration is
+# the entry point.  The delegation is now required, and what has to be guarded
+# is that it stays a hoist rather than a rewrite.
+if "rasberyOuterSegment().runSegment(" not in SOLVELOOP:
+    problems.append("Driver.h: SolveLoop does not delegate.  Task 10's whole M1 claim is "
+                    "device_outers == outer count, and ReconvergeFlux is the search "
+                    "FALLBACK -- a deck that never falls back would run zero device outers")
 want(DRIVER_TEXT, "WHY THE CALL SITE IS HERE AND NOT IN SolveLoop", "Driver.h",
      "the deviation from the plan's Task 9 Step 5b has to be named where the call site is, "
      "or a reader finds Step 5b unmet and no reason for it")
@@ -382,6 +413,65 @@ for anchor in ("ctx.cmfd_solver.updpsi(ctx.geometry.Phif());",
         problems.append("Driver.h: the host outer body no longer appears in both "
                         "ReconvergeFlux and SolveLoop -- the host loop is the reference path "
                         "and the delegation is an addition to it, never a replacement")
+
+# --- 8c. the SolveLoop delegation is a HOIST, not a rewrite (Task 10) -------
+#
+# The ladder is the most B0-sensitive code in the tree.  The delegation is
+# allowed to skip the BODY and nothing else, so the body has to still be there,
+# guarded, and the ladder has to be untouched.
+if "if (!outer_on_device) {" not in SOLVELOOP:
+    problems.append("Driver.h: the host outer body is not guarded by outer_on_device.  The "
+                    "delegation must SKIP the body, not replace it -- the body is the "
+                    "reference every B0 comparison is against")
+for anchor_line in ("ctx.cmfd_solver.updpsi(ctx.geometry.Phif());",
+                    "ctx.cmfd_solver.drive(eigv, ctx.geometry.Phif(), residual);",
+                    "ctx.cmfd_solver.upddhat(ctx.geometry.Phif(), ctx.geometry.Jnet());"):
+    if anchor_line not in SOLVELOOP:
+        problems.append(f"Driver.h: SolveLoop no longer contains {anchor_line!r}; the host "
+                        "body is the fallback and the reference, and it must survive verbatim")
+# The ladder must NOT consume the device escape: the device machine advances its
+# own flux_stall/stall_events/clean_iters inside cmfdOuterConvergence and the
+# ladder advances the host's.  Consuming both double-counts.
+_deleg = body_of(SOLVELOOP, "if (gpu_outer_armed) {", "if (!outer_on_device) {")
+if _deleg and "seg.escape" in _deleg:
+    problems.append("Driver.h: SolveLoop consumes seg.escape.  In this mode the device "
+                    "decision is advisory -- the host ladder owns flux_stall, stall_events "
+                    "and clean_iters, and the device copies drift -- so only flux_converged "
+                    "and the three carried scalars may cross")
+if _deleg and "seg.flux_converged" not in _deleg:
+    problems.append("Driver.h: the delegation does not adopt the device flux_converged, so "
+                    "the ladder would run on the hoisted false")
+# A search deck stays refused here, and the reason is narrower than Task 9's.
+if "has_search" not in body_of(SOLVELOOP, "gpu::rasberyOuterSegment().refusal(", ");"):
+    problems.append("Driver.h: SolveLoop does not pass has_search to the refusal.  The "
+                    "search commits boron/rod BETWEEN outers, which moves the macro-XS the "
+                    "segment's upddhat reads, and nothing re-uploads them mid-loop")
+
+# --- 8d. every device buffer the segment READS is synced first (Task 10) ----
+#
+# TWO BUGS FOUND THIS WAY, both the same shape: the segment reads a device
+# buffer whose refresh belongs to the sweep and happens mid-outer.  dhat is
+# written by the segment at step 8 and read by the sweep at step 2, so the first
+# outer after arming read a dhat nobody had written (k_eff = -0.034501,
+# negative_flux on 447 of 516 outers).  xsnf is refreshed inside drive(), which
+# is step 2, but updpsi is step 1 -- so the fission source was built from the
+# previous outer's cross sections.
+want(GRAPH_CU_CODE, "seed residency", "CudaOuterGraph.cu",
+     "the device dhat/psi must be seeded from the host at arm time, or the first sweep "
+     "after arming reads a buffer the segment has not written yet")
+want(GRAPH_CU_CODE, "upload xsnf", "CudaOuterGraph.cu",
+     "updpsi runs BEFORE the sweep refreshes xs_xsnf, so the segment must sync it or "
+     "build the fission source from the previous outer's cross sections")
+want(GRAPH_CU_CODE, "upload flux", "CudaOuterGraph.cu",
+     "drive() takes the host loop during the Wielandt warm-up, after which the device phi "
+     "is behind Geometry::Phif")
+# And the control packet has to be reset, not just stamped.
+if "deviceSlotStateReset" not in GRAPH_H_CODE:
+    problems.append("CudaOuterGraph.h: k_outer_seed_slot does not reset DeviceSlotState.  The "
+                    "arena block comes back from cudaMallocFromPoolAsync with whatever was "
+                    "in those pages, clearSlotAsync cannot reach the control structs, and "
+                    "cmfdOuterConvergence BRANCHES on flux_stall/stall_events/clean_iters -- "
+                    "garbage there publishes prev_inner = eigv + 1.0 and SolveLoop adopts it")
 
 # --- 9. stub parity ----------------------------------------------------------
 CU_SYMBOLS = ["outerGpuEnabled", "outerSegmentBudget", "outerSegmentCounters",

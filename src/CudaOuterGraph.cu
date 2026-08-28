@@ -422,7 +422,7 @@ bool CudaOuterSegment::bindResidency(const OuterSegmentResidency& residency) {
         residency.dtil == nullptr || residency.dhat == nullptr ||
         residency.xsnf == nullptr || residency.host_jnet == nullptr ||
         residency.host_flux == nullptr || residency.host_dhat == nullptr ||
-        residency.host_psi == nullptr)
+        residency.host_psi == nullptr || residency.host_xsnf == nullptr)
         return false;
     if (residency.arena_slot < 0 || residency.arena_slot >= _impl->slot_count) return false;
 
@@ -446,7 +446,40 @@ bool CudaOuterSegment::bindResidency(const OuterSegmentResidency& residency) {
         return false;
     }
     _impl->binding.host_jnet = residency.host_jnet;
+    // SEED THE DEVICE COPIES FROM THE HOST, ONCE PER ARM.
+    //
+    // THE BUG THIS FIXES, in the number that found it.  The segment writes dhat
+    // at the END of an outer (step 8) and the sweep reads it in the MIDDLE
+    // (step 2), so on the first outer after arming the sweep reads a dhat the
+    // segment has not written yet -- and the H2D that used to fill it is
+    // precisely what dhat_device_resident now elides.  With cudaMalloc memory
+    // behind it, i-SMR CY01 came out at k_eff = -0.034501 with negative_flux on
+    // 447 of its 516 outers.
+    //
+    // PER ARM, NOT ONCE PER PROCESS, because Driver.h:2656/2673 call
+    // CMFD::resetDhat() between statepoints: the host zeroes _dhat, and a device
+    // copy seeded only at the first arm would still be holding the previous
+    // statepoint's.  armOuterSegment runs at every SolveLoop and ReconvergeFlux
+    // entry, which is after every such reset.
+    const std::size_t seed_dhat_bytes =
+        static_cast<std::size_t>(_impl->binding.geom.nsurf) *
+        static_cast<std::size_t>(_impl->binding.ng) * sizeof(double);
+    const std::size_t seed_psi_bytes =
+        static_cast<std::size_t>(_impl->binding.nxyz) * sizeof(double);
+    if ((rc = cudaMemcpy(residency.dhat, residency.host_dhat, seed_dhat_bytes,
+                         cudaMemcpyHostToDevice)) != cudaSuccess ||
+        (rc = cudaMemcpy(residency.psi, residency.host_psi, seed_psi_bytes,
+                         cudaMemcpyHostToDevice)) != cudaSuccess) {
+        _impl->status = std::string("seed residency: ") + cudaGetErrorString(rc);
+        return false;
+    }
+
     _impl->binding.host_flux = residency.host_flux;
+    _impl->binding.host_xsnf   = residency.host_xsnf;
+    // const_cast: the view hands xsnf out as read-only because the BODIES only
+    // read it; the buffer is the sweep's own xs_xsnf and the segment writes it
+    // for exactly the same reason issueSweepUploads does.
+    _impl->binding.device_xsnf = const_cast<double*>(residency.xsnf);
     _impl->binding.host_dhat   = residency.host_dhat;
     _impl->binding.host_psi    = residency.host_psi;
     _impl->binding.device_dhat = residency.dhat;
@@ -649,6 +682,15 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                 return launchFailed("upload flux", rc);
             bump(counters().flux_sync_bytes, flux_bytes);
         }
+        if (bound_.host_xsnf != nullptr && bound_.device_xsnf != nullptr) {
+            const std::size_t xsnf_bytes =
+                static_cast<std::size_t>(bound_.nxyz) *
+                static_cast<std::size_t>(bound_.ng) * sizeof(double);
+            if ((rc = cudaMemcpyAsync(bound_.device_xsnf, bound_.host_xsnf, xsnf_bytes,
+                                      cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
+                return launchFailed("upload xsnf", rc);
+            bump(counters().flux_sync_bytes, xsnf_bytes);
+        }
 
         // (1) updpsi -- Driver.h:1547
         if ((rc = enqueueUpdPsi(m.arena, queue, bound_.geom, bound_.table, bound_.forms,
@@ -762,6 +804,7 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     DeviceOuterSegmentState seg_out{};
     DeviceSlotState         state_out{};
     unsigned long long      halted_out = 0;
+    CmfdOuterDecision       decision_out{};
     if ((rc = cudaMemcpyAsync(&seg_out, m.d_segments + slot, sizeof(seg_out),
                               cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
         return launchFailed("download segment state", rc);
@@ -771,6 +814,12 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     if ((rc = cudaMemcpyAsync(&halted_out, m.d_halted, sizeof(halted_out),
                               cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
         return launchFailed("download halted count", rc);
+    // The decision, for SolveLoop's ladder.  It rides the SAME observation as
+    // the other three -- one more 24-byte copy on a stream that is about to be
+    // synchronised anyway -- rather than becoming a second rendezvous.
+    if ((rc = cudaMemcpyAsync(&decision_out, m.d_decisions + slot, sizeof(decision_out),
+                              cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+        return launchFailed("download outer decision", rc);
     if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
         return launchFailed("segment synchronize", rc);
 
@@ -785,6 +834,7 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     resume.device_outers      = seg_out.outer_in_segment;
     resume.next_phase         = seg_out.next_phase;
     resume.escape             = seg_out.escape;
+    resume.flux_converged     = decision_out.flux_converged;
     resume.eigv               = state_out.eigv;
     resume.residual           = state_out.flux_l2;
     resume.prev_inner         = state_out.previous_eigv;

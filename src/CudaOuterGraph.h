@@ -759,6 +759,8 @@ struct OuterSegmentBinding {
     /// Geometry::Phif; see OuterSegmentResidency::host_flux for why the segment
     /// uploads it rather than trusting the device copy.
     const double*          host_flux     = nullptr;
+    const double*          host_xsnf     = nullptr;
+    double*                device_xsnf   = nullptr;
     double*                host_dhat     = nullptr;
     double*                host_psi      = nullptr;
     double*                device_dhat   = nullptr;
@@ -811,6 +813,18 @@ struct OuterSegmentResume {
     unsigned int device_outers = 0; ///< outers COMMITTED; always >= 1 on success
     unsigned int next_phase    = 0; ///< DevicePhase
     unsigned int escape        = 0; ///< DeviceEscape
+
+    /// Driver.h's `flux_converged`, computed on the device from the SAME three
+    /// inputs (Driver.h:1818 |prev_inner - eigv| < keff_tol && residual < flux_tol).
+    ///
+    /// THE ONE FIELD SolveLoop's LADDER TAKES FROM THE DEVICE, and it is exact
+    /// for a reason worth stating: cmfdOuterConvergence computes it from
+    /// st.prev_inner -- which the host uploads at segment entry -- and from the
+    /// eigv/residual the sweep just produced.  None of the other state the
+    /// device machine carries (flux_stall, stall_events, clean_iters,
+    /// xe_interim_count) participates in it, so those may drift on the device
+    /// without touching this answer.
+    int flux_converged = 0;
 
     double eigv       = 0.0;
     double residual   = 0.0;
@@ -875,6 +889,15 @@ struct OuterSegmentResidency {
     /// CMFD::dhatData() / CMFD::psiData() -- the host twins of the two arrays
     /// the segment writes.  See CMFD.h: the host drive path still reads them
     /// during the Wielandt warm-up and whenever the device sweep declines.
+    /// XSSet::xsnfData() -- the fission cross section updpsi is about to read.
+    ///
+    /// SAME ORDERING PROBLEM AS THE FLUX, and it bites harder.  The sweep
+    /// refreshes xs_xsnf from the host INSIDE drive(), which is step 2 of the
+    /// segment -- but updpsi is step 1.  So without this the segment's fission
+    /// source would be built from the PREVIOUS outer's cross sections, and
+    /// every Xe or T/H step between outers would be one outer late.
+    const double* host_xsnf = nullptr;
+
     double* host_dhat = nullptr;
     double* host_psi  = nullptr;
 
@@ -1115,6 +1138,26 @@ __global__ void k_outer_seed_slot(DeviceArenaView arena, int slot,
                                   unsigned long long material_generation) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
     DeviceSlotState& st = arena.states[slot];
+
+    // RESET THE WHOLE CONTROL PACKET FIRST.  The arena's ONE allocation is a
+    // cudaMallocFromPoolAsync block: the control structs come back with
+    // whatever was in those pages, and GpuPhysicsArena::clearSlotAsync
+    // deliberately cannot reach them (they live below slot_base, outside every
+    // slot's stride).  cmfdLoadOuterState reads flux_stall, stall_events,
+    // clean_iters and xe_interim_count out of this struct, and
+    // cmfdOuterConvergence BRANCHES on them -- so garbage here sends the
+    // decision down the xe-interim or boron-settling path, which publishes
+    // `prev_inner = eigv + 1.0` instead of `eigv`.  SolveLoop then adopts that
+    // as its own prev_inner and its convergence test is wrong.
+    //
+    // The symptom was run-to-run variation with the same inputs: i-SMR CY01
+    // statepoint 1 came out at 1.028112, 1.028550 and 1.044908 across five
+    // runs of one binary, with one run crashing outright.  Uninitialised
+    // memory reads as noise, and noise in a branch condition reads as
+    // non-determinism.
+    deviceSlotStateReset(st);
+    deviceSlotPhaseReset(*arena.slotView(slot).phase, 1u);
+
     st.material_generation = material_generation;
     // Deliberately NOT equal to it: the constants have never been built on the
     // device, so the gate must read "stale" the first time it is asked.

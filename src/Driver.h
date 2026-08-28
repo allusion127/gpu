@@ -924,6 +924,7 @@ private:
         residency.host_flux  = ctx.geometry.Phif();
         residency.host_dhat  = ctx.cmfd_solver.dhatData();
         residency.host_psi   = ctx.cmfd_solver.psiData();
+        residency.host_xsnf  = ctx.cross_sections.xsnfData();
         residency.arena_slot = 0; // the physics arena is width 1 (link 1)
         residency.valid      = true;
 
@@ -1789,6 +1790,39 @@ private:
         // re-convergence (flux_stall guard), and the search/T-H step counts are bounded too.
         const int max_iter = 50 * std::max({schedule.max_outer_iter, schedule.max_th_iter,
                                             has_search ? schedule.max_search_iter : 0});
+        // ===================================================================
+        // Rev.7.1 Task 10: device outer eligibility for SolveLoop
+        // ===================================================================
+        //
+        // Hoisted, exactly as ReconvergeFlux hoists it, for the same reason: a
+        // per-outer eligibility query would ask a pure predicate 600 times to
+        // get the same answer.  With the feature off this is a false const and
+        // every statement in the delegation branch folds away.
+        const bool gpu_outer_enabled = gpu::outerGpuEnabled();
+        if (gpu_outer_enabled) armOuterSegment(ctx, eigv, residual);
+        const bool gpu_outer_rods =
+            gpu_outer_enabled &&
+            gpu::outerDeckHasFractionalRods(ctx.cross_sections.axial_rod_division(),
+                                            ctx.geometry.nxyz() > 0
+                                                ? &ctx.geometry.rod_fraction(0)
+                                                : nullptr,
+                                            ctx.geometry.nxyz(), EPS);
+        // A CRITICAL SEARCH IS STILL REFUSED HERE, and for a narrower reason
+        // than Task 9`s.  Task 9 refused it because the DEVICE decision stood in
+        // for Driver.h`s search terms and the two spellings disagree
+        // (OuterSegmentEligibility::critical_search).  In SolveLoop the device
+        // decision is advisory -- only flux_converged is consumed -- so that
+        // modelling gap cannot reach the answer.  What remains is that the
+        // search commits boron/rod between outers, which moves the macro-XS the
+        // segment`s upddhat reads, and nothing yet re-uploads them mid-loop.
+        const gpu::OuterSegmentRefusal gpu_outer_why =
+            gpu_outer_enabled ? gpu::rasberyOuterSegment().refusal(rasberyBatchWidth(),
+                                                                   gpu_outer_rods, has_search)
+                              : gpu::OuterSegmentRefusal::FeatureOff;
+        bool gpu_outer_armed = (gpu_outer_why == gpu::OuterSegmentRefusal::None);
+        if (gpu_outer_enabled && !gpu_outer_armed)
+            gpu::noteOuterSegmentRefusal(gpu_outer_why);
+
         for (int iout = 0; iout < max_iter; ++iout) {
             bool stall_sample = false; // limit-cycle fall-through this outer
             bool th_fired     = false; // telemetry: T/H perturbed inside this outer
@@ -1797,6 +1831,71 @@ private:
                                             ? ga_feedback_passes
                                             : ((xe_relax < 1.0) ? XE_EQUILIBRIUM_MAX_ITER_DAMPED
                                                                 : XE_EQUILIBRIUM_MAX_ITER);
+            // ===============================================================
+            // Rev.7.1 Task 10: the SolveLoop delegation
+            // ===============================================================
+            //
+            // WHAT MADE THIS POSSIBLE.  Task 9 argued that a SolveLoop segment
+            // could not resume, because the outer whose decision ends the
+            // segment has already had its BODY run and SolveLoop had no entry
+            // point past the body.  That was a statement about the loop, not
+            // about the physics: the only thing the ladder below needs from the
+            // body is `flux_converged` and the three scalars it is computed
+            // from.  Hoisting the declaration out of the body is the entry
+            // point, and it costs one `const` and nothing else.
+            //
+            // THE HOST LADDER STAYS AUTHORITATIVE, deliberately.  The device
+            // machine also advances flux_stall, stall_events, clean_iters and
+            // xe_interim_count inside cmfdOuterConvergence, and the ladder below
+            // advances its own.  Consuming both would double-count, so this
+            // branch takes ONLY flux_converged and the three carried scalars and
+            // ignores seg.escape entirely.  The device copies of those counters
+            // drift and are never read here; they matter on the ReconvergeFlux
+            // path, where the device machine IS the authority, and they will
+            // matter again when Tasks 13/14/17 put the ladder itself on the
+            // device.  flux_converged is exact regardless: it is computed from
+            // st.prev_inner, which this loop uploads at segment entry.
+            bool flux_converged = false;
+            bool outer_on_device = false;
+            if (gpu_outer_armed) {
+                gpu::OuterSegmentScalars s{};
+                s.eigv           = eigv;
+                s.residual       = residual;
+                s.prev_inner     = prev_inner;
+                s.keff_tol       = keff_tol;
+                s.flux_tol       = flux_tol;
+                s.max_outer_iter = static_cast<unsigned int>(schedule.max_outer_iter);
+                // The gates the decision reads.  They are this outer`s, not the
+                // previous one`s, because the ladder recomputes them below from
+                // the same locals -- so the device sees what the host would.
+                s.xe_pending      = 0;
+                s.th_pending      = 0;
+                s.xe_interim_l2   = 0.0;
+                s.xe_once_mode    = 0;
+                s.xe_budget_probe = static_cast<unsigned int>(xe_budget_probe);
+
+                gpu::OuterSegmentResume seg{};
+                if (gpu::rasberyOuterSegment().runSegment(s, rasberyBatchWidth(),
+                                                          gpu_outer_rods, has_search, seg)) {
+                    eigv           = seg.eigv;
+                    residual       = seg.residual;
+                    prev_inner     = seg.prev_inner;
+                    flux_converged = seg.flux_converged != 0;
+                    total_outer += static_cast<int>(seg.device_outers);
+                    ctx.telemetry.outers_by_cause[sp_cause] +=
+                        static_cast<long long>(seg.device_outers);
+                    outer_timing::buckets().outers.fetch_add(seg.device_outers,
+                                                             std::memory_order_relaxed);
+                    outer_on_device = true;
+                } else {
+                    // A launch or hook failure.  Every ELIGIBILITY refusal was
+                    // decided once above the loop, so this recurs; stop paying
+                    // for it and let the host body below be the whole outer.
+                    gpu_outer_armed = false;
+                }
+            }
+
+            if (!outer_on_device) {
             // 1. Flux: CMFD BiCGSTAB iterations + Wielandt shift.
             {
                 outer_timing::Scope t(sptelem::PH_UPDPSI);
@@ -1815,8 +1914,8 @@ private:
             // outer belongs to (plan Rev.4 Sec 8 attribution rules).
             ++ctx.telemetry.outers_by_cause[sp_cause];
             outer_timing::buckets().outers.fetch_add(1, std::memory_order_relaxed);
-            const bool flux_converged = std::abs(prev_inner - eigv) < keff_tol && residual < flux_tol;
-            prev_inner                = eigv;
+            flux_converged = std::abs(prev_inner - eigv) < keff_tol && residual < flux_tol;
+            prev_inner     = eigv;
 
             // 2. Nodal correction -> CNCC (d-hat) + rod cusping macro-XS update. The cusping blend
             //    co-converges with the flux, so its settledness is implied by flux_converged.
@@ -1838,6 +1937,7 @@ private:
             {
                 outer_timing::Scope t(sptelem::PH_UPDDHAT);
                 ctx.cmfd_solver.upddhat(ctx.geometry.Phif(), ctx.geometry.Jnet());
+            }
             }
 
             // Keep iterating flux + nodal/cusping until the flux is converged; the feedbacks

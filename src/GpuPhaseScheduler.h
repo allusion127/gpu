@@ -402,7 +402,10 @@ inline constexpr OuterQuantumStep kOuterQuantumSteps[] = {
     {"updpsi",     "ctx.cmfd_solver.updpsi(ctx.geometry.Phif());"},
     {"setls",      "ctx.cmfd_solver.setls(eigv);"},
     {"drive",      "ctx.cmfd_solver.drive(eigv, ctx.geometry.Phif(), residual);"},
-    {"conv_check", "const bool flux_converged ="},
+    // Rev.7.1 Task 10 moved the DECLARATION out of the outer body -- SolveLoop
+    // now hoists `bool flux_converged` so the device delegation can supply it --
+    // so the anchor is the ASSIGNMENT, which is where the test still lives.
+    {"conv_check", "flux_converged = std::abs(prev_inner - eigv)"},
     {"updjnet",    "ctx.cmfd_solver.updjnet(ctx.geometry.Phif(), ctx.geometry.Jnet());"},
     {"nodal",      "ctx.nodal_solver.drive();"},
     {"cusping",    "ctx.cross_sections.ApplyRodCusping(eigv, ctx.nodal_solver.axialTransverseLeakage())"},
