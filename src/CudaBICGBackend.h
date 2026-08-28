@@ -333,12 +333,19 @@ struct SweepGraphCapacity {
     int nmax      = -1; ///< exact key: inner BiCGSTAB budget (a process constant)
     int slots     = -1; ///< capacity key: sweep slots CAPTURED
     int precision = -1; ///< exact key: the FP32 fallback changes the topology
+    /// Exact key: grid.y, which a captured graph BAKES.  It is the arena width
+    /// unless RASBERY_GPU_CMFD_COMPACT is on, in which case it is the bucket
+    /// for the arrival width and each bucket needs its own instantiation.
+    /// Unlike `slots` above this is NOT a capacity: a graph captured 32 lanes
+    /// wide dispatches 32 lanes whatever the map says, so a narrower launch
+    /// would pay for padding blocks the compaction exists to remove.
+    int lanes     = -1;
 
     /// Can the captured graph serve a launch wanting `want_slots` slots?
     [[nodiscard]] constexpr bool serves(int want_nmax, int want_slots,
-                                        int want_precision) const {
+                                        int want_precision, int want_lanes) const {
         return slots >= 0 && nmax == want_nmax && precision == want_precision &&
-               slots >= want_slots;
+               lanes == want_lanes && slots >= want_slots;
     }
 
     /// Depth to capture at.  Never shallower than what is already captured, so
