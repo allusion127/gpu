@@ -1585,6 +1585,11 @@ struct XsReconBackend::Impl {
         if (dev_sscale) cudaFree(dev_sscale);
         if (nodal_graph) cudaGraphExecDestroy(nodal_graph);
         if (nodal_h_reigv) cudaFreeHost(nodal_h_reigv);
+        // W3 item 2: one event per backend, created lazily on the first
+        // deferred drain.  Destroyed beside the other lazily-created nodal
+        // resources for the same reason they are: this destructor is the only
+        // place that knows the backend is going away.
+        if (nodal_done_event != nullptr) cudaEventDestroy(nodal_done_event);
         if (ndev_dbl) cudaFree(ndev_dbl);
         if (ndev_int) cudaFree(ndev_int);
         if (stream) cudaStreamDestroy(stream);
@@ -2079,6 +2084,12 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     // the two halves of a drive cannot disagree about which mode this is.
     const bool hybrid_even = !rasberyGpuNodalFullEnabled();
     Impl& d = *_impl;
+    // W3 item 2: the pending event describes ONE drive.  Cleared HERE, before
+    // any early return, so a drive that refuses -- the batch arena took it, the
+    // allocation failed, the enqueue failed -- cannot leave the previous drive's
+    // event standing for the caller to wait on.  It is set again only at the
+    // very end, and only when this drive actually deferred.
+    d.nodal_drain_deferred = false;
     if (!d.available || host.nxyz <= 0 || host.nsurf <= 0) return false;
 
     // ---- multi-instance batch arena ---------------------------------------
@@ -2787,9 +2798,17 @@ void XsReconBackend::setCanonicalNodalSegmentMode(bool in_segment, bool device_o
                        gpu::canonicalBit(gpu::CanonicalRegion::Phis));
 }
 
-void* XsReconBackend::nodalCompletionEvent() const {
-    const Impl& d = *_impl;
-    return d.nodal_drain_deferred ? static_cast<void*>(d.nodal_done_event) : nullptr;
+void* XsReconBackend::nodalCompletionEvent() {
+    Impl& d = *_impl;
+    if (!d.nodal_drain_deferred) return nullptr;
+    // CONSUME-ONCE.  The event describes the drive that just ran, and the
+    // caller's wait is what discharges it.  Leaving the flag up would hand the
+    // NEXT outer -- whose drive may have taken the CPU body and enqueued
+    // nothing at all -- an event from an older drive to wait on: harmless
+    // today, because that event is long since complete, and exactly the kind of
+    // stale handover that stops being harmless the moment anything overlaps.
+    d.nodal_drain_deferred = false;
+    return static_cast<void*>(d.nodal_done_event);
 }
 
 unsigned long long XsReconBackend::canonicalUploadsElided() const {

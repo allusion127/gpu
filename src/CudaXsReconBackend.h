@@ -205,10 +205,15 @@ public:
     /// UNORDERED read on the path that did not -- so the runner asks for it once
     /// per outer and waits, rather than assuming either answer.
     ///
+    /// CONSUME-ONCE, which is why it is not const: the event describes ONE
+    /// drive, and reading it is what discharges it.  The next outer's drive may
+    /// take the CPU body and enqueue nothing, and it must not inherit this
+    /// answer.
+    ///
     /// Returned as void* so Driver.h and the runner's hook table stay free of
     /// <cuda_runtime.h>; the one place that casts it back is the runner, which
-    /// is a .cu.  Valid until the next solveNodal on this backend.
-    [[nodiscard]] void* nodalCompletionEvent() const;
+    /// is a .cu.
+    [[nodiscard]] void* nodalCompletionEvent();
 
     /// Receipt: how many routine per-outer transfers the sharing removed.
     [[nodiscard]] unsigned long long canonicalUploadsElided() const;

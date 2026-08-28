@@ -65,7 +65,7 @@ void XsReconBackend::setCanonicalNodalSegmentMode(bool, bool) {}
 
 std::uint32_t XsReconBackend::materializeMask() const { return 0u; }
 
-void*              XsReconBackend::nodalCompletionEvent() const { return nullptr; }
+void*              XsReconBackend::nodalCompletionEvent() { return nullptr; }
 unsigned long long XsReconBackend::canonicalUploadsElided() const { return 0; }
 
 unsigned long long XsReconBackend::canonicalDownloadsElided() const { return 0; }
