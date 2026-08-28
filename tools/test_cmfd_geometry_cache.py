@@ -66,7 +66,7 @@ for token in ("_g.lklr", "_g.idirlr", "_g.lktosfc", "_g.neib", "_g.hmesh", "_g.v
 
 for signature, forbidden in (
     ("void CMFD::upddtil(const int& ls)", ("_g.lklr", "_g.idirlr", "_g.hmesh", "_g.albedo")),
-    ("void CMFD::upddhat(const int& ls, double* flux, double* jnet)", ("_g.lklr",)),
+    ("void CMFD::upddhat(const int& ls, const double* flux, double* jnet)", ("_g.lklr",)),
     ("void CMFD::setls(const int& l)", ("_g.lktosfc", "_g.hmesh", "_g.vol")),
     ("void CMFD::updpsi(const int& l, const double* flux)", ("_g.vol",)),
 ):

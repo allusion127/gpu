@@ -607,7 +607,7 @@ void Nodal::calculateJnet2n(const int& ls) {
     }
 }
 
-void Nodal::reset(const double& reigv, double* jnet, double* phif, double* phis) {
+void Nodal::reset(const double& reigv, double* jnet, const double* phif, double* phis) {
     _flux  = phif;
     _jnet  = jnet;
     _phis  = phis;

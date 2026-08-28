@@ -121,7 +121,7 @@ public:
     virtual void upddtil() = 0;
 
     /// @brief update the d_hat for CMFD
-    virtual void upddhat(double* flux, double* jnet) = 0;
+    virtual void upddhat(const double* flux, double* jnet) = 0;
 
     /// @brief set the linear system for CMFD
     /// @param eigv the eigenvalue
@@ -130,7 +130,7 @@ public:
     /// @brief update the net current for CMFD
     /// @param flux the flux
     /// @param jnet the net current
-    virtual void updjnet(double* flux, double* jnet) = 0;
+    virtual void updjnet(const double* flux, double* jnet) = 0;
 
     /// @brief update the fission source term for CMFD
     /// @param flux the flux
@@ -149,7 +149,7 @@ public:
     void upddtil(const int& ls);
 
     /// @brief update d_hat for each surface
-    void upddhat(const int& ls, double* flux, double* jnet);
+    void upddhat(const int& ls, const double* flux, double* jnet);
 
     /// @brief setup the linear system element for each node for CMFD calculation
     void setls(const int& l);

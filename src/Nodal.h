@@ -113,7 +113,7 @@ private:
     double* _jnet;
 
     /// @brief flux in each node
-    double* _flux;
+    const double* _flux; // -> Geometry::Phif(), READ-ONLY
 
     /// @brief surface flux at left or right of each surface
     double* _phis;
@@ -136,7 +136,7 @@ public:
     /// @param jnet the net current
     /// @param phif the node flux
     /// @param phis the surface flux
-    void reset(const double& reigv, double* jnet, double* phif, double* phis);
+    void reset(const double& reigv, double* jnet, const double* phif, double* phis);
 
     /// @brief run the nodal calculation and update the net current
     void drive();

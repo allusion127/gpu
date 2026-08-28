@@ -439,7 +439,7 @@ elif 0 <= _converged < _charge:
 # The host loop must remain the reference path: the delegation is an ADDITION,
 # never a replacement, so the host outer body still has to be there verbatim.
 for anchor in ("ctx.cmfd_solver.updpsi(ctx.geometry.Phif());",
-               "ctx.cmfd_solver.drive(eigv, ctx.geometry.Phif(), residual);",
+               "ctx.cmfd_solver.drive(eigv, ctx.geometry.PhifMutable(), residual);",
                "ctx.cmfd_solver.upddhat(ctx.geometry.Phif(), ctx.geometry.Jnet());"):
     if DRIVER_CODE.count(anchor) < 2:
         problems.append("Driver.h: the host outer body no longer appears in both "
@@ -456,7 +456,7 @@ if "if (!outer_on_device) {" not in SOLVELOOP:
                     "delegation must SKIP the body, not replace it -- the body is the "
                     "reference every B0 comparison is against")
 for anchor_line in ("ctx.cmfd_solver.updpsi(ctx.geometry.Phif());",
-                    "ctx.cmfd_solver.drive(eigv, ctx.geometry.Phif(), residual);",
+                    "ctx.cmfd_solver.drive(eigv, ctx.geometry.PhifMutable(), residual);",
                     "ctx.cmfd_solver.upddhat(ctx.geometry.Phif(), ctx.geometry.Jnet());"):
     if anchor_line not in SOLVELOOP:
         problems.append(f"Driver.h: SolveLoop no longer contains {anchor_line!r}; the host "

@@ -202,7 +202,7 @@ void BICGCMFD::upddtil() {
     }
 }
 
-void BICGCMFD::upddhat(double* flux, double* jnet) {
+void BICGCMFD::upddhat(const double* flux, double* jnet) {
     // Rev.7.1 Task 9: one relaxed increment per SWEEP, so a receipt can say
     // whether the device outer actually replaced this loop (HostOuterBodyCounters.h).
     hostouter::bumpHostBody(hostouter::counters().upddhat);
@@ -287,7 +287,7 @@ void BICGCMFD::updls(const int& l, const double& reigvs) {
     }
 }
 
-void BICGCMFD::updjnet(double* flux, double* jnet) {
+void BICGCMFD::updjnet(const double* flux, double* jnet) {
     // Rev.7.1 Task 9: one relaxed increment per SWEEP, so a receipt can say
     // whether the device outer actually replaced this loop (HostOuterBodyCounters.h).
     hostouter::bumpHostBody(hostouter::counters().updjnet);

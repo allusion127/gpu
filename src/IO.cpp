@@ -957,7 +957,7 @@ void IO::ReadInput(const std::string& filepath) {
             std::vector<double> flux;
             rfile.getDataSet("flux").read(flux);
             if (flux.size() == sz)
-                std::copy_n(flux.data(), sz, _g.Phif());
+                std::copy_n(flux.data(), sz, _g.PhifMutable());
         }
 
         PLOG_INFO << "Restart: burnup, isotope densities and flux loaded from " << _restart_path;

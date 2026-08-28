@@ -72,7 +72,7 @@ private:
     double _reigv; // reciprocal of eigenvalue (1/k_eff)
 
     // Pointers to Geometry-owned nodal arrays
-    double* _phif; // -> g.Phif()
+    const double* _phif; // -> g.Phif(), READ-ONLY (Geometry.h)
     double* _phis; // -> g.Phis()
     double* _jnet; // -> g.Jnet()
 
@@ -150,7 +150,7 @@ public:
     ~PPR() = default;
 
     /// @brief Reset pointers and recompute buckling / corner flux / fitting coefficients
-    void reset(const double reigv, double* jnet, double* phif, double* phis);
+    void reset(const double reigv, double* jnet, const double* phif, double* phis);
 
     double getPhis(int side, int dir, int lk, int g);
 

@@ -176,7 +176,7 @@ void PPR::buildStencil(int lk, int idx[3][3], bool xrev[3][3], bool yrev[3][3]) 
     }
 }
 
-void PPR::reset(const double reigv, double* jnet, double* phif, double* phis) {
+void PPR::reset(const double reigv, double* jnet, const double* phif, double* phis) {
 
     // 1. Get mesh information and initialize variables
     _reigv = reigv;

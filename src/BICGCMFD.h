@@ -247,7 +247,7 @@ public:
     void upddtil() override;
 
     /// @brief update d_hat for CMFD
-    void upddhat(double* flux, double* jnet) override;
+    void upddhat(const double* flux, double* jnet) override;
 
     /// @brief setup the linear system for CMFD
     /// @param eigv the eigenvalue
@@ -256,7 +256,7 @@ public:
     /// @brief update the net current for CMFD
     /// @param flux the flux
     /// @param jnet the net current
-    void updjnet(double* flux, double* jnet) override;
+    void updjnet(const double* flux, double* jnet) override;
 
     /// @brief update the fission source term for CMFD
     /// @param flux the flux

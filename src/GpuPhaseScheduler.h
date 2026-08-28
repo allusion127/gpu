@@ -401,7 +401,7 @@ struct OuterQuantumStep {
 inline constexpr OuterQuantumStep kOuterQuantumSteps[] = {
     {"updpsi",     "ctx.cmfd_solver.updpsi(ctx.geometry.Phif());"},
     {"setls",      "ctx.cmfd_solver.setls(eigv);"},
-    {"drive",      "ctx.cmfd_solver.drive(eigv, ctx.geometry.Phif(), residual);"},
+    {"drive",      "ctx.cmfd_solver.drive(eigv, ctx.geometry.PhifMutable(), residual);"},
     // Rev.7.1 Task 10 moved the DECLARATION out of the outer body -- SolveLoop
     // now hoists `bool flux_converged` so the device delegation can supply it --
     // so the anchor is the ASSIGNMENT, which is where the test still lives.

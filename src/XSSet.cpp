@@ -3340,7 +3340,7 @@ void XSSet::UpdateBurnup(double dt, double power) {
                                 static_cast<std::uint64_t>(_g.nxyz()));
     const int     ng   = _g.ng();
     const int     nxyz = _g.nxyz();
-    double* const flux = _g.Phif();
+    const double* const flux = _g.Phif();
 
     const double norm_factor = NormFactor(power);
 
@@ -4019,7 +4019,7 @@ void XSSet::DepleteNode(DepletionWorkspace& ws, size_t l,
 void XSSet::Deplete(double dt, double power, bool xe_transient) {
     const int     ng   = _g.ng();
     const int     nxyz = _g.nxyz();
-    double* const flux = _g.Phif();
+    const double* const flux = _g.Phif();
 
     const double norm_factor = NormFactor(power);
 
@@ -4900,7 +4900,7 @@ void XSSet::SetPowerRate(double power_rate) {
 }
 
 void XSSet::ResetFluxAndCurrents(double flux_value) {
-    std::fill_n(_g.Phif(), static_cast<size_t>(_g.ngxyz()), flux_value);
+    std::fill_n(_g.PhifMutable(), static_cast<size_t>(_g.ngxyz()), flux_value);
 
     const size_t surface_size = static_cast<size_t>(LR) * static_cast<size_t>(_g.ng()) *
                                 static_cast<size_t>(NDIRMAX) * static_cast<size_t>(_g.nxyz());
@@ -4923,8 +4923,11 @@ void XSSet::NormalizeFluxSign() {
         return;
 
     const size_t flux_size = static_cast<size_t>(_g.ngxyz());
+    // Hoisted: PhifMutable() bumps the flux generation, and this is ONE write
+    // of the array, not ngxyz of them.
+    double* const phif = _g.PhifMutable();
     for (size_t i = 0; i < flux_size; ++i)
-        _g.Phif()[i] = -_g.Phif()[i];
+        phif[i] = -phif[i];
 
     const size_t surface_size = static_cast<size_t>(LR) * static_cast<size_t>(ng) *
                                 static_cast<size_t>(NDIRMAX) * static_cast<size_t>(nxyz);

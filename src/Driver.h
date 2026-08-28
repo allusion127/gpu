@@ -896,7 +896,7 @@ private:
         // cannot outlive the caller that made it true.
         h.ctx->cmfd_solver.setOuterSegmentResident(true);
         h.ctx->cmfd_solver.setls(*h.eigv);
-        h.ctx->cmfd_solver.drive(*h.eigv, h.ctx->geometry.Phif(), *h.residual);
+        h.ctx->cmfd_solver.drive(*h.eigv, h.ctx->geometry.PhifMutable(), *h.residual);
         h.ctx->cmfd_solver.setOuterSegmentResident(false);
 
         // NO DEVICE-ONLY SIGNALS FROM A HOST-DRIVEN DRIVE.
@@ -959,7 +959,7 @@ private:
         // because a refused enqueue has no finish half.
         h.ctx->cmfd_solver.setOuterSegmentResident(true);
         h.ctx->cmfd_solver.setls(*h.eigv);
-        if (h.ctx->cmfd_solver.enqueueDrive(*h.eigv, h.ctx->geometry.Phif(), *h.residual,
+        if (h.ctx->cmfd_solver.enqueueDrive(*h.eigv, h.ctx->geometry.PhifMutable(), *h.residual,
                                             sink)) {
             h.enqueued = true;
             return true;
@@ -971,7 +971,7 @@ private:
         // is about to read), and a blocking drive would read those arrays while
         // the copies were still filling them.
         h.ctx->cmfd_solver.syncSweepStream();
-        h.ctx->cmfd_solver.drive(*h.eigv, h.ctx->geometry.Phif(), *h.residual);
+        h.ctx->cmfd_solver.drive(*h.eigv, h.ctx->geometry.PhifMutable(), *h.residual);
         h.ctx->cmfd_solver.setOuterSegmentResident(false);
         // The blocking drive resolved the retry and the Rayleigh hand-back
         // before returning, so these two are what THIS drive observed rather
@@ -995,7 +995,7 @@ private:
         h.enqueued                   = false;
         bool          host_continued = false;
         const bool    ok =
-            h.ctx->cmfd_solver.finishDrive(*h.eigv, h.ctx->geometry.Phif(), *h.residual,
+            h.ctx->cmfd_solver.finishDrive(*h.eigv, h.ctx->geometry.PhifMutable(), *h.residual,
                                            host_continued);
         // LOWERED ON EVERY EXIT, including the failure.  finishDrive is the end
         // of the drive the enqueue half raised the flag for; leaving it up on a
@@ -1301,7 +1301,7 @@ private:
             }
             ctx.cmfd_solver.updpsi(ctx.geometry.Phif());
             ctx.cmfd_solver.setls(eigv);
-            ctx.cmfd_solver.drive(eigv, ctx.geometry.Phif(), residual);
+            ctx.cmfd_solver.drive(eigv, ctx.geometry.PhifMutable(), residual);
             ++total_outer;
             const bool converged = std::abs(prev_inner - eigv) < keff_tol && residual < flux_tol;
             prev_inner           = eigv;
@@ -2128,7 +2128,7 @@ private:
             }
             {
                 outer_timing::Scope t(sptelem::PH_DRIVE);
-                ctx.cmfd_solver.drive(eigv, ctx.geometry.Phif(), residual);
+                ctx.cmfd_solver.drive(eigv, ctx.geometry.PhifMutable(), residual);
             }
             ++total_outer;
             // Exactly one cause bucket per outer, charged to the segment this

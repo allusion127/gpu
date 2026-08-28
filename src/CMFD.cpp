@@ -1,4 +1,4 @@
-﻿#include "CMFD.h"
+#include "CMFD.h"
 
 #include "HostPinRegistry.h"
 
@@ -123,7 +123,7 @@ void CMFD::upddtil(const int& ls) {
     }
 }
 
-void CMFD::upddhat(const int& ls, double* flux, double* jnet) {
+void CMFD::upddhat(const int& ls, const double* flux, double* jnet) {
     const int ll = cachedSurfaceNode(LEFT, ls);
     const int lr = cachedSurfaceNode(RIGHT, ls);
 

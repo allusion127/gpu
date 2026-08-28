@@ -392,9 +392,43 @@ private:
     double* _phis; // surface-averaged scalar flux [LR * ng * NDIRMAX * nxyz]
     double* _psi;  // fission source [nxyz]
 
+    /// How many times a HOST writer has moved _phif.
+    ///
+    /// WHAT IT IS FOR.  The device outer segment uploads the flux at the top of
+    /// every outer because the sweep's own download is conditional -- it only
+    /// happens when the device sweep finished, which the Wielandt warm-up and
+    /// every declined enqueue do not.  681 KiB per outer of that upload is
+    /// copying an array onto itself, and the only safe way to tell which outers
+    /// those are is to ask whether a host writer has touched it since.
+    ///
+    /// A GENERATION AND NOT A FLAG, because there are several readers with
+    /// different memories of when they last looked.
+    unsigned long long _phif_generation = 1;
+
 public:
-    /// @brief Node-averaged scalar flux array [ng * nxyz]
-    inline double* Phif() { return _phif; }
+    /// @brief Node-averaged scalar flux array [ng * nxyz], READ-ONLY.
+    ///
+    /// CONST SO THE COMPILER ENUMERATES THE WRITERS.  A generation that every
+    /// writer has to remember to bump is a generation that is wrong the first
+    /// time somebody forgets; the only enforceable version is one where writing
+    /// requires going through a door that bumps it, and reading cannot.  Every
+    /// caller that needs to WRITE the flux now says so at the call site.
+    inline const double* Phif() const { return _phif; }
+
+    /// @brief The same array, for a caller that is about to WRITE it.
+    ///
+    /// Bumps the flux generation.  Conservative by construction: it counts
+    /// intent, not actual modification, so a caller that takes the pointer and
+    /// writes nothing costs one skipped elision and never a stale read.
+    inline double* PhifMutable() {
+        ++_phif_generation;
+        return _phif;
+    }
+
+    /// See _phif_generation.
+    [[nodiscard]] inline unsigned long long fluxGeneration() const {
+        return _phif_generation;
+    }
 
     /// @brief Surface-averaged net current array
     inline double* Jnet() { return _jnet; }
