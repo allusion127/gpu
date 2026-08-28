@@ -1318,8 +1318,7 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     //      of 14552 passes are DISCOVERY-ONLY: they synchronise, see the exit,
     //      and break without committing an outer.
     //
-    //      IT CAN BE REMOVED WITHOUT (1), AND HERE IS THE SHAPE, because it is
-    //      worth 43% of b8's rendezvous on its own.  Nothing between the sweep
+    //      IT CAN BE REMOVED WITHOUT (1), AND HERE IS THE SHAPE.  Nothing between the sweep
     //      and upddhat touches the three inputs of the convergence decision
     //      (eigv, residual, prev_inner) -- that is the same argument the header
     //      note makes for evaluating the decision AFTER upddhat, run backwards --
@@ -1344,6 +1343,21 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     //      -- so a re-issue recomputes from an unmutated state.  That is a real
     //      change to the tree's most delicate kernel and it belongs in its own
     //      gated commit, not as a rider on this one.
+    //
+    //      AND SIZE IT BEFORE BUILDING IT, because the rendezvous COUNT
+    //      overstates it.  Removing this drain deletes 11341 of b8's 26643
+    //      rendezvous -- 43% of the count -- but a rendezvous is not a wall.
+    //      This one waits for outer i's TAIL (upddhat, the refresh, the
+    //      decision, the transition and a 32-byte D2H), so what it costs is not
+    //      the round trip, it is the failure to overlap that tail with the
+    //      enqueue of outer i+1's front half: tens of microseconds times 11341,
+    //      order half a second of a 44.5 s server run.  `sync_pre_nodal` is a
+    //      different animal -- it waits for the SWEEP, which is real work, so
+    //      deleting it does not save its duration either.  What (1) actually
+    //      buys is the end of the serialisation: with the body captured, the
+    //      device stops going idle while the host observes, launches and asks
+    //      about cusping.  Whoever picks this up should measure that idle window
+    //      on the 238 box FIRST and let the number choose the order of work.
     //
     // MEASURED ON THE LOCAL BOX (tools/probe_conditional_graph.cu, CUDA 12.6,
     // sm_61, GTX 1080 Ti): WHILE conditional nodes are legal and the handle
