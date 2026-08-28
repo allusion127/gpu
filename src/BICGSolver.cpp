@@ -50,18 +50,39 @@ BICGSolver::BICGSolver(Geometry& g)
     // solves CMFD on the CPU.  It exists as the control experiment for the
     // batch mode -- "is this the arena or is this the rest of RASBERY?" -- and
     // doubles as an in-process multi-instance runner on machines with no GPU.
-    if (rasberyBatchWidth() > 0 && std::getenv("RASBERY_BATCH_CPU") == nullptr) {
+    const char* gpu_env = std::getenv("RASBERY_GPU");
+    const bool  gpu_requested = gpu_env != nullptr && std::string(gpu_env) != "0";
+
+    // Rev.7.1 Task 6: RESIDENT SINGLE.  Before this, the arena existed only
+    // under --batch-mode, so canUseDeviceAssembly() (BICGCMFD.cpp:207-217) --
+    // which requires `_ls->arena() != nullptr` -- refused for every normal
+    // single run.  The resident device assembly and the device-resident sweeps
+    // were therefore reachable only by asking for a batch of one, which is not
+    // how anybody runs a single deck.
+    //
+    // RASBERY_GPU_CMFD_RESIDENT_SINGLE opens the same arena at width 1.  It
+    // still needs RASBERY_GPU: this is a CUDA path, and a flag that silently
+    // turned the GPU on would be a worse surprise than one that does nothing.
+    const bool resident_single =
+        rasberyBatchWidth() == 0 && rasberyResidentSingleCmfd() && gpu_requested;
+
+    if ((rasberyBatchWidth() > 0 || resident_single) &&
+        std::getenv("RASBERY_BATCH_CPU") == nullptr) {
         _arena      = rasberyBatchArena(_g);
         _batch_slot = _arena->acquireSlot();
         if (_batch_slot < 0)
             throw std::runtime_error(
-                "batch mode: no free instance slot (more concurrent instances than --batch-mode M)");
+                resident_single
+                    ? "RASBERY_GPU_CMFD_RESIDENT_SINGLE: the width-1 arena is already "
+                      "taken; resident-single supports exactly one concurrent instance"
+                    : "batch mode: no free instance slot (more concurrent instances than --batch-mode M)");
         _use_cuda = true;
+        if (resident_single)
+            std::cout << "[RASBERY][CUDA] CMFD resident-single arena (width 1)" << std::endl;
         return;
     }
 
-    const char* gpu_env = std::getenv("RASBERY_GPU");
-    if (gpu_env != nullptr && std::string(gpu_env) != "0") {
+    if (gpu_requested) {
         _cuda = std::make_unique<CudaBICGBackend>(_g);
         if (!_cuda->available())
             throw std::runtime_error("RASBERY_GPU requested but unavailable: " + _cuda->status());

@@ -82,6 +82,13 @@ build-*/
 /test/**
 !/test/*.cpp
 !/test/*.h
+# .cu belongs here for the same reason .cpp does.  Without it every device test
+# had to be `git add -f`'d, and one of them -- test/nodal_mine_device.cu, the
+# miner behind NODAL_FORMS in src/NodalKernel.h -- was simply forgotten, leaving
+# CMakeLists.txt naming a source no clone had.  That took the whole
+# RASBERY_ENABLE_TESTS=ON configure down until Task 5 guarded it.  This line is
+# the cause; the guard was the symptom.
+!/test/*.cu
 !/test/.gitignore
 !/test/reference/
 !/test/reference/*.json

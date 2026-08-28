@@ -64,6 +64,21 @@ enum ScalarSlot : int {
     kGammaN,
     kErrAcc,
     kNgxyz,       ///< ng*nxyz, for the all-negative reset rule
+    // ---- Rev.7.1 Task 6 Step 3: the sweep-slot budget, off the graph key ----
+    //
+    // `unroll` used to be a CAPTURE-TIME loop bound and part of the graph cache
+    // key.  It is the REMAINING sweep budget (`_ncmfd - iout`, BICGCMFD.cpp:394)
+    // and _ncmfd is 5 (Driver.h:2114), so it walked 5,4,3,... and back to 5 on
+    // the next drive() -- the sweep graph was destroyed and rebuilt continuously
+    // and graph_reinstantiations climbed for the whole run.
+    //
+    // Moving it here makes the captured graph CAPACITY instead of
+    // configuration: it may hold more slots than a launch may spend, and the
+    // excess halt in cmfd_sweep_begin before touching anything.  That is what
+    // makes a deeper capture bit-identical to an exact one rather than merely
+    // similar.
+    kSweepSlotBudget, ///< sweep slots this launch may spend (was `unroll`)
+    kSweepSlots,      ///< slots spent so far in this launch
     kScalarCount
 };
 
@@ -1577,7 +1592,33 @@ __global__ void cmfd_sweep_begin(double* scalars, std::uint32_t* sweep_halt) {
     if (threadIdx.x != 0) return;
     const int m = static_cast<int>(blockIdx.y);
     if (sweep_halt[m] != 0u) return;
-    double* sm    = scalars + static_cast<long long>(m) * kScalarCount;
+    double* sm = scalars + static_cast<long long>(m) * kScalarCount;
+
+    // Rev.7.1 Task 6 Step 3.  The captured graph is CAPACITY: it can hold more
+    // sweep slots than this launch may spend, so the slot budget is a DEVICE
+    // scalar and the excess halts HERE -- at the first kernel of the slot,
+    // before anything is read or written.
+    //
+    // This is what makes over-capture bit-identical rather than merely similar.
+    // A halted slot's every later kernel returns on its first instruction:
+    // cmfd_src_build, cmfd_wiel_terms, cmfd_wiel_finalize, cmfd_updls,
+    // cmfd_negative_scan and cmfd_sweep_end all test sweep_halt, and the whole
+    // inner BiCGSTAB is masked too because initialize_solver_state folds
+    // sweep_halt into `halt` and returns before it touches scalars, flags or
+    // counters.  So a graph of depth D launched with a budget of U < D slots
+    // executes exactly what a depth-U graph would have.
+    //
+    // Note this is the SLOT budget, not kSweepBudget.  kSweepBudget counts
+    // ADVANCES (cmfd_sweep_end skips the increment on a negative-flux retry);
+    // this counts attempts.  Conflating them would silently change how many
+    // retries fit in one launch, which is the one observable the host's
+    // `state == 0` loop reacts to.
+    if (sm[kSweepSlots] >= sm[kSweepSlotBudget]) {
+        sweep_halt[m] = 1u;
+        return;
+    }
+    sm[kSweepSlots] += 1.0;
+
     sm[kReigvdel] = sm[kReigv] - sm[kReigvs];
     sm[kNegative] = 0.0;
     sm[kIcmfdDone] += 1.0; // host ++icmfd at the top of each pass
@@ -2736,14 +2777,20 @@ public:
     }
 
     /// Graph-cached counterpart of launch_outer for the sweep sequence.
+    ///
+    /// `unroll` is now a CAPACITY request, not a configuration: the launch may
+    /// spend at most that many sweep slots, and the device enforces it through
+    /// kSweepSlotBudget (issueSweepUploads stamps it).  A captured graph that is
+    /// deeper serves the launch unchanged, so the cache only ever grows -- see
+    /// SweepGraphCapacity in CudaBICGBackend.h for why that is exact and not an
+    /// approximation.
     void launch_sweeps(int nmax, int unroll) {
         if (!use_graph) {
             enqueue_sweeps(nmax, unroll);
             return;
         }
-        if (sweep_graph_exec == nullptr || sweep_graph_nmax != nmax ||
-            sweep_graph_unroll != unroll ||
-            sweep_graph_precision != precisionTag()) {
+        if (!sweep_graph.serves(nmax, unroll, precisionTag())) {
+            const int depth = sweep_graph.captureDepth(unroll);
             if (sweep_graph_exec != nullptr) {
                 CUDA_CHECK(cudaGraphExecDestroy(sweep_graph_exec));
                 sweep_graph_exec = nullptr;
@@ -2752,7 +2799,7 @@ public:
             cudaGraph_t graph = nullptr;
             cudaError_t rc = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
             if (rc == cudaSuccess) {
-                enqueue_sweeps(nmax, unroll);
+                enqueue_sweeps(nmax, depth);
                 rc = cudaStreamEndCapture(stream, &graph);
             }
             if (rc == cudaSuccess)
@@ -2764,14 +2811,13 @@ public:
                 // only execution.
                 cudaGetLastError();
                 sweep_graph_exec = nullptr;
+                sweep_graph      = SweepGraphCapacity{};
                 use_graph        = false;
                 ++telemetry.graph_fallbacks;
                 enqueue_sweeps(nmax, unroll);
                 return;
             }
-            sweep_graph_nmax      = nmax;
-            sweep_graph_unroll    = unroll;
-            sweep_graph_precision = precisionTag();
+            sweep_graph = SweepGraphCapacity{nmax, depth, precisionTag()};
         }
         CUDA_CHECK(cudaGraphLaunch(sweep_graph_exec, stream));
         ++telemetry.graph_launches;
@@ -2783,7 +2829,18 @@ public:
     /// The per-slot sweep_halt starts at 0 for participants, 1 for everyone
     /// else -- and is restored to all-zero by finishSweeps so the plain solve
     /// path never sees a stale mask.
-    void issueSweepUploads(const int* active_slots, int count) {
+    /// `slot_budget` is how many sweep slots THIS launch may spend -- the value
+    /// that used to be the graph's capture depth.  It is stamped into every
+    /// participant's staged scalar block here, right before the H2D, because it
+    /// is a property of the launch and not of any one slot: the pre-Task-6 code
+    /// gave every participant the batch-wide max, and preserving that exactly is
+    /// what keeps the retry packing (and therefore `state == 0`) unchanged.
+    void issueSweepUploads(const int* active_slots, int count, int slot_budget) {
+        for (int i = 0; i < count; ++i) {
+            Slot& sl = slot[static_cast<size_t>(active_slots[i])];
+            sl.sweep_in[kSweepSlotBudget - kSweepFirst] = static_cast<double>(slot_budget);
+            sl.sweep_in[kSweepSlots - kSweepFirst]      = 0.0;
+        }
         std::memset(host_active, 0, static_cast<size_t>(slots) * sizeof(std::uint32_t));
         std::fill(host_assembly_active.begin(), host_assembly_active.end(), 0u);
         for (int i = 0; i < count; ++i) {
@@ -3057,9 +3114,8 @@ public:
         }
         if (sweep_graph_exec != nullptr) {
             cudaGraphExecDestroy(sweep_graph_exec);
-            sweep_graph_exec   = nullptr;
-            sweep_graph_nmax   = -1;
-            sweep_graph_unroll = -1;
+            sweep_graph_exec = nullptr;
+            sweep_graph      = SweepGraphCapacity{};
             ++telemetry.graph_reinstantiations;
         }
         std::cerr << "[RASBERY][CUDA][FP32_FALLBACK] {\"reason\":\"nonfinite\","
@@ -3136,7 +3192,7 @@ public:
     /// Which kernel set the cached graphs were captured with.
     [[nodiscard]] int precisionTag() const { return fp32Active() ? 1 : 0; }
     int           graph_precision = -1;
-    int           sweep_graph_precision = -1;
+    // (the sweep graph's precision now lives in SweepGraphCapacity::precision)
     /// Float mirrors of the operator.  Written ONLY by
     /// refresh_operator_mirror_f32; the double diag/cc stay authoritative.
     float*        diag_f = nullptr;
@@ -3161,8 +3217,10 @@ public:
     std::uint32_t* sweep_halt = nullptr; ///< all-zero outside the sweep path
     std::uint32_t* device_assembly_active = nullptr;
     cudaGraphExec_t sweep_graph_exec = nullptr;
-    int             sweep_graph_nmax = -1;
-    int             sweep_graph_unroll = -1;
+    /// Replaces the old (nmax, unroll, precision) triple.  `unroll` is gone from
+    /// the key entirely -- it lives in kSweepSlotBudget now -- and what is left
+    /// is a capacity that only grows.  See SweepGraphCapacity in the header.
+    SweepGraphCapacity sweep_graph{};
 
     long long node_stride() const { return static_cast<long long>(nxyz); }
 };
@@ -3450,7 +3508,13 @@ void CudaBatchArena::stageSweeps(int m, const CmfdSweepIO& io) {
     in[kGammaN - kSweepFirst]      = 0.0;
     in[kErrAcc - kSweepFirst]      = 0.0;
     in[kNgxyz - kSweepFirst]       = static_cast<double>(io.ngxyz);
-    sl.sweep_unroll                = io.sweep_budget;
+    // The slot budget is a LAUNCH property (the batch-wide max), so it is
+    // stamped by issueSweepUploads once the participant set is known.  Seeded
+    // here only so a staged-but-never-launched block is not left holding a
+    // stale budget from the previous drive.
+    in[kSweepSlotBudget - kSweepFirst] = static_cast<double>(io.sweep_budget);
+    in[kSweepSlots - kSweepFirst]      = 0.0;
+    sl.sweep_unroll                    = io.sweep_budget;
 }
 
 void CudaBatchArena::solveSweeps(int m, double* out_phi, CmfdSweepIO& io) {
@@ -3602,7 +3666,7 @@ void CudaBatchArena::solveCommon(int m, double* out_phi, int kind) {
                                  static_cast<int>(participants.size()));
                 } else {
                     a.core.issueSweepUploads(participants.data(),
-                                             static_cast<int>(participants.size()));
+                                             static_cast<int>(participants.size()), unroll);
                     a.core.launch_sweeps(nmax, unroll);
                     a.core.issueFluxDownloads(participants.data(),
                                               static_cast<int>(participants.size()));
@@ -3688,10 +3752,26 @@ void rasberySetBatchWidth(int slots) { g_batch_width = slots > 0 ? slots : 0; }
 
 int rasberyBatchWidth() { return g_batch_width; }
 
+/// Rev.7.1 Task 6.  Read once, like every other RASBERY_* gate, so the flag
+/// cannot change meaning halfway through a run.
+bool rasberyResidentSingleCmfd() {
+    static const bool on = [] {
+        const char* v = std::getenv("RASBERY_GPU_CMFD_RESIDENT_SINGLE");
+        return v != nullptr && std::string(v) != "0";
+    }();
+    return on;
+}
+
 CudaBatchArena* rasberyBatchArena(Geometry& geometry) {
     std::lock_guard<std::mutex> lock(g_arena_mutex);
     if (!g_arena) {
-        g_arena = std::make_unique<CudaBatchArena>(geometry, g_batch_width);
+        // Width 1 is the resident-single case (Task 6): no --batch-mode, one
+        // physical slot, and the SAME BatchCore kernels.  There is deliberately
+        // no separate single-instance kernel set -- a second path would be a
+        // second thing to keep bit-identical, which is the cost the whole task
+        // exists to avoid.
+        const int width = g_batch_width > 0 ? g_batch_width : 1;
+        g_arena = std::make_unique<CudaBatchArena>(geometry, width);
         if (!g_arena->available()) {
             const std::string message = g_arena->status();
             g_arena.reset();

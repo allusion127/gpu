@@ -249,13 +249,27 @@ struct DeviceSlotView {
     // --- flux / current state ---
     double* phif; ///< [l*ng + ig]  (AoS, matching Geometry::Phif)
     double* phis; ///< [((l*NDIRMAX + dir)*LR + side)*ng + ig]
-    double* jnet; ///< same shape as phis
+    double* jnet; ///< [ls*ng + ig], surface-indexed (Geometry::Jnet; CMFD.cpp:6)
     double* psi;  ///< [nxyz]
     double* phic; ///< [(l*ng + ig)*NEWS + corner]
 
     // --- CMFD operator + Krylov workspace ---
-    double* dtil;      ///< [ig*nsurf + ls]
-    double* dhat;      ///< [ig*nsurf + ls]
+    //
+    // dtil/dhat/jnet are [ls*ng + ig] -- the HOST's order (CMFD.h:172-186,
+    // CMFD.cpp:5-6), adopted deliberately for Task 6/7 rather than the
+    // transpose Rev.7 sketched here.  Two reasons, in that order: the Class B0
+    // bodies in CmfdOuterKernel.h are scored bit-for-bit against the CPU loops,
+    // and sharing the host's addressing means the canonical device buffers are
+    // the same bytes rather than a transposed copy -- no transpose kernel, no
+    // second layout to keep in step.
+    //
+    // A coalescing-motivated reorder to [ig*nsurf + ls] is a MEASURED-LATER N1
+    // change, not a free one: it moves every surface kernel's access pattern and
+    // would have to be justified against an L2/DRAM measurement (Task 7 Step 6b)
+    // and re-gated, because a transposed canonical buffer is no longer
+    // byte-shareable with the host arrays.
+    double* dtil;      ///< [ls*ng + ig]  (host order; see the note above)
+    double* dhat;      ///< [ls*ng + ig]
     double* diag;      ///< [l*ng2 + ...]
     double* cc;        ///< [(l*ng + ig)*NEWSBT + dir]
     double* src;       ///< [ig*nxyz + l]

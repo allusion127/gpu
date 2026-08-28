@@ -277,6 +277,53 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// Rev.7.1 Task 6 Step 3: the sweep graph is CAPACITY, not configuration.
+// ---------------------------------------------------------------------------
+
+/// What a captured device-resident CMFD sweep graph is good for.
+///
+/// THE BUG THIS REPLACES.  The graph was keyed on the exact `unroll` it was
+/// captured at, and `unroll` is the REMAINING sweep budget (`_ncmfd - iout`,
+/// BICGCMFD.cpp:394) with _ncmfd = 5 (Driver.h:2114).  So it walked 5,4,3,...
+/// and back to 5 at the next drive(): the topology was destroyed and rebuilt
+/// continuously, `graph_reinstantiations` climbed for the whole run, and Task 10's
+/// instantiation gate could not pass.
+///
+/// THE FIX.  `unroll` became a device scalar (kSweepSlotBudget), so a graph with
+/// MORE slots than a launch may spend is not merely acceptable -- it is exactly
+/// equivalent, because the excess slots halt in cmfd_sweep_begin before reading
+/// or writing anything.  The cache therefore only has to GROW, which it does at
+/// most once per run: the first launch of every drive() asks for the largest
+/// budget there is (iout == 0).
+///
+/// nmax IS STILL AN EXACT KEY, deliberately.  A deeper nmax capture would
+/// over-iterate: `force_halt` is placed at capture time from `1 + nmax`
+/// (CudaBICGBackend.cu, enqueue_outer), so a graph captured for a larger nmax
+/// runs more inner iterations than a smaller request wants.  That is safe to
+/// leave exact because nmax is a PROCESS CONSTANT -- it is read once from
+/// RASBERY_BICG_NMAX in the BICGCMFD constructor, setIterLim has no callers, and
+/// batch mode already refuses a non-uniform nmax -- so it contributes at most
+/// one instantiation per run.  The contract test pins that reasoning.
+struct SweepGraphCapacity {
+    int nmax      = -1; ///< exact key: inner BiCGSTAB budget (a process constant)
+    int slots     = -1; ///< capacity key: sweep slots CAPTURED
+    int precision = -1; ///< exact key: the FP32 fallback changes the topology
+
+    /// Can the captured graph serve a launch wanting `want_slots` slots?
+    [[nodiscard]] constexpr bool serves(int want_nmax, int want_slots,
+                                        int want_precision) const {
+        return slots >= 0 && nmax == want_nmax && precision == want_precision &&
+               slots >= want_slots;
+    }
+
+    /// Depth to capture at.  Never shallower than what is already captured, so
+    /// the capacity ratchets and settles instead of oscillating.
+    [[nodiscard]] constexpr int captureDepth(int want_slots) const {
+        return slots > want_slots ? slots : want_slots;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Process-wide batch-mode plumbing.  main() declares the batch width once,
 // and the first BICGSolver that is constructed afterwards builds the arena
 // from its own Geometry (the shape is not known before a deck is read).
@@ -287,6 +334,17 @@ void rasberySetBatchWidth(int slots);
 
 /// The width declared above (0 when batch mode is off).
 [[nodiscard]] int rasberyBatchWidth();
+
+/// Rev.7.1 Task 6: RASBERY_GPU_CMFD_RESIDENT_SINGLE, default OFF.
+///
+/// With it set, a run WITHOUT --batch-mode still builds the arena -- at width 1
+/// -- so a single instance reaches the resident device assembly and the
+/// device-resident sweeps.  Before this, `_ls->arena()` was null outside batch
+/// mode and canUseDeviceAssembly() (BICGCMFD.cpp:207-217) therefore refused,
+/// which meant the whole resident path was reachable only by asking for a batch
+/// of one.  Nothing about the kernels changes: the same BatchCore drives one
+/// physical slot, so there is no second code path to keep in step.
+[[nodiscard]] bool rasberyResidentSingleCmfd();
 
 /// The process arena, created on first call from @p geometry.  Throws when a
 /// later instance presents an incompatible geometry.
