@@ -2179,6 +2179,17 @@ private:
             gpu::noteOuterSegmentRefusal(gpu_outer_why);
 
         for (int iout = 0; iout < max_iter; ++iout) {
+            // HOW MANY OUTERS THIS PASS OF THE LOOP ACTUALLY RAN.
+            //
+            // One, on the host body.  `seg.device_outers` on the delegated arm,
+            // which is what the stall ladder below has to count: `flux_stall` is
+            // Driver.h's "outers since the flux last converged", and a ladder
+            // that counted PASSES let a budget-8 segment run eight times as far
+            // before the limit cycle was declared.  On kngr_238 statepoint 12 --
+            // the first statepoint whose boron trial point limit-cycles -- that
+            // is 3619 outers against the host's 680, and the search then samples
+            // a different iterate and the whole depletion diverges.
+            int  outers_this_pass = 1;
             // WHERE THE TRACER IS.  Set before anything of this outer runs, so
             // the device runner's step lines carry the same (statepoint, outer)
             // the host arm's do and a single grep aligns the two arms.
@@ -2232,6 +2243,16 @@ private:
                 s.xe_interim_l2   = 0.0;
                 s.xe_once_mode    = 0;
                 s.xe_budget_probe = static_cast<unsigned int>(xe_budget_probe);
+                // THE STALL LADDER'S CARRIED COUNT, UPLOADED LIKE prev_inner.
+                //
+                // Without it the device machine counts from whatever the
+                // previous segment left, and -- worse -- it cannot stop at the
+                // outer this loop's own limit-cycle test would have stopped at.
+                // Seeded, the device's `++st.flux_stall > max_outer_iter` fires
+                // on exactly that outer, so the segment ends there and the
+                // ladder below re-derives the same verdict from
+                // `flux_stall + device_outers`.
+                s.flux_stall      = static_cast<unsigned int>(flux_stall);
 
                 gpu::OuterSegmentResume seg{};
                 if (gpu::rasberyOuterSegment().runSegment(s, rasberyBatchWidth(),
@@ -2241,6 +2262,15 @@ private:
                     prev_inner     = seg.prev_inner;
                     flux_converged = seg.flux_converged != 0;
                     total_outer += static_cast<int>(seg.device_outers);
+                    // CHARGE THE LOOP BOUND IN OUTERS, NOT IN PASSES.
+                    //
+                    // ReconvergeFlux has done this since Task 9 (Driver.h:1402)
+                    // and SolveLoop did not, which made `max_iter` mean
+                    // `max_iter SEGMENTS` on the ON arm -- up to eight times the
+                    // outers the OFF arm is allowed at the same point of the
+                    // solve.  The loop's own ++ supplies the last one.
+                    iout += static_cast<int>(seg.device_outers) - 1;
+                    outers_this_pass = static_cast<int>(seg.device_outers);
                     ctx.telemetry.outers_by_cause[sp_cause] +=
                         static_cast<long long>(seg.device_outers);
                     outer_timing::buckets().outers.fetch_add(seg.device_outers,
@@ -2393,7 +2423,8 @@ private:
             if (xe_interim)
                 flux_stall = 0; // the Xe step below changes the problem; not a stall
             if (!flux_converged && !xe_interim) {
-                if (++flux_stall <= schedule.max_outer_iter)
+                flux_stall += outers_this_pass;
+                if (flux_stall <= schedule.max_outer_iter)
                     continue;
 
                 // Flux limit cycle on this trial point.  Previously this break abandoned the

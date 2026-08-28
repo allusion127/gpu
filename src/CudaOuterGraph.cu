@@ -869,6 +869,18 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                               sizeof(double), cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
         return launchFailed("upload prev_inner", rc);
 
+    // flux_stall lives in DeviceSlotState::flux_stall and is read through the
+    // same cmfdLoadOuterState.  Uploaded for exactly prev_inner's reason: it is
+    // a SolveLoop local the device carries INSIDE a segment and the host owns
+    // BETWEEN segments.  Left unseeded, the device counted from the previous
+    // segment's leftovers and could not stop at the outer the host's
+    // limit-cycle test would have stopped at -- so a budget-8 segment ran up to
+    // eight times as far past a stalling trial point as the host ever would.
+    if ((rc = cudaMemcpyAsync(&m.arena.states[slot].flux_stall, &scalars.flux_stall,
+                              sizeof(std::uint32_t), cudaMemcpyHostToDevice, m.stream)) !=
+        cudaSuccess)
+        return launchFailed("upload flux_stall", rc);
+
     // --- prologue: the nodal constants, once ---------------------------------
     //
     // ONCE PER SEGMENT, NOT ONCE PER OUTER, and that is Driver.h's shape:

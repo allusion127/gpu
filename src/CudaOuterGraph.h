@@ -1041,6 +1041,21 @@ struct OuterSegmentScalars {
     unsigned int xe_budget_probe = 0;
     int          th_pending      = 0;
 
+    /// Driver.h's `flux_stall` at segment entry -- outers since the flux last
+    /// converged, the counter the limit-cycle test in SolveLoop's ladder reads.
+    ///
+    /// UPLOADED FOR THE SAME REASON prev_inner IS.  The device machine advances
+    /// its own copy inside cmfdOuterConvergence, and a copy that started from
+    /// the previous segment's leftovers cannot end the segment at the outer the
+    /// host's ladder would have ended it at.  Seeded, `++st.flux_stall >
+    /// max_outer_iter` fires on exactly that outer; the host then adds
+    /// `device_outers` to its own counter and reaches the same verdict.
+    ///
+    /// ReconvergeFlux leaves it 0: that loop has no limit-cycle handling at all
+    /// and hands the device its own iteration bound as `max_outer_iter`, so the
+    /// ladder is deliberately unreachable there.
+    unsigned int flux_stall = 0;
+
     /// Issue the updateConstant prologue before the first outer.  False when the
     /// caller knows the constants are current (nodal_constant_generation
     /// unchanged since the last drive).
