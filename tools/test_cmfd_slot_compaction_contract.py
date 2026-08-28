@@ -39,6 +39,22 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 FULL_WIDTH_KERNELS = ("initialize_solver_state", "finalize_status")
 
+# Rev.7.1 Task 10 part 2: the two kernels of the STREAM-ORDERED sweep enqueue.
+#
+# THEY TAKE THE PHYSICAL SLOT AS AN ARGUMENT, and that is not a compaction
+# escape -- it is the absence of a batch.  CudaBatchArena::enqueueSweeps serves
+# ONE participant by construction (it refuses when inUseCount() > 1, because it
+# takes no rendezvous and two launchers on one stream is the failure the
+# rendezvous exists to prevent), so there is no arrival width to compact and no
+# slot map to consult: both are launched <<<1, 1>>> for a slot the CALLER named.
+# Reading blockIdx.y here would be reading a dimension that is always 0, and
+# resolving through the map would be resolving a map with one entry.
+#
+# The rule they must obey instead is the thread-0/block-0 filter, which is
+# checked below, because a launch geometry that ever widened would otherwise
+# have every thread write the same scalars.
+EXPLICIT_SLOT_KERNELS = ("cmfd_sweep_gate", "cmfd_sweep_verdict")
+
 
 def read(*parts: str) -> str:
     with open(os.path.join(ROOT, *parts), "r", encoding="utf-8-sig") as handle:
@@ -112,6 +128,16 @@ def main() -> int:
                     "stale mask.")
             if "RASBERY_CMFD_SLOT(" in body:
                 problems.append(f"{name} was compacted; it must stay full width")
+            continue
+
+        if name in EXPLICIT_SLOT_KERNELS:
+            if re.search(r"blockIdx\.y", body):
+                problems.append(f"{name} reads blockIdx.y; it is launched for ONE named "
+                                "slot and has no lane dimension to read")
+            if "if (threadIdx.x != 0 || blockIdx.x != 0) return;" not in body:
+                problems.append(f"{name} has no single-thread filter.  It writes per-slot "
+                                "scalars, so a launch geometry wider than <<<1, 1>>> would "
+                                "have every thread write them")
             continue
 
         if "RASBERY_CMFD_SLOT(m);" not in body:

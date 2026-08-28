@@ -158,8 +158,19 @@ want(GRAPH_H_CODE, "kOuterSegmentPlanCount == kOuterQuantumStepCount", "CudaOute
      "the static_assert that ties the two lists together")
 
 # The enqueue sequence in the .cu must appear in the plan's order.
-SEQ_ORDER = ["enqueueUpdPsi", "enqueue_cmfd_sweep", "enqueueOuterRefreshInputs",
+#
+# enqueueOuterRefreshInputs IS THE ONE STEP THAT MOVED, and it moved for a
+# reason the plan's order does not cover.  Rev.7.1 Task 10 part 2 made the sweep
+# a stream-ordered enqueue whose verdict kernel publishes the probe from device
+# memory -- and on the exceptional launches the device could not finish (sweep
+# state 0 or 2) the HOST finishes the drive afterwards and republishes it.  So
+# the probe is only final after the segment's observation, and a refresh issued
+# at the plan's position would carry a half drive's eigenvalue into the decision.
+# Nothing between the two positions reads CmfdOuterInputs, so the decision is the
+# same one from the same state; what moved is only WHICH probe it reads.
+SEQ_ORDER = ["enqueueUpdPsi", "enqueue_cmfd_sweep",
              "enqueueUpdJnet", "enqueue_nodal_drive", "enqueueUpdDhat",
+             "enqueueOuterRefreshInputs",
              "enqueueOuterConvergence", "enqueueOuterTransition"]
 positions = []
 for name in SEQ_ORDER:
@@ -311,11 +322,27 @@ for banned in ("cudaDeviceSynchronize", "cudaStreamQuery", "cudaEventSynchronize
 want(GRAPH_H_CODE, "sweep_synchronizes", "CudaOuterGraph.h",
      "a hook that rendezvouses has to SAY so, or the budget silently enqueues outers the "
      "transition cannot have halted yet")
-if "m_hooks_synchronize ? 1u : outerSegmentBudget()" not in GRAPH_CU_CODE:
+if "stream_sweep ? outerSegmentBudget() : 1u" not in GRAPH_CU_CODE:
     problems.append("CudaOuterGraph.cu: a synchronising sweep hook does not force the budget "
                     "to 1.  With a hook that drains the stream, outers past the first are "
                     "enqueued against a halt word the transition has not published -- the "
                     "Class-B0-on-trajectory failure the no-observation rule exists to stop")
+# ... and `stream_sweep` is only true when BOTH halves of the stream-ordered
+# sweep are present.  A hook that enqueues and never publishes its observation
+# would leave the flux the nodal drive reads one outer behind -- silently, and
+# only on the arm the budget was opened for.
+if "m.hooks.finish_cmfd_sweep != nullptr" not in GRAPH_CU_CODE:
+    problems.append("CudaOuterGraph.cu: the budget opens without requiring "
+                    "OuterSegmentHooks::finish_cmfd_sweep, so a sweep that enqueues but never "
+                    "publishes its observation would run the nodal drive on a stale flux")
+# The segment must not enqueue an outer past the exit: the halt gate makes the
+# KERNELS no-ops, but the nodal drive (and the blocking sweep arm) are host
+# calls, and a host call cannot read a device word.
+if "m.h_seg->exit != 0u" not in GRAPH_CU_CODE:
+    problems.append("CudaOuterGraph.cu: the per-outer loop does not test the segment exit "
+                    "before enqueueing the next outer.  The halt gate silences the kernels; "
+                    "it cannot silence the host nodal drive, which would then re-solve on the "
+                    "previous outer's jnet")
 # Every D2H inside the loop must be one of the three NAMED bridges, and each one
 # has to carry its byte counter -- an unnamed copy is the rendezvous creeping
 # back in.
@@ -328,7 +355,12 @@ for bridge, counter in (("mirror psi to the host", "host_mirror_bytes"),
     if counter not in GRAPH_CU_CODE:
         problems.append(f"CudaOuterGraph.cu: {bridge!r} is not counted by {counter} -- an "
                         "uncounted transfer is one nobody can argue about")
-if GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost") > 7:
+# EIGHT, not seven, since Rev.7.1 Task 10 part 2: the exit word.  It is a
+# 32-byte copy into pinned memory issued straight behind the transition, and it
+# is what lets the loop stop enqueueing instead of running an outer whose host
+# calls the halt gate cannot silence.  It is NOT a rendezvous -- nothing waits on
+# it; the sync at the top of the next pass is what makes it visible.
+if GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost") > 8:
     problems.append("CudaOuterGraph.cu: more D2H sites than the three named bridges plus "
                     "the segment's three-copy observation (%d).  Each one is a rendezvous "
                     "and needs a name" % GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost"))
