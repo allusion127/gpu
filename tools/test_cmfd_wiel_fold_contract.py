@@ -49,6 +49,11 @@ def read(path: str) -> str:
         return handle.read()
 
 
+def strip_comments(text: str) -> str:
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    return re.sub(r"//[^\n]*", "", text)
+
+
 def fold_body(text: str, where: str, problems: list[str]) -> str:
     start = text.find(BEGIN)
     stop = text.find(END)
@@ -130,6 +135,111 @@ def main() -> int:
             "test/cmfd_wiel_fold_replay.cu: the marked fold body leaked into "
             "fold_reference, so the comparison would be a kernel against itself"
         )
+
+    # --- 3b. the OPT-IN chunked arm (N1) ------------------------------------
+    #
+    # The chunked fold is a legitimate campaign arm and a catastrophic default:
+    # it is 1.6e-14 away from the frozen reference output, which is far too
+    # small to notice in a plot and far too large to accept.  So the gate is
+    # not "is it correct" -- it is "can it ever be reached without someone
+    # having asked for it", plus the determinism its N1 classification claims.
+    code = strip_comments(cu)
+
+    if "enum class WielFoldMode" not in code:
+        problems.append("no WielFoldMode: the chunked arm must be a named mode, not a bool")
+    gate = code[code.find("inline WielFoldMode wielFoldMode()"):][:1200]
+    if not gate:
+        problems.append("wielFoldMode() is missing")
+    else:
+        if "RASBERY_GPU_WIEL_FOLD" not in gate:
+            problems.append("wielFoldMode does not read RASBERY_GPU_WIEL_FOLD")
+        # DEFAULT SERIAL, and unreachable-chunked-when-unset.  Both spellings
+        # of "nothing was asked for" -- unset, and set to empty/whitespace --
+        # must land on serial.
+        if "value == nullptr" not in gate or "return WielFoldMode::SERIAL" not in gate:
+            problems.append("wielFoldMode does not default to serial when the env is unset")
+        if 's.empty() || s == "serial"' not in gate:
+            problems.append(
+                "an empty or whitespace-only RASBERY_GPU_WIEL_FOLD must mean serial")
+        if 's == "chunked"' not in gate:
+            problems.append("wielFoldMode never returns CHUNKED for \"chunked\"")
+        # chunked must be reachable ONLY through that one comparison: if any
+        # other branch can return it, "unset means serial" stops being a
+        # property of the parser.
+        chunked_returns = gate.count("WielFoldMode::CHUNKED")
+        if chunked_returns != 1:
+            problems.append(
+                f"wielFoldMode has {chunked_returns} paths to CHUNKED; exactly one "
+                "(the explicit \"chunked\" spelling) may exist, or an unset variable "
+                "could select an N1 arm")
+        # trim + case-fold, like Driver.h's xeMode.
+        if "tolower" not in gate:
+            problems.append("wielFoldMode does not case-fold (xeMode does)")
+        if "isspace" not in gate:
+            problems.append("wielFoldMode does not trim surrounding whitespace")
+        if "not a mode" not in cu:
+            problems.append(
+                "a typo in RASBERY_GPU_WIEL_FOLD must warn rather than silently buy a "
+                "mode; the two arms produce different bits")
+
+    # BOTH paths present, and the scalar tail shared between them so the two
+    # modes cannot drift into different Rayleigh/latch semantics.
+    for kernel in ("cmfd_wiel_finalize", "cmfd_wiel_stage1", "cmfd_wiel_finalize_chunked"):
+        if f"__global__ void {kernel}(" not in code:
+            problems.append(f"{kernel} is missing; both fold paths must be present")
+    if "__device__ __forceinline__ void cmfd_wiel_apply(" not in code:
+        problems.append(
+            "the scalar tail is not factored into cmfd_wiel_apply; the two modes would "
+            "each carry their own copy of the eigenvalue update and the sweep_state==2 "
+            "Rayleigh latch, free to drift apart")
+    if code.count("sm[kSweepState] = 2.0;") != 1:
+        problems.append(
+            "the Rayleigh latch appears more than once; there must be exactly one copy, "
+            "shared by both fold modes")
+    for kernel in ("cmfd_wiel_finalize", "cmfd_wiel_finalize_chunked"):
+        body = code[code.find(f"__global__ void {kernel}("):]
+        body = body[: body.find("\n__global__", 1) if body.find("\n__global__", 1) > 0
+                    else len(body)]
+        if "cmfd_wiel_apply(" not in body:
+            problems.append(f"{kernel} does not go through the shared scalar tail")
+
+    # The N1 determinism claim, statically: fixed partition, fixed tree, strict
+    # stage-2 walk, and NO atomics anywhere in the chunked path.
+    stage1 = code[code.find("__global__ void cmfd_wiel_stage1("):]
+    stage1 = stage1[: stage1.find("__global__ void cmfd_wiel_finalize_chunked")]
+    if ("const int chunk = (nxyz + static_cast<int>(gridDim.x) - 1) / "
+            "static_cast<int>(gridDim.x);") not in stage1:
+        problems.append(
+            "cmfd_wiel_stage1's partition is not the (nxyz, gridDim.x) chunk; an N1 arm "
+            "must be reproducible, which means the partition may depend on nothing else")
+    if "for (int stride = kReduceThreads / 2; stride > 0; stride >>= 1)" not in stage1:
+        problems.append("cmfd_wiel_stage1 does not use the fixed binary reduction tree")
+    stage2 = code[code.find("__global__ void cmfd_wiel_finalize_chunked("):][:1200]
+    if "for (int i = 0; i < blocks; ++i) sum = sum + values[i];" not in stage2:
+        problems.append("the chunked stage-2 fold is not a strict ascending index walk")
+    for banned in ("atomicAdd", "atomicCAS", "__shfl", "cooperative"):
+        if banned in stage1 or banned in stage2:
+            problems.append(
+                f"the chunked fold uses `{banned}`; an N1 arm has to be bit-identical "
+                "run to run, and that rules out any order the hardware picks")
+
+    # The receipt, and its three fields.
+    if "[RASBERY][CMFD][WIEL_FOLD]" not in cu:
+        problems.append("no [RASBERY][CMFD][WIEL_FOLD] receipt")
+    receipt = cu[cu.find("inline void reportWielFold("):][:1200]
+    # The fields are emitted as C++ string literals, so they carry their
+    # backslash-escaped quotes in the source text.
+    for field in ('\\"mode\\"', '\\"source\\"', '\\"chunk\\"'):
+        if field not in receipt:
+            problems.append(f"the WIEL_FOLD receipt has no {field} field")
+    if "wielFoldModeFromEnv" not in receipt:
+        problems.append(
+            "the receipt does not record provenance; an N1 result that reached a report "
+            "without one is indistinguishable from a B0 one")
+
+    # And the launch actually forks on the mode.
+    if "if (wielFoldMode() == WielFoldMode::CHUNKED) {" not in code:
+        problems.append("enqueue_sweeps does not fork on the fold mode")
 
     # --- 4. the neighbouring reduction chunking is untouched ----------------
     for needle, why in (
