@@ -29,8 +29,8 @@
 
 #include "CmfdOuterKernel.h"
 
-#include "cmfd_outer_mine.h"
-#include "cmfd_outer_reference.h"
+#include "CmfdOuterFormMine.h"
+#include "CmfdOuterReference.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -230,9 +230,18 @@ int main(int argc, char** argv) {
     }
     check(co::CMFD_OUTER_FORMS == co::cmfdOuterForms(),
           "CMFD_OUTER_FORMS and cmfdOuterForms() disagree");
-    check(co::cmfdOuterFormsRuntime() == co::CMFD_OUTER_FORMS ||
+    // THE PRODUCTION RESOLVER MUST RETURN THE MINED MASK, not the baked one.
+    //
+    // This check used to accept the build default, which is precisely how the
+    // campaign shipped a binary whose device outer rounded updpsi differently
+    // from its own host loop: the gate mined 0x7, printed it as a NOTE, and then
+    // asserted that the runtime was allowed to keep using 0x6.  The mined value
+    // IS the contract on this host, so that is what the resolver has to hand the
+    // kernels.
+    check(co::cmfdOuterFormsRuntime() == mined ||
               std::getenv("RASBERY_CMFD_OUTER_FORMS") != nullptr,
-          "cmfdOuterFormsRuntime() differs from the build default with no override set");
+          "cmfdOuterFormsRuntime() does not return this host's mined mask with no "
+          "override set -- the device bodies would not reproduce the host loop");
 
     // 3. Each site must be DECISIVE on this fixture: if flipping a bit changes
     //    nothing, the fixture does not constrain it and the recorded value is a

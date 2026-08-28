@@ -77,4 +77,69 @@ inline unsigned long long resolveFormMask(const char* env_name,
     return value;
 }
 
+/// Resolve one mask when the binary can MINE the host's answer for itself.
+///
+/// THE PRECEDENCE, AND WHY IT IS THIS WAY ROUND:
+///
+///   1. the environment override, when it parses -- a binary built on one host
+///      and validated against a reference produced on another has to be able to
+///      say so, and a human who typed the variable meant it;
+///   2. the MINED value, when the mining is sound -- it is a measurement of THIS
+///      binary on THIS machine, which is strictly better evidence than a
+///      constant somebody measured on some other machine;
+///   3. the build default, only when the mining could not reach zero mismatches,
+///      and then LOUDLY, because at that point nothing here knows the contract.
+///
+/// The build default is therefore no longer a value the run depends on; it is
+/// kept as the thing the receipt compares against, so a host whose contraction
+/// differs from the shipped one says so in one line instead of being discovered
+/// three campaigns later as an unexplained ULP.
+inline unsigned long long resolveCalibratedFormMask(const char* env_name,
+                                                    unsigned long long build_default,
+                                                    unsigned long long mined,
+                                                    bool mined_sound,
+                                                    const char* mask_name) {
+    unsigned long long value  = build_default;
+    const char*        source = "build_default";
+
+    if (mined_sound) {
+        value  = mined;
+        source = (mined == build_default) ? "mined_matches_default" : "mined";
+        if (mined != build_default) {
+            std::cerr << "[RASBERY][FORMS] " << mask_name << ": this host contracts 0x"
+                      << std::hex << mined << " where the build default says 0x"
+                      << build_default << std::dec
+                      << "; using the mined value.  The default is a record of the"
+                         " machine it was measured on, not of the physics.\n";
+        }
+    } else {
+        std::cerr << "[RASBERY][WARN][FORMS] " << mask_name
+                  << ": the contraction mining did not reach a bit-exact mask on this"
+                     " host; falling back to the build default 0x"
+                  << std::hex << build_default << std::dec
+                  << ".  Device/host bit-equality is NOT established for this run.\n";
+        source = "build_default_mining_failed";
+    }
+
+    const char* raw = std::getenv(env_name);
+    if (raw != nullptr) {
+        unsigned long long parsed = 0;
+        if (parseFormMask(raw, parsed)) {
+            value  = parsed;
+            source = "env";
+        } else {
+            std::cerr << "[RASBERY][WARN][FORMS] " << env_name << "=\"" << raw
+                      << "\" is not a number; ignoring the override. "
+                         "A malformed override must not silently pass for a valid one.\n";
+        }
+    }
+
+    std::cerr << "[RASBERY][FORMS] {\"mask\":\"" << mask_name << "\",\"value\":\"0x"
+              << std::hex << value << std::dec << "\",\"source\":\"" << source
+              << "\",\"build_default\":\"0x" << std::hex << build_default << std::dec
+              << "\",\"mined\":\"0x" << std::hex << mined << std::dec
+              << "\",\"mined_sound\":" << (mined_sound ? 1 : 0) << "}" << std::endl;
+    return value;
+}
+
 } // namespace rasbery::gpu

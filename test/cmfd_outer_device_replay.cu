@@ -22,10 +22,10 @@
 // The arithmetic itself is Class B0, so the comparison is bit equality --
 // --fmad=false plus the mined CMFD_OUTER_FORMS is what makes that reachable.
 
-#include "../src/CmfdOuterKernel.h"
+#include "CmfdOuterKernel.h"
 #include "../src/CudaCmfdOuterKernels.h"
 
-#include "cmfd_outer_reference.h"
+#include "CmfdOuterReference.h"
 
 #include <cuda_runtime.h>
 

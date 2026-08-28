@@ -47,7 +47,10 @@ SCHED = SRC / "GpuPhaseScheduler.h"
 CMAKE = ROOT / "CMakeLists.txt"
 PROBE = TEST / "cmfd_outer_form_probe.cpp"
 REPLAY = TEST / "cmfd_outer_replay.cpp"
-REFERENCE = TEST / "cmfd_outer_reference.cpp"
+# PROMOTED OUT OF test/.  The verbatim quotation is a production artefact now:
+# cmfdOuterFormsRuntime() MINES the host's contraction against it at startup
+# instead of trusting the baked constant, so RASBERY links it too.
+REFERENCE = SRC / "CmfdOuterReference.cpp"
 DEVICE = TEST / "cmfd_outer_device_replay.cu"
 
 problems: list[str] = []
@@ -124,9 +127,16 @@ else:
             ("cmfdOuterFormsRuntime", "the resolved accessor")):
         if needle not in BODY_TEXT:
             problems.append(f"CmfdOuterKernel.h: missing {needle!r} -- {why}")
-    if "resolveFormMask" not in BODY_CODE:
+    if "resolveCalibratedFormMask" not in BODY_CODE:
         problems.append("CmfdOuterKernel.h: the runtime mask is not resolved through "
-                        "GpuFormMask.h, so an override would not be receipt-logged")
+                        "GpuFormMask.h's CALIBRATED resolver, so it would neither mine "
+                        "this host's contraction nor receipt-log an override")
+    if "mineCmfdOuterFormsOnThisHost" not in BODY_CODE:
+        problems.append("CmfdOuterKernel.h: the runtime mask does not mine this host. "
+                        "The baked default is a record of the machine it was measured "
+                        "on -- shipping it as the contract is what made the device "
+                        "updpsi round differently from the host loop on both 238 and "
+                        "the WSL box (0x6 baked, 0x7 mined)")
 want(BODY_CODE, "coMa1(", "CmfdOuterKernel.h", "the multiply-add sites need the policy")
 want(BODY_CODE, "coMa2(", "CmfdOuterKernel.h", "the two-product site needs the policy")
 
@@ -252,7 +262,7 @@ want(PROBE_TEXT, "branch coverage", "test/cmfd_outer_form_probe.cpp",
      "a mask mined on operands that never reach the guards covers part of the function")
 want(REPLAY_TEXT, "kPhaseTransitions", "test/cmfd_outer_replay.cpp",
      "the emitted edges must be cross-checked against the W1 table")
-want(REFERENCE_TEXT, "compiled ALONE", "test/cmfd_outer_reference.cpp",
+want(REFERENCE_TEXT, "compiled ALONE", "src/CmfdOuterReference.cpp",
      "the verbatim CPU quotation needs its own translation unit, or gcc "
      "common-subexpressions it with the shipped body and changes its contraction")
 want(DEVICE_TEXT, "atomicMax", "test/cmfd_outer_device_replay.cu",
@@ -264,7 +274,7 @@ for name, src in (("rasbery_cmfd_outer_form_probe", "test/cmfd_outer_form_probe.
                   ("rasbery_cmfd_outer_device_replay", "test/cmfd_outer_device_replay.cu")):
     if name not in CMAKE_TEXT:
         problems.append(f"CMakeLists.txt: does not build {name} ({src})")
-if "test/cmfd_outer_reference.cpp" not in CMAKE_TEXT:
+if "src/CmfdOuterReference.cpp" not in CMAKE_TEXT:
     problems.append("CMakeLists.txt: the reference TU is not linked into the gates")
 block = CMAKE_TEXT[CMAKE_TEXT.find("test/cmfd_outer_device_replay.cu"):] \
     if "test/cmfd_outer_device_replay.cu" in CMAKE_TEXT else ""

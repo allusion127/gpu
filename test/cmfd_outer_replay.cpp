@@ -7,7 +7,7 @@
 // TWO HALVES, TWO KINDS OF EVIDENCE.
 //
 //   (1) ARITHMETIC.  upddtil / updpsi / updjnet / upddhat, scored elementwise
-//       against test/cmfd_outer_reference.cpp -- a verbatim quotation of the CPU
+//       against src/CmfdOuterReference.cpp -- a verbatim quotation of the CPU
 //       loops compiled in a translation unit of its own (see the note there for
 //       why that separation is load-bearing).  Class B0 means BIT-identical:
 //       there is no transcendental in any of these bodies, so "close" is not a
@@ -30,8 +30,8 @@
 #include "CmfdOuterKernel.h"
 #include "CudaCmfdOuterKernels.h"
 
-#include "cmfd_outer_mine.h"
-#include "cmfd_outer_reference.h"
+#include "CmfdOuterFormMine.h"
+#include "CmfdOuterReference.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -519,7 +519,7 @@ int main(int argc, char** argv) {
     const int nxyz = argc > 1 ? std::atoi(argv[1]) : 1024;
     const cmfdref::Fixture f = cmfdref::buildFixture(nxyz);
 
-    // SELF-CALIBRATING (see cmfd_outer_mine.h): the mask records which
+    // SELF-CALIBRATING (see CmfdOuterFormMine.h): the mask records which
     // multiply-adds THIS HOST's compiler fused -- measured 0x6 on the authoring
     // box and 0x7 on 238's Xeon Gold 5317 -- so the Class B0 comparison must be
     // made against the host's own mask, not a literal from another machine.

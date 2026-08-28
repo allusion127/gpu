@@ -130,15 +130,41 @@ RASBERY_CMFD_HD constexpr unsigned long long cmfdOuterForms() {
     return 0x6ull;
 }
 
-/// HOST-SIDE resolved mask: the build default unless RASBERY_CMFD_OUTER_FORMS
-/// overrides it.  Read once, receipt-logged once.
+/// Mine THIS BINARY's contraction on THIS HOST.  Defined in
+/// CmfdOuterFormMiner.cpp, which is the only translation unit that may see both
+/// the shipped bodies and the verbatim CPU quotation; `sound` comes back false
+/// when the coordinate descent could not reach a bit-exact mask, which is the
+/// only honest reason to fall back to the baked constant.
 ///
-/// Every enqueue in CudaCmfdOuterKernels.h takes `forms` as a parameter, so the
-/// value crosses to the device as a kernel ARGUMENT and no device code ever has
-/// to reach for an environment variable.
+/// HOST ONLY.  Device code never calls it: every enqueue in
+/// CudaCmfdOuterKernels.h takes `forms` as a kernel ARGUMENT.
+unsigned long long mineCmfdOuterFormsOnThisHost(bool& sound);
+
+/// HOST-SIDE resolved mask, MINED rather than assumed.  Read once, receipt
+/// logged once.
+///
+/// WHAT CHANGED AND WHY.  This used to return CMFD_OUTER_FORMS unless
+/// RASBERY_CMFD_OUTER_FORMS was set -- the production binary trusted a constant
+/// measured on the AUTHORING host, while the gates around it had already been
+/// taught to mine the host's own (see the note above CMFD_OUTER_FORMS).  On both
+/// machines this campaign runs on, the two disagree: default 0x6, mined 0x7,
+/// because the Xeon Gold 5317 and the current WSL toolchain both fuse
+/// CO_PSI_ACC.  So the device updpsi rounded `psi += flux*xsnf` in two steps
+/// where the host loop fused it, and RASBERY_GPU_OUTER=1 diverged from the host
+/// outer in the last bits of psi at the FIRST device outer, on every deck,
+/// deterministically.  On kngr_238 that alone was 421 of 644 datasets.
+///
+/// The mask asserts "the shipped host bodies and the verbatim CPU quotation
+/// agree bit for bit in THIS binary", which is a question this binary can
+/// answer.  So it answers it, once, and says so in the receipt.  See
+/// CmfdOuterFormMiner.cpp for the cost and the layering.
 inline unsigned long long cmfdOuterFormsRuntime() {
-    static const unsigned long long value = gpu::resolveFormMask(
-        "RASBERY_CMFD_OUTER_FORMS", CMFD_OUTER_FORMS, "cmfd_outer");
+    static const unsigned long long value = [] {
+        bool                     sound = false;
+        const unsigned long long mined = mineCmfdOuterFormsOnThisHost(sound);
+        return gpu::resolveCalibratedFormMask("RASBERY_CMFD_OUTER_FORMS", CMFD_OUTER_FORMS,
+                                              mined, sound, "cmfd_outer");
+    }();
     return value;
 }
 

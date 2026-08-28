@@ -243,10 +243,15 @@ if (RASBERY_ENABLE_TESTS)
     # longer the production one.  That is not hypothetical -- Task 4 hit it, on
     # m264.  -march=native for the same reason as above: no FMA in the ISA means
     # gcc contracts nothing and the mined mask cannot be scored.
+    # CmfdOuterFormMiner.cpp is linked here for the same reason it is linked into
+    # RASBERY: cmfdOuterFormsRuntime() now MINES the host's mask instead of
+    # trusting the baked one, and the gate has to exercise the production
+    # resolver rather than a test-only copy of it.
     foreach (cmfd_gate cmfd_outer_form_probe cmfd_outer_replay)
         add_executable(rasbery_${cmfd_gate}
                 "${CMAKE_CURRENT_SOURCE_DIR}/test/${cmfd_gate}.cpp"
-                "${CMAKE_CURRENT_SOURCE_DIR}/test/cmfd_outer_reference.cpp")
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/CmfdOuterReference.cpp"
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/CmfdOuterFormMiner.cpp")
         target_compile_features(rasbery_${cmfd_gate} PRIVATE cxx_std_20)
         target_include_directories(rasbery_${cmfd_gate} PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -400,7 +405,7 @@ if (RASBERY_ENABLE_TESTS)
         # It links the same verbatim CPU reference object the host gates use.
         add_executable(rasbery_cmfd_outer_device_replay
                 "${CMAKE_CURRENT_SOURCE_DIR}/test/cmfd_outer_device_replay.cu"
-                "${CMAKE_CURRENT_SOURCE_DIR}/test/cmfd_outer_reference.cpp")
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/CmfdOuterReference.cpp")
         target_compile_features(rasbery_cmfd_outer_device_replay PRIVATE cxx_std_20)
         target_include_directories(rasbery_cmfd_outer_device_replay PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/src"
