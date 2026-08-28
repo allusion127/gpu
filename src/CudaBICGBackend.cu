@@ -10,6 +10,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -236,6 +238,115 @@ bool cmfdFp32InnerEnabled() {
 #define HALT_GUARD(halt) \
     if (*(halt) != 0u) return
 
+// ---------------------------------------------------------------------------
+// ACTIVE-SLOT COMPACTION (RASBERY_GPU_CMFD_COMPACT, default OFF)
+//
+// The arena's grids are `slots`-wide on the batch axis whatever the arrival
+// width, so a 64-slot arena serving a mean of 2.9-22 instances dispatches
+// 90-95% padding blocks.  Each of those still costs a dispatch (W0 measured
+// 0.78 us per node, and the block count is what a node's cost scales with),
+// and there are ~25 kernels per inner iteration.
+//
+// The fix is the Task 8 nodal one, transplanted: grid.y becomes a LOGICAL lane
+// over a bucket wide enough for the arrivals, and `slot_map[logical]` names the
+// physical slot that lane drives.  Everything downstream of the map is
+// unchanged -- every per-slot array (scalars, halt, active, sweep_halt,
+// device_assembly_active, the vector strides) is still indexed by the PHYSICAL
+// slot, because that is what the host's Slot table and the status D2H agree
+// on.  The map is the only thing allowed to be logical.
+//
+// TWO INVARIANTS, both of which a test would otherwise miss because they only
+// bite when compaction is ON:
+//
+//   * Nothing may read blockIdx.y as a slot index.  It is correct exactly when
+//     the map is the identity, which is the compaction-OFF case -- so the bug
+//     passes every OFF test and every ON test that happens to arrive full.
+//     RASBERY_CMFD_SLOT is the only reader; the contract test enforces that.
+//
+//   * The guard must be the kernel's FIRST statement, before any __syncthreads
+//     or shared write.  Unlike the nodal kernels these DO carry barriers
+//     (cmfd_wiel_finalize).  That is safe here and only here because the guard
+//     is BLOCK-UNIFORM: it reads blockIdx.y and nothing else, so either the
+//     whole block returns or none of it does, and no barrier is ever reached
+//     by a partial block.
+//
+// Compaction OFF is the FULL IDENTITY over physical slots (slot_map[i] == i
+// for every declared slot, participant or not) with lanes == slots, so the OFF
+// launch visits exactly the blocks it visited before and masks them exactly
+// where it masked them before -- the halt guard, not the map.
+// ---------------------------------------------------------------------------
+#define RASBERY_CMFD_SLOT_ARGS const int* __restrict__ slot_map, const int lanes
+
+#define RASBERY_CMFD_SLOT(m)                                            \
+    int m = 0;                                                          \
+    do {                                                                \
+        const int rasbery_logical = static_cast<int>(blockIdx.y);       \
+        if (rasbery_logical >= lanes) return;                           \
+        m = slot_map[rasbery_logical];                                  \
+        if (m < 0) return;                                              \
+    } while (0)
+
+/// The dispatch ladder, shared with the nodal arena (GpuPhaseScheduler.h's
+/// kDispatchBuckets).  A graph bakes grid.y, so the dispatch width IS topology
+/// and every distinct width is a separate instantiation; the coarse ladder is
+/// what keeps that list at nine entries instead of sixty-four.
+inline int cmfdBucketFor(int count, int slots) {
+    static const int kBuckets[] = {1, 2, 4, 8, 16, 24, 32, 48, 64};
+    for (int b : kBuckets)
+        if (count <= b) return b < slots ? b : slots;
+    return slots;
+}
+
+inline int cmfdBucketIndex(int lanes) {
+    static const int kBucketIndex[9] = {1, 2, 4, 8, 16, 24, 32, 48, 64};
+    for (int i = 0; i < 9; ++i)
+        if (lanes <= kBucketIndex[i]) return i;
+    return 8;
+}
+
+/// RASBERY_GPU_CMFD_COMPACT, default OFF.  Read once, like every other gate.
+inline bool cmfdCompactEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("RASBERY_GPU_CMFD_COMPACT");
+        return v != nullptr && std::string(v) != "0";
+    }();
+    return on;
+}
+
+std::atomic<unsigned long long> g_cmfd_logical_drives{0};
+std::atomic<unsigned long long> g_cmfd_physical_blocks{0};
+std::atomic<unsigned long long> g_cmfd_padding_blocks{0};
+std::atomic<unsigned long long> g_cmfd_bucket_graphs{0};
+/// Nine buckets, indexed by the ladder position (1,2,4,8,16,24,32,48,64).
+std::array<std::atomic<unsigned long long>, 9> g_cmfd_bucket_histogram{};
+
+inline void cmfdBucketHistogramBump(int lanes) {
+    g_cmfd_bucket_histogram[static_cast<std::size_t>(cmfdBucketIndex(lanes))].fetch_add(
+        1, std::memory_order_relaxed);
+}
+
+/// Flux-mirror cost, kept OUTSIDE BackendCounters because the two places that
+/// pay it -- stageSlot() and adoptFluxMirror() -- both run UNLOCKED on the
+/// owning instance's thread, by design ("No CUDA call: safe to run
+/// concurrently on every instance thread").  Every other counter in that
+/// struct is bumped on the launcher, which is single-threaded by the
+/// rendezvous; these are not, so they are atomics folded in by counters().
+std::atomic<unsigned long long> g_cmfd_phi_mirror_ns{0};
+std::atomic<unsigned long long> g_cmfd_phi_mirror_calls{0};
+std::atomic<unsigned long long> g_cmfd_phi_mirror_bypassed{0};
+std::atomic<unsigned long long> g_cmfd_phi_h2d_elided_bytes{0};
+
+/// The one place the mirror atomics enter a BackendCounters snapshot.
+inline BackendCounters withPhiMirrorCounters(BackendCounters c) {
+    c.cmfd_phi_mirror_ns = g_cmfd_phi_mirror_ns.load(std::memory_order_relaxed);
+    c.cmfd_phi_mirror_calls = g_cmfd_phi_mirror_calls.load(std::memory_order_relaxed);
+    c.cmfd_phi_mirror_bypassed =
+        g_cmfd_phi_mirror_bypassed.load(std::memory_order_relaxed);
+    c.cmfd_phi_h2d_elided_bytes =
+        g_cmfd_phi_h2d_elided_bytes.load(std::memory_order_relaxed);
+    return c;
+}
+
 constexpr int kReduceThreads   = 256;
 constexpr int kMaxReduceBlocks = 256;
 
@@ -269,8 +380,9 @@ __global__ void reduce_dot_stage1(const int n,
                                   const double* __restrict__ a,
                                   const double* __restrict__ b,
                                   double* __restrict__ partial,
-                                  const std::uint32_t* __restrict__ halt) {
-    const int m = static_cast<int>(blockIdx.y);
+                                  const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     HALT_GUARD(halt + m);
     __shared__ double shared[kReduceThreads];
 
@@ -306,9 +418,10 @@ __global__ void reduce_dot_stage2(const int blocks,
                                   double* __restrict__ scalars,
                                   const int slot,
                                   const bool take_sqrt,
-                                  const std::uint32_t* __restrict__ halt) {
+                                  const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
     if (threadIdx.x != 0) return;
-    const int m = static_cast<int>(blockIdx.y);
+    RASBERY_CMFD_SLOT(m);
     HALT_GUARD(halt + m);
     const double* pm = partial + static_cast<long long>(m) * kMaxReduceBlocks;
     double sum = 0.0;
@@ -323,9 +436,10 @@ __global__ void reduce_norm_store_reference_stage2(
     const int blocks,
     const double* __restrict__ partial,
     double* scalars,
-    const std::uint32_t* __restrict__ halt) {
+    const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
     if (threadIdx.x != 0) return;
-    const int m = static_cast<int>(blockIdx.y);
+    RASBERY_CMFD_SLOT(m);
     HALT_GUARD(halt + m);
     const double* pm = partial + static_cast<long long>(m) * kMaxReduceBlocks;
     double sum = 0.0;
@@ -359,8 +473,9 @@ __global__ void reduce_dot2_stage1(const int n,
                                    const double* __restrict__ b1,
                                    double* __restrict__ partial0,
                                    double* __restrict__ partial1,
-                                   const std::uint32_t* __restrict__ halt) {
-    const int m = static_cast<int>(blockIdx.y);
+                                   const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     HALT_GUARD(halt + m);
     __shared__ double shared0[kReduceThreads];
     __shared__ double shared1[kReduceThreads];
@@ -409,9 +524,10 @@ __global__ void reduce_dot2_stage2(const int blocks,
                                    double* __restrict__ scalars,
                                    const int slot0,
                                    const int slot1,
-                                   const std::uint32_t* __restrict__ halt) {
+                                   const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
     if (threadIdx.x != 0) return;
-    const int m = static_cast<int>(blockIdx.y);
+    RASBERY_CMFD_SLOT(m);
     HALT_GUARD(halt + m);
     const double* p0m = partial0 + static_cast<long long>(m) * kMaxReduceBlocks;
     const double* p1m = partial1 + static_cast<long long>(m) * kMaxReduceBlocks;
@@ -434,8 +550,9 @@ __global__ void matvec_two_group(const int nxyz,
                                  const double* __restrict__ cc,
                                  const double* __restrict__ x,
                                  double* __restrict__ y,
-                                 const std::uint32_t* __restrict__ halt) {
-    const int m = static_cast<int>(blockIdx.y);
+                                 const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     HALT_GUARD(halt + m);
     const int l = blockIdx.x * blockDim.x + threadIdx.x;
     if (l >= nxyz) return;
@@ -507,8 +624,9 @@ __global__ void begin_outer_fused(const int nxyz,
                                   double* __restrict__ r0,
                                   double* __restrict__ p,
                                   double* __restrict__ v,
-                                  const std::uint32_t* __restrict__ halt) {
-    const int m = static_cast<int>(blockIdx.y);
+                                  const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     HALT_GUARD(halt + m);
     const int l = blockIdx.x * blockDim.x + threadIdx.x;
     if (l >= nxyz) return;
@@ -608,9 +726,10 @@ __global__ void initialize_solver_state(double* scalars,
 /// Freeze the reference residual for this outer.  The host used to hold it in
 /// a local `r20`; it is now the fixed denominator of the device-side test.
 __global__ void store_reference_norm(double* scalars,
-                                     const std::uint32_t* __restrict__ halt) {
+                                     const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
     if (threadIdx.x != 0) return;
-    const int m = static_cast<int>(blockIdx.y);
+    RASBERY_CMFD_SLOT(m);
     HALT_GUARD(halt + m);
     double* sm = scalars + static_cast<long long>(m) * kScalarCount;
     sm[kR20]   = sm[kInitialNorm];
@@ -646,8 +765,9 @@ __global__ void prepare_p_jacobi(const int nxyz,
                                  const double* __restrict__ v,
                                  double* __restrict__ p,
                                  double* __restrict__ y,
-                                 const std::uint32_t* __restrict__ halt) {
-    const int m = static_cast<int>(blockIdx.y);
+                                 const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     HALT_GUARD(halt + m);
     const int l = blockIdx.x * blockDim.x + threadIdx.x;
     if (l >= nxyz) return;
@@ -701,8 +821,9 @@ __global__ void colored_block_sweep(const int nxyz,
                                     const double* __restrict__ dinv,
                                     const double* __restrict__ b,
                                     double* __restrict__ x,
-                                    const std::uint32_t* __restrict__ halt) {
-    const int m = static_cast<int>(blockIdx.y);
+                                    const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     HALT_GUARD(halt + m);
     const int l = blockIdx.x * blockDim.x + threadIdx.x;
     if (l >= nxyz || colors[l] != target_color) return;
@@ -751,8 +872,9 @@ __global__ void update_s_jacobi(const int nxyz,
                                 const double* __restrict__ v,
                                 double* __restrict__ s,
                                 double* __restrict__ z,
-                                const std::uint32_t* __restrict__ halt) {
-    const int m = static_cast<int>(blockIdx.y);
+                                const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     HALT_GUARD(halt + m);
     const int l = blockIdx.x * blockDim.x + threadIdx.x;
     if (l >= nxyz) return;
@@ -815,8 +937,9 @@ __global__ void update_solution(const int n,
                                 const double* __restrict__ t,
                                 double* __restrict__ phi,
                                 double* __restrict__ r,
-                                const std::uint32_t* __restrict__ halt) {
-    const int m = static_cast<int>(blockIdx.y);
+                                const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     HALT_GUARD(halt + m);
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -899,9 +1022,10 @@ __global__ void accumulate_iteration(const int allow_halt,
                                      std::uint32_t* sticky_flags,
                                      std::uint32_t* counters,
                                      std::uint32_t* halt,
-                                     const std::uint32_t* __restrict__ active) {
+                                     const std::uint32_t* __restrict__ active,
+                                   RASBERY_CMFD_SLOT_ARGS) {
     if (threadIdx.x != 0) return;
-    const int m = static_cast<int>(blockIdx.y);
+    RASBERY_CMFD_SLOT(m);
     if (active[m] == 0u) return;
 
     std::uint32_t* cm = counters + static_cast<long long>(m) * kCounterSlots;
@@ -926,9 +1050,10 @@ __global__ void reduce_norm_accumulate_stage2(
     std::uint32_t* sticky_flags,
     std::uint32_t* counters,
     std::uint32_t* halt,
-    const std::uint32_t* __restrict__ active) {
+    const std::uint32_t* __restrict__ active,
+                                   RASBERY_CMFD_SLOT_ARGS) {
     if (threadIdx.x != 0) return;
-    const int m = static_cast<int>(blockIdx.y);
+    RASBERY_CMFD_SLOT(m);
     if (active[m] == 0u) return;
 
     std::uint32_t* cm = counters + static_cast<long long>(m) * kCounterSlots;
@@ -1067,8 +1192,9 @@ __global__ void refresh_operator_mirror_f32(const int nxyz,
                                             const double* __restrict__ cc,
                                             float* __restrict__ diag_f,
                                             float* __restrict__ cc_f,
-                                            const std::uint32_t* __restrict__ halt) {
-    const int m = static_cast<int>(blockIdx.y);
+                                            const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     HALT_GUARD(halt + m);
     const int l = blockIdx.x * blockDim.x + threadIdx.x;
     if (l >= nxyz) return;
@@ -1111,8 +1237,9 @@ __global__ void begin_outer_fused_f32(const int nxyz,
                                       float* __restrict__ r0_f,
                                       float* __restrict__ p_f,
                                       float* __restrict__ v_f,
-                                      const std::uint32_t* __restrict__ halt) {
-    const int m = static_cast<int>(blockIdx.y);
+                                      const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     HALT_GUARD(halt + m);
     const int l = blockIdx.x * blockDim.x + threadIdx.x;
     if (l >= nxyz) return;
@@ -1185,8 +1312,9 @@ __global__ void reduce_dot_stage1_f32(const int n,
                                       const float* __restrict__ a,
                                       const float* __restrict__ b,
                                       double* __restrict__ partial,
-                                      const std::uint32_t* __restrict__ halt) {
-    const int m = static_cast<int>(blockIdx.y);
+                                      const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     HALT_GUARD(halt + m);
     __shared__ double shared[kReduceThreads];
 
@@ -1225,8 +1353,9 @@ __global__ void reduce_dot2_stage1_f32(const int n,
                                        const float* __restrict__ b1,
                                        double* __restrict__ partial0,
                                        double* __restrict__ partial1,
-                                       const std::uint32_t* __restrict__ halt) {
-    const int m = static_cast<int>(blockIdx.y);
+                                       const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     HALT_GUARD(halt + m);
     __shared__ double shared0[kReduceThreads];
     __shared__ double shared1[kReduceThreads];
@@ -1278,8 +1407,9 @@ __global__ void matvec_two_group_f32(const int nxyz,
                                      const float* __restrict__ cc_f,
                                      const float* __restrict__ x,
                                      float* __restrict__ y,
-                                     const std::uint32_t* __restrict__ halt) {
-    const int m = static_cast<int>(blockIdx.y);
+                                     const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     HALT_GUARD(halt + m);
     const int l = blockIdx.x * blockDim.x + threadIdx.x;
     if (l >= nxyz) return;
@@ -1321,8 +1451,9 @@ __global__ void colored_block_sweep_f32(const int nxyz,
                                         const float* __restrict__ dinv_f,
                                         const float* __restrict__ b,
                                         float* __restrict__ x,
-                                        const std::uint32_t* __restrict__ halt) {
-    const int m = static_cast<int>(blockIdx.y);
+                                        const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     HALT_GUARD(halt + m);
     const int l = blockIdx.x * blockDim.x + threadIdx.x;
     if (l >= nxyz || colors[l] != target_color) return;
@@ -1361,8 +1492,9 @@ __global__ void prepare_p_jacobi_f32(const int nxyz,
                                      const float* __restrict__ v_f,
                                      float* __restrict__ p_f,
                                      float* __restrict__ y_f,
-                                     const std::uint32_t* __restrict__ halt) {
-    const int m = static_cast<int>(blockIdx.y);
+                                     const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     HALT_GUARD(halt + m);
     const int l = blockIdx.x * blockDim.x + threadIdx.x;
     if (l >= nxyz) return;
@@ -1414,8 +1546,9 @@ __global__ void update_s_jacobi_f32(const int nxyz,
                                     const float* __restrict__ v_f,
                                     float* __restrict__ s_f,
                                     float* __restrict__ z_f,
-                                    const std::uint32_t* __restrict__ halt) {
-    const int m = static_cast<int>(blockIdx.y);
+                                    const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     HALT_GUARD(halt + m);
     const int l = blockIdx.x * blockDim.x + threadIdx.x;
     if (l >= nxyz) return;
@@ -1480,8 +1613,9 @@ __global__ void update_solution_f32(const int n,
                                     const float* __restrict__ t_f,
                                     double* __restrict__ phi,
                                     float* __restrict__ r_f,
-                                    const std::uint32_t* __restrict__ halt) {
-    const int m = static_cast<int>(blockIdx.y);
+                                    const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     HALT_GUARD(halt + m);
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -1561,8 +1695,9 @@ __global__ void cmfd_assemble_operator_2g(
     double* udiag,
     const double* __restrict__ scalars,
     const std::uint32_t* __restrict__ device_assembly_active,
-    const std::uint32_t* __restrict__ sweep_halt) {
-    const int m = static_cast<int>(blockIdx.y);
+    const std::uint32_t* __restrict__ sweep_halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     if (device_assembly_active[m] == 0u || sweep_halt[m] != 0u) return;
     const int l = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (l >= nxyz) return;
@@ -1588,9 +1723,10 @@ __global__ void cmfd_assemble_operator_2g(
     cmfd_assembly::assembleNode2G(view, l);
 }
 
-__global__ void cmfd_sweep_begin(double* scalars, std::uint32_t* sweep_halt) {
+__global__ void cmfd_sweep_begin(double* scalars, std::uint32_t* sweep_halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
     if (threadIdx.x != 0) return;
-    const int m = static_cast<int>(blockIdx.y);
+    RASBERY_CMFD_SLOT(m);
     if (sweep_halt[m] != 0u) return;
     double* sm = scalars + static_cast<long long>(m) * kScalarCount;
 
@@ -1634,8 +1770,9 @@ __global__ void cmfd_src_build(const int nxyz,
                                const double* __restrict__ psi,
                                double* __restrict__ src,
                                const double* __restrict__ scalars,
-                               const std::uint32_t* __restrict__ sweep_halt) {
-    const int m = static_cast<int>(blockIdx.y);
+                               const std::uint32_t* __restrict__ sweep_halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     if (sweep_halt[m] != 0u) return;
     const int l = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (l >= nxyz) return;
@@ -1664,8 +1801,9 @@ __global__ void cmfd_wiel_terms(const int nxyz,
                                 const double* __restrict__ vol,
                                 double* __restrict__ terms_ab, ///< [slot][2*nxyz]: err1^2, psid*pv
                                 double* __restrict__ terms_c,  ///< [slot][>=nxyz]: pv*pv
-                                const std::uint32_t* __restrict__ sweep_halt) {
-    const int m = static_cast<int>(blockIdx.y);
+                                const std::uint32_t* __restrict__ sweep_halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     if (sweep_halt[m] != 0u) return;
     const int l = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (l >= nxyz) return;
@@ -1684,18 +1822,59 @@ __global__ void cmfd_wiel_terms(const int nxyz,
     ps[l]              = pv;
 }
 
+/// How many addends one fold lane pulls into registers before it folds them.
+///
+/// This is a MEMORY-LEVEL-PARALLELISM knob and nothing else.  The fold below
+/// is a hard serial dependency (see the kernel comment), so the only latency
+/// a restructuring can remove is the load latency, and the only way a single
+/// thread removes load latency is by having more than one load in flight.
+///
+/// Measured on GP102 (sm_61, nxyz = 8451 -- the KNGR mesh), interleaved
+/// best-of-12 so the clock ramp cannot bias the ratio:
+///
+///     flat (what ptxas schedules on its own)   258.3 us   1.00x
+///     batch 4                                  258.8 us   1.00x
+///     batch 8 / 16 / 32                        230.6 us   1.12x
+///     batch 64                                 216.8 us   1.19x
+///     dependent DADD chain, no memory at all   202.3 us   1.28x
+///
+/// That last row is the ceiling: it is the same 8451-long chain with the
+/// operands already in registers, so 1.28x is ALL that any bit-preserving
+/// rewrite of this fold can ever be worth.  64 collects 93% of it and ptxas
+/// reports 32 registers with zero spill, so there is nothing to trade back.
+constexpr int kWielFoldBatch = 64;
+
 /// The serial l-ascending fold of the stored addends, plus the eigenvalue
 /// update.  One thread per slot; slots in parallel on gridDim.y.  The
 /// warm-up (icy < 0) and Rayleigh branches never run here: the host only
 /// delegates once the Wielandt regime is reached, and a degenerate gamma
 /// hands the sweep back to the host with the sums exported.
+///
+/// WHY THIS FOLD IS SERIAL, AND WHY IT STAYS SERIAL.  `sum = sum + v[l]` over
+/// l ascending is BICGCMFD::wiel's own accumulation (BICGCMFD.cpp, the
+/// `err`/`gammad`/`gamman` loop), and a rounded floating-point add is not
+/// associative: any partition of the range into chunks that are summed
+/// separately and then folded changes the result by a few ULP.  The stage-1 /
+/// stage-2 partition that reduce_dot_stage1/2 use is therefore NOT available
+/// here -- those reductions define their own order and only have to be
+/// reproducible, this one has to reproduce a specific serial order that is
+/// already baked into the frozen reference output.  Nor is there a parallel
+/// algorithm that reproduces a chosen sequential rounding sequence: each
+/// rounding depends on the running sum, so the chain length nxyz IS the
+/// critical path.
+///
+/// What CAN be removed is load latency, and only that; see kWielFoldBatch.
+/// The addends are folded in exactly the same order, each one an ordinary
+/// rounded double, so the batching is bit-preserving by construction -- only
+/// the loads move, never an add.
 __global__ void cmfd_wiel_finalize(const int nxyz,
                                    const long long vec_stride,
                                    const double* __restrict__ terms_ab,
                                    const double* __restrict__ terms_c,
                                    double* scalars,
-                                   std::uint32_t* sweep_halt) {
-    const int m = static_cast<int>(blockIdx.y);
+                                   std::uint32_t* sweep_halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     if (sweep_halt[m] != 0u) return; // uniform for the whole slot block
     const int lane = static_cast<int>(threadIdx.x);
     const double* ta = terms_ab + m * vec_stride;
@@ -1708,7 +1887,20 @@ __global__ void cmfd_wiel_finalize(const int nxyz,
     if (lane < 3) {
         const double* values = lane == 0 ? ta : (lane == 1 ? ta + nxyz : tc);
         double sum = 0.0;
-        for (int l = 0; l < nxyz; ++l) sum = sum + values[l];
+        // RASBERY_CMFD_WIEL_FOLD_BEGIN -- mirrored verbatim by
+        // test/cmfd_wiel_fold_replay.cu; tools/test_cmfd_wiel_fold_contract.py
+        // fails if the two texts drift apart.
+        int       l    = 0;
+        const int tail = nxyz - (nxyz % kWielFoldBatch);
+        for (; l < tail; l += kWielFoldBatch) {
+            double batch[kWielFoldBatch];
+#pragma unroll
+            for (int j = 0; j < kWielFoldBatch; ++j) batch[j] = __ldg(values + l + j);
+#pragma unroll
+            for (int j = 0; j < kWielFoldBatch; ++j) sum = sum + batch[j];
+        }
+        for (; l < nxyz; ++l) sum = sum + values[l];
+        // RASBERY_CMFD_WIEL_FOLD_END
         lane_sum[lane] = sum;
     }
     __syncthreads();
@@ -1750,8 +1942,9 @@ __global__ void cmfd_updls(const int nxyz,
                            const double* __restrict__ udiag,
                            double* __restrict__ diag,
                            const double* __restrict__ scalars,
-                           const std::uint32_t* __restrict__ sweep_halt) {
-    const int m = static_cast<int>(blockIdx.y);
+                           const std::uint32_t* __restrict__ sweep_halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     if (sweep_halt[m] != 0u) return;
     const double* sm = scalars + static_cast<long long>(m) * kScalarCount;
     if (sm[kEshift] == 0.0) return;
@@ -1778,8 +1971,9 @@ __global__ void cmfd_negative_scan(const int n,
                                    const long long vec_stride,
                                    const double* __restrict__ phi,
                                    double* scalars,
-                                   const std::uint32_t* __restrict__ sweep_halt) {
-    const int m = static_cast<int>(blockIdx.y);
+                                   const std::uint32_t* __restrict__ sweep_halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
     if (sweep_halt[m] != 0u) return;
     const int i = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -1789,9 +1983,10 @@ __global__ void cmfd_negative_scan(const int n,
 
 /// The host loop's control tail: the all-negative reset, the retry rule that
 /// refuses to count a negative-flux sweep against iout, and the exit tests.
-__global__ void cmfd_sweep_end(double* scalars, std::uint32_t* sweep_halt) {
+__global__ void cmfd_sweep_end(double* scalars, std::uint32_t* sweep_halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
     if (threadIdx.x != 0) return;
-    const int m = static_cast<int>(blockIdx.y);
+    RASBERY_CMFD_SLOT(m);
     if (sweep_halt[m] != 0u) return;
     double* sm  = scalars + static_cast<long long>(m) * kScalarCount;
     double  neg = sm[kNegative];
@@ -1879,6 +2074,8 @@ public:
         const double* host_vol   = nullptr;
         double*       host_udiag = nullptr;
         double*       host_psi   = nullptr; ///< in/out
+        bool          push_psi   = true;    ///< CmfdSweepIO::psi_dirty
+        bool          psi_downloaded = false; ///< D2H issued for THIS launch
         bool          device_assembly = false;
         bool          pushed_xsrf = false;
         bool          pushed_xssm = false;
@@ -2142,6 +2339,20 @@ public:
             CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&host_active),
                                       S * sizeof(std::uint32_t)));
             std::memset(host_active, 0, S * sizeof(std::uint32_t));
+
+            // The lane -> slot map.  Allocated once at the FULL fleet width
+            // whatever a launch's bucket turns out to be, so d_slot_map is a
+            // fixed address a captured graph can bake, and seeded with the
+            // identity so a launch that never calls buildSlotMap (a direct
+            // enqueue, a test) behaves exactly as the pre-compaction code did.
+            allocate(reinterpret_cast<void**>(&d_slot_map), S * sizeof(int));
+            CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&h_slot_map),
+                                      S * sizeof(int)));
+            for (std::size_t i = 0; i < S; ++i) h_slot_map[i] = static_cast<int>(i);
+            CUDA_CHECK(cudaMemcpy(d_slot_map, h_slot_map, S * sizeof(int),
+                                  cudaMemcpyHostToDevice));
+            lanes = slots;
+
             CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
             CUBLAS_CHECK(cublasCreate(&handle));
             CUBLAS_CHECK(cublasSetStream(handle, stream));
@@ -2159,14 +2370,21 @@ public:
     void allocate(void** pointer, size_t bytes) { CUDA_CHECK(cudaMalloc(pointer, bytes)); }
 
     void release() {
-        if (graph_exec != nullptr) cudaGraphExecDestroy(graph_exec);
-        graph_exec = nullptr;
+        // Every live instantiation is in the caches (a successful capture is
+        // pushed there before it is used, a failed one leaves nothing), so
+        // this is the single teardown -- destroying graph_exec separately
+        // would be a double free of a cached entry.
+        destroyGraphCaches();
         if (handle != nullptr) cublasDestroy(handle);
         handle = nullptr;
         if (stream != nullptr) cudaStreamDestroy(stream);
         stream = nullptr;
         cudaFree(neighbors);
         cudaFree(colors);
+        cudaFree(d_slot_map);
+        d_slot_map = nullptr;
+        if (h_slot_map != nullptr) cudaFreeHost(h_slot_map);
+        h_slot_map = nullptr;
         cudaFree(assembly_node_surface);
         cudaFree(assembly_face_area);
         cudaFree(assembly_volume);
@@ -2193,8 +2411,7 @@ public:
         cudaFree(device_active);
         cudaFree(device_counters);
         cudaFree(device_status);
-        if (sweep_graph_exec != nullptr) cudaGraphExecDestroy(sweep_graph_exec);
-        sweep_graph_exec = nullptr;
+
         cudaFree(xs_chif);
         cudaFree(xs_xsnf);
         cudaFree(xs_xsrf);
@@ -2286,12 +2503,27 @@ public:
     /// Grid for a per-node/per-element kernel: x is the *single-instance* grid,
     /// y is the batch axis.  Never fold the two.
     [[nodiscard]] dim3 node_grid() const {
-        return dim3(static_cast<unsigned>(node_blocks()), static_cast<unsigned>(slots));
+        return dim3(static_cast<unsigned>(node_blocks()), static_cast<unsigned>(lanes));
     }
     [[nodiscard]] dim3 vector_grid() const {
-        return dim3(static_cast<unsigned>(vector_blocks()), static_cast<unsigned>(slots));
+        return dim3(static_cast<unsigned>(vector_blocks()), static_cast<unsigned>(lanes));
     }
     [[nodiscard]] dim3 scalar_grid() const {
+        return dim3(1u, static_cast<unsigned>(lanes));
+    }
+
+    /// The two kernels that are deliberately NOT compacted.
+    ///
+    /// initialize_solver_state writes iter_flags[m] and halt[m] for EVERY
+    /// declared slot before it masks anything -- that is byte for byte the
+    /// per-iteration cudaMemsetAsync(iter_flags) it replaced, and `halt` is
+    /// what every later kernel consults, so a slot that never gets written
+    /// keeps a stale mask.  finalize_status likewise has to cover every slot
+    /// because the status D2H copies all of them.  Both are one thread per
+    /// slot, so keeping them full width costs a handful of empty blocks and
+    /// buys the whole full-width argument for free -- no separate reset
+    /// kernel, no extra graph node, and the OFF path is untouched.
+    [[nodiscard]] dim3 full_scalar_grid() const {
         return dim3(1u, static_cast<unsigned>(slots));
     }
 
@@ -2313,7 +2545,7 @@ public:
         // and just upload it every time -- which is what happened anyway.
         sl.push_diag = true;
         sl.push_cc   = !mirrorMatches(sl.cc_mirror, host_cc, coupling_count);
-        sl.push_phi  = !mirrorMatches(sl.phi_mirror, host_phi, static_cast<size_t>(n));
+        sl.push_phi  = !phiMirrorMatches(sl, host_phi, static_cast<size_t>(n));
     }
 
     static bool mirrorMatches(const MirroredUpload& mirror, const double* host, size_t count) {
@@ -2321,8 +2553,104 @@ public:
                std::memcmp(mirror.shadow.data(), host, count * sizeof(double)) == 0;
     }
 
+    /// Is the FLUX mirror worth its keep?  MEASURED: yes, at every width.
+    ///
+    /// The audit item this answers (C5) proposed bypassing the mirror in
+    /// single-slot mode, on the theory that its two host passes -- the shadow
+    /// copy in adoptFluxMirror and the memcmp before the next upload, 2 x n
+    /// doubles -- cost more than the one async H2D of n doubles they elide,
+    /// with an idle copy engine and no batch-mates to amortise over.  The
+    /// measurement says the opposite, at the KNGR mesh (n = 16 902, 132 KB):
+    ///
+    ///     adoptFluxMirror shadow copy               1.74 us
+    ///     mirrorMatches memcmp                      1.95 us
+    ///     -> mirror, per launch                     3.69 us
+    ///     pinned cudaMemcpyAsync H2D, ISSUE only   19.52 us
+    ///     pinned H2D + stream sync                 50.11 us
+    ///
+    /// and the elision is not occasional: inside the sweep loop the device
+    /// produced the flux and the host only read it, so the shadow matches on
+    /// every continuation launch.  The mirror is therefore ~3.7 us spent to
+    /// avoid >=19.5 us of launcher time, single slot included.  It stays on.
+    ///
+    /// The gate remains so the claim stays falsifiable on the real device:
+    /// RASBERY_GPU_PHI_MIRROR=0 turns it off, and cmfd_phi_mirror_ns /
+    /// _calls / cmfd_phi_h2d_elided_bytes are the two sides of the trade.
+    /// Turning it off is byte-exact by construction -- the mirror only ever
+    /// ELIDES an upload of bytes the device already holds, so declining to
+    /// elide uploads the same bytes again.
+    [[nodiscard]] bool phiMirrorEnabled() const {
+        static const bool on = [] {
+            const char* v = std::getenv("RASBERY_GPU_PHI_MIRROR");
+            return v == nullptr || std::string(v) != "0";
+        }();
+        return on;
+    }
+
+    /// mirrorMatches for the flux, with the width gate and the cost clock.
+    bool phiMirrorMatches(Slot& sl, const double* host_phi, size_t count) {
+        if (!phiMirrorEnabled()) {
+            g_cmfd_phi_mirror_bypassed.fetch_add(1, std::memory_order_relaxed);
+            return false; // "does not match" == upload, which is always correct
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool hit = mirrorMatches(sl.phi_mirror, host_phi, count);
+        g_cmfd_phi_mirror_ns.fetch_add(
+            static_cast<unsigned long long>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count()),
+            std::memory_order_relaxed);
+        g_cmfd_phi_mirror_calls.fetch_add(1, std::memory_order_relaxed);
+        if (hit)
+            g_cmfd_phi_h2d_elided_bytes.fetch_add(
+                static_cast<unsigned long long>(count) * sizeof(double),
+                std::memory_order_relaxed);
+        return hit;
+    }
+
+    /// Decide this launch's dispatch width and publish the lane -> slot map.
+    ///
+    /// Called from issueUploads / issueSweepUploads, i.e. on the launcher's
+    /// stream BEFORE the graph launch and OUTSIDE any capture, so the map the
+    /// replayed graph reads is the one this launch wrote.  `active_slots` is
+    /// ascending (the rendezvous builds it that way), and the compacted map
+    /// preserves that order: every per-slot mirror, generation counter and
+    /// status row is keyed by the PHYSICAL slot, so lane order is the only
+    /// thing allowed to be logical.
+    ///
+    /// Compaction OFF is the FULL IDENTITY, not "the participants only": the
+    /// OFF launch must visit the same blocks it visited before compaction
+    /// existed and be masked in the same place (the halt guard), or the two
+    /// paths stop being the same program.
+    void buildSlotMap(const int* active_slots, int count) {
+        if (!compact) {
+            lanes = slots;
+            for (int i = 0; i < slots; ++i) h_slot_map[i] = i;
+        } else {
+            lanes = cmfdBucketFor(count, slots);
+            for (int i = 0; i < slots; ++i) h_slot_map[i] = -1;
+            for (int i = 0; i < count && i < lanes; ++i) h_slot_map[i] = active_slots[i];
+        }
+        // Always the FULL fleet width, never `lanes`: a stale entry from a
+        // wider previous launch must never be reachable by a later, deeper
+        // graph replay.
+        CUDA_CHECK(cudaMemcpyAsync(d_slot_map, h_slot_map,
+                                   static_cast<size_t>(slots) * sizeof(int),
+                                   cudaMemcpyHostToDevice, stream));
+        g_cmfd_logical_drives.fetch_add(static_cast<unsigned long long>(count),
+                                        std::memory_order_relaxed);
+        g_cmfd_physical_blocks.fetch_add(static_cast<unsigned long long>(count),
+                                         std::memory_order_relaxed);
+        g_cmfd_padding_blocks.fetch_add(
+            static_cast<unsigned long long>(lanes > count ? lanes - count : 0),
+            std::memory_order_relaxed);
+        cmfdBucketHistogramBump(lanes);
+    }
+
     /// H2D for the participating slots, plus the participation mask itself.
     void issueUploads(const int* active_slots, int count) {
+        buildSlotMap(active_slots, count);
         std::memset(host_active, 0, static_cast<size_t>(slots) * sizeof(std::uint32_t));
         for (int i = 0; i < count; ++i) host_active[active_slots[i]] = 1u;
         CUDA_CHECK(cudaMemcpyAsync(device_active,
@@ -2399,11 +2727,11 @@ public:
     /// Bit-reproducible replacement for cublasDdot / cublasDnrm2.
     void dot(const double* a, const double* b, int scalar_slot, bool take_sqrt = false) {
         const int blocks = reduce_blocks_for(n);
-        reduce_dot_stage1<<<dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(slots)),
+        reduce_dot_stage1<<<dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(lanes)),
                             kReduceThreads, 0, stream>>>(
-            n, vec_stride(), a, b, partials, device_halt);
+            n, vec_stride(), a, b, partials, device_halt, d_slot_map, lanes);
         reduce_dot_stage2<<<scalar_grid(), 1, 0, stream>>>(
-            blocks, partials, scalars, scalar_slot, take_sqrt, device_halt);
+            blocks, partials, scalars, scalar_slot, take_sqrt, device_halt, d_slot_map, lanes);
     }
 
     /// Two independent dots over the same n in ONE pair of nodes.  See
@@ -2413,11 +2741,11 @@ public:
     void dot2(const double* a0, const double* b0, int scalar_slot0,
               const double* a1, const double* b1, int scalar_slot1) {
         const int blocks = reduce_blocks_for(n);
-        reduce_dot2_stage1<<<dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(slots)),
+        reduce_dot2_stage1<<<dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(lanes)),
                              kReduceThreads, 0, stream>>>(
-            n, vec_stride(), a0, b0, a1, b1, partials, partials2, device_halt);
+            n, vec_stride(), a0, b0, a1, b1, partials, partials2, device_halt, d_slot_map, lanes);
         reduce_dot2_stage2<<<scalar_grid(), 1, 0, stream>>>(
-            blocks, partials, partials2, scalars, scalar_slot0, scalar_slot1, device_halt);
+            blocks, partials, partials2, scalars, scalar_slot0, scalar_slot1, device_halt, d_slot_map, lanes);
     }
 
     /// Is the mixed-precision inner loop armed right now?  The env gate minus
@@ -2431,28 +2759,28 @@ public:
     /// with the FP64 path, which is why no _f32 stage 2 exists.
     void dot_f32(const float* a, const float* b, int scalar_slot) {
         const int blocks = reduce_blocks_for(n);
-        reduce_dot_stage1_f32<<<dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(slots)),
+        reduce_dot_stage1_f32<<<dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(lanes)),
                                 kReduceThreads, 0, stream>>>(
-            n, vec_stride(), a, b, partials, device_halt);
+            n, vec_stride(), a, b, partials, device_halt, d_slot_map, lanes);
         reduce_dot_stage2<<<scalar_grid(), 1, 0, stream>>>(
-            blocks, partials, scalars, scalar_slot, false, device_halt);
+            blocks, partials, scalars, scalar_slot, false, device_halt, d_slot_map, lanes);
     }
 
     void dot2_f32(const float* a0, const float* b0, int scalar_slot0,
                   const float* a1, const float* b1, int scalar_slot1) {
         const int blocks = reduce_blocks_for(n);
-        reduce_dot2_stage1_f32<<<dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(slots)),
+        reduce_dot2_stage1_f32<<<dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(lanes)),
                                  kReduceThreads, 0, stream>>>(
-            n, vec_stride(), a0, b0, a1, b1, partials, partials2, device_halt);
+            n, vec_stride(), a0, b0, a1, b1, partials, partials2, device_halt, d_slot_map, lanes);
         reduce_dot2_stage2<<<scalar_grid(), 1, 0, stream>>>(
-            blocks, partials, partials2, scalars, scalar_slot0, scalar_slot1, device_halt);
+            blocks, partials, partials2, scalars, scalar_slot0, scalar_slot1, device_halt, d_slot_map, lanes);
     }
 
     void precondition_sweeps_f32(const float* b, float* x) {
         for (int sweep = 0; sweep < rb_sweeps; ++sweep)
             colored_block_sweep_f32<<<node_grid(), block_size, 0, stream>>>(
                 nxyz, vec_stride(), mat_stride(), cpl_stride(), sweep % ncolors, colors,
-                neighbors, cc_f, dinv_f, b, x, device_halt);
+                neighbors, cc_f, dinv_f, b, x, device_halt, d_slot_map, lanes);
     }
 
     /// One mixed-precision BiCGSTAB iteration.  Kernel for kernel, node for
@@ -2464,41 +2792,41 @@ public:
         dot_f32(r0_f, r_f, kRhoNew);
         prepare_p_jacobi_f32<<<node_grid(), block_size, 0, stream>>>(
             nxyz, vec_stride(), mat_stride(), scalars, iter_flags, dinv_f, r_f, v_f,
-            p_f, y_f, device_halt);
+            p_f, y_f, device_halt, d_slot_map, lanes);
         precondition_sweeps_f32(p_f, y_f);
         matvec_two_group_f32<<<node_grid(), block_size, 0, stream>>>(
             nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag_f, cc_f,
-            y_f, v_f, device_halt);
+            y_f, v_f, device_halt, d_slot_map, lanes);
 
         dot_f32(r0_f, v_f, kR0V);
         update_s_jacobi_f32<<<node_grid(), block_size, 0, stream>>>(
             nxyz, vec_stride(), mat_stride(), scalars, iter_flags, dinv_f, r_f, v_f,
-            s_f, z_f, device_halt);
+            s_f, z_f, device_halt, d_slot_map, lanes);
         precondition_sweeps_f32(s_f, z_f);
         matvec_two_group_f32<<<node_grid(), block_size, 0, stream>>>(
             nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag_f, cc_f,
-            z_f, t_f, device_halt);
+            z_f, t_f, device_halt, d_slot_map, lanes);
 
         dot2_f32(s_f, t_f, kPts, t_f, t_f, kPtt);
 
         update_solution_f32<<<vector_grid(), block_size, 0, stream>>>(
             n, vec_stride(), scalars, iter_flags, y_f, z_f, s_f, t_f, phi, r_f,
-            device_halt);
+            device_halt, d_slot_map, lanes);
         const int norm_blocks = reduce_blocks_for(n);
         reduce_dot_stage1_f32<<<
-            dim3(static_cast<unsigned>(norm_blocks), static_cast<unsigned>(slots)),
+            dim3(static_cast<unsigned>(norm_blocks), static_cast<unsigned>(lanes)),
             kReduceThreads, 0, stream>>>(
-            n, vec_stride(), r_f, r_f, partials, device_halt);
+            n, vec_stride(), r_f, r_f, partials, device_halt, d_slot_map, lanes);
         if (scalar_fusion) {
             reduce_norm_accumulate_stage2<<<scalar_grid(), 1, 0, stream>>>(
                 norm_blocks, allow_halt, force_halt, partials, scalars, iter_flags,
-                device_flags, device_counters, device_halt, device_active);
+                device_flags, device_counters, device_halt, device_active, d_slot_map, lanes);
         } else {
             reduce_dot_stage2<<<scalar_grid(), 1, 0, stream>>>(
-                norm_blocks, partials, scalars, kInitialNorm, true, device_halt);
+                norm_blocks, partials, scalars, kInitialNorm, true, device_halt, d_slot_map, lanes);
             accumulate_iteration<<<scalar_grid(), 1, 0, stream>>>(
                 allow_halt, force_halt, scalars, iter_flags, device_flags,
-                device_counters, device_halt, device_active);
+                device_counters, device_halt, device_active, d_slot_map, lanes);
         }
     }
 
@@ -2516,7 +2844,7 @@ public:
         for (int sweep = 0; sweep < rb_sweeps; ++sweep)
             colored_block_sweep<<<node_grid(), block_size, 0, stream>>>(
                 nxyz, vec_stride(), mat_stride(), cpl_stride(), sweep % ncolors, colors, neighbors,
-                cc, dinv, b, x, device_halt);
+                cc, dinv, b, x, device_halt, d_slot_map, lanes);
     }
 
     /// One BiCGSTAB iteration.  `allow_halt` is 0 only for the first one,
@@ -2534,18 +2862,18 @@ public:
         dot(r0, r, kRhoNew);
         prepare_p_jacobi<<<node_grid(), block_size, 0, stream>>>(
             nxyz, vec_stride(), mat_stride(), scalars, iter_flags, dinv, r, v, p, y,
-            device_halt);
+            device_halt, d_slot_map, lanes);
         precondition_sweeps(p, y);
         matvec_two_group<<<node_grid(), block_size, 0, stream>>>(
-            nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag, cc, y, v, device_halt);
+            nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag, cc, y, v, device_halt, d_slot_map, lanes);
 
         dot(r0, v, kR0V);
         update_s_jacobi<<<node_grid(), block_size, 0, stream>>>(
             nxyz, vec_stride(), mat_stride(), scalars, iter_flags, dinv, r, v, s, z,
-            device_halt);
+            device_halt, d_slot_map, lanes);
         precondition_sweeps(s, z);
         matvec_two_group<<<node_grid(), block_size, 0, stream>>>(
-            nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag, cc, z, t, device_halt);
+            nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag, cc, z, t, device_halt, d_slot_map, lanes);
 
         // s.t and t.t are the only two adjacent dots with no kernel between
         // them; one stage-1/stage-2 pair carries both, each with its own
@@ -2553,25 +2881,25 @@ public:
         dot2(s, t, kPts, t, t, kPtt);
 
         update_solution<<<vector_grid(), block_size, 0, stream>>>(
-            n, vec_stride(), scalars, iter_flags, y, z, s, t, phi, r, device_halt);
+            n, vec_stride(), scalars, iter_flags, y, z, s, t, phi, r, device_halt, d_slot_map, lanes);
         // Absolute residual of the iterate that update_solution just wrote.
         // The stage-1 partition is unchanged; only the scalar stage-2 node is
         // optionally fused with its immediately dependent bookkeeping node.
         const int norm_blocks = reduce_blocks_for(n);
         reduce_dot_stage1<<<
-            dim3(static_cast<unsigned>(norm_blocks), static_cast<unsigned>(slots)),
+            dim3(static_cast<unsigned>(norm_blocks), static_cast<unsigned>(lanes)),
             kReduceThreads, 0, stream>>>(
-            n, vec_stride(), r, r, partials, device_halt);
+            n, vec_stride(), r, r, partials, device_halt, d_slot_map, lanes);
         if (scalar_fusion) {
             reduce_norm_accumulate_stage2<<<scalar_grid(), 1, 0, stream>>>(
                 norm_blocks, allow_halt, force_halt, partials, scalars, iter_flags,
-                device_flags, device_counters, device_halt, device_active);
+                device_flags, device_counters, device_halt, device_active, d_slot_map, lanes);
         } else {
             reduce_dot_stage2<<<scalar_grid(), 1, 0, stream>>>(
-                norm_blocks, partials, scalars, kInitialNorm, true, device_halt);
+                norm_blocks, partials, scalars, kInitialNorm, true, device_halt, d_slot_map, lanes);
             accumulate_iteration<<<scalar_grid(), 1, 0, stream>>>(
                 allow_halt, force_halt, scalars, iter_flags, device_flags,
-                device_counters, device_halt, device_active);
+                device_counters, device_halt, device_active, d_slot_map, lanes);
         }
     }
 
@@ -2594,7 +2922,7 @@ public:
     /// sequence BICGCMFD::drive used to drive from the host, with the same
     /// operands in the same order.
     void enqueue_outer(int nmax) {
-        initialize_solver_state<<<scalar_grid(), 1, 0, stream>>>(
+        initialize_solver_state<<<full_scalar_grid(), 1, 0, stream>>>(
             scalars, device_flags, device_halt, device_counters, iter_flags,
             device_active, sweep_halt);
         if (fp32Active()) {
@@ -2603,33 +2931,33 @@ public:
             // write to the double diag/cc -- the H2D pushes, the device
             // assembly and the per-sweep cmfd_updls all precede this point.
             refresh_operator_mirror_f32<<<node_grid(), block_size, 0, stream>>>(
-                nxyz, mat_stride(), cpl_stride(), diag, cc, diag_f, cc_f, device_halt);
+                nxyz, mat_stride(), cpl_stride(), diag, cc, diag_f, cc_f, device_halt, d_slot_map, lanes);
             // Same three fused steps as below, but only the RESULTS narrow: the
             // block inversion, A*phi and b - A*phi are FP64, and `r` still
             // receives the FP64 residual so the reference norm harvested by the
             // unmodified reduction below is the FP64 one.
             begin_outer_fused_f32<<<node_grid(), block_size, 0, stream>>>(
                 nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag, cc,
-                phi, src, dinv_f, ax, r, r_f, r0_f, p_f, v_f, device_halt);
+                phi, src, dinv_f, ax, r, r_f, r0_f, p_f, v_f, device_halt, d_slot_map, lanes);
         } else {
             // One node for what used to be three: the block inversion (independent
             // of the other two), the A*phi matvec and the residual it feeds.
             begin_outer_fused<<<node_grid(), block_size, 0, stream>>>(
                 nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag, cc, phi,
-                src, dinv, ax, r, r0, p, v, device_halt);
+                src, dinv, ax, r, r0, p, v, device_halt, d_slot_map, lanes);
         }
         const int reference_blocks = reduce_blocks_for(n);
         reduce_dot_stage1<<<
-            dim3(static_cast<unsigned>(reference_blocks), static_cast<unsigned>(slots)),
+            dim3(static_cast<unsigned>(reference_blocks), static_cast<unsigned>(lanes)),
             kReduceThreads, 0, stream>>>(
-            n, vec_stride(), r, r, partials, device_halt);
+            n, vec_stride(), r, r, partials, device_halt, d_slot_map, lanes);
         if (scalar_fusion) {
             reduce_norm_store_reference_stage2<<<scalar_grid(), 1, 0, stream>>>(
-                reference_blocks, partials, scalars, device_halt);
+                reference_blocks, partials, scalars, device_halt, d_slot_map, lanes);
         } else {
             reduce_dot_stage2<<<scalar_grid(), 1, 0, stream>>>(
-                reference_blocks, partials, scalars, kInitialNorm, true, device_halt);
-            store_reference_norm<<<scalar_grid(), 1, 0, stream>>>(scalars, device_halt);
+                reference_blocks, partials, scalars, kInitialNorm, true, device_halt, d_slot_map, lanes);
+            store_reference_norm<<<scalar_grid(), 1, 0, stream>>>(scalars, device_halt, d_slot_map, lanes);
         }
 
         // The algorithmic budget is `1 + nmax`; the capture may be deeper.
@@ -2653,7 +2981,7 @@ public:
         iter_batch_used      = captured;
         telemetry.iter_batch = static_cast<std::uint64_t>(captured);
 
-        finalize_status<<<scalar_grid(), 1, 0, stream>>>(
+        finalize_status<<<full_scalar_grid(), 1, 0, stream>>>(
             scalars, device_flags, device_counters, device_status, device_active);
         CUDA_CHECK(cudaMemcpyAsync(host_status,
                                    device_status,
@@ -2675,12 +3003,33 @@ public:
         // The precision mode is part of the captured topology (different
         // kernels, one extra node), so a latched fallback invalidates the graph
         // exactly the way a changed nmax does.
-        if (graph_exec == nullptr || graph_nmax != nmax ||
+        // grid.y is baked into a graph, so the dispatch width is TOPOLOGY:
+        // a bucket change invalidates the instantiation exactly the way a
+        // changed nmax or a latched FP32 fallback does.  With compaction off
+        // `lanes` is the constant `slots` and this term never fires.
+        if (graph_exec == nullptr || graph_nmax != nmax || graph_lanes != lanes ||
             graph_precision != precisionTag()) {
+            // A bucket the arena has already served has an instantiation
+            // waiting: switch to it instead of paying a capture again.  Without
+            // this the arrival width oscillating between two buckets would
+            // re-instantiate on every launch, which costs far more than the
+            // padding blocks compaction removes.  The key space is bounded --
+            // nine buckets x two precisions x one nmax -- so the list is short
+            // by construction and needs no eviction.
+            graph_exec = nullptr;
+            for (const OuterGraph& e : outer_graphs)
+                if (e.nmax == nmax && e.lanes == lanes && e.precision == precisionTag()) {
+                    graph_exec = e.exec;
+                    break;
+                }
             if (graph_exec != nullptr) {
-                CUDA_CHECK(cudaGraphExecDestroy(graph_exec));
-                graph_exec = nullptr;
-                ++telemetry.graph_reinstantiations;
+                graph_nmax      = nmax;
+                graph_lanes     = lanes;
+                graph_precision = precisionTag();
+                CUDA_CHECK(cudaGraphLaunch(graph_exec, stream));
+                ++telemetry.graph_launches;
+                if (iter_batch_used >= 2) ++telemetry.batched_graph_launches;
+                return;
             }
             cudaGraph_t graph = nullptr;
             cudaError_t rc = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
@@ -2720,13 +3069,17 @@ public:
                 // and only execution of this outer.
                 cudaGetLastError();
                 graph_exec = nullptr;
+                destroyGraphCaches();
                 use_graph  = false;
                 ++telemetry.graph_fallbacks;
                 enqueue_outer(nmax);
                 return;
             }
             graph_nmax      = nmax;
+            graph_lanes     = lanes;
             graph_precision = precisionTag();
+            outer_graphs.push_back(OuterGraph{graph_exec, nmax, lanes, precisionTag()});
+            g_cmfd_bucket_graphs.fetch_add(1, std::memory_order_relaxed);
             // The capture itself enqueued nothing: replay it now.
         }
         CUDA_CHECK(cudaGraphLaunch(graph_exec, stream));
@@ -2753,26 +3106,26 @@ public:
             nxyz, vec_stride(), mat_stride(), cpl_stride(), surface_stride(),
             assembly_node_surface, assembly_face_area, assembly_volume,
             xs_xsrf, xs_xssm, xs_chif, xs_xsnf, dtil_dev, dhat_dev,
-            diag, cc, udiag_dev, scalars, device_assembly_active, sweep_halt);
+            diag, cc, udiag_dev, scalars, device_assembly_active, sweep_halt, d_slot_map, lanes);
         for (int sweep = 0; sweep < unroll; ++sweep) {
-            cmfd_sweep_begin<<<scalar_grid(), 1, 0, stream>>>(scalars, sweep_halt);
+            cmfd_sweep_begin<<<scalar_grid(), 1, 0, stream>>>(scalars, sweep_halt, d_slot_map, lanes);
             cmfd_src_build<<<node_grid(), block_size, 0, stream>>>(
                 nxyz, vec_stride(), node_stride(), xs_chif, psi_dev, src, scalars,
-                sweep_halt);
+                sweep_halt, d_slot_map, lanes);
             enqueue_outer(nmax);
             // ax/s are BiCG scratch, dead between the inner loop and the next
             // sweep's initial residual; they carry the wiel addends here.
             cmfd_wiel_terms<<<node_grid(), block_size, 0, stream>>>(
                 nxyz, vec_stride(), node_stride(), phi, psi_dev, xs_xsnf, node_vol,
-                ax, s, sweep_halt);
+                ax, s, sweep_halt, d_slot_map, lanes);
             cmfd_wiel_finalize<<<scalar_grid(), 32, 0, stream>>>(
-                nxyz, vec_stride(), ax, s, scalars, sweep_halt);
+                nxyz, vec_stride(), ax, s, scalars, sweep_halt, d_slot_map, lanes);
             cmfd_updls<<<node_grid(), block_size, 0, stream>>>(
                 nxyz, vec_stride(), node_stride(), mat_stride(), xs_chif, xs_xsnf,
-                node_vol, udiag_dev, diag, scalars, sweep_halt);
+                node_vol, udiag_dev, diag, scalars, sweep_halt, d_slot_map, lanes);
             cmfd_negative_scan<<<vector_grid(), block_size, 0, stream>>>(
-                n, vec_stride(), phi, scalars, sweep_halt);
-            cmfd_sweep_end<<<scalar_grid(), 1, 0, stream>>>(scalars, sweep_halt);
+                n, vec_stride(), phi, scalars, sweep_halt, d_slot_map, lanes);
+            cmfd_sweep_end<<<scalar_grid(), 1, 0, stream>>>(scalars, sweep_halt, d_slot_map, lanes);
         }
     }
 
@@ -2789,13 +3142,35 @@ public:
             enqueue_sweeps(nmax, unroll);
             return;
         }
-        if (!sweep_graph.serves(nmax, unroll, precisionTag())) {
-            const int depth = sweep_graph.captureDepth(unroll);
+        if (!sweep_graph.serves(nmax, unroll, precisionTag(), lanes)) {
+            // Per-bucket cache, exactly as launch_outer.  The capacity
+            // ratchet on `unroll` stays PER BUCKET: a deeper capture serves a
+            // shallower launch only at the same grid.y, because grid.y is
+            // baked and a wider one would dispatch padding blocks again.
+            sweep_graph_exec = nullptr;
+            for (const SweepGraph& e : sweep_graphs)
+                if (e.key.serves(nmax, unroll, precisionTag(), lanes)) {
+                    sweep_graph_exec = e.exec;
+                    sweep_graph      = e.key;
+                    break;
+                }
             if (sweep_graph_exec != nullptr) {
-                CUDA_CHECK(cudaGraphExecDestroy(sweep_graph_exec));
-                sweep_graph_exec = nullptr;
-                ++telemetry.graph_reinstantiations;
+                CUDA_CHECK(cudaGraphLaunch(sweep_graph_exec, stream));
+                ++telemetry.graph_launches;
+                if (iter_batch_used >= 2) ++telemetry.batched_graph_launches;
+                return;
             }
+            // The capacity ratchet, now PER BUCKET: start from the deepest
+            // capture this grid.y already has, so a recapture is never
+            // shallower than what exists and the depth settles instead of
+            // oscillating -- exactly the pre-compaction property, restricted
+            // to the entries a launch at this width could have used.
+            sweep_graph = SweepGraphCapacity{};
+            for (const SweepGraph& e : sweep_graphs)
+                if (e.key.lanes == lanes && e.key.nmax == nmax &&
+                    e.key.precision == precisionTag() && e.key.slots > sweep_graph.slots)
+                    sweep_graph = e.key;
+            const int depth = sweep_graph.captureDepth(unroll);
             cudaGraph_t graph = nullptr;
             cudaError_t rc = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
             if (rc == cudaSuccess) {
@@ -2812,12 +3187,15 @@ public:
                 cudaGetLastError();
                 sweep_graph_exec = nullptr;
                 sweep_graph      = SweepGraphCapacity{};
+                destroyGraphCaches();
                 use_graph        = false;
                 ++telemetry.graph_fallbacks;
                 enqueue_sweeps(nmax, unroll);
                 return;
             }
-            sweep_graph = SweepGraphCapacity{nmax, depth, precisionTag()};
+            sweep_graph = SweepGraphCapacity{nmax, depth, precisionTag(), lanes};
+            sweep_graphs.push_back(SweepGraph{sweep_graph_exec, sweep_graph});
+            g_cmfd_bucket_graphs.fetch_add(1, std::memory_order_relaxed);
         }
         CUDA_CHECK(cudaGraphLaunch(sweep_graph_exec, stream));
         ++telemetry.graph_launches;
@@ -2836,6 +3214,7 @@ public:
     /// gave every participant the batch-wide max, and preserving that exactly is
     /// what keeps the retry packing (and therefore `state == 0`) unchanged.
     void issueSweepUploads(const int* active_slots, int count, int slot_budget) {
+        buildSlotMap(active_slots, count);
         for (int i = 0; i < count; ++i) {
             Slot& sl = slot[static_cast<size_t>(active_slots[i])];
             sl.sweep_in[kSweepSlotBudget - kSweepFirst] = static_cast<double>(slot_budget);
@@ -2941,7 +3320,18 @@ public:
                 ++telemetry.cmfd_assembly_cpu_fallbacks;
             }
 
-            push(psi_dev + m * node_stride(), sl.host_psi, static_cast<size_t>(nxyz));
+            // psi round trip, removed.  See CmfdSweepIO::psi_dirty: only the
+            // first launch of a drive carries host-written psi; a later launch
+            // in the same drive would be re-uploading the bytes the device
+            // itself produced, so leaving the device copy alone is the same
+            // state by a shorter path.
+            if (sl.push_psi) {
+                push(psi_dev + m * node_stride(), sl.host_psi, static_cast<size_t>(nxyz));
+            } else {
+                ++telemetry.bulk_h2d_skipped_during_iteration;
+                telemetry.cmfd_psi_h2d_elided_bytes +=
+                    static_cast<std::uint64_t>(nxyz) * sizeof(double);
+            }
             pushOrSkip(phi + m * vec_stride(), sl.host_phi, static_cast<size_t>(n),
                        sl.push_phi, sl.phi_mirror);
             CUDA_CHECK(cudaMemcpyAsync(
@@ -2958,22 +3348,30 @@ public:
         }
     }
 
-    /// D2H after the sweep graph: flux (issueFluxDownloads), psi and the sweep
+    /// D2H after the sweep graph: flux (issueFluxDownloads) and the sweep
     /// scalar block per participant, then the sweep_halt restore.
+    ///
+    /// psi is NOT here any more.  It used to come back after every launch, and
+    /// the only reader of those bytes was the degenerate-gamma (state == 2)
+    /// hand-back inside BICGCMFD::driveDeviceSweeps -- one launch in many.  On
+    /// every other path the host overwrites psi wholesale (CMFD::updpsi from
+    /// the flux) before it is next read, so the download was writing bytes
+    /// nobody looks at.  The exceptional launch pulls it in
+    /// issueExceptionalOperatorDownloads, where the state is already known.
     void issueSweepDownloads(const int* active_slots, int count) {
         for (int i = 0; i < count; ++i) {
             const int m  = active_slots[i];
             Slot&     sl = slot[static_cast<size_t>(m)];
-            CUDA_CHECK(cudaMemcpyAsync(sl.host_psi, psi_dev + m * node_stride(),
-                                       static_cast<size_t>(nxyz) * sizeof(double),
-                                       cudaMemcpyDeviceToHost, stream));
+            sl.psi_downloaded = false;
             CUDA_CHECK(cudaMemcpyAsync(
                 sl.sweep_out,
                 scalars + static_cast<long long>(m) * kScalarCount + kSweepFirst,
                 kSweepCount * sizeof(double), cudaMemcpyDeviceToHost, stream));
             ++telemetry.bulk_d2h_calls_during_iteration;
             telemetry.bulk_d2h_bytes_during_iteration +=
-                (static_cast<std::uint64_t>(nxyz) + kSweepCount) * sizeof(double);
+                static_cast<std::uint64_t>(kSweepCount) * sizeof(double);
+            telemetry.cmfd_psi_d2h_elided_bytes +=
+                static_cast<std::uint64_t>(nxyz) * sizeof(double);
         }
         CUDA_CHECK(cudaMemsetAsync(sweep_halt, 0,
                                    static_cast<size_t>(slots) * sizeof(std::uint32_t),
@@ -3017,7 +3415,23 @@ public:
             const int m = active_slots[i];
             Slot& sl = slot[static_cast<size_t>(m)];
             const int state = static_cast<int>(sl.sweep_out[kSweepState - kSweepFirst]);
-            if (!sl.device_assembly || state != 2) continue;
+            if (state != 2) continue;
+            // The Rayleigh hand-back in BICGCMFD reads psi(l) for sumf/summ,
+            // and this is the one launch on which it does.  Unconditional on
+            // device_assembly: the host arm needs the new fission source too.
+            if (sl.host_psi != nullptr && !sl.psi_downloaded) {
+                CUDA_CHECK(cudaMemcpyAsync(sl.host_psi, psi_dev + m * node_stride(),
+                                           static_cast<size_t>(nxyz) * sizeof(double),
+                                           cudaMemcpyDeviceToHost, stream));
+                sl.psi_downloaded = true;
+                ++telemetry.bulk_d2h_calls_during_iteration;
+                telemetry.bulk_d2h_bytes_during_iteration +=
+                    static_cast<std::uint64_t>(nxyz) * sizeof(double);
+                telemetry.cmfd_psi_d2h_elided_bytes -=
+                    static_cast<std::uint64_t>(nxyz) * sizeof(double);
+                queued = true;
+            }
+            if (!sl.device_assembly) continue;
             if (sl.host_diag_out == nullptr || sl.host_cc_out == nullptr ||
                 sl.host_udiag == nullptr)
                 throw std::runtime_error(
@@ -3106,18 +3520,11 @@ public:
     void latchFp32Off() {
         if (fp32_latched_off) return;
         fp32_latched_off = true;
-        if (graph_exec != nullptr) {
-            cudaGraphExecDestroy(graph_exec);
-            graph_exec = nullptr;
-            graph_nmax = -1;
-            ++telemetry.graph_reinstantiations;
-        }
-        if (sweep_graph_exec != nullptr) {
-            cudaGraphExecDestroy(sweep_graph_exec);
-            sweep_graph_exec = nullptr;
-            sweep_graph      = SweepGraphCapacity{};
-            ++telemetry.graph_reinstantiations;
-        }
+        // Precision is part of every cache key, so a latched fallback could in
+        // principle just miss; dropping the FP32 instantiations outright is
+        // what makes "the run FINISHED in fp64" a property of the process
+        // rather than of which bucket arrives next.
+        destroyGraphCaches();
         std::cerr << "[RASBERY][CUDA][FP32_FALLBACK] {\"reason\":\"nonfinite\","
                   << "\"fp32_fallbacks\":" << telemetry.fp32_fallbacks
                   << ",\"precision\":\"fp64\"}" << std::endl;
@@ -3129,8 +3536,23 @@ public:
     /// critical path, and never on a failed batch (the flux is undefined).
     void adoptFluxMirror(int m) {
         Slot& sl = slot[static_cast<size_t>(m)];
+        if (!phiMirrorEnabled()) {
+            // Nothing will consult it, and a stale shadow must never be able
+            // to elide an upload if the gate is flipped mid-run.
+            sl.phi_mirror.valid = false;
+            g_cmfd_phi_mirror_bypassed.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
         sl.phi_mirror.shadow.assign(sl.out_phi, sl.out_phi + n);
         sl.phi_mirror.valid = true;
+        g_cmfd_phi_mirror_ns.fetch_add(
+            static_cast<unsigned long long>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count()),
+            std::memory_order_relaxed);
+        g_cmfd_phi_mirror_calls.fetch_add(1, std::memory_order_relaxed);
     }
 
     int           slots;
@@ -3182,6 +3604,54 @@ public:
     int           iter_batch_used = 0;
     cudaGraphExec_t graph_exec = nullptr;
     int           graph_nmax = -1;
+    /// One instantiation per (nmax, grid.y, precision) for the outer, and per
+    /// (nmax, capture depth, precision, grid.y) for the sweep sequence.  Both
+    /// key spaces are bounded by the nine-entry bucket ladder, so these lists
+    /// saturate at a handful of entries and are scanned linearly.
+    struct OuterGraph {
+        cudaGraphExec_t exec;
+        int             nmax;
+        int             lanes;
+        int             precision;
+    };
+    struct SweepGraph {
+        cudaGraphExec_t    exec;
+        SweepGraphCapacity key;
+    };
+    std::vector<OuterGraph> outer_graphs;
+    std::vector<SweepGraph> sweep_graphs;
+
+    void destroyGraphCaches() {
+        for (const OuterGraph& e : outer_graphs)
+            if (e.exec != nullptr) cudaGraphExecDestroy(e.exec);
+        for (const SweepGraph& e : sweep_graphs)
+            if (e.exec != nullptr) cudaGraphExecDestroy(e.exec);
+        if (!outer_graphs.empty() || !sweep_graphs.empty())
+            telemetry.graph_reinstantiations +=
+                outer_graphs.size() + sweep_graphs.size();
+        outer_graphs.clear();
+        sweep_graphs.clear();
+        graph_exec       = nullptr;
+        graph_nmax       = -1;
+        graph_lanes      = -1;
+        graph_precision  = -1;
+        sweep_graph_exec = nullptr;
+        sweep_graph      = SweepGraphCapacity{};
+    }
+
+    /// grid.y the cached outer graph was captured at (a graph bakes it).
+    int           graph_lanes = -1;
+
+    // ---- active-slot compaction (RASBERY_GPU_CMFD_COMPACT, default OFF) ----
+    /// Logical dispatch lane -> physical slot; -1 is a padding lane.  Both
+    /// pointers are allocated once and NEVER move: d_slot_map is a kernel
+    /// argument baked into every captured graph, so only its contents change.
+    int*          d_slot_map = nullptr;
+    int*          h_slot_map = nullptr; // pinned
+    /// grid.y of the launch being enqueued.  Equals `slots` with compaction
+    /// off, the bucket for the arrival width with it on.
+    int           lanes      = 0;
+    const bool    compact    = cmfdCompactEnabled();
 
     // ---- mixed-precision inner loop (RASBERY_GPU_CMFD_FP32) ----
     /// The env gate, resolved once in the constructor.
@@ -3243,7 +3713,9 @@ CudaBICGBackend::~CudaBICGBackend() = default;
 
 bool CudaBICGBackend::available() const { return _impl->core.available; }
 const std::string& CudaBICGBackend::status() const { return _impl->core.status; }
-BackendCounters CudaBICGBackend::counters() const { return _impl->core.telemetry; }
+BackendCounters CudaBICGBackend::counters() const {
+    return withPhiMirrorCounters(_impl->core.telemetry);
+}
 DeviceSolveStatus CudaBICGBackend::lastSolveStatus() const {
     return _impl->core.host_status != nullptr ? _impl->core.host_status[0] : DeviceSolveStatus{};
 }
@@ -3384,7 +3856,9 @@ CudaBatchArena::~CudaBatchArena() = default;
 bool CudaBatchArena::available() const { return _impl->core.available; }
 const std::string& CudaBatchArena::status() const { return _impl->core.status; }
 int CudaBatchArena::slots() const { return _impl->core.slots; }
-BackendCounters CudaBatchArena::counters() const { return _impl->core.telemetry; }
+BackendCounters CudaBatchArena::counters() const {
+    return withPhiMirrorCounters(_impl->core.telemetry);
+}
 
 bool CudaBatchArena::compatible(Geometry& geometry) const {
     return _impl->core.compatibleGeometry(geometry);
@@ -3484,6 +3958,7 @@ void CudaBatchArena::stageSweeps(int m, const CmfdSweepIO& io) {
     sl.host_vol   = io.vol;
     sl.host_udiag = io.udiag;
     sl.host_psi   = io.psi;
+    sl.push_psi   = io.psi_dirty;
     sl.device_assembly = io.device_assembly && cmfdAssemblyEnabled();
     if (sl.device_assembly &&
         (sl.host_xsrf == nullptr || sl.host_xssm == nullptr ||
@@ -3786,8 +4261,43 @@ CudaBatchArena* rasberyBatchArena(Geometry& geometry) {
     return g_arena.get();
 }
 
+/// The active-slot compaction receipt.
+///
+/// Printed whether or not compaction is on, so two runs of the same deck are
+/// directly comparable and `padding_fraction` states the size of the prize
+/// before anyone pays for it.  Its own tag, so nothing that parses
+/// [RASBERY][CUDA][BACKEND_COUNTERS] or [BATCH_OCCUPANCY] has to change.
+static void reportCmfdCompaction() {
+    const unsigned long long phys = g_cmfd_physical_blocks.load(std::memory_order_relaxed);
+    const unsigned long long pad  = g_cmfd_padding_blocks.load(std::memory_order_relaxed);
+    std::ostringstream line;
+    line << "[RASBERY][CMFD][COMPACT] {\"enabled\":" << (cmfdCompactEnabled() ? 1 : 0)
+         << ",\"logical_drives\":"
+         << g_cmfd_logical_drives.load(std::memory_order_relaxed)
+         << ",\"physical_slot_blocks\":" << phys
+         << ",\"padding_blocks\":" << pad
+         << ",\"padding_fraction\":"
+         << ((phys + pad) ? static_cast<double>(pad) / static_cast<double>(phys + pad)
+                          : 0.0)
+         << ",\"bucket_graphs\":"
+         << g_cmfd_bucket_graphs.load(std::memory_order_relaxed)
+         << ",\"bucket_histogram\":[";
+    for (std::size_t i = 0; i < g_cmfd_bucket_histogram.size(); ++i) {
+        if (i) line << ',';
+        line << g_cmfd_bucket_histogram[i].load(std::memory_order_relaxed);
+    }
+    line << "]}";
+    std::cout << line.str() << std::endl;
+}
+
 void rasberyReleaseBatchArena() {
     std::lock_guard<std::mutex> lock(g_arena_mutex);
+    // Before the arena test, and gated on evidence rather than on batch mode:
+    // the single-instance backend dispatches through the same buildSlotMap, so
+    // a non-batch run has a padding fraction worth reading too (it is 0 there,
+    // which is the point).  A run that never reached the device stays silent.
+    if (g_cmfd_logical_drives.load(std::memory_order_relaxed) != 0)
+        reportCmfdCompaction();
     if (!g_arena) return;
     g_arena->reportBatchOccupancy("run");
     const BackendCounters c = g_arena->counters();
@@ -3800,6 +4310,16 @@ void rasberyReleaseBatchArena() {
               << c.cmfd_diag_h2d_elided_bytes << ','
               << "\"cmfd_cc_h2d_elided_bytes\":"
               << c.cmfd_cc_h2d_elided_bytes << ','
+              << "\"cmfd_psi_h2d_elided_bytes\":"
+              << c.cmfd_psi_h2d_elided_bytes << ','
+              << "\"cmfd_psi_d2h_elided_bytes\":"
+              << c.cmfd_psi_d2h_elided_bytes << ','
+              << "\"cmfd_phi_mirror_ns\":" << c.cmfd_phi_mirror_ns << ','
+              << "\"cmfd_phi_mirror_calls\":" << c.cmfd_phi_mirror_calls << ','
+              << "\"cmfd_phi_mirror_bypassed\":" << c.cmfd_phi_mirror_bypassed
+              << ','
+              << "\"cmfd_phi_h2d_elided_bytes\":"
+              << c.cmfd_phi_h2d_elided_bytes << ','
               << "\"bicg_early_convergence_exits\":" << c.bicg_early_convergence_exits << ','
               << "\"bicg_restarts\":" << c.bicg_restarts << ','
               << "\"bulk_h2d_calls_during_iteration\":" << c.bulk_h2d_calls_during_iteration << ','

@@ -215,7 +215,7 @@ static void check(bool ok, const char* what) {
 
 int main() {
     // 1. A fresh cache serves nothing.
-    check(!SweepGraphCapacity{}.serves(3, 1, 0), "empty cache must not serve");
+    check(!SweepGraphCapacity{}.serves(3, 1, 0, 1), "empty cache must not serve");
 
     // 2. THE TASK 6 PROPERTY: walking the budget down never re-captures.
     //    _ncmfd = 5 (Driver.h) so the real sequence is 5,4,3,2,1 and back to 5.
@@ -223,8 +223,8 @@ int main() {
     int captures = 0;
     for (int repeat = 0; repeat < 50; ++repeat) {
         for (int want = 5; want >= 1; --want) {
-            if (!cap.serves(3, want, 0)) {
-                cap = SweepGraphCapacity{3, cap.captureDepth(want), 0};
+            if (!cap.serves(3, want, 0, 1)) {
+                cap = SweepGraphCapacity{3, cap.captureDepth(want), 0, 1};
                 ++captures;
             }
         }
@@ -236,8 +236,8 @@ int main() {
     // 3. Growth re-captures once, then settles.
     captures = 0;
     for (int want : {5, 7, 7, 6, 7, 3}) {
-        if (!cap.serves(3, want, 0)) {
-            cap = SweepGraphCapacity{3, cap.captureDepth(want), 0};
+        if (!cap.serves(3, want, 0, 1)) {
+            cap = SweepGraphCapacity{3, cap.captureDepth(want), 0, 1};
             ++captures;
         }
     }
@@ -247,15 +247,20 @@ int main() {
     // 4. captureDepth never shrinks -- otherwise the capacity oscillates.
     for (int have = 0; have <= 8; ++have)
         for (int want = 0; want <= 8; ++want) {
-            const SweepGraphCapacity c{3, have, 0};
+            const SweepGraphCapacity c{3, have, 0, 1};
             const int d = c.captureDepth(want);
             check(d >= have && d >= want, "captureDepth must cover both");
         }
 
     // 5. nmax and precision are EXACT keys.
-    check(!cap.serves(4, 1, 0), "a different nmax must re-capture (force_halt is baked)");
-    check(!cap.serves(3, 1, 1), "a precision change must re-capture (different kernels)");
-    check(cap.serves(3, 1, 0), "same nmax/precision with spare capacity must be served");
+    check(!cap.serves(4, 1, 0, 1), "a different nmax must re-capture (force_halt is baked)");
+    check(!cap.serves(3, 1, 1, 1), "a precision change must re-capture (different kernels)");
+    check(cap.serves(3, 1, 0, 1), "same nmax/precision with spare capacity must be served");
+    // grid.y is BAKED into a captured graph, so a bucket change is a topology
+    // change, not a capacity one: a 32-lane graph cannot serve a 4-lane launch
+    // even though it is "wide enough" -- it would dispatch the padding blocks
+    // the compaction exists to remove.
+    check(!cap.serves(3, 1, 0, 4), "a different dispatch width must re-capture");
 
     if (failures) { std::printf("sweep graph capacity: FAIL (%d)\n", failures); return 1; }
     std::printf("sweep graph capacity: PASS\n");

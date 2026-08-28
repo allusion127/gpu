@@ -115,6 +115,15 @@ BICGSolver::~BICGSolver() {
         << c.cmfd_diag_h2d_elided_bytes << ','
         << "\"cmfd_cc_h2d_elided_bytes\":"
         << c.cmfd_cc_h2d_elided_bytes << ','
+        << "\"cmfd_psi_h2d_elided_bytes\":"
+        << c.cmfd_psi_h2d_elided_bytes << ','
+        << "\"cmfd_psi_d2h_elided_bytes\":"
+        << c.cmfd_psi_d2h_elided_bytes << ','
+        << "\"cmfd_phi_mirror_ns\":" << c.cmfd_phi_mirror_ns << ','
+        << "\"cmfd_phi_mirror_calls\":" << c.cmfd_phi_mirror_calls << ','
+        << "\"cmfd_phi_mirror_bypassed\":" << c.cmfd_phi_mirror_bypassed << ','
+        << "\"cmfd_phi_h2d_elided_bytes\":"
+        << c.cmfd_phi_h2d_elided_bytes << ','
         << "\"bicg_early_convergence_exits\":"
         << c.bicg_early_convergence_exits << ','
         << "\"bicg_restarts\":" << c.bicg_restarts << ','

@@ -60,6 +60,20 @@ struct BackendCounters {
     /// Host diag/cc transfers avoided because assembly wrote resident arrays.
     std::uint64_t cmfd_diag_h2d_elided_bytes           = 0;
     std::uint64_t cmfd_cc_h2d_elided_bytes             = 0;
+    /// psi round trip removed: the H2D bytes not re-pushed on a continuation
+    /// launch, and the D2H bytes not pulled back on a non-exceptional one.
+    std::uint64_t cmfd_psi_h2d_elided_bytes            = 0;
+    std::uint64_t cmfd_psi_d2h_elided_bytes            = 0;
+    /// Cost of the CMFD flux mirror, in nanoseconds of LAUNCHER time: the
+    /// adoptFluxMirror() shadow copy and the memcmp the next upload pays to
+    /// decide whether it can skip.  Compare against the bytes that skip
+    /// actually saved (cmfd_phi_h2d_elided_bytes) before believing in it.
+    std::uint64_t cmfd_phi_mirror_ns                   = 0;
+    std::uint64_t cmfd_phi_mirror_calls                = 0;
+    std::uint64_t cmfd_phi_h2d_elided_bytes            = 0;
+    /// Mirror maintenance skipped because the arena is single-slot (see
+    /// phiMirrorEnabled()).
+    std::uint64_t cmfd_phi_mirror_bypassed             = 0;
     std::uint64_t bicg_early_convergence_exits          = 0;
     std::uint64_t bicg_restarts                        = 0;
     std::uint64_t nodal_gpu_calls                      = 0;
@@ -233,6 +247,17 @@ public:
         const double* vol   = nullptr; ///< [l]
         double*       udiag = nullptr; ///< [l*ng2+ige*ng+igs], host fallback
         double*       psi   = nullptr; ///< [l], in/out
+        /// Has the HOST written `psi` since the previous launch of this drive?
+        ///
+        /// It used to be downloaded after every launch and re-uploaded before
+        /// the next one, which is a 2 x nxyz-double round trip per launch to
+        /// hand the device back exactly the bytes it just produced.  The host
+        /// only touches psi at a drive boundary (CMFD::updpsi regenerates it
+        /// from the flux before every BICGCMFD::drive, and nothing between two
+        /// launches of one drive writes it), so the first launch of a drive
+        /// uploads and the rest skip.  Skipping leaves the device's own psi in
+        /// place, which is bit-for-bit what the round trip put back.
+        bool          psi_dirty = true;
         /// Build diag/cc/udiag in the arena before the resident sweep graph.
         bool          device_assembly = false;
         double eigv = 0, reigv = 0, reigvs = 0, errl2 = 0;
@@ -308,12 +333,19 @@ struct SweepGraphCapacity {
     int nmax      = -1; ///< exact key: inner BiCGSTAB budget (a process constant)
     int slots     = -1; ///< capacity key: sweep slots CAPTURED
     int precision = -1; ///< exact key: the FP32 fallback changes the topology
+    /// Exact key: grid.y, which a captured graph BAKES.  It is the arena width
+    /// unless RASBERY_GPU_CMFD_COMPACT is on, in which case it is the bucket
+    /// for the arrival width and each bucket needs its own instantiation.
+    /// Unlike `slots` above this is NOT a capacity: a graph captured 32 lanes
+    /// wide dispatches 32 lanes whatever the map says, so a narrower launch
+    /// would pay for padding blocks the compaction exists to remove.
+    int lanes     = -1;
 
     /// Can the captured graph serve a launch wanting `want_slots` slots?
     [[nodiscard]] constexpr bool serves(int want_nmax, int want_slots,
-                                        int want_precision) const {
+                                        int want_precision, int want_lanes) const {
         return slots >= 0 && nmax == want_nmax && precision == want_precision &&
-               slots >= want_slots;
+               lanes == want_lanes && slots >= want_slots;
     }
 
     /// Depth to capture at.  Never shallower than what is already captured, so
