@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Contract gate: the three ways RASBERY_GPU_OUTER=1 stopped being the host outer.
+"""Contract gate: the ways RASBERY_GPU_OUTER=1 stopped being the host outer.
 
 All three were found on the FULL kngr_238 deck (35 statepoints) after the
 trimmed 3-statepoint gate had passed, and all three are invisible to a gate that
@@ -68,6 +68,38 @@ on the sweep arena's.  Nothing but a host synchronise (or an event) orders the
 two, in either direction: the drive reads the jnet updjnet wrote, and upddhat
 reads the jnet the drive wrote.  This is currently a pair of host synchronises
 and it must stay one of the two.
+
+-------------------------------------------------------------------------------
+5. AN UPLOAD ELISION IS DECIDED FROM SOMETHING THAT CANNOT MISS A WRITER
+-------------------------------------------------------------------------------
+
+The segment skips the per-outer xsnf H2D when it believes the device copy is
+already the host's bytes.  It used to believe that on the strength of
+XSSet::hoststateGeneration(), and that generation does not mean what the gate
+needed: it means "the device mirror of _xs is stale", NOT "the host bytes of _xs
+changed".  XSSet deliberately leaves it alone when a DEVICE arm rewrites host
+_xs -- UpdateFlatXS's GPU branch bumps only `if (!gpu_ok || !rodded.empty())`,
+and UpdateEquilibriumXenon's GPU branch returns before the bump -- because after
+such a write the host and that particular device mirror agree.
+
+The segment's device xsnf is a DIFFERENT buffer (the CMFD arena's), so those are
+precisely the writes it must not miss.  CudaBICGBackend.cu has always known
+this: the sweep's own xsnf upload is gated on Slot::xsnf_mirror, a byte-exact
+shadow, and tools/test_cmfd_sweep_transfer_contract.py forbids the generation
+there by name.  The segment used the generation anyway, and updpsi is the reader
+that makes it fatal: psi = flux . xsnf . vol runs BEFORE the sweep's own upload
+can correct the buffer, so the outer computes its fission source from the
+previous cross sections and everything after it from the new ones.
+
+MEASURED on kngr_238 with RASBERY_GPU_XSRECON=1 RASBERY_GPU_FLATXS=1 (which is
+how the 238 host runs it; the authoring box had them unset, which is why b1 was
+exact there and not there).  Statepoint 1, outer 28 -- the first boron trial
+commit -- ON b1's updpsi produced a psi hash EQUAL to its own outer 27 while the
+OFF arm's moved; the run finished 434 of 644 datasets apart, at 12642 outers
+against 12017.  With the byte-exact gate: 0 of 644, at 12017.
+
+RULE: the xsnf elision compares BYTES (cuda_transfer::ByteExactMirror), never a
+generation, and commits the shadow only from the bytes it actually uploaded.
 
 Run:  python tools/test_device_outer_exactness_contract.py
 """
@@ -283,12 +315,71 @@ def check_cross_stream_handovers_are_ordered(problems: list[str]) -> None:
         )
 
 
+def check_xsnf_elision_is_byte_exact(problems: list[str]) -> None:
+    runner = read("src", "CudaOuterGraph.cu")
+    backend = read("src", "CudaBICGBackend.cu")
+
+    run = body_of(runner, "bool CudaOuterSegment::runSegment")
+    try:
+        gate_at = run.index("const bool xsnf_current")
+    except ValueError:
+        problems.append(
+            "CudaOuterGraph.cu: runSegment has no xsnf_current gate at all; the "
+            "per-outer xsnf upload is either unconditional or gone"
+        )
+        return
+    gate = run[gate_at : run.index(";", run.index("bump(counters().xsnf_uploads_elided)"))]
+
+    if "resident_xsnf.matches" not in gate:
+        problems.append(
+            "CudaOuterGraph.cu: the xsnf elision is not decided from a byte-exact "
+            "shadow.  hoststateGeneration() cannot see a DEVICE arm rewriting host "
+            "_xs (XSSet.cpp's UpdateFlatXS / UpdateEquilibriumXenon GPU branches), "
+            "and updpsi reads the device xsnf before the sweep's own byte-exact "
+            "upload can correct it -- kngr_238 sp1 outer 28 with RASBERY_GPU_XSRECON=1"
+        )
+    if "xs_generation" in gate:
+        problems.append(
+            "CudaOuterGraph.cu: the xsnf elision still reads a generation.  A "
+            "generation records what the host DECLARED; only the bytes record what "
+            "the host WROTE, and the device arms write without declaring"
+        )
+    if "ByteExactMirror<double> resident_xsnf" not in runner:
+        problems.append(
+            "CudaOuterGraph.cu: the segment keeps no byte-exact shadow of the xsnf it "
+            "uploaded, so its gate has nothing sound to compare against"
+        )
+    if "resident_xsnf.commit(" not in runner:
+        problems.append(
+            "CudaOuterGraph.cu: the xsnf shadow is never committed, so the elision can "
+            "only ever say `upload` and the counter is dead"
+        )
+    if "resident_xsnf.invalidate()" not in body_of(
+        runner, "bool CudaOuterSegment::bindResidency"
+    ):
+        problems.append(
+            "CudaOuterGraph.cu: bindResidency does not invalidate the xsnf shadow.  A "
+            "rebind may hand over different device memory, and a shadow describing the "
+            "old buffer would elide the upload that fills the new one"
+        )
+
+    # The two arms upload the SAME device buffer (the arena's xs_xsnf); they must
+    # not disagree about what makes it stale.
+    if "sl.xsnf_mirror" not in backend:
+        problems.append(
+            "CudaBICGBackend.cu: the sweep's xsnf upload no longer uses a byte-exact "
+            "mirror.  Both arms write the arena's xs_xsnf; a generation on either "
+            "side is the sp1-outer-28 divergence again"
+        )
+
+
 def main() -> int:
     problems: list[str] = []
     check_form_mask_is_mined(problems)
     check_host_ladder_counts_outers(problems)
     check_swallowed_step_is_reissued(problems)
     check_cross_stream_handovers_are_ordered(problems)
+    check_xsnf_elision_is_byte_exact(problems)
 
     if problems:
         print("FAIL: device outer exactness contract")
@@ -300,6 +391,7 @@ def main() -> int:
     print("  2. SolveLoop's flux_stall and loop bound are charged in outers")
     print("  3. the step the sweep verdict's halt swallows is re-issued")
     print("  4. both cross-stream handovers around the nodal drive are ordered")
+    print("  5. the xsnf upload elision compares bytes, not a generation")
     return 0
 
 

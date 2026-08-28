@@ -986,10 +986,27 @@ want(_TRACE, "RASBERY_OUTER_TRACE", "OuterTrace.h", "the tracer's gate")
 if "enabled()" not in DRIVER_CODE or "outertrace::emit" not in DRIVER_CODE:
     problems.append("Driver.h: the per-outer tracer is not wired, so a future trajectory "
                     "difference has to be localised by re-deriving the instrument first")
-_TR_CALL = body_of(DRIVER_CODE, "if (outertrace::enabled()) {", "outertrace::emit")
+_TR_CALL = body_of(DRIVER_CODE, "if (outertrace::active()) {", "outertrace::emit")
 if not _TR_CALL:
-    problems.append("Driver.h: outertrace::emit is not guarded by outertrace::enabled(), so "
+    problems.append("Driver.h: outertrace::emit is not guarded by outertrace::active(), so "
                     "every run would pay a hash of psi/jnet/dhat/flux per outer")
+# THE STATEPOINT FILTER IS PART OF THE GATE, not a convenience.  The per-STEP
+# tracer synchronises and copies a device array per step; on kngr_238 that is
+# twelve thousand outers of it, minutes of wall and a log too big to diff.  Every
+# divergence is localised to a statepoint first (the h5diff names it), so the
+# instrument has to be able to answer the second question about one statepoint.
+want(_TRACE, "RASBERY_OUTER_TRACE_SP", "OuterTrace.h", "the statepoint filter")
+want(_TRACE, "inline bool active()", "OuterTrace.h",
+     "the flag AND the filter, asked as one question at every emit and hash site")
+for _f, _c in (("Driver.h", DRIVER_CODE), ("CudaOuterGraph.cu", GRAPH_CU_CODE)):
+    if "outertrace::enabled()" in _c and "outertrace::active()" not in _c:
+        problems.append(f"{_f}: a trace site asks enabled() where it should ask active(); "
+                        "the statepoint filter would then be ignored and the run would "
+                        "trace all thirty-five")
+if "trace_steps = outertrace::active()" not in GRAPH_CU_CODE:
+    problems.append("CudaOuterGraph.cu: the per-step tracer's own gate is not active(), so "
+                    "the device arm hashes device memory on every statepoint however narrow "
+                    "the filter is")
 
 # --- 21. cusping is answered PER OUTER, by the host, where the host asks ------
 #
@@ -1082,7 +1099,8 @@ if "read_live_state(m.hooks.ctx, live)" not in _LOOP22:
 for _gate, _why in (
         ("flux_current", "the flux upload has to be gated or it copies 135 KiB per outer "
                          "onto itself"),
-        ("xsnf_current", "the xsnf upload has to be gated on hoststateGeneration"),
+        ("xsnf_current", "the xsnf upload has to be gated or it copies 135 KiB per outer "
+                         "onto itself"),
         ("dtil_current", "the dtil upload has to be gated on the upddtil generation")):
     want(GRAPH_CU_CODE, _gate, "CudaOuterGraph.cu", _why)
 _FLUXGATE = body_of(GRAPH_CU_CODE, "const bool flux_current", "if (flux_current)")
@@ -1098,12 +1116,50 @@ if "after.device_owns_flux" not in GRAPH_CU_CODE:
 # A rebind may hand over different memory; nothing uploaded to the old buffers
 # describes the new ones.
 _BIND22 = body_of(GRAPH_CU_CODE, "bool CudaOuterSegment::bindResidency", "return true;")
-for _r in ("resident_flux_generation = 0", "resident_xs_generation   = 0",
-           "resident_dtil_generation = 0"):
+for _r in ("resident_flux_generation = 0", "resident_dtil_generation = 0",
+           "resident_xsnf.invalidate()"):
     if _BIND22 and _r not in _BIND22:
         problems.append(f"CudaOuterGraph.cu: bindResidency does not clear {_r.split()[0]}; a "
                         "rebind can point at different device memory and the old generation "
                         "would claim it is already filled")
+
+# --- 22b. the xsnf upload is gated on the BYTES, never on a generation -------
+#
+# THE BUG.  The gate used to be `hoststateGeneration() has not moved`.  That
+# generation means "the device mirror of _xs is stale", NOT "the host bytes of
+# _xs changed", and XSSet says so twice: UpdateFlatXS's device arm bumps only
+# `if (!gpu_ok || !rodded.empty())` (XSSet.cpp) and UpdateEquilibriumXenon's
+# device arm returns before the bump.  Both of those DO rewrite host _xs -- they
+# download a freshly reconstructed one -- and both leave the generation still.
+# CudaBICGBackend.cu has always known this: the sweep's own xsnf upload is gated
+# on Slot::xsnf_mirror, a byte-exact shadow, and tools/test_cmfd_sweep_transfer_
+# contract.py forbids the generation there by name.
+#
+# THE SEGMENT'S DEVICE xsnf IS A DIFFERENT BUFFER -- the CMFD arena's -- so those
+# are exactly the writes it must not miss, and updpsi (psi = flux . xsnf . vol)
+# is the reader that cannot be corrected later: it runs BEFORE the sweep's own
+# byte-exact upload.  Measured on kngr_238 with RASBERY_GPU_XSRECON=1
+# RASBERY_GPU_FLATXS=1 (the 238 host's configuration): statepoint 1, outer 28 --
+# the first boron trial commit -- ON b1's updpsi produced a psi hash EQUAL to
+# outer 27's while OFF's moved, and the run ended 434/644 datasets apart at
+# 12642 outers against 12017.  With the byte gate it is 0/644 at 12017.
+_XSNF22 = body_of(GRAPH_CU_CODE, "const bool xsnf_current", "if (xsnf_current)")
+if _XSNF22 and "resident_xsnf.matches" not in _XSNF22:
+    problems.append("CudaOuterGraph.cu: the xsnf elision is not decided from a byte-exact "
+                    "shadow.  hoststateGeneration() is NOT 'the host bytes changed' -- the "
+                    "GPU XS-recon and flat-XS arms rewrite host _xs without bumping it -- "
+                    "and updpsi reads the device xsnf before the sweep's own upload can "
+                    "correct it (kngr_238 sp1 outer 28 with RASBERY_GPU_XSRECON set)")
+if _XSNF22 and "live.xs_generation" in _XSNF22:
+    problems.append("CudaOuterGraph.cu: the xsnf elision still reads a generation.  "
+                    "The generation cannot see a device-arm rebuild of host _xs; only the "
+                    "bytes can")
+if "ByteExactMirror<double> resident_xsnf" not in GRAPH_CU_CODE:
+    problems.append("CudaOuterGraph.cu: no byte-exact shadow for the segment's xsnf upload")
+# The shadow must be COMMITTED, or every outer re-uploads and the elision is dead.
+if "resident_xsnf.commit(" not in GRAPH_CU_CODE:
+    problems.append("CudaOuterGraph.cu: the xsnf shadow is never committed, so the gate "
+                    "can only ever say 'upload'")
 
 # --- 23. the cusping generation bump tells the truth -------------------------
 #

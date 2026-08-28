@@ -101,6 +101,7 @@
 
 #include "CudaOuterGraph.h"
 
+#include "CudaTransferMirror.h"
 #include "GpuPhysicsArena.h"
 #include "OuterTrace.h"
 
@@ -370,8 +371,29 @@ struct CudaOuterSegment::Impl {
     /// uploaded`, which the host generations cannot collide with because they
     /// start at 1.
     unsigned long long resident_flux_generation = 0;
-    unsigned long long resident_xs_generation   = 0;
     unsigned long long resident_dtil_generation = 0;
+    /// The BYTES of xsnf the device copy was last filled FROM.
+    ///
+    /// A GENERATION IS NOT USABLE FOR THIS ONE, and the codebase already says
+    /// so where the sweep does the same upload: XSSet::hoststateGeneration()
+    /// means "the device mirror of _xs is stale", NOT "the host bytes changed",
+    /// and XSSet.cpp deliberately does not bump it when the GPU XS arm writes a
+    /// freshly reconstructed _xs into host memory (XSSet.cpp:2772,
+    /// XSSet::UpdateEquilibriumXenon's device arm).  The segment's device xsnf
+    /// is a DIFFERENT device buffer from that mirror -- it is the CMFD arena's
+    /// -- so those are exactly the writes it must not miss, and it missed them:
+    /// on a host with RASBERY_GPU_XSRECON / RASBERY_GPU_FLATXS set, kngr_238
+    /// statepoint 1 outer 28 (the first boron trial commit) rebuilt xsnf on the
+    /// host, the generation did not move, this upload was elided, and updpsi
+    /// then computed psi = flux . xsnf . vol from the PREVIOUS xsnf -- the psi
+    /// hash of outer 28 equal to outer 27's, with everything downstream in that
+    /// outer diverging from the host arm.
+    ///
+    /// A byte-exact shadow cannot miss a writer by construction, which is the
+    /// whole reason it and not another generation: memcmp over 135 KB is ~2 us
+    /// at the kngr mesh against ~19.5 us for the H2D issue it elides, the same
+    /// trade CudaBICGBackend.cu's flux mirror measured and kept.
+    cuda_transfer::ByteExactMirror<double> resident_xsnf;
     bool                  residency_bound = false;
     /// Raised by republishAfterHostSweep: THIS outer's drive did not finish on
     /// the device and the host finished it at the observation.  Read by the body
@@ -604,8 +626,8 @@ bool CudaOuterSegment::bindResidency(const OuterSegmentResidency& residency) {
     // A rebind may hand over different device memory, so nothing that was
     // uploaded to the old buffers describes the new ones.
     _impl->resident_flux_generation = 0;
-    _impl->resident_xs_generation   = 0;
     _impl->resident_dtil_generation = 0;
+    _impl->resident_xsnf.invalidate();
     _impl->residency_bound   = true;
     return true;
 }
@@ -918,7 +940,7 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     // IT SYNCHRONISES AND COPIES, PER STEP.  That is a real cost and it is paid
     // only under the environment gate: `trace_steps` is a cached bool, so an
     // untraced run pays one predictable branch per step and no allocation.
-    const bool trace_steps = outertrace::enabled();
+    const bool trace_steps = outertrace::active();
     auto traceHash = [&](const double* dev, std::size_t n) -> std::uint64_t {
         if (dev == nullptr || n == 0) return 0ull;
         if (cudaStreamSynchronize(m.stream) != cudaSuccess) { cudaGetLastError(); return 0ull; }
@@ -1038,22 +1060,36 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                 return launchFailed("upload flux", rc);
             bump(counters().flux_sync_bytes, flux_bytes);
         }
-        // XSSet bumps hoststateGeneration on every write to _xs, so an
-        // unchanged generation is a proof the bytes are the same rather than a
-        // guess that they probably are.
-        const bool xsnf_current = m.hooks.read_live_state != nullptr &&
-                                  m.resident_xs_generation != 0 &&
-                                  m.resident_xs_generation == live.xs_generation;
+        // xsnf, gated on the BYTES and not on a generation -- see
+        // Impl::resident_xsnf for the failure a generation gate produced.
+        //
+        // updpsi is the step that makes this load-bearing: it is
+        // psi = flux . xsnf . vol, it runs three lines below, and it is the ONE
+        // reader of the device xsnf that runs before the sweep's own upload
+        // (CudaBICGBackend.cu's push_pending, which has always been byte-exact
+        // through Slot::xsnf_mirror) can correct it.  A missed upload here is
+        // therefore not a stale-by-one-outer psi, it is a psi built from the
+        // wrong cross sections while the rest of the outer uses the right ones.
+        const std::size_t xsnf_count = static_cast<std::size_t>(bound_.nxyz) *
+                                       static_cast<std::size_t>(bound_.ng);
+        const bool xsnf_current =
+            bound_.host_xsnf != nullptr && bound_.device_xsnf != nullptr &&
+            m.resident_xsnf.matches(bound_.host_xsnf, xsnf_count);
         if (xsnf_current) bump(counters().xsnf_uploads_elided);
         if (bound_.host_xsnf != nullptr && bound_.device_xsnf != nullptr && !xsnf_current) {
-            const std::size_t xsnf_bytes =
-                static_cast<std::size_t>(bound_.nxyz) *
-                static_cast<std::size_t>(bound_.ng) * sizeof(double);
+            const std::size_t xsnf_bytes = xsnf_count * sizeof(double);
             if ((rc = cudaMemcpyAsync(bound_.device_xsnf, bound_.host_xsnf, xsnf_bytes,
                                       cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
                 return launchFailed("upload xsnf", rc);
             bump(counters().flux_sync_bytes, xsnf_bytes);
-            m.resident_xs_generation = live.xs_generation;
+            // COMMITTED AT THE ISSUE, and that is safe HERE for a reason the
+            // general rule (CudaTransferMirror.h: commit only after the copy has
+            // landed) does not cover: the shadow records the bytes this copy was
+            // handed, and the only host writer of _xs that can run before the
+            // outer's synchronise is ApplyRodCusping -- which runs after it, in
+            // the nodal drive's window.  A writer that appears between the two
+            // would be caught by the NEXT outer's memcmp, never elided.
+            m.resident_xsnf.commit(bound_.host_xsnf, xsnf_count);
         }
         // upddtil() is the only writer of _dtil and it runs once per SolveLoop
         // entry, plus once for every cusping that fires.  On a still deck this

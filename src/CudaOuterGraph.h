@@ -837,7 +837,19 @@ using OuterSegmentStream = void*;
 struct OuterSegmentLiveState {
     /// Geometry::fluxGeneration() -- bumped by every HOST writer of Phif.
     unsigned long long flux_generation = 0;
-    /// XSSet::hoststateGeneration() -- bumped by every host write of _xs.
+    /// XSSet::hoststateGeneration().
+    ///
+    /// READ, AND DELIBERATELY NOT THE xsnf GATE.  It means "the device mirror of
+    /// _xs is stale", not "the host bytes of _xs changed": XSSet does not bump
+    /// it when the GPU XS arm writes a freshly reconstructed _xs into host
+    /// memory (XSSet.cpp:2772, and UpdateEquilibriumXenon's device arm), because
+    /// after such a write the host and THAT device mirror agree.  The segment's
+    /// device xsnf is the CMFD arena's, a different buffer, so those writes are
+    /// exactly the ones it must not miss -- and it did miss them until the
+    /// upload moved to a byte-exact shadow (CudaOuterGraph.cu, Impl::resident_xsnf).
+    ///
+    /// Kept because it is one host load and it is the honest name for "the XS
+    /// moved at all", which the receipt and the state-machine test read.
     unsigned long long xs_generation = 0;
     /// BICGCMFD::dtilGeneration() -- bumped by upddtil(), its only writer.
     unsigned long long dtil_generation = 0;

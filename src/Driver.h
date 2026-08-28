@@ -2290,7 +2290,7 @@ private:
             // just an outer.  hashDoubles over the host arrays is right HERE
             // because this arm computes into them; the device arm hashes device
             // memory, for the reason OuterTrace.h states.
-            const bool     tr_step = outertrace::enabled();
+            const bool     tr_step = outertrace::active();
             const int      tr_nxyz = ctx.geometry.nxyz();
             const int      tr_ng   = ctx.geometry.ng();
             const size_t   tr_nsg  = static_cast<size_t>(ctx.geometry.nsurf()) * tr_ng;
@@ -2361,7 +2361,7 @@ private:
                                      nullptr, 0);
             }
 
-            if (outertrace::enabled()) {
+            if (outertrace::active()) {
                 const int    nxyz  = ctx.geometry.nxyz();
                 const int    ngg   = ctx.geometry.ng();
                 const size_t nsg   = static_cast<size_t>(ctx.geometry.nsurf()) * ngg;

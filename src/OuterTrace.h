@@ -81,6 +81,39 @@ inline void setContext(int statepoint, int outer) {
     c.outer      = outer;
 }
 
+/// Narrow the trace to ONE statepoint -- RASBERY_OUTER_TRACE_SP, default all.
+///
+/// WHY IT IS NEEDED.  The per-step tracer synchronises and copies a device
+/// array PER STEP, and kngr_238 runs twelve thousand outers; tracing the whole
+/// run to look at one statepoint costs minutes and produces a log no diff can
+/// usefully be pointed at.  A divergence is localised to a statepoint FIRST --
+/// that is what the h5diff says -- so the next question is always asked about
+/// one statepoint, and this is how it gets asked without paying for the rest.
+///
+/// -1 (the default, and the value of an unset or empty variable) is every
+/// statepoint, which is what the flag alone meant before this existed.
+[[nodiscard]] inline int statepointFilter() {
+    static const int sp = [] {
+        const char* v = std::getenv("RASBERY_OUTER_TRACE_SP");
+        if (v == nullptr) return -1;
+        const std::string s(v);
+        return s.empty() ? -1 : std::atoi(v);
+    }();
+    return sp;
+}
+
+/// Should THIS outer be traced?
+///
+/// `enabled()` is the flag; this is the flag AND the statepoint filter, and it
+/// is what every emit site and every hash site asks.  setContext is the one
+/// caller that asks `enabled()` instead: it is what makes the statepoint known,
+/// so it cannot be gated on it.
+[[nodiscard]] inline bool active() {
+    if (!enabled()) return false;
+    const int sp = statepointFilter();
+    return sp < 0 || context().statepoint == sp;
+}
+
 /// One line per STEP of one outer -- the resolution the per-outer line cannot
 /// give.
 ///
