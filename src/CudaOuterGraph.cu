@@ -169,6 +169,11 @@ struct AtomicCounters {
     std::atomic<std::uint64_t> reigv_device_outers{0};
     std::atomic<std::uint64_t> reigv_reissued{0};
     std::atomic<std::uint64_t> in_body_host_syncs{0};
+    std::atomic<std::uint64_t> sync_exit_observation{0};
+    std::atomic<std::uint64_t> sync_mirror_drain{0};
+    std::atomic<std::uint64_t> sync_pre_nodal{0};
+    std::atomic<std::uint64_t> sync_sweep_reissue{0};
+    std::atomic<std::uint64_t> sync_segment_exit{0};
     std::atomic<std::uint64_t> phis_mirror_bytes{0};
     std::atomic<std::uint64_t> jnet_mirror_bytes{0};
     std::atomic<std::uint64_t> refusals[static_cast<int>(OuterSegmentRefusal::Count)];
@@ -251,6 +256,11 @@ OuterSegmentCounters outerSegmentCounters() {
     out.reigv_device_outers     = a.reigv_device_outers.load(std::memory_order_relaxed);
     out.reigv_reissued          = a.reigv_reissued.load(std::memory_order_relaxed);
     out.in_body_host_syncs      = a.in_body_host_syncs.load(std::memory_order_relaxed);
+    out.sync_exit_observation  = a.sync_exit_observation.load(std::memory_order_relaxed);
+    out.sync_mirror_drain      = a.sync_mirror_drain.load(std::memory_order_relaxed);
+    out.sync_pre_nodal         = a.sync_pre_nodal.load(std::memory_order_relaxed);
+    out.sync_sweep_reissue     = a.sync_sweep_reissue.load(std::memory_order_relaxed);
+    out.sync_segment_exit      = a.sync_segment_exit.load(std::memory_order_relaxed);
     out.phis_mirror_bytes       = a.phis_mirror_bytes.load(std::memory_order_relaxed);
     out.jnet_mirror_bytes       = a.jnet_mirror_bytes.load(std::memory_order_relaxed);
     for (int i = 0; i < static_cast<int>(OuterSegmentRefusal::Count); ++i)
@@ -287,6 +297,11 @@ std::string outerSegmentReceiptJson() {
                     ",\"reigv_reissued\":" + std::to_string(c.reigv_reissued) +
                     ",\"in_body_host_syncs\":" +
                     std::to_string(c.in_body_host_syncs) +
+                    ",\"sync_exit_observation\":" + std::to_string(c.sync_exit_observation) +
+                    ",\"sync_mirror_drain\":" + std::to_string(c.sync_mirror_drain) +
+                    ",\"sync_pre_nodal\":" + std::to_string(c.sync_pre_nodal) +
+                    ",\"sync_sweep_reissue\":" + std::to_string(c.sync_sweep_reissue) +
+                    ",\"sync_segment_exit\":" + std::to_string(c.sync_segment_exit) +
                     ",\"phis_mirror_bytes\":" + std::to_string(c.phis_mirror_bytes) +
                     ",\"jnet_mirror_bytes\":" + std::to_string(c.jnet_mirror_bytes) +
                     ",\"segment_budget\":" + std::to_string(outerSegmentBudget());
@@ -1292,6 +1307,7 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         // priced at 3.9us.
         if (i > 0) {
             bump(counters().in_body_host_syncs);
+            bump(counters().sync_exit_observation);
             if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
                 return launchFailed("synchronize on the segment exit", rc);
             if (m.h_seg != nullptr && m.h_seg->exit != 0u) break;
@@ -1436,6 +1452,7 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         // no mirror and pay nothing.
         if (!stream_sweep || host_reader_next) {
             bump(counters().in_body_host_syncs);
+            bump(counters().sync_mirror_drain);
             if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
                 return launchFailed("synchronize before the CMFD sweep", rc);
         }
@@ -1528,6 +1545,7 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
 
         // THE ONE SYNCHRONISE OF THE OUTER, and it belongs to the nodal drive.
         bump(counters().in_body_host_syncs);
+        bump(counters().sync_pre_nodal);
         if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
             return launchFailed("synchronize before the nodal drive", rc);
 
@@ -1605,6 +1623,7 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
             // the DEVICE jnet, on the backend's own stream, ordered against this
             // one by nothing but this synchronise.
             bump(counters().in_body_host_syncs);
+            bump(counters().sync_sweep_reissue);
             if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
                 return launchFailed("synchronize after the re-issued updjnet", rc);
         }
@@ -1930,6 +1949,7 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     if ((rc = cudaMemcpyAsync(&decision_out, m.d_decisions + slot, sizeof(decision_out),
                               cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
         return launchFailed("download outer decision", rc);
+    bump(counters().sync_segment_exit);
     if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
         return launchFailed("segment synchronize", rc);
 

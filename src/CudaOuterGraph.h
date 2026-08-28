@@ -756,6 +756,19 @@ struct OuterSegmentCounters {
     ///   4. the re-issue drain, on the three-in-twelve-thousand outers where the
     ///      device could not finish the sweep.
     std::uint64_t in_body_host_syncs       = 0;
+    /// The same total, split by site, because the four have different fixes.
+    /// sync_pre_nodal is the one Task 10 has to remove and the only one that
+    /// fires on EVERY outer; sync_exit_observation is what a wide segment adds
+    /// back, so a budget of 8 pays MORE rendezvous per outer than a budget of 1
+    /// and its advantage today is transfer amortisation, not fewer round trips.
+    std::uint64_t sync_exit_observation    = 0;
+    std::uint64_t sync_mirror_drain        = 0;
+    std::uint64_t sync_pre_nodal           = 0;
+    std::uint64_t sync_sweep_reissue       = 0;
+    /// Not in the total: this one is the segment EXIT, which the host is
+    /// entitled to and Task 10 does not remove.  Carried so the per-outer
+    /// rendezvous arithmetic can be done from the receipt alone.
+    std::uint64_t sync_segment_exit        = 0;
     /// Bytes returned to Geometry::Phis at a segment exit.
     ///
     /// THE PRICE OF THE ELIDED DOWNLOAD, and it is charged per EXIT rather than
