@@ -771,13 +771,26 @@ struct OuterSegmentCounters {
     return std::string("\"idle_reason\":\"") + outerRefusalName(why) + "\"";
 }
 
-[[nodiscard]] inline std::string outerHostBodyJson() {
-    const hostouter::Snapshot h = hostouter::snapshot();
-    return "\"host_body_calls\":{\"updpsi\":" + std::to_string(h.updpsi) +
+[[nodiscard]] inline std::string outerHostBodyFields(const hostouter::Snapshot& h) {
+    return "{\"updpsi\":" + std::to_string(h.updpsi) +
            ",\"updjnet\":" + std::to_string(h.updjnet) +
            ",\"upddhat\":" + std::to_string(h.upddhat) +
            ",\"upddtil\":" + std::to_string(h.upddtil) +
            ",\"nodal_constants\":" + std::to_string(h.nodal_constants) + "}";
+}
+
+/// BOTH SCOPES, because they answer different questions and only one of them is
+/// the claim.  `host_body_calls` is the whole process -- it is what catches a
+/// device kernel with no production caller (8be6bee).  `host_body_calls_in_segment`
+/// is what a device outer actually asserts: zero host arithmetic BETWEEN the
+/// segment's entry and its exit.  The run-wide number cannot be zero on any real
+/// deck (SolveLoop builds d-tilde before it delegates, and a material change
+/// rebuilds the nodal constants before the next segment starts), so a gate held
+/// to the run-wide number would be held to something unreachable.
+[[nodiscard]] inline std::string outerHostBodyJson() {
+    return "\"host_body_calls\":" + outerHostBodyFields(hostouter::snapshot()) +
+           ",\"host_body_calls_in_segment\":" +
+           outerHostBodyFields(hostouter::snapshotOf(hostouter::segmentCounters()));
 }
 
 /// Writes one `[RASBERY][OUTER_GPU] {...}` line.  Emitted whenever the feature

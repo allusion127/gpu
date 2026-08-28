@@ -979,6 +979,10 @@ void XSSet::Reconstruct() {
 #pragma omp parallel for schedule(static) if (nxyz > OMP_THRESHOLD)
     for (int b = 0; b < nblk; ++b)
         reconstructSlice(b * RECON_BLOCK, std::min(nxyz, (b + 1) * RECON_BLOCK));
+    // Steps 3 and 4 above assigned _xs.xsdf and _xs.xsrf.  Said HERE, once,
+    // rather than inside the slice lambda: the bump is per CALL, and the
+    // reader (Nodal::updateConstant's gate) only ever compares equality.
+    noteMacroXsWrite();
 }
 
 void XSSet::ReconstructNode(size_t l) {
@@ -1025,6 +1029,7 @@ void XSSet::ReconstructNode(size_t l) {
             rf += _xs.xssm[(igs * ng + ige) * nxyz + l];
         _xs.xsrf[igs * nxyz + l] = rf;
     }
+    noteMacroXsWrite();
 }
 
 // Update: fetch XS from the library, unpack into SoA, then reconstruct.
@@ -2368,6 +2373,7 @@ void XSSet::UpdateUnroddedNodeXS(int l) {
             rf += _xs.xssm[(static_cast<size_t>(ig) * ng + ige) * nxyz + l];
         _xs.xsrf[static_cast<size_t>(ig) * nxyz + l] = rf;
     }
+    noteMacroXsWrite();
 }
 
 // Fill the flat-XS pointer view with this instance's host arrays.  The stream
@@ -2683,6 +2689,16 @@ bool XSSet::TryUpdateFlatXSGpu(const std::vector<int>& unrodded, bool any_rodded
     v.stream_x        = _flatxs_stream_x.data();
     v.stream_scale    = _flatxs_stream_scale.data();
 
+    // THE DEVICE ARM IS A MACRO-XS WRITER TOO.  solveFlatXs downloads whole
+    // arrays into the host _xs columns pinned above (that is what the "runs
+    // after the device download so the device's whole-array downloads cannot
+    // clobber these columns" note in UpdateFlatXS is about), and xsdf/xsrf are
+    // among them.  _hoststate_generation is deliberately NOT bumped for this
+    // write -- the device mirror and the host agree afterwards -- which is
+    // exactly why the constants gate needs its own counter.  Bumped
+    // UNCONDITIONALLY: a refusal that had already run part of the download
+    // would otherwise leave a write unannounced.
+    noteMacroXsWrite();
     return _xsrecon_backend->solveFlatXs(v, MakeFlatXsLibShape(), _micx_generation,
                                          _micx_generation + 1, _ref_generation,
                                          _hoststate_generation, !any_rodded);
@@ -3174,10 +3190,15 @@ void XSSet::ApplyRodCuspingStencil(int tip_l, double reigv,
             _xs.xsrf[ig * _g.nxyz() + lk] = rf;
         }
     }
+    noteMacroXsWrite();
 }
 
 void XSSet::ResetCuspingNodesToBase(const std::vector<int>& nodes) {
     ++_hoststate_generation; // restores _xs columns from host snapshots
+    // The restore below writes EVERY N_XS_SCALAR column, XSDF and XSRF among
+    // them, through the generic _xs[xtype] form -- so this is a macro-XS writer
+    // even though it names neither array.
+    noteMacroXsWrite();
     const int ng   = _g.ng();
     const int nxyz = _g.nxyz();
     if (static_cast<int>(_cusping_base_snapshot.size()) < nxyz)
@@ -3634,6 +3655,11 @@ bool XSSet::TryUpdateEquilibriumXenonGpu(double power, double relax, double& max
     v.dep_i135    = dep_i135.data();
     v.dep_xe135   = dep_xe135.data();
 
+    // Same reason as TryUpdateFlatXSGpu: this arm downloads into the host _xs
+    // columns and UpdateEquilibriumXenon's GPU branch returns BEFORE the
+    // _hoststate_generation bump, so this counter is the only announcement the
+    // constants gate can see.
+    noteMacroXsWrite();
     return _xsrecon_backend->solve(v, _micx_generation, _hoststate_generation,
                                    &max_change);
 }

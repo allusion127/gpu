@@ -5,6 +5,7 @@
 #include "Model.h"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <filesystem>
 #include <map>
@@ -188,6 +189,35 @@ private:
     // bump site corrupts physics silently -- the full-deck debug-hash A/B is
     // the gate for any new host-side writer.
     unsigned long long _hoststate_generation = 1;
+
+    // ---------------------------------------------------------------------
+    // Rev.7.1 Task 9/W3: THE MACRO-XS WRITE GENERATION
+    // ---------------------------------------------------------------------
+    //
+    // "Did the HOST BYTES of _xs.xsrf / _xs.xsdf move" -- and nothing else.
+    //
+    // WHY IT IS NOT _hoststate_generation.  That counter means "the device
+    // MIRROR of _xs is stale", which is a different question and deliberately
+    // NOT bumped when a device arm rewrites the host array (UpdateFlatXS's GPU
+    // branch bumps only `if (!gpu_ok || !rodded.empty())`; UpdateEquilibriumXenon's
+    // returns before its bump), because after such a write host and mirror
+    // agree.  tools/test_device_outer_exactness_contract.py invariant 5 is the
+    // record of what that cost when a gate believed otherwise.
+    //
+    // WHY IT CANNOT MISS A WRITER.  It is bumped AT THE WRITE, inside the four
+    // functions that assign _xs.xsrf / _xs.xsdf (Reconstruct, ReconstructNode,
+    // UpdateUnroddedNodeXS, ApplyRodCuspingStencil), not at their callers.  A
+    // caller's policy -- which arm ran, whether a mirror agrees -- cannot
+    // therefore change the answer, and a new writer that does not bump is
+    // caught by tools/test_nodal_constant_host_gate_contract.py, which greps
+    // for exactly those assignments.
+    //
+    // ATOMIC because ReconstructNode and UpdateUnroddedNodeXS are called from
+    // inside OpenMP loops over nodes.  Relaxed is the right order: nothing
+    // BRANCHES on this value concurrently with a write -- Nodal reads it between
+    // drives, on one thread -- and a redundant bump is conservative (it can only
+    // make a reader recompute something that had not moved).
+    std::atomic<unsigned long long> _macroxs_generation{1};
 
     // Flat-XS device arm (RASBERY_GPU_FLATXS, default off).  The reference
     // blocks (_ref_lmpx/_ref_micx) are device-resident and re-upload only
@@ -583,6 +613,22 @@ public:
     }
     [[nodiscard]] unsigned long long hoststateGeneration() const {
         return _hoststate_generation;
+    }
+
+    /// "Have the host bytes of _xs.xsrf / _xs.xsdf moved since you last asked?"
+    ///
+    /// The ONLY sound gate for Nodal::updateConstant's node sweep: those two
+    /// arrays plus Geometry::hmesh (immutable after stand-up) are the whole
+    /// input of nodalConstantCoefficients, so a generation that held still means
+    /// the sweep would have found `unchanged` on every node and written nothing.
+    /// See _macroxs_generation for why this is not hoststateGeneration().
+    [[nodiscard]] unsigned long long macroXsGeneration() const {
+        return _macroxs_generation.load(std::memory_order_relaxed);
+    }
+
+    /// Bumped at the point of the write, by the four writers of xsrf/xsdf.
+    void noteMacroXsWrite() {
+        _macroxs_generation.fetch_add(1, std::memory_order_relaxed);
     }
     [[nodiscard]] unsigned long long refGeneration() const {
         return _ref_generation;

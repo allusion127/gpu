@@ -762,6 +762,12 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         return false;
     }
 
+    // Rev.7.1 W3 item 1: everything a host body does from here to the return --
+    // through a hook, through the nodal drive, anywhere -- is charged to the
+    // segment.  Placed AFTER the two refusals above, so a segment that never
+    // started cannot make the in-segment claim look worse than it is.
+    const hostouter::SegmentScope host_body_scope;
+
     Impl&                      m      = *_impl;
     const bool                 m_hooks_synchronize = _impl->hooks.sweep_synchronizes;
     const OuterSegmentBinding& bound_ = m.binding;
@@ -920,6 +926,43 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     // ONCE PER SEGMENT, NOT ONCE PER OUTER, and that is Driver.h's shape:
     // Nodal::updateConstant re-runs when the macro-XS move, and the only in-outer
     // XS write is rod cusping -- which an eligible slot cannot do.
+    //
+    // =====================================================================
+    // THIS IS INERT ON THE PRODUCTION PATH, AND IT MUST STAY THAT WAY UNTIL
+    // TWO THINGS ARE FIXED.  W3 item 1 audit, 2026-08-29.
+    // =====================================================================
+    //
+    // OuterSegmentScalars::run_nodal_constants has no setter anywhere in src/,
+    // so this branch never runs.  That is not an oversight to correct by adding
+    // one; the phase cannot produce a correct answer from where it stands:
+    //
+    //  (1) ITS INPUTS ARE NOT THERE.  k_nodal_update_constant reads
+    //      DeviceSlotView::xs (SlotRegion::Xs) and DeviceSlotView::constant_xs
+    //      (SlotRegion::ConstantXs) out of the PHYSICS arena.  rasberyStandUpOuterSegment
+    //      imports exactly five geometry regions -- Lklr, Idirlr, Hmesh, Vol,
+    //      Albedo -- and nothing in src/ ever writes either slot region on the
+    //      production path.  The kernel would build the nine coefficient arrays
+    //      out of an uninitialised cudaMallocFromPoolAsync block.
+    //
+    //  (2) ITS OUTPUT IS AT THE WRONG OFFSET FOR THE ONLY READER.  The reader is
+    //      the nodal backend, which addresses the nine packed arrays as
+    //      `d.ndev_dbl + d.n_off_consts + i*ndg` with i=7 -> diagD and i=8 ->
+    //      diagDI (CudaXsReconBackend.cu:2138-2140, :2182-2183, :2548-2549, and
+    //      the h_const staging at :496-500).  The arena's packing is the
+    //      OPPOSITE: NodalConstSlot has kNcDiagDI = 7 and kNcDiagD = 8
+    //      (CudaNodalConstantKernel.h:135-137), which test/nodal_constant_gpu_replay.cpp:332
+    //      and tools/test_nodal_constant_gpu_contract.py:165 both pin on
+    //      purpose.  Binding one to the other swaps D and 1/D on every node and
+    //      direction, and both arrays are finite and plausible, so nothing
+    //      crashes -- the answer is simply wrong.
+    //
+    // AND EVEN WITH BOTH FIXED IT IS A CLASS N1 TRANSITION (CUDA exp differs
+    // from glibc by 1 ulp on 3.34% of arguments, NodalConstantKernel.h), so it
+    // may not be turned on inside a gate that requires ON == OFF.  W3 item 1
+    // therefore removed the host call the other way round -- by not running the
+    // sweep when its inputs have not moved, which is bit-exact by construction
+    // (Nodal::updateConstantsIfMoved).  The phase and its replay tests stay for
+    // Task 22, where Gate A/B admits N1.
     if (scalars.run_nodal_constants) {
         if ((rc = enqueueNodalUpdateConstant(m.arena, queue, bound_.geometry, bound_.nxyz,
                                              bound_.ng, m.stream)) != cudaSuccess)

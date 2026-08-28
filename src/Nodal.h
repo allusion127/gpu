@@ -123,6 +123,37 @@ private:
 
     unsigned long long _const_generation = 1;
 
+    // ---------------------------------------------------------------------
+    // Rev.7.1 W3 item 1: THE CONSTANTS GATE
+    // ---------------------------------------------------------------------
+    //
+    // WHAT IT REMOVES.  Every drive re-ran the whole updateConstant sweep --
+    // nxyz*ng cache comparisons -- and on the device outer segment that sweep is
+    // HOST ARITHMETIC inside a body that is otherwise entirely enqueued.  The
+    // [RASBERY][OUTER_GPU] receipt said so: host_body_calls.nodal_constants was
+    // equal to device_outers (12017 of 12017 on kngr_238), and it was the only
+    // non-zero body left besides the out-of-segment upddtil.
+    //
+    // WHY THE SWEEP CAN BE SKIPPED RATHER THAN MOVED.  updateConstant's entire
+    // input is xs.xsrf, xs.xsdf and Geometry::hmesh (immutable after stand-up).
+    // When none of the three moved, every node takes the node-scoped early-out,
+    // the function returns false everywhere, _const_generation does not advance
+    // and NOT ONE COEFFICIENT IS WRITTEN.  Skipping it is therefore bit-exact by
+    // construction, which porting it to the device would NOT be: the coefficient
+    // body is class N1 (CUDA exp differs from glibc by 1 ulp on 3.34% of
+    // arguments, NodalConstantKernel.h), so a device producer changes the
+    // trajectory on every outer that genuinely recomputes.
+    //
+    // THE GENERATION IT WATCHES.  XSSet::macroXsGeneration(), NOT
+    // hoststateGeneration() -- see XSSet.h::_macroxs_generation.  0 means "never
+    // built", which no live generation can equal (XSSet starts it at 1), so the
+    // first drive always sweeps.
+    //
+    // RASBERY_NODAL_CONST_VERIFY=1 runs the sweep even when the gate says skip
+    // and complains if any node reports a change, so the gate's premise is
+    // measurable on a real deck rather than argued.
+    unsigned long long _constants_macroxs_generation = 0;
+
 public:
     /// @brief the maximum number of iteration for updating the fission source shape
     int nmaxswp;
@@ -151,6 +182,11 @@ public:
 
     /// The six solve phases (capture wrapper lives in drive()).
     void driveBody();
+
+    /// Rev.7.1 W3 item 1: run the updateConstant sweep only when the macro XS it
+    /// reads can have moved.  Shared by BOTH drives, so the gate has exactly one
+    /// spelling.  See _constants_macroxs_generation.
+    void updateConstantsIfMoved();
 
     /// Rev.7.1 Task 18-lite: would TryDriveGpu take the device path right now?
     ///
@@ -228,4 +264,10 @@ public:
         return _trlcff0[(lkd)*_ng + ig] + _trlcff1[(lkd)*_ng + ig] + _trlcff2[(lkd)*_ng + ig];
     }
 };
+
+/// How many times RASBERY_NODAL_CONST_VERIFY caught the constants gate skipping
+/// a sweep that had work to do.  Zero on every gated run so far; printed in the
+/// receipt so "verify found nothing" and "verify was off" are different numbers.
+[[nodiscard]] std::uint64_t nodalConstantGateViolations();
+
 } // namespace rasbery

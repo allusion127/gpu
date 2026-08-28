@@ -38,6 +38,114 @@
 
 using namespace rasbery;
 
+namespace {
+
+/// RASBERY_NODAL_CONST_VERIFY -- run the constants sweep even when the gate says
+/// it cannot have moved, and complain if it did.
+///
+/// The gate's premise ("xsrf/xsdf did not move, so every node takes the
+/// early-out") is an argument about who writes those two arrays; this turns it
+/// into a measurement on the deck actually being run.  It costs a full sweep per
+/// drive, so it is a validation mode, not a default.
+[[nodiscard]] bool nodalConstVerifyEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("RASBERY_NODAL_CONST_VERIFY");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
+
+/// Counted, not just printed: a violation that scrolled past in a 60-second run
+/// is not evidence.  The receipt prints this, so "verify ran and found nothing"
+/// and "verify was never on" are different numbers.
+std::atomic<std::uint64_t> g_nodal_const_gate_violations{0};
+
+/// Sweeps the gate ADMITTED, i.e. drives on which the macro XS had moved.  The
+/// receipt's own denominator: "2433 of 12017 outers still swept" is a statement
+/// about this deck's physics, "2433 sweeps" on its own is not.
+std::atomic<std::uint64_t> g_nodal_const_sweeps{0};
+
+/// Printed ONLY under RASBERY_NODAL_CONST_VERIFY, at static destruction.
+///
+/// A validation mode whose result is a line that scrolled past mid-run is not a
+/// result.  This is the line a gate script greps.
+struct NodalConstVerifyReceipt {
+    ~NodalConstVerifyReceipt() {
+        if (!nodalConstVerifyEnabled()) return;
+        std::fprintf(stderr,
+                     "[RASBERY][NODAL_CONST_VERIFY] {\"sweeps_admitted\":%llu,"
+                     "\"gate_violations\":%llu}\n",
+                     static_cast<unsigned long long>(
+                         g_nodal_const_sweeps.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(
+                         g_nodal_const_gate_violations.load(std::memory_order_relaxed)));
+    }
+};
+const NodalConstVerifyReceipt g_nodal_const_verify_receipt{};
+
+} // namespace
+
+namespace rasbery {
+std::uint64_t nodalConstantGateViolations() {
+    return g_nodal_const_gate_violations.load(std::memory_order_relaxed);
+}
+} // namespace rasbery
+
+/// The constants sweep, behind its gate.  ONE implementation for both drives:
+/// TryDriveGpu and driveBody ran the same loop, and a gate spelled twice is a
+/// gate that can be answered twice differently.
+///
+/// Returns nothing; the two side effects are Nodal's own -- the nine coefficient
+/// arrays and _const_generation.
+void Nodal::updateConstantsIfMoved() {
+    const unsigned long long macro_gen = xs.macroXsGeneration();
+    const bool               moved     = (macro_gen != _constants_macroxs_generation);
+    const bool               verify    = nodalConstVerifyEnabled();
+    if (!moved && !verify)
+        return;
+
+    // Rev.7.1 Task 9: counted once per SWEEP over the nodes, not per node -- the
+    // number a reader wants is "did this drive recompute the constants on the
+    // host at all", which is what a device outer claims it did not
+    // (HostOuterBodyCounters.h).  Counted only when the sweep RUNS, so the
+    // receipt's nodal_constants is now the number of drives that had host
+    // arithmetic to do rather than the number of drives.
+    if (moved) {
+        hostouter::bumpHostBody(hostouter::counters().nodal_constants);
+        g_nodal_const_sweeps.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    int constants_changed = 0;
+#ifdef _OPENMP
+#pragma omp parallel for reduction(| : constants_changed) schedule(static) if (_nxyz > rasbery_omp_gate)
+#endif
+    for (int lk = 0; lk < _nxyz; ++lk)
+        constants_changed |= updateConstant(lk) ? 1 : 0;
+
+    if (!moved) {
+        // Verify mode on an unmoved generation.  A change here means a writer of
+        // xs.xsrf / xs.xsdf did not call XSSet::noteMacroXsWrite(), and the gate
+        // has been skipping a sweep that had work to do.
+        if (constants_changed != 0) {
+            g_nodal_const_gate_violations.fetch_add(1, std::memory_order_relaxed);
+            std::cerr << "[RASBERY][ERROR][nodal] constants gate violated: "
+                         "macroXsGeneration held at "
+                      << macro_gen
+                      << " but updateConstant recomputed at least one node.  A writer of "
+                         "_xs.xsrf/_xs.xsdf is missing its noteMacroXsWrite().\n";
+            // The coefficients were just rebuilt, so the run is consistent from
+            // here; advancing the residency generation is what tells the device
+            // to re-upload them.
+            ++_const_generation;
+        }
+        return;
+    }
+
+    if (constants_changed != 0)
+        ++_const_generation;
+    _constants_macroxs_generation = macro_gen;
+}
+
 Nodal::Nodal(Geometry& g, XSSet& xs)
     : _g(g), xs(xs) {
 
@@ -828,19 +936,12 @@ bool Nodal::TryDriveGpu() {
     // advances the device-residency generation exactly once per drive. This
     // removes the previous data race on _const_generation and avoids thousands
     // of redundant increments when a whole core state changes.
-    // Rev.7.1 Task 9: counted once per SWEEP over the nodes, not per node -- the
-    // number a reader wants is "did this drive recompute the constants on the
-    // host at all", which is what a device outer claims it did not
-    // (HostOuterBodyCounters.h).
-    hostouter::bumpHostBody(hostouter::counters().nodal_constants);
-    int constants_changed = 0;
-#ifdef _OPENMP
-#pragma omp parallel for reduction(| : constants_changed) schedule(static) if (_nxyz > rasbery_omp_gate)
-#endif
-    for (int lk = 0; lk < _nxyz; ++lk)
-        constants_changed |= updateConstant(lk) ? 1 : 0;
-    if (constants_changed != 0)
-        ++_const_generation;
+    // Rev.7.1 W3 item 1: the sweep runs only when xsrf/xsdf can have moved.  See
+    // Nodal::updateConstantsIfMoved and Nodal.h::_constants_macroxs_generation --
+    // on an unmoved generation every node takes the early-out and writes
+    // nothing, so skipping it is bit-exact and _const_generation is untouched
+    // (which is what keeps the backend's coefficient upload elided too).
+    updateConstantsIfMoved();
 
     nodal::NodalView v = MakeView();
     if (!backend->solveNodal(v, _const_generation, xs.refGeneration(),
@@ -870,22 +971,19 @@ void Nodal::driveBody() {
     // Each per-node / per-surface routine is independent (writes its own node/surface data; reads
     // neighbours only across the implicit barrier between phases). One parallel region with a
     // barrier per phase amortizes fork/join; results are bit-identical (no cross-node reduction).
-    // Rev.7.1 Task 9: counted once per SWEEP over the nodes, not per node -- the
-    // number a reader wants is "did this drive recompute the constants on the
-    // host at all", which is what a device outer claims it did not
-    // (HostOuterBodyCounters.h).
-    hostouter::bumpHostBody(hostouter::counters().nodal_constants);
-    int constants_changed = 0;
+    // Rev.7.1 W3 item 1: the constants sweep LEFT THIS PARALLEL REGION, because
+    // it is now conditional and a conditional phase cannot be a `#pragma omp for`
+    // inside a region every thread has already entered.
+    //
+    // BIT-EXACT EITHER WAY.  Every phase here writes only its own node's data
+    // and reads neighbours only across the barrier between phases (the note
+    // above), so moving one phase out of the region changes fork/join cost and
+    // nothing else.  The cost it changes is in the right direction: on the
+    // outers the gate skips, the region is one phase shorter AND the phase that
+    // left did not run.
+    updateConstantsIfMoved();
 #pragma omp parallel if (_nxyz > rasbery_omp_gate)
     {
-#pragma omp for reduction(| : constants_changed) schedule(static)
-        for (int lk = 0; lk < _nxyz; ++lk)
-            constants_changed |= updateConstant(lk) ? 1 : 0;
-#pragma omp single
-        {
-            if (constants_changed != 0)
-                ++_const_generation;
-        }
 #pragma omp for schedule(static)
         for (int lk = 0; lk < _nxyz; ++lk)
             caltrlcff0(lk);

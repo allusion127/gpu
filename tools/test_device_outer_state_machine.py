@@ -626,9 +626,23 @@ for fn, counter, stop in (
         problems.append("BICGCMFD.cpp: %s does not bump hostouter::counters().%s -- without "
                         "it a device outer's 'the host did not run this' is unfalsifiable"
                         % (fn.strip("(") , counter))
-if NODAL.count("hostouter::counters().nodal_constants") < 2:
-    problems.append("Nodal.cpp: both updateConstant sweeps (the GPU arm's and the CPU "
-                    "drive's) must be counted; counting one leaves the other invisible")
+# W3 item 1 MERGED THE TWO SWEEPS.  TryDriveGpu and driveBody each ran their own
+# copy of the updateConstant loop and each bumped the counter, so the rule was
+# "count both".  There is now exactly ONE sweep -- Nodal::updateConstantsIfMoved,
+# which both drives call -- because the sweep became conditional and a gate
+# spelled twice is a gate that can be answered twice differently.  The invariant
+# that survives is the one that mattered: no drive may reach a sweep that is not
+# counted.  tools/test_nodal_constant_host_gate_contract.py pins the rest of the
+# gate (which generation it reads, that every writer announces itself).
+if NODAL.count("hostouter::counters().nodal_constants") < 1:
+    problems.append("Nodal.cpp: the updateConstant sweep is not counted; a device "
+                    "outer's 'the host did not run this' is then unfalsifiable")
+if "void Nodal::updateConstantsIfMoved()" not in NODAL:
+    problems.append("Nodal.cpp: the two drives no longer share one constants gate, so "
+                    "one of them can sweep without being counted")
+for caller in ("bool Nodal::TryDriveGpu()", "void Nodal::driveBody()"):
+    if "updateConstantsIfMoved()" not in body_of(NODAL, caller, "\n}"):
+        problems.append("Nodal.cpp: %s does not go through updateConstantsIfMoved" % caller)
 # Counted per SWEEP, not per node: a per-node atomic inside the OpenMP loop
 # would be nxyz increments per drive on the hottest loop in the nodal solver.
 if "updateConstant(lk) ? 1 : 0;\n            hostouter::" in NODAL or \
