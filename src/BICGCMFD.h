@@ -95,9 +95,48 @@ protected:
     [[nodiscard]] bool canUseDeviceAssembly() const;
     void assembleHostLinearSystem(const double& eigv);
 
+    /// The three aliased host arrays every sweep launch of one drive reads.
+    ///
+    /// Resolved once by prepareDeviceSweeps and carried, rather than re-derived
+    /// per launch, because the resolution includes the page-lock leases and the
+    /// no-fission-spectrum chif fallback -- work that is per DRIVE, not per
+    /// launch, and that the stream-ordered arm must not repeat between the
+    /// enqueue and the observation.
+    struct SweepPrep {
+        const double* xsnf = nullptr;
+        const double* chif = nullptr;
+        const double* vol  = nullptr;
+        bool          ok   = false;
+    };
+
+    /// Alias + page-lock this drive's sweep inputs.  False = no device sweep.
+    bool prepareDeviceSweeps(double* flux, SweepPrep& p);
+    /// Fill one launch's IO block.  `device_assembly` is the caller's to set.
+    void stageSweepIO(CudaBatchArena::CmfdSweepIO& io, const SweepPrep& p, double eigv,
+                      double reigv, double reigvs, double errl2, int iout, int icmfd,
+                      bool psi_dirty);
+    /// Absorb one launch; true when the DRIVE is over.
+    bool absorbSweepLaunch(CudaBatchArena::CmfdSweepIO& io, double& eigv, double* flux,
+                           double& errl2, double& reigv, double& reigvs, int& iout,
+                           int& icmfd);
+
     /// @brief the device-resident sweep loop; true when it owned the whole
     /// drive, false when the caller must run the host loop from scratch
     bool driveDeviceSweeps(double& eigv, double* flux, double& errl2);
+
+    /// What a stream-ordered drive has to carry from its enqueue to the
+    /// observation that finishes it.  Exactly the locals driveDeviceSweeps keeps
+    /// across one launch, and nothing else.
+    struct EnqueuedDrive {
+        bool      active              = false;
+        bool      use_device_assembly = false;
+        SweepPrep prep{};
+        CudaBatchArena::CmfdSweepIO io{};
+        double*   flux   = nullptr;
+        double    reigv  = 0.0;
+        double    reigvs = 0.0;
+    };
+    EnqueuedDrive _enqueued{};
 
 public:
     // -------------------------------------------------------------------
@@ -125,6 +164,51 @@ public:
     /// Tell the sweep that dhat and psi are the segment's now.
     void setOuterSegmentResident(bool on) { _outer_segment_resident = on; }
     [[nodiscard]] bool outerSegmentResident() const { return _outer_segment_resident; }
+
+    // -------------------------------------------------------------------
+    // Rev.7.1 Task 10 part 2: the drive as an ENQUEUE
+    // -------------------------------------------------------------------
+    //
+    // WHAT THIS REPLACES, AND WHAT IT DOES NOT.  drive() rendezvouses: it takes
+    // the arena mutex, joins a batch, lingers, launches, DRAINS the stream, runs
+    // the per-slot absorb and copies the flux mirror -- all of it per outer, on
+    // the segment's critical path, and all of it before the segment can enqueue
+    // anything else.  That is why OuterSegmentHooks::sweep_synchronizes was true
+    // and the segment budget was forced to one.
+    //
+    // enqueueDrive is the same launch with the rendezvous and the drain removed.
+    // It does NOT remove the segment's own synchronise: the nodal drive that
+    // follows in the same outer is host arithmetic over Geometry::Jnet, so the
+    // segment has to observe once per outer whatever this does.  What it removes
+    // is the SECOND observation and the rendezvous around it, and it moves the
+    // sweep's verdict (eigv, residual, the negative-flux and Rayleigh signals)
+    // into a device kernel so the normal path publishes the segment's probe
+    // without a readback at all.
+
+    /// Would drive() take the device-resident sweep right now?  Same predicate,
+    /// asked without running anything, so the segment can choose its arm.
+    [[nodiscard]] bool canEnqueueDrive() const;
+
+    /// Enqueue one drive on the arena's stream and return.  Nothing is drained
+    /// and nothing is observed; @p probe names the device addresses the sweep
+    /// verdict kernel publishes into.  False = nothing was enqueued and the
+    /// caller must take the blocking drive().
+    bool enqueueDrive(double& eigv, double* flux, double& errl2,
+                      const CudaBatchArena::CmfdSweepProbeSink& probe);
+
+    /// Finish the drive enqueueDrive started.  THE CALLER MUST HAVE
+    /// SYNCHRONISED sweepStream().  Sets @p host_continued when the drive was
+    /// not over at that observation and this call ran the remaining (blocking)
+    /// launches -- in which case the device probe is stale and the caller must
+    /// republish it from lastSweep*() and clear its halt.
+    bool finishDrive(double& eigv, double* flux, double& errl2, bool& host_continued);
+
+    /// The stream enqueueDrive issues on.  Null when there is no arena.
+    [[nodiscard]] void* sweepStream() const { return _ls ? _ls->sweepStream() : nullptr; }
+
+    /// Drain that stream, for a caller that must fall back to a blocking drive
+    /// with stream-ordered work of its own still in flight.
+    void syncSweepStream() { if (_ls) _ls->syncSweepStream(); }
 
     /// The two device-only signals the segment's transition ranks.
     [[nodiscard]] bool lastSweepNegativeFlux() const { return _last_sweep_negative != 0; }

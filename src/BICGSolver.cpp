@@ -369,6 +369,26 @@ bool BICGSolver::driveSweepsCuda(double* phi, CudaBatchArena::CmfdSweepIO& io) {
     return true;
 }
 
+bool BICGSolver::enqueueSweepsCuda(double* phi, const CudaBatchArena::CmfdSweepIO& io,
+                                   const CudaBatchArena::CmfdSweepProbeSink& probe) {
+    if (_arena == nullptr || _batch_slot < 0 || !_arena->available()) return false;
+    return _arena->enqueueSweeps(_batch_slot, phi, io, probe);
+}
+
+bool BICGSolver::finishSweepsCuda(CudaBatchArena::CmfdSweepIO& io) {
+    if (_arena == nullptr || _batch_slot < 0) return false;
+    return _arena->finishSweeps(_batch_slot, io);
+}
+
+void* BICGSolver::sweepStream() const {
+    if (_arena == nullptr) return nullptr;
+    return _arena->sweepStream();
+}
+
+void BICGSolver::syncSweepStream() {
+    if (_arena != nullptr) _arena->syncSweepStream();
+}
+
 void BICGSolver::axb(double* diag, double* cc, double* phi, double* aphi) {
     const int ng   = _g.ng();
     const int ng2  = _g.ng2();

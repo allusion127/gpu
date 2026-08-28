@@ -341,6 +341,90 @@ public:
     /// mixes plain solves with sweep runs -- the graphs differ).
     void solveSweeps(int slot, double* phi, CmfdSweepIO& io);
 
+    // -----------------------------------------------------------------------
+    // Rev.7.1 Task 10 part 2: the sweep as a STREAM-ORDERED ENQUEUE
+    // -----------------------------------------------------------------------
+    //
+    // WHAT solveSweeps COSTS THAT A SEGMENT CANNOT AFFORD.  It takes the arena
+    // mutex, joins a rendezvous, lingers for absent participants, launches,
+    // drains the stream, runs the per-slot drain bookkeeping and finishes with
+    // adoptFluxMirror -- an n-double host memcpy.  All of that is per OUTER, and
+    // it is exactly the host rendezvous the device outer segment exists to
+    // remove; while the sweep hook calls it, OuterSegmentHooks::sweep_synchronizes
+    // has to stay true and the segment budget is forced to one.
+    //
+    // enqueueSweeps is the same launch with the rendezvous and the drain taken
+    // out: the caller owns the stream (sweepStream(), so segment kernels and
+    // sweep kernels are ordered against each other by construction) and observes
+    // when IT is ready.  Single participant only -- a batch has a rendezvous
+    // precisely because it has more than one arrival, and the segment refuses
+    // batch mode anyway.
+
+    /// The arena's stream, so a caller can order its own work against the sweep
+    /// without an event.  Null when the arena is unavailable.
+    [[nodiscard]] void* sweepStream() const;
+
+    /// Where the device publishes what the outer segment has to rank, so the
+    /// normal path needs no host readback at all.  Every pointer is DEVICE
+    /// memory owned by the caller; a null one is simply not written.
+    struct CmfdSweepProbeSink {
+        double*        eigv     = nullptr; ///< the sweep's eigenvalue
+        double*        residual = nullptr; ///< the sweep's L2 flux residual
+        std::uint32_t* negative = nullptr; ///< negative-flux entries of the last sweep
+        std::uint32_t* rayleigh = nullptr; ///< sweep state 2, the gamma hand-back
+        /// CLEARED, never set, and that is the point.  The non-finite flag is
+        /// raised by the segment's own input-refresh kernel, which is the one
+        /// place that holds eigv and residual at once -- but it has to be raised
+        /// PER OUTER.  The host probe publish it replaces wrote a zeroed struct
+        /// every outer; a verdict that wrote only the four live fields would let
+        /// one non-finite outer latch the flag for the rest of the process, so
+        /// the next armed segment would fail its first outer on a signal from a
+        /// solve that had already been abandoned.
+        std::uint32_t* nonfinite = nullptr;
+        /// The segment's per-slot halt word, indexed by `halt_slot`.
+        ///
+        /// READ as well as written: a halted outer must not run its sweep at
+        /// all, and the re-seed kernel is the one place inside the sweep that
+        /// can see the segment's halt before the graph starts.  Written only to
+        /// latch an incomplete drive (sweep state 0 or 2), which ends the outer
+        /// where it stands rather than letting the body run on a half sweep.
+        std::uint32_t* halt      = nullptr;
+        int            halt_slot = 0;
+    };
+
+    /// Enqueue one resident sweep run on sweepStream() and RETURN.
+    ///
+    /// Nothing is drained and nothing is read back: `io`'s outputs stay
+    /// unfilled.  The caller synchronises when it is ready and then calls
+    /// readSweepObservation() to learn whether the drive finished.
+    ///
+    /// Returns false without enqueueing anything when the arena cannot serve a
+    /// single-participant launch, in which case the caller must take solveSweeps.
+    bool enqueueSweeps(int slot, double* phi, const CmfdSweepIO& io,
+                       const CmfdSweepProbeSink& probe);
+
+    /// Copy the sweep outputs of the last enqueueSweeps into @p io.
+    ///
+    /// ONLY VALID AFTER A SYNCHRONISE of sweepStream(): the D2H that fills the
+    /// staging block rode that stream.  This is a host read of pinned memory,
+    /// not a transfer, so it costs a load per field.
+    void readSweepObservation(int slot, CmfdSweepIO& io) const;
+
+    /// The post-synchronise half of an enqueueSweeps launch: the mirror commits,
+    /// the per-slot status absorb and the flux mirror that drain() would have
+    /// done, plus readSweepObservation.  THE CALLER MUST HAVE SYNCHRONISED
+    /// sweepStream() -- this deliberately does not, because the whole point of
+    /// the enqueue path is that the segment owns when that happens.
+    ///
+    /// Returns false when the device flagged this slot's flux non-finite.
+    bool finishSweeps(int slot, CmfdSweepIO& io);
+
+    /// Drain sweepStream().  For the caller that has to fall back to a BLOCKING
+    /// drive after issuing stream-ordered work of its own -- the Wielandt
+    /// warm-up inside a device outer segment -- where the host loop is about to
+    /// read arrays those copies are still filling.
+    void syncSweepStream();
+
     /// One JSON line of how full the batches actually were.  The batch mode is
     /// only worth its complexity when the mean width is close to the slot
     /// count, so this is the number to read first when the speed-up disappoints.

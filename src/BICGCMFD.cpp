@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 
 #define flux(ig, l)  (flux[(l) * _g.ng() + ig])
@@ -303,21 +304,25 @@ void BICGCMFD::updpsi(const double* flux) {
         CMFD::updpsi(l, flux);
     }
 }
-
 // The device-resident sweep loop (RASBERY_GPU_CMFD_SWEEP).  One graph launch
 // runs up to the remaining sweep budget; the loop below only spins again for
 // the negative-flux retry pathology or the degenerate-gamma hand-back, both
 // of which the plain host loop also treats as exceptional.  Delegation only
 // happens in the Wielandt regime (the caller checks the warm-up), so the
 // Rayleigh branch here is the gamma-degenerate fallback, not the schedule.
-bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
+//
+// Rev.7.1 Task 10 part 2 SPLIT IT IN THREE, and the split is what keeps the
+// stream-ordered arm honest.  A device outer segment needs the SAME drive
+// enqueued instead of driven, and the obvious way to get that -- a second copy
+// of the launch sequence with the drain taken out -- would be two spellings of
+// one physics loop, free to disagree about the Rayleigh hand-back or the retry
+// packing.  So the pieces are named and shared: prepareDeviceSweeps is the
+// prologue (aliasing and page-locking), stageSweepIO fills one launch's IO
+// block, absorbSweepLaunch is the whole post-launch decision including the
+// Rayleigh branch, and BOTH arms are those three in a loop.
+bool BICGCMFD::prepareDeviceSweeps(double* flux, SweepPrep& p) {
     const int nxyz = _g.nxyz();
     const int ng   = _g.ng();
-    const bool use_device_assembly = _device_assembly_pending;
-    auto finish = [&](bool result) {
-        _device_assembly_pending = false;
-        return result;
-    };
     // chif / xsnf / vol are ALIASED, not copied.
     //
     // The staging loop that used to live here rebuilt three vectors on every
@@ -351,7 +356,7 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
         }
         sweep_chif = _sweep_chif.data();
     }
-    if (sweep_xsnf == nullptr || sweep_vol == nullptr) return finish(false);
+    if (sweep_xsnf == nullptr || sweep_vol == nullptr) return false;
 
     // Page-lock every buffer the sweep launcher memcpys, once per instance:
     // pageable async copies stage through the driver ON the launcher's
@@ -423,36 +428,27 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
                          _sweep_chif.size() * sizeof(double), "bicg.sweep_chif@sweep");
     }
 
-    double reigv  = 1. / eigv;
-    double reigvs = (_eshift != 0.0) ? 1. / (eigv + _eshift) : 0.0;
-    int    iout = 0, icmfd = 0;
+    p.xsnf = sweep_xsnf;
+    p.chif = sweep_chif;
+    p.vol  = sweep_vol;
+    p.ok   = true;
+    return true;
+}
 
-    // Only the FIRST launch of this drive carries host-written psi.  The host
-    // regenerates _psi wholesale (CMFD::updpsi from the flux) before every
-    // BICGCMFD::drive and never writes it between two launches of one drive,
-    // so a later launch would be handing the device back exactly the bytes it
-    // produced.  See CmfdSweepIO::psi_dirty.
-    bool psi_dirty = true;
-
-    while (iout < _ncmfd) {
-        // Stage this outer's operator exactly as a host sweep would; the
-        // device builds src itself, so _src rides along unused.
-        double r20 = 0.0;
-        _ls->reset(_diag, _cc, flux, _src, r20);
-        _ls->solveInner(_nmaxbicg, _epsbicg);
-
-        CudaBatchArena::CmfdSweepIO io;
-        io.chif         = sweep_chif;
-        io.xsnf         = sweep_xsnf;
+/// Fill one launch's IO block exactly as the host sweep loop always has.
+void BICGCMFD::stageSweepIO(CudaBatchArena::CmfdSweepIO& io, const SweepPrep& p,
+                            double eigv, double reigv, double reigvs, double errl2,
+                            int iout, int icmfd, bool psi_dirty) {
+        io.chif         = p.chif;
+        io.xsnf         = p.xsnf;
         io.xsrf         = _x.xsrfData();
         io.xssm         = _x.xssmData();
         io.dtil         = _dtil;
         io.dhat         = _dhat;
-        io.vol          = sweep_vol;
+        io.vol          = p.vol;
         io.udiag        = _udiag.data();
         io.psi          = _psi;
         io.psi_dirty    = psi_dirty;
-        io.device_assembly = use_device_assembly;
         io.eigv         = eigv;
         io.reigv        = reigv;
         io.reigvs       = reigvs;
@@ -468,17 +464,20 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
         // copy them over the bytes the segment just produced.
         io.dhat_device_resident = _outer_segment_resident;
         io.psi_device_resident  = _outer_segment_resident;
+}
 
-        if (!_ls->driveSweepsCuda(flux, io)) {
-            // Nothing ran. Rebuild the host operator before allowing the
-            // pristine host loop to take over; stale diag/cc is fail-closed.
-            if (use_device_assembly) assembleHostLinearSystem(eigv);
-            return finish(false);
-        }
-
-        // The device now owns psi: it advanced it, and nothing on the host
-        // touches it until the next drive's updpsi.
-        psi_dirty          = false;
+/// Absorb one launch's outputs and say whether the DRIVE is over.
+///
+/// True = this drive is finished (converged, or the sweep budget is spent, or
+/// the Rayleigh hand-back converged).  False = the caller must launch again:
+/// state 0 means the launch's slot budget ran out mid-retry, state 2 means the
+/// gamma degenerated and the branch below has just finished that sweep on the
+/// host, exactly as the host loop always did.
+bool BICGCMFD::absorbSweepLaunch(CudaBatchArena::CmfdSweepIO& io, double& eigv,
+                                 double* flux, double& errl2, double& reigv,
+                                 double& reigvs, int& iout, int& icmfd) {
+    const int nxyz = _g.nxyz();
+    const int ng   = _g.ng();
         const int attempts = io.icmfd_done - icmfd;
         icmfd              = io.icmfd_done;
         iout += io.sweeps_done;
@@ -496,7 +495,7 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
         _last_sweep_negative = io.negative_last;
         _last_sweep_state    = io.state;
 
-        if (io.state == 1 || io.state == 3) return finish(true); // converged / budget spent
+        if (io.state == 1 || io.state == 3) return true; // converged / budget spent
 
         if (io.state == 2) {
             // Degenerate gamma: the device ran this sweep's source/BiCG/psi
@@ -531,14 +530,164 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
                     if (flux(ig2, l) < 0) ++negative;
             if (negative == _g.ngxyz()) negative = 0;
             if (!(negative != 0 && icmfd < 20 * _ncmfd)) ++iout;
-            if (errl2 < _epsl2) return finish(true);
-            continue;
+            if (errl2 < _epsl2) return true;
+            return false;
         }
-        // state 0: the launch unroll was spent on retries; go again with the
-        // remaining budget.
-    }
-    return finish(true);
+    // state 0: the launch unroll was spent on retries; the caller goes again
+    // with the remaining budget.
+    return false;
 }
+
+bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
+    const bool use_device_assembly = _device_assembly_pending;
+    _device_assembly_pending       = false;
+
+    SweepPrep p;
+    if (!prepareDeviceSweeps(flux, p)) return false;
+
+    double reigv  = 1. / eigv;
+    double reigvs = (_eshift != 0.0) ? 1. / (eigv + _eshift) : 0.0;
+    int    iout = 0, icmfd = 0;
+
+    // Only the FIRST launch of this drive carries host-written psi.  The host
+    // regenerates _psi wholesale (CMFD::updpsi from the flux) before every
+    // BICGCMFD::drive and never writes it between two launches of one drive,
+    // so a later launch would be handing the device back exactly the bytes it
+    // produced.  See CmfdSweepIO::psi_dirty.
+    bool psi_dirty = true;
+
+    while (iout < _ncmfd) {
+        // Stage this outer's operator exactly as a host sweep would; the
+        // device builds src itself, so _src rides along unused.
+        double r20 = 0.0;
+        _ls->reset(_diag, _cc, flux, _src, r20);
+        _ls->solveInner(_nmaxbicg, _epsbicg);
+
+        CudaBatchArena::CmfdSweepIO io;
+        stageSweepIO(io, p, eigv, reigv, reigvs, errl2, iout, icmfd, psi_dirty);
+        io.device_assembly = use_device_assembly;
+
+        if (!_ls->driveSweepsCuda(flux, io)) {
+            // Nothing ran. Rebuild the host operator before allowing the
+            // pristine host loop to take over; stale diag/cc is fail-closed.
+            if (use_device_assembly) assembleHostLinearSystem(eigv);
+            return false;
+        }
+        // The device now owns psi: it advanced it, and nothing on the host
+        // touches it until the next drive's updpsi.
+        psi_dirty = false;
+        if (absorbSweepLaunch(io, eigv, flux, errl2, reigv, reigvs, iout, icmfd)) return true;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Rev.7.1 Task 10 part 2: the drive as a stream-ordered enqueue
+// ---------------------------------------------------------------------------
+
+bool BICGCMFD::canEnqueueDrive() const {
+    // The SAME gate drive() applies, minus the one-shot form-probe capture,
+    // which is a property of the call and not of the run.  Spelled once, here,
+    // so the segment cannot arm an arm drive() would not have taken.
+    static const bool sweep_dev = [] {
+        const char* v = std::getenv("RASBERY_GPU_CMFD_SWEEP");
+        return v != nullptr && std::string(v) != "0";
+    }();
+    return sweep_dev && _ls != nullptr && _ls->usingCuda() && _g.ng() == 2 &&
+           _wiel_sweep >= WIELANDT_WARMUP_SWEEPS;
+}
+
+bool BICGCMFD::enqueueDrive(double& eigv, double* flux, double& errl2,
+                            const CudaBatchArena::CmfdSweepProbeSink& probe) {
+    _enqueued = EnqueuedDrive{};
+    // ASKED BEFORE ANYTHING IS CONSUMED.  A refusal here must leave the solver
+    // exactly as setls() left it, because the caller's fallback is the blocking
+    // drive() -- which reads `_device_assembly_pending` to decide whether the
+    // operator is the arena's or the host's.
+    if (!canEnqueueDrive()) return false;
+
+    const bool use_device_assembly = _device_assembly_pending;
+    _device_assembly_pending       = false;
+
+    SweepPrep p;
+    if (!prepareDeviceSweeps(flux, p)) return false;
+
+    const double reigv  = 1. / eigv;
+    const double reigvs = (_eshift != 0.0) ? 1. / (eigv + _eshift) : 0.0;
+
+    // Exactly the first pass of driveDeviceSweeps' loop: the operator stage, the
+    // inner budget, the IO block at iout = icmfd = 0 with psi_dirty set.
+    double r20 = 0.0;
+    _ls->reset(_diag, _cc, flux, _src, r20);
+    _ls->solveInner(_nmaxbicg, _epsbicg);
+
+    CudaBatchArena::CmfdSweepIO io;
+    stageSweepIO(io, p, eigv, reigv, reigvs, errl2, 0, 0, /*psi_dirty=*/true);
+    io.device_assembly = use_device_assembly;
+
+    if (!_ls->enqueueSweepsCuda(flux, io, probe)) {
+        // Nothing was enqueued.  Rebuild the host operator before the caller
+        // falls back, for the same fail-closed reason driveDeviceSweeps does.
+        if (use_device_assembly) assembleHostLinearSystem(eigv);
+        return false;
+    }
+
+    _enqueued.active              = true;
+    _enqueued.use_device_assembly = use_device_assembly;
+    _enqueued.prep                = p;
+    _enqueued.io                  = io;
+    _enqueued.flux                = flux;
+    _enqueued.reigv               = reigv;
+    _enqueued.reigvs              = reigvs;
+    return true;
+}
+
+bool BICGCMFD::finishDrive(double& eigv, double* flux, double& errl2,
+                           bool& host_continued) {
+    host_continued = false;
+    if (!_enqueued.active) return false;
+    EnqueuedDrive d = _enqueued;
+    _enqueued       = EnqueuedDrive{};
+
+    if (!_ls->finishSweepsCuda(d.io))
+        throw std::runtime_error("CUDA BiCGSTAB detected a non-finite value");
+
+    int iout = 0, icmfd = 0;
+    if (absorbSweepLaunch(d.io, eigv, flux, errl2, d.reigv, d.reigvs, iout, icmfd))
+        return true;
+
+    // THE DRIVE IS NOT OVER, and this is the one place the host still has to
+    // spin: sweep state 0 (the launch's slot budget was spent on negative-flux
+    // retries) and state 2 (the Wielandt gamma degenerated, and absorbSweepLaunch
+    // has just finished that sweep on the Rayleigh branch).  Both are exceptional
+    // -- 0 of 1690 outers on i-SMR CY01 -- and both are the host loop verbatim,
+    // because it is the same three calls in the same order.
+    //
+    // The caller is told so it can republish the segment's probe: the device
+    // verdict kernel published the eigenvalue of a HALF drive and latched the
+    // segment's halt on it, and what follows here moves both.
+    host_continued = true;
+    bool psi_dirty = false;
+    while (iout < _ncmfd) {
+        double r20 = 0.0;
+        _ls->reset(_diag, _cc, flux, _src, r20);
+        _ls->solveInner(_nmaxbicg, _epsbicg);
+
+        CudaBatchArena::CmfdSweepIO io;
+        stageSweepIO(io, d.prep, eigv, d.reigv, d.reigvs, errl2, iout, icmfd, psi_dirty);
+        io.device_assembly = d.use_device_assembly;
+
+        if (!_ls->driveSweepsCuda(flux, io)) {
+            if (d.use_device_assembly) assembleHostLinearSystem(eigv);
+            return false;
+        }
+        psi_dirty = false;
+        if (absorbSweepLaunch(io, eigv, flux, errl2, d.reigv, d.reigvs, iout, icmfd))
+            return true;
+    }
+    return true;
+}
+
 
 void BICGCMFD::drive(double& eigv, double* flux, double& errl2) {
 
@@ -579,12 +728,7 @@ void BICGCMFD::drive(double& eigv, double* flux, double& errl2) {
     // and its Rayleigh schedule stay on the host, so the device never needs
     // the icy < 0 branch).  A false return means nothing ran on the device and
     // the pristine host loop below takes over.
-    static const bool sweep_dev = [] {
-        const char* v = std::getenv("RASBERY_GPU_CMFD_SWEEP");
-        return v != nullptr && std::string(v) != "0";
-    }();
-    if (sweep_dev && !cap && _ls->usingCuda() && _g.ng() == 2 &&
-        _wiel_sweep >= WIELANDT_WARMUP_SWEEPS) {
+    if (!cap && canEnqueueDrive()) {
         if (driveDeviceSweeps(eigv, flux, errl2)) return;
     }
 

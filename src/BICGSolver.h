@@ -141,6 +141,25 @@ public:
     /// outer's operator and inner budget first, exactly as for solve().
     bool driveSweepsCuda(double* phi, CudaBatchArena::CmfdSweepIO& io);
 
+    /// Rev.7.1 Task 10 part 2: the same sweep run, ENQUEUED and not drained.
+    ///
+    /// Returns false when the arena cannot serve a single-participant launch, in
+    /// which case the caller must take driveSweepsCuda.  On true, nothing has
+    /// been observed yet: the caller synchronises sweepStream() when it is ready
+    /// and calls finishSweepsCuda() to read the outcome.
+    bool enqueueSweepsCuda(double* phi, const CudaBatchArena::CmfdSweepIO& io,
+                           const CudaBatchArena::CmfdSweepProbeSink& probe);
+
+    /// The post-synchronise half of enqueueSweepsCuda.  False = non-finite flux.
+    bool finishSweepsCuda(CudaBatchArena::CmfdSweepIO& io);
+
+    /// The stream enqueueSweepsCuda issues on, so the caller can order its own
+    /// work against it.  Null when there is no arena.
+    [[nodiscard]] void* sweepStream() const;
+
+    /// Drain that stream.  See CudaBatchArena::syncSweepStream.
+    void syncSweepStream();
+
     /// @brief calculate Axb in the BICGStab calculation
     /// @param diag the diagonal matrix
     /// @param cc the coupling coefficient

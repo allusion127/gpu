@@ -315,7 +315,12 @@ struct CudaOuterSegment::Impl {
     DeviceArenaView arena{};
     int             slot_count = 0;
 
-    cudaStream_t stream = nullptr;
+    /// The stream the segment issues on.  Rev.7.1 Task 10 part 2: normally the
+    /// CMFD arena's, so the sweep's kernels and the segment's are ordered by the
+    /// stream itself rather than by an event pair; `own_stream` is the private
+    /// fallback and the thing release() destroys.
+    cudaStream_t stream     = nullptr;
+    cudaStream_t own_stream = nullptr;
 
     // Device scratch, all sized [slot_count] except the one counter.
     DeviceOuterProbe*        d_probes    = nullptr;
@@ -327,6 +332,15 @@ struct CudaOuterSegment::Impl {
 
     OuterSegmentResidency residency{};
     bool                  residency_bound = false;
+    /// The segment exit word, read once per outer with no extra synchronise.
+    ///
+    /// A D2H of it rides the stream right behind the transition, so at the
+    /// segment's NEXT per-outer synchronise the host can see whether the
+    /// PREVIOUS outer ended without paying for a second rendezvous.  Pinned
+    /// because it is copied every outer and a pageable 32-byte D2H stages
+    /// through the driver on the launcher's critical path.
+    DeviceOuterSegmentState* h_seg = nullptr;
+
     OuterSegmentHooks   hooks{};
     OuterSegmentBinding binding{};
     bool                is_bound = false;
@@ -363,8 +377,12 @@ bool CudaOuterSegment::initialize(const DeviceArenaView& arena, int slot_count) 
 
     const std::size_t n = static_cast<std::size_t>(slot_count);
     cudaError_t       rc;
-    if ((rc = cudaStreamCreateWithFlags(&_impl->stream, cudaStreamNonBlocking)) != cudaSuccess)
+    if ((rc = cudaStreamCreateWithFlags(&_impl->own_stream, cudaStreamNonBlocking)) !=
+        cudaSuccess)
         return fail("cudaStreamCreateWithFlags", rc);
+    _impl->stream = _impl->own_stream;
+    if ((rc = cudaMallocHost(&_impl->h_seg, sizeof(DeviceOuterSegmentState))) != cudaSuccess)
+        return fail("cudaMallocHost(segment state)", rc);
     if ((rc = cudaMalloc(&_impl->d_probes, n * sizeof(DeviceOuterProbe))) != cudaSuccess)
         return fail("cudaMalloc(probes)", rc);
     if ((rc = cudaMalloc(&_impl->d_segments, n * sizeof(DeviceOuterSegmentState))) !=
@@ -395,15 +413,40 @@ void CudaOuterSegment::release() {
     if (_impl->d_inputs != nullptr) cudaFree(_impl->d_inputs);
     if (_impl->d_decisions != nullptr) cudaFree(_impl->d_decisions);
     if (_impl->d_halted != nullptr) cudaFree(_impl->d_halted);
-    if (_impl->stream != nullptr) cudaStreamDestroy(_impl->stream);
+    if (_impl->h_seg != nullptr) cudaFreeHost(_impl->h_seg);
+    if (_impl->own_stream != nullptr) cudaStreamDestroy(_impl->own_stream);
     _impl->d_probes    = nullptr;
     _impl->d_segments  = nullptr;
     _impl->d_halt      = nullptr;
     _impl->d_inputs    = nullptr;
     _impl->d_decisions = nullptr;
     _impl->d_halted    = nullptr;
+    _impl->h_seg       = nullptr;
     _impl->stream      = nullptr;
+    _impl->own_stream  = nullptr;
     _impl->ready       = false;
+}
+
+bool CudaOuterSegment::useStream(void* stream) {
+    if (_impl == nullptr || !_impl->ready) return false;
+    _impl->stream = (stream != nullptr) ? static_cast<cudaStream_t>(stream)
+                                        : _impl->own_stream;
+    return true;
+}
+
+CudaOuterSegment::ProbeAddresses CudaOuterSegment::probeAddresses(int slot) const {
+    ProbeAddresses a;
+    if (_impl == nullptr || !_impl->ready) return a;
+    if (slot < 0 || slot >= _impl->slot_count) return a;
+    DeviceOuterProbe* probe = _impl->d_probes + slot;
+    a.eigv     = &probe->eigv;
+    a.residual = &probe->residual;
+    a.negative = &probe->negative_flux;
+    a.rayleigh  = &probe->rayleigh;
+    a.nonfinite = &probe->nonfinite;
+    a.halt      = _impl->d_halt;
+    a.valid    = true;
+    return a;
 }
 
 bool CudaOuterSegment::available() const { return _impl != nullptr && _impl->ready; }
@@ -506,6 +549,19 @@ bool CudaOuterSegment::publishProbe(int slot, double eigv, double residual,
     return rc == cudaSuccess;
 }
 
+bool CudaOuterSegment::republishAfterHostSweep(int slot, double eigv, double residual,
+                                               bool negative_flux, bool rayleigh) {
+    if (!publishProbe(slot, eigv, residual, negative_flux, rayleigh)) return false;
+    // THE HALT COMES OFF LAST, and that ordering is the point: until the probe
+    // holds the finished drive's numbers, an outer that resumed would compute
+    // its convergence from the half drive the verdict kernel saw.  publishProbe
+    // is a blocking H2D, so by the time this runs the new numbers are down.
+    const std::uint32_t clear = 0u;
+    const cudaError_t   rc =
+        cudaMemcpy(_impl->d_halt + slot, &clear, sizeof(clear), cudaMemcpyHostToDevice);
+    return rc == cudaSuccess;
+}
+
 bool rasberyBindOuterResidency(const OuterSegmentResidency& residency) {
     return rasberyOuterSegment().bindResidency(residency);
 }
@@ -561,6 +617,11 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     Impl&                      m      = *_impl;
     const bool                 m_hooks_synchronize = _impl->hooks.sweep_synchronizes;
     const OuterSegmentBinding& bound_ = m.binding;
+    // The stream-ordered sweep is only stream-ordered if BOTH halves are here:
+    // a hook that enqueues and never publishes its observation would leave the
+    // flux the nodal drive reads one outer behind.
+    const bool                 stream_sweep =
+        !m_hooks_synchronize && m.hooks.finish_cmfd_sweep != nullptr;
     // THE SYNCHRONISING SWEEP HOOK FORCES A SEGMENT OF ONE.
     //
     // BICGCMFD::drive drains its stream and copies the flux back, so the host
@@ -572,7 +633,7 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     // is why `device_outers` equals the host outer count rather than exceeding
     // `segment_launches` by the budget.
     const unsigned int         budget =
-        m_hooks_synchronize ? 1u : outerSegmentBudget();
+        stream_sweep ? outerSegmentBudget() : 1u;
     const int                  slot   = scalars.slot;
     const DevicePhaseQueue     queue  = singleSlotQueue(slot);
 
@@ -633,6 +694,11 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     };
 
     cudaError_t rc;
+    // The host mirror of the exit word is the loop's stopping condition, and it
+    // survives the previous segment.  Clearing it here rather than trusting the
+    // first D2H is what stops a converged segment's exit from breaking the NEXT
+    // segment out at its second outer.
+    if (m.h_seg != nullptr) *m.h_seg = seg;
     if ((rc = cudaMemcpyAsync(m.d_segments + slot, &seg, sizeof(seg), cudaMemcpyHostToDevice,
                               m.stream)) != cudaSuccess)
         return launchFailed("upload segment state", rc);
@@ -665,7 +731,48 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     }
 
     // --- the body, budget times, on ONE stream -------------------------------
+    //
+    // Rev.7.1 Task 10 part 2 CHANGED WHERE THE SYNCHRONISE IS, NOT HOW MANY.
+    // The v1 body synchronised TWICE per outer -- once so the sweep hook could
+    // make its host call, once so the nodal hook could -- and the sweep hook
+    // then rendezvoused and drained on its own account.  With the sweep
+    // enqueued (BICGCMFD::enqueueDrive) the first of those disappears: the sweep
+    // rides this stream and is observed at the sync the NODAL drive was going to
+    // force anyway.  One sync per outer is what remains, and it is host
+    // arithmetic over Geometry::Jnet that costs it -- Task 18, not this task.
+    //
+    // WHAT THE HALT GATE IS DOING HERE.  With a budget above one the outers are
+    // enqueued back to back, so outer i+1's kernels are in flight before outer
+    // i's transition has been observed.  Every one of them tests the segment's
+    // halt word first (CudaCmfdOuterKernels.h, and cmfd_sweep_gate for the sweep
+    // graph), so an outer whose kernels are already in flight when the exit
+    // latches is a sequence of no-ops rather than a sequence of wrong answers.
+    // The host never enqueues the NEXT one: it reads the exit word that rode the
+    // stream behind the transition at the top of every pass.
     for (unsigned int i = 0; i < budget; ++i) {
+        // THE PREVIOUS OUTER'S EXIT, AND WHY IT COSTS A SYNCHRONISE.
+        //
+        // The halt gate makes an outer past the exit a sequence of no-op
+        // KERNELS, but two steps of the body are host CALLS -- the nodal drive
+        // and, on the arm that has no stream-ordered drive, the sweep itself --
+        // and a host call cannot read a device word.  Running either on a halted
+        // outer would not be a no-op: the nodal drive would re-solve on the
+        // previous outer's jnet, and a blocking drive would advance the
+        // eigenvalue past the exit the segment already published.
+        //
+        // So the exit is observed here, before anything of this outer is
+        // enqueued.  The sync is on a stream whose only outstanding work is the
+        // tail of the previous outer -- upddhat, the decision, the transition
+        // and three small copies -- all of which ran while the host was in the
+        // nodal drive, so in practice it returns immediately.  It is what bounds
+        // the overrun at ZERO outers rather than the budget - 1 the v1 note
+        // priced at 3.9us.
+        if (i > 0) {
+            if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
+                return launchFailed("synchronize on the segment exit", rc);
+            if (m.h_seg != nullptr && m.h_seg->exit != 0u) break;
+        }
+
         // (0) the flux the whole outer is computed from.
         //
         // See OuterSegmentBinding::host_flux: drive() takes the HOST loop for
@@ -710,21 +817,19 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                 return launchFailed("mirror psi to the host", rc);
             bump(counters().host_mirror_bytes, psi_bytes);
         }
-        // The hook is a HOST call, so everything queued above has to have landed.
-        if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
+        // A SYNCHRONISING SWEEP HOOK IS STILL A HOST CALL.  Kept for the arm
+        // that has no stream-ordered drive (no arena, or the Wielandt warm-up),
+        // where the budget is forced to one and this is the only sync of the
+        // segment.
+        if (!stream_sweep && (rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
             return launchFailed("synchronize before the CMFD sweep", rc);
 
-        // (2,3) setls + drive -- Driver.h:1551-1555.  The hook also publishes
-        // this outer's DeviceOuterProbe; nothing after it can see eigv,
-        // residual or the negative/Rayleigh signals otherwise.
+        // (2,3) setls + drive -- Driver.h:1551-1555.  On the stream-ordered arm
+        // this only ENQUEUES; the sweep's own verdict kernel publishes this
+        // outer's DeviceOuterProbe from device memory, so nothing between here
+        // and the convergence kernel needs the host.
         if (!m.hooks.enqueue_cmfd_sweep(m.hooks.ctx, m.stream, slot, i))
             return hookFailed("the CMFD sweep hook");
-
-        // (4) the convergence INPUTS -- Driver.h:1562.  See the header note on
-        // why the decision itself is published at the end of the body.
-        if ((rc = enqueueOuterRefreshInputs(queue, m.d_probes, m.d_inputs, m.d_halt,
-                                            m.stream)) != cudaSuccess)
-            return launchFailed("enqueue input refresh", rc);
 
         // (5) updjnet -- Driver.h:1569
         if ((rc = enqueueUpdJnet(m.arena, queue, bound_.geom, bound_.table, bound_.forms,
@@ -739,26 +844,39 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         // runs, and the result comes back -- in the RUNNER rather than in the
         // hook, so the hook stays pure host physics with no device vocabulary.
         // Both halves are counted; see OuterSegmentCounters::jnet_bridge_bytes.
-        if (bound_.host_jnet != nullptr && bound_.device_jnet != nullptr) {
-            const std::size_t jnet_bytes =
-                static_cast<std::size_t>(bound_.geom.nsurf) *
-                static_cast<std::size_t>(bound_.ng) * sizeof(double);
+        const bool bridge_jnet =
+            bound_.host_jnet != nullptr && bound_.device_jnet != nullptr;
+        std::size_t jnet_bytes = 0;
+        if (bridge_jnet) {
+            jnet_bytes = static_cast<std::size_t>(bound_.geom.nsurf) *
+                         static_cast<std::size_t>(bound_.ng) * sizeof(double);
             if ((rc = cudaMemcpyAsync(bound_.host_jnet, bound_.device_jnet, jnet_bytes,
                                       cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
                 return launchFailed("download jnet for the nodal drive", rc);
-            if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
-                return launchFailed("synchronize before the nodal drive", rc);
             bump(counters().jnet_bridge_bytes, jnet_bytes);
+        }
 
-            if (!m.hooks.enqueue_nodal_drive(m.hooks.ctx, m.stream, slot, i))
-                return hookFailed("the nodal drive hook");
+        // THE ONE SYNCHRONISE OF THE OUTER, and it belongs to the nodal drive.
+        if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
+            return launchFailed("synchronize before the nodal drive", rc);
 
+        // The sweep's observation, on the sync that just happened.  It adopts
+        // the flux into Geometry::Phif and the eigenvalue into the host local
+        // the nodal hook is about to divide by -- and, on the exceptional
+        // launches the device could not finish (sweep state 0 or 2), it runs the
+        // remaining blocking launches and republishes the probe the verdict
+        // kernel had to guess at.
+        if (stream_sweep && !m.hooks.finish_cmfd_sweep(m.hooks.ctx, m.stream, slot, i))
+            return hookFailed("the CMFD sweep observation hook");
+
+        if (!m.hooks.enqueue_nodal_drive(m.hooks.ctx, m.stream, slot, i))
+            return hookFailed("the nodal drive hook");
+
+        if (bridge_jnet) {
             if ((rc = cudaMemcpyAsync(bound_.device_jnet, bound_.host_jnet, jnet_bytes,
                                       cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
                 return launchFailed("upload jnet after the nodal drive", rc);
             bump(counters().jnet_bridge_bytes, jnet_bytes);
-        } else if (!m.hooks.enqueue_nodal_drive(m.hooks.ctx, m.stream, slot, i)) {
-            return hookFailed("the nodal drive hook");
         }
 
         // (7) cusping -- Driver.h:1579-1580.  Stage A: eligibility guarantees
@@ -788,6 +906,19 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
             bump(counters().host_mirror_bytes, dhat_bytes);
         }
 
+        // (4) the convergence INPUTS -- Driver.h:1562.
+        //
+        // MOVED BEHIND THE OBSERVATION, deliberately.  The plan puts this right
+        // after the drive because that is where Driver.h forms eigv and
+        // residual; nothing between there and the decision reads
+        // CmfdOuterInputs, so the only thing the position decides is WHICH
+        // probe it reads.  On the exceptional launches the host finished, the
+        // probe the verdict kernel published is a half drive's -- so refreshing
+        // before the observation would carry that half drive into the decision.
+        if ((rc = enqueueOuterRefreshInputs(queue, m.d_probes, m.d_inputs, m.d_halt,
+                                            m.stream)) != cudaSuccess)
+            return launchFailed("enqueue input refresh", rc);
+
         // the decision -- Driver.h:1601-1705, 1834-1860
         if ((rc = enqueueOuterConvergence(m.arena, queue, m.d_inputs, m.d_decisions, m.stream,
                                           m.d_halt)) != cudaSuccess)
@@ -798,8 +929,14 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                                          m.d_segments, m.d_halt, m.d_halted, m.stream)) !=
             cudaSuccess)
             return launchFailed("enqueue outer transition", rc);
-    }
 
+        // The exit word, straight behind the transition that writes it, so the
+        // NEXT pass's synchronise makes it visible without one of its own.
+        if (m.h_seg != nullptr &&
+            (rc = cudaMemcpyAsync(m.h_seg, m.d_segments + slot, sizeof(*m.h_seg),
+                                  cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+            return launchFailed("download segment exit", rc);
+    }
     // --- the single observation ---------------------------------------------
     DeviceOuterSegmentState seg_out{};
     DeviceSlotState         state_out{};
