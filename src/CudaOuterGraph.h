@@ -833,11 +833,180 @@ inline CudaOuterSegment& rasberyOuterSegment() {
     return segment;
 }
 
+// ---------------------------------------------------------------------------
+// Sec 4  Standing the segment up in production  (Rev.7.1 Task 9, link 1)
+// ---------------------------------------------------------------------------
+//
+// THE STATE THIS REPLACES.  GpuPhysicsArena::reserve() had zero callers in the
+// whole tree, so nothing ever built a DeviceSlotView, nothing published a
+// DeviceArenaView, and the runner refused every segment with `no_runner`.  The
+// Task 4/5/7 kernels were therefore dead code with a passing replay behind
+// them.  This is the one call that makes the runner exist.
+//
+// ONE SLOT, DELIBERATELY.  Task 9 is eligible on the single-run path only
+// (OuterSegmentEligibility::batch_width), so reserving 64 slots would take
+// 64x the VRAM to leave 63 of them permanently empty.  Sec 4.4 admission is
+// run either way and the refusal is loud: a deck that does not fit is refused,
+// never silently shrunk.
+
+/// What the production owner hands over.  Every field is something Driver.h
+/// already holds at the top of Drive(); nothing here is derived, so a caller
+/// cannot get it subtly wrong.
+struct OuterSegmentDeck {
+    // --- cohort shape (ArenaDims) ---
+    int nxyz   = 0;
+    int nsurf  = 0;
+    int nxy    = 0;
+    int n_fuel = 0;
+    int ng     = 0;
+
+    // --- the CMFD topology cache, uploaded ONCE (CMFD.h base pointers) ---
+    //
+    // These are the five arrays cmfd::CmfdGeometryView is the device twin of,
+    // in the same layout, so the upload is a byte copy and not a translation.
+    const int*    surface_node    = nullptr; ///< [ls*LR + side]
+    const int*    surface_dir     = nullptr; ///< [ls*LR + side]
+    const double* node_hmesh      = nullptr; ///< [l*NDIRMAX + dir]
+    const double* node_volume     = nullptr; ///< [nxyz]
+    const double* boundary_albedo = nullptr; ///< [dir*LR + side]
+
+    bool dhat_clamp = false; ///< RASBERY_DHAT_CLAMP, as CMFD resolved it
+
+    /// Sec 3.5 link 5: the host counter behind DeviceSlotState::material_generation.
+    ///
+    /// XSSet::hoststateGeneration(), and NOT a new counter.  Every host site
+    /// that writes `_xs` already bumps it -- Reconstruct (XSSet.cpp:1060), the
+    /// reference rebuild (:1474), both UpdateFlatXS arms (:2774, :2801),
+    /// ResetCuspingNodesToBase (:3180), ApplyRodCusping (:3280), the Xe
+    /// reconstruct (:3759), equilibrium Xe (:3955) and depletion (:4043) -- and
+    /// SetBoron/SetRod reach it through UpdateFlatXS.  Inventing a second
+    /// counter beside a correct one is how two counters disagree.
+    unsigned long long material_generation = 0;
+};
+
+/// Reserve the arena, upload the geometry, publish the views, bind the runner.
+///
+/// Emits the Sec 4.4 admission receipt (`[RASBERY][GPU_ARENA]`) on `receipt`
+/// whatever the outcome, because a refusal that prints nothing is the failure
+/// mode Sec 4.4 exists to prevent.  Returns true when the runner is available
+/// and bound afterwards.
+///
+/// IT DOES NOT MAKE SEGMENTS RUN.  With the runner standing, the refusal moves
+/// from `no_runner` to `no_sweep_hook`, which is the honest next blocker: the
+/// resident CMFD sweep still has no stream-ordered enqueue (link 2).  Moving a
+/// refusal one step down the list IS the deliverable -- the list is now the
+/// real one rather than one that stopped at the first missing thing.
+bool rasberyStandUpOuterSegment(const OuterSegmentDeck& deck, std::ostream& receipt);
+
+/// Tear it down.  Safe to call when nothing was ever stood up.
+void rasberyTearDownOuterSegment();
+
+
 #if defined(__CUDACC__)
 
 // ---------------------------------------------------------------------------
 // Kernels (nvcc only)
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// The slot table IS the arena  (Rev.7.1 Task 9, links 3 and 4)
+// ---------------------------------------------------------------------------
+//
+// ONE SOURCE OF TRUTH, DERIVED ON THE DEVICE.  A CmfdOuterSlotTable built by
+// hand beside a reserved arena is a SECOND set of pointers to the same slot,
+// and the two would be free to disagree -- a table whose `dhat` is not the
+// arena`s `dhat` fails nowhere and produces a wrong answer everywhere.  So the
+// table is computed FROM arena.slotView(), by this kernel, and the only place
+// a binding decision is written down is the eight lines below.
+//
+// LINK 3, AND WHY THERE IS NO TRANSPOSE HERE.  Every field is a pointer
+// REBASE, not a copy and not a re-layout, because the arena deliberately
+// adopted the host`s addressing for exactly these arrays:
+//
+//   CmfdOuterView::flux [l*ng + ig]   <- DeviceSlotView::phif, documented as
+//                                        "AoS, matching Geometry::Phif"
+//                                        (GpuPhysicsTypes.h:250)
+//   jnet/dtil/dhat      [ls*ng + ig]  <- the same, and the note at
+//                                        GpuPhysicsTypes.h:258-270 says why:
+//                                        the Class B0 bodies are scored against
+//                                        the CPU loops, so the canonical device
+//                                        buffers are the SAME BYTES as the host
+//                                        arrays -- no transpose kernel, no
+//                                        second layout to keep in step.
+//   xsdf/xsnf [ig*nxyz + l]           <- two of the NXS packed scalar slots of
+//                                        DeviceSlotView::xs, addressed with the
+//                                        shared macroXsIndex.
+//
+// The group-major/node-major mismatch that does exist is against
+// BatchCore::phi [ig*nxyz + l], which is the SWEEP`s buffer, not the arena`s.
+// It is therefore a link-2 boundary question and adding a transpose here would
+// be transposing something that already matches.
+//
+// LINK 4: `psi` IS `cmfd_psi`.  DeviceSlotView carries two [nxyz] arrays --
+// `psi` (SlotRegion::Psi) and `cmfd_psi` (SlotRegion::CmfdPsi, documented as
+// "the CMFD fission source, distinct from psi").  CmfdOuterView::psi is the
+// CMFD fission source (CmfdOuterKernel.h:211), so it binds to the second.
+// Binding the first is silent: both are [nxyz] doubles, both are writable, and
+// updpsi would happily fill the array the nodal path reads.  This kernel is
+// the ONLY place that choice is expressed, and the contract test pins it.
+__global__ void k_cmfd_build_slot_table(DeviceArenaView arena, cmfd::CmfdOuterView* views,
+                                        int slot_count, int ng, int nxyz) {
+    const int slot = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (slot >= slot_count) return;
+
+    const DeviceSlotView& v = arena.slotView(slot);
+
+    cmfd::CmfdOuterView o;
+    o.xsdf = v.xs + macroXsIndex(kXtXsdf, 0, 0, ng, nxyz);
+    o.xsnf = v.xs + macroXsIndex(kXtXsnf, 0, 0, ng, nxyz);
+    o.flux = v.phif;
+    o.jnet = v.jnet;
+    o.dtil = v.dtil;
+    o.dhat = v.dhat;
+    o.psi  = v.cmfd_psi;
+    views[slot] = o;
+}
+
+/// Seed one slot`s control packet so the segment has somewhere to resume from.
+///
+/// `material_generation` is the host`s XSSet::hoststateGeneration() (link 5).
+/// Stamping it here rather than leaving the reset`s zero is what makes
+/// nodalConstantSlotIsCurrent truthful: with both counters at zero the gate
+/// reads "current" and the constants phase would return without computing
+/// anything, for the whole run.
+__global__ void k_outer_seed_slot(DeviceArenaView arena, int slot,
+                                  unsigned long long material_generation) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    DeviceSlotState& st = arena.states[slot];
+    st.material_generation = material_generation;
+    // Deliberately NOT equal to it: the constants have never been built on the
+    // device, so the gate must read "stale" the first time it is asked.
+    st.nodal_constant_generation = material_generation - 1ull;
+}
+
+inline cudaError_t enqueueBuildCmfdSlotTable(const DeviceArenaView& arena,
+                                             cmfd::CmfdOuterView* views, int slot_count,
+                                             int ng, int nxyz, cudaStream_t stream) {
+    if (slot_count <= 0) return cudaSuccess;
+    const int block = 64;
+    const int grid  = (slot_count + block - 1) / block;
+    k_cmfd_build_slot_table<<<grid, block, 0, stream>>>(arena, views, slot_count, ng, nxyz);
+    return cudaGetLastError();
+}
+
+/// The plan`s name for the nodal constants phase (Sec 6.1 / Task 9).
+///
+/// A thin, deliberate alias: the plan and the campaign notes both call this
+/// `enqueueNodalConstants`, the implementation is called
+/// enqueueNodalUpdateConstant, and a reader who greps the plan`s name found
+/// nothing.  Naming it here rather than renaming the original keeps
+/// CudaNodalConstantKernel.h`s three-launch contract and its own tests intact.
+inline cudaError_t enqueueNodalConstants(const DeviceArenaView& arena,
+                                         const DevicePhaseQueue& queue,
+                                         const DeviceGeometryView& geom, int nxyz, int ng,
+                                         cudaStream_t stream) {
+    return enqueueNodalUpdateConstant(arena, queue, geom, nxyz, ng, stream);
+}
 
 /// Refresh the two CmfdOuterInputs fields that move between outers.
 ///

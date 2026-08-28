@@ -2251,6 +2251,53 @@ public:
 
         SolverContext ctx{geometry, cross_sections, cmfd_solver, nodal_solver, SearchMemory{}};
 
+        // ===================================================================
+        // Rev.7.1 Task 9 link 1: stand the device outer segment up, ONCE.
+        // ===================================================================
+        //
+        // HERE, AND NOT EARLIER, because this is the first point at which the
+        // deck is fully known: ReadInput has run, so the geometry dimensions and
+        // the CMFD topology cache are final, and the arena's ONE allocation can
+        // be sized without guessing.  It is also before any solve, which is the
+        // other half of the arena's contract -- every address it hands out is
+        // fixed for the run, so nothing may allocate after a graph could exist.
+        //
+        // WITH THE FEATURE OFF THIS IS ONE PREDICATE AND A RETURN.  The gate is
+        // inside rasberyStandUpOuterSegment (a cached env read), so the OFF path
+        // pays a call that returns false and nothing else -- no geometry scan,
+        // no VRAM query, and above all no allocation.
+        //
+        // THE FUEL-NODE COUNT IS SCANNED, not read, because Geometry keeps the
+        // flag per node and no count beside it.  nxyz loads once per run, next
+        // to an HDF5 parse; a cached count that could disagree with the flags
+        // would be the more expensive mistake.
+        if (gpu::outerGpuEnabled()) {
+            gpu::OuterSegmentDeck deck;
+            deck.nxyz  = geometry.nxyz();
+            deck.nsurf = geometry.nsurf();
+            deck.nxy   = geometry.nxy();
+            deck.ng    = geometry.ng();
+            int n_fuel = 0;
+            for (int l = 0; l < geometry.nxyz(); ++l)
+                if (geometry.IsFuel(l)) ++n_fuel;
+            deck.n_fuel = n_fuel;
+
+            deck.surface_node    = cmfd_solver.surfaceNodeData();
+            deck.surface_dir     = cmfd_solver.surfaceDirData();
+            deck.node_hmesh      = cmfd_solver.nodeHmeshData();
+            deck.node_volume     = cmfd_solver.nodeVolumeData();
+            deck.boundary_albedo = cmfd_solver.boundaryAlbedoData();
+
+            deck.dhat_clamp = cmfd_solver.dhatClampEnabled();
+            // Link 5: the counter that already moves on every host `_xs` write.
+            deck.material_generation = cross_sections.hoststateGeneration();
+
+            // The arena receipt goes to stdout beside every other [RASBERY]
+            // receipt; a VRAM admission that only appeared on failure would be
+            // the one number nobody could quote when a run did fit.
+            gpu::rasberyStandUpOuterSegment(deck, std::cout);
+        }
+
         // 2. Initialize run state
         const bool is_restart_run = input_output.has_restart() && !input_output.has_shuffle();
         const bool is_shuffle_run = input_output.has_shuffle();

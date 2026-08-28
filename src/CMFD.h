@@ -160,6 +160,34 @@ public:
     /// @brief set the criterion for convergence
     void setEpsl2(double epsl2);
 
+    // -----------------------------------------------------------------
+    // Base pointers of the immutable topology cache (Rev.7.1 Task 9)
+    // -----------------------------------------------------------------
+    //
+    // cmfd::CmfdGeometryView (CmfdOuterKernel.h:190) is the device twin of
+    // exactly these five arrays, in exactly this layout, and the arena
+    // uploads them once per run.  Handing out the BASE POINTER rather than
+    // adding a copy accessor matters: the device view is byte-shareable with
+    // the host cache only while both sides address the same layout, and a
+    // copy would be a second layout nobody would notice drifting.
+    //
+    // They are const and read-only.  The cache is built once per Driver
+    // (CMFD.cpp:31-73) and is immutable for the run, which is the whole
+    // reason it exists -- so exposing it cannot create a second writer.
+    [[nodiscard]] const int* surfaceNodeData() const { return _surface_node.data(); }
+    [[nodiscard]] const int* surfaceDirData() const { return _surface_dir.data(); }
+    [[nodiscard]] const double* nodeHmeshData() const { return _node_hmesh.data(); }
+    [[nodiscard]] const double* nodeVolumeData() const { return _node_volume.data(); }
+    /// RASBERY_DHAT_CLAMP as this CMFD resolved it (CMFD.cpp:76).  The device
+    /// upddhat body takes the same flag, and reading it from here rather than
+    /// re-parsing the environment is what stops the two arms disagreeing about
+    /// a clamp that changes the answer.
+    [[nodiscard]] bool dhatClampEnabled() const { return _dhat_clamp_enabled; }
+
+    [[nodiscard]] const double* boundaryAlbedoData() const {
+        return _boundary_albedo.data();
+    }
+
     /// @brief reset nonlinear current correction after an imposed state change
     void resetDhat();
 

@@ -264,10 +264,19 @@ struct alignas(128) DeviceSlotState {
     //
     //   SPECULATIVE (no host counter yet; device-side only until a phase owns
     //   one).  Do not gate an upload on these until the owning task lands.
-    //     geometry_generation   Task 4    material_generation  Task 12a
-    //     operator_generation   Task 5    flux_generation      Task 9
-    //     current_generation    Task 5    dhat_generation      Task 7
-    //     isotope_generation    Task 16   th_generation        Task 14
+    //     geometry_generation   Task 4    operator_generation  Task 5
+    //     flux_generation       Task 9    current_generation   Task 5
+    //     dhat_generation       Task 7    isotope_generation   Task 16
+    //     th_generation         Task 14
+    //
+    //   material_generation LEFT THAT LIST IN Rev.7.1 TASK 9 (link 5).
+    //   XSSet::hoststateGeneration() is its host counter -- every site that
+    //   writes `_xs` already bumps it (XSSet.cpp:1060, 1474, 2774, 2801,
+    //   3180, 3280, 3759, 3955, 4043; SetBoron/SetRod reach it through
+    //   UpdateFlatXS) -- and rasberyStandUpOuterSegment stamps it into the
+    //   slot at stand-up.  It is therefore SAFE to gate on, which is what
+    //   nodalConstantSlotIsCurrent does; before the stamp both counters sat
+    //   at zero and that gate read `current` for the whole run.
     //
     // Every one of them is a refill reset target either way: a survivor here
     // suppresses a rebuild the NEW tenant needs, which is the failure mode the

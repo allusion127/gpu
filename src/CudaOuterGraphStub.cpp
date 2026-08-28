@@ -157,4 +157,26 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars&, int batch_width,
     return false;
 }
 
+
+// ---------------------------------------------------------------------------
+// Standing the segment up -- the no-CUDA answer  (Task 9, link 1)
+// ---------------------------------------------------------------------------
+//
+// IT STILL COUNTS THE REFUSAL, and that is the whole point of having a stub
+// here rather than an #ifdef at the call site.  A CPU-only build asked for
+// RASBERY_GPU_OUTER=1 must print the same receipt with the same idle reason as
+// a CUDA build that found no device -- "the feature was on and never engaged"
+// is one state, not two, and Driver.h should not have to know which build it is
+// compiled into to say so.
+
+bool rasberyStandUpOuterSegment(const OuterSegmentDeck&, std::ostream&) {
+    if (!outerGpuEnabled()) return false;
+    ++stubRefusals(OuterSegmentRefusal::NoRunner);
+    std::fprintf(stderr, "[RASBERY][OUTER_GPU][WARN] RASBERY_GPU_OUTER=1 in a build with no "
+                         "CUDA; the device outer stays off\n");
+    return false;
+}
+
+void rasberyTearDownOuterSegment() {}
+
 } // namespace rasbery::gpu

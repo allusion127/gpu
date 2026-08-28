@@ -101,6 +101,8 @@
 
 #include "CudaOuterGraph.h"
 
+#include "GpuPhysicsArena.h"
+
 #include <cuda_runtime.h>
 
 #include <atomic>
@@ -109,6 +111,7 @@
 #include <cstring>
 #include <ostream>
 #include <string>
+#include <vector>
 
 // Forward-declared rather than included: the receipt needs the batch width to name
 // the idle reason, and CudaBICGBackend.h would drag the whole solver surface into a
@@ -639,6 +642,217 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         halted_seen = halted_out;
     }
     return true;
+}
+
+
+// ---------------------------------------------------------------------------
+// Standing the segment up  (Rev.7.1 Task 9, links 1/3/4/5)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// The one arena of the single-run path.
+///
+/// A function-local static rather than a member of anything: the arena outlives
+/// every Driver in the process -- its whole contract is that its addresses never
+/// move -- and giving it an owner would mean giving it that owner's lifetime.
+GpuPhysicsArena& outerArena() {
+    static GpuPhysicsArena arena;
+    return arena;
+}
+
+/// The device tables the arena does not own.
+///
+/// ALLOCATED ONCE AND NEVER AGAIN, which is the arena's own rule and for the
+/// arena's own reason: Task 10 captures a graph over these pointers, and a table
+/// that moved would invalidate it.  They are NOT carved out of the arena block
+/// because the layout has no region for them, and adding one would move every
+/// offset in a layout that has its own gate.
+struct StandUpTables {
+    DeviceSlotView*      slot_views    = nullptr; ///< [slots] = DeviceArenaView::slot_views
+    cmfd::CmfdOuterView* cmfd_views    = nullptr; ///< [slots], derived ON THE DEVICE
+    CmfdOuterCounters*   dhat_counters = nullptr; ///< [slots]
+    bool                 stood         = false;
+};
+
+StandUpTables& standUpTables() {
+    static StandUpTables t;
+    return t;
+}
+
+/// One geometry import, sized from the layout calculator rather than recomputed.
+///
+/// Recomputing an element count at the call site is how an import silently
+/// copies half an array: the layout is the only thing that knows how big a
+/// region is, and it is already unit-tested with no CUDA.
+template <typename T>
+bool importGeometryRegion(GeometryRegion region, const T* host, const ArenaDims& dims,
+                          const char* what) {
+    const std::size_t bytes = arenaGeometryElements(region, dims) * sizeof(T);
+    if (!outerArena().importGeometryAsync(region, host, bytes, nullptr)) {
+        std::fprintf(stderr, "[RASBERY][OUTER_GPU][WARN] geometry import failed (%s): %s\n",
+                     what, outerArena().status().c_str());
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+bool rasberyStandUpOuterSegment(const OuterSegmentDeck& deck, std::ostream& receipt) {
+    // The gate is tested HERE and not at the call site, so Driver.h holds one
+    // unconditional call and the feature-off path is this early return.
+    if (!outerGpuEnabled()) return false;
+    if (standUpTables().stood) return rasberyOuterSegment().bound();
+
+    if (deck.nxyz <= 0 || deck.nsurf <= 0 || deck.nxy <= 0 || deck.ng <= 0 ||
+        deck.surface_node == nullptr || deck.surface_dir == nullptr ||
+        deck.node_hmesh == nullptr || deck.node_volume == nullptr ||
+        deck.boundary_albedo == nullptr) {
+        std::fprintf(stderr, "[RASBERY][OUTER_GPU][WARN] incomplete deck description; the "
+                             "device outer stays off\n");
+        return false;
+    }
+    // Sec 3.3: the device bodies are built for a two-group deck (kDevNg), and a
+    // three-group deck would index every packed block with the wrong stride.
+    // Refusing is the only safe answer, and it has to be loud.
+    if (deck.ng != kDevNg) {
+        std::fprintf(stderr,
+                     "[RASBERY][OUTER_GPU][WARN] ng=%d but the device bodies are built for "
+                     "%d groups; the device outer stays off\n",
+                     deck.ng, kDevNg);
+        return false;
+    }
+
+    // --- 1. the ONE allocation, with Sec 4.4 admission -----------------------
+    ArenaDims dims = arenaDims(deck.nxyz, deck.nsurf, deck.nxy, deck.n_fuel, 1);
+    dims.ng             = deck.ng;
+    const bool reserved = outerArena().reserve(dims);
+    // The receipt goes out on BOTH paths.  A refusal that printed nothing is
+    // exactly the silent-shrink failure Sec 4.4 was written against.
+    outerArena().emitReceipt(receipt);
+    if (!reserved) {
+        std::fprintf(stderr, "[RASBERY][OUTER_GPU][WARN] arena refused: %s\n",
+                     outerArena().status().c_str());
+        return false;
+    }
+
+    // --- 2. the immutable topology, uploaded once ----------------------------
+    if (!importGeometryRegion(GeometryRegion::Lklr, deck.surface_node, dims, "surface_node") ||
+        !importGeometryRegion(GeometryRegion::Idirlr, deck.surface_dir, dims, "surface_dir") ||
+        !importGeometryRegion(GeometryRegion::Hmesh, deck.node_hmesh, dims, "node_hmesh") ||
+        !importGeometryRegion(GeometryRegion::Vol, deck.node_volume, dims, "node_volume") ||
+        !importGeometryRegion(GeometryRegion::Albedo, deck.boundary_albedo, dims, "albedo")) {
+        outerArena().release();
+        return false;
+    }
+
+    // --- 3. the slot-view table, which is what a DeviceArenaView IS ----------
+    StandUpTables& t  = standUpTables();
+    const int      n  = dims.slots;
+    cudaError_t    rc = cudaSuccess;
+
+    auto fail = [&](const char* what) {
+        std::fprintf(stderr, "[RASBERY][OUTER_GPU][WARN] %s: %s\n", what,
+                     cudaGetErrorString(rc));
+        rasberyTearDownOuterSegment();
+        return false;
+    };
+
+    if ((rc = cudaMalloc(&t.slot_views, sizeof(DeviceSlotView) * n)) != cudaSuccess)
+        return fail("cudaMalloc(slot_views)");
+    if ((rc = cudaMalloc(&t.cmfd_views, sizeof(cmfd::CmfdOuterView) * n)) != cudaSuccess)
+        return fail("cudaMalloc(cmfd_views)");
+    if ((rc = cudaMalloc(&t.dhat_counters, sizeof(CmfdOuterCounters) * n)) != cudaSuccess)
+        return fail("cudaMalloc(dhat_counters)");
+    if ((rc = cudaMemset(t.dhat_counters, 0, sizeof(CmfdOuterCounters) * n)) != cudaSuccess)
+        return fail("cudaMemset(dhat_counters)");
+
+    // slotView() is a pure index rebase on the host, so the table is built here
+    // and uploaded once; after this the DEVICE never asks the host for an
+    // address again, which is the precondition for capturing a graph over them.
+    std::vector<DeviceSlotView> host_views(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i)
+        host_views[static_cast<std::size_t>(i)] = outerArena().slotView(i);
+    if ((rc = cudaMemcpy(t.slot_views, host_views.data(), sizeof(DeviceSlotView) * n,
+                         cudaMemcpyHostToDevice)) != cudaSuccess)
+        return fail("upload slot_views");
+
+    // The four control arrays are DENSE and below slot_base, so slot 0's
+    // pointers ARE the array bases (GpuPhysicsArenaLayout.h ControlRegion note).
+    // Taking them from slotView(0) rather than recomputing an offset is what
+    // keeps this agreeing with the layout gate.
+    DeviceArenaView arena{};
+    arena.slot_views = t.slot_views;
+    arena.phases     = outerArena().slotView(0).phase;
+    arena.states     = outerArena().slotView(0).state;
+    arena.searches   = outerArena().slotView(0).search;
+    arena.params     = outerArena().slotView(0).params;
+    arena.slot_count = n;
+
+    // --- 4. derive the CMFD table FROM the arena, on the device --------------
+    if ((rc = enqueueBuildCmfdSlotTable(arena, t.cmfd_views, n, dims.ng, dims.nxyz,
+                                        nullptr)) != cudaSuccess)
+        return fail("build cmfd slot table");
+
+    // --- 5. seed the control packet (link 5) ---------------------------------
+    // XSSet::_hoststate_generation starts at 1 and only ever increments, so a
+    // zero here means the caller did not fill the field.  Clamping to 1 keeps
+    // the seed kernel out of the one input that would wrap its `gen - 1` to
+    // UINT64_MAX and leave the constants phase permanently stale.
+    const unsigned long long seed_generation =
+        deck.material_generation != 0ull ? deck.material_generation : 1ull;
+    k_outer_seed_slot<<<1, 1>>>(arena, 0, seed_generation);
+    if ((rc = cudaGetLastError()) != cudaSuccess) return fail("seed slot state");
+    if ((rc = cudaDeviceSynchronize()) != cudaSuccess) return fail("stand-up synchronize");
+
+    // --- 6. hand it to the runner --------------------------------------------
+    if (!rasberyOuterSegment().initialize(arena, n)) {
+        std::fprintf(stderr, "[RASBERY][OUTER_GPU][WARN] runner initialise failed: %s\n",
+                     rasberyOuterSegment().status().c_str());
+        rasberyTearDownOuterSegment();
+        return false;
+    }
+
+    OuterSegmentBinding binding{};
+    binding.geom.surface_node = static_cast<const int*>(
+        outerArena().geometryRegion(GeometryRegion::Lklr));
+    binding.geom.surface_dir = static_cast<const int*>(
+        outerArena().geometryRegion(GeometryRegion::Idirlr));
+    binding.geom.node_hmesh = static_cast<const double*>(
+        outerArena().geometryRegion(GeometryRegion::Hmesh));
+    binding.geom.node_volume = static_cast<const double*>(
+        outerArena().geometryRegion(GeometryRegion::Vol));
+    binding.geom.boundary_albedo = static_cast<const double*>(
+        outerArena().geometryRegion(GeometryRegion::Albedo));
+    binding.geom.nxyz  = dims.nxyz;
+    binding.geom.nsurf = dims.nsurf;
+    binding.geom.ng    = dims.ng;
+
+    binding.geometry      = outerArena().geometryView();
+    binding.table         = CmfdOuterSlotTable{t.cmfd_views, n};
+    binding.forms         = cmfd::cmfdOuterFormsRuntime();
+    binding.dhat_clamp    = deck.dhat_clamp;
+    binding.dhat_counters = t.dhat_counters;
+    binding.nxyz          = dims.nxyz;
+    binding.ng            = dims.ng;
+    rasberyOuterSegment().bind(binding);
+
+    t.stood = true;
+    return rasberyOuterSegment().bound();
+}
+
+void rasberyTearDownOuterSegment() {
+    StandUpTables& t = standUpTables();
+    rasberyOuterSegment().release();
+    if (t.slot_views != nullptr) cudaFree(t.slot_views);
+    if (t.cmfd_views != nullptr) cudaFree(t.cmfd_views);
+    if (t.dhat_counters != nullptr) cudaFree(t.dhat_counters);
+    t.slot_views    = nullptr;
+    t.cmfd_views    = nullptr;
+    t.dhat_counters = nullptr;
+    t.stood         = false;
+    outerArena().release();
 }
 
 } // namespace rasbery::gpu

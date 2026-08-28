@@ -451,6 +451,123 @@ for arm, code in (("CudaOuterGraph.cu", GRAPH_CU_CODE),
         problems.append(f"{arm}: the idle reason must be printed only when nothing ran -- "
                         "on a healthy run it is 'none' and would be noise")
 
+# --- 12. the arena is stood up in production (link 1) ------------------------
+#
+# GpuPhysicsArena::reserve() had ZERO callers at 8be6bee, so no DeviceSlotView
+# was ever built, no DeviceArenaView was ever published, and the runner refused
+# every segment with `no_runner` -- which made the Task 4/5/7 kernels dead code
+# with a passing replay behind them.
+ARENA_H = read(SRC / "GpuPhysicsArena.h")
+SLOTCTL = read(SRC / "GpuSlotControl.h")
+for arm, code, name in ((GRAPH_CU_CODE, GRAPH_CU_CODE, "CudaOuterGraph.cu"),
+                        (STUB_CODE, STUB_CODE, "CudaOuterGraphStub.cpp")):
+    if "rasberyStandUpOuterSegment" not in code:
+        problems.append(f"{name}: does not define rasberyStandUpOuterSegment; the stand-up "
+                        "must have both arms or a CPU-only build cannot link the call site")
+want(GRAPH_CU_CODE, "outerArena().reserve(dims)", "CudaOuterGraph.cu",
+     "the production reserve() -- without it nothing builds a DeviceSlotView and the "
+     "runner refuses with no_runner forever")
+want(GRAPH_CU_CODE, "emitReceipt(receipt)", "CudaOuterGraph.cu",
+     "the Sec 4.4 VRAM admission receipt, on BOTH paths: a refusal that printed nothing "
+     "is the silent-shrink failure Sec 4.4 was written against")
+# The receipt must be emitted whether or not the reservation succeeded.
+_res = body_of(GRAPH_CU_CODE, "const bool reserved = outerArena().reserve", "if (!reserved)")
+if _res and "emitReceipt" not in _res:
+    problems.append("CudaOuterGraph.cu: the arena receipt is emitted only on success; a "
+                    "refused reservation is exactly the case a reader needs the numbers for")
+want(GRAPH_CU_CODE, "arena.slot_views = t.slot_views", "CudaOuterGraph.cu",
+     "the DeviceArenaView must carry an uploaded slot-view table")
+for field in ("arena.phases", "arena.states", "arena.searches", "arena.params"):
+    want(GRAPH_CU_CODE, field, "CudaOuterGraph.cu",
+         "the four dense control arrays are what DeviceArenaView is; a missing one is a "
+         "null dereference in the first kernel that touches it")
+want(DRIVER_CODE, "gpu::rasberyStandUpOuterSegment(", "Driver.h",
+     "the stand-up needs a production call site or reserve() is still uncalled")
+# It must be gated and it must run once, before any solve.
+_drv = body_of(DRIVER_CODE, "if (gpu::outerGpuEnabled()) {", "const bool is_restart_run")
+if _drv and "rasberyStandUpOuterSegment" not in _drv:
+    problems.append("Driver.h: the stand-up is not inside the RASBERY_GPU_OUTER gate, so an "
+                    "OFF run would pay a VRAM query and an allocation it never uses")
+if DRIVER_CODE.count("gpu::rasberyStandUpOuterSegment(") != 1:
+    problems.append("Driver.h: the arena must be stood up EXACTLY once -- reserve() is "
+                    "documented as an error to call twice, and every address it hands out "
+                    "has to be fixed before a graph could exist")
+
+# --- 13. one slot table, DERIVED from the arena (links 3 and 4) --------------
+#
+# A hand-built CmfdOuterSlotTable beside a reserved arena is a second set of
+# pointers to the same slot, free to disagree with the first.  It fails nowhere
+# and is wrong everywhere.
+want(GRAPH_H_CODE, "k_cmfd_build_slot_table", "CudaOuterGraph.h",
+     "the CMFD slot table must be DERIVED from arena.slotView(), not built beside it")
+TABLE = body_of(GRAPH_H_CODE, "void k_cmfd_build_slot_table", "__global__ void k_outer_seed_slot")
+if "arena.slotView(slot)" not in TABLE:
+    problems.append("k_cmfd_build_slot_table: does not read arena.slotView(slot), so the "
+                    "table is not derived from the arena and the two can disagree about "
+                    "which bytes a slot owns")
+# LINK 4: psi is cmfd_psi, and this is the ONLY place it is decided.
+if "o.psi  = v.cmfd_psi;" not in TABLE and "o.psi = v.cmfd_psi;" not in TABLE:
+    problems.append("k_cmfd_build_slot_table: CmfdOuterView::psi must bind to "
+                    "DeviceSlotView::cmfd_psi, not psi.  DeviceSlotView carries BOTH -- "
+                    "`psi` (SlotRegion::Psi) and `cmfd_psi` (SlotRegion::CmfdPsi, 'the CMFD "
+                    "fission source, distinct from psi') -- and CmfdOuterView::psi is the "
+                    "CMFD fission source.  Both are [nxyz] writable doubles, so binding the "
+                    "wrong one is silent: updpsi fills the array the nodal path reads")
+if re.search(r"o\.psi\s*=\s*v\.psi\b", TABLE):
+    problems.append("k_cmfd_build_slot_table: binds CmfdOuterView::psi to DeviceSlotView::psi")
+# LINK 3: pointer REBASE, never a transpose -- the arena adopted host order.
+for banned in ("transpose", "Transpose"):
+    if banned in GRAPH_H_CODE or banned in GRAPH_CU_CODE:
+        problems.append("CudaOuterGraph: contains a transpose.  DeviceSlotView::phif is "
+                        "[l*ng+ig] ('AoS, matching Geometry::Phif') and dtil/dhat/jnet are "
+                        "the host's [ls*ng+ig] by deliberate design, so every CmfdOuterView "
+                        "field is a pointer rebase.  The group-major mismatch is against "
+                        "BatchCore::phi, which belongs to the sweep")
+for rebase in ("o.flux = v.phif;", "o.jnet = v.jnet;", "o.dtil = v.dtil;", "o.dhat = v.dhat;"):
+    if rebase not in TABLE:
+        problems.append(f"k_cmfd_build_slot_table: missing the {rebase!r} rebase")
+if "macroXsIndex(kXtXsdf" not in TABLE or "macroXsIndex(kXtXsnf" not in TABLE:
+    problems.append("k_cmfd_build_slot_table: xsdf/xsnf must be addressed through the shared "
+                    "macroXsIndex, not a hand-written stride into the packed xs block")
+
+# --- 14. material_generation has a host counter now (link 5) -----------------
+#
+# nodalConstantSlotIsCurrent gates the whole constants phase on
+# `nodal_constant_generation == material_generation`.  With nothing bumping
+# material_generation both sat at zero, the gate read "current", and the phase
+# returned without computing anything for the entire run.
+want(GRAPH_H_CODE, "k_outer_seed_slot", "CudaOuterGraph.h",
+     "the slot's control packet must be seeded or the constants gate reads 'current' from "
+     "a pair of zeros")
+SEED = body_of(GRAPH_H_CODE, "void k_outer_seed_slot", "inline cudaError_t enqueueBuildCmfdSlotTable")
+if "st.material_generation" not in SEED:
+    problems.append("k_outer_seed_slot: does not stamp material_generation")
+if "st.nodal_constant_generation" not in SEED:
+    problems.append("k_outer_seed_slot: does not stamp nodal_constant_generation.  Leaving "
+                    "it equal to material_generation makes nodalConstantSlotIsCurrent read "
+                    "'current' before the constants have ever been built on the device")
+want(DRIVER_CODE, "hoststateGeneration()", "Driver.h",
+     "material_generation must be fed from XSSet's EXISTING host counter; a second counter "
+     "beside a correct one is how two counters disagree")
+want(GRAPH_CU_CODE, "seed_generation", "CudaOuterGraph.cu",
+     "the seed must be clamped away from zero -- `gen - 1` on a zero wraps to UINT64_MAX "
+     "and leaves the constants permanently stale")
+# The speculative list has to lose the entry, or the next reader is told not to
+# gate on the counter this task just made truthful.
+# Scoped to the LIST, which ends where the note explaining the removal begins;
+# spanning further would match the note itself and pass on any list there is.
+_spec = body_of(SLOTCTL, "SPECULATIVE (no host counter yet", "material_generation LEFT")
+if "material_generation" in _spec:
+    problems.append("GpuSlotControl.h: material_generation is still listed as SPECULATIVE "
+                    "('do not gate an upload on these'), but link 5 gave it a host counter "
+                    "and nodalConstantSlotIsCurrent now gates on it")
+want(SLOTCTL, "hoststateGeneration", "GpuSlotControl.h",
+     "the counter that backs material_generation has to be named where the field is")
+# The plan's own name for the constants phase must exist.
+want(GRAPH_H_CODE, "enqueueNodalConstants", "CudaOuterGraph.h",
+     "the plan calls the constants phase enqueueNodalConstants; a reader who greps the "
+     "plan's name found nothing")
+
 # --- the gates exist and are built -------------------------------------------
 want(REPLAY_TEXT, "kPhaseTransitions", "test/outer_state_replay.cpp",
      "the emitted edges must be cross-checked against the W1 table")
