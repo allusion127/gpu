@@ -120,6 +120,29 @@ against 12017.  With the byte-exact gate: 0 of 644, at 12017.
 RULE: the xsnf elision compares BYTES (cuda_transfer::ByteExactMirror), never a
 generation, and commits the shadow only from the bytes it actually uploaded.
 
+W3 item 4 MOVED WHERE THAT GATE RUNS, not what it compares.  A conditional WHILE
+cannot capture a body whose set of memcpy NODES is decided by a host memcmp each
+iteration, so the xsnf and dtil stages were hoisted to the segment entry -- on a
+proof, not a hope, about which host inputs can move inside a segment:
+
+  Geometry::Phif  moves EVERY outer (BICGCMFD::drive's host loop writes it, and
+                  absorbSweepLaunch adopts the device phi into it).  Its gate did
+                  NOT move and must not: that is the i-SMR CY02 shape.
+  XSSet::_xs      moves inside a segment only through XSSet::ApplyRodCusping.
+                  The device arms that write host _xs -- UpdateFlatXS,
+                  UpdateEquilibriumXenon -- belong to the Xe and Search steps of
+                  the host ladder, and reaching either means the segment has
+                  already exited (neither is an Outer -> Outer transition).
+  CMFD::_dtil     same: upddtil() is its only writer, called from SolveLoop's
+                  entry and from the cusping hook.
+
+So the cusping branch owes BOTH re-stages, and it used to owe only the d-tilde
+one -- the cross-section blend was caught by accident, by the next outer's
+memcmp, which is exactly the mechanism that was hoisted away.
+
+RULE (item 4): the xsnf and dtil stages are issued in the arm block, not in the
+body; the cusping branch re-issues both; the flux stage stays in the body.
+
 -------------------------------------------------------------------------------
 6. A MIRROR ISSUED FOR A HOST READER IS SYNCHRONISED BEFORE THAT READER RUNS
 -------------------------------------------------------------------------------
@@ -468,15 +491,17 @@ def check_xsnf_elision_is_byte_exact(problems: list[str]) -> None:
     backend = read("src", "CudaBICGBackend.cu")
 
     run = body_of(runner, "bool CudaOuterSegment::runSegment")
+    # W3 item 4 moved the gate out of the body and into a lambda the arm block
+    # calls once; the RULE is unchanged, so the check follows the code rather
+    # than pinning the code to where it used to live.
     try:
-        gate_at = run.index("const bool xsnf_current")
+        gate = body_of(run, "auto stageXsnf = [&]() -> bool")
     except ValueError:
         problems.append(
-            "CudaOuterGraph.cu: runSegment has no xsnf_current gate at all; the "
-            "per-outer xsnf upload is either unconditional or gone"
+            "CudaOuterGraph.cu: runSegment has no stageXsnf gate at all; the per-segment "
+            "xsnf upload is either unconditional or gone"
         )
         return
-    gate = run[gate_at : run.index(";", run.index("bump(counters().xsnf_uploads_elided)"))]
 
     if "resident_xsnf.matches" not in gate:
         problems.append(
@@ -686,6 +711,77 @@ def check_device_reigv_has_one_writer(problems: list[str]) -> None:
             )
 
 
+
+def check_staged_uploads_have_one_in_body_writer(problems: list[str]) -> None:
+    """Invariant 5, item-4 half.  Two of the three operator uploads are staged
+    once per segment; the proof that they may be is that exactly one host call in
+    the body can move them, and that call re-stages."""
+    runner_src = read("src", "CudaOuterGraph.cu")
+    run = strip_comments(body_of(runner_src, "bool CudaOuterSegment::runSegment"))
+
+    try:
+        loop_at = run.index("for (unsigned int i = 0")
+    except ValueError:
+        problems.append("CudaOuterGraph.cu: runSegment has no body loop to check")
+        return
+    arm, body = run[:loop_at], run[loop_at:]
+
+    for call, what in (("stageXsnf()", "xsnf"), ("stageDtil(", "dtil")):
+        if call not in arm:
+            problems.append(
+                "CudaOuterGraph.cu: the " + what + " stage is not issued in the arm "
+                "block.  Left in the body it is a memcpy NODE whose existence a host "
+                "memcmp decides per iteration, which is a body a conditional WHILE "
+                "cannot capture"
+            )
+
+    # The flux is the one that CANNOT be staged, and saying so mechanically is
+    # what stops the next tidy-up from moving it too.
+    if "flux_current" not in body or "flux_current" in arm:
+        problems.append(
+            "CudaOuterGraph.cu: the flux elision is no longer decided in the body.  "
+            "BICGCMFD::drive writes Geometry::Phif on every host-loop outer and "
+            "absorbSweepLaunch adopts the device phi into it on the rest, so a "
+            "segment-entry answer is stale from the second outer -- the i-SMR CY02 "
+            "failure at b8 and b16 that passed at b1"
+        )
+
+    # The cusping hook is the only in-body writer of the two staged arrays, so it
+    # owes both re-stages.  It already owed the d-tilde one.
+    try:
+        cusp_at = body.index("m.hooks.apply_cusping(m.hooks.ctx, slot, i)")
+        cusp_end = body.index("if (bridge_jnet)", cusp_at)
+    except ValueError:
+        problems.append(
+            "CudaOuterGraph.cu: cannot find the cusping branch; the re-stage rule has "
+            "nothing to check"
+        )
+        return
+    cusp = body[cusp_at:cusp_end]
+    if "stageXsnf()" not in cusp:
+        problems.append(
+            "CudaOuterGraph.cu: a cusping that fired does not re-stage xsnf.  "
+            "ApplyRodCusping BLENDS the cross sections, and with the gate hoisted to "
+            "the segment entry nothing downstream will notice: the next outer's "
+            "updpsi builds psi = flux . xsnf . vol from the pre-blend cross sections "
+            "while the rest of that outer uses the post-blend ones"
+        )
+    if "device_dtil" not in cusp:
+        problems.append(
+            "CudaOuterGraph.cu: a cusping that fired does not re-upload dtil.  It "
+            "rebuilt the host d-tilde and the device upddhat reads the device one"
+        )
+
+    # The receipt that says how many host rendezvous are left, which is the number
+    # Task 10 exists to drive to zero.
+    if "in_body_host_syncs" not in runner_src:
+        problems.append(
+            "CudaOuterGraph.cu: the body's host synchronises are not counted.  Every "
+            "other receipt says what the device did; without this one the remaining "
+            "round trip is an assertion instead of a number"
+        )
+
+
 def main() -> int:
     problems: list[str] = []
     check_form_mask_is_mined(problems)
@@ -695,6 +791,7 @@ def main() -> int:
     check_xsnf_elision_is_byte_exact(problems)
     check_host_reader_mirror_is_synchronised(problems)
     check_device_reigv_has_one_writer(problems)
+    check_staged_uploads_have_one_in_body_writer(problems)
 
     if problems:
         print("FAIL: device outer exactness contract")
@@ -706,7 +803,9 @@ def main() -> int:
     print("  2. SolveLoop's flux_stall and loop bound are charged in outers")
     print("  3. the step the sweep verdict's halt swallows is re-issued")
     print("  4. both cross-stream handovers around the nodal drive are ordered")
-    print("  5. the xsnf upload elision compares bytes, not a generation")
+    print("  5. the xsnf upload elision compares bytes, not a generation,")
+    print("     is staged once per segment, and is re-staged by the cusping that")
+    print("     is its only in-body writer")
     print("  6. the psi/dhat mirror lands before the host loop that reads it")
     print("  7. the nodal reigv slot has exactly one writer per drive")
     return 0

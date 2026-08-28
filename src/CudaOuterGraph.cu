@@ -168,6 +168,7 @@ struct AtomicCounters {
     std::atomic<std::uint64_t> nodal_event_waits{0};
     std::atomic<std::uint64_t> reigv_device_outers{0};
     std::atomic<std::uint64_t> reigv_reissued{0};
+    std::atomic<std::uint64_t> in_body_host_syncs{0};
     std::atomic<std::uint64_t> phis_mirror_bytes{0};
     std::atomic<std::uint64_t> jnet_mirror_bytes{0};
     std::atomic<std::uint64_t> refusals[static_cast<int>(OuterSegmentRefusal::Count)];
@@ -249,6 +250,7 @@ OuterSegmentCounters outerSegmentCounters() {
     out.nodal_event_waits       = a.nodal_event_waits.load(std::memory_order_relaxed);
     out.reigv_device_outers     = a.reigv_device_outers.load(std::memory_order_relaxed);
     out.reigv_reissued          = a.reigv_reissued.load(std::memory_order_relaxed);
+    out.in_body_host_syncs      = a.in_body_host_syncs.load(std::memory_order_relaxed);
     out.phis_mirror_bytes       = a.phis_mirror_bytes.load(std::memory_order_relaxed);
     out.jnet_mirror_bytes       = a.jnet_mirror_bytes.load(std::memory_order_relaxed);
     for (int i = 0; i < static_cast<int>(OuterSegmentRefusal::Count); ++i)
@@ -283,6 +285,8 @@ std::string outerSegmentReceiptJson() {
                     ",\"reigv_device_outers\":" +
                     std::to_string(c.reigv_device_outers) +
                     ",\"reigv_reissued\":" + std::to_string(c.reigv_reissued) +
+                    ",\"in_body_host_syncs\":" +
+                    std::to_string(c.in_body_host_syncs) +
                     ",\"phis_mirror_bytes\":" + std::to_string(c.phis_mirror_bytes) +
                     ",\"jnet_mirror_bytes\":" + std::to_string(c.jnet_mirror_bytes) +
                     ",\"segment_budget\":" + std::to_string(outerSegmentBudget());
@@ -968,6 +972,92 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         return false;
     };
 
+    // =======================================================================
+    // Rev.7.1 W3 item 4: THE OPERATOR UPLOADS A SEGMENT STAGES ONCE
+    // =======================================================================
+    //
+    // WHICH HOST INPUTS CAN MOVE INSIDE A SEGMENT, PROVED RATHER THAN ASSUMED.
+    // The body makes exactly four host calls -- the sweep hook, the sweep
+    // observation, the nodal drive and apply_cusping -- so the writers reachable
+    // from inside a segment are the writers those four can reach:
+    //
+    //   Geometry::Phif (flux)  MOVES EVERY OUTER.  BICGCMFD::drive's host loop
+    //       writes it directly, and absorbSweepLaunch adopts the device phi into
+    //       it on the enqueued path.  Its elision is therefore a genuinely
+    //       per-outer question and stays in the body, re-decided from the
+    //       generation the drive that just ran left behind.
+    //
+    //   XSSet::_xs (xsnf)      MOVES ONLY IF CUSPING FIRES.  The device-arm
+    //       writers of host _xs -- UpdateFlatXS and UpdateEquilibriumXenon --
+    //       belong to the Xe and search steps of the HOST LADDER, and reaching
+    //       either of them means the segment has already exited (they are
+    //       DevicePhase::Xenon / ::Search, and every phase that is not
+    //       Outer -> Outer sets exit_segment).  The boron trial commit that
+    //       produced the sp1-outer-28 divergence is one of those: it happens
+    //       BETWEEN segments, which is why staging at entry still sees it.
+    //       Inside the body only XSSet::ApplyRodCusping writes _xs.
+    //
+    //   CMFD::_dtil            MOVES ONLY IF CUSPING FIRES.  upddtil() is its
+    //       only writer, and it is called from SolveLoop's entry (before the
+    //       delegation) and from the cusping hook.  Driver.h:2718/2735's
+    //       resetDhat calls are in Drive(), outside SolveLoop entirely.
+    //
+    // So the two that cannot move are staged here, once, and re-staged by the
+    // cusping branch -- which is the one place they can move -- and the one that
+    // can move every outer stays where it was.  What this buys is not bytes (the
+    // elisions already removed those) but a body whose H2D NODE SET is fixed:
+    // Task 10's conditional WHILE cannot capture a loop whose set of memcpy
+    // nodes is decided by a host memcmp each iteration.
+    //
+    // THE MEMCMP IS STILL THE GATE, and per SEGMENT rather than per outer.  A
+    // generation cannot be substituted here for the reason invariant 5 gives:
+    // XSSet::hoststateGeneration() means `the device mirror of _xs is stale`,
+    // not `the host bytes of _xs changed`, and the arms that write _xs from the
+    // device deliberately do not bump it.
+    auto stageXsnf = [&]() -> bool {
+        if (bound_.host_xsnf == nullptr || bound_.device_xsnf == nullptr) return true;
+        const std::size_t xsnf_count = static_cast<std::size_t>(bound_.nxyz) *
+                                       static_cast<std::size_t>(bound_.ng);
+        if (m.resident_xsnf.matches(bound_.host_xsnf, xsnf_count)) {
+            bump(counters().xsnf_uploads_elided);
+            return true;
+        }
+        const std::size_t xsnf_bytes = xsnf_count * sizeof(double);
+        const cudaError_t r = cudaMemcpyAsync(bound_.device_xsnf, bound_.host_xsnf,
+                                              xsnf_bytes, cudaMemcpyHostToDevice, m.stream);
+        if (r != cudaSuccess) return launchFailed("upload xsnf", r);
+        bump(counters().flux_sync_bytes, xsnf_bytes);
+        // COMMITTED AT THE ISSUE.  The general rule (CudaTransferMirror.h) is to
+        // commit only after the copy has landed; the shadow records the bytes
+        // this copy was HANDED, and the only host writer that can run before the
+        // copy drains is ApplyRodCusping -- which re-stages through this same
+        // lambda, so a writer between the two is caught rather than elided.
+        m.resident_xsnf.commit(bound_.host_xsnf, xsnf_count);
+        return true;
+    };
+
+    // upddtil() is the only writer of _dtil and it runs once per SolveLoop
+    // entry, plus once for every cusping that fires.  On a still deck this copy
+    // happens once per segment and then never again.
+    auto stageDtil = [&](const OuterSegmentLiveState& live) -> bool {
+        if (bound_.host_dtil == nullptr || bound_.device_dtil == nullptr) return true;
+        const bool dtil_current = m.hooks.read_live_state != nullptr &&
+                                  m.resident_dtil_generation != 0 &&
+                                  m.resident_dtil_generation == live.dtil_generation;
+        if (dtil_current) {
+            bump(counters().dtil_uploads_elided);
+            return true;
+        }
+        const std::size_t dtil_bytes = static_cast<std::size_t>(bound_.geom.nsurf) *
+                                       static_cast<std::size_t>(bound_.ng) * sizeof(double);
+        const cudaError_t r = cudaMemcpyAsync(bound_.device_dtil, bound_.host_dtil,
+                                              dtil_bytes, cudaMemcpyHostToDevice, m.stream);
+        if (r != cudaSuccess) return launchFailed("upload dtil", r);
+        bump(counters().flux_sync_bytes, dtil_bytes);
+        m.resident_dtil_generation = live.dtil_generation;
+        return true;
+    };
+
     cudaError_t rc;
     // The host mirror of the exit word is the loop's stopping condition, and it
     // survives the previous segment.  Clearing it here rather than trusting the
@@ -1005,6 +1095,19 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                               sizeof(std::uint32_t), cudaMemcpyHostToDevice, m.stream)) !=
         cudaSuccess)
         return launchFailed("upload flux_stall", rc);
+
+    // --- the staged operator uploads, once -----------------------------------
+    //
+    // Issued HERE, in the arm block, so the claim two comments up -- `the only
+    // H2D of a segment happen before the first outer` -- is true of the operator
+    // as well as of the control packet.  The flux is the one exception and it
+    // says why for itself, at the top of the body.
+    {
+        OuterSegmentLiveState arm_live;
+        if (m.hooks.read_live_state != nullptr) m.hooks.read_live_state(m.hooks.ctx, arm_live);
+        if (!stageXsnf()) return false;
+        if (!stageDtil(arm_live)) return false;
+    }
 
     // --- prologue: the nodal constants, once ---------------------------------
     //
@@ -1188,6 +1291,7 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         // the overrun at ZERO outers rather than the budget - 1 the v1 note
         // priced at 3.9us.
         if (i > 0) {
+            bump(counters().in_body_host_syncs);
             if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
                 return launchFailed("synchronize on the segment exit", rc);
             if (m.h_seg != nullptr && m.h_seg->exit != 0u) break;
@@ -1201,6 +1305,13 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         // calls -- and each of them can move a generation.  Deciding an
         // elision from a segment-entry value is what made i-SMR CY02 fail at
         // b8 and b16 while passing at b1.
+        //
+        // W3 item 4 NARROWED WHAT IS DECIDED FROM IT rather than contradicting
+        // it.  Two of the three elisions moved to the segment entry, on the
+        // proof that _xs and _dtil have exactly one in-body writer
+        // (ApplyRodCusping) which re-stages them itself.  The flux has no such
+        // proof and did not move: BICGCMFD::drive writes Geometry::Phif on every
+        // host-loop outer, which is precisely the CY02 shape.
         m.sweep_host_continued = false;
 
         // The tracer's outer index inside the segment.  Driver.h set the context
@@ -1239,54 +1350,6 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                                       cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
                 return launchFailed("upload flux", rc);
             bump(counters().flux_sync_bytes, flux_bytes);
-        }
-        // xsnf, gated on the BYTES and not on a generation -- see
-        // Impl::resident_xsnf for the failure a generation gate produced.
-        //
-        // updpsi is the step that makes this load-bearing: it is
-        // psi = flux . xsnf . vol, it runs three lines below, and it is the ONE
-        // reader of the device xsnf that runs before the sweep's own upload
-        // (CudaBICGBackend.cu's push_pending, which has always been byte-exact
-        // through Slot::xsnf_mirror) can correct it.  A missed upload here is
-        // therefore not a stale-by-one-outer psi, it is a psi built from the
-        // wrong cross sections while the rest of the outer uses the right ones.
-        const std::size_t xsnf_count = static_cast<std::size_t>(bound_.nxyz) *
-                                       static_cast<std::size_t>(bound_.ng);
-        const bool xsnf_current =
-            bound_.host_xsnf != nullptr && bound_.device_xsnf != nullptr &&
-            m.resident_xsnf.matches(bound_.host_xsnf, xsnf_count);
-        if (xsnf_current) bump(counters().xsnf_uploads_elided);
-        if (bound_.host_xsnf != nullptr && bound_.device_xsnf != nullptr && !xsnf_current) {
-            const std::size_t xsnf_bytes = xsnf_count * sizeof(double);
-            if ((rc = cudaMemcpyAsync(bound_.device_xsnf, bound_.host_xsnf, xsnf_bytes,
-                                      cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
-                return launchFailed("upload xsnf", rc);
-            bump(counters().flux_sync_bytes, xsnf_bytes);
-            // COMMITTED AT THE ISSUE, and that is safe HERE for a reason the
-            // general rule (CudaTransferMirror.h: commit only after the copy has
-            // landed) does not cover: the shadow records the bytes this copy was
-            // handed, and the only host writer of _xs that can run before the
-            // outer's synchronise is ApplyRodCusping -- which runs after it, in
-            // the nodal drive's window.  A writer that appears between the two
-            // would be caught by the NEXT outer's memcmp, never elided.
-            m.resident_xsnf.commit(bound_.host_xsnf, xsnf_count);
-        }
-        // upddtil() is the only writer of _dtil and it runs once per SolveLoop
-        // entry, plus once for every cusping that fires.  On a still deck this
-        // copy happens once and then never again.
-        const bool dtil_current = m.hooks.read_live_state != nullptr &&
-                                  m.resident_dtil_generation != 0 &&
-                                  m.resident_dtil_generation == live.dtil_generation;
-        if (dtil_current) bump(counters().dtil_uploads_elided);
-        if (bound_.host_dtil != nullptr && bound_.device_dtil != nullptr && !dtil_current) {
-            const std::size_t dtil_bytes =
-                static_cast<std::size_t>(bound_.geom.nsurf) *
-                static_cast<std::size_t>(bound_.ng) * sizeof(double);
-            if ((rc = cudaMemcpyAsync(bound_.device_dtil, bound_.host_dtil, dtil_bytes,
-                                      cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
-                return launchFailed("upload dtil", rc);
-            bump(counters().flux_sync_bytes, dtil_bytes);
-            m.resident_dtil_generation = live.dtil_generation;
         }
 
         // (1) updpsi -- Driver.h:1547
@@ -1371,9 +1434,11 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         // outer with host_reader_next runs a blocking host CMFD drive three
         // lines below; the enqueued outers -- 656 of 661 on this deck -- issue
         // no mirror and pay nothing.
-        if ((!stream_sweep || host_reader_next) &&
-            (rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
-            return launchFailed("synchronize before the CMFD sweep", rc);
+        if (!stream_sweep || host_reader_next) {
+            bump(counters().in_body_host_syncs);
+            if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
+                return launchFailed("synchronize before the CMFD sweep", rc);
+        }
 
         // (2,3) setls + drive -- Driver.h:1551-1555.  On the stream-ordered arm
         // this only ENQUEUES; the sweep's own verdict kernel publishes this
@@ -1462,6 +1527,7 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         }
 
         // THE ONE SYNCHRONISE OF THE OUTER, and it belongs to the nodal drive.
+        bump(counters().in_body_host_syncs);
         if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
             return launchFailed("synchronize before the nodal drive", rc);
 
@@ -1538,6 +1604,7 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
             // AND THE CANONICAL ARM NEEDS IT TOO.  There the nodal drive reads
             // the DEVICE jnet, on the backend's own stream, ordered against this
             // one by nothing but this synchronise.
+            bump(counters().in_body_host_syncs);
             if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
                 return launchFailed("synchronize after the re-issued updjnet", rc);
         }
@@ -1703,6 +1770,20 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                     m.resident_dtil_generation = after_cusp.dtil_generation;
                 }
             }
+            // AND IT BLENDED THE CROSS SECTIONS, which is the other half of what
+            // ApplyRodCusping does and the half the segment used to catch by
+            // accident.  While the xsnf memcmp ran at the top of every outer,
+            // the NEXT outer's gate saw the blended bytes and uploaded them.
+            // W3 item 4 moved that gate to the segment entry -- on the proof
+            // that this hook is the only writer of _xs inside a segment -- so
+            // the proof has to be discharged HERE, where the writer is.
+            //
+            // updpsi of the next outer is the reader that makes it load-bearing:
+            // psi = flux . xsnf . vol runs before the sweep's own byte-exact
+            // upload can correct the buffer, so a missed re-stage is a fission
+            // source built from the pre-blend cross sections while the rest of
+            // the outer uses the post-blend ones.
+            if (!stageXsnf()) return false;
         }
 
         if (bridge_jnet) {

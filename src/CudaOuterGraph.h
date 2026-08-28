@@ -697,7 +697,13 @@ struct OuterSegmentCounters {
     /// to `how much of this deck is warm-up` is a number and not an estimate.
     std::uint64_t device_flux_outers       = 0;
     /// Uploads the generations cancelled, by array.
+    /// PER OUTER.  Geometry::Phif moves inside a segment on every outer whose
+    /// drive takes the host CMFD loop, so this decision cannot be staged.
     std::uint64_t flux_uploads_elided      = 0;
+    /// PER SEGMENT since W3 item 4, plus once per cusping that fired -- those are
+    /// the only two points at which _xs and _dtil can move inside a segment, and
+    /// the proof is in runSegment's staging block.  Compare against
+    /// `segment_launches` and `cusping_fired`, NOT against `device_outers`.
     std::uint64_t xsnf_uploads_elided      = 0;
     std::uint64_t dtil_uploads_elided      = 0;
     /// Segment exits that mirrored psi and dhat back.  The receipt arithmetic:
@@ -729,6 +735,27 @@ struct OuterSegmentCounters {
     /// `reigv_device_outers` is the number of outers.
     std::uint64_t reigv_device_outers      = 0;
     std::uint64_t reigv_reissued           = 0;
+
+    /// Rev.7.1 W3 item 4: HOST RENDEZVOUS INSIDE THE BODY, COUNTED.
+    ///
+    /// THE NUMBER TASK 10 HAS TO DRIVE TO ZERO, and the reason it is a counter
+    /// rather than a claim: every other receipt here says what the DEVICE did,
+    /// and none of them can say how often the host still had to look.  Divide by
+    /// `device_outers` for the per-outer figure.
+    ///
+    /// The four sites, in body order:
+    ///   1. the exit observation at the top of every pass but the first -- the
+    ///      halt gate makes an overrun outer a no-op KERNEL, but the nodal drive
+    ///      and a declining sweep are host CALLS and a host call cannot read a
+    ///      device word.
+    ///   2. the mirror drain, on the outers whose drive takes the host CMFD loop
+    ///      (invariant 6).  ~1% of outers on kngr_238.
+    ///   3. the pre-nodal drain, which since W3 item 3 exists only for the sweep
+    ///      OBSERVATION -- BICGCMFD::finishDrive reads the sweep's scalars out of
+    ///      a pinned block the stream filled.  This is the one that has to move.
+    ///   4. the re-issue drain, on the three-in-twelve-thousand outers where the
+    ///      device could not finish the sweep.
+    std::uint64_t in_body_host_syncs       = 0;
     /// Bytes returned to Geometry::Phis at a segment exit.
     ///
     /// THE PRICE OF THE ELIDED DOWNLOAD, and it is charged per EXIT rather than

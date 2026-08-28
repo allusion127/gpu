@@ -1110,13 +1110,34 @@ if "read_live_state(m.hooks.ctx, live)" not in _LOOP22:
                     "the host has already moved")
 
 # Each of the three uploads is gated, and the flux needs BOTH conditions.
+#
+# W3 item 4 moved two of the three out of the body: _xs and _dtil have exactly
+# one in-body writer (XSSet::ApplyRodCusping), so their gates run once at the arm
+# and again after a cusping that fired, which is what gives the body a FIXED set
+# of memcpy nodes for Task 10's capture.  The flux keeps its per-outer gate --
+# BICGCMFD::drive writes Geometry::Phif on every host-loop outer, which is the
+# i-SMR CY02 shape rule 22 exists for.
 for _gate, _why in (
         ("flux_current", "the flux upload has to be gated or it copies 135 KiB per outer "
                          "onto itself"),
-        ("xsnf_current", "the xsnf upload has to be gated or it copies 135 KiB per outer "
-                         "onto itself"),
-        ("dtil_current", "the dtil upload has to be gated on the upddtil generation")):
+        ("auto stageXsnf", "the xsnf upload has to be gated or it copies 135 KiB per "
+                           "segment onto itself"),
+        ("auto stageDtil", "the dtil upload has to be gated on the upddtil generation")):
     want(GRAPH_CU_CODE, _gate, "CudaOuterGraph.cu", _why)
+_ARM22 = GRAPH_CU_CODE[:GRAPH_CU_CODE.find("for (unsigned int i = 0")]
+for _call, _what in (("stageXsnf()", "xsnf"), ("stageDtil(", "dtil")):
+    if _call not in _ARM22:
+        problems.append(f"CudaOuterGraph.cu: the {_what} stage is not issued before the "
+                        "per-outer loop.  Staging it inside makes the body's H2D node set "
+                        "depend on a host memcmp per iteration, which is a body no "
+                        "conditional WHILE can capture")
+if "stageXsnf()" not in body_of(GRAPH_CU_CODE, "m.hooks.apply_cusping(m.hooks.ctx, slot, i)",
+                                "if (bridge_jnet)"):
+    problems.append("CudaOuterGraph.cu: a cusping that fired does not re-stage xsnf.  "
+                    "ApplyRodCusping BLENDS the cross sections, and it is the ONLY host "
+                    "call in the body that can: with the gate at the arm, nothing "
+                    "downstream notices, and the next outer's updpsi builds psi from the "
+                    "pre-blend cross sections")
 _FLUXGATE = body_of(GRAPH_CU_CODE, "const bool flux_current", "if (flux_current)")
 if _FLUXGATE and "resident_flux_generation == live.flux_generation" not in _FLUXGATE:
     problems.append("CudaOuterGraph.cu: the flux elision does not compare generations.  "
@@ -1157,14 +1178,15 @@ for _r in ("resident_flux_generation = 0", "resident_dtil_generation = 0",
 # the first boron trial commit -- ON b1's updpsi produced a psi hash EQUAL to
 # outer 27's while OFF's moved, and the run ended 434/644 datasets apart at
 # 12642 outers against 12017.  With the byte gate it is 0/644 at 12017.
-_XSNF22 = body_of(GRAPH_CU_CODE, "const bool xsnf_current", "if (xsnf_current)")
+_XSNF22 = body_of(GRAPH_CU_CODE, "auto stageXsnf = [&]() -> bool",
+                  "auto stageDtil")
 if _XSNF22 and "resident_xsnf.matches" not in _XSNF22:
     problems.append("CudaOuterGraph.cu: the xsnf elision is not decided from a byte-exact "
                     "shadow.  hoststateGeneration() is NOT 'the host bytes changed' -- the "
                     "GPU XS-recon and flat-XS arms rewrite host _xs without bumping it -- "
                     "and updpsi reads the device xsnf before the sweep's own upload can "
                     "correct it (kngr_238 sp1 outer 28 with RASBERY_GPU_XSRECON set)")
-if _XSNF22 and "live.xs_generation" in _XSNF22:
+if _XSNF22 and "xs_generation" in _XSNF22:
     problems.append("CudaOuterGraph.cu: the xsnf elision still reads a generation.  "
                     "The generation cannot see a device-arm rebuild of host _xs; only the "
                     "bytes can")
