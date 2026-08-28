@@ -4,6 +4,7 @@
 #include "CudaOuterGraph.h"
 #include "IO.h"
 #include "Nodal.h"
+#include "OuterTrace.h"
 #include "PPR.h"
 #include "Scheduler.h"
 
@@ -959,6 +960,7 @@ private:
         residency.host_dhat  = ctx.cmfd_solver.dhatData();
         residency.host_psi   = ctx.cmfd_solver.psiData();
         residency.host_xsnf  = ctx.cross_sections.xsnfData();
+        residency.host_dtil  = ctx.cmfd_solver.dtilData();
         residency.arena_slot = 0; // the physics arena is width 1 (link 1)
         residency.valid      = true;
 
@@ -1982,6 +1984,21 @@ private:
                 outer_timing::Scope t(sptelem::PH_UPDDHAT);
                 ctx.cmfd_solver.upddhat(ctx.geometry.Phif(), ctx.geometry.Jnet());
             }
+            }
+
+            if (outertrace::enabled()) {
+                const int    nxyz  = ctx.geometry.nxyz();
+                const int    ngg   = ctx.geometry.ng();
+                const size_t nsg   = static_cast<size_t>(ctx.geometry.nsurf()) * ngg;
+                outertrace::emit(
+                    ctx.statepoint, iout, outer_on_device ? "dev" : "host", eigv, residual,
+                    prev_inner,
+                    outertrace::hashDoubles(ctx.cmfd_solver.psiData(),
+                                            static_cast<size_t>(nxyz)),
+                    outertrace::hashDoubles(ctx.geometry.Jnet(), nsg),
+                    outertrace::hashDoubles(ctx.cmfd_solver.dhatData(), nsg),
+                    outertrace::hashDoubles(ctx.geometry.Phif(),
+                                            static_cast<size_t>(nxyz) * ngg));
             }
 
             // Keep iterating flux + nodal/cusping until the flux is converged; the feedbacks

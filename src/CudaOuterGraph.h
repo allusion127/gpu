@@ -760,6 +760,8 @@ struct OuterSegmentBinding {
     /// uploads it rather than trusting the device copy.
     const double*          host_flux     = nullptr;
     const double*          host_xsnf     = nullptr;
+    const double*          host_dtil     = nullptr;
+    double*                device_dtil   = nullptr;
     double*                device_xsnf   = nullptr;
     double*                host_dhat     = nullptr;
     double*                host_psi      = nullptr;
@@ -897,6 +899,18 @@ struct OuterSegmentResidency {
     /// source would be built from the PREVIOUS outer's cross sections, and
     /// every Xe or T/H step between outers would be one outer late.
     const double* host_xsnf = nullptr;
+
+    /// CMFD::dtilData() -- the d-tilde updjnet and upddhat read.
+    ///
+    /// THE THIRD BUFFER WITH A CONDITIONAL REFRESH, and the one that cost a
+    /// whole outer.  issueSweepUploads pushes dtil ONLY inside its
+    /// `if (sl.device_assembly)` branch, and device assembly is off for the
+    /// entire Wielandt warm-up -- so on the first outers dtil_dev holds
+    /// whatever was in the arena while the host had a freshly computed _dtil.
+    /// The device updjnet then produced a different jnet, upddhat a different
+    /// dhat, and i-SMR CY01 took one extra outer per statepoint with the same
+    /// converged k_eff.
+    const double* host_dtil = nullptr;
 
     double* host_dhat = nullptr;
     double* host_psi  = nullptr;

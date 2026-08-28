@@ -422,7 +422,8 @@ bool CudaOuterSegment::bindResidency(const OuterSegmentResidency& residency) {
         residency.dtil == nullptr || residency.dhat == nullptr ||
         residency.xsnf == nullptr || residency.host_jnet == nullptr ||
         residency.host_flux == nullptr || residency.host_dhat == nullptr ||
-        residency.host_psi == nullptr || residency.host_xsnf == nullptr)
+        residency.host_psi == nullptr || residency.host_xsnf == nullptr ||
+        residency.host_dtil == nullptr)
         return false;
     if (residency.arena_slot < 0 || residency.arena_slot >= _impl->slot_count) return false;
 
@@ -480,6 +481,8 @@ bool CudaOuterSegment::bindResidency(const OuterSegmentResidency& residency) {
     // read it; the buffer is the sweep's own xs_xsnf and the segment writes it
     // for exactly the same reason issueSweepUploads does.
     _impl->binding.device_xsnf = const_cast<double*>(residency.xsnf);
+    _impl->binding.host_dtil   = residency.host_dtil;
+    _impl->binding.device_dtil = residency.dtil;
     _impl->binding.host_dhat   = residency.host_dhat;
     _impl->binding.host_psi    = residency.host_psi;
     _impl->binding.device_dhat = residency.dhat;
@@ -690,6 +693,15 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                                       cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
                 return launchFailed("upload xsnf", rc);
             bump(counters().flux_sync_bytes, xsnf_bytes);
+        }
+        if (bound_.host_dtil != nullptr && bound_.device_dtil != nullptr) {
+            const std::size_t dtil_bytes =
+                static_cast<std::size_t>(bound_.geom.nsurf) *
+                static_cast<std::size_t>(bound_.ng) * sizeof(double);
+            if ((rc = cudaMemcpyAsync(bound_.device_dtil, bound_.host_dtil, dtil_bytes,
+                                      cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
+                return launchFailed("upload dtil", rc);
+            bump(counters().flux_sync_bytes, dtil_bytes);
         }
 
         // (1) updpsi -- Driver.h:1547

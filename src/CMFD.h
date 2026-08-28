@@ -195,6 +195,12 @@ public:
     /// stale -- silently, and only on the decks that warm up differently.
     [[nodiscard]] double* dhatData() { return _dhat; }
     [[nodiscard]] double* psiData() { return _psi; }
+    /// The CMFD operator's d-tilde.  The segment READS it (updjnet, upddhat)
+    /// and never writes it -- upddtil is host-only -- but the device copy it
+    /// reads is refreshed by the sweep only on the device-assembly path, so
+    /// the segment has to sync it like the flux and xsnf.  See
+    /// OuterSegmentResidency::host_dtil.
+    [[nodiscard]] const double* dtilData() const { return _dtil; }
 
     [[nodiscard]] const double* boundaryAlbedoData() const {
         return _boundary_albedo.data();

@@ -842,6 +842,65 @@ if _FAILBR and "prev_inner" not in _FAILBR:
                     "Failed -- on a non-finite that is not a number this loop should carry. "
                     "The host body's own rule is prev_inner = eigv")
 
+# --- 19. EVERY device buffer the segment reads is synced by the segment -----
+#
+# THE RULE, learned three times.  A buffer the segment READS but the SWEEP
+# refreshes is only current if the sweep's refresh is unconditional and happens
+# before the segment's first reader.  Three were not:
+#
+#   dhat  written by the segment at step 8, read by the sweep at step 2, and its
+#         H2D is the one link 2 elides -> uninitialised on the first outer
+#         (k_eff -0.034501, negative_flux on 447 of 516 outers).
+#   xsnf  refreshed inside drive(), which is step 2, but updpsi is step 1 -> the
+#         fission source came from the previous outer's cross sections.
+#   dtil  pushed ONLY inside issueSweepUploads' `if (sl.device_assembly)` branch,
+#         and device assembly is off for the whole Wielandt warm-up -> the device
+#         updjnet read a dtil the host had already recomputed.  Cost: one extra
+#         outer per statepoint on i-SMR CY01 with an identical converged k_eff,
+#         which is a trajectory-B0 violation that no answer-level check sees.
+#
+# So the segment syncs all of them itself.  A new device input added to a body
+# without a sync here is the same bug a fourth time.
+for _sync, _why in (
+        ("upload flux", "drive() takes the host loop during the Wielandt warm-up, after "
+                        "which the device phi is behind Geometry::Phif"),
+        ("upload xsnf", "updpsi runs BEFORE the sweep refreshes xs_xsnf"),
+        ("upload dtil", "issueSweepUploads pushes dtil only on the device-assembly path, "
+                        "which is off for the whole Wielandt warm-up"),
+        ("seed residency", "the segment writes dhat at step 8 and the sweep reads it at "
+                           "step 2, so the first outer after arming has nothing to read")):
+    want(GRAPH_CU_CODE, _sync, "CudaOuterGraph.cu", _why)
+# The bodies read exactly these; if one grows an input the sync list must grow.
+_BODY_INPUTS = ("v.flux", "v.dtil", "v.dhat", "v.jnet", "v.psi", "v.xsnf", "v.xsdf")
+_KERNEL_SRC = strip_comments(read(SRC / "CmfdOuterKernel.h"))
+for _fld in re.findall(r"v\.(\w+)\[", _KERNEL_SRC):
+    if "v." + _fld not in _BODY_INPUTS:
+        problems.append(f"CmfdOuterKernel.h: a body reads v.{_fld}, which is not in the "
+                        "segment's sync list.  Every device buffer a body reads has to be "
+                        "either written by the segment itself or synced by it -- a buffer "
+                        "whose refresh belongs to the sweep is only current if that refresh "
+                        "is unconditional and happens before the first reader, and three of "
+                        "them were not")
+want(strip_comments(read(SRC / "CMFD.h")), "dtilData", "CMFD.h",
+     "the segment needs the host d-tilde to sync from")
+
+# --- 20. the per-outer tracer stays off by default ---------------------------
+#
+# It is what localised the dtil bug -- it prints eigv/residual/prev_inner and a
+# byte hash of psi/jnet/dhat/flux per outer, so the ON and OFF arms can be
+# diffed to the FIRST differing quantity instead of to the converged answer.
+# Kept because the next trajectory difference will need it, gated because it is
+# a per-outer fprintf over ~100k doubles.
+_TRACE = read(SRC / "OuterTrace.h")
+want(_TRACE, "RASBERY_OUTER_TRACE", "OuterTrace.h", "the tracer's gate")
+if "enabled()" not in DRIVER_CODE or "outertrace::emit" not in DRIVER_CODE:
+    problems.append("Driver.h: the per-outer tracer is not wired, so a future trajectory "
+                    "difference has to be localised by re-deriving the instrument first")
+_TR_CALL = body_of(DRIVER_CODE, "if (outertrace::enabled()) {", "outertrace::emit")
+if not _TR_CALL:
+    problems.append("Driver.h: outertrace::emit is not guarded by outertrace::enabled(), so "
+                    "every run would pay a hash of psi/jnet/dhat/flux per outer")
+
 # --- the gates exist and are built -------------------------------------------
 want(REPLAY_TEXT, "kPhaseTransitions", "test/outer_state_replay.cpp",
      "the emitted edges must be cross-checked against the W1 table")
