@@ -852,6 +852,16 @@ private:
         SolverContext* ctx      = nullptr;
         double*        eigv     = nullptr;
         double*        residual = nullptr;
+        /// Rev.7.1 Task 10 part 2: did THIS outer's sweep get enqueued, or did
+        /// the enqueue hook have to fall back to the blocking drive?
+        ///
+        /// The choice is per OUTER and not per segment, because the gate it
+        /// turns on is the Wielandt warm-up -- `_wiel_sweep >=
+        /// WIELANDT_WARMUP_SWEEPS`, which is false at the top of every SolveLoop
+        /// and becomes true a few outers in.  Deciding it once at arm time would
+        /// therefore arm the blocking path for the whole loop, which is the same
+        /// trap deviceSweepResident() documents for the residency gate.
+        bool           enqueued = false;
     };
     static OuterHookCtx& outerHookCtx() {
         static OuterHookCtx c;
@@ -907,6 +917,96 @@ private:
         // on this path.  The two signals come back when the sweep itself is
         // stream-ordered and can hand back mid-segment (Task 10 part 2).
         return gpu::rasberyPublishOuterProbe(slot, *h.eigv, *h.residual, false, false);
+    }
+
+    // =======================================================================
+    // Rev.7.1 Task 10 part 2: the same sweep, in two stream-ordered halves
+    // =======================================================================
+    //
+    // WHY IT IS TWO HOOKS AND NOT ONE.  A drive is an enqueue AND an
+    // observation, and only the first of them is stream-ordered.  Splitting them
+    // is what lets the segment put its own work -- updjnet, the jnet download --
+    // BETWEEN the launch and the observation, so the one synchronise the nodal
+    // drive forces covers the sweep as well.  A single hook would have to
+    // synchronise inside itself to return an answer, which is the round trip the
+    // whole task is removing.
+    //
+    // THE PROBE IS PUBLISHED BY A DEVICE KERNEL on the normal path
+    // (cmfd_sweep_verdict, CudaBICGBackend.cu): eigv, residual, the negative
+    // census and the Rayleigh latch are already in device memory when the graph
+    // ends, and the convergence kernel reads them from device memory, so the
+    // host was only ever carrying them from one device buffer to another.
+    static bool outerSweepEnqueueHook(void* raw, gpu::OuterSegmentStream, int slot,
+                                      unsigned int) {
+        OuterHookCtx& h = *static_cast<OuterHookCtx*>(raw);
+        const gpu::CudaOuterSegment::ProbeAddresses a =
+            gpu::rasberyOuterSegment().probeAddresses(slot);
+        h.enqueued = false;
+        if (!a.valid) return false;
+        CudaBatchArena::CmfdSweepProbeSink sink;
+        sink.eigv      = a.eigv;
+        sink.residual  = a.residual;
+        sink.negative  = a.negative;
+        sink.rayleigh  = a.rayleigh;
+        sink.nonfinite = a.nonfinite;
+        sink.halt      = a.halt;
+        sink.halt_slot = slot;
+        // RAISED HERE, LOWERED IN THE FINISH HALF.  stageSweepIO reads the
+        // residency, and on this path it runs inside enqueueDrive AND again
+        // inside finishDrive's exceptional blocking launches -- so the flag has
+        // to span both halves of one drive, not just the enqueue.  The finish
+        // hook lowers it on every exit; the fallback below lowers it itself,
+        // because a refused enqueue has no finish half.
+        h.ctx->cmfd_solver.setOuterSegmentResident(true);
+        h.ctx->cmfd_solver.setls(*h.eigv);
+        if (h.ctx->cmfd_solver.enqueueDrive(*h.eigv, h.ctx->geometry.Phif(), *h.residual,
+                                            sink)) {
+            h.enqueued = true;
+            return true;
+        }
+        // THE WIELANDT WARM-UP, AND THE ONLY OTHER WAY OUT.  enqueueDrive
+        // refuses exactly when drive() would not have taken the device sweep, so
+        // this is the Task 9 hook verbatim -- with one addition: the segment has
+        // stream-ordered work in flight (updpsi and the psi mirror the host loop
+        // is about to read), and a blocking drive would read those arrays while
+        // the copies were still filling them.
+        h.ctx->cmfd_solver.syncSweepStream();
+        h.ctx->cmfd_solver.drive(*h.eigv, h.ctx->geometry.Phif(), *h.residual);
+        h.ctx->cmfd_solver.setOuterSegmentResident(false);
+        // The blocking drive resolved the retry and the Rayleigh hand-back
+        // before returning, so these two are what THIS drive observed rather
+        // than a latch from an older one -- prepareDeviceSweeps cleared them on
+        // entry.
+        return gpu::rasberyPublishOuterProbe(slot, *h.eigv, *h.residual,
+                                             h.ctx->cmfd_solver.lastSweepNegativeFlux(),
+                                             h.ctx->cmfd_solver.lastSweepRayleigh());
+    }
+
+    /// The observation half.  Runs on the segment's own synchronise, so it costs
+    /// no transfer -- except on the exceptional launches (sweep state 0 or 2)
+    /// that the device could not finish, where it runs the remaining blocking
+    /// launches and then has to overrule the verdict kernel's half-drive probe.
+    static bool outerSweepFinishHook(void* raw, gpu::OuterSegmentStream, int slot,
+                                     unsigned int) {
+        OuterHookCtx& h              = *static_cast<OuterHookCtx*>(raw);
+        // Nothing was enqueued: the enqueue hook took the blocking drive and has
+        // already published this outer's probe.
+        if (!h.enqueued) return true;
+        h.enqueued                   = false;
+        bool          host_continued = false;
+        const bool    ok =
+            h.ctx->cmfd_solver.finishDrive(*h.eigv, h.ctx->geometry.Phif(), *h.residual,
+                                           host_continued);
+        // LOWERED ON EVERY EXIT, including the failure.  finishDrive is the end
+        // of the drive the enqueue half raised the flag for; leaving it up on a
+        // failure path hands the next HOST outer a sweep that elides the dhat
+        // and psi H2D, which is exactly the sticky-flag bug in a rarer costume.
+        h.ctx->cmfd_solver.setOuterSegmentResident(false);
+        if (!ok) return false;
+        if (!host_continued) return true;
+        return gpu::rasberyOuterSegment().republishAfterHostSweep(
+            slot, *h.eigv, *h.residual, h.ctx->cmfd_solver.lastSweepNegativeFlux(),
+            h.ctx->cmfd_solver.lastSweepRayleigh());
     }
 
     /// The nodal drive, exactly as SolveLoop runs it.
@@ -969,11 +1069,33 @@ private:
         hc.eigv          = &eigv;
         hc.residual      = &residual;
 
+        // Rev.7.1 Task 10 part 2: take the stream-ordered sweep when the drive
+        // can actually be enqueued, and the blocking one otherwise.
+        //
+        // canEnqueueDrive() is drive()'s OWN gate asked without running
+        // anything, so this cannot arm an arm drive() would not have taken --
+        // and when it is false (the Wielandt warm-up, no arena, the form-probe
+        // capture) the hooks are exactly Task 9's and the budget goes back to
+        // one.  Both arms bind the SAME stream, because the segment's kernels
+        // read and write the buffers the sweep touches and stream order is what
+        // says so.
+        // canEnqueueDrive() is NOT asked here, deliberately: it carries the
+        // per-drive Wielandt warm-up, which is false at the top of every
+        // SolveLoop, so arming on it would arm the blocking path for the whole
+        // loop and never engage.  What is asked here is the RUN's shape -- is
+        // there an arena stream to share -- and the per-outer question is asked
+        // per outer, inside the enqueue hook.
+        const bool stream_sweep = ctx.cmfd_solver.sweepStream() != nullptr &&
+                                  gpu::rasberyOuterSegment().useStream(
+                                      ctx.cmfd_solver.sweepStream());
+
         gpu::OuterSegmentHooks hooks;
-        hooks.enqueue_cmfd_sweep  = &outerSweepHook;
+        hooks.enqueue_cmfd_sweep =
+            stream_sweep ? &outerSweepEnqueueHook : &outerSweepHook;
+        hooks.finish_cmfd_sweep   = stream_sweep ? &outerSweepFinishHook : nullptr;
         hooks.enqueue_nodal_drive = &outerNodalHook;
         hooks.ctx                 = &hc;
-        hooks.sweep_synchronizes  = true;
+        hooks.sweep_synchronizes  = !stream_sweep;
         gpu::rasberyOuterSegment().setHooks(hooks);
 
         if (!gpu::rasberyBindOuterResidency(residency)) return false;
@@ -983,6 +1105,20 @@ private:
         ctx.cmfd_solver.setOuterSegmentResident(false);
         return true;
     }
+
+    /// WHY THERE IS NO LOOP-SCOPE OWNERSHIP SETTER.
+    ///
+    /// Two fixes for the sticky residency flag met here.  One set it from the
+    /// ARMED decision at loop scope; this tree raises and lowers it around the
+    /// drive itself (outerSweepHook / outerSweepEnqueueHook +
+    /// outerSweepFinishHook).  Keeping both would leave the flag TRUE while the
+    /// HOST body runs inside an armed loop -- which happens on a launch failure
+    /// and on every `!outer_on_device` pass -- and that is the same bug the two
+    /// fixes were written for, one call later.
+    ///
+    /// Drive scope is the tighter of the two and it subsumes the looser: the
+    /// flag says `the caller of THIS drive owns dhat and psi on the device`,
+    /// which cannot outlive that caller however the loop is armed.
 
     // Flux-only re-convergence (CMFD/BiCGSTAB + nodal/CNCC + cusping), with every feedback
     // (search, T/H, Xe) held fixed.  Used after the search falls back to a previously observed

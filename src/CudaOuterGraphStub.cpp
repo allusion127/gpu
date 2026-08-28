@@ -150,6 +150,16 @@ OuterSegmentHooks CudaOuterSegment::hooks() const { return _impl->hooks; }
 bool CudaOuterSegment::bindResidency(const OuterSegmentResidency&) { return false; }
 bool CudaOuterSegment::residencyBound() const { return false; }
 bool CudaOuterSegment::publishProbe(int, double, double, bool, bool) { return false; }
+/// Rev.7.1 Task 10 part 2.  No stream to adopt, no device probe to address and
+/// nothing to unlatch: the runner is unavailable, so every one of these answers
+/// the same "not here" the rest of this file does.
+bool CudaOuterSegment::useStream(void*) { return false; }
+CudaOuterSegment::ProbeAddresses CudaOuterSegment::probeAddresses(int) const {
+    return ProbeAddresses{};
+}
+bool CudaOuterSegment::republishAfterHostSweep(int, double, double, bool, bool) {
+    return false;
+}
 
 OuterSegmentRefusal CudaOuterSegment::refusal(int, bool, bool) const {
     return outerGpuEnabled() ? OuterSegmentRefusal::NoRunner : OuterSegmentRefusal::FeatureOff;

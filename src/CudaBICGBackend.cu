@@ -2215,6 +2215,71 @@ __global__ void cmfd_sweep_end(double* scalars, std::uint32_t* sweep_halt,
 }
 
 // ---------------------------------------------------------------------------
+// Rev.7.1 Task 10 part 2: the two kernels that let a sweep run inside a device
+// outer segment without a host round trip.
+// ---------------------------------------------------------------------------
+
+/// Carry the outer segment's halt into the sweep's own mask.
+///
+/// A SEGMENT THAT HAS ALREADY EXITED MUST NOT RUN ANOTHER SWEEP.  The segment
+/// stops enqueueing at its next observation, but the outer whose kernels were
+/// already in flight when the previous outer's transition latched has to be a
+/// no-op -- that is the halt-gate contract every other body kernel obeys
+/// (CudaCmfdOuterKernels.h), and the sweep's own mask is `sweep_halt`.
+///
+/// It runs BETWEEN issueSweepUploads (which uploads the participation masks) and
+/// launch_sweeps (whose every kernel tests the mask at its first instruction),
+/// which is the only window in which the segment's halt is visible and the graph
+/// has not started.  Raising sweep_halt here masks the whole captured graph
+/// exactly the way an over-captured slot budget does in cmfd_sweep_begin.
+__global__ void cmfd_sweep_gate(std::uint32_t* sweep_halt,
+                                const std::uint32_t* __restrict__ outer_halt,
+                                const int outer_slot, const int m) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    if (outer_halt != nullptr && outer_halt[outer_slot] != 0u) sweep_halt[m] = 1u;
+}
+
+/// Publish what the outer segment's transition has to rank, from the device.
+///
+/// THIS IS THE READBACK THAT ISN'T.  Without it the sweep hook has to drain the
+/// stream, copy four scalars home and hand them back down as a probe -- the
+/// per-outer round trip the segment exists to delete.  The four values are
+/// already in device memory when the graph ends, and the segment's convergence
+/// kernel reads them out of device memory, so the host was only ever a courier.
+///
+/// `negative` and `rayleigh` are the SAME two the host publishes today
+/// (BICGCMFD::lastSweepNegativeFlux / lastSweepRayleigh, fed from
+/// io.negative_last and io.state == 2), so the transition ranks the same signals
+/// from the same numbers.
+///
+/// AN UNFINISHED DRIVE ENDS THE OUTER HERE.  States 0 (the launch's slot budget
+/// ran out) and 2 (the Wielandt gamma degenerated) are the two the host `while`
+/// loop in driveDeviceSweeps spins on: the drive is NOT over, so the flux this
+/// outer's updjnet and upddhat would read is a half sweep.  Raising the
+/// segment's halt stops the rest of the body dead, and the host finishes the
+/// drive verbatim at the observation it was going to make anyway.
+__global__ void cmfd_sweep_verdict(const double* __restrict__ scalars, const int m,
+                                   double* eigv_out, double* residual_out,
+                                   std::uint32_t* negative_out,
+                                   std::uint32_t* rayleigh_out,
+                                   std::uint32_t* nonfinite_out,
+                                   std::uint32_t* outer_halt, const int outer_slot) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    if (outer_halt != nullptr && outer_halt[outer_slot] != 0u) return;
+    const double* sm = scalars + static_cast<long long>(m) * kScalarCount;
+
+    if (eigv_out != nullptr) *eigv_out = sm[kEigv];
+    if (residual_out != nullptr) *residual_out = sm[kErrl2];
+    if (negative_out != nullptr) *negative_out = (sm[kNegative] != 0.0) ? 1u : 0u;
+    // Per outer, exactly as the host probe publish this replaces was.
+    if (nonfinite_out != nullptr) *nonfinite_out = 0u;
+
+    const int state = static_cast<int>(sm[kSweepState]);
+    if (rayleigh_out != nullptr) *rayleigh_out = (state == 2) ? 1u : 0u;
+    if (outer_halt != nullptr && (state == 0 || state == 2)) outer_halt[outer_slot] = 1u;
+}
+
+// ---------------------------------------------------------------------------
 // BatchCore -- the device side of both execution modes.
 //
 // `slots` is 1 for a plain single-instance run and M for the batch mode; the
@@ -3456,6 +3521,25 @@ public:
         if (iter_batch_used >= 2) ++telemetry.batched_graph_launches;
     }
 
+    /// Rev.7.1 Task 10 part 2: mask this slot's sweep when the segment has halted.
+    ///
+    /// Issued AFTER issueSweepUploads, which is what uploads the participation
+    /// masks this kernel then overrides for the one slot, and BEFORE
+    /// launch_sweeps, because every kernel of the graph tests what it writes.
+    void enqueueSweepGate(int m, const std::uint32_t* outer_halt, int outer_slot) {
+        if (outer_halt == nullptr) return;
+        cmfd_sweep_gate<<<1, 1, 0, stream>>>(sweep_halt, outer_halt, outer_slot, m);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    /// Publish the outer segment's probe from device memory (no readback).
+    void enqueueSweepVerdict(int m, const CudaBatchArena::CmfdSweepProbeSink& p) {
+        cmfd_sweep_verdict<<<1, 1, 0, stream>>>(scalars, m, p.eigv, p.residual, p.negative,
+                                                p.rayleigh, p.nonfinite, p.halt,
+                                                p.halt_slot);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
     /// H2D for one sweep batch.  chif/vol mirror away their (rare/never)
     /// changes; xsnf, udiag, psi and the sweep scalars are new every drive.
     /// The per-slot sweep_halt starts at 0 for participants, 1 for everyone
@@ -3764,6 +3848,16 @@ public:
         ++telemetry.stream_sync_calls_during_iteration;
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaGetLastError());
+        absorb(active_slots, count);
+    }
+
+    /// The half of drain() that is NOT the synchronise.
+    ///
+    /// Split out for the Rev.7.1 Task 10 part 2 enqueue path, which owns its own
+    /// stream and synchronises once for the whole outer -- a second sync here
+    /// would be the round trip that path exists to remove.  drain() is this plus
+    /// the sync, so there is still one body and the two cannot drift.
+    void absorb(const int* active_slots, int count) {
         commitAssemblyMirrors(active_slots, count);
 
         const bool fp32_was_active = fp32Active();
@@ -4319,6 +4413,79 @@ void CudaBatchArena::stageSweeps(int m, const CmfdSweepIO& io) {
     in[kSweepSlotBudget - kSweepFirst] = static_cast<double>(io.sweep_budget);
     in[kSweepSlots - kSweepFirst]      = 0.0;
     sl.sweep_unroll                    = io.sweep_budget;
+}
+
+void* CudaBatchArena::sweepStream() const {
+    return _impl->core.available ? static_cast<void*>(_impl->core.stream) : nullptr;
+}
+
+bool CudaBatchArena::enqueueSweeps(int m, double* out_phi, const CmfdSweepIO& io,
+                                   const CmfdSweepProbeSink& probe) {
+    Impl& a = *_impl;
+    if (!a.core.available || out_phi == nullptr) return false;
+    if (m < 0 || m >= a.core.slots) return false;
+    // ONE PARTICIPANT, AND THAT IS THE WHOLE PRECONDITION.  solveCommon has a
+    // rendezvous because a batch has several arrivals to align; this path has
+    // none to align and takes no lock, so a second in-flight instance would be a
+    // second launcher on one stream -- the failure the `launching` claim exists
+    // to prevent.  The device outer segment refuses batch mode already
+    // (OuterSegmentEligibility::batch_width); this refuses it again, here, where
+    // the stream is.
+    if (a.inUseCount() > 1) return false;
+
+    stageSweeps(m, io);
+    auto& sl   = a.core.slot[static_cast<size_t>(m)];
+    sl.out_phi = out_phi;
+
+    const int nmax   = sl.nmax;
+    const int unroll = sl.sweep_unroll;
+    a.core.issueSweepUploads(&m, 1, unroll);
+    a.core.enqueueSweepGate(m, probe.halt, probe.halt_slot);
+    a.core.launch_sweeps(nmax, unroll);
+    // The verdict BEFORE the downloads: it reads the scalar block the graph just
+    // wrote, and issueSweepDownloads ends by clearing sweep_halt for the next
+    // launch, which would erase the very state the verdict is reading if the
+    // order were reversed.
+    a.core.enqueueSweepVerdict(m, probe);
+    a.core.issueFluxDownloads(&m, 1);
+    a.core.issueSweepDownloads(&m, 1);
+    return true;
+}
+
+bool CudaBatchArena::finishSweeps(int m, CmfdSweepIO& io) {
+    Impl& a = *_impl;
+    a.core.absorb(&m, 1);
+    readSweepObservation(m, io);
+    // The Rayleigh hand-back is the one launch whose host branch reads psi and
+    // the assembled operator, so it is the one launch that pulls them.  This
+    // call synchronises internally -- exceptionally, and only on the path that
+    // is about to run host arithmetic anyway.
+    if (io.state == 2) a.core.issueExceptionalOperatorDownloads(&m, 1);
+    if (a.core.slot[static_cast<size_t>(m)].nonfinite) return false;
+    a.core.adoptFluxMirror(m);
+    return true;
+}
+
+void CudaBatchArena::syncSweepStream() {
+    if (!_impl->core.available) return;
+    CUDA_CHECK(cudaStreamSynchronize(_impl->core.stream));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void CudaBatchArena::readSweepObservation(int m, CmfdSweepIO& io) const {
+    const auto&   sl  = _impl->core.slot[static_cast<size_t>(m)];
+    const double* out = sl.sweep_out;
+    io.eigv          = out[kEigv - kSweepFirst];
+    io.reigv         = out[kReigv - kSweepFirst];
+    io.reigvs        = out[kReigvs - kSweepFirst];
+    io.errl2         = out[kErrl2 - kSweepFirst];
+    io.sweeps_done   = static_cast<int>(out[kSweepsDone - kSweepFirst]);
+    io.icmfd_done    = static_cast<int>(out[kIcmfdDone - kSweepFirst]);
+    io.state         = static_cast<int>(out[kSweepState - kSweepFirst]);
+    io.negative_last = static_cast<int>(out[kNegative - kSweepFirst]);
+    io.gammad        = out[kGammaD - kSweepFirst];
+    io.gamman        = out[kGammaN - kSweepFirst];
+    io.err_acc       = out[kErrAcc - kSweepFirst];
 }
 
 void CudaBatchArena::solveSweeps(int m, double* out_phi, CmfdSweepIO& io) {

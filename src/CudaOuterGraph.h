@@ -738,16 +738,38 @@ using OuterSegmentHook = bool (*)(void* ctx, OuterSegmentStream stream, int slot
                                   unsigned int outer_index);
 
 struct OuterSegmentHooks {
-    OuterSegmentHook enqueue_cmfd_sweep = nullptr; ///< setls + drive + probe
+    OuterSegmentHook enqueue_cmfd_sweep = nullptr; ///< setls + drive (+ probe)
     OuterSegmentHook enqueue_nodal_drive = nullptr; ///< nodal reset + drive
+
+    /// Rev.7.1 Task 10 part 2: the post-synchronise half of the sweep.
+    ///
+    /// A STREAM-ORDERED SWEEP HAS TWO HALVES AND ONLY ONE OF THEM IS AN
+    /// ENQUEUE.  enqueue_cmfd_sweep issues the launch and returns; the flux it
+    /// produced still has to be adopted into Geometry::Phif and the eigenvalue
+    /// into the host's `eigv` before the NODAL hook -- which is host arithmetic
+    /// over host arrays -- can run.  Both are reads of memory the runner's own
+    /// per-outer synchronise has already made valid, so this hook costs no
+    /// transfer and no extra sync; it exists so the runner does not have to know
+    /// what a CMFD drive's observation consists of.
+    ///
+    /// Supplying it is what makes `sweep_synchronizes` false legal.
+    OuterSegmentHook finish_cmfd_sweep = nullptr;
+
     /// TRUE while the sweep hook is a HOST call that rendezvouses.
     ///
     /// BICGCMFD::drive drains its stream and copies the flux back, so a segment
     /// containing it cannot enqueue outer i+1 before observing outer i.  The
     /// runner therefore forces the budget to 1: a longer budget would enqueue
     /// outers whose inputs the halt gate has not yet been told about, which is a
-    /// different trajectory, not a faster one.  It goes false -- and the budget
-    /// opens up -- the day the sweep has a stream-ordered enqueue (Task 10/18).
+    /// different trajectory, not a faster one.
+    ///
+    /// It goes FALSE when the caller supplies finish_cmfd_sweep, i.e. when the
+    /// sweep is BICGCMFD::enqueueDrive rather than BICGCMFD::drive.  The segment
+    /// still synchronises once per outer -- the nodal drive is host arithmetic
+    /// and nothing can remove that until Task 18 -- but the sweep no longer
+    /// rendezvouses, no longer drains a second time, and no longer hands its
+    /// verdict back through the host, so outer i+1 may be enqueued behind outer
+    /// i's kernels under the halt gate.
     bool sweep_synchronizes = false;
     void*            ctx                 = nullptr;
 };
@@ -991,6 +1013,46 @@ public:
     /// Write one outer's observation into the probe the decision kernel reads.
     bool publishProbe(int slot, double eigv, double residual, bool negative_flux,
                       bool rayleigh);
+
+    /// Rev.7.1 Task 10 part 2: run the segment's kernels on SOMEBODY ELSE'S
+    /// stream.
+    ///
+    /// ONE STREAM IS THE WHOLE ORDERING ARGUMENT.  The sweep is enqueued by the
+    /// arena on the arena's stream, and everything around it -- updpsi before,
+    /// updjnet and upddhat after -- reads and writes the buffers that sweep
+    /// touches.  Two streams would need an event pair per outer to say so;
+    /// adopting the arena's makes the ordering the stream's own and costs
+    /// nothing.  Passing null restores the runner's private stream.
+    ///
+    /// Refused while a segment is in flight, and refused when the runner is not
+    /// initialised, because either would retarget work already queued.
+    bool useStream(void* stream);
+
+    /// The device addresses the sweep's verdict kernel publishes into.
+    ///
+    /// Handed out rather than passed through the hook signature because the
+    /// probe LAYOUT is this file's (DeviceOuterProbe), and a hook that built the
+    /// four addresses itself would be a second place that knows it.
+    struct ProbeAddresses {
+        double*        eigv     = nullptr;
+        double*        residual = nullptr;
+        std::uint32_t* negative = nullptr;
+        std::uint32_t* rayleigh  = nullptr;
+        std::uint32_t* nonfinite = nullptr;
+        std::uint32_t* halt      = nullptr;
+        bool           valid     = false;
+    };
+    [[nodiscard]] ProbeAddresses probeAddresses(int slot) const;
+
+    /// Undo a device verdict the host had to overrule.
+    ///
+    /// The verdict kernel published the eigenvalue of a HALF drive and latched
+    /// the segment's halt on it (sweep state 0 or 2); the host has since
+    /// finished that drive, so both have to be replaced by what actually
+    /// happened.  Same four values publishProbe takes, plus the halt release.
+    bool republishAfterHostSweep(int slot, double eigv, double residual,
+                                 bool negative_flux, bool rayleigh);
+
     [[nodiscard]] OuterSegmentHooks hooks() const;
 
     /// Would a segment run right now?  Pure query, no CUDA call, so the caller

@@ -82,6 +82,18 @@ void CudaBatchArena::stageSweeps(int, const CmfdSweepIO&) {
 void CudaBatchArena::solveSweeps(int, double*, CmfdSweepIO&) {
     throw std::runtime_error(_impl->status);
 }
+/// Rev.7.1 Task 10 part 2.  No device, no stream, and nothing to enqueue on it:
+/// the stream-ordered sweep REFUSES rather than throws, because its caller (the
+/// device outer segment's sweep hook) is written to fall back to the host loop
+/// on a false and has no other use for an exception.
+void* CudaBatchArena::sweepStream() const { return nullptr; }
+bool  CudaBatchArena::enqueueSweeps(int, double*, const CmfdSweepIO&,
+                                    const CmfdSweepProbeSink&) {
+    return false;
+}
+void CudaBatchArena::readSweepObservation(int, CmfdSweepIO&) const {}
+bool CudaBatchArena::finishSweeps(int, CmfdSweepIO&) { return false; }
+void CudaBatchArena::syncSweepStream() {}
 void CudaBatchArena::solveCommon(int, double*, int) {
     throw std::runtime_error(_impl->status);
 }

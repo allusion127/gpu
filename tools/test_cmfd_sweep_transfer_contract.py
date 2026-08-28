@@ -88,14 +88,20 @@ def main() -> int:
         problems.append("issueSweepUploads pushes psi unconditionally")
     if "bool psi_dirty = true;" not in cmfd_code:
         problems.append("driveDeviceSweeps does not arm psi_dirty for the first launch")
-    if "psi_dirty          = false;" not in cmfd_code:
+    # Matched on the STATEMENT, not on its alignment: Rev.7.1 Task 10 part 2
+    # split the launch loop so the clear appears in two arms (driveDeviceSweeps
+    # and BICGCMFD::finishDrive's blocking continuation), and a column-exact
+    # pattern would have failed on the reindent rather than on the invariant.
+    clear_re = re.compile(r"psi_dirty\s*=\s*false;")
+    if not clear_re.search(cmfd_code):
         problems.append(
             "driveDeviceSweeps never clears psi_dirty; every launch would re-upload the "
             "host copy over the psi the device just advanced")
     # It has to be cleared AFTER the launch, not before -- otherwise the very
     # first launch of a drive skips the one upload that matters.
     launch_at = cmfd_code.find("_ls->driveSweepsCuda(flux, io)")
-    clear_at = cmfd_code.find("psi_dirty          = false;")
+    _m = clear_re.search(cmfd_code)
+    clear_at = _m.start() if _m else -1
     if launch_at >= 0 and clear_at >= 0 and clear_at < launch_at:
         problems.append("psi_dirty is cleared before the launch that consumes it")
 
@@ -115,7 +121,14 @@ def main() -> int:
     # inside a function whose name contains Hook" would pass for a hook that
     # never regenerated anything.  There is exactly one such producer today; a
     # second one has to be added here, which is the point.
-    DEVICE_PSI_PRODUCERS = ("outerSweepHook",)
+    # Rev.7.1 Task 10 part 2 adds the SECOND one, and it is admitted here on the
+    # same evidence: outerSweepEnqueueHook runs behind the same segment body, so
+    # the psi its drive reads is the one the segment's updpsi kernel produced and
+    # mirrored back.  Its drive() call is the Wielandt warm-up fallback -- taken
+    # when BICGCMFD::enqueueDrive refuses because drive() would not have gone to
+    # the device either -- and it is preceded by a syncSweepStream(), which is
+    # what makes that mirror complete before the host loop reads it.
+    DEVICE_PSI_PRODUCERS = ("outerSweepHook", "outerSweepEnqueueHook")
 
     def enclosing_function(text, pos):
         head = text.rfind("static bool ", 0, pos)
