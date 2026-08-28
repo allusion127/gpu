@@ -601,6 +601,46 @@ outerSegmentRefusal(const OuterSegmentEligibility& e) {
     return OuterSegmentRefusal::None;
 }
 
+/// The half of the ladder a caller can decide BEFORE it arms.
+///
+/// WHY THIS EXISTS -- THE BATCH PERTURBATION.  Arming is not a query.  It binds
+/// residency (which patches the shared slot table, synchronises the device and
+/// seeds dhat/psi H2D over live arena memory) and it adopts the segment's
+/// jnet/phis/flux as the nodal backend's CANONICAL set.  Those buffers come from
+/// ONE process-wide arena slot, so in `--batch-mode` every concurrent Driver
+/// adopted the SAME three device pointers and the batched nodal drive stopped
+/// having a per-deck jnet, phis and flux.  The segment itself refused every time
+/// -- `refusals{"batch_mode":N}`, `segment_launches:0` -- and the answers moved
+/// anyway: ~622 of 708 datasets differed, ppm by ~1.3 of 1285, k_eff by 8e-6.
+///
+/// So the refusal has to be asked BEFORE the arm, not after it, and this is the
+/// part of it that can be: every reason ranked above `residency_bound` is a
+/// property of the RUN (is there a runner, is it bound, is this a batch, does
+/// the deck cusp, is there a search) rather than of the arming.  The reasons
+/// below it are exactly the ones arming exists to satisfy, so they are answered
+/// `yes` here and left to the post-arm `refusal()` -- which still runs, still
+/// reports, and still ranks `batch_mode` above them, so the receipt is
+/// unchanged.
+///
+/// The ladder is not restated: this builds an eligibility whose post-arm fields
+/// are all satisfied and asks the SAME function, so the two cannot disagree.
+[[nodiscard]] inline OuterSegmentRefusal
+outerSegmentPreArmRefusal(int batch_width, bool fractional_rods, bool critical_search) {
+    if (!outerGpuEnabled()) return OuterSegmentRefusal::FeatureOff;
+    OuterSegmentEligibility e{};
+    e.runner_available  = 1;
+    e.arena_reserved    = 1;
+    e.bound             = 1;
+    e.batch_width       = batch_width;
+    e.fractional_rods   = fractional_rods ? 1 : 0;
+    e.critical_search   = critical_search ? 1 : 0;
+    e.residency_bound   = 1;
+    e.have_sweep_hook   = 1;
+    e.have_nodal_hook   = 1;
+    e.have_cusping_hook = 1;
+    return outerSegmentRefusal(e);
+}
+
 /// The Stage-A cusping predicate, mined from XSSet::ApplyRodCusping
 /// (XSSet.cpp:3242-3268).  `division` is XSSet::axial_rod_division(),
 /// `fraction` is Geometry::rod_fraction over the node list, `eps` is pch.h's EPS.

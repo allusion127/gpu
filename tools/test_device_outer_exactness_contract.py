@@ -216,6 +216,33 @@ per-drive flip costs no instantiation.  The divide is correctly rounded
 (__ddiv_rn), because the host's `1.0 / eigv` is and the two have to agree bit for
 bit.
 
+-------------------------------------------------------------------------------
+8. A REFUSAL THE CALLER CAN SEE COMING IS NOT ARMED FOR
+-------------------------------------------------------------------------------
+
+The first six were found with the segment RUNNING.  This one is the opposite
+failure: the segment never ran at all and the answers moved anyway.
+
+Both call sites armed on the bare RASBERY_GPU_OUTER flag and asked the refusal
+ladder afterwards.  Arming is not a query -- armOuterSegment binds residency
+(a kernel that patches the shared slot table, a device synchronise, and two H2D
+seeds over live arena memory) and then adopts the segment's jnet/phis/flux as
+the XS-recon backend's CANONICAL nodal set.  Those three pointers come from ONE
+process-wide arena slot, so in --batch-mode every concurrent Driver adopted the
+SAME three device buffers and the batched nodal drive stopped having a per-deck
+jnet, phis and flux.
+
+MEASURED on the 238 host, M64 manifest, arm X + OUTER=1 b8: ~622 of 708 datasets
+differed against OUTER unset, boron by ~1.3 ppm of 1285, k_eff by 7-9e-6, one
+dataset by 27.7 absolute -- under a receipt that read segment_launches 0,
+device_outers 0, refusals {"batch_mode": 6483}.  Reproduced on a 4-deck local
+batch as 184 of 184 accounted datasets, and 0 after the gate.
+
+RULE: the half of the ladder that is a property of the RUN rather than of the
+arming (gpu::outerSegmentPreArmRefusal) is asked BEFORE the arm, through the
+same outerSegmentRefusal ladder, with this run's batch width.  The post-arm
+refusal() still runs and still reports, so the receipt is unchanged.
+
 Run:  python tools/test_device_outer_exactness_contract.py
 """
 
@@ -782,6 +809,109 @@ def check_staged_uploads_have_one_in_body_writer(problems: list[str]) -> None:
         )
 
 
+def check_refused_segment_is_not_armed(problems: list[str]) -> None:
+    """Invariant 8: a refusal the caller can see coming is not armed for.
+
+    ARMING IS NOT A QUERY.  armOuterSegment binds residency -- which patches the
+    shared slot table with a kernel, synchronises the device and seeds dhat and
+    psi H2D over live arena memory -- and then adopts the segment's
+    jnet/phis/flux as the XS-recon backend's CANONICAL nodal set.  Those three
+    pointers come from ONE process-wide arena slot (CudaOuterGraph.cu's
+    stand-up: `outerArena().slotView(0).jnet` / `.phis`).
+
+    Both call sites armed on the bare `RASBERY_GPU_OUTER` flag and asked the
+    refusal ladder AFTERWARDS.  In `--batch-mode` the ladder answered
+    `batch_mode` every single time and the segment never ran an outer -- and
+    every concurrent Driver had already adopted the SAME three device buffers,
+    so the batched nodal drive stopped having a per-deck jnet, phis and flux.
+    MEASURED on the 238 host, M64 manifest, arm X + OUTER=1 b8: ~622 of 708
+    datasets differed against OUTER unset, boron by ~1.3 ppm of 1285, k_eff by
+    7-9e-6, one dataset by 27.7 absolute -- under a receipt that read
+    `{"segment_launches":0,"device_outers":0,
+      "refusals":{"batch_mode":6483},"idle_reason":"batch_mode"}`.
+
+    RULE: the half of the ladder that is a property of the RUN rather than of
+    the arming is asked BEFORE the arm (gpu::outerSegmentPreArmRefusal), it is
+    the same ladder rather than a second spelling of it, and it is asked with
+    this run's batch width.  The post-arm refusal() still runs and still
+    reports, so the receipt is unchanged.
+    """
+    header = read("src", "CudaOuterGraph.h")
+    pre_arm = "outerSegmentPreArmRefusal"
+    if pre_arm not in header:
+        problems.append(
+            "CudaOuterGraph.h does not define outerSegmentPreArmRefusal: there is no "
+            "way for a caller to ask whether arming is pointless before it arms, and "
+            "arming is what adopts the process-wide canonical nodal set"
+        )
+        return
+
+    pre_body = strip_comments(body_of(header, "outerSegmentPreArmRefusal"))
+    if "outerSegmentRefusal(e)" not in pre_body:
+        problems.append(
+            "outerSegmentPreArmRefusal must answer through outerSegmentRefusal, not "
+            "restate the ladder: two spellings of the same gate are free to disagree, "
+            "and the receipt is printed from the other one"
+        )
+    if "e.batch_width" not in pre_body:
+        problems.append(
+            "outerSegmentPreArmRefusal must carry the batch width -- batch_mode is the "
+            "refusal that armed 6483 times and moved 622 of 708 datasets"
+        )
+    for satisfied in ("e.residency_bound", "e.have_sweep_hook", "e.have_nodal_hook"):
+        if f"{satisfied}   = 1" not in pre_body and f"{satisfied}  = 1" not in pre_body:
+            problems.append(
+                f"outerSegmentPreArmRefusal must answer {satisfied} with 1: those are "
+                "exactly the fields arming exists to satisfy, and refusing on them "
+                "before the arm would refuse every run"
+            )
+
+    # The receipt has to keep naming batch_mode, which it only does while the
+    # ladder ranks it ABOVE the fields a skipped arm leaves false.
+    ladder = strip_comments(body_of(header, "outerSegmentRefusal(const OuterSegmentEligibility& e)"))
+    if "BatchMode" in ladder and "NoResidency" in ladder and             ladder.index("BatchMode") > ladder.index("NoResidency"):
+        problems.append(
+            "outerSegmentRefusal ranks NoResidency above BatchMode.  With the arm "
+            "skipped there is no residency, so the batch receipt would report "
+            "no_residency and stop naming the reason the segment was never eligible"
+        )
+
+    driver = read("src", "Driver.h")
+    for fn, sig in (
+        ("ReconvergeFlux", "static void ReconvergeFlux(SolverContext& ctx"),
+        ("SolveLoop", "static void SolveLoop(SolverContext& ctx"),
+    ):
+        try:
+            body = strip_comments(body_of(driver, sig))
+        except ValueError:
+            problems.append(f"Driver.h: could not find {fn}'s body ({sig!r})")
+            continue
+        if "armOuterSegment(ctx" not in body:
+            continue
+        if re.search(r"if\s*\(\s*gpu_outer_enabled\s*\)\s*armOuterSegment", body):
+            problems.append(
+                f"Driver.h: {fn} arms the outer segment on the bare RASBERY_GPU_OUTER "
+                "flag.  Arming adopts the process-wide canonical nodal set, so a run "
+                "the ladder is going to refuse -- every batch run -- is perturbed by a "
+                "segment that never executes an outer"
+            )
+        if pre_arm not in body:
+            problems.append(
+                f"Driver.h: {fn} does not ask gpu::{pre_arm} before arming"
+            )
+            continue
+        if body.index(pre_arm) > body.index("armOuterSegment(ctx"):
+            problems.append(
+                f"Driver.h: {fn} asks {pre_arm} AFTER armOuterSegment, which is the "
+                "ordering that caused the batch perturbation in the first place"
+            )
+        if not re.search(pre_arm + r"\s*\(\s*rasberyBatchWidth\(\)", body):
+            problems.append(
+                f"Driver.h: {fn} must pass rasberyBatchWidth() to {pre_arm}; a pre-arm "
+                "gate that cannot see the batch is not a gate"
+            )
+
+
 def main() -> int:
     problems: list[str] = []
     check_form_mask_is_mined(problems)
@@ -792,6 +922,7 @@ def main() -> int:
     check_host_reader_mirror_is_synchronised(problems)
     check_device_reigv_has_one_writer(problems)
     check_staged_uploads_have_one_in_body_writer(problems)
+    check_refused_segment_is_not_armed(problems)
 
     if problems:
         print("FAIL: device outer exactness contract")
@@ -808,6 +939,7 @@ def main() -> int:
     print("     is its only in-body writer")
     print("  6. the psi/dhat mirror lands before the host loop that reads it")
     print("  7. the nodal reigv slot has exactly one writer per drive")
+    print("  8. a refusal the caller can see coming is not armed for")
     return 0
 
 

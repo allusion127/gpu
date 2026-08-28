@@ -1391,14 +1391,11 @@ private:
         // was.  With it ON and no arena bound, the runner refuses and the
         // [RASBERY][OUTER_GPU] receipt names why.
         const bool gpu_outer_enabled = gpu::outerGpuEnabled();
-        // Link 2: hand the runner the sweep arena's buffers and install the two
-        // hooks.  Done HERE rather than at stand-up because the arena slot
-        // belongs to this BICGCMFD and the eigv/residual the sweep hook has to
-        // publish are this loop's own locals.
-        if (gpu_outer_enabled) armOuterSegment(ctx, eigv, residual);
         // Stage A eligibility: a deck that can cusp would have to escape with
         // MaterialChanged on outer 1, which is a segment of length one.  The
         // predicate is XSSet::ApplyRodCusping's own (XSSet.cpp:3243, 3266).
+        //
+        // ASKED BEFORE THE ARM, because the arm consumes it (below).
         const bool gpu_outer_rods =
             gpu_outer_enabled &&
             gpu::outerDeckHasFractionalRods(ctx.cross_sections.axial_rod_division(),
@@ -1406,6 +1403,25 @@ private:
                                                 ? &ctx.geometry.rod_fraction(0)
                                                 : nullptr,
                                             ctx.geometry.nxyz(), EPS);
+        // Link 2: hand the runner the sweep arena's buffers and install the two
+        // hooks.  Done HERE rather than at stand-up because the arena slot
+        // belongs to this BICGCMFD and the eigv/residual the sweep hook has to
+        // publish are this loop's own locals.
+        //
+        // GATED ON THE PRE-ARM REFUSAL, because arming is not free and not a
+        // query: it binds residency (a shared-slot kernel patch, a device
+        // synchronise and two H2D seeds over live arena memory) and it adopts
+        // the segment's ONE jnet/phis/flux as this backend's canonical nodal
+        // set.  In `--batch-mode` every concurrent Driver adopted the same three
+        // process-wide pointers, so the batched nodal drive lost its per-deck
+        // buffers -- while the segment refused every outer and the receipt said
+        // so.  A refusal the caller can see coming must not be armed for.  See
+        // gpu::outerSegmentPreArmRefusal.
+        const bool gpu_outer_may_arm =
+            gpu_outer_enabled &&
+            gpu::outerSegmentPreArmRefusal(rasberyBatchWidth(), gpu_outer_rods, false) ==
+                gpu::OuterSegmentRefusal::None;
+        if (gpu_outer_may_arm) armOuterSegment(ctx, eigv, residual);
 
         // ReconvergeFlux runs no critical search by construction, so the
         // search refusal cannot apply here.
@@ -2193,7 +2209,6 @@ private:
         // get the same answer.  With the feature off this is a false const and
         // every statement in the delegation branch folds away.
         const bool gpu_outer_enabled = gpu::outerGpuEnabled();
-        if (gpu_outer_enabled) armOuterSegment(ctx, eigv, residual);
         const bool gpu_outer_rods =
             gpu_outer_enabled &&
             gpu::outerDeckHasFractionalRods(ctx.cross_sections.axial_rod_division(),
@@ -2201,6 +2216,17 @@ private:
                                                 ? &ctx.geometry.rod_fraction(0)
                                                 : nullptr,
                                             ctx.geometry.nxyz(), EPS);
+        // GATED ON THE PRE-ARM REFUSAL.  Same reason as ReconvergeFlux's copy:
+        // arming binds residency and adopts the process-wide canonical nodal
+        // set, so a segment that is going to be refused for a reason already
+        // visible here -- above all `batch_mode` -- must not be armed for.  With
+        // the gate the OUTER=1 arm is byte-identical to OUTER unset whenever the
+        // receipt says the segment never engaged.
+        const bool gpu_outer_may_arm =
+            gpu_outer_enabled &&
+            gpu::outerSegmentPreArmRefusal(rasberyBatchWidth(), gpu_outer_rods, false) ==
+                gpu::OuterSegmentRefusal::None;
+        if (gpu_outer_may_arm) armOuterSegment(ctx, eigv, residual);
 
         // A CRITICAL SEARCH IS NO LONGER REFUSED HERE.
         //
