@@ -1,6 +1,10 @@
 #pragma once
 #include "CudaXsReconBackend.h"
 #include "FlatXsKernel.h"
+// For xsrecon::NISO and xsrecon::BatchView: the device Xe entry points
+// below take a view by reference and size the depTrans rows from the
+// kernel's own constant, rather than restating 39 here.
+#include "XsReconKernel.h"
 #include "Geometry.h"
 #include "Model.h"
 
@@ -168,6 +172,14 @@ private:
     XSArraySet           _micx; // current node microscopic XS after branch/rod updates
     XSArraySet           _lmpx; // current node lumped XS after branch/rod updates
     milk::Vector<double> _iden; // current node isotope densities
+
+    /// Shared setup for every device Xe entry point: dimension check, backend
+    /// creation, host page-locking, the depTrans rows and the pointer view.
+    /// The two dep arrays are the CALLER's locals because the view holds their
+    /// addresses and the backend reads them after this returns.
+    bool PrepareXeDeviceCall(double power, double relax, xsrecon::BatchView& view,
+                             std::array<double, xsrecon::NISO>& dep_i135,
+                             std::array<double, xsrecon::NISO>& dep_xe135);
 
     // Equilibrium-Xe device backend (RASBERY_GPU_XSRECON, default off).  The
     // generation counter advances whenever a host path rebuilds _micx/_lmpx
@@ -478,6 +490,56 @@ public:
     /// when RASBERY_GPU_XSRECON is set.  Returns false on any unavailability,
     /// in which case the caller runs the unchanged CPU loop.
     bool TryUpdateEquilibriumXenonGpu(double power, double relax, double& max_change);
+
+    // --- Rev.7.1 Task 13: the SPLIT device Xe arm (RASBERY_GPU_XE) ---------
+    //
+    // TryUpdateEquilibriumXenonGpu above is the FUSED device step and it is the
+    // whole of UpdateEquilibriumXenon.  These take the same node body apart at
+    // the SAME seam the host API is split at -- Snapshot / Evaluate / Commit --
+    // so the safeguarded Anderson arm can run on the device without its history
+    // (ten triples over the fuel nodes) crossing the bus every step.
+    //
+    // THE HISTORY LIVES IN THE BACKEND, WHICH IS PER XSSet AND THEREFORE PER
+    // DRIVER.  A --batch-mode run gives each deck its own Driver, its own XSSet
+    // and its own backend, so the histories are independent by construction and
+    // there is nothing process-wide to share by accident.  That is deliberate:
+    // the batch bug this tree just fixed was a process-wide slot-0 buffer that
+    // every Driver adopted.
+    //
+    // Every one returns false when the arm is unavailable, having written
+    // nothing, and the caller then runs the untouched host path.
+
+    /// Evaluate F(x) on the device without applying it, and report the RAW
+    /// (pre-damping) maximum relative Xe-135 change -- the same number
+    /// UpdateEquilibriumXenon and EvaluateEquilibriumXenon return.
+    bool XeGpuEvaluate(double power, double& picard);
+
+    /// Anderson window bookkeeping, one primitive per line of the host arm's
+    /// history roll, so the two read the same way side by side.
+    bool XeGpuRotateHistory();
+    bool XeGpuRecordColumn(int col);
+    bool XeGpuSaveEvaluation();
+
+    /// The six inner products of the depth-2 normal equations, in
+    /// xe::XeDotSlot order.  THIS is the N1 step: a fixed partition, not the
+    /// host's single serial fold (see XeKernel.h).
+    bool XeGpuDots(int ncol, double* out_six);
+
+    /// Build the candidate and measure the two things the safeguards need.
+    bool XeGpuCandidate(const double* gamma, int ncol, double& step, bool& physics_ok);
+
+    /// Commit the accepted candidate: writes the three Xe-chain rows of every
+    /// fuel node and reconstructs them, exactly like CommitXenon.
+    bool XeGpuCommitCandidate(double power);
+
+    /// Commit the damped Picard image x + relax*(F - x), skipping the nodes the
+    /// fused loop skips, exactly like UpdateEquilibriumXenon.
+    bool XeGpuCommitPicard(double power, double relax);
+
+    /// Evaluate + commit, i.e. the whole of UpdateEquilibriumXenon through the
+    /// split kernels.  This is the B0 (bit-gated) half of Task 13.
+    bool TryUpdateEquilibriumXenonGpuSplit(double power, double relax,
+                                           double& max_change);
 
     // --- Raw fixed-point API (plan Rev.4 Sec 10.1) ------------------------
     //

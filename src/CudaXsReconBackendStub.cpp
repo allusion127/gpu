@@ -29,6 +29,33 @@ bool XsReconBackend::solveFlatXs(const flatxs::FlatXsView&, const FlatXsLibShape
     return false;
 }
 
+// Rev.7.1 Task 13 stub parity: the split Xe arm fails open, which is exactly
+// what a no-CUDA build should do -- every one of these returning false means
+// the caller runs the host Anderson/Picard path, unchanged.
+bool XsReconBackend::xeEvaluate(const xsrecon::BatchView&, unsigned long long,
+                                unsigned long long, double*) {
+    return false;
+}
+
+bool XsReconBackend::xeRotateHistory() { return false; }
+
+bool XsReconBackend::xeRecordColumn(int) { return false; }
+
+bool XsReconBackend::xeSaveEvaluation() { return false; }
+
+bool XsReconBackend::xeDots(int, double*) { return false; }
+
+bool XsReconBackend::xeCandidate(const double*, int, double*, bool*) { return false; }
+
+bool XsReconBackend::xeCommit(const xsrecon::BatchView&, int, double, bool,
+                              unsigned long long) {
+    return false;
+}
+
+unsigned long long XsReconBackend::xeEvaluations() { return 0; }
+
+unsigned long long XsReconBackend::xeCommits() { return 0; }
+
 unsigned long long XsReconBackend::nodesSolved() { return 0; }
 
 unsigned long long XsReconBackend::flatXsNodesSolved() { return 0; }
@@ -77,6 +104,14 @@ bool rasberyGpuXsReconEnabled() { return false; }
 bool rasberyGpuFlatXsEnabled() { return false; }
 
 bool rasberyGpuNodalEnabled() { return false; }
+
+bool rasberyGpuXeEnabled() { return false; }
+
+int rasberyGpuXeDotPartitions() { return 0; }
+
+unsigned long long rasberyGpuXeEvaluations() { return 0; }
+
+unsigned long long rasberyGpuXeCommits() { return 0; }
 
 unsigned long long rasberyGpuNodalDrives() { return 0; }
 

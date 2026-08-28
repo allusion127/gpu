@@ -39,6 +39,10 @@ namespace xsrecon {
 struct BatchView;
 }
 
+namespace xe {
+struct XeTriple;
+}
+
 namespace flatxs {
 struct FlatXsView;
 }
@@ -86,6 +90,84 @@ public:
     /// xs/iden uploads are skipped (host and device are bit-identical).
     bool solve(const xsrecon::BatchView& host, unsigned long long micx_generation,
                unsigned long long state_generation, double* max_change_out);
+
+    // --- Rev.7.1 Task 13: the SPLIT Xe arm (RASBERY_GPU_XE) ----------------
+    //
+    // solve() above is the FUSED step -- evaluate, damp, write, reconstruct --
+    // and it is the whole of XSSet::UpdateEquilibriumXenon.  The safeguarded
+    // Anderson arm cannot use it: it has to see F(x) before it commits
+    // anything.  These six take the same node body apart at the same seam the
+    // host API is split at (SnapshotXenon / EvaluateEquilibriumXenon /
+    // CommitXenon) and keep the Anderson history DEVICE-RESIDENT between them,
+    // which is the point -- ten triples of 3*n_fuel doubles never cross the bus.
+    //
+    // ONE HISTORY PER BACKEND, AND THEREFORE PER DRIVER.  A backend belongs to
+    // one XSSet, an XSSet to one Driver, and a --batch-mode deck to one Driver,
+    // so a batch of M decks has M independent histories with no arrangement
+    // needed.  That is deliberate and it is the fix for a bug this tree has
+    // already had: a process-wide slot-0 buffer that every Driver adopted.
+    // Nothing here is static.
+    //
+    // Every one returns false on any unavailability or CUDA error, having
+    // written nothing to the host, and the caller then runs the untouched host
+    // path.  The state uploads follow solve()'s residency contract exactly.
+
+    /// Evaluate the map at the current inventory: x (the snapshot), F(x) and
+    /// g = F(x) - x into the device history, and the RAW maximum relative
+    /// Xe-135 step into *picard_out.  WRITES NOTHING to the host arrays --
+    /// no iden row, no xs entry -- so a caller that rejects the image leaves
+    /// the solver exactly as it found it.
+    bool xeEvaluate(const xsrecon::BatchView& host, unsigned long long micx_generation,
+                    unsigned long long state_generation, double* picard_out);
+
+    /// df[0] <- df[1], dg[0] <- dg[1]: the oldest window column falls out.
+    bool xeRotateHistory();
+
+    /// df[col] <- f - f_prev, dg[col] <- g - g_prev.
+    bool xeRecordColumn(int col);
+
+    /// f_prev <- f, g_prev <- g.
+    bool xeSaveEvaluation();
+
+    /// The six inner products of the depth-2 normal equations, in
+    /// xe::XeDotSlot order.  `ncol` selects which of them are actually
+    /// computed: a one-column window reads only <g,g>, <dg0,dg0> and <dg0,g>,
+    /// and the unread slots are left at zero rather than filled from a buffer
+    /// no evaluation has written.
+    ///
+    /// FIXED PARTITION, and that is the N1 line: the host folds ~3*n_fuel
+    /// terms into one running sum, this cuts the range into a partition count
+    /// that depends on nothing but a constant, so it is reproducible run to run
+    /// but associates the additions differently.  See XeKernel.h.
+    bool xeDots(int ncol, double* out_six);
+
+    /// cand <- F - sum_j gamma_j dF_j, plus the two numbers the safeguards
+    /// need: *step_out is the trust-region metric and *physics_ok is false when
+    /// any component came out non-finite or negative.
+    bool xeCandidate(const double* gamma, int ncol, double* step_out, bool* physics_ok);
+
+    /// Commit an image and reconstruct.  `triple` is an xe::XeTripleId --
+    /// XE_T_CAND for an accepted Anderson candidate, and the Picard path passes
+    /// XE_T_F with `relax` to commit x + relax*(F - x) instead.
+    ///
+    /// `picard_skip` reproduces the FUSED update's skip: that path neither
+    /// writes nor reconstructs a node whose normalized flux was not positive,
+    /// where CommitXenon reconstructs every fuel node it is given.  Two
+    /// different host functions with two different contracts, and the device
+    /// has to honour both.
+    ///
+    /// Downloads xs (all slots + scatter) and the three Xe-chain iden rows into
+    /// the host arrays, so the host is authoritative again on return and the
+    /// caller must NOT bump its host-state generation -- the same contract
+    /// solve() has.
+    bool xeCommit(const xsrecon::BatchView& host, int triple, double relax,
+                  bool picard_skip, unsigned long long state_generation);
+
+    /// Receipts (process-wide, all instances): fuel-node evaluations and
+    /// commits the device actually ran.  Zero means the arm never fired,
+    /// whatever the flag said -- the G0 validity check.
+    static unsigned long long xeEvaluations();
+    static unsigned long long xeCommits();
 
     /// Run one unrodded flat-XS update for every node in `host` (host-side
     /// pointers; see flatxs::FlatXsView for the stream contract).
@@ -288,6 +370,20 @@ unsigned long long rasberyGpuXsReconNodes();
 
 /// Receipt accessor mirroring XsReconBackend::flatXsNodesSolved for main.cpp.
 unsigned long long rasberyGpuFlatXsNodes();
+
+/// RASBERY_GPU_XE, read once per process: the Rev.7.1 Task 13 split Xe arm
+/// (evaluate / Anderson algebra / commit on the device).  Stub builds return
+/// false.  DEFAULT OFF until the Gate A/B receipts adopt it.
+bool rasberyGpuXeEnabled();
+
+/// The fixed partition count the device inner product is cut into
+/// (RASBERY_GPU_XE_DOT_PARTITIONS, default xe::XE_DOT_PARTITIONS_DEFAULT).
+/// One reproduces the host's serial fold exactly and is bit-gateable.
+int rasberyGpuXeDotPartitions();
+
+/// Receipt accessors mirroring XsReconBackend::xeEvaluations/xeCommits.
+unsigned long long rasberyGpuXeEvaluations();
+unsigned long long rasberyGpuXeCommits();
 
 /// RASBERY_GPU_NODAL, read once per process.  Stub builds return false.
 bool rasberyGpuNodalEnabled();

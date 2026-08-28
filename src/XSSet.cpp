@@ -2,6 +2,8 @@
 
 #include "Importer.h"
 #include "XSTiming.h"
+#include "XeGpuReceipt.h"
+#include "XeKernel.h"
 #include "XsReconKernel.h"
 
 #include <cstdint>
@@ -3575,7 +3577,9 @@ static void xsreconDumpArrays(const char* path, Geometry& g,
     std::fclose(f);
 }
 
-bool XSSet::TryUpdateEquilibriumXenonGpu(double power, double relax, double& max_change) {
+bool XSSet::PrepareXeDeviceCall(double power, double relax, xsrecon::BatchView& view,
+                                std::array<double, xsrecon::NISO>& dep_i135,
+                                std::array<double, xsrecon::NISO>& dep_xe135) {
     using namespace Isotope;
 
     // The kernel fixes NG/NISO at compile time (registers, full unroll); a
@@ -3588,8 +3592,9 @@ bool XSSet::TryUpdateEquilibriumXenonGpu(double power, double relax, double& max
     if (!_xsrecon_backend->available()) {
         static std::once_flag warn_once;
         std::call_once(warn_once, [this] {
-            std::cerr << "[RASBERY][WARN][xsrecon] RASBERY_GPU_XSRECON set but device "
-                         "path unavailable ("
+            std::cerr << "[RASBERY][WARN][xsrecon] a device Xe arm was requested "
+                         "(RASBERY_GPU_XSRECON / RASBERY_GPU_FLATXS / RASBERY_GPU_XE) "
+                         "but the device path is unavailable ("
                       << _xsrecon_backend->status() << ") -- CPU loop\n";
         });
         return false;
@@ -3629,31 +3634,37 @@ bool XSSet::TryUpdateEquilibriumXenonGpu(double power, double relax, double& max
         _xsrecon_pinned = true;
     }
 
-    std::array<double, xsrecon::NISO> dep_i135{}, dep_xe135{};
     for (int j = 0; j < xsrecon::NISO; ++j) {
         dep_i135[static_cast<size_t>(j)]  = depTrans(iI135, static_cast<size_t>(j));
         dep_xe135[static_cast<size_t>(j)] = depTrans(iXe135, static_cast<size_t>(j));
     }
 
-    xsrecon::BatchView v{};
     for (int xt = 0; xt < xsrecon::NXS; ++xt) {
         const auto t = static_cast<XSTYPE>(xt);
-        v.mic[xt]    = _micx[t].data();
-        v.lmp[xt]    = _lmpx[t].data();
-        v.xs[xt]     = _xs[t].data();
+        view.mic[xt] = _micx[t].data();
+        view.lmp[xt] = _lmpx[t].data();
+        view.xs[xt]  = _xs[t].data();
     }
-    v.mic_ssm     = _micx.xssm.data();
-    v.lmp_ssm     = _lmpx.xssm.data();
-    v.xs_ssm      = _xs.xssm.data();
-    v.iden        = _iden.data();
-    v.phif        = _g.Phif();
-    v.fuel        = _fuel_nodes.data();
-    v.n_fuel      = static_cast<int>(_fuel_nodes.size());
-    v.nxyz        = nxyz;
-    v.norm_factor = NormFactor(power);
-    v.relax       = relax;
-    v.dep_i135    = dep_i135.data();
-    v.dep_xe135   = dep_xe135.data();
+    view.mic_ssm     = _micx.xssm.data();
+    view.lmp_ssm     = _lmpx.xssm.data();
+    view.xs_ssm      = _xs.xssm.data();
+    view.iden        = _iden.data();
+    view.phif        = _g.Phif();
+    view.fuel        = _fuel_nodes.data();
+    view.n_fuel      = static_cast<int>(_fuel_nodes.size());
+    view.nxyz        = nxyz;
+    view.norm_factor = NormFactor(power);
+    view.relax       = relax;
+    view.dep_i135    = dep_i135.data();
+    view.dep_xe135   = dep_xe135.data();
+    return true;
+}
+
+bool XSSet::TryUpdateEquilibriumXenonGpu(double power, double relax, double& max_change) {
+    std::array<double, xsrecon::NISO> dep_i135{}, dep_xe135{};
+    xsrecon::BatchView                v{};
+    if (!PrepareXeDeviceCall(power, relax, v, dep_i135, dep_xe135))
+        return false;
 
     // Same reason as TryUpdateFlatXSGpu: this arm downloads into the host _xs
     // columns and UpdateEquilibriumXenon's GPU branch returns BEFORE the
@@ -3664,6 +3675,114 @@ bool XSSet::TryUpdateEquilibriumXenonGpu(double power, double relax, double& max
                                    &max_change);
 }
 
+// ---------------------------------------------------------------------------
+// Rev.7.1 Task 13 -- the SPLIT device Xe arm (RASBERY_GPU_XE)
+// ---------------------------------------------------------------------------
+//
+// The header on the raw fixed-point API below says the device arm "fuses
+// evaluate + apply + reconstruct into a single kernel, so there is no
+// evaluate-only device entry point to borrow".  THAT IS WHAT THESE ADD.  They
+// do not replace the fused arm -- it is still what RASBERY_GPU_XSRECON runs,
+// bit for bit -- they add the seam, out of the same node body, so the Anderson
+// cascade can run without the host evaluating a 39-isotope condensation over
+// every fuel node on every step.
+//
+// WHAT STAYS ON THE HOST, AND WHY.  The 2x2 normal equations and all four
+// safeguards: they are eight doubles of arithmetic, they are the part a reader
+// has to be able to check against Sec 10, and running them on the host means
+// the device and host Anderson arms differ in EXACTLY ONE PLACE -- the inner
+// products.  That is what makes the N1 classification a statement about one
+// identified thing rather than about "the algebra moved".
+
+bool XSSet::XeGpuEvaluate(double power, double& picard) {
+    // THE SAME TWO TERMS UpdateEquilibriumXenon returns 0.0 on, and refusing
+    // here is behaviourally the same thing.  The host Anderson arm would run an
+    // IDENTITY evaluation instead (EvaluateEquilibriumXenon seeds its outputs
+    // with the snapshot and returns 0.0), record a zero difference column, and
+    // then fail its own arming test because 0.0 is under the tolerance -- so on
+    // both arms the outcome is "no candidate, this step is a plain Picard step",
+    // and a cascade at zero power converges on its first step either way.  What
+    // differs is a history the arming test can never reach.  The `depDecay`
+    // term is not optional: with no depletion data depTrans has no rows and the
+    // kernel's dep_i135/dep_xe135 would be built out of nothing.
+    if (depDecay.size() == 0 || power <= 0.0)
+        return false;
+    std::array<double, xsrecon::NISO> dep_i135{}, dep_xe135{};
+    xsrecon::BatchView                v{};
+    if (!PrepareXeDeviceCall(power, 1.0, v, dep_i135, dep_xe135))
+        return false;
+    xsphase::Scope eqxe_scope(xsphase::tallies().eqxe,
+                              static_cast<std::uint64_t>(v.n_fuel));
+    // Nothing is written: no _iden row, no _xs entry, no generation bump, no
+    // node reconstructed -- the same contract EvaluateEquilibriumXenon keeps.
+    return _xsrecon_backend->xeEvaluate(v, _micx_generation, _hoststate_generation,
+                                        &picard);
+}
+
+bool XSSet::XeGpuRotateHistory() {
+    return _xsrecon_backend && _xsrecon_backend->xeRotateHistory();
+}
+
+bool XSSet::XeGpuRecordColumn(int col) {
+    return _xsrecon_backend && _xsrecon_backend->xeRecordColumn(col);
+}
+
+bool XSSet::XeGpuSaveEvaluation() {
+    return _xsrecon_backend && _xsrecon_backend->xeSaveEvaluation();
+}
+
+bool XSSet::XeGpuDots(int ncol, double* out_six) {
+    return _xsrecon_backend && _xsrecon_backend->xeDots(ncol, out_six);
+}
+
+bool XSSet::XeGpuCandidate(const double* gamma, int ncol, double& step,
+                           bool& physics_ok) {
+    return _xsrecon_backend &&
+           _xsrecon_backend->xeCandidate(gamma, ncol, &step, &physics_ok);
+}
+
+bool XSSet::XeGpuCommitCandidate(double power) {
+    std::array<double, xsrecon::NISO> dep_i135{}, dep_xe135{};
+    xsrecon::BatchView                v{};
+    if (!PrepareXeDeviceCall(power, 1.0, v, dep_i135, dep_xe135))
+        return false;
+    xsphase::Scope recon_scope(xsphase::tallies().eqxe_recon,
+                               static_cast<std::uint64_t>(v.n_fuel));
+    // The download makes the host arrays equal to the device copy again, so --
+    // exactly like the fused arm -- this returns BEFORE any host-state
+    // generation bump and the macro-XS write counter is the only announcement.
+    noteMacroXsWrite();
+    return _xsrecon_backend->xeCommit(v, xe::XE_T_CAND, 1.0, /*picard_skip=*/false,
+                                      _hoststate_generation);
+}
+
+bool XSSet::XeGpuCommitPicard(double power, double relax) {
+    std::array<double, xsrecon::NISO> dep_i135{}, dep_xe135{};
+    xsrecon::BatchView                v{};
+    if (!PrepareXeDeviceCall(power, relax, v, dep_i135, dep_xe135))
+        return false;
+    xsphase::Scope recon_scope(xsphase::tallies().eqxe_recon,
+                               static_cast<std::uint64_t>(v.n_fuel));
+    noteMacroXsWrite();
+    return _xsrecon_backend->xeCommit(v, xe::XE_T_F, relax, /*picard_skip=*/true,
+                                      _hoststate_generation);
+}
+
+bool XSSet::TryUpdateEquilibriumXenonGpuSplit(double power, double relax,
+                                              double& max_change) {
+    // Evaluate then commit, which composes to EXACTLY the fused body: the
+    // seam between them carries doubles and nothing else, so no rounding can
+    // hide in it.  A failure of the second half after the first is the one
+    // asymmetry -- the evaluate wrote nothing, but a commit whose download
+    // failed may have left the host arrays half refreshed.  That is the same
+    // exposure solve() has had since it shipped, and it is a CUDA error, not a
+    // control-flow path: the instance is dead by then and every later call
+    // fails open.
+    if (!XeGpuEvaluate(power, max_change))
+        return false;
+    return XeGpuCommitPicard(power, relax);
+}
+
 double XSSet::UpdateEquilibriumXenon(double power, double relax) {
     using namespace Isotope;
 
@@ -3672,6 +3791,28 @@ double XSSet::UpdateEquilibriumXenon(double power, double relax) {
 
     xsphase::Scope eqxe_scope(xsphase::tallies().eqxe,
                               static_cast<std::uint64_t>(_g.nxyz()));
+
+    // Rev.7.1 Task 13.  The split arm runs the same node body through three
+    // kernels instead of one, so it is the SAME numbers -- what it buys is the
+    // seam the Anderson arm needs, and running the Picard cascade through it
+    // too is what makes that seam bit-gateable against this very loop.  It is
+    // tried first because a run that asked for RASBERY_GPU_XE asked for the
+    // split kernels; with the flag unset not one line of this is reached.
+    if (rasberyGpuXeEnabled()) {
+        double          gpu_max = 0.0;
+        xe::XeGpuTally& tally   = xe::xeGpuTally();
+        // Charged BEFORE the attempt, so xe_updates counts steps ASKED FOR and
+        // device_updates + host_fallbacks always adds up to it.  A receipt whose
+        // parts do not sum to its whole cannot be used to find the fallbacks.
+        tally.xe_updates.fetch_add(1, std::memory_order_relaxed);
+        if (TryUpdateEquilibriumXenonGpuSplit(power, relax, gpu_max)) {
+            tally.device_updates.fetch_add(1, std::memory_order_relaxed);
+            xsreconDebugHash(_xs, _iden, _g.ng(), _g.nxyz(), gpu_max);
+            return gpu_max;
+        }
+        tally.host_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        // any failure falls through to the fused arm, then to the CPU loop
+    }
 
     if (rasberyGpuXsReconEnabled()) {
         double gpu_max = 0.0;

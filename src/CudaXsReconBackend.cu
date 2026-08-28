@@ -4,6 +4,8 @@
 #include "FlatXsKernel.h"
 #include "GpuCanonicalState.h"
 #include "NodalKernel.h"
+#include "XeFormMask.h"
+#include "XeKernel.h"
 #include "XsReconKernel.h"
 
 #include <cuda_runtime.h>
@@ -36,6 +38,14 @@ namespace xsr = rasbery::xsrecon;
 namespace {
 
 std::atomic<unsigned long long> g_nodes_solved{0};
+
+// Rev.7.1 Task 13 receipts.  PROCESS-WIDE and therefore summed over every
+// Driver in a --batch-mode run, exactly like g_nodes_solved: they answer "did
+// the arm fire at all" (G0), which is a question about the process.  Nothing
+// per-deck lives here -- the Anderson history is a per-backend allocation and
+// there is no static holding deck state anywhere in this arm.
+std::atomic<unsigned long long> g_xe_evaluations{0};
+std::atomic<unsigned long long> g_xe_commits{0};
 
 bool envFlagEnabled(const char* name) {
     const char* v = std::getenv(name);
@@ -94,6 +104,165 @@ __global__ void kernelXsRecon(xsr::BatchView v, unsigned long long* max_bits,
         atomicMax(max_bits, static_cast<unsigned long long>(__double_as_longlong(mc)));
         atomicAdd(solved, 1ULL);
     }
+}
+
+namespace xek = rasbery::xe;
+
+// ---------------------------------------------------------------------------
+// Rev.7.1 Task 13 -- the split Xe arm's three kernels
+// ---------------------------------------------------------------------------
+//
+// THE HISTORY BLOCK is one allocation laid out [row][triple][ordinal]:
+//
+//     base + (row * XE_TRIPLE_COUNT + triple) * n_fuel
+//
+// row-major over the TRIPLE and not over the row, which looks backwards until
+// the candidate kernel is read: it wants the same row of consecutive window
+// columns (df[0].i135 and df[1].i135) n_fuel apart, so the column index is a
+// plain stride.  A triple's three rows being 10*n_fuel apart costs nothing --
+// XeTripleConst carries three pointers either way.
+
+__device__ __host__ inline const double* xeRow(const double* base, int row, int triple,
+                                               int n_fuel) {
+    return base + (static_cast<long long>(row) * xek::XE_TRIPLE_COUNT + triple) * n_fuel;
+}
+
+__device__ __host__ inline xek::XeTriple xeTripleAt(double* base, int triple, int n_fuel) {
+    xek::XeTriple t;
+    t.i135   = const_cast<double*>(xeRow(base, 0, triple, n_fuel));
+    t.xe135  = const_cast<double*>(xeRow(base, 1, triple, n_fuel));
+    t.xe135m = const_cast<double*>(xeRow(base, 2, triple, n_fuel));
+    return t;
+}
+
+__device__ __host__ inline xek::XeTripleConst xeTripleConstAt(const double* base,
+                                                              int triple, int n_fuel) {
+    xek::XeTripleConst t;
+    t.i135   = xeRow(base, 0, triple, n_fuel);
+    t.xe135  = xeRow(base, 1, triple, n_fuel);
+    t.xe135m = xeRow(base, 2, triple, n_fuel);
+    return t;
+}
+
+/// KERNEL 1 of 3: the Xe rate/dot evaluation.  One thread per fuel ordinal;
+/// x, F(x) and g land in the device history and nothing else is written.
+///
+/// The residual reduces through the same 64-bit atomicMax kernelXsRecon uses:
+/// the metric is |dXe| / max(|Xe|, 1e-30) and therefore never negative, and for
+/// non-negative IEEE doubles the unsigned order of the bit patterns IS the value
+/// order -- so the reduction is exact and order-insensitive, which is what makes
+/// it say the same thing whatever order the blocks retire in.
+__global__ void kXeEvaluate(xsr::BatchView v, double* hist, unsigned char* processed,
+                            unsigned long long* max_bits) {
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= v.n_fuel) return;
+
+    const xek::XeTriple x = xeTripleAt(hist, xek::XE_T_X, v.n_fuel);
+    const xek::XeTriple f = xeTripleAt(hist, xek::XE_T_F, v.n_fuel);
+    const xek::XeTriple g = xeTripleAt(hist, xek::XE_T_G, v.n_fuel);
+
+    double change = 0.0;
+    xek::xeEvaluateOrdinal(v, k, x, f, g, processed, &change);
+    atomicMax(max_bits, static_cast<unsigned long long>(__double_as_longlong(change)));
+}
+
+/// out = a - b over the three rows: the difference columns of the window, and
+/// the f_prev/g_prev save, expressed once.
+__global__ void kXeSub(const double* hist, int ta, int tb, int tout, int n_fuel) {
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= n_fuel) return;
+    xek::xeSubOrdinal(xeTripleConstAt(hist, ta, n_fuel), xeTripleConstAt(hist, tb, n_fuel),
+                      xeTripleAt(const_cast<double*>(hist), tout, n_fuel), k);
+}
+
+/// KERNEL 3 of 3, stage 1: k_xe_dot_reduce.  One thread owns ONE PARTITION of
+/// one pair, start to finish, so the accumulation inside a partition is serial
+/// and in ascending ordinal order -- the host's own order.  The partition
+/// boundaries come from xeDotPartitionRange, which reads only (n_fuel, parts):
+/// no launch shape, no occupancy, no arrival order.
+///
+/// This is NOT a warp-per-slot serial fold.  Thirty-two lanes splitting ~15,000
+/// terms would put the association in the hands of whoever wrote the lane
+/// mapping and would still not be the host's; a fixed partition at least makes
+/// the difference a stated, reproducible one.
+__global__ void kXeDotStage1(const double* hist, int n_fuel, int parts, int npairs,
+                             const int* pairs, double* partials,
+                             unsigned long long forms) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= npairs * parts) return;
+    const int pair = t / parts;
+    const int part = t - pair * parts;
+
+    const xek::XeTripleConst a = xeTripleConstAt(hist, pairs[2 * pair], n_fuel);
+    const xek::XeTripleConst b = xeTripleConstAt(hist, pairs[2 * pair + 1], n_fuel);
+
+    int i0 = 0, i1 = 0;
+    xek::xeDotPartitionRange(n_fuel, parts, part, &i0, &i1);
+    partials[static_cast<long long>(pair) * parts + part] =
+        xek::xeDotChunk(a, b, i0, i1, forms);
+}
+
+/// Stage 2: one thread per pair, strict serial fold in ascending partition
+/// order.  A tree here would hand the association back to the scheduler, which
+/// is the whole thing the fixed partition takes out of its hands.
+__global__ void kXeDotStage2(int parts, int npairs, const double* partials,
+                             const int* slots, double* out) {
+    const int pair = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pair >= npairs) return;
+    out[slots[pair]] =
+        xek::xeDotFold(partials + static_cast<long long>(pair) * parts, parts);
+}
+
+/// KERNEL 2a of 3: the Anderson candidate.  One thread per fuel ordinal.
+__global__ void kXeCandidate(double* hist, int n_fuel, int ncol, double g0, double g1,
+                             unsigned long long forms, int* physics_bad,
+                             unsigned long long* step_bits) {
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= n_fuel) return;
+
+    const double gamma[2] = {g0, g1};
+    int          bad      = 0;
+    double       step     = 0.0;
+    xek::xeCandidateOrdinal(xeTripleConstAt(hist, xek::XE_T_F, n_fuel),
+                            xeTripleConstAt(hist, xek::XE_T_X, n_fuel),
+                            xeRow(hist, 0, xek::XE_T_DF0, n_fuel),
+                            xeRow(hist, 1, xek::XE_T_DF0, n_fuel),
+                            xeRow(hist, 2, xek::XE_T_DF0, n_fuel), ncol, gamma,
+                            xeTripleAt(hist, xek::XE_T_CAND, n_fuel), k, n_fuel, forms,
+                            &bad, &step);
+    if (bad) atomicOr(physics_bad, 1);
+    atomicMax(step_bits, static_cast<unsigned long long>(__double_as_longlong(step)));
+}
+
+/// KERNEL 2b of 3: the Picard/Anderson update -- write the three Xe-chain rows
+/// and reconstruct the node.
+///
+/// `picard_skip` is the difference between the two host functions this one
+/// stands in for.  UpdateEquilibriumXenon's loop `continue`s on a node whose
+/// normalized flux is not positive: it writes nothing and reconstructs nothing.
+/// CommitXenon reconstructs every fuel node it is handed, because the caller
+/// chose that inventory for all of them.  Getting this wrong is not a rounding
+/// -- it is a node reconstructed that the host left alone.
+__global__ void kXeCommit(xsr::BatchView v, const double* hist, int triple, double relax,
+                          int picard_skip, const unsigned char* processed,
+                          unsigned long long* solved) {
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= v.n_fuel) return;
+    if (picard_skip && processed[k] == 0u) return;
+
+    double vi = 0.0, vx = 0.0, vm = 0.0;
+    if (picard_skip) {
+        xek::xeBlendOrdinal(xeTripleConstAt(hist, triple, v.n_fuel),
+                            xeTripleConstAt(hist, xek::XE_T_X, v.n_fuel), relax, k, &vi,
+                            &vx, &vm);
+    } else {
+        const xek::XeTripleConst t = xeTripleConstAt(hist, triple, v.n_fuel);
+        vi                         = t.i135[k];
+        vx                         = t.xe135[k];
+        vm                         = t.xe135m[k];
+    }
+    xek::xeCommitOrdinal(v, k, vi, vx, vm);
+    atomicAdd(solved, 1ULL);
 }
 
 namespace fxs = rasbery::flatxs;
@@ -1570,6 +1739,20 @@ struct XsReconBackend::Impl {
     std::uint64_t          lib_hash_cached = 0; // host tables are immutable;
     const void*            lib_hash_key    = nullptr; // hash once per source
 
+    // --- Rev.7.1 Task 13: the split Xe arm (RASBERY_GPU_XE) ---------------
+    //
+    // PER BACKEND, therefore per XSSet, therefore per Driver, therefore per
+    // deck in a --batch-mode run.  Not one byte of this is static.
+    double*             xe_hist      = nullptr; // [3][XE_TRIPLE_COUNT][n_fuel]
+    unsigned char*      xe_processed = nullptr; // [n_fuel], the zero-flux skip
+    double*             xe_partials  = nullptr; // [XE_DOT_COUNT * xe_parts]
+    double*             xe_dots      = nullptr; // [XE_DOT_COUNT]
+    int*                xe_pairs     = nullptr; // [2*XE_DOT_COUNT] then [XE_DOT_COUNT]
+    int*                xe_flags     = nullptr; // [1] physics_bad
+    unsigned long long* xe_bits      = nullptr; // [0] max/step bits, [1] nodes
+    int                 xe_parts     = 0;       // the FIXED partition count
+    int                 xe_hist_fuel = 0;       // n_fuel the block was sized for
+
     // Offsets into dev_block, in doubles.
     std::size_t off_mic[xsr::NXS] = {};
     std::size_t off_mic_ssm       = 0;
@@ -1588,6 +1771,7 @@ struct XsReconBackend::Impl {
             g_nodal_arena->releaseSlot(nodal_slot);
             nodal_slot = -1;
         }
+        xeRelease();
         if (dev_block) cudaFree(dev_block);
         if (dev_fuel) cudaFree(dev_fuel);
         if (dev_scalars) cudaFree(dev_scalars);
@@ -1620,6 +1804,9 @@ struct XsReconBackend::Impl {
         // The nodal graph baked dev_block-relative xs pointers into its kernel
         // nodes; this realloc moves them.
         dropNodalGraph();
+        // The Xe history is sized on n_fuel and its addresses are handed to
+        // kernels; a geometry change invalidates both.
+        xeRelease();
         if (dev_block) { cudaFree(dev_block); dev_block = nullptr; }
         if (dev_fuel) { cudaFree(dev_fuel); dev_fuel = nullptr; }
         if (dev_ref) { cudaFree(dev_ref); dev_ref = nullptr; }
@@ -1656,6 +1843,171 @@ struct XsReconBackend::Impl {
         return true;
     }
 
+    void xeRelease() {
+        if (xe_hist) { cudaFree(xe_hist); xe_hist = nullptr; }
+        if (xe_processed) { cudaFree(xe_processed); xe_processed = nullptr; }
+        if (xe_partials) { cudaFree(xe_partials); xe_partials = nullptr; }
+        if (xe_dots) { cudaFree(xe_dots); xe_dots = nullptr; }
+        if (xe_pairs) { cudaFree(xe_pairs); xe_pairs = nullptr; }
+        if (xe_flags) { cudaFree(xe_flags); xe_flags = nullptr; }
+        if (xe_bits) { cudaFree(xe_bits); xe_bits = nullptr; }
+        xe_hist_fuel = 0;
+        xe_parts     = 0;
+    }
+
+    /// Allocate the Xe arm's blocks for the current n_fuel.  Called from every
+    /// entry point rather than from a setup hook, so the arm has no ordering
+    /// requirement on the caller: the first thing that needs it makes it.
+    bool xeEnsure() {
+        if (xe_hist != nullptr && xe_hist_fuel == n_fuel) return true;
+        xeRelease();
+        if (n_fuel <= 0) return false;
+
+        const std::size_t nf = static_cast<std::size_t>(n_fuel);
+        xe_parts             = rasberyGpuXeDotPartitions();
+        if (xe_parts > n_fuel) xe_parts = n_fuel; // empty partitions are pure waste
+        if (xe_parts < 1) xe_parts = 1;
+
+        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&xe_hist),
+                                    3 * static_cast<std::size_t>(xek::XE_TRIPLE_COUNT) *
+                                        nf * sizeof(double)),
+                         status);
+        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&xe_processed), nf), status);
+        RASBERY_CUDA_TRY(
+            cudaMalloc(reinterpret_cast<void**>(&xe_partials),
+                       static_cast<std::size_t>(xek::XE_DOT_COUNT) *
+                           static_cast<std::size_t>(xe_parts) * sizeof(double)),
+            status);
+        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&xe_dots),
+                                    xek::XE_DOT_COUNT * sizeof(double)),
+                         status);
+        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&xe_pairs),
+                                    3 * xek::XE_DOT_COUNT * sizeof(int)),
+                         status);
+        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&xe_flags), sizeof(int)),
+                         status);
+        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&xe_bits),
+                                    2 * sizeof(unsigned long long)),
+                         status);
+        // The history is READ before it is written on exactly one path: a
+        // window column the arm never recorded.  The host guards that with
+        // ncol, and so does this arm -- but a NaN sitting in an unwritten
+        // column would turn a guard bug into a silent poisoning instead of an
+        // obvious zero, so the block starts at zero.
+        RASBERY_CUDA_TRY(cudaMemsetAsync(xe_hist, 0,
+                                         3 * static_cast<std::size_t>(
+                                                 xek::XE_TRIPLE_COUNT) *
+                                             nf * sizeof(double),
+                                         stream),
+                         status);
+        xe_hist_fuel = n_fuel;
+        return true;
+    }
+
+    /// The uploads and the view repointing every kernel entry point needs:
+    /// _micx/_lmpx on micx_generation, _xs/_iden on state_generation, phif per
+    /// call, depTrans once per instance.
+    ///
+    /// FACTORED OUT OF solve(), which now calls it, so the residency contract
+    /// is written once.  Two copies of this would be two opinions about when a
+    /// 70 MB block is stale, and the arm that guessed wrong would compute
+    /// physics against yesterday's cross sections.
+    bool stage(const xsr::BatchView& host, unsigned long long micx_generation,
+               unsigned long long state_generation, bool upload_phif,
+               xsr::BatchView& v) {
+        const std::size_t nx  = static_cast<std::size_t>(nxyz);
+        const std::size_t mic = static_cast<std::size_t>(xsr::NISO) * xsr::NG * nx;
+        const std::size_t lmp = static_cast<std::size_t>(xsr::NG) * nx;
+        const std::size_t msm =
+            static_cast<std::size_t>(xsr::NISO) * xsr::NG * xsr::NG * nx;
+        const std::size_t ssm = static_cast<std::size_t>(xsr::NG) * xsr::NG * nx;
+
+        if (!fuel_uploaded) {
+            RASBERY_CUDA_TRY(cudaMemcpyAsync(dev_fuel, host.fuel,
+                                             static_cast<std::size_t>(host.n_fuel) *
+                                                 sizeof(int),
+                                             cudaMemcpyHostToDevice, stream),
+                             status);
+            fuel_uploaded = true;
+        }
+
+        // _micx and _lmpx move together (both are outputs of the same host-side
+        // rebuild paths), so one generation covers both.
+        if (micx_generation != resident_micx_generation) {
+            for (int xt = 0; xt < xsr::NXS; ++xt)
+                if (!upload(host.mic[xt], off_mic[xt], mic)) return false;
+            if (!upload(host.mic_ssm, off_mic_ssm, msm)) return false;
+            for (int xt = 0; xt < xsr::NXS; ++xt)
+                if (!upload(host.lmp[xt], off_lmp[xt], lmp)) return false;
+            if (!upload(host.lmp_ssm, off_lmp_ssm, ssm)) return false;
+            resident_micx_generation = micx_generation;
+        }
+
+        // Per-call state.  _iden and _xs are uploaded whole so the kernel's
+        // fuel-only writes round-trip the non-fuel entries unchanged, keeping
+        // the host arrays authoritative for every node after the download.
+        // While the host-state generation matches the resident copy, the host
+        // has not written _xs/_iden since our last download, so both are
+        // already bit-identical on the device and the ~4.4 MB re-upload is
+        // skipped.
+        if (state_generation != resident_state_generation) {
+            if (!upload(host.iden, off_iden, static_cast<std::size_t>(xsr::NISO) * nx))
+                return false;
+            for (int xt = 0; xt < xsr::NXS; ++xt)
+                if (!upload(host.xs[xt], off_xs[xt], lmp)) return false;
+            if (!upload(host.xs_ssm, off_xs_ssm, ssm)) return false;
+        }
+        if (upload_phif &&
+            !upload(host.phif, off_phif, static_cast<std::size_t>(xsr::NG) * nx))
+            return false;
+
+        v = host;
+        for (int xt = 0; xt < xsr::NXS; ++xt) {
+            v.mic[xt] = dev_block + off_mic[xt];
+            v.lmp[xt] = dev_block + off_lmp[xt];
+            v.xs[xt]  = dev_block + off_xs[xt];
+        }
+        v.mic_ssm = dev_block + off_mic_ssm;
+        v.lmp_ssm = dev_block + off_lmp_ssm;
+        v.iden    = dev_block + off_iden;
+        v.xs_ssm  = dev_block + off_xs_ssm;
+        v.phif    = dev_block + off_phif;
+        v.fuel    = dev_fuel;
+
+        // depTrans rows: 39 doubles each, constant for the process, so they are
+        // uploaded exactly once per instance.  With 100 Xe calls per case the
+        // two per-call copies were pure API-call overhead (nsys: memcpy CALL
+        // COUNT, not payload, dominates the timeline).
+        if (dev_dep == nullptr) {
+            RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&dev_dep),
+                                        2 * xsr::NISO * sizeof(double)),
+                             status);
+            RASBERY_CUDA_TRY(cudaMemcpyAsync(dev_dep, host.dep_i135,
+                                             xsr::NISO * sizeof(double),
+                                             cudaMemcpyHostToDevice, stream),
+                             status);
+            RASBERY_CUDA_TRY(cudaMemcpyAsync(dev_dep + xsr::NISO, host.dep_xe135,
+                                             xsr::NISO * sizeof(double),
+                                             cudaMemcpyHostToDevice, stream),
+                             status);
+        }
+        v.dep_i135  = dev_dep;
+        v.dep_xe135 = dev_dep + xsr::NISO;
+        return true;
+    }
+
+    /// The xs + Xe-chain-iden download every committing path owes the host.
+    bool drainXeCommit(const xsr::BatchView& host) {
+        const std::size_t nx  = static_cast<std::size_t>(nxyz);
+        const std::size_t lmp = static_cast<std::size_t>(xsr::NG) * nx;
+        const std::size_t ssm = static_cast<std::size_t>(xsr::NG) * xsr::NG * nx;
+        for (int xt = 0; xt < xsr::NXS; ++xt)
+            if (!download(host.xs[xt], off_xs[xt], lmp)) return false;
+        if (!download(host.xs_ssm, off_xs_ssm, ssm)) return false;
+        return download(host.iden + static_cast<std::size_t>(xsr::I135) * nx,
+                        off_iden + static_cast<std::size_t>(xsr::I135) * nx, 3 * nx);
+    }
+
     bool upload(const double* src, std::size_t off, std::size_t count) {
         RASBERY_CUDA_TRY(cudaMemcpyAsync(dev_block + off, src, count * sizeof(double),
                                          cudaMemcpyHostToDevice, stream), status);
@@ -1671,8 +2023,9 @@ struct XsReconBackend::Impl {
 
 XsReconBackend::XsReconBackend() : _impl(std::make_unique<Impl>()) {
     if (!rasberyGpuXsReconEnabled() && !rasberyGpuFlatXsEnabled() &&
-        !rasberyGpuNodalEnabled()) {
-        _impl->status = "disabled (RASBERY_GPU_XSRECON/RASBERY_GPU_FLATXS unset)";
+        !rasberyGpuNodalEnabled() && !rasberyGpuXeEnabled()) {
+        _impl->status =
+            "disabled (RASBERY_GPU_XSRECON/RASBERY_GPU_FLATXS/RASBERY_GPU_XE unset)";
         return;
     }
     int count = 0;
@@ -1710,77 +2063,14 @@ bool XsReconBackend::solve(const xsr::BatchView& host, unsigned long long micx_g
         return false;
     }
 
-    const std::size_t nx  = static_cast<std::size_t>(d.nxyz);
-    const std::size_t mic = static_cast<std::size_t>(xsr::NISO) * xsr::NG * nx;
-    const std::size_t lmp = static_cast<std::size_t>(xsr::NG) * nx;
-    const std::size_t msm = static_cast<std::size_t>(xsr::NISO) * xsr::NG * xsr::NG * nx;
-    const std::size_t ssm = static_cast<std::size_t>(xsr::NG) * xsr::NG * nx;
-
-    if (!d.fuel_uploaded) {
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_fuel, host.fuel,
-                                         static_cast<std::size_t>(host.n_fuel) * sizeof(int),
-                                         cudaMemcpyHostToDevice, d.stream), d.status);
-        d.fuel_uploaded = true;
-    }
-
-    // _micx and _lmpx move together (both are outputs of the same host-side
-    // rebuild paths), so one generation covers both.
-    if (micx_generation != d.resident_micx_generation) {
-        for (int xt = 0; xt < xsr::NXS; ++xt)
-            if (!d.upload(host.mic[xt], d.off_mic[xt], mic)) return false;
-        if (!d.upload(host.mic_ssm, d.off_mic_ssm, msm)) return false;
-        for (int xt = 0; xt < xsr::NXS; ++xt)
-            if (!d.upload(host.lmp[xt], d.off_lmp[xt], lmp)) return false;
-        if (!d.upload(host.lmp_ssm, d.off_lmp_ssm, ssm)) return false;
-        d.resident_micx_generation = micx_generation;
-    }
-
-    // Per-call state.  _iden and _xs are uploaded whole so the kernel's
-    // fuel-only writes round-trip the non-fuel entries unchanged, keeping the
-    // host arrays authoritative for every node after the download.  While the
-    // host-state generation matches the resident copy, the host has not
-    // written _xs/_iden since our last download, so both are already
-    // bit-identical on the device and the ~4.4 MB re-upload is skipped.
-    if (state_generation != d.resident_state_generation) {
-        if (!d.upload(host.iden, d.off_iden, static_cast<std::size_t>(xsr::NISO) * nx)) return false;
-        for (int xt = 0; xt < xsr::NXS; ++xt)
-            if (!d.upload(host.xs[xt], d.off_xs[xt], lmp)) return false;
-        if (!d.upload(host.xs_ssm, d.off_xs_ssm, ssm)) return false;
-    }
-    if (!d.upload(host.phif, d.off_phif, static_cast<std::size_t>(xsr::NG) * nx)) return false;
+    // Uploads and view repointing: Impl::stage, which is this function's own
+    // former body -- the Task 13 arm needs the identical residency contract and
+    // two copies of it would be two opinions about when a 70 MB block is stale.
+    xsr::BatchView v{};
+    if (!d.stage(host, micx_generation, state_generation, true, v)) return false;
 
     RASBERY_CUDA_TRY(cudaMemsetAsync(d.dev_scalars, 0, 2 * sizeof(unsigned long long),
                                      d.stream), d.status);
-
-    xsr::BatchView v = host;
-    for (int xt = 0; xt < xsr::NXS; ++xt) {
-        v.mic[xt] = d.dev_block + d.off_mic[xt];
-        v.lmp[xt] = d.dev_block + d.off_lmp[xt];
-        v.xs[xt]  = d.dev_block + d.off_xs[xt];
-    }
-    v.mic_ssm = d.dev_block + d.off_mic_ssm;
-    v.lmp_ssm = d.dev_block + d.off_lmp_ssm;
-    v.iden    = d.dev_block + d.off_iden;
-    v.xs_ssm  = d.dev_block + d.off_xs_ssm;
-    v.phif    = d.dev_block + d.off_phif;
-    v.fuel    = d.dev_fuel;
-
-    // depTrans rows: 39 doubles each, constant for the process, so they are
-    // uploaded exactly once per instance.  With 100 Xe calls per case the two
-    // per-call copies were pure API-call overhead (nsys: memcpy CALL COUNT,
-    // not payload, dominates the timeline).
-    if (d.dev_dep == nullptr) {
-        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d.dev_dep),
-                                    2 * xsr::NISO * sizeof(double)), d.status);
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_dep, host.dep_i135,
-                                         xsr::NISO * sizeof(double),
-                                         cudaMemcpyHostToDevice, d.stream), d.status);
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_dep + xsr::NISO, host.dep_xe135,
-                                         xsr::NISO * sizeof(double),
-                                         cudaMemcpyHostToDevice, d.stream), d.status);
-    }
-    v.dep_i135  = d.dev_dep;
-    v.dep_xe135 = d.dev_dep + xsr::NISO;
 
     const int block = 128;
     const int grid  = (host.n_fuel + block - 1) / block;
@@ -1789,12 +2079,7 @@ bool XsReconBackend::solve(const xsr::BatchView& host, unsigned long long micx_g
 
     // Results the host needs back: the reconstructed xs, the three Xe-chain
     // density rows (contiguous, iso-major), and the two scalars.
-    for (int xt = 0; xt < xsr::NXS; ++xt)
-        if (!d.download(host.xs[xt], d.off_xs[xt], lmp)) return false;
-    if (!d.download(host.xs_ssm, d.off_xs_ssm, ssm)) return false;
-    if (!d.download(host.iden + static_cast<std::size_t>(xsr::I135) * nx,
-                    d.off_iden + static_cast<std::size_t>(xsr::I135) * nx, 3 * nx))
-        return false;
+    if (!d.drainXeCommit(host)) return false;
 
     unsigned long long scalars[2] = {0, 0};
     RASBERY_CUDA_TRY(cudaMemcpyAsync(scalars, d.dev_scalars,
@@ -1814,6 +2099,276 @@ bool XsReconBackend::solve(const xsr::BatchView& host, unsigned long long micx_g
 
     g_nodes_solved.fetch_add(scalars[1], std::memory_order_relaxed);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Rev.7.1 Task 13 -- the split Xe arm
+// ---------------------------------------------------------------------------
+//
+// Six entry points, and between them the Anderson history NEVER LEAVES THE
+// DEVICE.  That is the whole reason the split is worth having: the host arm
+// carries ten triples of 3*n_fuel doubles (about 2 MB on kngr_238) and touches
+// all of them every step, and moving that across the bus twice per step would
+// cost more than the algebra it is accelerating.  What crosses instead is
+// eight doubles and a flag.
+//
+// EVERY ONE FAILS OPEN.  A false return means "the host path must run", and it
+// is returned before anything the host can observe has been touched -- the
+// uploads copy host->device only, and the one function that writes host memory
+// (xeCommit) does so after its kernel has already succeeded.
+
+bool XsReconBackend::xeEvaluate(const xsr::BatchView& host,
+                                unsigned long long micx_generation,
+                                unsigned long long state_generation,
+                                double* picard_out) {
+    Impl& d = *_impl;
+    if (!d.available || host.n_fuel <= 0 || host.nxyz <= 0) return false;
+    if (!d.ensure(host.nxyz, host.n_fuel)) {
+        d.available = false;
+        return false;
+    }
+    if (!d.xeEnsure()) {
+        d.available = false;
+        return false;
+    }
+
+    xsr::BatchView v{};
+    if (!d.stage(host, micx_generation, state_generation, true, v)) return false;
+
+    RASBERY_CUDA_TRY(cudaMemsetAsync(d.xe_bits, 0, 2 * sizeof(unsigned long long),
+                                     d.stream),
+                     d.status);
+
+    const int block = 128;
+    const int grid  = (host.n_fuel + block - 1) / block;
+    kXeEvaluate<<<grid, block, 0, d.stream>>>(v, d.xe_hist, d.xe_processed, d.xe_bits);
+    RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
+
+    unsigned long long bits = 0;
+    RASBERY_CUDA_TRY(cudaMemcpyAsync(&bits, d.xe_bits, sizeof(bits),
+                                     cudaMemcpyDeviceToHost, d.stream),
+                     d.status);
+    RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
+
+    double picard;
+    static_assert(sizeof(picard) == sizeof(bits), "bit width");
+    std::memcpy(&picard, &bits, sizeof(picard));
+    *picard_out = picard;
+
+    // NOTHING WAS WRITTEN on the host, so the host arrays and the device copy
+    // still agree exactly as the staging left them -- and the staging is what
+    // brought them into agreement, so the residency advances here even though
+    // no download ran.  Missing this would re-upload _xs and _iden on every
+    // step of a cascade that never dirtied them.
+    d.resident_state_generation = state_generation;
+
+    g_xe_evaluations.fetch_add(static_cast<unsigned long long>(host.n_fuel),
+                               std::memory_order_relaxed);
+    return true;
+}
+
+bool XsReconBackend::xeRotateHistory() {
+    Impl& d = *_impl;
+    if (!d.available || d.xe_hist == nullptr || d.xe_hist_fuel <= 0) return false;
+    // df[0] <- df[1] and dg[0] <- dg[1], one row at a time: the block is
+    // [row][triple][ordinal], so a triple's three rows are not contiguous and a
+    // single copy would drag nine other triples along with them.
+    const std::size_t bytes = static_cast<std::size_t>(d.xe_hist_fuel) * sizeof(double);
+    const int         pairs[2][2] = {{xek::XE_T_DF1, xek::XE_T_DF0},
+                                     {xek::XE_T_DG1, xek::XE_T_DG0}};
+    for (const auto& pr : pairs)
+        for (int row = 0; row < 3; ++row) {
+            double* dst = const_cast<double*>(xeRow(d.xe_hist, row, pr[1], d.xe_hist_fuel));
+            const double* src = xeRow(d.xe_hist, row, pr[0], d.xe_hist_fuel);
+            RASBERY_CUDA_TRY(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice,
+                                             d.stream),
+                             d.status);
+        }
+    return true;
+}
+
+bool XsReconBackend::xeRecordColumn(int col) {
+    Impl& d = *_impl;
+    if (!d.available || d.xe_hist == nullptr || d.xe_hist_fuel <= 0) return false;
+    if (col < 0 || col >= xek::XE_DEPTH) return false;
+
+    const int block = 256;
+    const int grid  = (d.xe_hist_fuel + block - 1) / block;
+    kXeSub<<<grid, block, 0, d.stream>>>(d.xe_hist, xek::XE_T_F, xek::XE_T_F_PREV,
+                                         xek::XE_T_DF0 + col, d.xe_hist_fuel);
+    RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
+    kXeSub<<<grid, block, 0, d.stream>>>(d.xe_hist, xek::XE_T_G, xek::XE_T_G_PREV,
+                                         xek::XE_T_DG0 + col, d.xe_hist_fuel);
+    RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
+    return true;
+}
+
+bool XsReconBackend::xeSaveEvaluation() {
+    Impl& d = *_impl;
+    if (!d.available || d.xe_hist == nullptr || d.xe_hist_fuel <= 0) return false;
+    const std::size_t bytes = static_cast<std::size_t>(d.xe_hist_fuel) * sizeof(double);
+    const int         pairs[2][2] = {{xek::XE_T_F, xek::XE_T_F_PREV},
+                                     {xek::XE_T_G, xek::XE_T_G_PREV}};
+    for (const auto& pr : pairs)
+        for (int row = 0; row < 3; ++row) {
+            double* dst = const_cast<double*>(xeRow(d.xe_hist, row, pr[1], d.xe_hist_fuel));
+            const double* src = xeRow(d.xe_hist, row, pr[0], d.xe_hist_fuel);
+            RASBERY_CUDA_TRY(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice,
+                                             d.stream),
+                             d.status);
+        }
+    return true;
+}
+
+bool XsReconBackend::xeDots(int ncol, double* out_six) {
+    Impl& d = *_impl;
+    if (!d.available || d.xe_hist == nullptr || d.xe_hist_fuel <= 0) return false;
+    if (ncol < 1 || ncol > xek::XE_DEPTH) return false;
+
+    // WHICH PRODUCTS THE HOST ACTUALLY READS, and no others.  With a full
+    // window it reads all six.  With one column it reads <g,g>, <dg0,dg0> and
+    // <dg0,g> -- and its one-column fallback takes the NEWEST column, which at
+    // ncol == 1 is dg0, so those three cover both branches.  Computing the rest
+    // would read triples no evaluation has written; leaving them at zero says
+    // "not measured" instead of manufacturing a number.
+    int host_pairs[2 * xek::XE_DOT_COUNT] = {};
+    int host_slots[xek::XE_DOT_COUNT]     = {};
+    int npairs                            = 0;
+    auto add = [&](int slot, int left, int right) {
+        host_pairs[2 * npairs]     = left;
+        host_pairs[2 * npairs + 1] = right;
+        host_slots[npairs]         = slot;
+        ++npairs;
+    };
+    add(xek::XE_DOT_GG, xek::XE_T_G, xek::XE_T_G);
+    add(xek::XE_DOT_A, xek::XE_T_DG0, xek::XE_T_DG0);
+    add(xek::XE_DOT_P, xek::XE_T_DG0, xek::XE_T_G);
+    if (ncol == xek::XE_DEPTH) {
+        add(xek::XE_DOT_B, xek::XE_T_DG0, xek::XE_T_DG1);
+        add(xek::XE_DOT_C, xek::XE_T_DG1, xek::XE_T_DG1);
+        add(xek::XE_DOT_Q, xek::XE_T_DG1, xek::XE_T_G);
+    }
+
+    RASBERY_CUDA_TRY(cudaMemcpyAsync(d.xe_pairs, host_pairs,
+                                     static_cast<std::size_t>(2 * npairs) * sizeof(int),
+                                     cudaMemcpyHostToDevice, d.stream),
+                     d.status);
+    RASBERY_CUDA_TRY(cudaMemcpyAsync(d.xe_pairs + 2 * xek::XE_DOT_COUNT, host_slots,
+                                     static_cast<std::size_t>(npairs) * sizeof(int),
+                                     cudaMemcpyHostToDevice, d.stream),
+                     d.status);
+    RASBERY_CUDA_TRY(cudaMemsetAsync(d.xe_dots, 0, xek::XE_DOT_COUNT * sizeof(double),
+                                     d.stream),
+                     d.status);
+
+    const int block1 = 128;
+    const int total  = npairs * d.xe_parts;
+    kXeDotStage1<<<(total + block1 - 1) / block1, block1, 0, d.stream>>>(
+        d.xe_hist, d.xe_hist_fuel, d.xe_parts, npairs, d.xe_pairs, d.xe_partials,
+        xe::xeFormMask());
+    RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
+    kXeDotStage2<<<1, xek::XE_DOT_COUNT, 0, d.stream>>>(
+        d.xe_parts, npairs, d.xe_partials, d.xe_pairs + 2 * xek::XE_DOT_COUNT,
+        d.xe_dots);
+    RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
+
+    RASBERY_CUDA_TRY(cudaMemcpyAsync(out_six, d.xe_dots,
+                                     xek::XE_DOT_COUNT * sizeof(double),
+                                     cudaMemcpyDeviceToHost, d.stream),
+                     d.status);
+    RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
+    return true;
+}
+
+bool XsReconBackend::xeCandidate(const double* gamma, int ncol, double* step_out,
+                                 bool* physics_ok) {
+    Impl& d = *_impl;
+    if (!d.available || d.xe_hist == nullptr || d.xe_hist_fuel <= 0) return false;
+    if (ncol < 1 || ncol > xek::XE_DEPTH) return false;
+
+    RASBERY_CUDA_TRY(cudaMemsetAsync(d.xe_flags, 0, sizeof(int), d.stream), d.status);
+    RASBERY_CUDA_TRY(cudaMemsetAsync(d.xe_bits, 0, sizeof(unsigned long long), d.stream),
+                     d.status);
+
+    const int block = 256;
+    const int grid  = (d.xe_hist_fuel + block - 1) / block;
+    kXeCandidate<<<grid, block, 0, d.stream>>>(d.xe_hist, d.xe_hist_fuel, ncol, gamma[0],
+                                               gamma[1], xe::xeFormMask(), d.xe_flags,
+                                               d.xe_bits);
+    RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
+
+    int                bad  = 0;
+    unsigned long long bits = 0;
+    RASBERY_CUDA_TRY(cudaMemcpyAsync(&bad, d.xe_flags, sizeof(int),
+                                     cudaMemcpyDeviceToHost, d.stream),
+                     d.status);
+    RASBERY_CUDA_TRY(cudaMemcpyAsync(&bits, d.xe_bits, sizeof(bits),
+                                     cudaMemcpyDeviceToHost, d.stream),
+                     d.status);
+    RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
+
+    double step;
+    std::memcpy(&step, &bits, sizeof(step));
+    *step_out   = step;
+    *physics_ok = (bad == 0);
+    return true;
+}
+
+bool XsReconBackend::xeCommit(const xsr::BatchView& host, int triple, double relax,
+                              bool picard_skip, unsigned long long state_generation) {
+    Impl& d = *_impl;
+    if (!d.available || host.n_fuel <= 0 || host.nxyz <= 0) return false;
+    if (d.xe_hist == nullptr || d.xe_hist_fuel != host.n_fuel) return false;
+
+    // A commit is only ever reached through an evaluate that staged _micx and
+    // _lmpx; if that has not happened, the resident generation is still 0 and
+    // passing it to stage() would read "already resident" and run the kernel
+    // against an empty block.  Refuse instead, and let the host path run.
+    if (d.resident_micx_generation == 0) return false;
+
+    // The evaluate that produced this image already staged everything; passing
+    // state_generation again is what makes that explicit rather than assumed --
+    // if the host DID write in between, the re-upload happens here and the
+    // commit runs against what the host actually holds.  phif is not uploaded:
+    // a commit reads no flux.
+    xsr::BatchView v{};
+    if (!d.stage(host, d.resident_micx_generation, state_generation, false, v))
+        return false;
+
+    RASBERY_CUDA_TRY(cudaMemsetAsync(d.xe_bits + 1, 0, sizeof(unsigned long long),
+                                     d.stream),
+                     d.status);
+
+    const int block = 128;
+    const int grid  = (host.n_fuel + block - 1) / block;
+    kXeCommit<<<grid, block, 0, d.stream>>>(v, d.xe_hist, triple, relax,
+                                            picard_skip ? 1 : 0, d.xe_processed,
+                                            d.xe_bits + 1);
+    RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
+
+    if (!d.drainXeCommit(host)) return false;
+
+    unsigned long long solved = 0;
+    RASBERY_CUDA_TRY(cudaMemcpyAsync(&solved, d.xe_bits + 1, sizeof(solved),
+                                     cudaMemcpyDeviceToHost, d.stream),
+                     d.status);
+    RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
+
+    // Same contract solve() has: the downloads just made the host arrays equal
+    // to the device copy, so the caller must NOT bump its host-state generation
+    // -- the two agree, and a bump would buy a 4.4 MB re-upload for nothing.
+    d.resident_state_generation = state_generation;
+
+    g_xe_commits.fetch_add(solved, std::memory_order_relaxed);
+    return true;
+}
+
+unsigned long long XsReconBackend::xeEvaluations() {
+    return g_xe_evaluations.load(std::memory_order_relaxed);
+}
+
+unsigned long long XsReconBackend::xeCommits() {
+    return g_xe_commits.load(std::memory_order_relaxed);
 }
 
 bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
@@ -2952,6 +3507,44 @@ bool rasberyGpuFlatXsEnabled() {
 bool rasberyGpuNodalEnabled() {
     static const bool on = envFlagEnabled("RASBERY_GPU_NODAL");
     return on;
+}
+
+bool rasberyGpuXeEnabled() {
+    static const bool on = envFlagEnabled("RASBERY_GPU_XE");
+    return on;
+}
+
+int rasberyGpuXeDotPartitions() {
+    // Read once, clamped once.  A partition count that changed between calls
+    // would change the association between calls, and then a run would not even
+    // be reproducible against itself -- which is the one property the fixed
+    // partition exists to give.  Nonsense (zero, negative, unparseable) falls
+    // back to the default rather than to 1: silently switching to the exact but
+    // slow fold would look like a performance regression with no cause.
+    static const int parts = [] {
+        const char* v = std::getenv("RASBERY_GPU_XE_DOT_PARTITIONS");
+        if (v == nullptr) return xe::XE_DOT_PARTITIONS_DEFAULT;
+        char*           end = nullptr;
+        const long long n   = std::strtoll(v, &end, 10);
+        if (end == nullptr || *end != '\0' || n < 1) {
+            std::cerr << "[RASBERY][WARN][xe] RASBERY_GPU_XE_DOT_PARTITIONS=\"" << v
+                      << "\" is not a positive count; using the default "
+                      << xe::XE_DOT_PARTITIONS_DEFAULT << " instead.\n";
+            return xe::XE_DOT_PARTITIONS_DEFAULT;
+        }
+        return static_cast<int>(n > xe::XE_DOT_PARTITIONS_MAX
+                                    ? xe::XE_DOT_PARTITIONS_MAX
+                                    : n);
+    }();
+    return parts;
+}
+
+unsigned long long rasberyGpuXeEvaluations() {
+    return g_xe_evaluations.load(std::memory_order_relaxed);
+}
+
+unsigned long long rasberyGpuXeCommits() {
+    return g_xe_commits.load(std::memory_order_relaxed);
 }
 
 unsigned long long rasberyGpuNodalDrives() {

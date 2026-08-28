@@ -597,6 +597,18 @@ int main(int argc, char* argv[]) {
         if (rasbery::rasberyGpuFlatXsEnabled())
             std::cout << "[RASBERY][FLATXS][GPU] {\"nodes_solved\":"
                       << rasbery::rasberyGpuFlatXsNodes() << "}" << std::endl;
+        // Rev.7.1 Task 13.  device_updates == 0 with the flag set means the arm
+        // never ran and every A/B measured against this run is void (G0); the
+        // node counts are the same claim at fuel-node granularity.
+        if (rasbery::rasberyGpuXeEnabled()) {
+            std::cout << "[RASBERY][XE_GPU] {";
+            rasbery::xe::appendXeGpuReceiptFields(std::cout);
+            std::cout << ",\"fuel_node_evaluations\":"
+                      << rasbery::rasberyGpuXeEvaluations()
+                      << ",\"fuel_node_commits\":" << rasbery::rasberyGpuXeCommits()
+                      << ",\"dot_partitions\":" << rasbery::rasberyGpuXeDotPartitions()
+                      << "}" << std::endl;
+        }
         if (rasbery::rasberyGpuNodalEnabled()) {
             std::cout << "[RASBERY][NODAL][GPU] {\"drives_solved\":"
                       << rasbery::rasberyGpuNodalDrives() << "}" << std::endl;
@@ -691,6 +703,15 @@ int main(int argc, char* argv[]) {
     if (rasbery::rasberyGpuFlatXsEnabled())
         std::cout << "[RASBERY][FLATXS][GPU] {\"nodes_solved\":"
                   << rasbery::rasberyGpuFlatXsNodes() << "}" << std::endl;
+    // See the batch arm above: the Task 13 device Xe receipt, same fields.
+    if (rasbery::rasberyGpuXeEnabled()) {
+        std::cout << "[RASBERY][XE_GPU] {";
+        rasbery::xe::appendXeGpuReceiptFields(std::cout);
+        std::cout << ",\"fuel_node_evaluations\":" << rasbery::rasberyGpuXeEvaluations()
+                  << ",\"fuel_node_commits\":" << rasbery::rasberyGpuXeCommits()
+                  << ",\"dot_partitions\":" << rasbery::rasberyGpuXeDotPartitions()
+                  << "}" << std::endl;
+    }
     if (rasbery::rasberyGpuNodalEnabled()) {
         std::cout << "[RASBERY][NODAL][GPU] {\"drives_solved\":"
                   << rasbery::rasberyGpuNodalDrives() << "}" << std::endl;

@@ -107,6 +107,11 @@ DRIVE = region(DRIVER, "    int Drive() {", "\n};\n", "Drive")
 AA = region(DRIVER, "    static bool TryAndersonXeStep(",
             "\n    // Frozen-Xe startup guard", "TryAndersonXeStep")
 AA_CODE = code_lines(AA)
+# Rev.7.1 Task 13: the device sibling (RASBERY_GPU_XE).  Scoped separately so a
+# check can say WHICH arm it is talking about; every check above this line is
+# about the host arm and stays that way.
+GPU_AA = region(DRIVER, "    static bool TryAndersonXeStepGpu(",
+                "\n    /// One safeguarded Anderson step", "TryAndersonXeStepGpu")
 
 # ---------------------------------------------------------------------------
 # 1. The gate: one read, cached, MODE-DEPENDENT default, env overrides both ways.
@@ -475,10 +480,20 @@ fuel_fn = region(XSSET, "const std::vector<int>& XSSet::fuel_nodes() {",
                  "\nvoid XSSet::SnapshotXenon(", "fuel_nodes")
 if "_g.IsFuel(l)" not in fuel_fn or "if (_fuel_nodes.empty())" not in fuel_fn:
     fail("fuel_nodes() is not the build-once, ascending-node-index list the ordinals mean")
-gpu_arm = region(XSSET, "bool XSSet::TryUpdateEquilibriumXenonGpu(",
-                 "\ndouble XSSet::UpdateEquilibriumXenon(", "TryUpdateEquilibriumXenonGpu")
+# Rev.7.1 Task 13 moved the shared setup -- dimension check, backend creation,
+# pinning, the ordinal list and the pointer view -- into PrepareXeDeviceCall, so
+# the fused arm and the three split entry points cannot disagree about any of
+# them.  The region therefore starts THERE: what this check has always been
+# about is that the device side indexes through the ONE fuel_nodes() list rather
+# than building a second one, and the single owner of that call is now the
+# preparation function every device arm goes through.
+gpu_arm = region(XSSET, "bool XSSet::PrepareXeDeviceCall(",
+                 "\ndouble XSSet::UpdateEquilibriumXenon(", "PrepareXeDeviceCall")
 if "fuel_nodes()" not in gpu_arm:
     fail("the xsrecon device arm no longer reads the shared fuel_nodes() list")
+if gpu_arm.count("fuel_nodes()") != 1 or "_g.IsFuel" in gpu_arm:
+    fail("a device Xe arm builds its own fuel-node list; there must be exactly one "
+         "fuel_nodes() call, in PrepareXeDeviceCall, and no independent IsFuel scan")
 for fn in ("SnapshotXenon", "EvaluateEquilibriumXenon", "CommitXenon"):
     body = region(XSSET, f"XSSet::{fn}(", "\n}\n", fn)
     if "fuel_nodes()" not in body:
@@ -678,8 +693,22 @@ for counter in COUNTERS:
         fail(f"{counter} is not published by both SPTELEM receipts")
     if DRIVER.count(f"c.{counter}") != 2:
         fail(f"{counter} is not passed as an argument at both receipt sites")
-    if DRIVER.count(f"++ctx.telemetry.{counter};") != 1:
-        fail(f"{counter} must be charged in exactly one place")
+    # ONE CHARGE SITE PER ARM, and no more.  Rev.7.1 Task 13 added a second
+    # Anderson arm (TryAndersonXeStepGpu, RASBERY_GPU_XE) which is a SIBLING of
+    # the host one rather than a shared body -- Driver.h says why, and the price
+    # of that decision is that "proposed" and "accepted" are charged twice, once
+    # in each arm.  Exactly one of the two arms runs in a process, so the totals
+    # are unchanged; what would break them is a THIRD site, or a second site
+    # outside the device arm, and both are still failures here.
+    #
+    # "rejected" and "history_resets" stay at ONE site each: both arms reach
+    # them through RejectXeAnderson / ResetXeAndersonHistory, which is what makes
+    # the two arms' rejection distributions and reset counts comparable at all.
+    per_arm = 2 if counter in ("xe_aa_proposed", "xe_aa_accepted") else 1
+    if DRIVER.count(f"++ctx.telemetry.{counter};") != per_arm:
+        fail(f"{counter} must be charged in exactly {per_arm} place(s)")
+    if per_arm == 2 and GPU_AA.count(f"++ctx.telemetry.{counter};") != 1:
+        fail(f"{counter}'s second charge site is not inside the device Anderson arm")
     # ...and that place is inside the gated arm, never in the loop body, where it
     # would be charged on a step Anderson never took.
     if f"ctx.telemetry.{counter}" in SOLVE_CODE:

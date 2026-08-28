@@ -7,6 +7,8 @@
 #include "OuterTrace.h"
 #include "PPR.h"
 #include "Scheduler.h"
+#include "XeGpuReceipt.h"
+#include "XeKernel.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1696,6 +1698,13 @@ private:
             return;
         aa.forget();
         ++ctx.telemetry.xe_aa_history_resets;
+        // The same event in the run-total receipt.  The DEVICE history needs no
+        // separate discard: aa.ncol and aa.have_prev are the only things that
+        // decide whether a column is read, they live here on the host for both
+        // arms, and forget() has just cleared them -- so a device column can no
+        // longer be reached until an evaluation overwrites it.  One place
+        // decides, which is what keeps the two arms' reset counts identical.
+        xe::xeGpuTally().reset_edges.fetch_add(1, std::memory_order_relaxed);
     }
 
     /// Charge one rejection and, only under RASBERY_XE_ANDERSON_DEBUG, say why.
@@ -1708,6 +1717,190 @@ private:
             std::cerr << std::format(
                 "[RASBERY][DEBUG][xe-aa] rejected ({}) cols={} picard={:.3e} value={:.3e}\n",
                 reason, cols, picard, value);
+    }
+
+    /// The DEVICE arm of the safeguarded Anderson step (RASBERY_GPU_XE,
+    /// Rev.7.1 Task 13).
+    ///
+    /// ---------------------------------------------------------------------
+    /// WHY THIS IS A SIBLING AND NOT A PARAMETER OF THE HOST FUNCTION
+    /// ---------------------------------------------------------------------
+    ///
+    /// The obvious move is to lift the two arms behind a small interface --
+    /// evaluate / roll / dots / candidate / commit -- and share the safeguards.
+    /// It is the wrong move HERE, and the reason is measurable: the host arm's
+    /// XeDot and candidate loop are currently INLINED into the host arm, and
+    /// what gcc contracts inside an inlined body is not what it contracts
+    /// behind an indirect call.  Task 13's first gate is that RASBERY_GPU_XE
+    /// unset reproduces the frozen baseline byte for byte, and a refactor that
+    /// moves the host's arithmetic into a different function body cannot
+    /// promise that.  So the host arm is not touched at all, and the price is
+    /// this: the eight safeguard decisions appear twice.
+    ///
+    /// THEY ARE THE SAME EIGHT, IN THE SAME ORDER, WITH THE SAME CONSTANTS, and
+    /// tools/test_xe_gpu_contract.py reads both functions and fails when they
+    /// stop being so.  What differs -- the ONLY thing that differs -- is where
+    /// the six inner products are computed:
+    ///
+    ///     host arm    XeDot, one serial fold over ~3*n_fuel terms
+    ///     this arm    k_xe_dot_reduce, a fixed partition of the same range
+    ///
+    /// which associates the additions differently and is therefore a trajectory
+    /// change (N1, Gate A/B).  Everything else -- the map, the window, the
+    /// normal equations, the four safeguards, the acceptance semantics, the
+    /// history reset edges -- is bit-for-bit the host's.
+    ///
+    /// THE REJECTION PATH IS THE HOST'S, NOT AN OPTIMISED ONE.  The plan's
+    /// Rev.7.1 Step 5 has the device commit a damped Picard image from the F it
+    /// already holds, saving one evaluation.  This returns FALSE instead and
+    /// lets the caller run UpdateEquilibriumXenon, which re-evaluates the map at
+    /// the same untouched state and therefore commits THE SAME IMAGE -- with
+    /// the same xe_relax the plan asks for, because that call takes the
+    /// damper's relax.  Identical result, on ~5 % of steps, and the caller's
+    /// control flow stays the one the host arm's caller already has: the
+    /// fallback is literally the production path rather than a second near-copy
+    /// of it.  That is the same trade the host arm's own comment defends.
+    static bool TryAndersonXeStepGpu(SolverContext& ctx, XeAndersonState& aa,
+                                     double power, double max_step, double& xe_change) {
+        XSSet& xs = ctx.cross_sections;
+
+        // 1. Evaluate the map without applying it (plan Sec 10.1) -- x, F(x)
+        //    and g land in the DEVICE history and never cross the bus.
+        double picard = 0.0;
+        if (!xs.XeGpuEvaluate(power, picard))
+            return false;
+        const size_t n = xs.fuel_nodes().size();
+        if (n == 0)
+            return false;
+
+        // 2. Roll the history forward BEFORE deciding anything.  A refused step
+        //    still contributes its pair: the Picard step the caller falls back
+        //    to advances the SAME iteration on the SAME map, so the next
+        //    evaluation's difference column is only meaningful if this one was
+        //    recorded.  Sec 10.5: raw, undamped (x, F(x)) pairs only.
+        if (aa.have_prev) {
+            if (aa.ncol == XE_ANDERSON_DEPTH) {
+                if (!xs.XeGpuRotateHistory())
+                    return false;
+                --aa.ncol; // the oldest column falls out of the window
+            }
+            if (!xs.XeGpuRecordColumn(aa.ncol))
+                return false;
+            ++aa.ncol;
+        }
+        if (!xs.XeGpuSaveEvaluation())
+            return false;
+        aa.have_prev = true;
+        // The host arm's length check has no device counterpart and needs none:
+        // the history block is one allocation sized on n_fuel, which is
+        // geometry-fixed, and the backend refuses every call whose n_fuel does
+        // not match what the block was sized for.  A column of the wrong length
+        // is unrepresentable rather than guarded against.
+
+        // 3. Arming -- NOT a rejection, so neither counter moves.  Same two
+        //    terms, same reasons, as the host arm.
+        if (aa.ncol == 0 || picard < XE_EQUILIBRIUM_TOLERANCE)
+            return false;
+
+        ++ctx.telemetry.xe_aa_proposed;
+        xe::xeGpuTally().aa_proposed.fetch_add(1, std::memory_order_relaxed);
+
+        // 4. The least squares, through explicit normal equations.  THE HOST
+        //    COMPUTES THESE, from six device-reduced scalars: it is eight
+        //    doubles of arithmetic, it is the part a reader checks against
+        //    Sec 10, and doing it here means the two arms differ in exactly one
+        //    identified place (the inner products) rather than in "the algebra".
+        double dots[xe::XE_DOT_COUNT] = {};
+        if (!xs.XeGpuDots(aa.ncol, dots))
+            return false;
+
+        static_assert(XE_ANDERSON_DEPTH == 2,
+                      "the normal equations below are written out for a two-column window; "
+                      "the device dot slots (xe::XeDotSlot) are too, and a depth-3 "
+                      "experiment has to widen both together");
+        const double gg = dots[xe::XE_DOT_GG];
+        double       gamma[XE_ANDERSON_DEPTH] = {};
+        double       proj                     = 0.0; // sum_j gamma_j <dG_j, g_k>
+        bool         solved                   = false;
+        if (aa.ncol == XE_ANDERSON_DEPTH) {
+            const double a   = dots[xe::XE_DOT_A];
+            const double b   = dots[xe::XE_DOT_B];
+            const double c   = dots[xe::XE_DOT_C];
+            const double p   = dots[xe::XE_DOT_P];
+            const double q   = dots[xe::XE_DOT_Q];
+            const double det = a * c - b * b;
+            if (a > 0.0 && c > 0.0 && std::isfinite(det) && std::isfinite(p) &&
+                std::isfinite(q) && det > XE_ANDERSON_MIN_GRAM * a * c) {
+                gamma[0] = (c * p - b * q) / det;
+                gamma[1] = (a * q - b * p) / det;
+                proj     = gamma[0] * p + gamma[1] * q;
+                solved   = true;
+            }
+        }
+        if (!solved) {
+            // The newest column.  At ncol == 2 that is dg[1] -- slots C and Q --
+            // and at ncol == 1 it is dg[0], which is slots A and P; the backend
+            // fills exactly those for a one-column window.
+            const int    j = aa.ncol - 1;
+            const double a = (j == 1) ? dots[xe::XE_DOT_C] : dots[xe::XE_DOT_A];
+            const double p = (j == 1) ? dots[xe::XE_DOT_Q] : dots[xe::XE_DOT_P];
+            if (a > 0.0 && std::isfinite(a) && std::isfinite(p) &&
+                a > XE_ANDERSON_MIN_GRAM * gg) {
+                for (double& gj : gamma)
+                    gj = 0.0;
+                gamma[j] = p / a;
+                proj     = gamma[j] * p;
+                solved   = true;
+            }
+        }
+        if (!solved) {
+            RejectXeAnderson(ctx, "condition", aa.ncol, picard, gg);
+            return false;
+        }
+
+        // SAFEGUARD 2/4: the fit must predict a residual DECREASE.
+        const double pred2 = gg - proj;
+        if (!(std::isfinite(pred2) && pred2 >= 0.0 && pred2 < gg)) {
+            RejectXeAnderson(ctx, "residual", aa.ncol, picard, pred2);
+            return false;
+        }
+
+        // x_{k+1} = F_k - sum_j gamma_j dF_j, and with it SAFEGUARD 3/4 (every
+        // density finite and non-negative) and the trust-region metric, all in
+        // one device pass over the fuel nodes.  Two scalars come back.
+        double step        = 0.0;
+        bool   physics_ok  = false;
+        if (!xs.XeGpuCandidate(gamma, aa.ncol, step, physics_ok))
+            return false;
+        if (!physics_ok) {
+            // The host arm names the offending Xe-135 density here; the device
+            // arm knows only that one node failed, and the step is what it can
+            // honestly report.  The counter and the reason are the same.
+            RejectXeAnderson(ctx, "physics", aa.ncol, picard, step);
+            return false;
+        }
+
+        // SAFEGUARD 4/4: the trust region.  Written as !(<=) so a NaN rejects.
+        if (!(step <= max_step * picard)) {
+            RejectXeAnderson(ctx, "step", aa.ncol, picard, step);
+            return false;
+        }
+
+        // Accepted.  The commit writes exactly the three Xe-chain rows,
+        // reconstructs the fuel nodes and downloads both back into the host
+        // arrays -- so the host is authoritative again and, exactly like the
+        // fused device arm, the host-state generation is NOT bumped.
+        if (!xs.XeGpuCommitCandidate(power))
+            return false;
+        ++ctx.telemetry.xe_aa_accepted;
+        {
+            xe::XeGpuTally& t = xe::xeGpuTally();
+            t.aa_accepted.fetch_add(1, std::memory_order_relaxed);
+            t.xe_updates.fetch_add(1, std::memory_order_relaxed);
+            t.device_updates.fetch_add(1, std::memory_order_relaxed);
+        }
+        xe_change = picard;
+        return true;
     }
 
     /// One safeguarded Anderson step on the Xe fixed point.
@@ -1727,6 +1920,18 @@ private:
     /// otherwise pays a full flux re-convergence.
     static bool TryAndersonXeStep(SolverContext& ctx, XeAndersonState& aa, double power,
                                   double max_step, double& xe_change) {
+        // Rev.7.1 Task 13.  ONE LINE, AT THE TOP, and the body below is
+        // untouched -- the same shape the fused equilibrium-Xe entry point in
+        // XSSet.cpp gives its device branch, and for the same reason: with
+        // RASBERY_GPU_XE unset this is a load of a cached bool and the host arm
+        // runs exactly the expressions it always ran, in the same function,
+        // with the same inlining.  A restructuring that hoisted the two arms
+        // behind a common interface would move the host's arithmetic into a
+        // different function body, and a bit-identity claim does not survive
+        // that.
+        if (rasberyGpuXeEnabled())
+            return TryAndersonXeStepGpu(ctx, aa, power, max_step, xe_change);
+
         XSSet& xs = ctx.cross_sections;
 
         // 1. Evaluate the map without applying it (plan Sec 10.1).
