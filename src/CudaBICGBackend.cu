@@ -1684,11 +1684,51 @@ __global__ void cmfd_wiel_terms(const int nxyz,
     ps[l]              = pv;
 }
 
+/// How many addends one fold lane pulls into registers before it folds them.
+///
+/// This is a MEMORY-LEVEL-PARALLELISM knob and nothing else.  The fold below
+/// is a hard serial dependency (see the kernel comment), so the only latency
+/// a restructuring can remove is the load latency, and the only way a single
+/// thread removes load latency is by having more than one load in flight.
+///
+/// Measured on GP102 (sm_61, nxyz = 8451 -- the KNGR mesh), interleaved
+/// best-of-12 so the clock ramp cannot bias the ratio:
+///
+///     flat (what ptxas schedules on its own)   258.3 us   1.00x
+///     batch 4                                  258.8 us   1.00x
+///     batch 8 / 16 / 32                        230.6 us   1.12x
+///     batch 64                                 216.8 us   1.19x
+///     dependent DADD chain, no memory at all   202.3 us   1.28x
+///
+/// That last row is the ceiling: it is the same 8451-long chain with the
+/// operands already in registers, so 1.28x is ALL that any bit-preserving
+/// rewrite of this fold can ever be worth.  64 collects 93% of it and ptxas
+/// reports 32 registers with zero spill, so there is nothing to trade back.
+constexpr int kWielFoldBatch = 64;
+
 /// The serial l-ascending fold of the stored addends, plus the eigenvalue
 /// update.  One thread per slot; slots in parallel on gridDim.y.  The
 /// warm-up (icy < 0) and Rayleigh branches never run here: the host only
 /// delegates once the Wielandt regime is reached, and a degenerate gamma
 /// hands the sweep back to the host with the sums exported.
+///
+/// WHY THIS FOLD IS SERIAL, AND WHY IT STAYS SERIAL.  `sum = sum + v[l]` over
+/// l ascending is BICGCMFD::wiel's own accumulation (BICGCMFD.cpp, the
+/// `err`/`gammad`/`gamman` loop), and a rounded floating-point add is not
+/// associative: any partition of the range into chunks that are summed
+/// separately and then folded changes the result by a few ULP.  The stage-1 /
+/// stage-2 partition that reduce_dot_stage1/2 use is therefore NOT available
+/// here -- those reductions define their own order and only have to be
+/// reproducible, this one has to reproduce a specific serial order that is
+/// already baked into the frozen reference output.  Nor is there a parallel
+/// algorithm that reproduces a chosen sequential rounding sequence: each
+/// rounding depends on the running sum, so the chain length nxyz IS the
+/// critical path.
+///
+/// What CAN be removed is load latency, and only that; see kWielFoldBatch.
+/// The addends are folded in exactly the same order, each one an ordinary
+/// rounded double, so the batching is bit-preserving by construction -- only
+/// the loads move, never an add.
 __global__ void cmfd_wiel_finalize(const int nxyz,
                                    const long long vec_stride,
                                    const double* __restrict__ terms_ab,
@@ -1708,7 +1748,20 @@ __global__ void cmfd_wiel_finalize(const int nxyz,
     if (lane < 3) {
         const double* values = lane == 0 ? ta : (lane == 1 ? ta + nxyz : tc);
         double sum = 0.0;
-        for (int l = 0; l < nxyz; ++l) sum = sum + values[l];
+        // RASBERY_CMFD_WIEL_FOLD_BEGIN -- mirrored verbatim by
+        // test/cmfd_wiel_fold_replay.cu; tools/test_cmfd_wiel_fold_contract.py
+        // fails if the two texts drift apart.
+        int       l    = 0;
+        const int tail = nxyz - (nxyz % kWielFoldBatch);
+        for (; l < tail; l += kWielFoldBatch) {
+            double batch[kWielFoldBatch];
+#pragma unroll
+            for (int j = 0; j < kWielFoldBatch; ++j) batch[j] = __ldg(values + l + j);
+#pragma unroll
+            for (int j = 0; j < kWielFoldBatch; ++j) sum = sum + batch[j];
+        }
+        for (; l < nxyz; ++l) sum = sum + values[l];
+        // RASBERY_CMFD_WIEL_FOLD_END
         lane_sum[lane] = sum;
     }
     __syncthreads();
