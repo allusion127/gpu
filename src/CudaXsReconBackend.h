@@ -24,9 +24,11 @@
 //    off-by-default exploration path; fail-open-to-CPU keeps physics runs
 //    alive on machines without a device.
 
+#include "GpuCanonicalState.h"
 #include "HostPinRegistry.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <memory>
 #include <string>
@@ -137,6 +139,39 @@ public:
     /// arrays solveNodal downloaded, upload dsncff and finish with the jnet
     /// phase.  Only valid right after a hybrid solveNodal returned true.
     bool solveNodalPost(const nodal::NodalView& host);
+
+    // --- Rev.7.1 Task 7: canonical CMFD-Nodal device state -----------------
+    //
+    // EXTERNAL-BUFFER ADAPTER MODE.  The caller hands over device pointers this
+    // backend must USE instead of its own private block for jnet/flux/phis.
+    // They are BORROWED, never freed here, and they must come from
+    // GpuPhysicsArena -- whose whole contract is that a per-slot address is
+    // fixed at reserve() and never moves, which is what makes it legal to bake
+    // them into the captured nodal graph.
+    //
+    // Passing an all-null set (the default) is LEGACY: the private block is
+    // used, every transfer happens exactly as before, and the feature-off path
+    // is byte-identical.  That is also what makes mixed mode work -- one
+    // instance shared, another legacy, in one process, with no third code path.
+    void adoptCanonicalBuffers(const gpu::CanonicalSlotBuffers& buffers);
+
+    /// What this backend is currently borrowing (all-null in legacy mode).
+    [[nodiscard]] gpu::CanonicalSlotBuffers canonicalBuffers() const;
+
+    /// THE OBSERVATION API (Rev.7 Sec 3.3).  With the routine downloads elided,
+    /// the host Geometry arrays no longer track the device -- so a host consumer
+    /// must SAY it is about to look.  `mask` is a bitmask over CanonicalRegion
+    /// (canonicalConsumerMask() builds the right one per consumer); the regions
+    /// in it are copied back on the next drive, the rest are not.
+    ///
+    /// Set it to 0 again once the consumer has run, or every drive pays the
+    /// download the sharing was supposed to remove.
+    void setMaterializeMask(std::uint32_t mask);
+    [[nodiscard]] std::uint32_t materializeMask() const;
+
+    /// Receipt: how many routine per-outer transfers the sharing removed.
+    [[nodiscard]] unsigned long long canonicalUploadsElided() const;
+    [[nodiscard]] unsigned long long canonicalDownloadsElided() const;
 
     /// G0 receipt for the nodal kernel (RASBERY_GPU_NODAL): drive() calls
     /// completed on the device.

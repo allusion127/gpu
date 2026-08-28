@@ -49,6 +49,24 @@ bool XsReconBackend::pinHost(const void* p, size_t bytes, const char* tag) {
     return rasberyPinHost(p, bytes, tag);
 }
 
+// Rev.7.1 Task 7 stub parity.  A no-CUDA build has no device buffers to borrow,
+// so adoption is accepted and ignored and every accessor answers "legacy".  The
+// call sites therefore need no #ifdef, which is the same contract every other
+// symbol in this file keeps.
+void XsReconBackend::adoptCanonicalBuffers(const gpu::CanonicalSlotBuffers&) {}
+
+gpu::CanonicalSlotBuffers XsReconBackend::canonicalBuffers() const {
+    return gpu::CanonicalSlotBuffers{};
+}
+
+void XsReconBackend::setMaterializeMask(std::uint32_t) {}
+
+std::uint32_t XsReconBackend::materializeMask() const { return 0u; }
+
+unsigned long long XsReconBackend::canonicalUploadsElided() const { return 0; }
+
+unsigned long long XsReconBackend::canonicalDownloadsElided() const { return 0; }
+
 bool rasberyGpuXsReconEnabled() { return false; }
 
 bool rasberyGpuFlatXsEnabled() { return false; }

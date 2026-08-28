@@ -2,6 +2,7 @@
 
 #include "CudaTransferMirror.h"
 #include "FlatXsKernel.h"
+#include "GpuCanonicalState.h"
 #include "NodalKernel.h"
 #include "XsReconKernel.h"
 
@@ -1172,6 +1173,32 @@ struct XsReconBackend::Impl {
     const void*     g_key_flux = nullptr;
     int             g_key_nxyz = 0, g_key_nsurf = 0, g_key_chif_empty = -1;
 
+    // --- Rev.7.1 Task 7: canonical CMFD-Nodal device state ------------------
+    //
+    // `canonical.buffers` is BORROWED from GpuPhysicsArena (fixed addresses, so
+    // baking them into the capture is safe).  All-null means legacy, and every
+    // predicate is then inert -- which is how one slot shares while another does
+    // not, in one process, with no third code path.
+    gpu::CanonicalSlotState canonical{};
+    /// Which regions a host consumer has asked to SEE this drive.  0 = nobody
+    /// is looking, so the downloads are skipped and the Geometry arrays go
+    /// deliberately stale.
+    std::uint32_t canonical_materialize = 0u;
+    unsigned long long canonical_uploads_elided   = 0;
+    unsigned long long canonical_downloads_elided = 0;
+
+    // Both of these are BAKED INTO THE CAPTURE: the borrowed pointers are memcpy
+    // operands, and the materialize mask decides which memcpy NODES exist at
+    // all.  A graph captured under one and replayed under the other would move
+    // the wrong bytes, or none, so they are part of the key rather than assumed
+    // constant.
+    const void*   g_key_canon_jnet = nullptr;
+    const void*   g_key_canon_flux = nullptr;
+    const void*   g_key_canon_phis = nullptr;
+    std::uint32_t g_key_materialize = 0xFFFFFFFFu;
+    int           g_key_canon_owner_jnet = -1;
+    int           g_key_canon_owner_flux = -1;
+
     void dropNodalGraph() {
         if (nodal_graph != nullptr) {
             cudaGraphExecDestroy(nodal_graph);
@@ -1868,9 +1895,16 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     v.xsrf = d.dev_block + d.off_xs[xsr::T_XSRF];
     v.xsnf = d.dev_block + d.off_xs[xsr::T_XSNF];
     v.xssm = d.dev_block + d.off_xs_ssm;
-    v.jnet = d.ndev_dbl + d.n_off_jnet;
-    v.flux = d.ndev_dbl + d.n_off_flux;
-    v.phis = d.ndev_dbl + d.n_off_phis;
+    // Rev.7.1 Task 7: CANONICAL STATE.  In shared mode jnet/flux/phis are the
+    // arena's buffers, which the CMFD backend also holds -- so the three
+    // per-drive uploads and the two downloads below are copies of data that is
+    // already where it needs to be.  A null borrowed pointer means this slot is
+    // legacy and the private block is used, which is what lets one slot share
+    // while another does not (mixed mode) with no third code path.
+    const gpu::CanonicalSlotBuffers& canon = d.canonical.buffers;
+    v.jnet = canon.jnet != nullptr ? canon.jnet : d.ndev_dbl + d.n_off_jnet;
+    v.flux = canon.flux != nullptr ? canon.flux : d.ndev_dbl + d.n_off_flux;
+    v.phis = canon.phis != nullptr ? canon.phis : d.ndev_dbl + d.n_off_phis;
     double* wk = d.ndev_dbl + d.n_off_work;
     v.trlcff0 = wk; wk += ndg;
     v.trlcff1 = wk; wk += ndg;
@@ -1899,12 +1933,28 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         // reigv_dev stays null so updateMatrix reads the by-value scalar
         // exactly as before.
         v.reigv_dev = nullptr;
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_jnet, host.jnet,
-                                         surf_bytes,
-                                         cudaMemcpyHostToDevice, d.stream), d.status);
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_flux, host.flux,
-                                         nx * ndl::NG * sizeof(double),
-                                         cudaMemcpyHostToDevice, d.stream), d.status);
+        // Task 7: the same elision as the FULL path, and NOT optional here.
+        // v.jnet/v.flux are bound to the canonical buffers above, so an
+        // unconditional upload would overwrite what the CMFD backend just
+        // produced with the host's stale copy -- the sharing would silently
+        // become a slower, wronger version of the old path.
+        if (!gpu::canonicalElidesUpload(canon, gpu::CanonicalRegion::Jnet,
+                                        d.canonical.ownerOf(gpu::CanonicalRegion::Jnet),
+                                        gpu::CanonicalOwner::Nodal)) {
+            RASBERY_CUDA_TRY(cudaMemcpyAsync(v.jnet, host.jnet, surf_bytes,
+                                             cudaMemcpyHostToDevice, d.stream), d.status);
+        } else {
+            ++d.canonical_uploads_elided;
+        }
+        if (!gpu::canonicalElidesUpload(canon, gpu::CanonicalRegion::Flux,
+                                        d.canonical.ownerOf(gpu::CanonicalRegion::Flux),
+                                        gpu::CanonicalOwner::Nodal)) {
+            RASBERY_CUDA_TRY(cudaMemcpyAsync(const_cast<double*>(v.flux), host.flux,
+                                             nx * ndl::NG * sizeof(double),
+                                             cudaMemcpyHostToDevice, d.stream), d.status);
+        } else {
+            ++d.canonical_uploads_elided;
+        }
         kNodalTrl0<false><<<gng, B, 0, d.stream>>>(v, nullptr);
         kNodalTrl12<false><<<gng, B, 0, d.stream>>>(v, nullptr);
         kNodalMat<false><<<gn, B, 0, d.stream>>>(v, nullptr);
@@ -1971,12 +2021,27 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_reigv, reigv_src,
                                          sizeof(double),
                                          cudaMemcpyHostToDevice, d.stream), d.status);
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_jnet, host.jnet,
-                                         surf_bytes,
-                                         cudaMemcpyHostToDevice, d.stream), d.status);
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_flux, host.flux,
-                                         nx * ndl::NG * sizeof(double),
-                                         cudaMemcpyHostToDevice, d.stream), d.status);
+        // Task 7: elided when the region is canonical AND a device side wrote it
+        // last.  When the HOST wrote last -- a perturbation, a rod move, a
+        // restart -- the upload is still required, which is why the predicate
+        // consults ownership instead of just the sharing flag.
+        if (!gpu::canonicalElidesUpload(canon, gpu::CanonicalRegion::Jnet,
+                                        d.canonical.ownerOf(gpu::CanonicalRegion::Jnet),
+                                        gpu::CanonicalOwner::Nodal)) {
+            RASBERY_CUDA_TRY(cudaMemcpyAsync(v.jnet, host.jnet, surf_bytes,
+                                             cudaMemcpyHostToDevice, d.stream), d.status);
+        } else {
+            ++d.canonical_uploads_elided;
+        }
+        if (!gpu::canonicalElidesUpload(canon, gpu::CanonicalRegion::Flux,
+                                        d.canonical.ownerOf(gpu::CanonicalRegion::Flux),
+                                        gpu::CanonicalOwner::Nodal)) {
+            RASBERY_CUDA_TRY(cudaMemcpyAsync(const_cast<double*>(v.flux), host.flux,
+                                             nx * ndl::NG * sizeof(double),
+                                             cudaMemcpyHostToDevice, d.stream), d.status);
+        } else {
+            ++d.canonical_uploads_elided;
+        }
         kNodalTrl0<false><<<gng, B, 0, d.stream>>>(v, nullptr);
         kNodalTrl12<false><<<gng, B, 0, d.stream>>>(v, nullptr);
         if (nodalFuseMatEvenEnabled()) {
@@ -1986,10 +2051,24 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
             kNodalEven<false><<<gn, B, 0, d.stream>>>(v, nullptr);
         }
         kNodalJnet<false><<<gs, B, 0, d.stream>>>(v, nullptr);
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(host.jnet, v.jnet, surf_bytes,
-                                         cudaMemcpyDeviceToHost, d.stream), d.status);
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(host.phis, v.phis, surf_bytes,
-                                         cudaMemcpyDeviceToHost, d.stream), d.status);
+        // The drive just wrote jnet and phis on the device, so Nodal owns them.
+        // The download back to the Geometry arrays happens only when a host
+        // consumer has ASKED (materialize); otherwise the CMFD backend reads
+        // them straight out of the same buffers.
+        if (!gpu::canonicalElidesDownload(canon, gpu::CanonicalRegion::Jnet,
+                                          d.canonical_materialize)) {
+            RASBERY_CUDA_TRY(cudaMemcpyAsync(host.jnet, v.jnet, surf_bytes,
+                                             cudaMemcpyDeviceToHost, d.stream), d.status);
+        } else {
+            ++d.canonical_downloads_elided;
+        }
+        if (!gpu::canonicalElidesDownload(canon, gpu::CanonicalRegion::Phis,
+                                          d.canonical_materialize)) {
+            RASBERY_CUDA_TRY(cudaMemcpyAsync(host.phis, v.phis, surf_bytes,
+                                             cudaMemcpyDeviceToHost, d.stream), d.status);
+        } else {
+            ++d.canonical_downloads_elided;
+        }
         return true;
     };
 
@@ -1997,6 +2076,15 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     // host.phis / host.flux are Geometry-owned and stable per backend
     // instance, but a re-bound Nodal::reset would silently orphan the graph,
     // so they are checked rather than assumed.
+    //
+    // Task 7 adds four more.  The borrowed canonical pointers are memcpy
+    // OPERANDS in the capture, and the materialize mask plus the two ownerships
+    // decide which memcpy NODES exist at all -- a graph captured with the
+    // downloads elided and replayed when a consumer is looking would leave the
+    // host arrays stale, which is exactly the failure the observation API is
+    // there to prevent.  All four are constant in the steady state (ownership
+    // settles on the device side, and nobody materialises mid-segment), so this
+    // costs one instantiation at the mode change and none after.
     const bool key_ok = d.nodal_graph != nullptr &&
                         d.g_key_ndev == d.ndev_dbl &&
                         d.g_key_dblk == d.dev_block &&
@@ -2005,7 +2093,15 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
                         d.g_key_flux == host.flux &&
                         d.g_key_nxyz == host.nxyz &&
                         d.g_key_nsurf == host.nsurf &&
-                        d.g_key_chif_empty == host.chif_empty;
+                        d.g_key_chif_empty == host.chif_empty &&
+                        d.g_key_canon_jnet == canon.jnet &&
+                        d.g_key_canon_flux == canon.flux &&
+                        d.g_key_canon_phis == canon.phis &&
+                        d.g_key_materialize == d.canonical_materialize &&
+                        d.g_key_canon_owner_jnet ==
+                            static_cast<int>(d.canonical.ownerOf(gpu::CanonicalRegion::Jnet)) &&
+                        d.g_key_canon_owner_flux ==
+                            static_cast<int>(d.canonical.ownerOf(gpu::CanonicalRegion::Flux));
     if (d.nodal_graph != nullptr && !key_ok)
         d.dropNodalGraph();
 
@@ -2069,6 +2165,14 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
             d.g_key_nxyz       = host.nxyz;
             d.g_key_nsurf      = host.nsurf;
             d.g_key_chif_empty = host.chif_empty;
+            d.g_key_canon_jnet = canon.jnet;
+            d.g_key_canon_flux = canon.flux;
+            d.g_key_canon_phis = canon.phis;
+            d.g_key_materialize = d.canonical_materialize;
+            d.g_key_canon_owner_jnet =
+                static_cast<int>(d.canonical.ownerOf(gpu::CanonicalRegion::Jnet));
+            d.g_key_canon_owner_flux =
+                static_cast<int>(d.canonical.ownerOf(gpu::CanonicalRegion::Flux));
             const cudaError_t lrc = cudaGraphLaunch(d.nodal_graph, d.stream);
             if (lrc != cudaSuccess) {
                 d.status = std::string("cudaGraphLaunch -> ") + cudaGetErrorString(lrc);
@@ -2088,6 +2192,15 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
                    cudaGetErrorString(lasterr != cudaSuccess ? lasterr : syncrc);
         cudaGetLastError();
         return false;
+    }
+
+    // Task 7: the FULL drive wrote jnet and phis on the device.  Recording it
+    // here rather than at the enqueue is deliberate -- the ownership must not
+    // move until the work has actually landed, or a failed drive would leave the
+    // next upload elided against bytes that were never produced.
+    if (!hybrid_even) {
+        d.canonical.setOwner(gpu::CanonicalRegion::Jnet, gpu::CanonicalOwner::Nodal);
+        d.canonical.setOwner(gpu::CanonicalRegion::Phis, gpu::CanonicalOwner::Nodal);
     }
 
     g_nodal_d2h_bytes.store(2 * surf_bytes, std::memory_order_relaxed);
@@ -2132,9 +2245,13 @@ bool XsReconBackend::solveNodalPost(const ndl::NodalView& host) {
     v.m264   = d.ndev_dbl + d.n_off_consts + 6 * ndg2;
     v.diagD  = d.ndev_dbl + d.n_off_consts + 7 * ndg2;
     v.diagDI = d.ndev_dbl + d.n_off_consts + 8 * ndg2;
-    v.jnet = d.ndev_dbl + d.n_off_jnet;
-    v.flux = d.ndev_dbl + d.n_off_flux;
-    v.phis = d.ndev_dbl + d.n_off_phis;
+    // Task 7: same canonical binding as solveNodal -- solveNodalPost finishes
+    // the SAME drive, so it must address the same buffers or the jnet phase
+    // writes somewhere the CMFD backend will never look.
+    const gpu::CanonicalSlotBuffers& canon = d.canonical.buffers;
+    v.jnet = canon.jnet != nullptr ? canon.jnet : d.ndev_dbl + d.n_off_jnet;
+    v.flux = canon.flux != nullptr ? canon.flux : d.ndev_dbl + d.n_off_flux;
+    v.phis = canon.phis != nullptr ? canon.phis : d.ndev_dbl + d.n_off_phis;
     double* wk = wk0;
     v.trlcff0 = wk; wk += ndg2;
     v.trlcff1 = wk; wk += ndg2;
@@ -2154,16 +2271,80 @@ bool XsReconBackend::solveNodalPost(const ndl::NodalView& host) {
     kNodalJnet<false><<<gs, B, 0, d.stream>>>(v, nullptr);
     RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
 
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(host.jnet, v.jnet,
-                                     ns * ndl::NG * sizeof(double),
-                                     cudaMemcpyDeviceToHost, d.stream), d.status);
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(host.phis, v.phis,
-                                     ns * ndl::NG * sizeof(double),
-                                     cudaMemcpyDeviceToHost, d.stream), d.status);
+    if (!gpu::canonicalElidesDownload(canon, gpu::CanonicalRegion::Jnet,
+                                      d.canonical_materialize)) {
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(host.jnet, v.jnet,
+                                         ns * ndl::NG * sizeof(double),
+                                         cudaMemcpyDeviceToHost, d.stream), d.status);
+    } else {
+        ++d.canonical_downloads_elided;
+    }
+    if (!gpu::canonicalElidesDownload(canon, gpu::CanonicalRegion::Phis,
+                                      d.canonical_materialize)) {
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(host.phis, v.phis,
+                                         ns * ndl::NG * sizeof(double),
+                                         cudaMemcpyDeviceToHost, d.stream), d.status);
+    } else {
+        ++d.canonical_downloads_elided;
+    }
     RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
+
+    // The drive produced jnet and phis on the device; record that so the next
+    // drive's upload predicate knows it does not have to push them back.
+    d.canonical.setOwner(gpu::CanonicalRegion::Jnet, gpu::CanonicalOwner::Nodal);
+    d.canonical.setOwner(gpu::CanonicalRegion::Phis, gpu::CanonicalOwner::Nodal);
 
     g_nodal_drives.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Rev.7.1 Task 7: canonical CMFD-Nodal device state
+// ---------------------------------------------------------------------------
+
+void XsReconBackend::adoptCanonicalBuffers(const gpu::CanonicalSlotBuffers& buffers) {
+    Impl& d = *_impl;
+    // Adopting is a TOPOLOGY change for the captured nodal graph: the borrowed
+    // pointers are memcpy operands baked into it.  The key check in solveNodal
+    // catches that on its own, but dropping here makes the invalidation happen
+    // at the moment of the decision rather than one drive later.
+    if (d.canonical.buffers.jnet != buffers.jnet ||
+        d.canonical.buffers.flux != buffers.flux ||
+        d.canonical.buffers.phis != buffers.phis)
+        d.dropNodalGraph();
+
+    d.canonical.buffers = buffers;
+    // A freshly adopted buffer holds whatever the arena last put there, which
+    // this backend did not produce.  Start every region HOST-owned so the first
+    // drive uploads rather than trusting bytes nobody has vouched for.
+    for (int r = 0; r < gpu::kCanonicalRegionCount; ++r)
+        d.canonical.setOwner(static_cast<gpu::CanonicalRegion>(r), gpu::CanonicalOwner::Host);
+}
+
+gpu::CanonicalSlotBuffers XsReconBackend::canonicalBuffers() const {
+    return _impl->canonical.buffers;
+}
+
+void XsReconBackend::setMaterializeMask(std::uint32_t mask) {
+    Impl& d = *_impl;
+    // Also a topology change: the mask decides which download NODES exist in the
+    // capture.  Without the drop, a graph captured while nobody was looking
+    // would replay with the downloads still missing and the consumer would read
+    // a stale Geometry array -- the exact failure this API exists to prevent.
+    if (d.canonical_materialize != mask) d.dropNodalGraph();
+    d.canonical_materialize = mask;
+}
+
+std::uint32_t XsReconBackend::materializeMask() const {
+    return _impl->canonical_materialize;
+}
+
+unsigned long long XsReconBackend::canonicalUploadsElided() const {
+    return _impl->canonical_uploads_elided;
+}
+
+unsigned long long XsReconBackend::canonicalDownloadsElided() const {
+    return _impl->canonical_downloads_elided;
 }
 
 unsigned long long XsReconBackend::nodalDrivesSolved() {

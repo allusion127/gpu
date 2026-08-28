@@ -251,6 +251,19 @@ if (RASBERY_ENABLE_TESTS)
     add_test(NAME cmfd_outer_form_probe COMMAND rasbery_cmfd_outer_form_probe 512)
     add_test(NAME cmfd_outer_replay COMMAND rasbery_cmfd_outer_replay 1024)
 
+    # Canonical CMFD-Nodal device state (Rev.7.1 Task 7).  Pointer identity,
+    # mixed-mode isolation, the materialize masks and generation ownership are
+    # all pure addressing and bookkeeping, so they are checked with no device --
+    # which is the only place they get checked at all, since none of them shows
+    # up in a converged answer.
+    add_executable(rasbery_canonical_state
+            "${CMAKE_CURRENT_SOURCE_DIR}/test/canonical_state.cpp")
+    target_compile_features(rasbery_canonical_state PRIVATE cxx_std_20)
+    target_include_directories(rasbery_canonical_state PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+    add_test(NAME canonical_state COMMAND rasbery_canonical_state)
+
     # Device arm of the same gate: the CUDA build of the shared body against
     # the same capture, elementwise.  Compiled with --fmad=false exactly like
     # the production TU.
