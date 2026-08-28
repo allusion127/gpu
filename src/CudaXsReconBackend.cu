@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -123,6 +124,42 @@ std::atomic<unsigned long long> g_nodal_batches{0};        // batches launched
 std::atomic<unsigned long long> g_nodal_batch_drives{0};   // sum of participants
 std::atomic<unsigned long long> g_nodal_batch_graph_launches{0};
 std::atomic<unsigned long long> g_nodal_batch_graph_fallbacks{0};
+
+// --- Rev.7.1 Task 8 compaction receipt (Sec 9.3) --------------------------
+//
+// The point of compaction is the RATIO, so all three are counted: how much work
+// there was (logical_drives / physical_slot_blocks) and how much grid was
+// launched to do nothing (padding_blocks).  Reporting drives alone would hide
+// the effect entirely -- the drive count is identical either way.
+std::atomic<unsigned long long> g_nodal_logical_drives{0};
+std::atomic<unsigned long long> g_nodal_physical_blocks{0};
+std::atomic<unsigned long long> g_nodal_padding_blocks{0};
+/// Distinct (bucket, fusion, geometry) graph instantiations.  With the
+/// coarse ladder this saturates at a handful; a number that keeps climbing
+/// means the key is churning, which is the Task 10 instantiation gate.
+std::atomic<unsigned long long> g_nodal_bucket_graphs{0};
+/// Nine buckets, indexed by the ladder position (1,2,4,8,16,24,32,48,64).
+std::array<std::atomic<unsigned long long>, 9> g_nodal_bucket_histogram{};
+
+inline int nodalBucketIndex(int lanes) {
+    static const int kBuckets[9] = {1, 2, 4, 8, 16, 24, 32, 48, 64};
+    for (int i = 0; i < 9; ++i)
+        if (lanes <= kBuckets[i]) return i;
+    return 8;
+}
+inline void nodalBucketHistogramBump(int lanes) {
+    g_nodal_bucket_histogram[static_cast<std::size_t>(nodalBucketIndex(lanes))].fetch_add(
+        1, std::memory_order_relaxed);
+}
+
+/// RASBERY_GPU_NODAL_COMPACT, default OFF.  Read once, like every other gate.
+inline bool nodalCompactEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("RASBERY_GPU_NODAL_COMPACT");
+        return v != nullptr && std::string(v) != "0";
+    }();
+    return on;
+}
 std::atomic<unsigned long long> g_nodal_batch_fallbacks{0}; // -> per-instance arm
 std::atomic<unsigned long long> g_nodal_batch_refused{0};   // slot/geometry refusals
 std::atomic<unsigned long long> g_nodal_batch_hist[65]     = {}; // width -> count
@@ -147,55 +184,78 @@ std::atomic<unsigned long long> g_nodal_batch_xs_h2d_skipped_bytes{0};
 //    axis therefore cannot perturb the single-instance arm at all, not even by
 //    an extra integer add.
 //
-//  - BATCHED=true is the arena launch: grid.y == slots, blockIdx.y is the slot
-//    index m, and the FIRST instruction is the per-slot participation guard --
-//    the CMFD HALT_GUARD shape (CudaBICGBackend.cu:183), one uniform predicate
-//    per block, evaluated before anything is read or written, so a masked slot
-//    contributes nothing but an early-returning block.  gridDim.x chunking is
-//    untouched, so lk / ig / ls are computed exactly as in the per-instance
-//    launch; only the base pointers move (see nodal::nodalSlotView).
+//  - BATCHED=true is the arena launch: grid.y is the DISPATCH WIDTH and
+//    blockIdx.y is a LOGICAL lane, not a slot.  `slot_map` turns the lane into a
+//    physical slot; the FIRST instruction is the padding guard -- the W1 rule
+//    (gpuDispatchIsPadding), one uniform predicate per block, evaluated before
+//    anything is read or written.  gridDim.x chunking is untouched, so lk / ig /
+//    ls are computed exactly as in the per-instance launch; only the base
+//    pointers move (see nodal::nodalSlotView).
 //
-#define RASBERY_NODAL_SLOT_GUARD(base, active, v)                              \
+// WHY A MAP AND NOT blockIdx.y DIRECTLY (Rev.7.1 Task 8).  Before compaction,
+// grid.y was the FLEET width and every non-participating slot still launched a
+// block that read the participation mask and returned.  At 64 slots with 3 in
+// the batch that is 61/64 of every grid doing nothing but a load and a branch --
+// and the nodal phases launch six of those per drive.  With the map, grid.y is
+// the smallest bucket covering the participants, so the blocks that are launched
+// are (nearly) all real work.
+//
+// THE MAP IS THE ONLY WAY A LANE LEARNS ITS SLOT.  Nothing below may use
+// blockIdx.y as a slot index: it is correct only when the map happens to be the
+// identity, which is exactly the compaction-off case, so the bug would pass
+// every test that did not turn compaction on.
+//
+// NO __syncthreads ANYWHERE IN THESE KERNELS, which is what makes an early
+// `return` from a subset of blocks safe.  The contract test asserts it rather
+// than trusting it, because adding one later would turn this guard into a
+// deadlock.
+#define RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, v)                     \
     int _m = 0;                                                                \
     if (BATCHED) {                                                             \
-        _m = static_cast<int>(blockIdx.y);                                     \
-        if ((active)[_m] == 0u) return;                                        \
+        const int _logical = static_cast<int>(blockIdx.y);                     \
+        if (_logical >= (lanes)) return;                                       \
+        _m = (slot_map)[_logical];                                             \
+        if (_m < 0) return;                                                    \
     }                                                                          \
     const ndl::NodalView v = BATCHED ? ndl::nodalSlotView(base, _m) : (base)
 
 template <bool BATCHED>
-__global__ void kNodalTrl0(ndl::NodalView base, const std::uint32_t* __restrict__ active) {
-    RASBERY_NODAL_SLOT_GUARD(base, active, v);
+__global__ void kNodalTrl0(ndl::NodalView base, const int* __restrict__ slot_map,
+                             int lanes) {
+    RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, v);
     const int i  = blockIdx.x * blockDim.x + threadIdx.x;
     const int lk = i / ndl::NG;
     const int ig = i - lk * ndl::NG;
     if (lk < v.nxyz) ndl::nodalTrlcff0Group(v, lk, ig);
 }
 template <bool BATCHED>
-__global__ void kNodalTrl12(ndl::NodalView base, const std::uint32_t* __restrict__ active) {
-    RASBERY_NODAL_SLOT_GUARD(base, active, v);
+__global__ void kNodalTrl12(ndl::NodalView base, const int* __restrict__ slot_map,
+                             int lanes) {
+    RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, v);
     const int i  = blockIdx.x * blockDim.x + threadIdx.x;
     const int lk = i / ndl::NG;
     const int ig = i - lk * ndl::NG;
     if (lk < v.nxyz) ndl::nodalTrlcff12Group(v, lk, ig, ndl::StaticForms{});
 }
 template <bool BATCHED>
-__global__ void kNodalMat(ndl::NodalView base, const std::uint32_t* __restrict__ active) {
-    RASBERY_NODAL_SLOT_GUARD(base, active, v);
+__global__ void kNodalMat(ndl::NodalView base, const int* __restrict__ slot_map,
+                             int lanes) {
+    RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, v);
     const int lk = blockIdx.x * blockDim.x + threadIdx.x;
     if (lk < v.nxyz) ndl::nodalUpdateMatrix(v, lk, ndl::StaticForms{});
 }
 template <bool BATCHED>
-__global__ void kNodalEven(ndl::NodalView base, const std::uint32_t* __restrict__ active) {
-    RASBERY_NODAL_SLOT_GUARD(base, active, v);
+__global__ void kNodalEven(ndl::NodalView base, const int* __restrict__ slot_map,
+                             int lanes) {
+    RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, v);
     const int lk = blockIdx.x * blockDim.x + threadIdx.x;
     if (lk < v.nxyz) ndl::nodalCalculateEven(v, lk, ndl::StaticForms{});
 }
 
 template <bool BATCHED>
-__global__ void kNodalMatEven(ndl::NodalView base,
-                              const std::uint32_t* __restrict__ active) {
-    RASBERY_NODAL_SLOT_GUARD(base, active, v);
+__global__ void kNodalMatEven(ndl::NodalView base, const int* __restrict__ slot_map,
+                              int lanes) {
+    RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, v);
     const int lk = blockIdx.x * blockDim.x + threadIdx.x;
     if (lk >= v.nxyz) return;
     const ndl::StaticForms forms{};
@@ -203,8 +263,9 @@ __global__ void kNodalMatEven(ndl::NodalView base,
     ndl::nodalCalculateEven(v, lk, forms);
 }
 template <bool BATCHED>
-__global__ void kNodalJnet(ndl::NodalView base, const std::uint32_t* __restrict__ active) {
-    RASBERY_NODAL_SLOT_GUARD(base, active, v);
+__global__ void kNodalJnet(ndl::NodalView base, const int* __restrict__ slot_map,
+                             int lanes) {
+    RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, v);
     const int ls = blockIdx.x * blockDim.x + threadIdx.x;
     if (ls < v.nsurf) ndl::nodalCalculateJnet(v, ls, ndl::StaticForms{});
 }
@@ -626,6 +687,13 @@ private:
         std::memset(_h_reigv, 0, S * sizeof(double));
         rc = cudaMemset(_d_active, 0, S * sizeof(std::uint32_t));
         if (rc != cudaSuccess) { fail("cudaMemset(nodal arena mask)", rc); return; }
+        rc = cudaMalloc(reinterpret_cast<void**>(&_d_slot_map), S * sizeof(int));
+        if (rc != cudaSuccess) { fail("cudaMalloc(nodal arena slot map)", rc); return; }
+        rc = cudaMallocHost(reinterpret_cast<void**>(&_h_slot_map), S * sizeof(int));
+        if (rc != cudaSuccess) { fail("cudaMallocHost(nodal arena slot map)", rc); return; }
+        for (std::size_t i = 0; i < S; ++i) _h_slot_map[i] = -1;
+        rc = cudaMemcpy(_d_slot_map, _h_slot_map, S * sizeof(int), cudaMemcpyHostToDevice);
+        if (rc != cudaSuccess) { fail("cudaMemcpy(nodal arena slot map)", rc); return; }
         rc = cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking);
         if (rc != cudaSuccess) { fail("cudaStreamCreateWithFlags(nodal arena)", rc); return; }
 
@@ -744,50 +812,91 @@ private:
     /// on WHO is in the batch, this single capture serves every subset for the
     /// rest of the run.  Failure is not fatal -- the plain launches below are
     /// numerically the same thing.
-    void ensureGraph() {
-        if (!_use_graph || _graph != nullptr) return;
+    /// ONE CHILD GRAPH PER BUCKET (Rev.7.1 Task 8).
+    ///
+    /// A graph bakes its launch dimensions, so grid.y -- the dispatch width --
+    /// is topology.  Before compaction there was one width (the fleet) and
+    /// therefore one graph; with compaction there is one per bucket, and the
+    /// KEY is (bucket, MatEven fusion, geometry):
+    ///
+    ///   bucket    grid.y, baked
+    ///   fusion    a different kernel set (MatEven vs Mat + Even)
+    ///   geometry  grid.x comes from nxyz / nsurf
+    ///
+    /// The bucket ladder is deliberately coarse (nine steps to 64) so the cache
+    /// saturates after a handful of distinct batch widths instead of growing
+    /// with every count -- which is the same reason the case-phase scheduler
+    /// buckets at all (Sec 5.5).
+    cudaGraphExec_t ensureGraph(int lanes) {
+        if (!_use_graph) return nullptr;
+        for (const auto& e : _graphs)
+            if (e.lanes == lanes && e.fuse == _fuse_mat_even && e.nxyz == _nxyz &&
+                e.nsurf == _nsurf)
+                return e.exec;
+
         const cudaError_t drc = cudaStreamSynchronize(_stream);
-        if (drc != cudaSuccess) { _use_graph = false; return; }
+        if (drc != cudaSuccess) { _use_graph = false; return nullptr; }
         cudaGraph_t graph = nullptr;
         cudaError_t rc =
             cudaStreamBeginCapture(_stream, cudaStreamCaptureModeThreadLocal);
         if (rc == cudaSuccess) {
-            enqueueKernels();
+            enqueueKernels(lanes);
             // Must run even if the enqueue faulted: this is what takes the
             // stream back OUT of capture mode.
             rc = cudaStreamEndCapture(_stream, &graph);
         }
-        if (rc == cudaSuccess) rc = cudaGraphInstantiate(&_graph, graph, 0ull);
+        cudaGraphExec_t exec = nullptr;
+        if (rc == cudaSuccess) rc = cudaGraphInstantiate(&exec, graph, 0ull);
         if (graph != nullptr) cudaGraphDestroy(graph);
         if (rc != cudaSuccess) {
             // Work submitted to a capturing stream is RECORDED, not executed,
             // so a failed capture leaves nothing pending and the direct
             // launches below are this batch's first and only execution.
             cudaGetLastError();
-            _graph     = nullptr;
             _use_graph = false;
             g_nodal_batch_graph_fallbacks.fetch_add(1, std::memory_order_relaxed);
+            return nullptr;
         }
+        _graphs.push_back(BucketGraph{exec, lanes, _fuse_mat_even, _nxyz, _nsurf});
+        g_nodal_bucket_graphs.fetch_add(1, std::memory_order_relaxed);
+        return exec;
     }
 
-    void enqueueKernels() {
-        const unsigned S  = static_cast<unsigned>(_slots);
+    /// Rev.7.1 Task 8.  `lanes` is the DISPATCH WIDTH: the fleet width when
+    /// compaction is off (identity map, exactly the pre-Task-8 shape), and the
+    /// smallest bucket covering the participants when it is on.
+    void enqueueKernels(int lanes) {
+        const unsigned L  = static_cast<unsigned>(lanes);
         const int      B  = 128;
         const int      gn = (_nxyz + B - 1) / B;
         const int      gs = (_nsurf + B - 1) / B;
         const int      gg = (_nxyz * ndl::NG + B - 1) / B;
-        kNodalTrl0<true><<<dim3(static_cast<unsigned>(gg), S), B, 0, _stream>>>(_base, _d_active);
-        kNodalTrl12<true><<<dim3(static_cast<unsigned>(gg), S), B, 0, _stream>>>(_base, _d_active);
+        kNodalTrl0<true><<<dim3(static_cast<unsigned>(gg), L), B, 0, _stream>>>(
+            _base, _d_slot_map, lanes);
+        kNodalTrl12<true><<<dim3(static_cast<unsigned>(gg), L), B, 0, _stream>>>(
+            _base, _d_slot_map, lanes);
         if (_fuse_mat_even) {
-            kNodalMatEven<true><<<dim3(static_cast<unsigned>(gn), S), B, 0, _stream>>>(
-                _base, _d_active);
+            kNodalMatEven<true><<<dim3(static_cast<unsigned>(gn), L), B, 0, _stream>>>(
+                _base, _d_slot_map, lanes);
         } else {
-            kNodalMat<true><<<dim3(static_cast<unsigned>(gn), S), B, 0, _stream>>>(
-                _base, _d_active);
-            kNodalEven<true><<<dim3(static_cast<unsigned>(gn), S), B, 0, _stream>>>(
-                _base, _d_active);
+            kNodalMat<true><<<dim3(static_cast<unsigned>(gn), L), B, 0, _stream>>>(
+                _base, _d_slot_map, lanes);
+            kNodalEven<true><<<dim3(static_cast<unsigned>(gn), L), B, 0, _stream>>>(
+                _base, _d_slot_map, lanes);
         }
-        kNodalJnet<true><<<dim3(static_cast<unsigned>(gs), S), B, 0, _stream>>>(_base, _d_active);
+        kNodalJnet<true><<<dim3(static_cast<unsigned>(gs), L), B, 0, _stream>>>(
+            _base, _d_slot_map, lanes);
+    }
+
+    /// Smallest configured bucket covering `count`, mirroring the scheduler's
+    /// ladder (GpuPhaseScheduler.h) so the nodal phase and the case-phase
+    /// scheduler cannot disagree about what a bucket is.  Kept as its own
+    /// function so the contract test can check the two ladders agree.
+    static int nodalBucketFor(int count, int slots) {
+        static const int kBuckets[] = {1, 2, 4, 8, 16, 24, 32, 48, 64};
+        for (int b : kBuckets)
+            if (count <= b) return b < slots ? b : slots;
+        return slots;
     }
 
     /// Launcher-thread only.  Uploads for the participants, one graph launch
@@ -804,14 +913,47 @@ private:
         unsigned long long xs_h2d_skipped_bytes = 0;
 
         for (int m : part) pinSlot(_slot[static_cast<std::size_t>(m)]);
-        ensureGraph();
 
-        // ---- participation mask ------------------------------------------
-        std::memset(_h_active, 0, S * sizeof(std::uint32_t));
-        for (int m : part) _h_active[m] = 1u;
-        if (!memcpyAsyncOrFail(_d_active, _h_active, S * sizeof(std::uint32_t),
-                               cudaMemcpyHostToDevice, "nodal arena mask H2D"))
+        // ---- Rev.7.1 Task 8: the slot map -----------------------------------
+        //
+        // COMPACTION OFF (default) is the identity over the whole fleet, so the
+        // grid, the block count and the work each block does are exactly what
+        // they were before Task 8; only the participation test moved from a
+        // mask lookup to a map lookup.  ON, the map holds just the participants
+        // and `lanes` is the bucket, so the blocks that launch are the blocks
+        // that work.
+        //
+        // Ascending physical order in both cases.  That is not cosmetic: the
+        // per-slot XS mirrors and generation counters are indexed by PHYSICAL
+        // slot, so the map is the only thing that may be logical -- and a map
+        // whose order depended on the participant vector's arrival order would
+        // make the device access pattern differ run to run for the same batch.
+        const int lanes = _compact ? nodalBucketFor(static_cast<int>(part.size()), _slots)
+                                   : _slots;
+        for (int i = 0; i < _slots; ++i) _h_slot_map[i] = -1;
+        if (_compact) {
+            int n = 0;
+            for (int m : part) _h_slot_map[n++] = m; // `part` is already sorted
+        } else {
+            for (int m : part) _h_slot_map[m] = m;   // identity, holes stay -1
+        }
+        if (!memcpyAsyncOrFail(_d_slot_map, _h_slot_map,
+                               static_cast<std::size_t>(_slots) * sizeof(int),
+                               cudaMemcpyHostToDevice, "nodal arena slot map H2D"))
             return drained();
+
+        cudaGraphExec_t exec = ensureGraph(lanes);
+
+        // ---- compaction receipt (Sec 9.3) -----------------------------------
+        // Counted per PHASE-BLOCK-COLUMN, which is what the compaction actually
+        // removes: `lanes` grid.y columns are launched, of which part.size() do
+        // work.  Reporting only "drives" would hide the whole effect.
+        g_nodal_logical_drives.fetch_add(part.size(), std::memory_order_relaxed);
+        g_nodal_physical_blocks.fetch_add(static_cast<unsigned long long>(part.size()),
+                                          std::memory_order_relaxed);
+        g_nodal_padding_blocks.fetch_add(
+            static_cast<unsigned long long>(lanes) - part.size(), std::memory_order_relaxed);
+        nodalBucketHistogramBump(lanes);
 
         // ---- per-slot uploads: the SAME set the per-instance FULL path
         // uploads, with the same residency rules, in the same order ----------
@@ -892,12 +1034,12 @@ private:
             return drained();
 
         // ---- the five phases ----------------------------------------------
-        if (_graph != nullptr) {
-            const cudaError_t rc = cudaGraphLaunch(_graph, _stream);
+        if (exec != nullptr) {
+            const cudaError_t rc = cudaGraphLaunch(exec, _stream);
             if (rc != cudaSuccess) { fail("cudaGraphLaunch(nodal arena)", rc); return drained(); }
             g_nodal_batch_graph_launches.fetch_add(1, std::memory_order_relaxed);
         } else {
-            enqueueKernels();
+            enqueueKernels(lanes);
         }
         // Judged BEFORE the downloads are queued: a launch that never ran must
         // not have stale device jnet copied over the caller's host array, which
@@ -962,11 +1104,27 @@ private:
     int*           _idx         = nullptr;
     std::uint32_t* _d_active    = nullptr;
     std::uint32_t* _h_active    = nullptr; // pinned
+    // Rev.7.1 Task 8: logical lane -> physical slot.  -1 is a padding lane.
+    int*           _d_slot_map  = nullptr;
+    int*           _h_slot_map  = nullptr; // pinned
+    /// RASBERY_GPU_NODAL_COMPACT, default OFF.  Off, the map is the identity
+    /// over the fleet and the launch shape is exactly the pre-Task-8 one.
+    bool           _compact     = nodalCompactEnabled();
     double*        _h_reigv     = nullptr; // pinned
 
     ndl::NodalView  _base{};
-    cudaGraphExec_t _graph     = nullptr;
-    bool            _use_graph = true;
+    /// One instantiation per (bucket, fusion, geometry).  A graph bakes grid.y,
+    /// so the dispatch width IS topology; the coarse bucket ladder is what keeps
+    /// this list short instead of growing with every distinct batch count.
+    struct BucketGraph {
+        cudaGraphExec_t exec;
+        int             lanes;
+        bool            fuse;
+        int             nxyz;
+        int             nsurf;
+    };
+    std::vector<BucketGraph> _graphs;
+    bool                     _use_graph = true;
     bool            _fuse_mat_even = true;
     bool            _mirror_xs = true;
 
@@ -1065,6 +1223,32 @@ struct NodalReceipt {
         // above has to change.  Printed whenever the arena was reachable at all
         // (slots>0), so "engaged but never launched" is distinguishable from
         // "never built".
+        // Rev.7.1 Task 8 compaction receipt, on its own tag.  The number that
+        // matters is padding_blocks / (physical + padding): with compaction off
+        // it is (slots - width)/slots per drive, which is what the compaction
+        // removes.  Printed whether or not compaction is on, so the two are
+        // directly comparable from two runs of the same deck.
+        std::ostringstream comp;
+        const unsigned long long phys = g_nodal_physical_blocks.load(std::memory_order_relaxed);
+        const unsigned long long pad  = g_nodal_padding_blocks.load(std::memory_order_relaxed);
+        comp << "[RASBERY][NODAL][COMPACT] {\"enabled\":" << (nodalCompactEnabled() ? 1 : 0)
+             << ",\"logical_drives\":"
+             << g_nodal_logical_drives.load(std::memory_order_relaxed)
+             << ",\"physical_slot_blocks\":" << phys
+             << ",\"padding_blocks\":" << pad
+             << ",\"padding_fraction\":"
+             << ((phys + pad) ? static_cast<double>(pad) / static_cast<double>(phys + pad)
+                              : 0.0)
+             << ",\"bucket_graphs\":"
+             << g_nodal_bucket_graphs.load(std::memory_order_relaxed)
+             << ",\"bucket_histogram\":[";
+        for (std::size_t i = 0; i < g_nodal_bucket_histogram.size(); ++i) {
+            if (i) comp << ',';
+            comp << g_nodal_bucket_histogram[i].load(std::memory_order_relaxed);
+        }
+        comp << "]}";
+        std::cout << comp.str() << std::endl;
+
         const int slots = g_nodal_batch_slots.load(std::memory_order_relaxed);
         if (slots <= 0) return;
         const unsigned long long b = g_nodal_batches.load(std::memory_order_relaxed);
@@ -1098,6 +1282,7 @@ struct NodalReceipt {
         }
         line << "]}";
         std::cout << line.str() << std::endl;
+
     }
 };
 NodalReceipt g_nodal_receipt;
@@ -1955,9 +2140,9 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         } else {
             ++d.canonical_uploads_elided;
         }
-        kNodalTrl0<false><<<gng, B, 0, d.stream>>>(v, nullptr);
-        kNodalTrl12<false><<<gng, B, 0, d.stream>>>(v, nullptr);
-        kNodalMat<false><<<gn, B, 0, d.stream>>>(v, nullptr);
+        kNodalTrl0<false><<<gng, B, 0, d.stream>>>(v, nullptr, 0);
+        kNodalTrl12<false><<<gng, B, 0, d.stream>>>(v, nullptr, 0);
+        kNodalMat<false><<<gn, B, 0, d.stream>>>(v, nullptr, 0);
         RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
 
         // calculateEven runs on the HOST (the production member function is
@@ -2042,15 +2227,15 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         } else {
             ++d.canonical_uploads_elided;
         }
-        kNodalTrl0<false><<<gng, B, 0, d.stream>>>(v, nullptr);
-        kNodalTrl12<false><<<gng, B, 0, d.stream>>>(v, nullptr);
+        kNodalTrl0<false><<<gng, B, 0, d.stream>>>(v, nullptr, 0);
+        kNodalTrl12<false><<<gng, B, 0, d.stream>>>(v, nullptr, 0);
         if (nodalFuseMatEvenEnabled()) {
-            kNodalMatEven<false><<<gn, B, 0, d.stream>>>(v, nullptr);
+            kNodalMatEven<false><<<gn, B, 0, d.stream>>>(v, nullptr, 0);
         } else {
-            kNodalMat<false><<<gn, B, 0, d.stream>>>(v, nullptr);
-            kNodalEven<false><<<gn, B, 0, d.stream>>>(v, nullptr);
+            kNodalMat<false><<<gn, B, 0, d.stream>>>(v, nullptr, 0);
+            kNodalEven<false><<<gn, B, 0, d.stream>>>(v, nullptr, 0);
         }
-        kNodalJnet<false><<<gs, B, 0, d.stream>>>(v, nullptr);
+        kNodalJnet<false><<<gs, B, 0, d.stream>>>(v, nullptr, 0);
         // The drive just wrote jnet and phis on the device, so Nodal owns them.
         // The download back to the Geometry arrays happens only when a host
         // consumer has ASKED (materialize); otherwise the CMFD backend reads
@@ -2268,7 +2453,7 @@ bool XsReconBackend::solveNodalPost(const ndl::NodalView& host) {
 
     const int B  = 128;
     const int gs = (host.nsurf + B - 1) / B;
-    kNodalJnet<false><<<gs, B, 0, d.stream>>>(v, nullptr);
+    kNodalJnet<false><<<gs, B, 0, d.stream>>>(v, nullptr, 0);
     RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
 
     if (!gpu::canonicalElidesDownload(canon, gpu::CanonicalRegion::Jnet,

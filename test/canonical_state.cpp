@@ -269,6 +269,30 @@ int main() {
         std::printf("  generations: 4 real counters invalidate, 8 speculative ignored\n");
     }
 
+    // --- 4b. the nodal arena cannot borrow these yet, and says so -----------
+    //
+    // The arena advances each array pointer by that array's OWN dense per-slot
+    // count (nodalSlotView), while GpuPhysicsArena strides by the whole slot
+    // block.  Handing the arena a canonical pointer would index it with the
+    // wrong stride -- slot 1 reading inside slot 0 -- and every value would be
+    // finite and plausible.  So the predicate must refuse the arena layout and
+    // accept only a genuinely slot-dense one.
+    {
+        const long long dense_jnet = static_cast<long long>(d.nsurf) * 2;
+        const long long arena_slot_stride =
+            static_cast<long long>(o.per_slot_bytes / sizeof(double));
+        check(canonicalIsSlotDense(dense_jnet, dense_jnet),
+              "a genuinely slot-dense block must be accepted");
+        check(!canonicalIsSlotDense(arena_slot_stride, dense_jnet),
+              "GpuPhysicsArena's whole-slot stride must be REFUSED by the nodal arena's "
+              "dense-stride addressing -- accepting it would read slot 1 from inside "
+              "slot 0 and every number would still look plausible");
+        check(!canonicalIsSlotDense(0, 0), "a zero stride is not dense, it is unset");
+        std::printf("  nodal arena borrow: refused (arena per-slot stride %lld doubles vs "
+                    "dense jnet %lld)\n",
+                    arena_slot_stride, dense_jnet);
+    }
+
     // --- 5. feature-off is inert --------------------------------------------
     {
         const CanonicalSlotBuffers off{};
