@@ -171,9 +171,16 @@ if (RASBERY_ENABLE_TESTS)
     # Device arm of the same gate: nvcc's floating point vs g++'s, elementwise
     # on one call.  This is what the full-deck A/B cannot localize.
     if (RASBERY_ENABLE_CUDA)
+        # XeFormMiner/XeAndersonReference come along because the backend TU now
+        # carries the Task 13 Xe kernels, and those take the mined contraction
+        # mask as a kernel argument (XeFormMask.h).  Same two objects, and the
+        # same separation, as rasbery_xe_form_probe below -- the verbatim
+        # quotation keeps its own translation unit here too.
         add_executable(rasbery_xsrecon_device_consistency
                 "${CMAKE_CURRENT_SOURCE_DIR}/test/xsrecon_device_consistency_test.cpp"
-                "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaXsReconBackend.cu")
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaXsReconBackend.cu"
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/XeAndersonReference.cpp"
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/XeFormMiner.cpp")
         target_compile_features(rasbery_xsrecon_device_consistency PRIVATE cxx_std_20)
         target_include_directories(rasbery_xsrecon_device_consistency PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -263,6 +270,29 @@ if (RASBERY_ENABLE_TESTS)
 
     add_test(NAME cmfd_outer_form_probe COMMAND rasbery_cmfd_outer_form_probe 512)
     add_test(NAME cmfd_outer_replay COMMAND rasbery_cmfd_outer_replay 1024)
+
+    # Rev.7.1 Task 13: the Xe Anderson contraction mask and the fixed-partition
+    # inner product.  Same construction as the CMFD gate above and for the same
+    # reason -- the verbatim quotation gets its OWN object file, because with the
+    # quotation and the shipped body in one translation unit gcc
+    # common-subexpressions across them and changes what the reference measures.
+    # XeFormMiner.cpp is linked in so the gate exercises the PRODUCTION resolver
+    # (xeFormMask) rather than a test-only copy of it.
+    add_executable(rasbery_xe_form_probe
+            "${CMAKE_CURRENT_SOURCE_DIR}/test/xe_form_probe.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/XeAndersonReference.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/XeFormMiner.cpp")
+    target_compile_features(rasbery_xe_form_probe PRIVATE cxx_std_20)
+    target_include_directories(rasbery_xe_form_probe PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test")
+    if (NOT MSVC)
+        # -march=native: with no FMA in the ISA gcc contracts nothing and the
+        # mined mask cannot be scored.  Same flag, same reason, as the CMFD gate.
+        target_compile_options(rasbery_xe_form_probe PRIVATE -march=native -O3 -fno-lto)
+    endif ()
+
+    add_test(NAME xe_form_probe COMMAND rasbery_xe_form_probe 4096)
 
     # Canonical CMFD-Nodal device state (Rev.7.1 Task 7).  Pointer identity,
     # mixed-mode isolation, the materialize masks and generation ownership are
