@@ -573,6 +573,14 @@ struct OuterSegmentEligibility {
     int residency_bound;
     int have_sweep_hook;
     int have_nodal_hook;
+    /// Can this runner honour step 7 at all?
+    ///
+    /// WITHOUT IT, A FRACTIONAL ROD IS STILL A REFUSAL, and that pairing is the
+    /// point: `the deck cusps` is only a problem while the segment cannot cusp.
+    /// Stage A refused the deck because the capability was missing; now that
+    /// outerCuspingHook supplies it the same deck is eligible, and the refusal
+    /// survives exactly where it is still true -- a runner with no cusping hook.
+    int have_cusping_hook;
 };
 
 /// The predicate, in one place, ranked so the FIRST reason a reader would ask
@@ -583,7 +591,8 @@ outerSegmentRefusal(const OuterSegmentEligibility& e) {
     if (!e.arena_reserved) return OuterSegmentRefusal::NoArena;
     if (!e.bound) return OuterSegmentRefusal::Unbound;
     if (e.batch_width > 1) return OuterSegmentRefusal::BatchMode;
-    if (e.fractional_rods) return OuterSegmentRefusal::FractionalRods;
+    if (e.fractional_rods && !e.have_cusping_hook)
+        return OuterSegmentRefusal::FractionalRods;
     if (e.critical_search) return OuterSegmentRefusal::CriticalSearch;
     if (!e.residency_bound) return OuterSegmentRefusal::NoResidency;
     if (!e.have_sweep_hook) return OuterSegmentRefusal::NoSweepHook;
@@ -640,6 +649,15 @@ struct OuterSegmentCounters {
     /// when every drive is device-resident and nothing on the host reads _dhat
     /// or _psi any more -- which is a separate audit, not an assumption.
     std::uint64_t host_mirror_bytes        = 0;
+    /// Outers on which ApplyRodCusping fired inside a segment.
+    ///
+    /// The number that says whether a deck cusps at all, and the one that makes
+    /// the i-SMR CY02 failure visible in a receipt rather than only in a k_eff:
+    /// before this the segment SKIPPED step 7, so a cusping deck ran a different
+    /// outer from the host's and said nothing about it.
+    std::uint64_t cusping_fired            = 0;
+    /// d-tilde bytes re-uploaded because cusping rebuilt it mid-outer.
+    std::uint64_t cusping_dtil_bytes       = 0;
     std::uint64_t refusals[static_cast<int>(OuterSegmentRefusal::Count)] = {};
     std::uint64_t escapes[kDeviceEscapeCount]                           = {};
 };
@@ -734,12 +752,36 @@ using OuterSegmentStream = void*;
 /// `outer_index` is the 0-based position in the segment, for a hook that needs to
 /// do something once (a first-outer upload, say).  Returning false aborts the
 /// segment; the host path takes over and `LaunchFailed` is counted.
+/// Step 7's hook.  Returns TRUE when ApplyRodCusping fired, i.e. when the
+/// macro-XS moved and d-tilde was rebuilt on the host.
+///
+/// No stream argument, deliberately: it is pure host work over host arrays and
+/// it must not enqueue anything.  The runner owns the one device consequence.
+using OuterCuspingHook = bool (*)(void* ctx, int slot, unsigned int outer_index);
+
 using OuterSegmentHook = bool (*)(void* ctx, OuterSegmentStream stream, int slot,
                                   unsigned int outer_index);
 
 struct OuterSegmentHooks {
     OuterSegmentHook enqueue_cmfd_sweep = nullptr; ///< setls + drive (+ probe)
     OuterSegmentHook enqueue_nodal_drive = nullptr; ///< nodal reset + drive
+
+    /// Step 7: ApplyRodCusping + the upddtil it forces.  Returns whether the
+    /// macro-XS actually moved.
+    ///
+    /// A HOST HOOK, AND IT COSTS NOTHING EXTRA.  The nodal drive immediately
+    /// above it is already a host call in an already-synchronised window, so
+    /// cusping runs in the same window at the same point of the outer the host
+    /// loop runs it (Driver.h, between the nodal drive and upddhat).  That is
+    /// the whole design: not a device port of cusping, and not an escape that
+    /// hands the outer back -- just the host's own call, where the host makes
+    /// it.
+    ///
+    /// WHY IT HAS ITS OWN SIGNATURE.  Every other hook returns `did it work`.
+    /// This one returns `did it fire`, because the answer changes what the
+    /// runner must do next: a cusping that fired rewrote the host d-tilde, and
+    /// the device upddhat two steps later reads the DEVICE one.
+    OuterCuspingHook apply_cusping = nullptr;
 
     /// Rev.7.1 Task 10 part 2: the post-synchronise half of the sweep.
     ///

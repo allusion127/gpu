@@ -154,6 +154,8 @@ struct AtomicCounters {
     std::atomic<std::uint64_t> jnet_bridge_bytes{0};
     std::atomic<std::uint64_t> flux_sync_bytes{0};
     std::atomic<std::uint64_t> host_mirror_bytes{0};
+    std::atomic<std::uint64_t> cusping_fired{0};
+    std::atomic<std::uint64_t> cusping_dtil_bytes{0};
     std::atomic<std::uint64_t> refusals[static_cast<int>(OuterSegmentRefusal::Count)];
     std::atomic<std::uint64_t> escapes[kDeviceEscapeCount];
 
@@ -221,6 +223,8 @@ OuterSegmentCounters outerSegmentCounters() {
     out.jnet_bridge_bytes       = a.jnet_bridge_bytes.load(std::memory_order_relaxed);
     out.flux_sync_bytes         = a.flux_sync_bytes.load(std::memory_order_relaxed);
     out.host_mirror_bytes       = a.host_mirror_bytes.load(std::memory_order_relaxed);
+    out.cusping_fired           = a.cusping_fired.load(std::memory_order_relaxed);
+    out.cusping_dtil_bytes      = a.cusping_dtil_bytes.load(std::memory_order_relaxed);
     for (int i = 0; i < static_cast<int>(OuterSegmentRefusal::Count); ++i)
         out.refusals[i] = a.refusals[i].load(std::memory_order_relaxed);
     for (int i = 0; i < kDeviceEscapeCount; ++i)
@@ -239,6 +243,8 @@ std::string outerSegmentReceiptJson() {
                     ",\"jnet_bridge_bytes\":" + std::to_string(c.jnet_bridge_bytes) +
                     ",\"flux_sync_bytes\":" + std::to_string(c.flux_sync_bytes) +
                     ",\"host_mirror_bytes\":" + std::to_string(c.host_mirror_bytes) +
+                    ",\"cusping_fired\":" + std::to_string(c.cusping_fired) +
+                    ",\"cusping_dtil_bytes\":" + std::to_string(c.cusping_dtil_bytes) +
                     ",\"segment_budget\":" + std::to_string(outerSegmentBudget());
 
     // Only the non-zero buckets, so a healthy run's line stays readable and a
@@ -601,6 +607,7 @@ OuterSegmentRefusal CudaOuterSegment::refusal(int batch_width, bool fractional_r
     e.residency_bound  = _impl->residency_bound ? 1 : 0;
     e.have_sweep_hook  = _impl->hooks.enqueue_cmfd_sweep != nullptr ? 1 : 0;
     e.have_nodal_hook  = _impl->hooks.enqueue_nodal_drive != nullptr ? 1 : 0;
+    e.have_cusping_hook = _impl->hooks.apply_cusping != nullptr ? 1 : 0;
     return outerSegmentRefusal(e);
 }
 
@@ -884,6 +891,42 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         if (!m.hooks.enqueue_nodal_drive(m.hooks.ctx, m.stream, slot, i))
             return hookFailed("the nodal drive hook");
 
+        // (7) cusping -- Driver.h, between the nodal drive and upddhat.
+        //
+        // RUN, NOT SKIPPED, AND NOT REFUSED.  Stage A used to refuse any deck
+        // with a fractional rod and skip this step on the rest, on the argument
+        // that eligibility made it a no-op.  It does not: ApplyRodCusping can
+        // return true from its own prev_scratch even when no node is fractional
+        // NOW, and eligibility was evaluated once per SolveLoop entry while the
+        // host asks once per OUTER.  i-SMR CY02 is the deck that shows the
+        // difference -- 298 outers and k_eff 1.000003 against the host's 707 and
+        // 0.999975, with the same converged-looking answer.
+        //
+        // The fix is not a device port and not an escape: the nodal drive above
+        // is already a host call in an already-synchronised window, so cusping
+        // runs in that window, at the point of the outer the host runs it, with
+        // the leakage the host nodal drive just produced.
+        if (m.hooks.apply_cusping != nullptr &&
+            m.hooks.apply_cusping(m.hooks.ctx, slot, i)) {
+            bump(counters().cusping_fired);
+            // IT REBUILT THE HOST d-TILDE, AND upddhat READS THE DEVICE ONE.
+            //
+            // The top-of-outer sync cannot cover this: it ran before the nodal
+            // drive that produced the leakage cusping needed.  Without the
+            // re-upload the outer would blend the cross sections and then
+            // correct the current with the d-tilde from before the blend, which
+            // is neither the host's outer nor a consistent one.
+            if (bound_.host_dtil != nullptr && bound_.device_dtil != nullptr) {
+                const std::size_t dtil_bytes =
+                    static_cast<std::size_t>(bound_.geom.nsurf) *
+                    static_cast<std::size_t>(bound_.ng) * sizeof(double);
+                if ((rc = cudaMemcpyAsync(bound_.device_dtil, bound_.host_dtil, dtil_bytes,
+                                          cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
+                    return launchFailed("re-upload dtil after cusping", rc);
+                bump(counters().cusping_dtil_bytes, dtil_bytes);
+            }
+        }
+
         if (bridge_jnet) {
             if ((rc = cudaMemcpyAsync(bound_.device_jnet, bound_.host_jnet, jnet_bytes,
                                       cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
@@ -891,11 +934,6 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
             bump(counters().jnet_bridge_bytes, jnet_bytes);
         }
 
-        // (7) cusping -- Driver.h:1579-1580.  Stage A: eligibility guarantees
-        // ApplyRodCusping would return false for this deck, so the host's own
-        // branch here does nothing and the device skips nothing.  A deck for
-        // which it WOULD fire never gets here (OuterSegmentRefusal::
-        // FractionalRods), and Task 11 is what changes that.
 
         // (8) upddhat -- Driver.h:1584
         if ((rc = enqueueUpdDhat(m.arena, queue, bound_.geom, bound_.table, bound_.forms,

@@ -962,6 +962,68 @@ if not _TR_CALL:
     problems.append("Driver.h: outertrace::emit is not guarded by outertrace::enabled(), so "
                     "every run would pay a hash of psi/jnet/dhat/flux per outer")
 
+# --- 21. cusping is answered PER OUTER, by the host, where the host asks ------
+#
+# THE BUG.  Stage A refused any deck with a fractional rod and SKIPPED step 7 on
+# the rest, on the argument that eligibility made it a no-op.  Two things were
+# wrong with that.  ApplyRodCusping can return true from its own prev_scratch
+# with no node fractional at all (XSSet.cpp:3282), so "no fractional node" is
+# not "cusping is a no-op"; and the predicate was evaluated ONCE per SolveLoop
+# entry while the host asks once per OUTER.  i-SMR CY02 is the deck that shows
+# it: 298 outers and k_eff 1.000003 against the host's 707 and 0.999975 -- two
+# converged-looking answers, one of them wrong, with nothing in any receipt to
+# say so.
+#
+# The fix is not a device port and not an escape: the nodal drive is already a
+# host call in an already-synchronised window, so cusping runs in that window at
+# the point of the outer the host runs it.
+want(GRAPH_H_CODE, "OuterCuspingHook", "CudaOuterGraph.h",
+     "step 7 needs a hook with its own signature -- it answers 'did it fire', not "
+     "'did it work', and the answer changes what the runner does next")
+want(GRAPH_H_CODE, "apply_cusping", "CudaOuterGraph.h", "the cusping hook slot")
+want(DRIVER_CODE, "outerCuspingHook", "Driver.h", "the host side of step 7")
+want(DRIVER_CODE, "hooks.apply_cusping", "Driver.h",
+     "the hook has to be installed or the segment silently skips step 7 again")
+# It must be the REAL host call, not a reimplementation.
+_CUSP = body_of(DRIVER_CODE, "static bool outerCuspingHook(", "static bool armOuterSegment(")
+for _need in ("ApplyRodCusping(", "cmfd_solver.upddtil()"):
+    if _need not in _CUSP:
+        problems.append(f"Driver.h: outerCuspingHook does not call {_need} -- step 7 is "
+                        "XSSet's own call and the upddtil it forces, not a second copy of "
+                        "the cusping rule")
+# PER OUTER: the call must be INSIDE the segment's body loop.
+_LOOPBODY = body_of(GRAPH_CU_CODE, "for (unsigned int i = 0", "DeviceOuterSegmentState seg_out")
+if "apply_cusping" not in _LOOPBODY:
+    problems.append("CudaOuterGraph.cu: apply_cusping is not called inside the per-outer "
+                    "loop.  Once per segment is the same mistake as once per SolveLoop "
+                    "entry: the host asks once per OUTER")
+# And it must sit between the nodal drive and upddhat, as in Driver.h.
+_nodal = _LOOPBODY.find("enqueue_nodal_drive")
+_cusp = _LOOPBODY.find("apply_cusping")
+_dhat = _LOOPBODY.find("enqueueUpdDhat")
+if not (0 <= _nodal < _cusp < _dhat):
+    problems.append("CudaOuterGraph.cu: step 7 is out of order.  Driver.h runs cusping "
+                    "AFTER the nodal drive -- it needs that drive's transverse leakage -- "
+                    "and BEFORE upddhat, which reads the d-tilde cusping rebuilds")
+# A fired cusping rebuilt the HOST d-tilde; the device upddhat reads the device one.
+want(GRAPH_CU_CODE, "re-upload dtil after cusping", "CudaOuterGraph.cu",
+     "a cusping that fired rewrote _dtil, and the top-of-outer sync already happened -- "
+     "without the re-upload the outer blends the cross sections and then corrects the "
+     "current with the d-tilde from before the blend")
+want(GRAPH_H_CODE, "cusping_fired", "CudaOuterGraph.h",
+     "the receipt has to show whether a deck cusps, or the whole class of failure is "
+     "invisible again")
+# The refusal is about CAPABILITY, not about the deck.
+want(GRAPH_H_CODE, "have_cusping_hook", "CudaOuterGraph.h",
+     "'the deck cusps' is only a refusal while the segment cannot cusp")
+_PRED = body_of(GRAPH_H_CODE, "outerSegmentRefusal(const OuterSegmentEligibility& e)",
+                "return OuterSegmentRefusal::None;")
+if _PRED and "e.fractional_rods && !e.have_cusping_hook" not in _PRED:
+    problems.append("CudaOuterGraph.h: the fractional-rod refusal is not paired with the "
+                    "cusping capability.  Refusing a cusping deck outright costs every "
+                    "device outer on it (i-SMR CY02: 857), and refusing none of them "
+                    "without the hook is the CY02 wrong answer")
+
 # --- the gates exist and are built -------------------------------------------
 want(REPLAY_TEXT, "kPhaseTransitions", "test/outer_state_replay.cpp",
      "the emitted edges must be cross-checked against the W1 table")

@@ -96,6 +96,7 @@ std::string outerSegmentReceiptJson() {
                     "\"host_outer_observations\":0,\"budget_exits\":0,"
                     "\"halted_outer_launches\":0,\"jnet_bridge_bytes\":0,"
                     "\"flux_sync_bytes\":0,\"host_mirror_bytes\":0,"
+                    "\"cusping_fired\":0,\"cusping_dtil_bytes\":0,"
                     "\"segment_budget\":" +
                     std::to_string(outerSegmentBudget()) + ",\"escapes\":{},\"refusals\":{";
     bool first = true;

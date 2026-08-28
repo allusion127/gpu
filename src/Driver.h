@@ -1023,6 +1023,29 @@ private:
         return true;
     }
 
+    /// Step 7, verbatim from the host loop.
+    ///
+    /// THIS IS THE WHOLE FIX FOR i-SMR CY02.  The segment used to skip cusping
+    /// on the strength of a Stage A eligibility check -- `does any node have a
+    /// fractional rod right now` -- evaluated ONCE per SolveLoop entry.  The
+    /// host asks a different question, once per OUTER, and ApplyRodCusping can
+    /// answer yes from its own prev_scratch with no node fractional at all
+    /// (XSSet.cpp:3282).  So on a cusping deck the segment ran a different outer
+    /// from the host's and converged somewhere else: 298 outers and k_eff
+    /// 1.000003 where the host took 707 and got 0.999975.
+    ///
+    /// Calling it here is the same call, on the same leakage, at the same point
+    /// of the outer.  The runner handles the one device consequence -- a fired
+    /// cusping rebuilt _dtil and the device upddhat reads the device copy.
+    static bool outerCuspingHook(void* raw, int, unsigned int) {
+        OuterHookCtx& h = *static_cast<OuterHookCtx*>(raw);
+        if (!h.ctx->cross_sections.ApplyRodCusping(
+                *h.eigv, h.ctx->nodal_solver.axialTransverseLeakage()))
+            return false;
+        h.ctx->cmfd_solver.upddtil();
+        return true;
+    }
+
     /// Hand the runner the sweep arena's buffers and install the hooks.
     ///
     /// Called once per SolveLoop/ReconvergeFlux entry, because the arena slot is
@@ -1094,6 +1117,7 @@ private:
             stream_sweep ? &outerSweepEnqueueHook : &outerSweepHook;
         hooks.finish_cmfd_sweep   = stream_sweep ? &outerSweepFinishHook : nullptr;
         hooks.enqueue_nodal_drive = &outerNodalHook;
+        hooks.apply_cusping       = &outerCuspingHook;
         hooks.ctx                 = &hc;
         hooks.sweep_synchronizes  = !stream_sweep;
         gpu::rasberyOuterSegment().setHooks(hooks);
@@ -1195,6 +1219,7 @@ private:
                                                 ? &ctx.geometry.rod_fraction(0)
                                                 : nullptr,
                                             ctx.geometry.nxyz(), EPS);
+
         // ReconvergeFlux runs no critical search by construction, so the
         // search refusal cannot apply here.
         const gpu::OuterSegmentRefusal gpu_outer_why =
@@ -1989,6 +2014,7 @@ private:
                                                 ? &ctx.geometry.rod_fraction(0)
                                                 : nullptr,
                                             ctx.geometry.nxyz(), EPS);
+
         // A CRITICAL SEARCH IS NO LONGER REFUSED HERE.
         //
         // Task 9 refused it because the DEVICE decision stood in for Driver.h's
