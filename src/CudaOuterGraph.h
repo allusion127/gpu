@@ -669,6 +669,10 @@ struct OuterSegmentCounters {
     std::uint64_t flux_uploads_elided      = 0;
     std::uint64_t xsnf_uploads_elided      = 0;
     std::uint64_t dtil_uploads_elided      = 0;
+    /// Segment exits that mirrored psi and dhat back.  The receipt arithmetic:
+    /// host_mirror_bytes should be about (mirror_exits + host-loop outers) times
+    /// one psi+dhat pair, not device_outers times it.
+    std::uint64_t mirror_exits             = 0;
     std::uint64_t refusals[static_cast<int>(OuterSegmentRefusal::Count)] = {};
     std::uint64_t escapes[kDeviceEscapeCount]                           = {};
 };
@@ -798,6 +802,17 @@ struct OuterSegmentLiveState {
     /// it without the device seeing anything.  The generation catches those,
     /// this catches the drive that never downloaded at all.
     bool device_owns_flux = false;
+
+    /// Will the drive about to run take the DEVICE sweep?
+    ///
+    /// BICGCMFD::canEnqueueDrive() -- the same gate drive() applies.  When it
+    /// is true nothing on the host reads _psi or _dhat during that drive: the
+    /// sweep works from the device buffers, its uploads are elided, and the two
+    /// exceptional states download for themselves
+    /// (issueExceptionalOperatorDownloads).  When it is false the host loop
+    /// runs and reads _psi through wiel and _dhat through the host assembly,
+    /// and the mirrors are what make those reads correct.
+    bool sweep_will_enqueue = false;
 };
 
 /// Re-read the live state.  Pure host reads; it must not enqueue anything.

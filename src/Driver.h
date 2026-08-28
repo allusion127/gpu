@@ -1057,6 +1057,7 @@ private:
         out.xs_generation   = h.ctx->cross_sections.hoststateGeneration();
         out.dtil_generation = h.ctx->cmfd_solver.dtilGeneration();
         out.device_owns_flux = h.ctx->cmfd_solver.lastDriveLeftDeviceFlux();
+        out.sweep_will_enqueue = h.ctx->cmfd_solver.canEnqueueDrive();
     }
 
     /// Hand the runner the sweep arena's buffers and install the hooks.

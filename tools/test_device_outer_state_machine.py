@@ -360,9 +360,12 @@ for bridge, counter in (("mirror psi to the host", "host_mirror_bytes"),
 # is what lets the loop stop enqueueing instead of running an outer whose host
 # calls the halt gate cannot silence.  It is NOT a rendezvous -- nothing waits on
 # it; the sync at the top of the next pass is what makes it visible.
-if GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost") > 8:
+# TEN since the mirror condition: the three named bridges, the exit word,
+# the four-copy observation, and the two segment-exit mirrors that
+# replaced the per-outer pair.
+if GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost") > 10:
     problems.append("CudaOuterGraph.cu: more D2H sites than the three named bridges plus "
-                    "the segment's three-copy observation (%d).  Each one is a rendezvous "
+                    "the observation and the two exit mirrors (%d).  Each one is a rendezvous "
                     "and needs a name" % GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost"))
 if "cudaGraph" in GRAPH_CU_CODE or "cudaGraph" in GRAPH_H_CODE:
     problems.append("CudaOuterGraph: uses the graph API.  The conditional WHILE wrapper is "
@@ -1092,6 +1095,52 @@ if _CUSP23 and "if (!_rod_cusping_nodes_scratch.empty())" not in _CUSP23:
                     "ResetCuspingNodesToBase bumps for itself, so an unconditional bump "
                     "reports a cross-section change on every outer of every deck that has "
                     "an axial rod division -- and cancels the xsnf elision entirely")
+
+# --- 24. psi/dhat go home only when a host reader will run -------------------
+#
+# They used to go back EVERY outer -- 495 KiB a pair on kngr_238, 327 MB over a
+# run -- to serve a reader that almost never came: 656 of 661 outers took the
+# device sweep, which works from the device buffers, has its uploads elided,
+# and downloads for itself on the two exceptional states.  The host loop is the
+# only reader (_psi through wiel, _dhat through the host assembly), and
+# canEnqueueDrive() is exactly the gate that decides which of the two runs.
+want(GRAPH_H_CODE, "sweep_will_enqueue", "CudaOuterGraph.h",
+     "the runner cannot tell whether a host reader is coming without asking the same "
+     "gate drive() applies")
+want(DRIVER_CODE, "canEnqueueDrive()", "Driver.h",
+     "the live-state hook must report the sweep gate, not a second spelling of it")
+# The guard has to be DERIVED FROM THE SWEEP GATE, not merely present: a
+# `host_reader_next = true` still satisfies "there is a guard" while mirroring
+# on every outer exactly as before.
+if "const bool host_reader_next = !live.sweep_will_enqueue;" not in GRAPH_CU_CODE:
+    problems.append("CudaOuterGraph.cu: host_reader_next is not derived from the sweep "
+                    "gate.  The mirrors are for the host loop and nothing else, so the "
+                    "condition has to be the same predicate that decides whether the host "
+                    "loop runs -- anything weaker mirrors on every outer again")
+_LOOP24 = body_of(GRAPH_CU_CODE, "for (unsigned int i = 0",
+                  "mirror psi to the host at the segment exit")
+if _LOOP24.count("mirror psi to the host") > 1 or _LOOP24.count("mirror dhat to the host") > 1:
+    problems.append("CudaOuterGraph.cu: more than one in-loop mirror per array; the pair is "
+                    "meant to fire once, on the outers whose drive takes the host loop")
+for _m in ("mirror psi to the host", "mirror dhat to the host"):
+    _at = _LOOP24.find(_m)
+    _guard = _LOOP24.rfind("host_reader_next", 0, _at) if _at > 0 else -1
+    if _at > 0 and _guard < 0:
+        problems.append(f"CudaOuterGraph.cu: the in-loop '{_m}' is not guarded by "
+                        "host_reader_next, so it runs on the 99% of outers whose drive "
+                        "reads the DEVICE buffers and never looks at the host ones")
+# The exit mirror is the one place a host reader is certain, and it must exist:
+# without it the ladder -- and the `!outer_on_device` host outer -- would read
+# what the device wrote several outers ago.
+want(GRAPH_CU_CODE, "mirror psi to the host at the segment exit", "CudaOuterGraph.cu",
+     "when runSegment returns the host ladder runs and may run a whole host outer, which "
+     "reads both arrays")
+want(GRAPH_CU_CODE, "mirror dhat to the host at the segment exit", "CudaOuterGraph.cu",
+     "same reader, same certainty")
+want(GRAPH_H_CODE, "mirror_exits", "CudaOuterGraph.h",
+     "the receipt has to show the pair count, or 'once per exit' is unfalsifiable")
+if "bump(counters().mirror_exits)" not in GRAPH_CU_CODE:
+    problems.append("CudaOuterGraph.cu: mirror_exits is never bumped")
 
 # --- the gates exist and are built -------------------------------------------
 want(REPLAY_TEXT, "kPhaseTransitions", "test/outer_state_replay.cpp",

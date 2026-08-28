@@ -160,6 +160,7 @@ struct AtomicCounters {
     std::atomic<std::uint64_t> flux_uploads_elided{0};
     std::atomic<std::uint64_t> xsnf_uploads_elided{0};
     std::atomic<std::uint64_t> dtil_uploads_elided{0};
+    std::atomic<std::uint64_t> mirror_exits{0};
     std::atomic<std::uint64_t> refusals[static_cast<int>(OuterSegmentRefusal::Count)];
     std::atomic<std::uint64_t> escapes[kDeviceEscapeCount];
 
@@ -233,6 +234,7 @@ OuterSegmentCounters outerSegmentCounters() {
     out.flux_uploads_elided     = a.flux_uploads_elided.load(std::memory_order_relaxed);
     out.xsnf_uploads_elided     = a.xsnf_uploads_elided.load(std::memory_order_relaxed);
     out.dtil_uploads_elided     = a.dtil_uploads_elided.load(std::memory_order_relaxed);
+    out.mirror_exits            = a.mirror_exits.load(std::memory_order_relaxed);
     for (int i = 0; i < static_cast<int>(OuterSegmentRefusal::Count); ++i)
         out.refusals[i] = a.refusals[i].load(std::memory_order_relaxed);
     for (int i = 0; i < kDeviceEscapeCount; ++i)
@@ -257,6 +259,7 @@ std::string outerSegmentReceiptJson() {
                     ",\"flux_uploads_elided\":" + std::to_string(c.flux_uploads_elided) +
                     ",\"xsnf_uploads_elided\":" + std::to_string(c.xsnf_uploads_elided) +
                     ",\"dtil_uploads_elided\":" + std::to_string(c.dtil_uploads_elided) +
+                    ",\"mirror_exits\":" + std::to_string(c.mirror_exits) +
                     ",\"segment_budget\":" + std::to_string(outerSegmentBudget());
 
     // Only the non-zero buckets, so a healthy run's line stays readable and a
@@ -634,6 +637,17 @@ OuterSegmentRefusal CudaOuterSegment::refusal(int batch_width, bool fractional_r
     return outerSegmentRefusal(e);
 }
 
+namespace {
+
+/// Bytes of one psi + dhat mirror pair, for the receipt arithmetic.
+std::size_t mirrorPairBytes(const OuterSegmentBinding& b) {
+    return static_cast<std::size_t>(b.nxyz) * sizeof(double) +
+           static_cast<std::size_t>(b.geom.nsurf) * static_cast<std::size_t>(b.ng) *
+               sizeof(double);
+}
+
+} // namespace
+
 bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_width,
                                   bool fractional_rods, bool critical_search,
                                   OuterSegmentResume& resume) {
@@ -881,12 +895,34 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                                 m.stream, m.d_halt)) != cudaSuccess)
             return launchFailed("enqueue updpsi", rc);
 
-        // psi back to the host, BEFORE the hook that may read it.
+        // psi AND dhat back to the host -- ONLY when a host reader is about to
+        // run, which here means only when this outer's drive will take the HOST
+        // loop.
         //
-        // drive() takes the HOST loop during the Wielandt warm-up and whenever
-        // the device sweep declines, and that loop reads _psi through wiel.  The
-        // segment replaced CMFD::updpsi, so nothing else will write it.
-        if (bound_.host_psi != nullptr && bound_.device_psi != nullptr) {
+        // WHAT CHANGED.  These two used to go back every outer, 483 KiB of the
+        // 495 KiB pair on kngr_238 and 327 MB over a run, to serve a reader that
+        // almost never came: 656 of 661 outers took the device sweep, which
+        // reads the DEVICE buffers, has its uploads elided, and downloads for
+        // itself on the two exceptional states
+        // (issueExceptionalOperatorDownloads).  The host loop reads _psi through
+        // wiel and _dhat through the host assembly, and canEnqueueDrive() is
+        // exactly the gate that decides which of the two runs.
+        //
+        // dhat is mirrored HERE and not after upddhat because the reader is the
+        // NEXT drive: what the host assembly wants is the d-hat the previous
+        // outer produced, which is what the device holds at this point.
+        const bool host_reader_next = !live.sweep_will_enqueue;
+        if (host_reader_next && bound_.host_dhat != nullptr &&
+            bound_.device_dhat != nullptr) {
+            const std::size_t dhat_bytes =
+                static_cast<std::size_t>(bound_.geom.nsurf) *
+                static_cast<std::size_t>(bound_.ng) * sizeof(double);
+            if ((rc = cudaMemcpyAsync(bound_.host_dhat, bound_.device_dhat, dhat_bytes,
+                                      cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+                return launchFailed("mirror dhat to the host", rc);
+            bump(counters().host_mirror_bytes, dhat_bytes);
+        }
+        if (host_reader_next && bound_.host_psi != nullptr && bound_.device_psi != nullptr) {
             const std::size_t psi_bytes =
                 static_cast<std::size_t>(bound_.nxyz) * sizeof(double);
             if ((rc = cudaMemcpyAsync(bound_.host_psi, bound_.device_psi, psi_bytes,
@@ -1035,16 +1071,6 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         // BICGCMFD::upddhat.  The sweep itself does NOT need this -- it reads the
         // device buffer and its H2D is elided (CmfdSweepIO::dhat_device_resident)
         // -- so this copy exists only to keep the fallback path honest.
-        if (bound_.host_dhat != nullptr && bound_.device_dhat != nullptr) {
-            const std::size_t dhat_bytes =
-                static_cast<std::size_t>(bound_.geom.nsurf) *
-                static_cast<std::size_t>(bound_.ng) * sizeof(double);
-            if ((rc = cudaMemcpyAsync(bound_.host_dhat, bound_.device_dhat, dhat_bytes,
-                                      cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
-                return launchFailed("mirror dhat to the host", rc);
-            bump(counters().host_mirror_bytes, dhat_bytes);
-        }
-
         // (4) the convergence INPUTS -- Driver.h:1562.
         //
         // MOVED BEHIND THE OBSERVATION, deliberately.  The plan puts this right
@@ -1076,6 +1102,34 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                                   cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
             return launchFailed("download segment exit", rc);
     }
+    // --- the segment exit: psi and dhat back, ONCE ---------------------------
+    //
+    // THE ONE PLACE A HOST READER IS CERTAIN.  When runSegment returns, the
+    // host ladder runs -- Xe, T/H, the search commit -- and may run a whole host
+    // outer of its own on the `!outer_on_device` path, which reads _psi through
+    // wiel and _dhat through setls.  Neither can be left holding what the device
+    // wrote several outers ago.
+    //
+    // ONCE PER SEGMENT AND NOT ONCE PER OUTER, which is the whole saving: at a
+    // budget of 8 on kngr_238 that is 374 pairs instead of 661, and the outers
+    // inside a segment have no host reader between them by construction -- the
+    // sweep hook is the only host call that reads either array, and the copies
+    // above cover the outers where it takes the host loop.
+    if (bound_.host_psi != nullptr && bound_.device_psi != nullptr &&
+        bound_.host_dhat != nullptr && bound_.device_dhat != nullptr) {
+        const std::size_t psi_bytes = static_cast<std::size_t>(bound_.nxyz) * sizeof(double);
+        const std::size_t dhat_bytes = static_cast<std::size_t>(bound_.geom.nsurf) *
+                                       static_cast<std::size_t>(bound_.ng) * sizeof(double);
+        if ((rc = cudaMemcpyAsync(bound_.host_psi, bound_.device_psi, psi_bytes,
+                                  cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+            return launchFailed("mirror psi to the host at the segment exit", rc);
+        if ((rc = cudaMemcpyAsync(bound_.host_dhat, bound_.device_dhat, dhat_bytes,
+                                  cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+            return launchFailed("mirror dhat to the host at the segment exit", rc);
+        bump(counters().host_mirror_bytes, mirrorPairBytes(bound_));
+        bump(counters().mirror_exits);
+    }
+
     // --- the single observation ---------------------------------------------
     DeviceOuterSegmentState seg_out{};
     DeviceSlotState         state_out{};
