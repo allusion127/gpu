@@ -1240,43 +1240,110 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     // WHAT STILL STOPS TASK 10 FROM CAPTURING THIS LOOP AS A CONDITIONAL WHILE
     // =======================================================================
     //
-    // Surveyed 2026-08-29, after W3 item 2 removed the nodal drive's terminal
-    // drain.  A stream in capture mode RECORDS work; it may not be
-    // synchronised, and a host call that reads device memory inside the body is
-    // not a node, it is a hole.  The body below still has both, and the list is
-    // ordered by what has to be fixed FIRST, because each entry subsumes the
-    // ones under it.
+    // Re-surveyed after W3 items 3 and 4, which closed two of the four entries
+    // this list used to have.  A stream in capture mode RECORDS work; it may not
+    // be synchronised, and a host call that reads device memory inside the body
+    // is not a node, it is a hole.  What is left is ONE hole, and everything
+    // else in the body is downstream of it.
     //
-    //  (1) THE EIGENVALUE ROUND TRIP.  :1302's synchronise exists so that
-    //      finish_cmfd_sweep (Driver.h:998, BICGCMFD::finishDrive) and the nodal
-    //      reset's `1.0 / eigv` (Driver.h:1020) can read an eigenvalue the sweep
-    //      produced on the DEVICE.  The verdict kernel already publishes it into
-    //      DeviceOuterProbe, and the nodal solve already takes it from device
-    //      memory (`v.reigv_dev`, CudaXsReconBackend.cu) -- via a captured H2D
-    //      out of a pinned host slot the host writes each drive.  So the whole
-    //      of the reciprocal's journey is device -> host -> pinned slot ->
-    //      device, and a one-thread kernel writing 1/probe.eigv straight into
-    //      that device slot removes the second and third hops.  That is Task 8,
-    //      and it is the smallest of these.
+    // WHAT IS DONE.
     //
-    //  (2) THE SWEEP OBSERVATION.  finishDrive also adopts the flux into
-    //      Geometry::Phif, answers lastDriveLeftDeviceFlux(), and -- on the
-    //      exceptional launches (sweep state 0 or 2) -- runs the remaining
-    //      blocking launches and republishes a probe the verdict kernel had to
-    //      guess at.  Only the exceptional branch genuinely needs the host; the
-    //      normal one is already device-to-device.  Splitting them is what makes
-    //      (1) worth doing.
+    //   THE EIGENVALUE ROUND TRIP (W3 item 3) is gone.  k_outer_publish_reigv
+    //   writes 1/eigv from the device probe straight into NodalView::reigv_dev,
+    //   so the reciprocal no longer travels device -> host -> pinned slot ->
+    //   device.  The drive's ONE remaining dependence on this outer's
+    //   observation is which side owns the flux -- setCanonicalNodalSegmentMode
+    //   takes lastDriveLeftDeviceFlux(), which absorbSweepLaunch sets -- and on
+    //   the enqueued path (11946 of kngr_238's 12017 outers) that answer is
+    //   always "the device".  It is the 71 host-loop outers that make it a read
+    //   rather than a constant, which puts it inside hole (1) below and not
+    //   beside it.
     //
-    //  (3) THE HOST-DECIDED UPLOAD ELISIONS.  :1083, :1096, :1143 and :1388 read
-    //      generations and byte shadows on the host to decide whether three
-    //      cudaMemcpyAsync nodes exist this outer.  A captured body has a FIXED
-    //      node set, so inside a segment they have to become either
-    //      unconditional (correct, and pure waste on the ~98% of outers that
-    //      elide today) or device-gated copies.
+    //   THE HOST-DECIDED UPLOAD ELISIONS (W3 item 4) are two-thirds gone.  _xs
+    //   and _dtil are staged in the arm block, on the proof that
+    //   XSSet::ApplyRodCusping is their only in-body writer; the body's H2D node
+    //   set is now {flux} rather than {flux, xsnf, dtil}.
     //
-    //  (4) apply_cusping (:1484) IS A HOST CALL ON EVERY OUTER, and it must stay
-    //      one until Task 11: i-SMR CY02 proved the question has to be asked per
-    //      outer, and ApplyRodCusping answers it from host scratch.
+    // WHAT IS LEFT, AND IT IS ONE THING WITH THREE CONSEQUENCES.
+    //
+    //  (1) THE SWEEP OBSERVATION.  BICGCMFD::finishDrive reads the sweep's
+    //      scalar block out of pinned host memory the stream filled, so the
+    //      stream must be drained first.  That is `sync_pre_nodal` in the
+    //      receipt, it is exactly `device_outers` on every arm and every budget,
+    //      and it is the whole of what a WHILE capture is blocked on.
+    //
+    //      ON THE NORMAL PATH (sweep state 1 or 3) the host does nothing with
+    //      what it reads that the device does not already hold: it copies eigv,
+    //      residual and four counters into host locals and sets
+    //      _last_drive_device_flux.  Deferring it to the segment exit needs
+    //      three things, and the third is the hard one:
+    //
+    //        (a) the NEXT outer's sweep must get eigv/reigv/reigvs from device
+    //            memory.  BICGCMFD::setls is a no-op on the device-assembly arm
+    //            (BICGCMFD.cpp: it only records _device_assembly_pending), so
+    //            the only host input is the three scalars enqueueDrive stages
+    //            into CmfdSweepIO -- a patch kernel over the staged block, the
+    //            same shape as k_outer_publish_reigv.
+    //        (b) BICGCMFD's own counters (iter, _wiel_sweep, _bicg_iters) must
+    //            be reconstructed at the exit from the device's sweeps_done.
+    //            _wiel_sweep is the one with teeth: it gates canEnqueueDrive()
+    //            through WIELANDT_WARMUP_SWEEPS = 5 and resetIteration() zeroes
+    //            it per statepoint, which is why 71 outers of kngr_238's 12017
+    //            still take the host CMFD loop.
+    //        (c) A HALTED OUTER MUST BE A NO-OP FOR THE HOST CALLS TOO.  Today
+    //            the host learns of sweep state 0 or 2 at this drain and repairs
+    //            the outer in place -- re-issuing the updjnet the verdict's halt
+    //            swallowed -- which is the only structure that reproduces the
+    //            host's trajectory, because the host does not START A NEW OUTER
+    //            on those states, it CONTINUES the same drive.  With the
+    //            observation deferred, outers i+1..N are enqueued behind a halt
+    //            that has already fired: their KERNELS are no-ops (every one
+    //            tests it), but the nodal drive would still run and overwrite
+    //            the canonical jnet/phis, and apply_cusping would still read a
+    //            stale leakage and could blend the cross sections.  So (c) is
+    //            really "gate the nodal graph on the segment halt as well" plus
+    //            Task 11 for cusping -- two task-sized pieces, not a tidy-up.
+    //
+    //  (2) apply_cusping IS A HOST CALL ON EVERY OUTER, and it must stay one
+    //      until Task 11: i-SMR CY02 proved the question has to be asked per
+    //      outer (774 firings in 857 outers there), and ApplyRodCusping answers
+    //      it from host scratch.
+    //
+    //  (3) THE EXIT OBSERVATION at the top of every pass is (1) in its other
+    //      costume: it exists because the two host calls above cannot read a
+    //      device word.  It is what makes a WIDE segment pay MORE rendezvous per
+    //      outer than a narrow one -- kngr_238 measures 2.006 per outer at b1
+    //      against 2.217 at b8 and 2.224 at b16 -- so the budget's advantage
+    //      today is transfer amortisation, not fewer round trips.  At b8, 2535
+    //      of 14552 passes are DISCOVERY-ONLY: they synchronise, see the exit,
+    //      and break without committing an outer.
+    //
+    //      IT CAN BE REMOVED WITHOUT (1), AND HERE IS THE SHAPE, because it is
+    //      worth 43% of b8's rendezvous on its own.  Nothing between the sweep
+    //      and upddhat touches the three inputs of the convergence decision
+    //      (eigv, residual, prev_inner) -- that is the same argument the header
+    //      note makes for evaluating the decision AFTER upddhat, run backwards --
+    //      so refresh + convergence + a publish of `exit` could be issued right
+    //      behind the sweep instead.  The host would then learn outer i's exit
+    //      at outer i's OWN pre-nodal drain, which it already pays, and pass i+1
+    //      would simply not be entered.  sync_exit_observation goes to zero and
+    //      the discovery-only passes stop existing.
+    //
+    //      THE HAZARD IS cmfdOuterConvergence's SIDE EFFECTS, and it is why this
+    //      is written down rather than done here.  That body MUTATES
+    //      CmfdOuterState -- ++total_outer, prev_inner = eigv, xe_interim_count,
+    //      flux_stall, clean_iters (CmfdOuterKernel.h) -- so it is not
+    //      re-runnable, and the exceptional path (sweep state 0 or 2, 3 outers
+    //      in 12000) has to re-run it: republishAfterHostSweep overwrites the
+    //      probe the first evaluation read.  Running it twice would compare the
+    //      second evaluation's prev_inner against the FIRST one's eigenvalue,
+    //      which is a different convergence test on exactly the outers that are
+    //      already the hardest to reproduce.  The fix is to make the early
+    //      kernel write its state mutations to a SHADOW DeviceSlotState and have
+    //      the end-of-body commit apply the shadow -- decide early, commit late
+    //      -- so a re-issue recomputes from an unmutated state.  That is a real
+    //      change to the tree's most delicate kernel and it belongs in its own
+    //      gated commit, not as a rider on this one.
     //
     // MEASURED ON THE LOCAL BOX (tools/probe_conditional_graph.cu, CUDA 12.6,
     // sm_61, GTX 1080 Ti): WHILE conditional nodes are legal and the handle
@@ -1285,8 +1352,8 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     // iteration against WHILE's own 4.55 us; a cooperative kernel node inside a
     // conditional body is accepted; instantiation of 1505 nodes takes 3.24 ms,
     // against the plan's 250 ms gate.  At 4.55 us per outer a WHILE over this
-    // deck's 12017 outers costs 55 ms of a 60 s run, so the control flow is not
-    // what decides this -- the four holes above are.
+    // deck's 12017 outers costs 55 ms of a 60 s run, so the control flow has
+    // never been what decides this -- hole (1) is.
     for (unsigned int i = 0; i < budget; ++i) {
         // THE PREVIOUS OUTER'S EXIT, AND WHY IT COSTS A SYNCHRONISE.
         //
