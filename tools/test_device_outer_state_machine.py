@@ -388,6 +388,69 @@ for banned in ("std::chrono", "clock_gettime", "cudaEventElapsedTime"):
                         "increment per event; a segment is at most 8 outers and a timer per "
                         "outer would be a measurable tax on the thing being measured")
 
+# --- 11. the host bodies are COUNTED, so "on" and "engaged" are different ----
+#
+# An audit of 8be6bee found the Task 4/5/7 device bodies had ZERO production
+# callers: a run with every device feature on still executed
+# BICGCMFD::updpsi/updjnet/upddhat and Nodal::updateConstant on the CPU, and no
+# receipt in the tree could have said so.  A device outer's claim is
+# `host_body_calls` flat across the segment, and a claim with no counter behind
+# it is a review comment rather than a gate.
+COUNTERS_H = read(SRC / "HostOuterBodyCounters.h")
+BICG = strip_comments(read(SRC / "BICGCMFD.cpp"))
+NODAL = strip_comments(read(SRC / "Nodal.cpp"))
+for field in ("updpsi", "updjnet", "upddhat", "upddtil", "nodal_constants"):
+    want(COUNTERS_H, field, "HostOuterBodyCounters.h", "one counter per host outer body")
+# Each host body must bump its own counter, and the bump must be INSIDE the
+# function rather than at some call site that a second caller could bypass.
+for fn, counter, stop in (
+        ("void BICGCMFD::updpsi(", "updpsi", "void BICGCMFD::"),
+        ("void BICGCMFD::updjnet(", "updjnet", "void BICGCMFD::"),
+        ("void BICGCMFD::upddhat(", "upddhat", "bool BICGCMFD::"),
+        ("void BICGCMFD::upddtil(", "upddtil", "void BICGCMFD::")):
+    body = body_of(BICG, fn, stop)
+    if "hostouter::counters()." + counter not in body:
+        problems.append("BICGCMFD.cpp: %s does not bump hostouter::counters().%s -- without "
+                        "it a device outer's 'the host did not run this' is unfalsifiable"
+                        % (fn.strip("(") , counter))
+if NODAL.count("hostouter::counters().nodal_constants") < 2:
+    problems.append("Nodal.cpp: both updateConstant sweeps (the GPU arm's and the CPU "
+                    "drive's) must be counted; counting one leaves the other invisible")
+# Counted per SWEEP, not per node: a per-node atomic inside the OpenMP loop
+# would be nxyz increments per drive on the hottest loop in the nodal solver.
+if "updateConstant(lk) ? 1 : 0;\n            hostouter::" in NODAL or \
+        "hostouter::bumpHostBody" in body_of(NODAL, "bool Nodal::updateConstant(", "\n}"):
+    problems.append("Nodal.cpp: the constants counter is bumped per NODE.  It must be "
+                    "bumped once around the sweep -- nxyz atomics per drive is a "
+                    "measurable tax on the thing being measured")
+# And the receipt has to carry them, in one shared formatter so the two arms
+# cannot disagree.
+want(GRAPH_H_CODE, "outerHostBodyJson", "CudaOuterGraph.h",
+     "the host-body block must be formatted in ONE place for both arms")
+for arm, code in (("CudaOuterGraph.cu", GRAPH_CU_CODE),
+                  ("CudaOuterGraphStub.cpp", STUB_CODE)):
+    if "outerHostBodyJson()" not in code:
+        problems.append(f"{arm}: the receipt does not report host_body_calls, so a run "
+                        "cannot tell 'the device outer is on' from 'the host still did the "
+                        "arithmetic'")
+want(GRAPH_H_CODE, '\\"host_body_calls\\"', "CudaOuterGraph.h", "the receipt field name")
+# And an idle run must say WHY.  `refusals{}` is only filled by a call site that
+# reached the delegation, and ReconvergeFlux is the search FALLBACK -- a deck
+# that never falls back never enters it, so an ordinary run with the feature on
+# printed `device_outers:0, refusals:{}` and not one word about the reason.
+want(GRAPH_H_CODE, "outerIdleReasonJson", "CudaOuterGraph.h",
+     "an idle run must name its refusal, asked at print time rather than remembered "
+     "from a call site that may never have been reached")
+for arm, code in (("CudaOuterGraph.cu", GRAPH_CU_CODE),
+                  ("CudaOuterGraphStub.cpp", STUB_CODE)):
+    if "outerIdleReasonJson(" not in code:
+        problems.append(f"{arm}: the receipt does not name the idle reason, so "
+                        "'on and never engaged' and 'on and every segment did nothing' "
+                        "print the same line")
+    if "segment_launches == 0" not in code:
+        problems.append(f"{arm}: the idle reason must be printed only when nothing ran -- "
+                        "on a healthy run it is 'none' and would be noise")
+
 # --- the gates exist and are built -------------------------------------------
 want(REPLAY_TEXT, "kPhaseTransitions", "test/outer_state_replay.cpp",
      "the emitted edges must be cross-checked against the W1 table")

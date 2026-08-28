@@ -1,5 +1,6 @@
 #include "BICGCMFD.h"
 
+#include "HostOuterBodyCounters.h"
 #include "HostPinRegistry.h"
 
 #include <cstdio>
@@ -192,14 +193,18 @@ void BICGCMFD::wiel(const int& icy, const double* flux, double& reigvs, double& 
 }
 
 void BICGCMFD::upddtil() {
-
+    // Rev.7.1 Task 9: one relaxed increment per SWEEP, so a receipt can say
+    // whether the device outer actually replaced this loop (HostOuterBodyCounters.h).
+    hostouter::bumpHostBody(hostouter::counters().upddtil);
     for (int ls = 0; ls < _g.nsurf(); ++ls) {
         CMFD::upddtil(ls);
     }
 }
 
 void BICGCMFD::upddhat(double* flux, double* jnet) {
-
+    // Rev.7.1 Task 9: one relaxed increment per SWEEP, so a receipt can say
+    // whether the device outer actually replaced this loop (HostOuterBodyCounters.h).
+    hostouter::bumpHostBody(hostouter::counters().upddhat);
     for (int ls = 0; ls < _g.nsurf(); ++ls) {
         CMFD::upddhat(ls, flux, jnet);
     }
@@ -267,14 +272,18 @@ void BICGCMFD::updls(const int& l, const double& reigvs) {
 }
 
 void BICGCMFD::updjnet(double* flux, double* jnet) {
-
+    // Rev.7.1 Task 9: one relaxed increment per SWEEP, so a receipt can say
+    // whether the device outer actually replaced this loop (HostOuterBodyCounters.h).
+    hostouter::bumpHostBody(hostouter::counters().updjnet);
     for (int ls = 0; ls < _g.nsurf(); ++ls) {
         CMFD::updjnet(ls, flux, jnet);
     }
 }
 
 void BICGCMFD::updpsi(const double* flux) {
-
+    // Rev.7.1 Task 9: one relaxed increment per SWEEP, so a receipt can say
+    // whether the device outer actually replaced this loop (HostOuterBodyCounters.h).
+    hostouter::bumpHostBody(hostouter::counters().updpsi);
     for (int l = 0; l < _g.nxyz(); ++l) {
         CMFD::updpsi(l, flux);
     }

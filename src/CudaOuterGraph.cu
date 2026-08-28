@@ -36,9 +36,68 @@
 // outside the Task 2 gate calls reserve()), so `NoArena` refuses first.
 //
 // A refusal is not a silent fallback: it is counted, named, and printed in the
-// [RASBERY][OUTER_GPU] receipt.  The failure mode of an opt-in fast path is that
-// it never engages and the A/B measures the slow path twice; the receipt is what
-// makes that impossible to miss.
+// [RASBERY][OUTER_GPU] receipt -- as `idle_reason` when nothing ran at all, so a
+// deck that never reaches the delegation still says why.  The failure mode of an
+// opt-in fast path is that it never engages and the A/B measures the slow path
+// twice; the receipt is what makes that impossible to miss.
+//
+// ---------------------------------------------------------------------------
+// WHAT IS ACTUALLY IN THE WAY, MEASURED  (the standing work item)
+// ---------------------------------------------------------------------------
+//
+// An audit of 8be6bee found that the Task 4/5/7 device bodies have NO
+// production caller: the enqueue block below is their only one in src/, and it
+// is unreachable for the reasons above.  The receipt now MEASURES that -- a
+// two-statepoint i-SMR CY01 run with RASBERY_GPU_OUTER=1 prints
+//
+//     "device_outers":0, "idle_reason":"no_runner",
+//     "host_body_calls":{"updpsi":207,"updjnet":207,"upddhat":207,
+//                        "upddtil":3,"nodal_constants":207}
+//
+// i.e. the host ran every one of the 207 outer bodies.  Closing that is a chain
+// of four dependencies, and each link is somebody's task rather than an
+// oversight here:
+//
+//  (1) NO ARENA EXISTS AT RUNTIME.  GpuPhysicsArena::reserve()
+//      (GpuPhysicsArenaCuda.cu:79) has zero callers in src/ and test/, so there
+//      is no DeviceSlotView, no fixed per-slot addresses, and no
+//      CmfdOuterSlotTable to build.  That is Task 2/18's lifecycle, not this
+//      file's -- and it is what NoArena names.
+//
+//      NOTE, for whoever picks it up: the four BODY kernels
+//      (k_cmfd_upd_psi/dtil/jnet/dhat) take the arena and `(void)arena` it --
+//      only k_cmfd_outer_convergence reads arena.states.  So a bridged wiring
+//      that only wants the arithmetic needs a slot table and a queue, not a
+//      reserved arena.
+//
+//  (2) THE SWEEP READS THE HOST ARRAYS.  BICGCMFD::driveDeviceSweeps fills
+//      CmfdSweepIO with the raw host pointers (BICGCMFD.cpp:382-386:
+//      io.dtil = _dtil, io.dhat = _dhat, io.psi = _psi) and CudaBICGBackend's
+//      issueSweepUploads pushes dhat unconditionally every outer
+//      (CudaBICGBackend.cu:2918-2919, surface_group_count doubles) because
+//      "dhat changes after every nodal correction".  So a device-resident dhat
+//      does not remove that H2D -- pointing the sweep at the device buffer
+//      does, and that is the sweep/arena refactor, deliberately NOT touched
+//      here.  The same holds for psi, which is in/out across
+//      issueSweepUploads:2944 and issueSweepDownloads:2967.
+//
+//  (3) TWO LAYOUTS.  CmfdOuterView::flux is node-major [l*ng+ig]
+//      (Geometry::Phif), while BatchCore::phi and the xs mirrors are
+//      group-major [ig*nxyz+l].  dtil/dhat/jnet agree at [ls*ng+ig] on both
+//      sides.  Whoever binds the view has to choose a transpose site rather
+//      than alias the sweep's phi.
+//
+//  (4) TWO PSIs.  DeviceSlotView carries both `psi` (SlotRegion::Psi) and
+//      `cmfd_psi` (SlotRegion::CmfdPsi).  CmfdOuterView::psi is the CMFD
+//      fission source, so it binds to cmfd_psi.  Getting this wrong is silent.
+//
+// The nodal constants have a fifth, separate blocker:
+// nodalConstantSlotIsCurrent gates on
+// `nodal_constant_generation == material_generation`, and material_generation is
+// one of the eight SPECULATIVE counters nothing on the host ever bumps
+// (GpuSlotControl.h:280-287) -- so the device cache would read "current"
+// forever.  That is Task 13/18's, and it is why enqueueNodalUpdateConstant is
+// issued from the prologue here but nothing calls the prologue yet.
 
 #include "CudaOuterGraph.h"
 
@@ -50,6 +109,13 @@
 #include <cstring>
 #include <ostream>
 #include <string>
+
+// Forward-declared rather than included: the receipt needs the batch width to name
+// the idle reason, and CudaBICGBackend.h would drag the whole solver surface into a
+// file that only wants one int.  The declaration matches CudaBICGBackend.h:336.
+namespace rasbery {
+int rasberyBatchWidth();
+} // namespace rasbery
 
 namespace rasbery::gpu {
 
@@ -187,7 +253,16 @@ std::string outerSegmentReceiptJson() {
         s += outerRefusalName(static_cast<OuterSegmentRefusal>(i));
         s += "\":" + std::to_string(c.refusals[i]);
     }
-    s += "}}";
+    s += "},";
+    // Printed ONLY when nothing ran: on a healthy run the reason is "none" and
+    // saying so would be noise, while on an idle run it is the whole message.
+    if (c.segment_launches == 0) {
+        s += outerIdleReasonJson(
+            rasberyOuterSegment().refusal(rasberyBatchWidth(), false, false));
+        s += ",";
+    }
+    s += outerHostBodyJson();
+    s += "}";
     return s;
 }
 

@@ -124,6 +124,7 @@
 #include "CudaNodalConstantKernel.h"
 #include "GpuPhaseScheduler.h"
 #include "GpuPhysicsTypes.h"
+#include "HostOuterBodyCounters.h"
 
 #include <cstdint>
 #include <iosfwd>
@@ -595,8 +596,51 @@ struct OuterSegmentCounters {
 
 /// The Sec 9.3 payload: `{segment_launches, device_outers,
 /// host_outer_observations, budget_exits, halted_outer_launches, escapes{...},
-/// refusals{...}}`.
+/// refusals{...}, host_body_calls{...}}`.
 [[nodiscard]] std::string outerSegmentReceiptJson();
+
+/// THE OTHER HALF OF THE CLAIM, and the half an audit of 8be6bee found missing.
+///
+/// Every counter above says what the DEVICE did.  None of them can say whether
+/// the host did it too -- and at 8be6bee it did: the Task 4/5/7 kernels had no
+/// production caller at all, so a run with every device feature on still
+/// executed BICGCMFD::updpsi/updjnet/upddhat and Nodal::updateConstant on the
+/// CPU and every receipt in the tree looked healthy.
+///
+/// So the receipt carries the host counters beside the device ones.  A device
+/// outer's claim is `host_body_calls` flat across the segment; printing them
+/// together is what makes "the feature is on" and "the host still did the
+/// arithmetic" two different numbers instead of one silent one.
+///
+/// Defined here rather than in either arm so the two cannot format it
+/// differently, which is the same reason outerEscapeName lives in the header.
+/// Why nothing ran, asked at PRINT time rather than remembered from a call site.
+///
+/// THE HOLE THIS CLOSES.  `refusals{}` is only populated by a call site that
+/// actually reached the delegation -- ReconvergeFlux, which a deck that never
+/// falls back to a previous trial point never enters.  So a perfectly ordinary
+/// run with the feature ON printed `device_outers:0, refusals:{}`, which says
+/// "nothing happened" and not one word about WHY, and is byte-for-byte what a
+/// run whose every segment succeeded-at-zero-outers would print.
+///
+/// Asking the runner at print time costs one pure predicate and always answers.
+/// `fractional_rods` and `critical_search` are passed false deliberately: they
+/// are DECK properties the receipt has no access to here, and they are ranked
+/// BELOW every structural refusal (no runner, no arena, unbound, no hooks), so
+/// with any of those present the answer is exact.  When none of them is, the
+/// segment is running and this field is not printed at all.
+[[nodiscard]] inline std::string outerIdleReasonJson(OuterSegmentRefusal why) {
+    return std::string("\"idle_reason\":\"") + outerRefusalName(why) + "\"";
+}
+
+[[nodiscard]] inline std::string outerHostBodyJson() {
+    const hostouter::Snapshot h = hostouter::snapshot();
+    return "\"host_body_calls\":{\"updpsi\":" + std::to_string(h.updpsi) +
+           ",\"updjnet\":" + std::to_string(h.updjnet) +
+           ",\"upddhat\":" + std::to_string(h.upddhat) +
+           ",\"upddtil\":" + std::to_string(h.upddtil) +
+           ",\"nodal_constants\":" + std::to_string(h.nodal_constants) + "}";
+}
 
 /// Writes one `[RASBERY][OUTER_GPU] {...}` line.  Emitted whenever the feature
 /// was ENABLED, including when every segment was refused -- a receipt that only

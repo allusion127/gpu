@@ -31,6 +31,13 @@
 #include <ostream>
 #include <string>
 
+// Forward-declared rather than included: the receipt needs the batch width to name
+// the idle reason, and CudaBICGBackend.h would drag the whole solver surface into a
+// file that only wants one int.  The declaration matches CudaBICGBackend.h:336.
+namespace rasbery {
+int rasberyBatchWidth();
+} // namespace rasbery
+
 namespace rasbery::gpu {
 
 namespace {
@@ -98,7 +105,16 @@ std::string outerSegmentReceiptJson() {
         s += outerRefusalName(static_cast<OuterSegmentRefusal>(i));
         s += "\":" + std::to_string(c.refusals[i]);
     }
-    s += "}}";
+    s += "},";
+    // Printed ONLY when nothing ran: on a healthy run the reason is "none" and
+    // saying so would be noise, while on an idle run it is the whole message.
+    if (c.segment_launches == 0) {
+        s += outerIdleReasonJson(
+            rasberyOuterSegment().refusal(rasberyBatchWidth(), false, false));
+        s += ",";
+    }
+    s += outerHostBodyJson();
+    s += "}";
     return s;
 }
 

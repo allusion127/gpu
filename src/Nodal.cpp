@@ -1,4 +1,5 @@
 #include "Nodal.h"
+#include "HostOuterBodyCounters.h"
 #include "HostPinRegistry.h"
 #include "NodalConstantKernel.h"
 
@@ -816,6 +817,11 @@ bool Nodal::TryDriveGpu() {
     // advances the device-residency generation exactly once per drive. This
     // removes the previous data race on _const_generation and avoids thousands
     // of redundant increments when a whole core state changes.
+    // Rev.7.1 Task 9: counted once per SWEEP over the nodes, not per node -- the
+    // number a reader wants is "did this drive recompute the constants on the
+    // host at all", which is what a device outer claims it did not
+    // (HostOuterBodyCounters.h).
+    hostouter::bumpHostBody(hostouter::counters().nodal_constants);
     int constants_changed = 0;
 #ifdef _OPENMP
 #pragma omp parallel for reduction(| : constants_changed) schedule(static) if (_nxyz > rasbery_omp_gate)
@@ -853,6 +859,11 @@ void Nodal::driveBody() {
     // Each per-node / per-surface routine is independent (writes its own node/surface data; reads
     // neighbours only across the implicit barrier between phases). One parallel region with a
     // barrier per phase amortizes fork/join; results are bit-identical (no cross-node reduction).
+    // Rev.7.1 Task 9: counted once per SWEEP over the nodes, not per node -- the
+    // number a reader wants is "did this drive recompute the constants on the
+    // host at all", which is what a device outer claims it did not
+    // (HostOuterBodyCounters.h).
+    hostouter::bumpHostBody(hostouter::counters().nodal_constants);
     int constants_changed = 0;
 #pragma omp parallel if (_nxyz > rasbery_omp_gate)
     {
