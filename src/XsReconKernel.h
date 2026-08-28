@@ -118,12 +118,30 @@ struct BatchView {
     const double* dep_xe135;   ///< depTrans(iXe135, j), j = 0..NISO-1
 };
 
-/// One fuel node.  Returns 1 if the node was processed, 0 if it was skipped by
-/// the same zero-flux guard the CPU loop uses.  max_change_out receives the
-/// RAW (pre-damping) relative Xe-135 step for this node; the caller reduces
-/// with max, which is order-insensitive and therefore deterministic.
-RASBERY_XSR_HD inline int xsreconSolveNode(const BatchView& v, int l,
-                                           double* max_change_out) {
+/// The closed-form equilibrium image of one node's I-135/Xe-135/Xe-135m chain.
+struct XeNodeImage {
+    double i135;
+    double xe135;
+    double xe135m;
+};
+
+/// Steps (a)-(d) of the fused node body: absolute flux, micro-XS condensation,
+/// the closed-form Xe equilibrium image, and the RAW (pre-damping) relative
+/// Xe-135 step.  WRITES NOTHING -- not v.iden, not v.xs -- which is what lets
+/// the Anderson arm (Rev.7.1 Task 13) look at F(x) before deciding what to
+/// commit, exactly as the host XSSet::EvaluateEquilibriumXenon does.
+///
+/// EXTRACTED FROM xsreconSolveNode, NOT rewritten: same expressions, same
+/// accumulation orders, same xsrMul/xsrFma choices.  Returns 1 when the node
+/// was processed and 0 when the zero-flux guard skipped it; on a skip nothing
+/// is written and the caller must treat F(x) = x there (the identity seed the
+/// host evaluate path uses), because that is what the fused loop's `continue`
+/// means.
+///
+/// `iden_out` receives the node's CURRENT NISO densities -- the iterate x --
+/// with rows I135/XE135/XE135M still holding the pre-image values.
+RASBERY_XSR_HD inline int xsreconImageNode(const BatchView& v, int l, double* iden_out,
+                                           XeNodeImage* img_out, double* max_change_out) {
     const int nxyz = v.nxyz;
 
     // (a) absolute flux -- same accumulation order as the CPU loop.
@@ -142,7 +160,6 @@ RASBERY_XSR_HD inline int xsreconSolveNode(const BatchView& v, int l,
     // rounded before the add.
     const double invflux = 1.0 / raw_sumflux;
     double       cond[NISO * NXS];
-    double       iden[NISO];
     for (int iso = 0; iso < NISO; ++iso) {
         for (int xt = 0; xt < NXS; ++xt) {
             double sum = 0.0;
@@ -150,7 +167,7 @@ RASBERY_XSR_HD inline int xsreconSolveNode(const BatchView& v, int l,
                 sum += xsrMul(v.mic[xt][(iso * NG + ig) * nxyz + l], absflux[ig]);
             cond[iso * NXS + xt] = sum * invflux;
         }
-        iden[iso] = v.iden[iso * nxyz + l];
+        iden_out[iso] = v.iden[iso * nxyz + l];
     }
 
     // FluxScale(abs_flux, ng) recomputes the same ig-ascending sum as (a), so
@@ -162,14 +179,12 @@ RASBERY_XSR_HD inline int xsreconSolveNode(const BatchView& v, int l,
     // Xeeq quotient -- the numerator lambdaI*Ieq+fissSourceXe, and the
     // denominator ACROSS the sigaXe temporary as fma(cond, sumflux, lambdaXe),
     // which is why no separately-rounded sigaXe exists here.
-    const double old_i   = iden[I135];
-    const double old_xe  = iden[XE135];
-    const double old_xem = iden[XE135M];
+    const double old_xe = iden_out[XE135];
     {
         double fissSourceI = 0.0, fissSourceXe = 0.0;
         for (int j = AC_FIRST; j <= AC_LAST; ++j) {
             double xsff  = cond[j * NXS + T_XSFF];
-            double fRate = iden[j] * xsff * sumflux;
+            double fRate = iden_out[j] * xsff * sumflux;
             fissSourceI += xsrMul(fRate, v.dep_i135[j]);
             fissSourceXe += xsrMul(fRate, v.dep_xe135[j]);
         }
@@ -177,34 +192,39 @@ RASBERY_XSR_HD inline int xsreconSolveNode(const BatchView& v, int l,
         double Xeeq = xsrFma(LAMBDA_I, Ieq, fissSourceXe) /
                       xsrFma(cond[XE135 * NXS + T_XSAF], sumflux, LAMBDA_XE);
 
-        iden[I135]   = Ieq;
-        iden[XE135]  = Xeeq;
-        iden[XE135M] = BR_I_TO_XE135M * LAMBDA_I * Ieq / LAMBDA_XEM;
+        img_out->i135   = Ieq;
+        img_out->xe135  = Xeeq;
+        img_out->xe135m = BR_I_TO_XE135M * LAMBDA_I * Ieq / LAMBDA_XEM;
     }
 
     // (d) raw relative step.  std::max(a, b) is (a < b) ? b : a; spelled out
     // so host and device pick the identical operand.
-    const double new_xe    = iden[XE135];
+    const double new_xe    = img_out->xe135;
     const double abs_newxe = fabs(new_xe);
     const double scale     = (abs_newxe < 1.0e-30) ? 1.0e-30 : abs_newxe;
     *max_change_out        = fabs(new_xe - old_xe) / scale;
+    return 1;
+}
 
-    // x <- x + relax*(F(x) - x).  The guard keeps the undamped case
-    // arithmetically identical instead of relying on 1.0*(a-b)+b == a.
-    if (v.relax < 1.0) {
-        iden[I135]   = xsrFma(v.relax, iden[I135] - old_i, old_i);
-        iden[XE135]  = xsrFma(v.relax, iden[XE135] - old_xe, old_xe);
-        iden[XE135M] = xsrFma(v.relax, iden[XE135M] - old_xem, old_xem);
-    }
+/// ReconstructNode, verbatim: iso-ascending accumulation per element, from a
+/// caller-supplied NISO-long density vector.
+///
+/// EXTRACTED FROM xsreconSolveNode (Rev.7.1 Task 13), NOT rewritten.  The Xe
+/// commit kernel has to reconstruct a node from an inventory the Anderson arm
+/// chose rather than from the one the fused step just computed, and the one
+/// thing that must not happen is a second copy of this loop drifting from the
+/// first.  Every expression, every accumulation order and every xsrFma below is
+/// exactly what stood inside xsreconSolveNode; the two consistency harnesses
+/// (rasbery_xsrecon_consistency and rasbery_xsrecon_device_consistency) score
+/// the composed body against the -O3 reference, so a change of arithmetic in
+/// this move is a gate failure and not a silent one.
+///
+/// `iden` is the node's full isotope vector (NISO doubles), rows I135/XE135/
+/// XE135M already holding the values that were just stored into v.iden.
+RASBERY_XSR_HD inline void xsreconReconstructNode(const BatchView& v, int l,
+                                                  const double* iden) {
+    const int nxyz = v.nxyz;
 
-    // (e) only the Xe-chain rows change in the global density array.
-    v.iden[I135 * nxyz + l]   = iden[I135];
-    v.iden[XE135 * nxyz + l]  = iden[XE135];
-    v.iden[XE135M * nxyz + l] = iden[XE135M];
-
-    // (f) ReconstructNode, verbatim: iso-ascending accumulation per element.
-    // The CPU version re-reads _iden from memory here; rows 3..5 of the local
-    // copy hold exactly the values just stored, so the operands are the same.
     // Local mirror of ACTIVE_XT: device code cannot reference the
     // namespace-scope array's storage.
     const int active_xt[9] = {T_XSTF, T_XSAF, T_XSFF, T_XSNF, T_XSKF,
@@ -243,6 +263,45 @@ RASBERY_XSR_HD inline int xsreconSolveNode(const BatchView& v, int l,
             rf += v.xs_ssm[(igs * NG + ige) * nxyz + l];
         v.xs[T_XSRF][igs * nxyz + l] = rf;
     }
+}
+
+/// One fuel node.  Returns 1 if the node was processed, 0 if it was skipped by
+/// the same zero-flux guard the CPU loop uses.  max_change_out receives the
+/// RAW (pre-damping) relative Xe-135 step for this node; the caller reduces
+/// with max, which is order-insensitive and therefore deterministic.
+RASBERY_XSR_HD inline int xsreconSolveNode(const BatchView& v, int l,
+                                           double* max_change_out) {
+    const int nxyz = v.nxyz;
+
+    double      iden[NISO];
+    XeNodeImage img;
+    if (!xsreconImageNode(v, l, iden, &img, max_change_out))
+        return 0;
+
+    const double old_i   = iden[I135];
+    const double old_xe  = iden[XE135];
+    const double old_xem = iden[XE135M];
+    iden[I135]           = img.i135;
+    iden[XE135]          = img.xe135;
+    iden[XE135M]         = img.xe135m;
+
+    // x <- x + relax*(F(x) - x).  The guard keeps the undamped case
+    // arithmetically identical instead of relying on 1.0*(a-b)+b == a.
+    if (v.relax < 1.0) {
+        iden[I135]   = xsrFma(v.relax, iden[I135] - old_i, old_i);
+        iden[XE135]  = xsrFma(v.relax, iden[XE135] - old_xe, old_xe);
+        iden[XE135M] = xsrFma(v.relax, iden[XE135M] - old_xem, old_xem);
+    }
+
+    // (e) only the Xe-chain rows change in the global density array.
+    v.iden[I135 * nxyz + l]   = iden[I135];
+    v.iden[XE135 * nxyz + l]  = iden[XE135];
+    v.iden[XE135M * nxyz + l] = iden[XE135M];
+
+    // (f) ReconstructNode, verbatim: the CPU version re-reads _iden from memory
+    // here; rows 3..5 of the local copy hold exactly the values just stored, so
+    // the operands are the same.
+    xsreconReconstructNode(v, l, iden);
 
     return 1;
 }
