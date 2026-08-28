@@ -104,6 +104,20 @@ for bad in ("cudaMalloc", "cudaFree", "new double", "delete[]"):
                         "fixed-address contract that makes graph capture legal")
 want(CANON_CODE, "canonicalFromSlotView", "GpuCanonicalState.h",
      "the borrowed set must be derived from the arena's slot view, not assembled by hand")
+# The nodal arena now really borrows; the old hard refusal must be gone.
+if "canonicalIsSlotDense" in CANON_CODE:
+    problems.append("GpuCanonicalState.h: canonicalIsSlotDense is still here.  The nodal "
+                    "per-slot pointer table replaced the stride refusal with real wiring; "
+                    "leaving the predicate invites someone to re-add the refusal")
+want(CANON_CODE, "canonicalNodalSetIsCoherent", "GpuCanonicalState.h",
+     "flux/jnet/phis are adopted together or not at all -- a partial set would pair the "
+     "canonical jnet with the arena's own flux, blending two outer iterations")
+want(CU_CODE, "canonicalNodalSetIsCoherent", "CudaXsReconBackend.cu",
+     "the arena must refuse a partial set at the adoption boundary")
+want(CU_CODE, "g_nodal_arena->adoptCanonical", "CudaXsReconBackend.cu",
+     "adoptCanonicalBuffers must reach the ARENA, not stop at the per-instance path")
+want(CU_CODE, "refreshViews", "CudaXsReconBackend.cu",
+     "the view table has to be rebuilt when an adoption changes it")
 adopt = CU_CODE[CU_CODE.find("XsReconBackend::adoptCanonicalBuffers"):][:1200]
 if adopt and re.search(r"cudaFree|cudaMalloc", adopt):
     problems.append("adoptCanonicalBuffers: must not allocate or free -- it borrows")
@@ -197,7 +211,12 @@ if "add_test(NAME canonical_state" not in CMAKE_TEXT:
 for needle, why in (("pointer identity", "the identity check"),
                     ("mixed mode", "one slot shared, one legacy"),
                     ("speculative", "the speculative-counter check"),
-                    ("feature-off", "the inert-when-off check")):
+                    ("feature-off", "the inert-when-off check"),
+                    ("mixed stride", "canonical slot 0 beside legacy slot 1 -- the "
+                                     "configuration the dense rebase could not represent"),
+                    ("dense-equivalent", "a default table entry must equal the rebase, "
+                                         "which is what makes the conversion indirection "
+                                         "only")):
     if needle not in GATE_TEXT:
         problems.append(f"test/canonical_state.cpp: no {why}")
 

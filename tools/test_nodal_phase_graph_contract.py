@@ -81,6 +81,10 @@ guard = guard[:guard.find("\n\ntemplate")] if "\n\ntemplate" in guard else guard
 if not guard:
     problems.append("CudaXsReconBackend.cu: RASBERY_NODAL_SLOT_GUARD not found")
 else:
+    if "views" not in guard:
+        problems.append("RASBERY_NODAL_SLOT_GUARD: does not consult the per-slot view "
+                        "table.  Computing a slot address by a dense stride cannot reach "
+                        "canonical buffers, whose slot stride is the whole slot block")
     if "slot_map" not in guard:
         problems.append("RASBERY_NODAL_SLOT_GUARD: does not consult a slot map -- with "
                         "compaction the lane index is NOT the slot index")

@@ -209,7 +209,30 @@ std::atomic<unsigned long long> g_nodal_batch_xs_h2d_skipped_bytes{0};
 // `return` from a subset of blocks safe.  The contract test asserts it rather
 // than trusting it, because adding one later would turn this guard into a
 // deadlock.
-#define RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, v)                     \
+//
+// ---------------------------------------------------------------------------
+// PER-SLOT POINTER TABLE (Rev.7.1 pre-W3), replacing the dense rebase
+// ---------------------------------------------------------------------------
+//
+// A slot's view used to be COMPUTED: nodalSlotView(base, m) advanced each array
+// pointer by that array's own dense per-slot count (`jnet += m*nsurf*NG`).  That
+// works only while every array is its own contiguous slot-major block, which is
+// true of the arena's private allocation and false of GpuPhysicsArena, where a
+// slot is one 29.4-million-double stride covering all of its arrays.  Feeding a
+// canonical pointer to the dense rebase would have indexed it with the wrong
+// stride -- slot 1 reading inside slot 0 -- and every value would still have
+// been finite and plausible.
+//
+// So the view is now LOOKED UP: `views[m]` is slot m's fully-resolved
+// NodalView, built once on the host.  The kernel does not know or care how the
+// pointers were laid out, which is exactly what lets one slot borrow canonical
+// buffers while another keeps the arena's dense ones (mixed mode).
+//
+// THIS CHANGES NO ARITHMETIC.  nodalSlotView is still the builder for a legacy
+// slot, so a default table holds byte-for-byte the addresses the rebase
+// computed; the phase bodies are untouched and the replay gates score the same
+// functions on the same values.  Indirection only.
+#define RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, views, v)              \
     int _m = 0;                                                                \
     if (BATCHED) {                                                             \
         const int _logical = static_cast<int>(blockIdx.y);                     \
@@ -217,12 +240,15 @@ std::atomic<unsigned long long> g_nodal_batch_xs_h2d_skipped_bytes{0};
         _m = (slot_map)[_logical];                                             \
         if (_m < 0) return;                                                    \
     }                                                                          \
-    const ndl::NodalView v = BATCHED ? ndl::nodalSlotView(base, _m) : (base)
+    const ndl::NodalView v =                                                   \
+        !BATCHED                 ? (base)                                      \
+        : ((views) != nullptr)   ? (views)[_m]                                 \
+                                 : ndl::nodalSlotView(base, _m)
 
 template <bool BATCHED>
 __global__ void kNodalTrl0(ndl::NodalView base, const int* __restrict__ slot_map,
-                             int lanes) {
-    RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, v);
+                             int lanes, const ndl::NodalView* __restrict__ views) {
+    RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, views, v);
     const int i  = blockIdx.x * blockDim.x + threadIdx.x;
     const int lk = i / ndl::NG;
     const int ig = i - lk * ndl::NG;
@@ -230,8 +256,8 @@ __global__ void kNodalTrl0(ndl::NodalView base, const int* __restrict__ slot_map
 }
 template <bool BATCHED>
 __global__ void kNodalTrl12(ndl::NodalView base, const int* __restrict__ slot_map,
-                             int lanes) {
-    RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, v);
+                             int lanes, const ndl::NodalView* __restrict__ views) {
+    RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, views, v);
     const int i  = blockIdx.x * blockDim.x + threadIdx.x;
     const int lk = i / ndl::NG;
     const int ig = i - lk * ndl::NG;
@@ -239,23 +265,23 @@ __global__ void kNodalTrl12(ndl::NodalView base, const int* __restrict__ slot_ma
 }
 template <bool BATCHED>
 __global__ void kNodalMat(ndl::NodalView base, const int* __restrict__ slot_map,
-                             int lanes) {
-    RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, v);
+                             int lanes, const ndl::NodalView* __restrict__ views) {
+    RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, views, v);
     const int lk = blockIdx.x * blockDim.x + threadIdx.x;
     if (lk < v.nxyz) ndl::nodalUpdateMatrix(v, lk, ndl::StaticForms{});
 }
 template <bool BATCHED>
 __global__ void kNodalEven(ndl::NodalView base, const int* __restrict__ slot_map,
-                             int lanes) {
-    RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, v);
+                             int lanes, const ndl::NodalView* __restrict__ views) {
+    RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, views, v);
     const int lk = blockIdx.x * blockDim.x + threadIdx.x;
     if (lk < v.nxyz) ndl::nodalCalculateEven(v, lk, ndl::StaticForms{});
 }
 
 template <bool BATCHED>
 __global__ void kNodalMatEven(ndl::NodalView base, const int* __restrict__ slot_map,
-                              int lanes) {
-    RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, v);
+                              int lanes, const ndl::NodalView* __restrict__ views) {
+    RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, views, v);
     const int lk = blockIdx.x * blockDim.x + threadIdx.x;
     if (lk >= v.nxyz) return;
     const ndl::StaticForms forms{};
@@ -264,8 +290,8 @@ __global__ void kNodalMatEven(ndl::NodalView base, const int* __restrict__ slot_
 }
 template <bool BATCHED>
 __global__ void kNodalJnet(ndl::NodalView base, const int* __restrict__ slot_map,
-                             int lanes) {
-    RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, v);
+                             int lanes, const ndl::NodalView* __restrict__ views) {
+    RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, views, v);
     const int ls = blockIdx.x * blockDim.x + threadIdx.x;
     if (ls < v.nsurf) ndl::nodalCalculateJnet(v, ls, ndl::StaticForms{});
 }
@@ -694,6 +720,11 @@ private:
         for (std::size_t i = 0; i < S; ++i) _h_slot_map[i] = -1;
         rc = cudaMemcpy(_d_slot_map, _h_slot_map, S * sizeof(int), cudaMemcpyHostToDevice);
         if (rc != cudaSuccess) { fail("cudaMemcpy(nodal arena slot map)", rc); return; }
+        rc = cudaMalloc(reinterpret_cast<void**>(&_d_views), S * sizeof(ndl::NodalView));
+        if (rc != cudaSuccess) { fail("cudaMalloc(nodal arena view table)", rc); return; }
+        rc = cudaMallocHost(reinterpret_cast<void**>(&_h_views), S * sizeof(ndl::NodalView));
+        if (rc != cudaSuccess) { fail("cudaMallocHost(nodal arena view table)", rc); return; }
+        _canon.assign(S, gpu::CanonicalSlotBuffers{});
         rc = cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking);
         if (rc != cudaSuccess) { fail("cudaStreamCreateWithFlags(nodal arena)", rc); return; }
 
@@ -872,22 +903,76 @@ private:
         const int      gs = (_nsurf + B - 1) / B;
         const int      gg = (_nxyz * ndl::NG + B - 1) / B;
         kNodalTrl0<true><<<dim3(static_cast<unsigned>(gg), L), B, 0, _stream>>>(
-            _base, _d_slot_map, lanes);
+            _base, _d_slot_map, lanes, _d_views);
         kNodalTrl12<true><<<dim3(static_cast<unsigned>(gg), L), B, 0, _stream>>>(
-            _base, _d_slot_map, lanes);
+            _base, _d_slot_map, lanes, _d_views);
         if (_fuse_mat_even) {
             kNodalMatEven<true><<<dim3(static_cast<unsigned>(gn), L), B, 0, _stream>>>(
-                _base, _d_slot_map, lanes);
+                _base, _d_slot_map, lanes, _d_views);
         } else {
             kNodalMat<true><<<dim3(static_cast<unsigned>(gn), L), B, 0, _stream>>>(
-                _base, _d_slot_map, lanes);
+                _base, _d_slot_map, lanes, _d_views);
             kNodalEven<true><<<dim3(static_cast<unsigned>(gn), L), B, 0, _stream>>>(
-                _base, _d_slot_map, lanes);
+                _base, _d_slot_map, lanes, _d_views);
         }
         kNodalJnet<true><<<dim3(static_cast<unsigned>(gs), L), B, 0, _stream>>>(
-            _base, _d_slot_map, lanes);
+            _base, _d_slot_map, lanes, _d_views);
     }
 
+    /// Rebuild the per-slot view table and push it.
+    ///
+    /// A legacy slot's entry is exactly nodalSlotView(_base, m) -- the addresses
+    /// the dense rebase used to compute in the kernel.  An ADOPTED slot keeps
+    /// every one of those except the three canonical regions, because only
+    /// flux/jnet/phis are shared with the CMFD side; the working arrays, the
+    /// nine constants, the geometry and the XS block stay the arena's own.  That
+    /// is what makes the stride question disappear: the canonical pointer is
+    /// absolute, so its layout no longer has to match the arena's.
+    bool refreshViews() {
+        if (!_views_dirty) return true;
+        for (int m = 0; m < _slots; ++m) {
+            ndl::NodalView v = ndl::nodalSlotView(_base, m);
+            const gpu::CanonicalSlotBuffers& c = _canon[static_cast<std::size_t>(m)];
+            if (c.flux != nullptr) v.flux = c.flux;
+            if (c.jnet != nullptr) v.jnet = c.jnet;
+            if (c.phis != nullptr) v.phis = c.phis;
+            _h_views[m] = v;
+        }
+        const cudaError_t rc =
+            cudaMemcpy(_d_views, _h_views,
+                       static_cast<std::size_t>(_slots) * sizeof(ndl::NodalView),
+                       cudaMemcpyHostToDevice);
+        if (rc != cudaSuccess) { fail("cudaMemcpy(nodal arena view table)", rc); return false; }
+        _views_dirty = false;
+        return true;
+    }
+
+public:
+    /// Adopt canonical buffers for ONE slot.  All-null reverts it to legacy.
+    /// The table is a kernel argument baked into every captured graph, but the
+    /// TABLE POINTER never moves -- only its contents -- so adoption does not
+    /// invalidate a graph.  It does mark the table dirty.
+    void adoptCanonical(int slot, const gpu::CanonicalSlotBuffers& buffers) {
+        if (slot < 0 || slot >= _slots) return;
+        if (!gpu::canonicalNodalSetIsCoherent(buffers)) {
+            // All three or none.  A partial set would pair the canonical jnet
+            // with the arena's own flux -- two different outer iterations,
+            // silently blended.
+            std::cerr << "[RASBERY][WARN][nodal] refusing a partial canonical set for slot "
+                      << slot << " (flux/jnet/phis must be adopted together)"
+                      << std::endl;
+            return;
+        }
+        _canon[static_cast<std::size_t>(slot)] = buffers;
+        _views_dirty                           = true;
+    }
+
+    [[nodiscard]] gpu::CanonicalSlotBuffers canonicalOf(int slot) const {
+        if (slot < 0 || slot >= _slots) return gpu::CanonicalSlotBuffers{};
+        return _canon[static_cast<std::size_t>(slot)];
+    }
+
+private:
     /// Smallest configured bucket covering `count`, mirroring the scheduler's
     /// ladder (GpuPhaseScheduler.h) so the nodal phase and the case-phase
     /// scheduler cannot disagree about what a bucket is.  Kept as its own
@@ -941,6 +1026,8 @@ private:
                                static_cast<std::size_t>(_slots) * sizeof(int),
                                cudaMemcpyHostToDevice, "nodal arena slot map H2D"))
             return drained();
+
+        if (!refreshViews()) return drained();
 
         cudaGraphExec_t exec = ensureGraph(lanes);
 
@@ -1107,6 +1194,17 @@ private:
     // Rev.7.1 Task 8: logical lane -> physical slot.  -1 is a padding lane.
     int*           _d_slot_map  = nullptr;
     int*           _h_slot_map  = nullptr; // pinned
+    // Rev.7.1 pre-W3: physical slot -> fully-resolved NodalView.
+    //
+    // Built on the host so the kernels never compute a slot address.  Default
+    // entries come from nodalSlotView(_base, m), so a table nobody has adopted
+    // into holds byte-for-byte the addresses the dense rebase produced -- which
+    // is what makes the conversion pure indirection.
+    ndl::NodalView* _d_views = nullptr;
+    ndl::NodalView* _h_views = nullptr; // pinned
+    /// Per-slot canonical overrides.  All-null entries mean "legacy slot".
+    std::vector<gpu::CanonicalSlotBuffers> _canon;
+    bool                                   _views_dirty = true;
     /// RASBERY_GPU_NODAL_COMPACT, default OFF.  Off, the map is the identity
     /// over the fleet and the launch shape is exactly the pre-Task-8 one.
     bool           _compact     = nodalCompactEnabled();
@@ -2140,9 +2238,9 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         } else {
             ++d.canonical_uploads_elided;
         }
-        kNodalTrl0<false><<<gng, B, 0, d.stream>>>(v, nullptr, 0);
-        kNodalTrl12<false><<<gng, B, 0, d.stream>>>(v, nullptr, 0);
-        kNodalMat<false><<<gn, B, 0, d.stream>>>(v, nullptr, 0);
+        kNodalTrl0<false><<<gng, B, 0, d.stream>>>(v, nullptr, 0, nullptr);
+        kNodalTrl12<false><<<gng, B, 0, d.stream>>>(v, nullptr, 0, nullptr);
+        kNodalMat<false><<<gn, B, 0, d.stream>>>(v, nullptr, 0, nullptr);
         RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
 
         // calculateEven runs on the HOST (the production member function is
@@ -2227,15 +2325,15 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         } else {
             ++d.canonical_uploads_elided;
         }
-        kNodalTrl0<false><<<gng, B, 0, d.stream>>>(v, nullptr, 0);
-        kNodalTrl12<false><<<gng, B, 0, d.stream>>>(v, nullptr, 0);
+        kNodalTrl0<false><<<gng, B, 0, d.stream>>>(v, nullptr, 0, nullptr);
+        kNodalTrl12<false><<<gng, B, 0, d.stream>>>(v, nullptr, 0, nullptr);
         if (nodalFuseMatEvenEnabled()) {
-            kNodalMatEven<false><<<gn, B, 0, d.stream>>>(v, nullptr, 0);
+            kNodalMatEven<false><<<gn, B, 0, d.stream>>>(v, nullptr, 0, nullptr);
         } else {
-            kNodalMat<false><<<gn, B, 0, d.stream>>>(v, nullptr, 0);
-            kNodalEven<false><<<gn, B, 0, d.stream>>>(v, nullptr, 0);
+            kNodalMat<false><<<gn, B, 0, d.stream>>>(v, nullptr, 0, nullptr);
+            kNodalEven<false><<<gn, B, 0, d.stream>>>(v, nullptr, 0, nullptr);
         }
-        kNodalJnet<false><<<gs, B, 0, d.stream>>>(v, nullptr, 0);
+        kNodalJnet<false><<<gs, B, 0, d.stream>>>(v, nullptr, 0, nullptr);
         // The drive just wrote jnet and phis on the device, so Nodal owns them.
         // The download back to the Geometry arrays happens only when a host
         // consumer has ASKED (materialize); otherwise the CMFD backend reads
@@ -2453,7 +2551,7 @@ bool XsReconBackend::solveNodalPost(const ndl::NodalView& host) {
 
     const int B  = 128;
     const int gs = (host.nsurf + B - 1) / B;
-    kNodalJnet<false><<<gs, B, 0, d.stream>>>(v, nullptr, 0);
+    kNodalJnet<false><<<gs, B, 0, d.stream>>>(v, nullptr, 0, nullptr);
     RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
 
     if (!gpu::canonicalElidesDownload(canon, gpu::CanonicalRegion::Jnet,
@@ -2489,6 +2587,14 @@ bool XsReconBackend::solveNodalPost(const ndl::NodalView& host) {
 
 void XsReconBackend::adoptCanonicalBuffers(const gpu::CanonicalSlotBuffers& buffers) {
     Impl& d = *_impl;
+    // Rev.7.1 pre-W3: the adoption reaches the ARENA too, not just the
+    // per-instance path.  Before the pointer table this was impossible -- the
+    // arena computed a slot address by a dense stride the canonical block does
+    // not have -- so the adoption stopped at the instance and the arena went on
+    // using its own buffers.  Now the arena stores the override in its view
+    // table and the stride question is gone.
+    if (d.nodal_slot >= 0 && g_nodal_arena != nullptr)
+        g_nodal_arena->adoptCanonical(d.nodal_slot, buffers);
     // Adopting is a TOPOLOGY change for the captured nodal graph: the borrowed
     // pointers are memcpy operands baked into it.  The key check in solveNodal
     // catches that on its own, but dropping here makes the invalidation happen

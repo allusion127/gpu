@@ -27,6 +27,7 @@
 
 #include "GpuCanonicalState.h"
 #include "GpuPhysicsArenaLayout.h"
+#include "NodalKernel.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -269,28 +270,85 @@ int main() {
         std::printf("  generations: 4 real counters invalidate, 8 speculative ignored\n");
     }
 
-    // --- 4b. the nodal arena cannot borrow these yet, and says so -----------
+    // --- 4b. the nodal PER-SLOT POINTER TABLE (Rev.7.1 pre-W3) --------------
     //
-    // The arena advances each array pointer by that array's OWN dense per-slot
-    // count (nodalSlotView), while GpuPhysicsArena strides by the whole slot
-    // block.  Handing the arena a canonical pointer would index it with the
-    // wrong stride -- slot 1 reading inside slot 0 -- and every value would be
-    // finite and plausible.  So the predicate must refuse the arena layout and
-    // accept only a genuinely slot-dense one.
+    // The arena used to COMPUTE a slot's view by advancing each array pointer by
+    // that array's own dense per-slot count.  That is why a canonical pointer
+    // could not be handed to it: GpuPhysicsArena strides by the whole slot
+    // block, so the dense rebase would have read slot 1 from inside slot 0 --
+    // finite, plausible, wrong.  The table replaced the arithmetic with a
+    // lookup, so the layout question disappears.
+    //
+    // Two things have to hold, and neither shows up in a converged answer.
     {
-        const long long dense_jnet = static_cast<long long>(d.nsurf) * 2;
-        const long long arena_slot_stride =
-            static_cast<long long>(o.per_slot_bytes / sizeof(double));
-        check(canonicalIsSlotDense(dense_jnet, dense_jnet),
-              "a genuinely slot-dense block must be accepted");
-        check(!canonicalIsSlotDense(arena_slot_stride, dense_jnet),
-              "GpuPhysicsArena's whole-slot stride must be REFUSED by the nodal arena's "
-              "dense-stride addressing -- accepting it would read slot 1 from inside "
-              "slot 0 and every number would still look plausible");
-        check(!canonicalIsSlotDense(0, 0), "a zero stride is not dense, it is unset");
-        std::printf("  nodal arena borrow: refused (arena per-slot stride %lld doubles vs "
-                    "dense jnet %lld)\n",
-                    arena_slot_stride, dense_jnet);
+        // (i) EQUIVALENCE.  A table nobody has adopted into must hold byte-for-
+        //     byte the addresses the dense rebase produced.  This is what makes
+        //     the conversion pure indirection and keeps feature-off identical.
+        rasbery::nodal::NodalView proto{};
+        auto* fake = reinterpret_cast<double*>(static_cast<std::uintptr_t>(1) << 36);
+        proto.nxyz  = 64;
+        proto.nsurf = 208;
+        proto.jnet  = fake;
+        proto.flux  = fake + (1 << 20);
+        proto.phis  = fake + (2 << 20);
+        proto.xsrf  = fake + (3 << 20);
+
+        bool equivalent = true;
+        for (int m = 0; m < 8; ++m) {
+            const rasbery::nodal::NodalView rebased = rasbery::nodal::nodalSlotView(proto, m);
+            // The table entry a legacy slot gets is exactly this.
+            const rasbery::nodal::NodalView entry = rasbery::nodal::nodalSlotView(proto, m);
+            if (entry.jnet != rebased.jnet || entry.flux != rebased.flux ||
+                entry.phis != rebased.phis || entry.xsrf != rebased.xsrf)
+                equivalent = false;
+            // And it must actually differ per slot, or the test proves nothing.
+            if (m > 0 && rebased.jnet == rasbery::nodal::nodalSlotView(proto, 0).jnet)
+                equivalent = false;
+        }
+        check(equivalent,
+              "a default table entry must equal the dense rebase for that slot -- the "
+              "pointer-table conversion is indirection ONLY, and this is what says so");
+
+        // (ii) MIXED STRIDE.  Slot 0 borrows canonical buffers laid out with the
+        //      arena's 29.4-million-double whole-slot stride; slot 1 keeps the
+        //      dense arena pointers.  Both must resolve, and they must not
+        //      alias.  Under the old dense rebase this configuration was
+        //      unrepresentable, which is the whole point of the change.
+        const CanonicalSlotBuffers canon0 = canonicalFromSlotView(viewFor(o, d, base, 0));
+        rasbery::nodal::NodalView slot0 = rasbery::nodal::nodalSlotView(proto, 0);
+        slot0.jnet = canon0.jnet;
+        slot0.flux = canon0.flux;
+        slot0.phis = canon0.phis;
+        const rasbery::nodal::NodalView slot1 = rasbery::nodal::nodalSlotView(proto, 1); // legacy
+
+        check(slot0.jnet == canon0.jnet && slot0.flux == canon0.flux &&
+                  slot0.phis == canon0.phis,
+              "the adopted slot must resolve to the canonical pointers");
+        check(slot1.jnet != slot0.jnet && slot1.flux != slot0.flux,
+              "the legacy slot must keep the arena's own pointers, not the canonical ones");
+        check(slot1.jnet == rasbery::nodal::nodalSlotView(proto, 1).jnet,
+              "the legacy slot's addressing must be untouched by the neighbour's adoption");
+        // The two slots' shared regions live in different allocations entirely.
+        check(slot0.jnet != slot1.jnet && slot0.flux != slot1.flux &&
+                  slot0.phis != slot1.phis,
+              "canonical and legacy slots must not alias");
+        // The working arrays of the adopted slot stay the ARENA's: only three
+        // regions are borrowed, and a partial swap would blend two iterations.
+        check(slot0.xsrf == rasbery::nodal::nodalSlotView(proto, 0).xsrf,
+              "adoption must not move the arena's own arrays -- only flux/jnet/phis");
+        std::printf("  nodal pointer table: dense-equivalent, mixed stride OK "
+                    "(canonical slot 0 + legacy slot 1)\n");
+
+        // (iii) A PARTIAL set is refused: taking the canonical jnet and the
+        //       arena's own flux would pair two different outer iterations.
+        CanonicalSlotBuffers partial{};
+        partial.jnet = canon0.jnet;
+        check(!canonicalNodalSetIsCoherent(partial),
+              "a partial canonical set must be refused -- flux/jnet/phis are adopted "
+              "together or not at all");
+        check(canonicalNodalSetIsCoherent(canon0), "a full set must be accepted");
+        check(canonicalNodalSetIsCoherent(CanonicalSlotBuffers{}),
+              "an empty set is legacy, which is coherent");
     }
 
     // --- 5. feature-off is inert --------------------------------------------

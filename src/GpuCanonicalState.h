@@ -167,43 +167,41 @@ inline CanonicalSlotBuffers canonicalFromSlotView(const DeviceSlotView& v) {
 }
 
 // ---------------------------------------------------------------------------
-// Rev.7.1 Task 8: can the batched NODAL ARENA borrow these?
+// What the batched NODAL ARENA borrows  (Rev.7.1 pre-W3)
 // ---------------------------------------------------------------------------
 //
-// Not yet, and the reason is a LAYOUT MISMATCH that must not be discovered by
-// reading wrong numbers.
+// IT USED TO BE IMPOSSIBLE, AND WHY IS WORTH KEEPING.  The arena addressed a
+// slot by advancing each array pointer by that array's OWN dense per-slot count
+// (nodal::nodalSlotView: `jnet += m*nsurf*NG`), which works only while every
+// array is its own contiguous slot-major block.  GpuPhysicsArena lays a slot out
+// the other way round -- one stride per SLOT covering all of its arrays, 29.4
+// million doubles wide -- so handing the dense rebase a canonical pointer would
+// have indexed it with the wrong stride: slot 1 reading inside slot 0, every
+// value finite and plausible, the deck simply wrong.
 //
-// The arena addresses a slot by advancing each array pointer by that array's
-// own dense per-slot count (nodal::nodalSlotView: `jnet += m * nsurf*NG`,
-// `flux += m * nxyz*NG`).  Every array is therefore its own contiguous
-// slot-major block.  GpuPhysicsArena lays a slot out the other way round: one
-// stride per SLOT covering all of that slot's arrays, so slot m's jnet sits at
-// `slot_base + m*slot_stride + jnet_offset`.
+// The fix was to stop COMPUTING the slot address and start LOOKING IT UP: the
+// nodal kernels now take a per-slot table of fully-resolved NodalViews, the same
+// shape DeviceArenaView::slot_views has for the Task 7 phase kernels.  A
+// canonical pointer is absolute, so its layout no longer has to match anything.
+// That is also what makes MIXED STRIDE work: one slot's entry can hold
+// whole-slot-strided canonical pointers while the next holds the arena's dense
+// ones, in the same launch, because the kernel never does the arithmetic.
 //
-// Handing the arena a GpuPhysicsArena pointer would therefore index it with the
-// wrong stride: slot 1 would read somewhere inside slot 0's block.  Every value
-// would be finite and plausible, and the deck would simply be wrong.
-//
-// TWO WAYS OUT, both bigger than Task 8:
-//   (a) give the nodal kernels a per-slot POINTER TABLE, as the Task 7 phase
-//       kernels already have (DeviceArenaView::slot_views), replacing
-//       nodalSlotView's arithmetic.  This is the right answer and it touches the
-//       shared body every replay gate scores against, so it wants its own gate.
-//   (b) make one of the two layouts match the other, which moves the arena's
-//       Sec 3.6 budget arithmetic.
-//
-// Until then this predicate is the gate: adoption is REFUSED unless the
-// canonical block really is slot-dense with the arena's own strides.  Refusing
-// loudly and running on the arena's own buffers is correct and slow; accepting
-// is fast and wrong.
+// ONLY THREE REGIONS ARE BORROWED.  The nodal arena keeps its own working
+// arrays, the nine updateConstant products, the geometry tables and the XS
+// block; those are not shared with the CMFD side, and sharing a buffer only one
+// side reads buys nothing and costs a coupling.
+inline constexpr CanonicalRegion kCanonicalNodalRegions[] = {
+    CanonicalRegion::Flux, CanonicalRegion::Jnet, CanonicalRegion::Phis};
+inline constexpr int kCanonicalNodalRegionCount = 3;
 
-/// Is a canonical block addressable by the nodal arena's dense per-array
-/// stride?  `canonical_slot_stride` is the distance in doubles between one
-/// slot's copy of an array and the next; `dense_count` is that array's element
-/// count for a single slot.
-[[nodiscard]] inline constexpr bool canonicalIsSlotDense(long long canonical_slot_stride,
-                                                         long long dense_count) {
-    return canonical_slot_stride == dense_count && dense_count > 0;
+/// Does this borrowed set carry everything the nodal arena needs, or nothing?
+/// A PARTIAL set is the dangerous shape: the arena would take the canonical
+/// jnet and the arena's own flux, and the two would describe different outer
+/// iterations.  All three or none.
+[[nodiscard]] inline bool canonicalNodalSetIsCoherent(const CanonicalSlotBuffers& b) {
+    const int present = (b.flux != nullptr) + (b.jnet != nullptr) + (b.phis != nullptr);
+    return present == 0 || present == kCanonicalNodalRegionCount;
 }
 
 // ---------------------------------------------------------------------------
