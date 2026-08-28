@@ -101,6 +101,38 @@ against 12017.  With the byte-exact gate: 0 of 644, at 12017.
 RULE: the xsnf elision compares BYTES (cuda_transfer::ByteExactMirror), never a
 generation, and commits the shadow only from the bytes it actually uploaded.
 
+-------------------------------------------------------------------------------
+6. A MIRROR ISSUED FOR A HOST READER IS SYNCHRONISED BEFORE THAT READER RUNS
+-------------------------------------------------------------------------------
+
+On the outers whose drive takes the HOST CMFD loop the segment mirrors psi and
+dhat back with cudaMemcpyAsync, because that loop reads them.  Both arrays are
+page-locked (BICGCMFD::prepareDeviceSweeps leases them), so those are real
+asynchronous transfers whose timing belongs to the driver.
+
+The first thing the host path then did was setls(eigv) -- and on the warm-up
+that is assembleHostLinearSystem, which reads _dhat for every node
+(CMFD::setls: `(-dtil(ige, ls) + dhat(ige, ls)) * area`).  It ran BEFORE
+outerSweepEnqueueHook's syncSweepStream(), i.e. with the D2H still in flight
+into the buffer it was reading.  The operator came out built from the new
+d-hat, the old one, or a mix, and that decided how many Wielandt sweeps the
+warm-up took.
+
+INVISIBLE AT A BUDGET OF ONE, which is why it survived every b1 gate: there the
+previous segment had already exited, and its exit mirror plus the observation's
+synchronise had put that same d-hat in _dhat, so the in-body copy rewrote
+identical bytes.  From the second outer of a wider segment there has been no
+exit since and the copy is the first arrival of the current d-hat.  kngr_238
+statepoint 35 is where it surfaced -- its first outer's warm-up drive stops in
+four sweeps, so outer 1 is still inside WIELANDT_WARMUP_SWEEPS and still takes
+the host loop.  Two b8 runs of one binary took 245 and 253 outers there with
+statepoints 1..34 bit-identical; with the synchronise, 12017 outers and 0 of
+644 datasets against OFF, twice.
+
+RULE: an async D2H issued because a host reader is next is synchronised before
+that reader runs, and the condition is the same `host_reader_next` the mirrors
+themselves are gated on.
+
 Run:  python tools/test_device_outer_exactness_contract.py
 """
 
@@ -131,6 +163,14 @@ def body_of(code: str, signature: str) -> str:
             if depth == 0:
                 return code[open_brace : i + 1]
     raise AssertionError("unbalanced braces after " + signature)
+
+
+def strip_comments(code: str) -> str:
+    """Code only.  A rule that can be satisfied by the COMMENT explaining it is
+    not a rule -- and every one of these invariants has a long comment next to
+    it naming the very identifiers the check looks for."""
+    code = re.sub(r"/\*.*?\*/", " ", code, flags=re.S)
+    return re.sub(r"//[^\n]*", "", code)
 
 
 def check_form_mask_is_mined(problems: list[str]) -> None:
@@ -373,6 +413,57 @@ def check_xsnf_elision_is_byte_exact(problems: list[str]) -> None:
         )
 
 
+def check_host_reader_mirror_is_synchronised(problems: list[str]) -> None:
+    runner = read("src", "CudaOuterGraph.cu")
+    run = strip_comments(body_of(runner, "bool CudaOuterSegment::runSegment"))
+
+    try:
+        loop_at = run.index("for (unsigned int i = 0")
+        # The LAST of the two in-loop mirrors, so the guard slice below holds
+        # only the synchronise's own condition -- anchoring on the dhat one puts
+        # the psi mirror's own `if (host_reader_next ...)` inside it and any
+        # condition at all would then look right.
+        mirror_at = run.index('launchFailed("mirror psi to the host", rc)', loop_at)
+        hook_at = run.index("enqueue_cmfd_sweep(m.hooks.ctx", mirror_at)
+    except ValueError:
+        problems.append(
+            "CudaOuterGraph.cu: cannot find the in-loop psi/dhat mirror followed by the "
+            "sweep hook; invariant 6 has nothing to check and the ordering is unpinned"
+        )
+        return
+
+    between = run[mirror_at:hook_at]
+    if "cudaStreamSynchronize" not in between:
+        problems.append(
+            "CudaOuterGraph.cu: nothing synchronises the stream between the in-loop "
+            "psi/dhat mirror and the sweep hook.  Those are async D2Hs into PAGE-LOCKED "
+            "host buffers, and the hook's very first host call -- setls -> "
+            "assembleHostLinearSystem -- reads _dhat.  That is the kngr_238 sp35 b8 "
+            "run-to-run divergence"
+        )
+        return
+
+    guard = between[: between.index("cudaStreamSynchronize")]
+    if "host_reader_next" not in guard:
+        problems.append(
+            "CudaOuterGraph.cu: the synchronise before the sweep hook is not conditioned "
+            "on host_reader_next.  It has to fire for exactly the outers that issued a "
+            "mirror: weaker and the host loop reads a buffer with a DMA in flight, "
+            "stronger and it drains the stream on the 99% of outers whose drive is "
+            "enqueued and issues no mirror -- the round trip the stream-ordered sweep "
+            "exists to remove"
+        )
+
+    # The host side must not be relied on to sync for itself: outerSweepEnqueueHook's
+    # own syncSweepStream() comes AFTER setls, which is the read that raced.
+    hook = strip_comments(body_of(read("src", "Driver.h"), "static bool outerSweepEnqueueHook"))
+    if "setls" in hook and "syncSweepStream" in hook and             hook.index("setls") < hook.index("syncSweepStream") and             "host_reader_next" not in guard:
+        problems.append(
+            "Driver.h: outerSweepEnqueueHook calls setls before syncSweepStream, and "
+            "nothing upstream has drained the mirror setls reads"
+        )
+
+
 def main() -> int:
     problems: list[str] = []
     check_form_mask_is_mined(problems)
@@ -380,6 +471,7 @@ def main() -> int:
     check_swallowed_step_is_reissued(problems)
     check_cross_stream_handovers_are_ordered(problems)
     check_xsnf_elision_is_byte_exact(problems)
+    check_host_reader_mirror_is_synchronised(problems)
 
     if problems:
         print("FAIL: device outer exactness contract")
@@ -392,6 +484,7 @@ def main() -> int:
     print("  3. the step the sweep verdict's halt swallows is re-issued")
     print("  4. both cross-stream handovers around the nodal drive are ordered")
     print("  5. the xsnf upload elision compares bytes, not a generation")
+    print("  6. the psi/dhat mirror lands before the host loop that reads it")
     return 0
 
 

@@ -1158,7 +1158,41 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         // that has no stream-ordered drive (no arena, or the Wielandt warm-up),
         // where the budget is forced to one and this is the only sync of the
         // segment.
-        if (!stream_sweep && (rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
+        //
+        // AND THE MIRROR ABOVE IS AN ASYNC D2H THE HOST READER IS ABOUT TO READ.
+        //
+        // `host_reader_next` says this outer's drive takes the HOST loop, and
+        // the first thing that loop's call site does -- before it reaches
+        // BICGCMFD::drive at all -- is setls(eigv), which on the warm-up takes
+        // assembleHostLinearSystem and reads _dhat for every node
+        // (CMFD::setls: `(-dtil(ige, ls) + dhat(ige, ls)) * area`).  The two
+        // cudaMemcpyAsyncs just issued are filling _dhat and _psi FROM the
+        // device, on this stream, and outerSweepEnqueueHook's own
+        // syncSweepStream() comes AFTER setls -- so setls was reading a pinned
+        // buffer with a DMA in flight into it.  _dhat is page-locked
+        // (prepareDeviceSweeps leases it), so that copy is a real asynchronous
+        // transfer whose timing the driver owns: the operator was assembled
+        // from the new d-hat, the old one, or a mix, and which one decided how
+        // many Wielandt sweeps the warm-up took.
+        //
+        // WHY IT WAS INVISIBLE AT A BUDGET OF ONE.  At budget 1 the previous
+        // segment EXITED after the previous outer, and the exit mirror plus the
+        // observation's synchronise had already put that same d-hat in _dhat.
+        // The in-body copy then rewrites identical bytes and the race cannot be
+        // observed.  From the second outer of a wider segment there has been no
+        // exit since, _dhat still holds the d-hat of the last exit, and the
+        // copy is the first arrival of the current one.  kngr_238 statepoint 35
+        // is where it showed: its first outer's warm-up drive stops in four
+        // sweeps, so outer 1 is still inside WIELANDT_WARMUP_SWEEPS and still
+        // takes the host loop, and two b8 runs of the same binary took 245 and
+        // 253 outers there while statepoints 1..34 were bit-identical.
+        //
+        // ONE SYNCHRONISE, ON THE OUTERS THAT ARE ABOUT TO BLOCK ANYWAY.  An
+        // outer with host_reader_next runs a blocking host CMFD drive three
+        // lines below; the enqueued outers -- 656 of 661 on this deck -- issue
+        // no mirror and pay nothing.
+        if ((!stream_sweep || host_reader_next) &&
+            (rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
             return launchFailed("synchronize before the CMFD sweep", rc);
 
         // (2,3) setls + drive -- Driver.h:1551-1555.  On the stream-ordered arm
