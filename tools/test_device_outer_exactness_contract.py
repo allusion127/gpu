@@ -66,8 +66,24 @@ synchronise before the nodal drive reads it.
 The nodal drive runs on XsReconBackend's OWN stream while the segment body runs
 on the sweep arena's.  Nothing but a host synchronise (or an event) orders the
 two, in either direction: the drive reads the jnet updjnet wrote, and upddhat
-reads the jnet the drive wrote.  This is currently a pair of host synchronises
-and it must stay one of the two.
+reads the jnet the drive wrote.
+
+The FIRST handover (segment -> nodal) is still a host synchronise and cannot yet
+be anything else: the sweep's observation hook and the nodal reset's `1.0 / eigv`
+are host reads of a device-produced eigenvalue, so the host has to see it.
+
+The SECOND (nodal -> segment) became an event in W3 item 2.  XsReconBackend::solveNodal
+records cudaEventRecord(d.nodal_done_event) instead of draining -- but ONLY when
+the drive left nothing on the host, i.e. when both canonical downloads were
+elided, which is what setCanonicalNodalSegmentMode(true) establishes and nothing
+outside a device outer segment asks for.  On the Wielandt warm-up, the CPU body
+and any materialised drive it still blocks, because the D2H targets page-locked
+Geometry arrays a host reader is about to touch -- invariant 6 one level down.
+
+RULE: each handover is ordered by a synchronise or an event, and the two halves
+of the event form -- the record in solveNodal and the cudaStreamWaitEvent in
+runSegment, between the drive and the upddhat that reads it -- are pinned
+together.  Either half alone is not a slower ordering, it is no ordering.
 
 -------------------------------------------------------------------------------
 5. AN UPLOAD ELISION IS DECIDED FROM SOMETHING THAT CANNOT MISS A WRITER
@@ -345,14 +361,62 @@ def check_cross_stream_handovers_are_ordered(problems: list[str]) -> None:
         )
 
     # nodal stream -> segment stream: upddhat reads what the drive wrote.  The
-    # drive's own stream has to be drained before it returns.
+    # drive either drains its own stream before returning, or records an event
+    # the segment stream waits on -- W3 item 2 made the second legal, and the
+    # rule below pins BOTH halves of it, because either half alone is a race.
     solve = body_of(xsrecon, "bool XsReconBackend::solveNodal")
     if "cudaStreamSynchronize(d.stream)" not in solve:
         problems.append(
-            "XsReconBackend::solveNodal must drain its own stream before returning: "
-            "upddhat is enqueued on the SEGMENT's stream immediately afterwards and "
-            "reads the jnet this drive produced"
+            "XsReconBackend::solveNodal must still be able to drain its own stream: "
+            "the deferred path is only legal when the drive left NOTHING on the host, "
+            "and every other outer (the Wielandt warm-up, the CPU body, a "
+            "materialised drive) needs the block"
         )
+    if "cudaEventRecord(d.nodal_done_event" in solve:
+        # The deferral is on: its condition must be the one that means "no host
+        # reader is waiting", and the runner must actually wait on the event.
+        defer = solve[solve.index("const bool drain_deferrable") : solve.index(
+            "cudaEventRecord(d.nodal_done_event"
+        )]
+        for needed, why in (
+            (
+                "canonicalElidesDownload",
+                "the deferral may only fire when BOTH canonical downloads were "
+                "elided; with either one live, a D2H is in flight into a "
+                "page-locked Geometry array a host reader is about to touch, "
+                "which is invariant 6 one level down",
+            ),
+            (
+                "hybrid_even",
+                "the hybrid arm returns to the host for calculateEven and finishes "
+                "in solveNodalPost, so its stream has a host consumer",
+            ),
+        ):
+            if needed not in defer:
+                problems.append(
+                    f"solveNodal's deferred-drain condition is missing {needed}: {why}"
+                )
+        if "cudaStreamWaitEvent" not in run:
+            problems.append(
+                "solveNodal can defer its drain but runSegment never waits on the "
+                "event.  That is not a slower ordering, it is no ordering: upddhat "
+                "would read the jnet while the drive is still writing it"
+            )
+        else:
+            nodal_at = run.index("enqueue_nodal_drive(m.hooks.ctx")
+            dhat_at = run.index("enqueueUpdDhat")
+            if not (nodal_at < run.index("cudaStreamWaitEvent") < dhat_at):
+                problems.append(
+                    "the wait on the nodal completion event must sit between the "
+                    "drive that records it and the upddhat that reads what the drive "
+                    "wrote"
+                )
+        driver = read("src", "Driver.h")
+        if "hooks.nodal_completion_event" not in driver:
+            problems.append(
+                "Driver.h installs no nodal_completion_event hook, so the runner can "
+                "never see the event solveNodal recorded"
+            )
 
 
 def check_xsnf_elision_is_byte_exact(problems: list[str]) -> None:

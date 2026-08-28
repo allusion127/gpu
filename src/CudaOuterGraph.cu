@@ -165,6 +165,7 @@ struct AtomicCounters {
     std::atomic<std::uint64_t> dtil_uploads_elided{0};
     std::atomic<std::uint64_t> mirror_exits{0};
     std::atomic<std::uint64_t> canonical_nodal_outers{0};
+    std::atomic<std::uint64_t> nodal_event_waits{0};
     std::atomic<std::uint64_t> phis_mirror_bytes{0};
     std::atomic<std::uint64_t> jnet_mirror_bytes{0};
     std::atomic<std::uint64_t> refusals[static_cast<int>(OuterSegmentRefusal::Count)];
@@ -243,6 +244,7 @@ OuterSegmentCounters outerSegmentCounters() {
     out.dtil_uploads_elided     = a.dtil_uploads_elided.load(std::memory_order_relaxed);
     out.mirror_exits            = a.mirror_exits.load(std::memory_order_relaxed);
     out.canonical_nodal_outers  = a.canonical_nodal_outers.load(std::memory_order_relaxed);
+    out.nodal_event_waits       = a.nodal_event_waits.load(std::memory_order_relaxed);
     out.phis_mirror_bytes       = a.phis_mirror_bytes.load(std::memory_order_relaxed);
     out.jnet_mirror_bytes       = a.jnet_mirror_bytes.load(std::memory_order_relaxed);
     for (int i = 0; i < static_cast<int>(OuterSegmentRefusal::Count); ++i)
@@ -273,6 +275,7 @@ std::string outerSegmentReceiptJson() {
                     ",\"mirror_exits\":" + std::to_string(c.mirror_exits) +
                     ",\"canonical_nodal_outers\":" +
                     std::to_string(c.canonical_nodal_outers) +
+                    ",\"nodal_event_waits\":" + std::to_string(c.nodal_event_waits) +
                     ",\"phis_mirror_bytes\":" + std::to_string(c.phis_mirror_bytes) +
                     ",\"jnet_mirror_bytes\":" + std::to_string(c.jnet_mirror_bytes) +
                     ",\"segment_budget\":" + std::to_string(outerSegmentBudget());
@@ -1420,6 +1423,44 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         }
         if (!m.hooks.enqueue_nodal_drive(m.hooks.ctx, m.stream, slot, i))
             return hookFailed("the nodal drive hook");
+
+        // ==================================================================
+        // Rev.7.1 W3 item 2: THE NODAL -> SEGMENT HANDOVER, WITHOUT THE BLOCK
+        // ==================================================================
+        //
+        // The drive runs on the nodal backend's OWN stream and upddhat, twenty
+        // lines below, runs on this one and reads the jnet the drive produced.
+        // Nothing but a host synchronise or an event orders the two, and until
+        // now it was the synchronise -- XsReconBackend::solveNodal ended in
+        // cudaStreamSynchronize(d.stream) on every outer, so the host blocked
+        // once per outer for work whose only consumer is a kernel.
+        //
+        // THE CONTRACT IS THE SAME, THE MECHANISM IS THE CHEAPER OF THE TWO
+        // THE EXACTNESS GATE ALREADY ALLOWS (tools/test_device_outer_exactness_contract.py
+        // invariant 4: "a synchronise or an event").  The backend defers its
+        // drain only when the drive left NOTHING on the host -- both canonical
+        // downloads elided, which is what setCanonicalNodalSegmentMode(true)
+        // establishes and nothing outside a segment asks for -- and reports the
+        // event here.  On every other outer (the Wielandt warm-up, the CPU
+        // body, a materialised drive) it blocks for itself and hands back
+        // nullptr, and this is a branch not taken.
+        //
+        // A NULL HOOK IS ALSO `ALREADY ORDERED`.  A caller that installs no
+        // completion hook gets a backend that never defers, because the deferral
+        // and the wait were added together and the backend's condition does not
+        // consult the hook -- so the failure mode of a half-installed hook table
+        // is the old synchronise, not an unordered read.  The state-machine test
+        // pins that the two are installed together.
+        if (m.hooks.nodal_completion_event != nullptr) {
+            void* const nodal_done = m.hooks.nodal_completion_event(m.hooks.ctx);
+            if (nodal_done != nullptr) {
+                if ((rc = cudaStreamWaitEvent(
+                         m.stream, static_cast<cudaEvent_t>(nodal_done), 0)) != cudaSuccess)
+                    return launchFailed("wait for the nodal drive on the segment stream",
+                                        rc);
+                bump(counters().nodal_event_waits);
+            }
+        }
         if (trace_steps)
             outertrace::emitStep("dev", "nodal", "jnet",
                                  traceHash(bound_.device_jnet, trace_nsg), "phis",

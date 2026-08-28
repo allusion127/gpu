@@ -1023,6 +1023,21 @@ private:
         return true;
     }
 
+    /// Rev.7.1 W3 item 2: the event that orders the drive that just ran against
+    /// the segment's stream, or nullptr when the drive drained itself.
+    ///
+    /// ASKED AFTER EVERY DRIVE AND NOT CACHED, because the answer is a property
+    /// of that drive: the same backend defers on an in-segment canonical outer
+    /// and blocks on the Wielandt warm-up outer three lines later, where the
+    /// downloads are live and a host reader is next.  It is here rather than in
+    /// the runner for outerCanonicalNodalHook's reason -- the backend is reached
+    /// through XSSet, which is Driver.h's object.
+    static void* outerNodalCompletionHook(void* raw) {
+        OuterHookCtx&   h  = *static_cast<OuterHookCtx*>(raw);
+        XsReconBackend* be = h.ctx->cross_sections.EnsureBackend();
+        return be != nullptr ? be->nodalCompletionEvent() : nullptr;
+    }
+
     /// Rev.7.1 Task 18-lite: which side owns the canonical nodal regions.
     ///
     /// Called by the runner with 1 before every in-segment drive and with 0 at
@@ -1173,6 +1188,7 @@ private:
             stream_sweep ? &outerSweepEnqueueHook : &outerSweepHook;
         hooks.finish_cmfd_sweep   = stream_sweep ? &outerSweepFinishHook : nullptr;
         hooks.enqueue_nodal_drive = &outerNodalHook;
+        hooks.nodal_completion_event = &outerNodalCompletionHook;
         hooks.apply_cusping       = &outerCuspingHook;
         hooks.read_live_state     = &outerLiveStateHook;
         hooks.canonical_nodal_mode     = &outerCanonicalNodalHook;

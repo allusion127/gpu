@@ -192,6 +192,24 @@ public:
     /// it from churning the captured nodal graph.
     void setCanonicalNodalSegmentMode(bool in_segment, bool device_owns_flux);
 
+    /// Rev.7.1 W3 item 2: the event that says the LAST solveNodal's own stream
+    /// has finished, or nullptr when that drive already drained itself.
+    ///
+    /// WHY IT IS A HANDOVER AND NOT A PROMISE.  solveNodal ends by ordering its
+    /// stream against whoever reads jnet next, and there are exactly two ways to
+    /// do that: block the host, or record an event the reader's stream waits on.
+    /// It blocks whenever a download landed in a Geometry array (a host reader is
+    /// next); it records the event when both downloads were elided, which happens
+    /// only inside a device outer segment.  A caller that ignores this pointer
+    /// therefore gets the OLD behaviour on every path that needed it and an
+    /// UNORDERED read on the path that did not -- so the runner asks for it once
+    /// per outer and waits, rather than assuming either answer.
+    ///
+    /// Returned as void* so Driver.h and the runner's hook table stay free of
+    /// <cuda_runtime.h>; the one place that casts it back is the runner, which
+    /// is a .cu.  Valid until the next solveNodal on this backend.
+    [[nodiscard]] void* nodalCompletionEvent() const;
+
     /// Receipt: how many routine per-outer transfers the sharing removed.
     [[nodiscard]] unsigned long long canonicalUploadsElided() const;
     [[nodiscard]] unsigned long long canonicalDownloadsElided() const;

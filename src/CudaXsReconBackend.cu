@@ -122,6 +122,10 @@ std::atomic<unsigned long long> g_canon_down_bytes{0};
 std::atomic<unsigned long long> g_nodal_graph_launches{0};
 std::atomic<unsigned long long> g_nodal_graph_fallbacks{0};
 std::atomic<unsigned long long> g_nodal_d2h_bytes{0}; // per drive, last shape seen
+/// Rev.7.1 W3 item 2: drives whose terminal drain became an event on the
+/// segment's stream instead of a host block.  A deferral that never happened is
+/// the same receipt as a feature that is not there, which is why it is counted.
+std::atomic<unsigned long long> g_nodal_drains_deferred{0};
 
 // --- batch arena receipts (see NodalArena below).  Kept as TU-scope atomics,
 // not arena members, so the static-destruction receipt never has to reason
@@ -1321,7 +1325,9 @@ struct NodalReceipt {
                   << ",\"graph_fallbacks\":"
                   << g_nodal_graph_fallbacks.load(std::memory_order_relaxed)
                   << ",\"d2h_bytes_per_drive\":"
-                  << g_nodal_d2h_bytes.load(std::memory_order_relaxed) << "}"
+                  << g_nodal_d2h_bytes.load(std::memory_order_relaxed)
+                  << ",\"drains_deferred\":"
+                  << g_nodal_drains_deferred.load(std::memory_order_relaxed) << "}"
                   << std::endl;
 
         // The arena's own receipt, on its own tag so nothing consuming the line
@@ -1476,6 +1482,44 @@ struct XsReconBackend::Impl {
     std::uint32_t canonical_materialize = 0u;
     unsigned long long canonical_uploads_elided   = 0;
     unsigned long long canonical_downloads_elided = 0;
+
+    // --- Rev.7.1 W3 item 2: the DEFERRED DRAIN -----------------------------
+    //
+    // WHAT THE TERMINAL SYNCHRONISE IS FOR.  solveNodal ends in
+    // cudaStreamSynchronize(d.stream) because the device outer enqueues
+    // upddhat on the SEGMENT's stream on the very next line and that kernel
+    // reads the jnet this drive produced.  Two streams, one handover: it has to
+    // be ordered by a synchronise or an event, and it was the synchronise
+    // (tools/test_device_outer_exactness_contract.py invariant 4).
+    //
+    // WHY IT CAN BECOME AN EVENT, BUT ONLY SOMETIMES.  The drain is ALSO what
+    // makes the two downloads land before a host reader looks at Geometry::Jnet
+    // and Geometry::Phis.  When the drive elided both of them -- canonical
+    // buffers, materialize mask 0, i.e. inside a device outer segment -- nothing
+    // came back and no host reader can be waiting.  The only consumer left is a
+    // device kernel on another stream, and cudaStreamWaitEvent orders that
+    // strictly and without a host round trip.  When either download ran, the
+    // synchronise stays: an event would leave a D2H in flight into a page-locked
+    // Geometry array the host is about to read, which is invariant 6's failure
+    // one level down.
+    //
+    // ONE EVENT, CREATED ONCE, WITH DISABLE_TIMING.  A timing event forces a
+    // clock read on both sides; nothing here measures anything.  It is recorded
+    // at most once per drive and waited on at most once, so it can never be
+    // recorded twice before it is consumed.
+    cudaEvent_t nodal_done_event   = nullptr;
+    bool        nodal_drain_deferred = false; ///< true = the last drive left the event pending
+
+    [[nodiscard]] bool ensureNodalEvent() {
+        if (nodal_done_event != nullptr) return true;
+        if (cudaEventCreateWithFlags(&nodal_done_event, cudaEventDisableTiming) !=
+            cudaSuccess) {
+            cudaGetLastError();
+            nodal_done_event = nullptr;
+            return false;
+        }
+        return true;
+    }
 
     // Both of these are BAKED INTO THE CAPTURE: the borrowed pointers are memcpy
     // operands, and the materialize mask decides which memcpy NODES exist at
@@ -2486,12 +2530,62 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     }
     if (!ok) return fail_drained();
 
-    // Sync unconditionally (it is also the drain), then judge both errors.
+    // ==================================================================
+    // Rev.7.1 W3 item 2: DRAIN, OR HAND THE SEGMENT AN EVENT
+    // ==================================================================
+    //
+    // NOTHING CAME BACK, SO NOBODY ON THIS SIDE IS WAITING.  Both downloads
+    // above were elided exactly when the canonical buffers are shared and the
+    // materialize mask is 0 -- which is what setCanonicalNodalSegmentMode(true)
+    // establishes and what only the device outer segment ever asks for.  In that
+    // state the drive's only consumer is a kernel on the SEGMENT's stream
+    // (upddhat, enqueued on the very next line of runSegment), and
+    // cudaStreamWaitEvent orders that strictly, with no host round trip.
+    //
+    // THE ORDERING CONTRACT IS UNCHANGED, ONLY ITS MECHANISM.  The exactness
+    // contract's invariant 4 requires the two cross-stream handovers around the
+    // nodal drive to be ordered by a synchronise OR an event; this is the
+    // second.  What must not change is that upddhat still runs after this
+    // drive, and the event is what says so.
+    //
+    // WHEN EITHER DOWNLOAD RAN, THE SYNCHRONISE STAYS.  The D2H targets
+    // page-locked Geometry arrays that a host reader is about to touch --
+    // CMFD::upddhat on the host outer body takes Geometry::Jnet on the very next
+    // line -- and an event orders devices, not hosts.
+    const bool drain_deferrable =
+        !hybrid_even &&
+        gpu::canonicalElidesDownload(canon, gpu::CanonicalRegion::Jnet,
+                                     d.canonical_materialize) &&
+        gpu::canonicalElidesDownload(canon, gpu::CanonicalRegion::Phis,
+                                     d.canonical_materialize) &&
+        d.ensureNodalEvent();
+
+    d.nodal_drain_deferred = false;
+    // ASKED BEFORE EITHER BRANCH.  cudaGetLastError() reports launch-time
+    // failures without waiting for anything, so it is the half of the error
+    // check the deferred path keeps; an execution fault surfaces at the
+    // segment's own next synchronise, which is where every other enqueued phase
+    // of the outer already reports one.
     const cudaError_t lasterr = cudaGetLastError();
-    const cudaError_t syncrc  = cudaStreamSynchronize(d.stream);
-    if (lasterr != cudaSuccess || syncrc != cudaSuccess) {
-        d.status = std::string("nodal FULL -> ") +
-                   cudaGetErrorString(lasterr != cudaSuccess ? lasterr : syncrc);
+    if (lasterr != cudaSuccess) {
+        d.status = std::string("nodal FULL -> ") + cudaGetErrorString(lasterr);
+        cudaStreamSynchronize(d.stream);
+        cudaGetLastError();
+        return false;
+    }
+    if (drain_deferrable) {
+        const cudaError_t erc = cudaEventRecord(d.nodal_done_event, d.stream);
+        if (erc != cudaSuccess) {
+            d.status = std::string("nodal FULL event -> ") + cudaGetErrorString(erc);
+            cudaStreamSynchronize(d.stream);
+            cudaGetLastError();
+            return false;
+        }
+        d.nodal_drain_deferred = true;
+        g_nodal_drains_deferred.fetch_add(1, std::memory_order_relaxed);
+    } else if (const cudaError_t syncrc = cudaStreamSynchronize(d.stream);
+               syncrc != cudaSuccess) {
+        d.status = std::string("nodal FULL -> ") + cudaGetErrorString(syncrc);
         cudaGetLastError();
         return false;
     }
@@ -2691,6 +2785,11 @@ void XsReconBackend::setCanonicalNodalSegmentMode(bool in_segment, bool device_o
         d.canonical.setOwner(static_cast<gpu::CanonicalRegion>(r), gpu::CanonicalOwner::Host);
     setMaterializeMask(gpu::canonicalBit(gpu::CanonicalRegion::Jnet) |
                        gpu::canonicalBit(gpu::CanonicalRegion::Phis));
+}
+
+void* XsReconBackend::nodalCompletionEvent() const {
+    const Impl& d = *_impl;
+    return d.nodal_drain_deferred ? static_cast<void*>(d.nodal_done_event) : nullptr;
 }
 
 unsigned long long XsReconBackend::canonicalUploadsElided() const {

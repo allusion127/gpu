@@ -708,6 +708,18 @@ struct OuterSegmentCounters {
     /// binding live -- the ones that paid no jnet bridge and no flux upload
     /// inside the nodal call.
     std::uint64_t canonical_nodal_outers   = 0;
+
+    /// Rev.7.1 W3 item 2: outers whose nodal drive handed back an EVENT instead
+    /// of having drained itself, so the segment stream waited on it and the host
+    /// did not block.
+    ///
+    /// A DIFFERENCE, NOT A TOTAL.  device_outers - nodal_event_waits is the
+    /// number of outers that still paid a host round trip for the nodal
+    /// handover: the Wielandt warm-up, a drive that fell back to the CPU body,
+    /// and any outer a consumer had asked to materialise.  Zero on a run with the
+    /// feature wired means the backend never deferred, which is what a
+    /// half-installed hook table looks like.
+    std::uint64_t nodal_event_waits        = 0;
     /// Bytes returned to Geometry::Phis at a segment exit.
     ///
     /// THE PRICE OF THE ELIDED DOWNLOAD, and it is charged per EXIT rather than
@@ -898,9 +910,25 @@ using OuterCuspingHook = bool (*)(void* ctx, int slot, unsigned int outer_index)
 using OuterSegmentHook = bool (*)(void* ctx, OuterSegmentStream stream, int slot,
                                   unsigned int outer_index);
 
+/// Rev.7.1 W3 item 2: how the drive that just ran is ordered against the
+/// segment's stream.
+///
+/// Returns the nodal backend's completion event (an opaque cudaEvent_t) when
+/// that drive DEFERRED its own drain, and nullptr when it drained itself.
+/// Asked after every nodal hook, because the answer changes per outer: a drive
+/// that fell back to the CPU body, or one that materialised jnet/phis for a host
+/// reader, blocks and needs no event; a drive whose downloads were all elided
+/// left its work in flight and the segment must wait on it before upddhat reads
+/// the jnet.
+///
+/// NULLPTR IS A LEGAL ANSWER AND MEANS `ALREADY ORDERED`, never `do not bother`.
+using OuterNodalCompletionHook = void* (*)(void* ctx);
+
 struct OuterSegmentHooks {
     OuterSegmentHook enqueue_cmfd_sweep = nullptr; ///< setls + drive (+ probe)
     OuterSegmentHook enqueue_nodal_drive = nullptr; ///< nodal reset + drive
+    /// The other half of the nodal handover; see OuterNodalCompletionHook.
+    OuterNodalCompletionHook nodal_completion_event = nullptr;
 
     /// Step 7: ApplyRodCusping + the upddtil it forces.  Returns whether the
     /// macro-XS actually moved.
