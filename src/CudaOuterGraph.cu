@@ -111,6 +111,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <ostream>
 #include <string>
 #include <vector>
@@ -2138,6 +2139,27 @@ bool rasberyStandUpOuterSegment(const OuterSegmentDeck& deck, std::ostream& rece
     // The gate is tested HERE and not at the call site, so Driver.h holds one
     // unconditional call and the feature-off path is this early return.
     if (!outerGpuEnabled()) return false;
+
+    // ONE STAND-UP PER PROCESS MEANS ONE AT A TIME.
+    //
+    // Driver::Run calls this, and `--batch-mode M` runs M Drivers on M host
+    // threads: `stood` is a plain bool read and written with no ordering, so two
+    // workers that arrive together both read false, both reserve the arena, and
+    // both walk the cudaMalloc/bind sequence over the SAME process-wide objects.
+    // MEASURED on a 4-deck local batch with RASBERY_GPU_OUTER=1: two identical
+    // [RASBERY][GPU_ARENA] receipts, one per racing worker, both reporting the
+    // same pre-allocation vram_free -- i.e. two 237 MB reservations of a
+    // single-allocation arena, one of them leaked, and a runner left bound to
+    // whichever finished last.  The segment refuses in batch anyway, so nothing
+    // NUMERIC came of it; that is not a reason to leave the allocation racing.
+    //
+    // The lock is held for the whole body rather than around `stood` alone,
+    // because the later arrivals must see a FINISHED stand-up, not one in
+    // progress.  It is taken once per Driver and the fast path is one
+    // uncontended lock plus a bool.
+    static std::mutex stand_up_mutex;
+    std::lock_guard<std::mutex> stand_up_lock(stand_up_mutex);
+
     if (standUpTables().stood) return rasberyOuterSegment().bound();
 
     if (deck.nxyz <= 0 || deck.nsurf <= 0 || deck.nxy <= 0 || deck.ng <= 0 ||
