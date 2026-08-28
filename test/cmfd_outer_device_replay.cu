@@ -164,7 +164,14 @@ int main(int argc, char** argv) {
     TRY(cudaMalloc(&d_counters, sizeof(ng_::CmfdOuterCounters) * kSlots));
     TRY(cudaMemset(d_counters, 0, sizeof(ng_::CmfdOuterCounters) * kSlots));
 
-    const unsigned long long forms = co::cmfdOuterForms();
+    // THE MINED MASK, NOT THE BAKED ONE.  This gate scores the DEVICE bodies
+    // against the verbatim CPU quotation, so the mask it uses has to be the one
+    // the production binary hands the kernels -- which since the calibration fix
+    // is whatever THIS host contracts, not the constant the authoring host did.
+    // Scored against the baked 0x6 on a host that fuses CO_PSI_ACC, this gate
+    // reported `psi 730 / 4096 differ` and was read as a device-arithmetic
+    // problem for as long as nobody noticed the mask in its own banner.
+    const unsigned long long forms = co::cmfdOuterFormsRuntime();
 
     // Each kernel writes to its own output buffer, so the view is re-pointed
     // between launches and re-uploaded; the input arrays never move.

@@ -403,9 +403,14 @@ if (RASBERY_ENABLE_TESTS)
         # reduce, one atomic per block, atomicMax over the ratio's bit pattern --
         # has no host equivalent, so this is the only place it is checked at all.
         # It links the same verbatim CPU reference object the host gates use.
+        # CmfdOuterFormMiner.cpp for the same reason the host gates link it: the
+        # replay scores the device bodies under the mask the PRODUCTION resolver
+        # returns, and that resolver mines this host rather than trusting the
+        # baked constant.
         add_executable(rasbery_cmfd_outer_device_replay
                 "${CMAKE_CURRENT_SOURCE_DIR}/test/cmfd_outer_device_replay.cu"
-                "${CMAKE_CURRENT_SOURCE_DIR}/src/CmfdOuterReference.cpp")
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/CmfdOuterReference.cpp"
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/CmfdOuterFormMiner.cpp")
         target_compile_features(rasbery_cmfd_outer_device_replay PRIVATE cxx_std_20)
         target_include_directories(rasbery_cmfd_outer_device_replay PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/src"
