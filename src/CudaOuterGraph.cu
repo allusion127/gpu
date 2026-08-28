@@ -153,6 +153,7 @@ struct AtomicCounters {
     std::atomic<std::uint64_t> budget_exits{0};
     std::atomic<std::uint64_t> halted_outer_launches{0};
     std::atomic<std::uint64_t> jnet_bridge_bytes{0};
+    std::atomic<std::uint64_t> updjnet_reissued{0};
     std::atomic<std::uint64_t> flux_sync_bytes{0};
     std::atomic<std::uint64_t> host_mirror_bytes{0};
     std::atomic<std::uint64_t> cusping_fired{0};
@@ -230,6 +231,7 @@ OuterSegmentCounters outerSegmentCounters() {
     out.budget_exits            = a.budget_exits.load(std::memory_order_relaxed);
     out.halted_outer_launches   = a.halted_outer_launches.load(std::memory_order_relaxed);
     out.jnet_bridge_bytes       = a.jnet_bridge_bytes.load(std::memory_order_relaxed);
+    out.updjnet_reissued        = a.updjnet_reissued.load(std::memory_order_relaxed);
     out.flux_sync_bytes         = a.flux_sync_bytes.load(std::memory_order_relaxed);
     out.host_mirror_bytes       = a.host_mirror_bytes.load(std::memory_order_relaxed);
     out.cusping_fired           = a.cusping_fired.load(std::memory_order_relaxed);
@@ -258,6 +260,7 @@ std::string outerSegmentReceiptJson() {
                     ",\"budget_exits\":" + std::to_string(c.budget_exits) +
                     ",\"halted_outer_launches\":" + std::to_string(c.halted_outer_launches) +
                     ",\"jnet_bridge_bytes\":" + std::to_string(c.jnet_bridge_bytes) +
+                    ",\"updjnet_reissued\":" + std::to_string(c.updjnet_reissued) +
                     ",\"flux_sync_bytes\":" + std::to_string(c.flux_sync_bytes) +
                     ",\"host_mirror_bytes\":" + std::to_string(c.host_mirror_bytes) +
                     ",\"cusping_fired\":" + std::to_string(c.cusping_fired) +
@@ -370,6 +373,11 @@ struct CudaOuterSegment::Impl {
     unsigned long long resident_xs_generation   = 0;
     unsigned long long resident_dtil_generation = 0;
     bool                  residency_bound = false;
+    /// Raised by republishAfterHostSweep: THIS outer's drive did not finish on
+    /// the device and the host finished it at the observation.  Read by the body
+    /// to re-issue the step the sweep verdict's halt swallowed; cleared at the
+    /// top of every outer so it can never describe an older one.
+    bool                  sweep_host_continued = false;
     /// RASBERY_OUTER_TRACE scratch.  The per-step tracer has to hash DEVICE
     /// memory on this arm -- the host mirrors are elided inside a segment -- so
     /// it needs somewhere to land the copies.  Grown on first use and only when
@@ -654,6 +662,10 @@ bool CudaOuterSegment::publishProbe(int slot, double eigv, double residual,
 bool CudaOuterSegment::republishAfterHostSweep(int slot, double eigv, double residual,
                                                bool negative_flux, bool rayleigh) {
     if (!publishProbe(slot, eigv, residual, negative_flux, rayleigh)) return false;
+    // SAY THAT THE HOST FINISHED IT.  The body has to know, because the verdict
+    // kernel's halt no-opped every kernel enqueued between it and this call --
+    // updjnet among them -- and taking the halt off does not un-skip them.
+    _impl->sweep_host_continued = true;
     // THE HALT COMES OFF LAST, and that ordering is the point: until the probe
     // holds the finished drive's numbers, an outer that resumed would compute
     // its convergence from the half drive the verdict kernel saw.  publishProbe
@@ -987,6 +999,8 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         // calls -- and each of them can move a generation.  Deciding an
         // elision from a segment-entry value is what made i-SMR CY02 fail at
         // b8 and b16 while passing at b1.
+        m.sweep_host_continued = false;
+
         // The tracer's outer index inside the segment.  Driver.h set the context
         // to the host loop counter before delegating; `base + i` is then the
         // outer ordinal the OFF arm prints for the same outer, so the two logs
@@ -1180,6 +1194,60 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         // kernel had to guess at.
         if (stream_sweep && !m.hooks.finish_cmfd_sweep(m.hooks.ctx, m.stream, slot, i))
             return hookFailed("the CMFD sweep observation hook");
+
+        // ==================================================================
+        // THE STEP THE HALT SWALLOWED
+        // ==================================================================
+        //
+        // cmfd_sweep_verdict raises the segment's halt when the drive did not
+        // finish on the device -- sweep state 0 (the launch's slot budget ran
+        // out) or 2 (the Wielandt gamma degenerated) -- so that the rest of the
+        // body does not correct the current from a half sweep.  That is right,
+        // and it is why the halt is there.  What it did not account for is that
+        // updjnet is enqueued BEHIND the verdict on the same stream: it is
+        // therefore already in flight as a no-op by the time the host finishes
+        // the drive, and republishAfterHostSweep taking the halt off cannot
+        // un-skip it.  Everything after that point in the body -- upddhat, the
+        // refresh, the decision, the transition -- then ran normally, against
+        // the jnet of the PREVIOUS outer.
+        //
+        // The host loop has no such window: drive() returns only when the drive
+        // is over, and updjnet runs after it (Driver.h:1569).  So the repair is
+        // to run the step where the host runs it, on the outers where the device
+        // could not.
+        //
+        // MEASURED, NOT HYPOTHETICAL.  kngr_238, budget 8: three outers out of
+        // 11,993 take this path -- statepoint 23 outer 208, 25/113, 29/19 -- and
+        // before this block those three were the entire remaining ON-vs-OFF
+        // divergence.  Statepoints 1..22 were already bit-identical; 23 onward
+        // were not, and the per-step trace named `updjnet` at exactly 23/208
+        // with a hash equal to the previous outer's nodal jnet, which is what a
+        // step that did not run looks like.
+        //
+        // IT COSTS A SYNCHRONISE, ON THREE OUTERS IN TWELVE THOUSAND.  The
+        // common path is untouched: no extra transfer, no extra sync, and the
+        // branch is one predicted test per outer.
+        if (m.sweep_host_continued) {
+            bump(counters().updjnet_reissued);
+            if ((rc = enqueueUpdJnet(m.arena, queue, bound_.geom, bound_.table, bound_.forms,
+                                     m.stream, m.d_halt)) != cudaSuccess)
+                return launchFailed("re-enqueue updjnet after the host finished the sweep",
+                                    rc);
+            // The bridge copy above carried the pre-updjnet bytes, so it has to
+            // be taken again -- and the nodal drive below is a HOST call reading
+            // a HOST array, so it has to have landed before that call, not
+            // merely been enqueued.
+            if (bridge_jnet &&
+                (rc = cudaMemcpyAsync(bound_.host_jnet, bound_.device_jnet, jnet_bytes,
+                                      cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+                return launchFailed("re-download jnet after the host finished the sweep", rc);
+            // AND THE CANONICAL ARM NEEDS IT TOO.  There the nodal drive reads
+            // the DEVICE jnet, on the backend's own stream, ordered against this
+            // one by nothing but this synchronise.
+            if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
+                return launchFailed("synchronize after the re-issued updjnet", rc);
+        }
+
         // The sweep and updjnet step lines are emitted HERE, after the
         // observation, because that is the first point at which the sweep's
         // output has actually landed -- before it, the enqueue has only been

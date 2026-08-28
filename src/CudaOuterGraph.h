@@ -650,6 +650,26 @@ struct OuterSegmentCounters {
     /// (i-SMR CY02's fractional rods).  Zero here and non-zero
     /// canonical_nodal_outers is the receipt that the binding is live.
     std::uint64_t jnet_bridge_bytes        = 0;
+    /// Outers whose updjnet had to be RE-ISSUED after the host finished the
+    /// sweep.
+    ///
+    /// WHAT IT COUNTS, AND WHY IT IS NOT ZERO.  cmfd_sweep_verdict raises the
+    /// segment's halt when the drive did not finish on the device (sweep state
+    /// 0, the launch's slot budget ran out; state 2, the Wielandt gamma
+    /// degenerated), so that the rest of the body does not read a half sweep --
+    /// and updjnet is already enqueued BEHIND that verdict on the same stream,
+    /// so it becomes a no-op.  The host then finishes the drive at the
+    /// observation and republishAfterHostSweep takes the halt off, but nothing
+    /// re-ran the step the halt had swallowed: upddhat corrected the current
+    /// against the PREVIOUS outer's jnet, and the segment's trajectory left the
+    /// host's.  Measured on kngr_238: three outers out of 11,993 -- the first at
+    /// statepoint 23 -- and those three were the whole remaining ON-vs-OFF
+    /// divergence.
+    ///
+    /// A NON-ZERO VALUE IS HEALTHY, not a warning: it is the count of outers the
+    /// repair covered.  A run with sweep escapes and a ZERO here is the shape to
+    /// distrust.
+    std::uint64_t updjnet_reissued         = 0;
     /// Bytes uploaded to guarantee the device flux matches Geometry::Phif.
     std::uint64_t flux_sync_bytes          = 0;
     /// Bytes returned to the HOST dhat/psi so the host drive path stays correct.

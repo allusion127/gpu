@@ -373,16 +373,22 @@ for bridge, counter in (("mirror psi to the host", "host_mirror_bytes"),
 #   2  the same two again, BLOCKING, on the failure paths, where the segment is
 #      abandoning a stream whose state it can no longer reason about
 #
-# SIXTEEN since the per-step tracer, and the two new ones are named here for
+# SEVENTEEN since the per-step tracer and the re-issued updjnet, and the three
+# new ones are named here for
 # the same reason as the rest:
 #
+#   1  the jnet bridge RE-TAKEN when the sweep verdict's halt swallowed updjnet
+#      and the host finished the drive.  It is inside the per-outer loop and it
+#      is the fourth named bridge: the SAME copy as bridge (3), issued again
+#      because the first one carried the bytes of a step that did not run.
+#      Measured at three outers in 11,993 on kngr_238.
 #   2  the RASBERY_OUTER_TRACE per-step hashes -- one for an array, one for the
 #      probe.  Both are inside `if (trace_steps)`, which is a cached environment
 #      read, so an untraced run issues neither and pays one predicted branch.
 #
 # The invariant this number defends is unchanged: no D2H may appear inside the
 # per-outer loop that is not one of the named bridges or a debug-gated hash.
-if GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost") > 16:
+if GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost") > 17:
     problems.append("CudaOuterGraph.cu: more D2H sites than the four named bridges plus "
                     "the observation, the four exit mirrors and the two traced hashes "
                     "(%d).  Each one is a rendezvous and needs a name"
