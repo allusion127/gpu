@@ -184,6 +184,18 @@ public:
     /// a clamp that changes the answer.
     [[nodiscard]] bool dhatClampEnabled() const { return _dhat_clamp_enabled; }
 
+    /// Rev.7.1 Task 9 link 2: the HOST twins of the two arrays the device outer
+    /// segment writes.
+    ///
+    /// THE SEGMENT HAS TO KEEP THEM CURRENT, and this is why.  drive() does not
+    /// always take the resident sweep: the Wielandt warm-up runs on the host
+    /// (BICGCMFD.cpp:558-565), and the device sweep can decline.  The host loop
+    /// reads _dhat through setls/axb and _psi through wiel, so a segment that
+    /// wrote only the device copies would hand the host path arrays one outer
+    /// stale -- silently, and only on the decks that warm up differently.
+    [[nodiscard]] double* dhatData() { return _dhat; }
+    [[nodiscard]] double* psiData() { return _psi; }
+
     [[nodiscard]] const double* boundaryAlbedoData() const {
         return _boundary_albedo.data();
     }

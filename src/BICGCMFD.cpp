@@ -210,6 +210,21 @@ void BICGCMFD::upddhat(double* flux, double* jnet) {
     }
 }
 
+bool BICGCMFD::deviceSweepResident() const {
+    // canUseDeviceAssembly() is NOT reused here, and the difference is the whole
+    // point: it carries `_wiel_sweep >= WIELANDT_WARMUP_SWEEPS`, which is a
+    // PER-DRIVE state that is false at the top of every SolveLoop entry.  Arming
+    // the segment on it would arm nothing, ever.  What the segment needs to know
+    // is whether this run is CONFIGURED for the resident sweep at all; whether
+    // any individual drive takes it is drive()'s business, and the segment stays
+    // correct either way because it mirrors dhat and psi back to the host.
+    return envFlagEnabled("RASBERY_GPU_CMFD_SWEEP") &&
+           envFlagEnabledDefaultOn("RASBERY_GPU_CMFD_ASSEMBLY") &&
+           std::getenv("RASBERY_CMFD_DUMP") == nullptr && _g.ng() == 2 &&
+           _ls != nullptr && _ls->usingCuda() && _ls->arena() != nullptr &&
+           _ls->batchSlot() >= 0;
+}
+
 bool BICGCMFD::canUseDeviceAssembly() const {
     // The arena assembly is deliberately coupled to the resident multi-sweep
     // path.  Otherwise setls() could skip the host operator and the pristine
@@ -448,6 +463,11 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
         io.icmfd_budget = 20 * _ncmfd;
         io.icmfd_done   = icmfd;
         io.ngxyz        = _g.ngxyz();
+        // Rev.7.1 Task 9 link 2: when the device outer segment owns these, the
+        // host arrays are one outer behind by construction and the upload would
+        // copy them over the bytes the segment just produced.
+        io.dhat_device_resident = _outer_segment_resident;
+        io.psi_device_resident  = _outer_segment_resident;
 
         if (!_ls->driveSweepsCuda(flux, io)) {
             // Nothing ran. Rebuild the host operator before allowing the
@@ -471,6 +491,10 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
         reigv  = io.reigv;
         reigvs = io.reigvs;
         errl2  = io.errl2;
+        // What the segment's transition has to rank, recorded where the sweep
+        // status is known rather than re-derived from a later observation.
+        _last_sweep_negative = io.negative_last;
+        _last_sweep_state    = io.state;
 
         if (io.state == 1 || io.state == 3) return finish(true); // converged / budget spent
 

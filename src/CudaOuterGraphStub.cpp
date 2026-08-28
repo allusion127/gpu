@@ -94,7 +94,9 @@ std::string outerSegmentReceiptJson() {
     const OuterSegmentCounters c = outerSegmentCounters();
     std::string s = "{\"segment_launches\":0,\"device_outers\":0,"
                     "\"host_outer_observations\":0,\"budget_exits\":0,"
-                    "\"halted_outer_launches\":0,\"segment_budget\":" +
+                    "\"halted_outer_launches\":0,\"jnet_bridge_bytes\":0,"
+                    "\"flux_sync_bytes\":0,\"host_mirror_bytes\":0,"
+                    "\"segment_budget\":" +
                     std::to_string(outerSegmentBudget()) + ",\"escapes\":{},\"refusals\":{";
     bool first = true;
     for (int i = 0; i < static_cast<int>(OuterSegmentRefusal::Count); ++i) {
@@ -145,6 +147,9 @@ void CudaOuterSegment::bind(const OuterSegmentBinding& binding) { _impl->binding
 bool CudaOuterSegment::bound() const { return false; }
 void CudaOuterSegment::setHooks(const OuterSegmentHooks& hooks) { _impl->hooks = hooks; }
 OuterSegmentHooks CudaOuterSegment::hooks() const { return _impl->hooks; }
+bool CudaOuterSegment::bindResidency(const OuterSegmentResidency&) { return false; }
+bool CudaOuterSegment::residencyBound() const { return false; }
+bool CudaOuterSegment::publishProbe(int, double, double, bool, bool) { return false; }
 
 OuterSegmentRefusal CudaOuterSegment::refusal(int, bool, bool) const {
     return outerGpuEnabled() ? OuterSegmentRefusal::NoRunner : OuterSegmentRefusal::FeatureOff;
@@ -178,5 +183,12 @@ bool rasberyStandUpOuterSegment(const OuterSegmentDeck&, std::ostream&) {
 }
 
 void rasberyTearDownOuterSegment() {}
+
+// Link 2 has no meaning without a device: there are no arena addresses to hand
+// over and no probe to publish.  Both answer false so the caller takes the same
+// path it takes when a CUDA build has no arena -- one refusal, one name.
+bool rasberyBindOuterResidency(const OuterSegmentResidency&) { return false; }
+
+bool rasberyPublishOuterProbe(int, double, double, bool, bool) { return false; }
 
 } // namespace rasbery::gpu

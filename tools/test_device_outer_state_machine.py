@@ -256,20 +256,56 @@ if DHAT and "blockIdx.y" not in DHAT:
                     "block (they test blockIdx.y), or the counter reduction's __syncthreads "
                     "deadlocks the block")
 
-# --- 7. no observation between outers ---------------------------------------
+# --- 7. the segment observes only where a HOST hook forces it -------------
+#
+# THIS RULE CHANGED IN LINK 2, and the change is the honest description of what
+# the segment can do today rather than a relaxation.  The original ban -- no
+# sync, no D2H anywhere in the per-outer loop -- encoded "a segment never
+# returns to the host between outers".  That is still the goal, and it is still
+# what Task 10 delivers.  What link 2 established is that TWO of the eight steps
+# are host calls: BICGCMFD::drive rendezvouses and Nodal::drive is host
+# arithmetic over host arrays.  A segment containing them cannot enqueue outer
+# i+1 before observing outer i, whatever the loop says.
+#
+# So the contract is now: the segment may synchronise ONLY where a hook that
+# declares itself synchronising requires it, and declaring that MUST force the
+# budget to 1.  A budget above 1 with a synchronising hook would enqueue outers
+# whose halt state the transition has not been able to publish yet -- a
+# different trajectory, not a faster one, and exactly the failure the original
+# ban was written against.
 LOOP = body_of(GRAPH_CU_CODE, "for (unsigned int i = 0", "DeviceOuterSegmentState seg_out")
 if not LOOP:
     problems.append("CudaOuterGraph.cu: the per-outer loop could not be located")
-for banned in ("cudaStreamSynchronize", "cudaDeviceSynchronize", "cudaMemcpyDeviceToHost",
-               "cudaEventSynchronize", "cudaStreamQuery", "cudaMemcpy("):
+for banned in ("cudaDeviceSynchronize", "cudaStreamQuery", "cudaEventSynchronize"):
     if banned in LOOP:
-        problems.append("CudaOuterGraph.cu: the per-outer loop calls %s.  A segment that "
-                        "observes between outers reinstates the host rendezvous this task "
-                        "exists to remove -- the M64 campaign measured that rendezvous, not "
-                        "the kernels, as the wall." % banned)
-if GRAPH_CU_CODE.count("cudaStreamSynchronize") != 1:
-    problems.append("CudaOuterGraph.cu: expected exactly ONE cudaStreamSynchronize in the "
-                    "whole runner (found %d)" % GRAPH_CU_CODE.count("cudaStreamSynchronize"))
+        problems.append("CudaOuterGraph.cu: the per-outer loop calls %s.  Only the two host "
+                        "hooks may force an observation, and they do it with a stream "
+                        "synchronise on the segment's own stream -- a device-wide or "
+                        "polling wait is a rendezvous with everything else too." % banned)
+want(GRAPH_H_CODE, "sweep_synchronizes", "CudaOuterGraph.h",
+     "a hook that rendezvouses has to SAY so, or the budget silently enqueues outers the "
+     "transition cannot have halted yet")
+if "m_hooks_synchronize ? 1u : outerSegmentBudget()" not in GRAPH_CU_CODE:
+    problems.append("CudaOuterGraph.cu: a synchronising sweep hook does not force the budget "
+                    "to 1.  With a hook that drains the stream, outers past the first are "
+                    "enqueued against a halt word the transition has not published -- the "
+                    "Class-B0-on-trajectory failure the no-observation rule exists to stop")
+# Every D2H inside the loop must be one of the three NAMED bridges, and each one
+# has to carry its byte counter -- an unnamed copy is the rendezvous creeping
+# back in.
+for bridge, counter in (("mirror psi to the host", "host_mirror_bytes"),
+                        ("mirror dhat to the host", "host_mirror_bytes"),
+                        ("download jnet for the nodal drive", "jnet_bridge_bytes")):
+    if bridge not in GRAPH_CU_TEXT:
+        problems.append(f"CudaOuterGraph.cu: the {bridge!r} bridge is gone; if the copy is "
+                        "no longer needed the comment explaining why it was must go too")
+    if counter not in GRAPH_CU_CODE:
+        problems.append(f"CudaOuterGraph.cu: {bridge!r} is not counted by {counter} -- an "
+                        "uncounted transfer is one nobody can argue about")
+if GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost") > 6:
+    problems.append("CudaOuterGraph.cu: more D2H sites than the three named bridges plus "
+                    "the segment's three-copy observation (%d).  Each one is a rendezvous "
+                    "and needs a name" % GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost"))
 if "cudaGraph" in GRAPH_CU_CODE or "cudaGraph" in GRAPH_H_CODE:
     problems.append("CudaOuterGraph: uses the graph API.  The conditional WHILE wrapper is "
                     "Task 10; Task 9 is the stream-ordered sequence it will capture.")
@@ -567,6 +603,90 @@ want(SLOTCTL, "hoststateGeneration", "GpuSlotControl.h",
 want(GRAPH_H_CODE, "enqueueNodalConstants", "CudaOuterGraph.h",
      "the plan calls the constants phase enqueueNodalConstants; a reader who greps the "
      "plan's name found nothing")
+
+# --- 15. the dhat/psi handoff (link 2) ---------------------------------------
+#
+# The 416 KiB/outer dhat H2D was the ONE sweep input pushed unconditionally
+# every outer, because dhat changes after every nodal correction and comparing a
+# mirror would cost more than the copy.  Link 2 removes it by making the
+# segment's upddhat write the buffer the sweep reads -- so "skip the upload" is
+# not an optimisation that could be wrong, it is the only correct action once
+# the handoff is bound.
+BICG_CU = strip_comments(read(SRC / "CudaBICGBackend.cu"))
+BICG_H = read(SRC / "CudaBICGBackend.h")
+BICG_CPP = strip_comments(read(SRC / "BICGCMFD.cpp"))
+BICG_HDR = strip_comments(read(SRC / "BICGCMFD.h"))
+
+for field in ("dhat_device_resident", "psi_device_resident"):
+    want(BICG_H, field, "CudaBICGBackend.h",
+         "the sweep has to be TOLD the segment owns this, or it uploads the host twin "
+         "over the bytes the segment just produced")
+    want(BICG_CPP, "io." + field, "BICGCMFD.cpp",
+         "the flag has to be published from the drive that stages the sweep")
+for flag in ("dhat_resident", "psi_resident"):
+    want(BICG_CU, "sl." + flag, "CudaBICGBackend.cu",
+         "stageSweeps must carry the residency into the slot the upload loop reads")
+# The dhat push must be GUARDED, and the guard must be the residency.
+DHAT = body_of(BICG_CU, "if (sl.dhat_resident)", "++telemetry.cmfd_assembly_gpu_calls")
+if not DHAT or "push(dhat_dev" not in DHAT:
+    problems.append("CudaBICGBackend.cu: the dhat H2D is not guarded by sl.dhat_resident. "
+                    "It is the one sweep input pushed unconditionally every outer, so it "
+                    "is the whole 416 KiB/outer link 2 exists to remove")
+if "cmfd_dhat_h2d_elided_bytes" not in BICG_CU:
+    problems.append("CudaBICGBackend.cu: the elided dhat bytes are not counted, so the "
+                    "claim 'the H2D is gone' has no number behind it")
+# psi residency must outrank psi_dirty: dirty means 'the host wrote it', and
+# when the segment owns psi the host never wrote it at all.
+PSI = body_of(BICG_CU, "if (sl.psi_resident)", "pushOrSkip(phi + m")
+if PSI and PSI.find("else if (sl.push_psi)") < 0:
+    problems.append("CudaBICGBackend.cu: the psi residency test does not outrank psi_dirty. "
+                    "psi_dirty is true at every drive boundary, so ranking it first would "
+                    "upload the host twin over the fission source the segment's updpsi "
+                    "just produced")
+
+# The segment must bind to the sweep's buffers, and the binding must be a
+# POINTER REBASE -- every layout already matches (see the residentView note).
+want(GRAPH_H_CODE, "k_cmfd_bind_resident", "CudaOuterGraph.h",
+     "the slot table has to be repointed at the sweep's buffers")
+BIND = body_of(GRAPH_H_CODE, "void k_cmfd_bind_resident", "inline cudaError_t enqueueBuildCmfdSlotTable")
+for field in ("v.flux = flux;", "v.psi  = psi;", "v.dtil = dtil;", "v.dhat = dhat;"):
+    if field not in BIND:
+        problems.append(f"k_cmfd_bind_resident: missing {field!r}")
+if "v.jnet" in BIND:
+    problems.append("k_cmfd_bind_resident: rebinds jnet.  The sweep arena has no jnet -- it "
+                    "is not a CMFD input -- so jnet must keep the physics-arena pointer "
+                    "k_cmfd_build_slot_table gave it, or the two kernels own one field each "
+                    "and are free to disagree about it")
+want(BICG_H, "residentView", "CudaBICGBackend.h",
+     "the segment needs the sweep's device addresses to bind to")
+want(read(SRC / "CudaBICGBackendStub.cpp"), "CudaBatchArena::residentView",
+     "CudaBICGBackendStub.cpp", "stub parity for the residency accessor")
+
+# THE HOST TWINS MUST STILL BE WRITTEN.  drive() takes the host loop for the
+# Wielandt warm-up and whenever the device sweep declines, and that loop reads
+# _dhat and _psi.  A segment that wrote only the device copies would hand the
+# fallback path stale arrays -- silently, and only on decks that warm up
+# differently.
+for mirror in ("host_dhat", "host_psi"):
+    want(GRAPH_CU_CODE, "bound_." + mirror, "CudaOuterGraph.cu",
+         "the host twin has to be refreshed or the host drive path reads an array one "
+         "outer stale")
+want(GRAPH_H_CODE, "host_mirror_bytes", "CudaOuterGraph.h",
+     "the mirror is the honest remaining cost and it has to be counted")
+want(strip_comments(read(SRC / "CMFD.h")), "dhatData", "CMFD.h",
+     "the segment needs the host twin's address")
+# The arming gate must NOT reuse canUseDeviceAssembly: that carries the
+# per-drive Wielandt warm-up, which is false at every SolveLoop entry, so an
+# arming site built on it would arm nothing ever.
+RESIDENT = body_of(BICG_CPP, "bool BICGCMFD::deviceSweepResident() const", "bool BICGCMFD::canUseDeviceAssembly")
+if RESIDENT and "canUseDeviceAssembly" in RESIDENT:
+    problems.append("BICGCMFD::deviceSweepResident reuses canUseDeviceAssembly, which "
+                    "carries `_wiel_sweep >= WIELANDT_WARMUP_SWEEPS`.  That is per-drive "
+                    "state and it is false at the top of every SolveLoop entry, so the "
+                    "segment would never arm")
+if RESIDENT and "_wiel_sweep" in RESIDENT:
+    problems.append("BICGCMFD::deviceSweepResident tests the Wielandt warm-up, which is "
+                    "per-drive state the arming site cannot use")
 
 # --- the gates exist and are built -------------------------------------------
 want(REPLAY_TEXT, "kPhaseTransitions", "test/outer_state_replay.cpp",

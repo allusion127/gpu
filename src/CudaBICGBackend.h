@@ -64,6 +64,10 @@ struct BackendCounters {
     /// launch, and the D2H bytes not pulled back on a non-exceptional one.
     std::uint64_t cmfd_psi_h2d_elided_bytes            = 0;
     std::uint64_t cmfd_psi_d2h_elided_bytes            = 0;
+    /// Rev.7.1 Task 9 link 2: H2D bytes not copied because the device outer
+    /// segment had already written the arena buffer the sweep reads.
+    std::uint64_t cmfd_dhat_h2d_elided_bytes           = 0;
+    std::uint64_t cmfd_resident_psi_h2d_elided_bytes   = 0;
     /// Cost of the CMFD flux mirror, in nanoseconds of LAUNCHER time: the
     /// adoptFluxMirror() shadow copy and the memcmp the next upload pays to
     /// decide whether it can skip.  Compare against the bytes that skip
@@ -258,6 +262,23 @@ public:
         /// uploads and the rest skip.  Skipping leaves the device's own psi in
         /// place, which is bit-for-bit what the round trip put back.
         bool          psi_dirty = true;
+        /// Rev.7.1 Task 9 link 2: the device outer segment already wrote these
+        /// INTO THE ARENA, so the H2D would be copying the host's stale twin over
+        /// the authoritative bytes.
+        ///
+        /// THIS IS A POINTER HANDOFF AND NOT A CACHE.  The segment's upddhat
+        /// kernel writes dhat_dev for this slot directly -- the same buffer
+        /// cmfd_assemble_operator_2g reads -- so `skip the upload` here is not an
+        /// optimisation that could be wrong, it is the only correct action: the
+        /// host array is one outer behind by construction.
+        ///
+        /// dhat is the expensive one.  It is the ONE sweep input pushed
+        /// unconditionally every outer (nsurf*ng doubles, ~416 KiB at APR1400
+        /// size) because it changes after every nodal correction, so comparing a
+        /// mirror would cost more than the copy.  When the segment owns it there
+        /// is nothing to compare and nothing to copy.
+        bool          dhat_device_resident = false;
+        bool          psi_device_resident  = false;
         /// Build diag/cc/udiag in the arena before the resident sweep graph.
         bool          device_assembly = false;
         double eigv = 0, reigv = 0, reigvs = 0, errl2 = 0;
@@ -281,6 +302,38 @@ public:
     bool pinHost(const void* p, size_t bytes, const char* tag = nullptr) const;
 
     /// Record one drive()'s sweep inputs for @p slot.  No CUDA call, no lock.
+    /// Rev.7.1 Task 9 link 2: the DEVICE addresses of one slot's CMFD state.
+    ///
+    /// WHY THIS IS A HANDOFF AND NOT A COPY.  Every array here already has the
+    /// layout the host uses, so the device outer segment can write the buffers
+    /// the sweep reads with no transpose and no staging:
+    ///
+    ///   phi  [l*ng + ig]      -- node-major, byte-identical to Geometry::Phif;
+    ///                            cmfd_wiel_terms reads f[l*2+0], f[l*2+1].
+    ///   psi  [l]              -- cmfd_wiel_terms writes ps[l].
+    ///   dtil/dhat [ls*ng+ig]  -- CMFD.h's own order.
+    ///   xsnf [ig*nxyz + l]    -- group-major; x0 = base, x1 = base + nxyz.
+    ///
+    /// That coincidence is not luck: the arena was built to share the host's
+    /// addressing so the Class B0 bodies could be scored against the CPU loops.
+    /// It is what makes link 2 a pointer handoff rather than a second layout.
+    ///
+    /// The pointers are fixed for the arena's life, so a caller may bind them
+    /// once.  `valid` is false when the arena is unavailable or the slot is out
+    /// of range, in which case every pointer is null.
+    struct CmfdResidentView {
+        double*       phi  = nullptr;
+        double*       psi  = nullptr;
+        double*       dtil = nullptr;
+        double*       dhat = nullptr;
+        const double* xsnf = nullptr;
+        int  nxyz  = 0;
+        int  ngxyz = 0;
+        int  nsurf = 0;
+        bool valid = false;
+    };
+    [[nodiscard]] CmfdResidentView residentView(int slot) const;
+
     void stageSweeps(int slot, const CmfdSweepIO& io);
 
     /// Rendezvous + one multi-sweep graph launch + drain; same batching

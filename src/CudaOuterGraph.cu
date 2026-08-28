@@ -151,6 +151,9 @@ struct AtomicCounters {
     std::atomic<std::uint64_t> host_outer_observations{0};
     std::atomic<std::uint64_t> budget_exits{0};
     std::atomic<std::uint64_t> halted_outer_launches{0};
+    std::atomic<std::uint64_t> jnet_bridge_bytes{0};
+    std::atomic<std::uint64_t> flux_sync_bytes{0};
+    std::atomic<std::uint64_t> host_mirror_bytes{0};
     std::atomic<std::uint64_t> refusals[static_cast<int>(OuterSegmentRefusal::Count)];
     std::atomic<std::uint64_t> escapes[kDeviceEscapeCount];
 
@@ -215,6 +218,9 @@ OuterSegmentCounters outerSegmentCounters() {
     out.host_outer_observations = a.host_outer_observations.load(std::memory_order_relaxed);
     out.budget_exits            = a.budget_exits.load(std::memory_order_relaxed);
     out.halted_outer_launches   = a.halted_outer_launches.load(std::memory_order_relaxed);
+    out.jnet_bridge_bytes       = a.jnet_bridge_bytes.load(std::memory_order_relaxed);
+    out.flux_sync_bytes         = a.flux_sync_bytes.load(std::memory_order_relaxed);
+    out.host_mirror_bytes       = a.host_mirror_bytes.load(std::memory_order_relaxed);
     for (int i = 0; i < static_cast<int>(OuterSegmentRefusal::Count); ++i)
         out.refusals[i] = a.refusals[i].load(std::memory_order_relaxed);
     for (int i = 0; i < kDeviceEscapeCount; ++i)
@@ -230,6 +236,9 @@ std::string outerSegmentReceiptJson() {
                     std::to_string(c.host_outer_observations) +
                     ",\"budget_exits\":" + std::to_string(c.budget_exits) +
                     ",\"halted_outer_launches\":" + std::to_string(c.halted_outer_launches) +
+                    ",\"jnet_bridge_bytes\":" + std::to_string(c.jnet_bridge_bytes) +
+                    ",\"flux_sync_bytes\":" + std::to_string(c.flux_sync_bytes) +
+                    ",\"host_mirror_bytes\":" + std::to_string(c.host_mirror_bytes) +
                     ",\"segment_budget\":" + std::to_string(outerSegmentBudget());
 
     // Only the non-zero buckets, so a healthy run's line stays readable and a
@@ -316,6 +325,8 @@ struct CudaOuterSegment::Impl {
     CmfdOuterDecision*       d_decisions = nullptr;
     unsigned long long*      d_halted    = nullptr;
 
+    OuterSegmentResidency residency{};
+    bool                  residency_bound = false;
     OuterSegmentHooks   hooks{};
     OuterSegmentBinding binding{};
     bool                is_bound = false;
@@ -403,6 +414,74 @@ void CudaOuterSegment::setHooks(const OuterSegmentHooks& hooks) { _impl->hooks =
 
 OuterSegmentHooks CudaOuterSegment::hooks() const { return _impl->hooks; }
 
+bool CudaOuterSegment::bindResidency(const OuterSegmentResidency& residency) {
+    _impl->residency       = residency;
+    _impl->residency_bound = false;
+    if (!_impl->ready || !_impl->is_bound) return false;
+    if (!residency.valid || residency.flux == nullptr || residency.psi == nullptr ||
+        residency.dtil == nullptr || residency.dhat == nullptr ||
+        residency.xsnf == nullptr || residency.host_jnet == nullptr ||
+        residency.host_flux == nullptr || residency.host_dhat == nullptr ||
+        residency.host_psi == nullptr)
+        return false;
+    if (residency.arena_slot < 0 || residency.arena_slot >= _impl->slot_count) return false;
+
+    // The patch is a single-thread kernel rather than a host memcpy into the
+    // table because the table lives in device memory and the five fields are
+    // written INSIDE one CmfdOuterView; a host-side partial write would have to
+    // download the struct, edit it and upload it, which is three transfers to
+    // change five pointers.
+    // CmfdOuterSlotTable::views is const because the BODIES only read it; the
+    // allocation is this runner's own device buffer, so the cast is back to the
+    // type the table was built from rather than away from an immutable one.
+    k_cmfd_bind_resident<<<1, 1>>>(
+        const_cast<cmfd::CmfdOuterView*>(_impl->binding.table.views),
+        residency.arena_slot,
+                                   residency.flux, residency.psi, residency.dtil,
+                                   residency.dhat, residency.xsnf);
+    cudaError_t rc = cudaGetLastError();
+    if (rc == cudaSuccess) rc = cudaDeviceSynchronize();
+    if (rc != cudaSuccess) {
+        _impl->status = std::string("bind residency: ") + cudaGetErrorString(rc);
+        return false;
+    }
+    _impl->binding.host_jnet = residency.host_jnet;
+    _impl->binding.host_flux = residency.host_flux;
+    _impl->binding.host_dhat   = residency.host_dhat;
+    _impl->binding.host_psi    = residency.host_psi;
+    _impl->binding.device_dhat = residency.dhat;
+    _impl->binding.device_psi  = residency.psi;
+    _impl->residency_bound   = true;
+    return true;
+}
+
+bool CudaOuterSegment::residencyBound() const { return _impl->residency_bound; }
+
+bool CudaOuterSegment::publishProbe(int slot, double eigv, double residual,
+                                    bool negative_flux, bool rayleigh) {
+    if (!_impl->ready || slot < 0 || slot >= _impl->slot_count) return false;
+    DeviceOuterProbe probe{};
+    probe.eigv          = eigv;
+    probe.residual      = residual;
+    probe.negative_flux = negative_flux ? 1u : 0u;
+    probe.rayleigh      = rayleigh ? 1u : 0u;
+    // nonfinite is raised by k_outer_refresh_inputs, which is the one place that
+    // holds both values at once; material_changed cannot fire on an eligible
+    // deck.  Writing either here would be guessing at another kernel's job.
+    const cudaError_t rc = cudaMemcpy(_impl->d_probes + slot, &probe, sizeof(probe),
+                                      cudaMemcpyHostToDevice);
+    return rc == cudaSuccess;
+}
+
+bool rasberyBindOuterResidency(const OuterSegmentResidency& residency) {
+    return rasberyOuterSegment().bindResidency(residency);
+}
+
+bool rasberyPublishOuterProbe(int slot, double eigv, double residual, bool negative_flux,
+                              bool rayleigh) {
+    return rasberyOuterSegment().publishProbe(slot, eigv, residual, negative_flux, rayleigh);
+}
+
 void CudaOuterSegment::bind(const OuterSegmentBinding& binding) {
     _impl->binding = binding;
     // A binding is usable only when it can ADDRESS the CMFD bodies' slot views
@@ -427,6 +506,7 @@ OuterSegmentRefusal CudaOuterSegment::refusal(int batch_width, bool fractional_r
     e.batch_width      = batch_width;
     e.fractional_rods  = fractional_rods ? 1 : 0;
     e.critical_search  = critical_search ? 1 : 0;
+    e.residency_bound  = _impl->residency_bound ? 1 : 0;
     e.have_sweep_hook  = _impl->hooks.enqueue_cmfd_sweep != nullptr ? 1 : 0;
     e.have_nodal_hook  = _impl->hooks.enqueue_nodal_drive != nullptr ? 1 : 0;
     return outerSegmentRefusal(e);
@@ -446,8 +526,20 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     }
 
     Impl&                      m      = *_impl;
+    const bool                 m_hooks_synchronize = _impl->hooks.sweep_synchronizes;
     const OuterSegmentBinding& bound_ = m.binding;
-    const unsigned int         budget = outerSegmentBudget();
+    // THE SYNCHRONISING SWEEP HOOK FORCES A SEGMENT OF ONE.
+    //
+    // BICGCMFD::drive drains its stream and copies the flux back, so the host
+    // has already observed outer i by the time outer i+1 could be enqueued.
+    // Enqueueing further outers under that hook would issue kernels whose
+    // halt state the transition has not been able to publish yet -- a different
+    // trajectory, not a faster one.  One outer per segment is the honest
+    // description of what this can do until the sweep is stream-ordered, and it
+    // is why `device_outers` equals the host outer count rather than exceeding
+    // `segment_launches` by the budget.
+    const unsigned int         budget =
+        m_hooks_synchronize ? 1u : outerSegmentBudget();
     const int                  slot   = scalars.slot;
     const DevicePhaseQueue     queue  = singleSlotQueue(slot);
 
@@ -541,10 +633,44 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
 
     // --- the body, budget times, on ONE stream -------------------------------
     for (unsigned int i = 0; i < budget; ++i) {
+        // (0) the flux the whole outer is computed from.
+        //
+        // See OuterSegmentBinding::host_flux: drive() takes the HOST loop for
+        // the Wielandt warm-up and whenever the device sweep declines, and after
+        // such a drive the device phi is behind the host flux.  Uploading it
+        // here makes the segment independent of which path the previous drive
+        // took, which is the difference between a fast path and a correct one.
+        if (bound_.host_flux != nullptr && m.residency.flux != nullptr) {
+            const std::size_t flux_bytes =
+                static_cast<std::size_t>(bound_.nxyz) *
+                static_cast<std::size_t>(bound_.ng) * sizeof(double);
+            if ((rc = cudaMemcpyAsync(m.residency.flux, bound_.host_flux, flux_bytes,
+                                      cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
+                return launchFailed("upload flux", rc);
+            bump(counters().flux_sync_bytes, flux_bytes);
+        }
+
         // (1) updpsi -- Driver.h:1547
         if ((rc = enqueueUpdPsi(m.arena, queue, bound_.geom, bound_.table, bound_.forms,
                                 m.stream, m.d_halt)) != cudaSuccess)
             return launchFailed("enqueue updpsi", rc);
+
+        // psi back to the host, BEFORE the hook that may read it.
+        //
+        // drive() takes the HOST loop during the Wielandt warm-up and whenever
+        // the device sweep declines, and that loop reads _psi through wiel.  The
+        // segment replaced CMFD::updpsi, so nothing else will write it.
+        if (bound_.host_psi != nullptr && bound_.device_psi != nullptr) {
+            const std::size_t psi_bytes =
+                static_cast<std::size_t>(bound_.nxyz) * sizeof(double);
+            if ((rc = cudaMemcpyAsync(bound_.host_psi, bound_.device_psi, psi_bytes,
+                                      cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+                return launchFailed("mirror psi to the host", rc);
+            bump(counters().host_mirror_bytes, psi_bytes);
+        }
+        // The hook is a HOST call, so everything queued above has to have landed.
+        if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
+            return launchFailed("synchronize before the CMFD sweep", rc);
 
         // (2,3) setls + drive -- Driver.h:1551-1555.  The hook also publishes
         // this outer's DeviceOuterProbe; nothing after it can see eigv,
@@ -564,8 +690,34 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
             return launchFailed("enqueue updjnet", rc);
 
         // (6) nodal reset + drive -- Driver.h:1573-1575
-        if (!m.hooks.enqueue_nodal_drive(m.hooks.ctx, m.stream, slot, i))
+        //
+        // THE JNET BRIDGE.  The nodal drive is still a HOST call and it reads
+        // and writes Geometry::Jnet, while updjnet above wrote the device copy
+        // and upddhat below reads it.  So the device jnet goes down, the host
+        // runs, and the result comes back -- in the RUNNER rather than in the
+        // hook, so the hook stays pure host physics with no device vocabulary.
+        // Both halves are counted; see OuterSegmentCounters::jnet_bridge_bytes.
+        if (bound_.host_jnet != nullptr && bound_.device_jnet != nullptr) {
+            const std::size_t jnet_bytes =
+                static_cast<std::size_t>(bound_.geom.nsurf) *
+                static_cast<std::size_t>(bound_.ng) * sizeof(double);
+            if ((rc = cudaMemcpyAsync(bound_.host_jnet, bound_.device_jnet, jnet_bytes,
+                                      cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+                return launchFailed("download jnet for the nodal drive", rc);
+            if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
+                return launchFailed("synchronize before the nodal drive", rc);
+            bump(counters().jnet_bridge_bytes, jnet_bytes);
+
+            if (!m.hooks.enqueue_nodal_drive(m.hooks.ctx, m.stream, slot, i))
+                return hookFailed("the nodal drive hook");
+
+            if ((rc = cudaMemcpyAsync(bound_.device_jnet, bound_.host_jnet, jnet_bytes,
+                                      cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
+                return launchFailed("upload jnet after the nodal drive", rc);
+            bump(counters().jnet_bridge_bytes, jnet_bytes);
+        } else if (!m.hooks.enqueue_nodal_drive(m.hooks.ctx, m.stream, slot, i)) {
             return hookFailed("the nodal drive hook");
+        }
 
         // (7) cusping -- Driver.h:1579-1580.  Stage A: eligibility guarantees
         // ApplyRodCusping would return false for this deck, so the host's own
@@ -578,6 +730,21 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                                  bound_.dhat_clamp, bound_.dhat_counters, m.stream,
                                  m.d_halt)) != cudaSuccess)
             return launchFailed("enqueue upddhat", rc);
+
+        // dhat back to the host, for the same reason psi went back: setls/axb on
+        // the host drive path read _dhat, and the segment replaced
+        // BICGCMFD::upddhat.  The sweep itself does NOT need this -- it reads the
+        // device buffer and its H2D is elided (CmfdSweepIO::dhat_device_resident)
+        // -- so this copy exists only to keep the fallback path honest.
+        if (bound_.host_dhat != nullptr && bound_.device_dhat != nullptr) {
+            const std::size_t dhat_bytes =
+                static_cast<std::size_t>(bound_.geom.nsurf) *
+                static_cast<std::size_t>(bound_.ng) * sizeof(double);
+            if ((rc = cudaMemcpyAsync(bound_.host_dhat, bound_.device_dhat, dhat_bytes,
+                                      cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+                return launchFailed("mirror dhat to the host", rc);
+            bump(counters().host_mirror_bytes, dhat_bytes);
+        }
 
         // the decision -- Driver.h:1601-1705, 1834-1860
         if ((rc = enqueueOuterConvergence(m.arena, queue, m.d_inputs, m.d_decisions, m.stream,
@@ -834,6 +1001,10 @@ bool rasberyStandUpOuterSegment(const OuterSegmentDeck& deck, std::ostream& rece
     binding.forms         = cmfd::cmfdOuterFormsRuntime();
     binding.dhat_clamp    = deck.dhat_clamp;
     binding.dhat_counters = t.dhat_counters;
+    // The device end of the jnet bridge.  jnet has no twin in the sweep arena,
+    // so it stays in the physics arena and the runner moves it around the host
+    // nodal drive.
+    binding.device_jnet   = outerArena().slotView(0).jnet;
     binding.nxyz          = dims.nxyz;
     binding.ng            = dims.ng;
     rasberyOuterSegment().bind(binding);

@@ -2075,6 +2075,10 @@ public:
         double*       host_udiag = nullptr;
         double*       host_psi   = nullptr; ///< in/out
         bool          push_psi   = true;    ///< CmfdSweepIO::psi_dirty
+        /// Rev.7.1 Task 9 link 2: the device outer segment owns these in the
+        /// arena, so their H2D is skipped -- see CmfdSweepIO.
+        bool          dhat_resident = false;
+        bool          psi_resident  = false;
         bool          psi_downloaded = false; ///< D2H issued for THIS launch
         bool          device_assembly = false;
         bool          pushed_xsrf = false;
@@ -3294,8 +3298,20 @@ public:
                              sl.dtil_mirror);
                 // dhat changes after every nodal correction, so comparing it
                 // on the launcher's critical path is wasted work.
-                push(dhat_dev + m * surface_stride(), sl.host_dhat,
-                     surface_group_count);
+                //
+                // UNLESS THE DEVICE OUTER SEGMENT ALREADY WROTE IT (Task 9 link
+                // 2).  Its upddhat kernel writes THIS buffer for THIS slot, so
+                // the host array is one outer behind and copying it would undo
+                // the segment's work.  Skipping is the only correct action here,
+                // not an optimisation.
+                if (sl.dhat_resident) {
+                    ++telemetry.bulk_h2d_skipped_during_iteration;
+                    telemetry.cmfd_dhat_h2d_elided_bytes +=
+                        surface_group_count * sizeof(double);
+                } else {
+                    push(dhat_dev + m * surface_stride(), sl.host_dhat,
+                         surface_group_count);
+                }
 
                 ++telemetry.cmfd_assembly_gpu_calls;
                 telemetry.cmfd_diag_h2d_elided_bytes += matrix_count * sizeof(double);
@@ -3325,7 +3341,17 @@ public:
             // in the same drive would be re-uploading the bytes the device
             // itself produced, so leaving the device copy alone is the same
             // state by a shorter path.
-            if (sl.push_psi) {
+            //
+            // THE RESIDENCY TEST OUTRANKS psi_dirty (Task 9 link 2).  psi_dirty
+            // means 'the host wrote psi since the last launch', which is true at
+            // every drive boundary -- but when the device outer segment owns psi
+            // the host never wrote it at all, and uploading the host twin would
+            // overwrite the fission source the segment's updpsi just produced.
+            if (sl.psi_resident) {
+                ++telemetry.bulk_h2d_skipped_during_iteration;
+                telemetry.cmfd_resident_psi_h2d_elided_bytes +=
+                    static_cast<std::uint64_t>(nxyz) * sizeof(double);
+            } else if (sl.push_psi) {
                 push(psi_dev + m * node_stride(), sl.host_psi, static_cast<size_t>(nxyz));
             } else {
                 ++telemetry.bulk_h2d_skipped_during_iteration;
@@ -3947,6 +3973,26 @@ bool CudaBatchArena::pinHost(const void* p, size_t bytes, const char* tag) const
     return rasberyPinHost(p, bytes, tag);
 }
 
+CudaBatchArena::CmfdResidentView CudaBatchArena::residentView(int m) const {
+    CmfdResidentView v;
+    const auto& c = _impl->core;
+    if (!c.available || m < 0 || m >= c.slots) return v;
+    if (c.phi == nullptr || c.psi_dev == nullptr || c.dtil_dev == nullptr ||
+        c.dhat_dev == nullptr || c.xs_xsnf == nullptr)
+        return v;
+    v.phi   = c.phi + m * c.vec_stride();
+    v.psi   = c.psi_dev + m * c.node_stride();
+    v.dtil  = c.dtil_dev + m * c.surface_stride();
+    v.dhat  = c.dhat_dev + m * c.surface_stride();
+    v.xsnf  = c.xs_xsnf + m * c.vec_stride();
+    v.nxyz  = c.nxyz;
+    v.ngxyz = c.n;
+    v.nsurf = static_cast<int>(c.surface_group_count /
+                               static_cast<size_t>(c.n / c.nxyz));
+    v.valid = true;
+    return v;
+}
+
 void CudaBatchArena::stageSweeps(int m, const CmfdSweepIO& io) {
     auto& sl      = _impl->core.slot[static_cast<size_t>(m)];
     sl.host_chif  = io.chif;
@@ -3959,6 +4005,8 @@ void CudaBatchArena::stageSweeps(int m, const CmfdSweepIO& io) {
     sl.host_udiag = io.udiag;
     sl.host_psi   = io.psi;
     sl.push_psi   = io.psi_dirty;
+    sl.dhat_resident = io.dhat_device_resident;
+    sl.psi_resident  = io.psi_device_resident;
     sl.device_assembly = io.device_assembly && cmfdAssemblyEnabled();
     if (sl.device_assembly &&
         (sl.host_xsrf == nullptr || sl.host_xssm == nullptr ||
@@ -4314,6 +4362,10 @@ void rasberyReleaseBatchArena() {
               << c.cmfd_psi_h2d_elided_bytes << ','
               << "\"cmfd_psi_d2h_elided_bytes\":"
               << c.cmfd_psi_d2h_elided_bytes << ','
+              << "\"cmfd_dhat_h2d_elided_bytes\":"
+              << c.cmfd_dhat_h2d_elided_bytes << ','
+              << "\"cmfd_resident_psi_h2d_elided_bytes\":"
+              << c.cmfd_resident_psi_h2d_elided_bytes << ','
               << "\"cmfd_phi_mirror_ns\":" << c.cmfd_phi_mirror_ns << ','
               << "\"cmfd_phi_mirror_calls\":" << c.cmfd_phi_mirror_calls << ','
               << "\"cmfd_phi_mirror_bypassed\":" << c.cmfd_phi_mirror_bypassed

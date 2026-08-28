@@ -17,6 +17,13 @@ protected:
     /// @brief BICG solver object
     std::unique_ptr<BICGSolver> _ls;
 
+    /// Rev.7.1 Task 9 link 2: the device outer segment owns dhat and psi in
+    /// the sweep arena, so their H2D must be skipped.
+    bool _outer_segment_resident = false;
+    /// What the last device sweep observed, for the segment's probe.
+    int  _last_sweep_negative = 0;
+    int  _last_sweep_state    = 0;
+
     /// @brief Nodal object
     std::unique_ptr<Nodal> _nodal;
 
@@ -93,6 +100,36 @@ protected:
     bool driveDeviceSweeps(double& eigv, double* flux, double& errl2);
 
 public:
+    // -------------------------------------------------------------------
+    // Rev.7.1 Task 9 link 2: handing the CMFD arena to the device outer
+    // -------------------------------------------------------------------
+    //
+    // These expose WHERE the sweep keeps its state, not what is in it.  The
+    // segment needs the arena and the slot to ask for device addresses, and
+    // it needs to know the resident sweep is actually the path being taken --
+    // with RASBERY_GPU_CMFD_SWEEP off the host loop runs and the device flux
+    // the segment reads is never written.
+    [[nodiscard]] CudaBatchArena* residentArena() const {
+        return _ls ? _ls->arena() : nullptr;
+    }
+    [[nodiscard]] int residentSlot() const { return _ls ? _ls->batchSlot() : -1; }
+
+    /// Is the device-resident sweep the path drive() will take?
+    ///
+    /// It is the SAME predicate drive() uses (BICGCMFD.cpp:558-563) minus the
+    /// per-call Wielandt warm-up test, plus the device assembly -- because the
+    /// assembly is what reads the dhat the segment writes.  A second spelling
+    /// of the gate would be free to disagree with the one that decides.
+    [[nodiscard]] bool deviceSweepResident() const;
+
+    /// Tell the sweep that dhat and psi are the segment's now.
+    void setOuterSegmentResident(bool on) { _outer_segment_resident = on; }
+    [[nodiscard]] bool outerSegmentResident() const { return _outer_segment_resident; }
+
+    /// The two device-only signals the segment's transition ranks.
+    [[nodiscard]] bool lastSweepNegativeFlux() const { return _last_sweep_negative != 0; }
+    [[nodiscard]] bool lastSweepRayleigh() const { return _last_sweep_state == 2; }
+
     BICGCMFD(Geometry& g, XSSet& x);
 
     ~BICGCMFD() override;

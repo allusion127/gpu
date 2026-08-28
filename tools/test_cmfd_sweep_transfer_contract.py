@@ -100,19 +100,50 @@ def main() -> int:
         problems.append("psi_dirty is cleared before the launch that consumes it")
 
     # ---- C3c: the invariant the removal rests on --------------------------
-    # Every cmfd_solver.drive(...) must be preceded by an updpsi with no other
-    # cmfd_solver call in between.
+    # Every cmfd_solver.drive(...) must be preceded by a REGENERATION of psi.
+    #
+    # On the host path that is cmfd_solver.updpsi() with no other cmfd_solver
+    # call in between.  Rev.7.1 Task 9 link 2 adds a second producer: the device
+    # outer segment runs updpsi as a KERNEL over the arena buffer the sweep
+    # reads, and mirrors the result back into _psi before its sweep hook (see
+    # CudaOuterGraph.cu, "mirror psi to the host").  The invariant this test
+    # protects -- "the psi this drive reads was regenerated from the current
+    # flux" -- holds on both, so the check admits the hook by name rather than
+    # by relaxing the rule.
+    #
+    # NAMED, NOT PATTERN-MATCHED, deliberately.  A rule like "or any drive()
+    # inside a function whose name contains Hook" would pass for a hook that
+    # never regenerated anything.  There is exactly one such producer today; a
+    # second one has to be added here, which is the point.
+    DEVICE_PSI_PRODUCERS = ("outerSweepHook",)
+
+    def enclosing_function(text, pos):
+        head = text.rfind("static bool ", 0, pos)
+        if head < 0:
+            return ""
+        open_paren = text.find("(", head)
+        return text[head + len("static bool "):open_paren].strip() if open_paren > head else ""
+
     calls = [(m.start(), m.group(1))
              for m in re.finditer(r"cmfd_solver\.(updpsi|drive)\s*\(", driver)]
     for i, (pos, name) in enumerate(calls):
         if name != "drive":
             continue
+        if enclosing_function(driver, pos) in DEVICE_PSI_PRODUCERS:
+            continue
         if i == 0 or calls[i - 1][1] != "updpsi":
             problems.append(
                 f"Driver.h offset {pos}: cmfd_solver.drive() is not immediately preceded "
-                "by cmfd_solver.updpsi(). The psi download was removed BECAUSE updpsi "
-                "regenerates _psi from the flux before every drive; without that this "
+                "by cmfd_solver.updpsi(), and is not one of the named device-psi "
+                f"producers {DEVICE_PSI_PRODUCERS}. The psi download was removed BECAUSE "
+                "psi is regenerated from the flux before every drive; without that this "
                 "drive reads a host psi the device has moved past.")
+    # The named producer has to actually exist, or the exemption is a hole.
+    for producer in DEVICE_PSI_PRODUCERS:
+        if f"static bool {producer}(" not in driver:
+            problems.append(
+                f"Driver.h: the C3c exemption names {producer}, which does not exist; an "
+                "exemption for a function nobody can find exempts everything")
 
     # ---- C4: no staging copy, no generation guard -------------------------
     # Scoped to driveDeviceSweeps: updls and the offline dump capture read the

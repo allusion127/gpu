@@ -69,6 +69,13 @@ void CudaBatchArena::solve(int, double*) {
 bool CudaBatchArena::pinHost(const void* p, size_t bytes, const char* tag) const {
     return rasberyPinHost(p, bytes, tag);
 }
+/// Rev.7.1 Task 9 link 2.  No device, so no device addresses: every pointer is
+/// null and `valid` is false, which is exactly what the segment's eligibility
+/// predicate tests before it binds anything.
+CudaBatchArena::CmfdResidentView CudaBatchArena::residentView(int) const {
+    return CmfdResidentView{};
+}
+
 void CudaBatchArena::stageSweeps(int, const CmfdSweepIO&) {
     throw std::runtime_error(_impl->status);
 }

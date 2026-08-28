@@ -827,6 +827,126 @@ private:
         bool   xe_frozen_checked = false;
     };
 
+
+    // =======================================================================
+    // Rev.7.1 Task 9 link 2: the two hooks a real device outer needs
+    // =======================================================================
+    //
+    // WHAT A HOOK IS ALLOWED TO BE TODAY.  The contract
+    // (CudaOuterGraph.h::OuterSegmentHook) asks for a stream-ordered enqueue
+    // that returns without draining.  Neither of these can be that yet:
+    // BICGCMFD::drive rendezvouses and copies the flux back, and Nodal::drive
+    // is host arithmetic over host arrays.  So the hooks are HONEST about it --
+    // OuterSegmentHooks::sweep_synchronizes is set, the runner forces a segment
+    // of one, and `device_outers` therefore equals the host outer count instead
+    // of exceeding `segment_launches` by the budget.
+    //
+    // WHAT THEY BUY ANYWAY.  Everything between them is now device work on
+    // device-resident buffers: updpsi writes the psi the sweep reads, updjnet
+    // and upddhat write the jnet and dhat the next step reads, and the 416
+    // KiB/outer dhat H2D is gone because the sweep reads the buffer the segment
+    // wrote.  BICGCMFD::updpsi / updjnet / upddhat are not called at all, which
+    // is what host_body_calls reports.
+    struct OuterHookCtx {
+        SolverContext* ctx      = nullptr;
+        double*        eigv     = nullptr;
+        double*        residual = nullptr;
+    };
+    static OuterHookCtx& outerHookCtx() {
+        static OuterHookCtx c;
+        return c;
+    }
+
+    /// setls + drive, then publish what the sweep observed.
+    ///
+    /// THE PROBE IS THE WHOLE REASON THIS IS A HOOK and not a plain call: the
+    /// convergence kernel that runs after it reads eigv and residual out of
+    /// device memory, and nothing else in the segment can see them.  The two
+    /// device-only signals come from the sweep's own status -- a negative flux
+    /// iterate, and the degenerate-gamma hand-back cmfd_wiel_finalize latches as
+    /// sweep_state == 2.
+    static bool outerSweepHook(void* raw, gpu::OuterSegmentStream, int slot, unsigned int) {
+        OuterHookCtx& h = *static_cast<OuterHookCtx*>(raw);
+        h.ctx->cmfd_solver.setls(*h.eigv);
+        h.ctx->cmfd_solver.drive(*h.eigv, h.ctx->geometry.Phif(), *h.residual);
+        return gpu::rasberyPublishOuterProbe(slot, *h.eigv, *h.residual,
+                                             h.ctx->cmfd_solver.lastSweepNegativeFlux(),
+                                             h.ctx->cmfd_solver.lastSweepRayleigh());
+    }
+
+    /// The nodal drive, exactly as SolveLoop runs it.
+    ///
+    /// The runner has already brought the device jnet down into Geometry::Jnet
+    /// and will take the result back up, so this is the host body verbatim --
+    /// which is the point: a hook that reimplemented it would be a second nodal
+    /// solver to keep in step.
+    static bool outerNodalHook(void* raw, gpu::OuterSegmentStream, int, unsigned int) {
+        OuterHookCtx& h = *static_cast<OuterHookCtx*>(raw);
+        h.ctx->nodal_solver.reset(1.0 / *h.eigv, h.ctx->geometry.Jnet(),
+                                  h.ctx->geometry.Phif(), h.ctx->geometry.Phis());
+        h.ctx->nodal_solver.drive();
+        return true;
+    }
+
+    /// Hand the runner the sweep arena's buffers and install the hooks.
+    ///
+    /// Called once per SolveLoop/ReconvergeFlux entry, because the arena slot is
+    /// a property of the BICGCMFD instance and the eigv/residual it must publish
+    /// are that loop's locals.  Returns false when anything is missing, in which
+    /// case the segment refuses by name and the host loop runs unchanged.
+    static bool armOuterSegment(SolverContext& ctx, double& eigv, double& residual) {
+        if (!gpu::outerGpuEnabled()) return false;
+        const CudaBatchArena* arena = ctx.cmfd_solver.residentArena();
+        const int             slot  = ctx.cmfd_solver.residentSlot();
+        if (arena == nullptr || slot < 0) {
+            gpu::noteOuterSegmentRefusal(gpu::OuterSegmentRefusal::NoArena);
+            return false;
+        }
+        // The reason lives HERE because this is the only place that can see it:
+        // the receipt is printed from a process-wide singleton with no solver to
+        // ask.  Recording it makes `sweep_not_resident` appear in refusals{}
+        // instead of the run looking like nobody ever tried.
+        if (!ctx.cmfd_solver.deviceSweepResident()) {
+            gpu::noteOuterSegmentRefusal(gpu::OuterSegmentRefusal::SweepNotResident);
+            return false;
+        }
+
+        const CudaBatchArena::CmfdResidentView view = arena->residentView(slot);
+        if (!view.valid) return false;
+
+        gpu::OuterSegmentResidency residency;
+        residency.flux       = view.phi;
+        residency.psi        = view.psi;
+        residency.dtil       = view.dtil;
+        residency.dhat       = view.dhat;
+        residency.xsnf       = view.xsnf;
+        residency.host_jnet  = ctx.geometry.Jnet();
+        residency.host_flux  = ctx.geometry.Phif();
+        residency.host_dhat  = ctx.cmfd_solver.dhatData();
+        residency.host_psi   = ctx.cmfd_solver.psiData();
+        residency.arena_slot = 0; // the physics arena is width 1 (link 1)
+        residency.valid      = true;
+
+        OuterHookCtx& hc = outerHookCtx();
+        hc.ctx           = &ctx;
+        hc.eigv          = &eigv;
+        hc.residual      = &residual;
+
+        gpu::OuterSegmentHooks hooks;
+        hooks.enqueue_cmfd_sweep  = &outerSweepHook;
+        hooks.enqueue_nodal_drive = &outerNodalHook;
+        hooks.ctx                 = &hc;
+        hooks.sweep_synchronizes  = true;
+        gpu::rasberyOuterSegment().setHooks(hooks);
+
+        if (!gpu::rasberyBindOuterResidency(residency)) return false;
+        // The sweep must stop uploading what the segment now owns.  Setting this
+        // AFTER the bind is deliberate: a run that armed the flags and then
+        // failed to bind would have the sweep reading a dhat nobody wrote.
+        ctx.cmfd_solver.setOuterSegmentResident(true);
+        return true;
+    }
+
     // Flux-only re-convergence (CMFD/BiCGSTAB + nodal/CNCC + cusping), with every feedback
     // (search, T/H, Xe) held fixed.  Used after the search falls back to a previously observed
     // trial point so that the published k_eff belongs to the published rod position / boron.
@@ -887,6 +1007,11 @@ private:
         // was.  With it ON and no arena bound, the runner refuses and the
         // [RASBERY][OUTER_GPU] receipt names why.
         const bool gpu_outer_enabled = gpu::outerGpuEnabled();
+        // Link 2: hand the runner the sweep arena's buffers and install the two
+        // hooks.  Done HERE rather than at stand-up because the arena slot
+        // belongs to this BICGCMFD and the eigv/residual the sweep hook has to
+        // publish are this loop's own locals.
+        if (gpu_outer_enabled) armOuterSegment(ctx, eigv, residual);
         // Stage A eligibility: a deck that can cusp would have to escape with
         // MaterialChanged on outer 1, which is a segment of length one.  The
         // predicate is XSSet::ApplyRodCusping's own (XSSet.cpp:3243, 3266).

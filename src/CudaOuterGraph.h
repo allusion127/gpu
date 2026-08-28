@@ -485,6 +485,8 @@ enum class OuterSegmentRefusal : int {
     CriticalSearch,  ///< see the note on OuterSegmentEligibility::critical_search
     NoSweepHook,     ///< the resident CMFD sweep enqueue was not supplied
     NoNodalHook,     ///< the nodal drive enqueue was not supplied
+    SweepNotResident,///< RASBERY_GPU_CMFD_SWEEP/ASSEMBLY off: no device flux to read
+    NoResidency,     ///< the sweep arena's buffers were never handed over
     LaunchFailed,    ///< a CUDA call in the segment failed; the host path takes over
     Count
 };
@@ -501,6 +503,8 @@ inline const char* outerRefusalName(OuterSegmentRefusal r) {
         case OuterSegmentRefusal::CriticalSearch:  return "critical_search";
         case OuterSegmentRefusal::NoSweepHook:     return "no_sweep_hook";
         case OuterSegmentRefusal::NoNodalHook:     return "no_nodal_hook";
+        case OuterSegmentRefusal::SweepNotResident: return "sweep_not_resident";
+        case OuterSegmentRefusal::NoResidency:     return "no_residency";
         case OuterSegmentRefusal::LaunchFailed:    return "launch_failed";
         case OuterSegmentRefusal::Count:           break;
     }
@@ -536,6 +540,16 @@ struct OuterSegmentEligibility {
     ///     how Task 9 avoids depending on its resolution.
     int critical_search;
 
+    /// Link 2: has anyone handed this runner the sweep arena's buffers?
+    ///
+    /// ONE QUESTION, NOT TWO.  It is tempting to ask `is the run configured for
+    /// the resident sweep` separately, but the receipt is printed from a
+    /// process-wide singleton that has no BICGCMFD to ask -- and a second
+    /// spelling of the gate would be free to disagree with the one that
+    /// actually decided.  So the runner reports what it can see: whether the
+    /// handover happened.  WHY it did not is recorded by the arming site
+    /// itself, which does have the solver, and shows up in `refusals{}`.
+    int residency_bound;
     int have_sweep_hook;
     int have_nodal_hook;
 };
@@ -550,6 +564,7 @@ outerSegmentRefusal(const OuterSegmentEligibility& e) {
     if (e.batch_width > 1) return OuterSegmentRefusal::BatchMode;
     if (e.fractional_rods) return OuterSegmentRefusal::FractionalRods;
     if (e.critical_search) return OuterSegmentRefusal::CriticalSearch;
+    if (!e.residency_bound) return OuterSegmentRefusal::NoResidency;
     if (!e.have_sweep_hook) return OuterSegmentRefusal::NoSweepHook;
     if (!e.have_nodal_hook) return OuterSegmentRefusal::NoNodalHook;
     return OuterSegmentRefusal::None;
@@ -585,6 +600,25 @@ struct OuterSegmentCounters {
     std::uint64_t host_outer_observations  = 0; ///< segment exits the host had to read
     std::uint64_t budget_exits             = 0; ///< exits whose escape was SegmentBudget
     std::uint64_t halted_outer_launches    = 0; ///< no-op launches after the halt latched
+    /// Bytes moved bridging jnet around the HOST nodal drive, both ways.
+    ///
+    /// THE HONEST REMAINING COST OF LINK 2, and the number that says when it is
+    /// paid off.  The dhat H2D it removed is nsurf*ng doubles per outer; this
+    /// bridge is twice that, because the nodal drive is still a host call that
+    /// reads and writes Geometry::Jnet.  Link 2 is therefore a wash on bytes and
+    /// a win on host arithmetic; the bytes come back when the nodal drive becomes
+    /// a stream-ordered enqueue and the bridge disappears with it.
+    std::uint64_t jnet_bridge_bytes        = 0;
+    /// Bytes uploaded to guarantee the device flux matches Geometry::Phif.
+    std::uint64_t flux_sync_bytes          = 0;
+    /// Bytes returned to the HOST dhat/psi so the host drive path stays correct.
+    ///
+    /// This is what replaced the 416 KiB/outer dhat H2D rather than removing it
+    /// outright: the copy changed direction and left the PCIe budget roughly
+    /// where it was, while the arithmetic moved to the device.  It disappears
+    /// when every drive is device-resident and nothing on the host reads _dhat
+    /// or _psi any more -- which is a separate audit, not an assumption.
+    std::uint64_t host_mirror_bytes        = 0;
     std::uint64_t refusals[static_cast<int>(OuterSegmentRefusal::Count)] = {};
     std::uint64_t escapes[kDeviceEscapeCount]                           = {};
 };
@@ -685,6 +719,15 @@ using OuterSegmentHook = bool (*)(void* ctx, OuterSegmentStream stream, int slot
 struct OuterSegmentHooks {
     OuterSegmentHook enqueue_cmfd_sweep = nullptr; ///< setls + drive + probe
     OuterSegmentHook enqueue_nodal_drive = nullptr; ///< nodal reset + drive
+    /// TRUE while the sweep hook is a HOST call that rendezvouses.
+    ///
+    /// BICGCMFD::drive drains its stream and copies the flux back, so a segment
+    /// containing it cannot enqueue outer i+1 before observing outer i.  The
+    /// runner therefore forces the budget to 1: a longer budget would enqueue
+    /// outers whose inputs the halt gate has not yet been told about, which is a
+    /// different trajectory, not a faster one.  It goes false -- and the budget
+    /// opens up -- the day the sweep has a stream-ordered enqueue (Task 10/18).
+    bool sweep_synchronizes = false;
     void*            ctx                 = nullptr;
 };
 
@@ -708,6 +751,18 @@ struct OuterSegmentBinding {
     unsigned long long     forms         = 0; ///< cmfdOuterFormsRuntime()
     bool                   dhat_clamp    = false; ///< RASBERY_DHAT_CLAMP
     CmfdOuterCounters*     dhat_counters = nullptr;
+    /// Geometry::Jnet.  The runner bridges the device jnet to it around the
+    /// nodal hook; see OuterSegmentResidency::host_jnet.
+    double*                host_jnet     = nullptr;
+    /// The physics arena's jnet for the bound slot, the other end of the bridge.
+    double*                device_jnet   = nullptr;
+    /// Geometry::Phif; see OuterSegmentResidency::host_flux for why the segment
+    /// uploads it rather than trusting the device copy.
+    const double*          host_flux     = nullptr;
+    double*                host_dhat     = nullptr;
+    double*                host_psi      = nullptr;
+    double*                device_dhat   = nullptr;
+    double*                device_psi    = nullptr;
     int                    nxyz          = 0;
     int                    ng            = 0;
 };
@@ -769,6 +824,79 @@ struct OuterSegmentResume {
     unsigned int total_outer        = 0;
 };
 
+// ---------------------------------------------------------------------------
+// Link 2: the sweep's buffers ARE the segment's buffers
+// ---------------------------------------------------------------------------
+//
+// WHAT MAKES THIS A HANDOFF.  CudaBatchArena::residentView() hands out the
+// device addresses of one slot's phi/psi/dtil/dhat/xsnf, and every one of them
+// already has the layout CmfdOuterView wants -- node-major flux [l*ng+ig],
+// [ls*ng+ig] operators, group-major xsnf.  So binding is a pointer write: the
+// segment's updpsi writes the psi the sweep reads, its upddhat writes the dhat
+// cmfd_assemble_operator_2g reads, and the 416 KiB/outer dhat H2D disappears
+// because there is nothing left to copy.
+//
+// WHY THE SEGMENT REFUSES WITHOUT THE RESIDENT SWEEP.  The segment's kernels
+// read the DEVICE flux.  Only the resident sweep maintains it: with
+// RASBERY_GPU_CMFD_SWEEP off, BICGCMFD::drive runs the host CMFD loop, the
+// device phi is never written, and updpsi/updjnet/upddhat would compute this
+// outer from whatever flux was last uploaded.  That is not a slow path, it is a
+// wrong one, so `SweepNotResident` refuses it by name.  The same applies to the
+// device assembly: without it the sweep builds diag/cc from the HOST dhat, and
+// the host dhat is exactly what the segment stopped writing.
+struct OuterSegmentResidency {
+    double*       flux = nullptr; ///< the sweep's phi   [l*ng + ig]
+    double*       psi  = nullptr; ///< the sweep's psi   [l]
+    double*       dtil = nullptr; ///< the sweep's dtil  [ls*ng + ig]
+    double*       dhat = nullptr; ///< the sweep's dhat  [ls*ng + ig]
+    const double* xsnf = nullptr; ///< the sweep's xsnf  [ig*nxyz + l]
+
+    /// The HOST jnet the nodal drive reads and writes (Geometry::Jnet).
+    ///
+    /// The sweep arena has no jnet -- jnet is not a CMFD input -- so the segment
+    /// keeps it in the physics arena and bridges it around the nodal hook, which
+    /// is still a host call.  That bridge is the honest remaining cost of link 2
+    /// and it is counted (`jnet_bridge_bytes`); it goes away when the nodal drive
+    /// becomes a stream-ordered enqueue.
+    double* host_jnet = nullptr;
+
+    /// Geometry::Phif -- the flux the segment's updpsi is about to read.
+    ///
+    /// WHY IT IS UPLOADED AND NOT ASSUMED CURRENT.  The device phi is only
+    /// refreshed when the resident sweep launches, and drive() falls back to the
+    /// HOST loop for the Wielandt warm-up and whenever the device sweep declines
+    /// (BICGCMFD.cpp:558-565).  After such a drive the host flux has moved and
+    /// the device copy has not, so a segment that trusted the device buffer
+    /// would compute this outer from the flux of some earlier one.  One
+    /// ngxyz-double H2D per outer buys the guarantee; it is counted, and it is
+    /// still less than the dhat H2D the handoff removed.
+    const double* host_flux = nullptr;
+
+    /// CMFD::dhatData() / CMFD::psiData() -- the host twins of the two arrays
+    /// the segment writes.  See CMFD.h: the host drive path still reads them
+    /// during the Wielandt warm-up and whenever the device sweep declines.
+    double* host_dhat = nullptr;
+    double* host_psi  = nullptr;
+
+    int  arena_slot = -1;
+    bool valid      = false;
+};
+
+/// Rebind the bound slot table onto the sweep arena's buffers.
+///
+/// Called once, after the sweep arena exists and before the first segment.
+/// Returns false and leaves the segment refusing when the view is not usable.
+bool rasberyBindOuterResidency(const OuterSegmentResidency& residency);
+
+/// Publish one outer's observation from inside the sweep hook.
+///
+/// The hook has just returned from a HOST call that synchronised, so this is a
+/// plain synchronous H2D of six words -- there is no stream to be ordered
+/// against any more.  It is the runner's, not the hook's, so the probe layout
+/// stays private to this file.
+bool rasberyPublishOuterProbe(int slot, double eigv, double residual, bool negative_flux,
+                              bool rayleigh);
+
 /// The one object that runs a segment.
 ///
 /// Defined by the CUDA arm (CudaOuterGraph.cu) and by the no-CUDA stub, so call
@@ -797,6 +925,14 @@ public:
     [[nodiscard]] bool bound() const;
 
     void setHooks(const OuterSegmentHooks& hooks);
+
+    /// Link 2: point the CMFD slot table at the sweep arena's buffers.
+    bool bindResidency(const OuterSegmentResidency& residency);
+    [[nodiscard]] bool residencyBound() const;
+
+    /// Write one outer's observation into the probe the decision kernel reads.
+    bool publishProbe(int slot, double eigv, double residual, bool negative_flux,
+                      bool rayleigh);
     [[nodiscard]] OuterSegmentHooks hooks() const;
 
     /// Would a segment run right now?  Pure query, no CUDA call, so the caller
@@ -820,6 +956,7 @@ private:
     struct Impl;
     Impl* _impl;
 };
+
 
 /// The process-wide runner.
 ///
@@ -982,6 +1119,33 @@ __global__ void k_outer_seed_slot(DeviceArenaView arena, int slot,
     // Deliberately NOT equal to it: the constants have never been built on the
     // device, so the gate must read "stale" the first time it is asked.
     st.nodal_constant_generation = material_generation - 1ull;
+}
+
+/// Link 2: patch ONE slot of the table onto the sweep arena's buffers.
+///
+/// A PATCH AND NOT A REBUILD, deliberately.  jnet has no twin in the sweep
+/// arena -- jnet is not a CMFD input -- so it must keep the physics-arena
+/// pointer k_cmfd_build_slot_table gave it.  Rebuilding the whole view here
+/// would mean this kernel owning both bindings, and the two would be free to
+/// disagree about jnet.  It writes the five fields the sweep owns and nothing
+/// else.
+///
+/// xsdf is NOT among them and that is not an omission: the only body that reads
+/// it is upddtil, which the segment does not run (an eligible deck cannot cusp,
+/// so nothing re-runs upddtil inside an outer).  Pointing it at a buffer the
+/// sweep does not have would be inventing an address for a reader that does not
+/// exist.
+__global__ void k_cmfd_bind_resident(cmfd::CmfdOuterView* views, int slot, double* flux,
+                                     double* psi, double* dtil, double* dhat,
+                                     const double* xsnf) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    cmfd::CmfdOuterView v = views[slot];
+    v.flux = flux;
+    v.psi  = psi;
+    v.dtil = dtil;
+    v.dhat = dhat;
+    v.xsnf = xsnf;
+    views[slot] = v;
 }
 
 inline cudaError_t enqueueBuildCmfdSlotTable(const DeviceArenaView& arena,
