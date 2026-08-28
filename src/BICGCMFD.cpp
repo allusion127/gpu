@@ -294,16 +294,40 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
         _device_assembly_pending = false;
         return result;
     };
-    _sweep_chif.resize(static_cast<size_t>(ng) * nxyz);
-    _sweep_xsnf.resize(static_cast<size_t>(ng) * nxyz);
-    _sweep_vol.resize(static_cast<size_t>(nxyz));
-    for (int l = 0; l < nxyz; ++l) {
-        _sweep_vol[static_cast<size_t>(l)] = _g.vol(l);
-        for (int ig = 0; ig < ng; ++ig) {
-            _sweep_chif[static_cast<size_t>(ig) * nxyz + l] = _x.chif(ig, l);
-            _sweep_xsnf[static_cast<size_t>(ig) * nxyz + l] = _x.xsnf(ig, l);
+    // chif / xsnf / vol are ALIASED, not copied.
+    //
+    // The staging loop that used to live here rebuilt three vectors on every
+    // drive -- 2 x ng x nxyz strided reads plus nxyz -- and every element it
+    // wrote was already sitting contiguously in the layout the device wants:
+    //
+    //   XSSet::xsnf(ig, l) == _xs.xsnf[ig * nxyz + l]  == xsnfData()[ig*nxyz+l]
+    //   XSSet::chif(ig, l) == _ref_chix[ig * nxyz + l] == chifData()[ig*nxyz+l]
+    //   Geometry::vol(l)   == _vol[l]
+    //
+    // so the copy was a pure identity and the mirror memcmp that followed it
+    // was comparing a fresh copy of an array against a shadow of the same
+    // array.  Pointing at the originals is byte-identical by construction and
+    // costs nothing, and it needs no generation counter to stay honest.
+    //
+    // (A generation guard was the other candidate and is NOT usable here:
+    // XSSet::hoststateGeneration() means "the device mirror of _xs is stale",
+    // not "the host bytes changed".  XSSet.cpp deliberately does NOT bump it
+    // when the GPU XS arm downloads a freshly reconstructed _xs into host
+    // memory -- exactly the case a rebuild guard has to catch.)
+    const double* sweep_xsnf = _x.xsnfData();
+    const double* sweep_chif = _x.chifData();
+    const double* sweep_vol  = (nxyz > 0) ? &_g.vol(0) : nullptr;
+    if (sweep_chif == nullptr) {
+        // No burnup-interpolated fission spectrum: chif(ig,l) is the constant
+        // (1, 0, ...) of the accessor, so stage it once and keep it.
+        const size_t want = static_cast<size_t>(ng) * nxyz;
+        if (_sweep_chif.size() != want) {
+            _sweep_chif.assign(want, 0.0);
+            for (int l = 0; l < nxyz; ++l) _sweep_chif[static_cast<size_t>(l)] = 1.0;
         }
+        sweep_chif = _sweep_chif.data();
     }
+    if (sweep_xsnf == nullptr || sweep_vol == nullptr) return finish(false);
 
     // Page-lock every buffer the sweep launcher memcpys, once per instance:
     // pageable async copies stage through the driver ON the launcher's
@@ -336,16 +360,28 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
                         "cmfd.dtil@sweep");
             ar->pinHost(_dhat, static_cast<size_t>(_g.nsurf()) * ng * sizeof(double),
                         "cmfd.dhat@sweep");
+            // xsnf / vol joined this list when the staging copies went away:
+            // they are now the OWNERS' arrays (XSSet's _xs.xsnf, Geometry's
+            // _vol), released by ~XSSet / ~Geometry like xsrf and xssm above.
+            // A lease taken here and released in ~BICGCMFD would drop the only
+            // owner record for a base the owner still uses -- the registry
+            // deduplicates a repeat request for the SAME base instead of
+            // counting a second owner -- so these must NOT be lease_vector'd.
+            ar->pinHost(sweep_xsnf, static_cast<size_t>(ng) * nd * sizeof(double),
+                        "xs.xsnf@sweep");
+            ar->pinHost(sweep_vol, nd * sizeof(double), "geom.vol@sweep");
+            if (sweep_chif != _sweep_chif.data())
+                ar->pinHost(sweep_chif, static_cast<size_t>(ng) * nd * sizeof(double),
+                            "xs.chif@sweep");
             _sweep_pinned = true;
         }
-        // Vector-reallocation contract (plan Sec 6.5).  The three _sweep_*
-        // vectors are resized at the top of this function and _udiag is sized
-        // in the constructor, so on the steady path .data() never moves and
-        // these four comparisons are the whole cost.  If a resize ever DID
-        // reallocate, a lease left on the old address would be a registration
-        // pointing at freed memory: release it, then lease the new address.
-        // "Size before pin, never realloc while leased" is the rule; this is
-        // what enforces it rather than assuming it.
+        // Reallocation contract (plan Sec 6.5).  _udiag is sized in the
+        // constructor, so on the steady path .data() never moves and this
+        // comparison is the whole cost.  If a resize ever DID reallocate, a
+        // lease left on the old address would be a registration pointing at
+        // freed memory: release it, then lease the new address.  "Size before
+        // pin, never realloc while leased" is the rule; this enforces it
+        // rather than assuming it.
         auto lease_vector = [ar](const void*& leased, const void* data, size_t bytes,
                                  const char* tag) {
             if (leased == data) return;
@@ -355,17 +391,24 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
         };
         lease_vector(_pin_udiag, _udiag.data(), _udiag.size() * sizeof(double),
                      "bicg.udiag@sweep");
-        lease_vector(_pin_sweep_chif, _sweep_chif.data(), _sweep_chif.size() * sizeof(double),
-                     "bicg.sweep_chif@sweep");
-        lease_vector(_pin_sweep_xsnf, _sweep_xsnf.data(), _sweep_xsnf.size() * sizeof(double),
-                     "bicg.sweep_xsnf@sweep");
-        lease_vector(_pin_sweep_vol, _sweep_vol.data(), _sweep_vol.size() * sizeof(double),
-                     "bicg.sweep_vol@sweep");
+        // chif is XSSet-owned too (pinned once above) UNLESS the deck has no
+        // fission spectrum, in which case the constant fallback is OURS and is
+        // the one chif range ~BICGCMFD still has to release.
+        if (sweep_chif == _sweep_chif.data())
+            lease_vector(_pin_sweep_chif, sweep_chif,
+                         _sweep_chif.size() * sizeof(double), "bicg.sweep_chif@sweep");
     }
 
     double reigv  = 1. / eigv;
     double reigvs = (_eshift != 0.0) ? 1. / (eigv + _eshift) : 0.0;
     int    iout = 0, icmfd = 0;
+
+    // Only the FIRST launch of this drive carries host-written psi.  The host
+    // regenerates _psi wholesale (CMFD::updpsi from the flux) before every
+    // BICGCMFD::drive and never writes it between two launches of one drive,
+    // so a later launch would be handing the device back exactly the bytes it
+    // produced.  See CmfdSweepIO::psi_dirty.
+    bool psi_dirty = true;
 
     while (iout < _ncmfd) {
         // Stage this outer's operator exactly as a host sweep would; the
@@ -375,15 +418,16 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
         _ls->solveInner(_nmaxbicg, _epsbicg);
 
         CudaBatchArena::CmfdSweepIO io;
-        io.chif         = _sweep_chif.data();
-        io.xsnf         = _sweep_xsnf.data();
+        io.chif         = sweep_chif;
+        io.xsnf         = sweep_xsnf;
         io.xsrf         = _x.xsrfData();
         io.xssm         = _x.xssmData();
         io.dtil         = _dtil;
         io.dhat         = _dhat;
-        io.vol          = _sweep_vol.data();
+        io.vol          = sweep_vol;
         io.udiag        = _udiag.data();
         io.psi          = _psi;
+        io.psi_dirty    = psi_dirty;
         io.device_assembly = use_device_assembly;
         io.eigv         = eigv;
         io.reigv        = reigv;
@@ -403,6 +447,9 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
             return finish(false);
         }
 
+        // The device now owns psi: it advanced it, and nothing on the host
+        // touches it until the next drive's updpsi.
+        psi_dirty          = false;
         const int attempts = io.icmfd_done - icmfd;
         icmfd              = io.icmfd_done;
         iout += io.sweeps_done;

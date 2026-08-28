@@ -424,7 +424,15 @@ STATIC_TOKENS = {
         # every sweep-path request carries its call-site tag
         '"cmfd.diag@sweep"',
         '"xs.xssm@sweep"',
-        '"bicg.sweep_vol@sweep"',
+        # xsnf / vol / chif are ALIASED into the sweep from their owners now
+        # (XSSet's _xs.xsnf and _ref_chix, Geometry's _vol), so they are
+        # page-locked under the OWNER's tag and released by the owner's
+        # destructor -- a lease_vector here would release the only owner record
+        # for a base XSSet/Geometry still uses.  The BICGCMFD-owned chif
+        # fallback (a deck with no fission spectrum) keeps its own tag.
+        '"xs.xsnf@sweep"',
+        '"geom.vol@sweep"',
+        '"bicg.sweep_chif@sweep"',
     ),
     "src/BICGCMFD.h": (
         "PageExclusiveVector<double> _udiag;",

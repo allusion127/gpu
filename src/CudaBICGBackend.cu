@@ -1932,6 +1932,8 @@ public:
         const double* host_vol   = nullptr;
         double*       host_udiag = nullptr;
         double*       host_psi   = nullptr; ///< in/out
+        bool          push_psi   = true;    ///< CmfdSweepIO::psi_dirty
+        bool          psi_downloaded = false; ///< D2H issued for THIS launch
         bool          device_assembly = false;
         bool          pushed_xsrf = false;
         bool          pushed_xssm = false;
@@ -2366,12 +2368,63 @@ public:
         // and just upload it every time -- which is what happened anyway.
         sl.push_diag = true;
         sl.push_cc   = !mirrorMatches(sl.cc_mirror, host_cc, coupling_count);
-        sl.push_phi  = !mirrorMatches(sl.phi_mirror, host_phi, static_cast<size_t>(n));
+        sl.push_phi  = !phiMirrorMatches(sl, host_phi, static_cast<size_t>(n));
     }
 
     static bool mirrorMatches(const MirroredUpload& mirror, const double* host, size_t count) {
         return mirror.valid &&
                std::memcmp(mirror.shadow.data(), host, count * sizeof(double)) == 0;
+    }
+
+    /// Is the FLUX mirror worth its keep?  MEASURED: yes, at every width.
+    ///
+    /// The audit item this answers (C5) proposed bypassing the mirror in
+    /// single-slot mode, on the theory that its two host passes -- the shadow
+    /// copy in adoptFluxMirror and the memcmp before the next upload, 2 x n
+    /// doubles -- cost more than the one async H2D of n doubles they elide,
+    /// with an idle copy engine and no batch-mates to amortise over.  The
+    /// measurement says the opposite, at the KNGR mesh (n = 16 902, 132 KB):
+    ///
+    ///     adoptFluxMirror shadow copy               1.74 us
+    ///     mirrorMatches memcmp                      1.95 us
+    ///     -> mirror, per launch                     3.69 us
+    ///     pinned cudaMemcpyAsync H2D, ISSUE only   19.52 us
+    ///     pinned H2D + stream sync                 50.11 us
+    ///
+    /// and the elision is not occasional: inside the sweep loop the device
+    /// produced the flux and the host only read it, so the shadow matches on
+    /// every continuation launch.  The mirror is therefore ~3.7 us spent to
+    /// avoid >=19.5 us of launcher time, single slot included.  It stays on.
+    ///
+    /// The gate remains so the claim stays falsifiable on the real device:
+    /// RASBERY_GPU_PHI_MIRROR=0 turns it off, and cmfd_phi_mirror_ns /
+    /// _calls / cmfd_phi_h2d_elided_bytes are the two sides of the trade.
+    /// Turning it off is byte-exact by construction -- the mirror only ever
+    /// ELIDES an upload of bytes the device already holds, so declining to
+    /// elide uploads the same bytes again.
+    [[nodiscard]] bool phiMirrorEnabled() const {
+        static const bool on = [] {
+            const char* v = std::getenv("RASBERY_GPU_PHI_MIRROR");
+            return v == nullptr || std::string(v) != "0";
+        }();
+        return on;
+    }
+
+    /// mirrorMatches for the flux, with the width gate and the cost clock.
+    bool phiMirrorMatches(Slot& sl, const double* host_phi, size_t count) {
+        if (!phiMirrorEnabled()) {
+            ++telemetry.cmfd_phi_mirror_bypassed;
+            return false; // "does not match" == upload, which is always correct
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool hit = mirrorMatches(sl.phi_mirror, host_phi, count);
+        telemetry.cmfd_phi_mirror_ns += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count());
+        ++telemetry.cmfd_phi_mirror_calls;
+        if (hit) telemetry.cmfd_phi_h2d_elided_bytes += count * sizeof(double);
+        return hit;
     }
 
     /// H2D for the participating slots, plus the participation mask itself.
@@ -2994,7 +3047,18 @@ public:
                 ++telemetry.cmfd_assembly_cpu_fallbacks;
             }
 
-            push(psi_dev + m * node_stride(), sl.host_psi, static_cast<size_t>(nxyz));
+            // psi round trip, removed.  See CmfdSweepIO::psi_dirty: only the
+            // first launch of a drive carries host-written psi; a later launch
+            // in the same drive would be re-uploading the bytes the device
+            // itself produced, so leaving the device copy alone is the same
+            // state by a shorter path.
+            if (sl.push_psi) {
+                push(psi_dev + m * node_stride(), sl.host_psi, static_cast<size_t>(nxyz));
+            } else {
+                ++telemetry.bulk_h2d_skipped_during_iteration;
+                telemetry.cmfd_psi_h2d_elided_bytes +=
+                    static_cast<std::uint64_t>(nxyz) * sizeof(double);
+            }
             pushOrSkip(phi + m * vec_stride(), sl.host_phi, static_cast<size_t>(n),
                        sl.push_phi, sl.phi_mirror);
             CUDA_CHECK(cudaMemcpyAsync(
@@ -3011,22 +3075,30 @@ public:
         }
     }
 
-    /// D2H after the sweep graph: flux (issueFluxDownloads), psi and the sweep
+    /// D2H after the sweep graph: flux (issueFluxDownloads) and the sweep
     /// scalar block per participant, then the sweep_halt restore.
+    ///
+    /// psi is NOT here any more.  It used to come back after every launch, and
+    /// the only reader of those bytes was the degenerate-gamma (state == 2)
+    /// hand-back inside BICGCMFD::driveDeviceSweeps -- one launch in many.  On
+    /// every other path the host overwrites psi wholesale (CMFD::updpsi from
+    /// the flux) before it is next read, so the download was writing bytes
+    /// nobody looks at.  The exceptional launch pulls it in
+    /// issueExceptionalOperatorDownloads, where the state is already known.
     void issueSweepDownloads(const int* active_slots, int count) {
         for (int i = 0; i < count; ++i) {
             const int m  = active_slots[i];
             Slot&     sl = slot[static_cast<size_t>(m)];
-            CUDA_CHECK(cudaMemcpyAsync(sl.host_psi, psi_dev + m * node_stride(),
-                                       static_cast<size_t>(nxyz) * sizeof(double),
-                                       cudaMemcpyDeviceToHost, stream));
+            sl.psi_downloaded = false;
             CUDA_CHECK(cudaMemcpyAsync(
                 sl.sweep_out,
                 scalars + static_cast<long long>(m) * kScalarCount + kSweepFirst,
                 kSweepCount * sizeof(double), cudaMemcpyDeviceToHost, stream));
             ++telemetry.bulk_d2h_calls_during_iteration;
             telemetry.bulk_d2h_bytes_during_iteration +=
-                (static_cast<std::uint64_t>(nxyz) + kSweepCount) * sizeof(double);
+                static_cast<std::uint64_t>(kSweepCount) * sizeof(double);
+            telemetry.cmfd_psi_d2h_elided_bytes +=
+                static_cast<std::uint64_t>(nxyz) * sizeof(double);
         }
         CUDA_CHECK(cudaMemsetAsync(sweep_halt, 0,
                                    static_cast<size_t>(slots) * sizeof(std::uint32_t),
@@ -3070,7 +3142,23 @@ public:
             const int m = active_slots[i];
             Slot& sl = slot[static_cast<size_t>(m)];
             const int state = static_cast<int>(sl.sweep_out[kSweepState - kSweepFirst]);
-            if (!sl.device_assembly || state != 2) continue;
+            if (state != 2) continue;
+            // The Rayleigh hand-back in BICGCMFD reads psi(l) for sumf/summ,
+            // and this is the one launch on which it does.  Unconditional on
+            // device_assembly: the host arm needs the new fission source too.
+            if (sl.host_psi != nullptr && !sl.psi_downloaded) {
+                CUDA_CHECK(cudaMemcpyAsync(sl.host_psi, psi_dev + m * node_stride(),
+                                           static_cast<size_t>(nxyz) * sizeof(double),
+                                           cudaMemcpyDeviceToHost, stream));
+                sl.psi_downloaded = true;
+                ++telemetry.bulk_d2h_calls_during_iteration;
+                telemetry.bulk_d2h_bytes_during_iteration +=
+                    static_cast<std::uint64_t>(nxyz) * sizeof(double);
+                telemetry.cmfd_psi_d2h_elided_bytes -=
+                    static_cast<std::uint64_t>(nxyz) * sizeof(double);
+                queued = true;
+            }
+            if (!sl.device_assembly) continue;
             if (sl.host_diag_out == nullptr || sl.host_cc_out == nullptr ||
                 sl.host_udiag == nullptr)
                 throw std::runtime_error(
@@ -3182,8 +3270,21 @@ public:
     /// critical path, and never on a failed batch (the flux is undefined).
     void adoptFluxMirror(int m) {
         Slot& sl = slot[static_cast<size_t>(m)];
+        if (!phiMirrorEnabled()) {
+            // Nothing will consult it, and a stale shadow must never be able
+            // to elide an upload if the gate is flipped mid-run.
+            sl.phi_mirror.valid = false;
+            ++telemetry.cmfd_phi_mirror_bypassed;
+            return;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
         sl.phi_mirror.shadow.assign(sl.out_phi, sl.out_phi + n);
         sl.phi_mirror.valid = true;
+        telemetry.cmfd_phi_mirror_ns += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count());
+        ++telemetry.cmfd_phi_mirror_calls;
     }
 
     int           slots;
@@ -3537,6 +3638,7 @@ void CudaBatchArena::stageSweeps(int m, const CmfdSweepIO& io) {
     sl.host_vol   = io.vol;
     sl.host_udiag = io.udiag;
     sl.host_psi   = io.psi;
+    sl.push_psi   = io.psi_dirty;
     sl.device_assembly = io.device_assembly && cmfdAssemblyEnabled();
     if (sl.device_assembly &&
         (sl.host_xsrf == nullptr || sl.host_xssm == nullptr ||
@@ -3853,6 +3955,16 @@ void rasberyReleaseBatchArena() {
               << c.cmfd_diag_h2d_elided_bytes << ','
               << "\"cmfd_cc_h2d_elided_bytes\":"
               << c.cmfd_cc_h2d_elided_bytes << ','
+              << "\"cmfd_psi_h2d_elided_bytes\":"
+              << c.cmfd_psi_h2d_elided_bytes << ','
+              << "\"cmfd_psi_d2h_elided_bytes\":"
+              << c.cmfd_psi_d2h_elided_bytes << ','
+              << "\"cmfd_phi_mirror_ns\":" << c.cmfd_phi_mirror_ns << ','
+              << "\"cmfd_phi_mirror_calls\":" << c.cmfd_phi_mirror_calls << ','
+              << "\"cmfd_phi_mirror_bypassed\":" << c.cmfd_phi_mirror_bypassed
+              << ','
+              << "\"cmfd_phi_h2d_elided_bytes\":"
+              << c.cmfd_phi_h2d_elided_bytes << ','
               << "\"bicg_early_convergence_exits\":" << c.bicg_early_convergence_exits << ','
               << "\"bicg_restarts\":" << c.bicg_restarts << ','
               << "\"bulk_h2d_calls_during_iteration\":" << c.bulk_h2d_calls_during_iteration << ','
