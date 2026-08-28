@@ -122,6 +122,7 @@
 
 #include "CudaCmfdOuterKernels.h"
 #include "CudaNodalConstantKernel.h"
+#include "GpuCanonicalState.h"
 #include "GpuPhaseScheduler.h"
 #include "GpuPhysicsTypes.h"
 #include "HostOuterBodyCounters.h"
@@ -638,6 +639,16 @@ struct OuterSegmentCounters {
     /// reads and writes Geometry::Jnet.  Link 2 is therefore a wash on bytes and
     /// a win on host arithmetic; the bytes come back when the nodal drive becomes
     /// a stream-ordered enqueue and the bridge disappears with it.
+    ///
+    /// Rev.7.1 Task 18-lite MADE THAT SENTENCE COME TRUE WITHOUT THE ENQUEUE.
+    /// The bridge exists because the nodal drive reads a HOST array; when the
+    /// drive is the DEVICE nodal and it has adopted the segment's own jnet as
+    /// its canonical buffer, it reads the buffer updjnet just wrote and writes
+    /// the buffer upddhat is about to read -- so there is nothing to bridge and
+    /// this counter is zero.  It stays non-zero exactly where the binding cannot
+    /// be taken: a host nodal drive, or a deck Nodal::TryDriveGpu refuses
+    /// (i-SMR CY02's fractional rods).  Zero here and non-zero
+    /// canonical_nodal_outers is the receipt that the binding is live.
     std::uint64_t jnet_bridge_bytes        = 0;
     /// Bytes uploaded to guarantee the device flux matches Geometry::Phif.
     std::uint64_t flux_sync_bytes          = 0;
@@ -673,6 +684,25 @@ struct OuterSegmentCounters {
     /// host_mirror_bytes should be about (mirror_exits + host-loop outers) times
     /// one psi+dhat pair, not device_outers times it.
     std::uint64_t mirror_exits             = 0;
+    /// Rev.7.1 Task 18-lite.  Outers whose nodal drive ran with the canonical
+    /// binding live -- the ones that paid no jnet bridge and no flux upload
+    /// inside the nodal call.
+    std::uint64_t canonical_nodal_outers   = 0;
+    /// Bytes returned to Geometry::Phis at a segment exit.
+    ///
+    /// THE PRICE OF THE ELIDED DOWNLOAD, and it is charged per EXIT rather than
+    /// per outer, which is the whole trade: the device nodal writes phis into
+    /// the arena every outer and nothing on the host looks at it until the
+    /// statepoint (PPR, and XSSet::NormalizeFluxSign just before it).  The
+    /// reader list is in GpuCanonicalState.h's CanonicalConsumer table and it is
+    /// pinned by tools/test_segment_canonical_nodal_contract.py -- a host reader
+    /// that is not covered here is a stale read that produces plausible numbers.
+    std::uint64_t phis_mirror_bytes        = 0;
+    /// Bytes returned to Geometry::Jnet at a segment exit, same rule and the
+    /// same reader list.  Counted apart from jnet_bridge_bytes so the bridge's
+    /// disappearance stays legible: the bridge was 2 x nsurf*ng per OUTER, this
+    /// is 1 x nsurf*ng per EXIT.
+    std::uint64_t jnet_mirror_bytes        = 0;
     std::uint64_t refusals[static_cast<int>(OuterSegmentRefusal::Count)] = {};
     std::uint64_t escapes[kDeviceEscapeCount]                           = {};
 };
@@ -878,6 +908,44 @@ struct OuterSegmentHooks {
     /// verdict back through the host, so outer i+1 may be enqueued behind outer
     /// i's kernels under the halt gate.
     bool sweep_synchronizes = false;
+
+    /// Rev.7.1 Task 18-lite: which side owns the canonical nodal regions NOW.
+    ///
+    /// Called with 1 immediately before the nodal hook of every outer, and with
+    /// 0 exactly once at the segment exit (and on the failure paths, after the
+    /// runner has brought the host arrays back).  The runner does not know what
+    /// a canonical buffer is; the hook does, because it is the same call site
+    /// that adopted them.
+    ///
+    /// WHY A HOOK AND NOT A CALL FROM Driver.h AROUND runSegment.  The exit is
+    /// not where the caller regains control: ReconvergeFlux `return`s straight
+    /// out of the loop on FluxConverged, and SolveLoop takes four different
+    /// paths out of the same call.  A release that has to be written at every
+    /// one of those is a release that will be missing from the fifth -- and a
+    /// missing release is an elided upload against a host array somebody has
+    /// since rewritten, which is the exact failure mode this whole mechanism
+    /// exists to make impossible.
+    ///
+    /// Null means the segment has no canonical nodal binding, which is the
+    /// default and the feature-off shape.
+    void (*canonical_nodal_mode)(void* ctx, int in_segment) = nullptr;
+
+    /// Will the drive THIS outer is about to take run on the device against the
+    /// canonical buffers?  Non-zero yes.
+    ///
+    /// ASKED BEFORE THE BRIDGE IS DECIDED, and asked every outer, because the
+    /// answer changes inside a segment.  Nodal::TryDriveGpu falls back to the
+    /// CPU body on any deck with a fractional rod -- and the CPU body reads
+    /// Geometry::Jnet, which is stale the moment the bridge stops running.  A
+    /// rod SEARCH moves the bank inside SolveLoop, so a segment armed with every
+    /// rod integral meets fractional ones a few outers later; i-SMR CY02 is that
+    /// deck, and an arm-scope answer converged it somewhere else entirely.
+    ///
+    /// It must be TryDriveGpu's own predicate rather than a copy of it -- the
+    /// same relationship BICGCMFD::canEnqueueDrive() has to drive() -- so the
+    /// bridge and the drive cannot disagree about one outer.
+    int (*canonical_nodal_eligible)(void* ctx) = nullptr;
+
     void*            ctx                 = nullptr;
 };
 
@@ -917,6 +985,32 @@ struct OuterSegmentBinding {
     double*                host_psi      = nullptr;
     double*                device_dhat   = nullptr;
     double*                device_psi    = nullptr;
+
+    // --- Rev.7.1 Task 18-lite: the canonical nodal set ----------------------
+    //
+    // THE THREE BUFFERS Nodal::drive READS AND WRITES, as device addresses.
+    // Two of them the segment already had under other names -- `device_jnet` is
+    // the physics arena's jnet, and the sweep's phi arrives through
+    // OuterSegmentResidency::flux -- and the third is the arena's own phis
+    // region, which no other device body touches.  They are named here so the
+    // ADOPTION has one source of truth: the same three pointers go to
+    // XsReconBackend::adoptCanonicalBuffers and to the exit mirror, and a
+    // reader can see that they do.
+    //
+    // LAYOUT, because a canonical buffer that is indexed two ways is worse than
+    // no sharing at all.  NodalKernel.h indexes flux as [lk*NG + ig] and
+    // CmfdOuterKernel.h indexes it as [l*ng + ig]; jnet and phis are both
+    // [ls*ng + ig] on both sides and both are the same LR*ng*NDIRMAX*nxyz
+    // allocation Geometry gives them.  No transpose, no rebase.
+    double*                device_flux   = nullptr; ///< the sweep's phi
+    double*                device_phis   = nullptr; ///< the arena's phis
+    double*                host_phis     = nullptr; ///< Geometry::Phis
+    /// True once a backend has actually adopted the three above.  Set by
+    /// setCanonicalNodalBound(), never inferred from the pointers: they are
+    /// non-null whenever the arena exists, and the binding is only LIVE when
+    /// the nodal drive that will run inside the segment is the device one.
+    bool                   canonical_nodal = false;
+
     int                    nxyz          = 0;
     int                    ng            = 0;
 };
@@ -1065,6 +1159,13 @@ struct OuterSegmentResidency {
     double* host_dhat = nullptr;
     double* host_psi  = nullptr;
 
+    /// Geometry::Phis -- the other half of the canonical nodal set's host end.
+    ///
+    /// It arrives with the residency and not with the stand-up binding because
+    /// it is a GEOMETRY pointer, and the stand-up half of the binding is built
+    /// from the arena alone (see the split note on OuterSegmentBinding).
+    double* host_phis = nullptr;
+
     int  arena_slot = -1;
     bool valid      = false;
 };
@@ -1116,6 +1217,22 @@ public:
     /// Link 2: point the CMFD slot table at the sweep arena's buffers.
     bool bindResidency(const OuterSegmentResidency& residency);
     [[nodiscard]] bool residencyBound() const;
+
+    /// Rev.7.1 Task 18-lite: the three device buffers a nodal backend must
+    /// adopt to run inside this segment without a single per-outer transfer.
+    ///
+    /// All-null until the residency is bound, because the flux half of the set
+    /// is the SWEEP's phi and only the residency knows it.  Coherent by
+    /// construction -- all three or none -- which is what
+    /// gpu::canonicalNodalSetIsCoherent demands and what stops a caller pairing
+    /// the canonical jnet with the nodal arena's own flux.
+    [[nodiscard]] CanonicalSlotBuffers canonicalNodalSet() const;
+
+    /// Say whether a backend actually took the set above.  Until it is true the
+    /// runner bridges jnet around the nodal hook exactly as it did before, which
+    /// is what makes a refused adoption a slow path rather than a wrong one.
+    void setCanonicalNodalBound(bool bound);
+    [[nodiscard]] bool canonicalNodalBound() const;
 
     /// Write one outer's observation into the probe the decision kernel reads.
     bool publishProbe(int slot, double eigv, double residual, bool negative_flux,

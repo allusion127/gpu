@@ -360,13 +360,26 @@ for bridge, counter in (("mirror psi to the host", "host_mirror_bytes"),
 # is what lets the loop stop enqueueing instead of running an outer whose host
 # calls the halt gate cannot silence.  It is NOT a rendezvous -- nothing waits on
 # it; the sync at the top of the next pass is what makes it visible.
-# TEN since the mirror condition: the three named bridges, the exit word,
-# the four-copy observation, and the two segment-exit mirrors that
-# replaced the per-outer pair.
-if GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost") > 10:
+# FOURTEEN since Rev.7.1 Task 18-lite, and the four new ones are all EXITS
+# rather than per-outer copies -- which is the point of the task, not an
+# erosion of this budget.  The full accounting:
+#
+#   3  the named bridges          psi, dhat, jnet-for-the-nodal-drive
+#   1  the exit word              32 bytes behind the transition, nothing waits
+#   4  the single observation     segment state, slot state, halted, decision
+#   2  the psi/dhat exit mirrors  which replaced the per-outer pair
+#   2  the jnet/phis exit mirrors Task 18-lite: once per SEGMENT, and they are
+#                                 what let the jnet bridge above go to zero
+#   2  the same two again, BLOCKING, on the failure paths, where the segment is
+#      abandoning a stream whose state it can no longer reason about
+#
+# The invariant this number defends is unchanged: no D2H may appear inside the
+# per-outer loop that is not one of the three named bridges.
+if GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost") > 14:
     problems.append("CudaOuterGraph.cu: more D2H sites than the three named bridges plus "
-                    "the observation and the two exit mirrors (%d).  Each one is a rendezvous "
-                    "and needs a name" % GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost"))
+                    "the observation and the four exit mirrors (%d).  Each one is a "
+                    "rendezvous and needs a name"
+                    % GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost"))
 if "cudaGraph" in GRAPH_CU_CODE or "cudaGraph" in GRAPH_H_CODE:
     problems.append("CudaOuterGraph: uses the graph API.  The conditional WHILE wrapper is "
                     "Task 10; Task 9 is the stream-ordered sequence it will capture.")

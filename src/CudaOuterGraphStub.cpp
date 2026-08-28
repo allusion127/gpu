@@ -99,7 +99,8 @@ std::string outerSegmentReceiptJson() {
                     "\"cusping_fired\":0,\"cusping_dtil_bytes\":0,"
                     "\"device_flux_outers\":0,\"flux_uploads_elided\":0,"
                     "\"xsnf_uploads_elided\":0,\"dtil_uploads_elided\":0,"
-                    "\"mirror_exits\":0,"
+                    "\"mirror_exits\":0,\"canonical_nodal_outers\":0,"
+                    "\"phis_mirror_bytes\":0,\"jnet_mirror_bytes\":0,"
                     "\"segment_budget\":" +
                     std::to_string(outerSegmentBudget()) + ",\"escapes\":{},\"refusals\":{";
     bool first = true;
@@ -153,6 +154,14 @@ void CudaOuterSegment::setHooks(const OuterSegmentHooks& hooks) { _impl->hooks =
 OuterSegmentHooks CudaOuterSegment::hooks() const { return _impl->hooks; }
 bool CudaOuterSegment::bindResidency(const OuterSegmentResidency&) { return false; }
 bool CudaOuterSegment::residencyBound() const { return false; }
+/// Rev.7.1 Task 18-lite.  Nothing to adopt without a device, so the set is
+/// empty and the binding can never be live -- which is what makes the runner's
+/// `bridge or not` test answer `bridge` in a stub build without a second path.
+CanonicalSlotBuffers CudaOuterSegment::canonicalNodalSet() const {
+    return CanonicalSlotBuffers{};
+}
+void CudaOuterSegment::setCanonicalNodalBound(bool) { _impl->binding.canonical_nodal = false; }
+bool CudaOuterSegment::canonicalNodalBound() const { return false; }
 bool CudaOuterSegment::publishProbe(int, double, double, bool, bool) { return false; }
 /// Rev.7.1 Task 10 part 2.  No stream to adopt, no device probe to address and
 /// nothing to unlatch: the runner is unavailable, so every one of these answers

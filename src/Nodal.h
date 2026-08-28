@@ -152,6 +152,20 @@ public:
     /// The six solve phases (capture wrapper lives in drive()).
     void driveBody();
 
+    /// Rev.7.1 Task 18-lite: would TryDriveGpu take the device path right now?
+    ///
+    /// TryDriveGpu's OWN refusal test, asked without running anything -- the
+    /// same relationship BICGCMFD::canEnqueueDrive() has to drive().  The device
+    /// outer segment needs the answer BEFORE the drive, because it decides
+    /// whether the jnet bridge around the nodal hook can be dropped: with the
+    /// bridge gone, a drive that falls back to the CPU body reads a
+    /// Geometry::Jnet the device stopped sending home.
+    ///
+    /// A PREDICATE AND NOT A COPY OF ONE.  TryDriveGpu calls this, so the two
+    /// cannot drift; a second spelling of `does this deck have a fractional
+    /// rod` is a second chance to answer it differently.
+    [[nodiscard]] bool DeviceDriveEligible() const;
+
     /// Device arm behind RASBERY_GPU_NODAL; false = run the CPU body.
     bool TryDriveGpu();
 

@@ -779,7 +779,7 @@ void Nodal::drive() {
 // updateConstant phase (the only transcendental), the backend runs the five
 // arithmetic phases with the mined contraction masks and returns jnet/phis.
 // Fail-open to the CPU body.
-bool Nodal::TryDriveGpu() {
+bool Nodal::DeviceDriveEligible() const {
     if (!rasberyGpuNodalEnabled())
         return false;
     if (_ng != nodal::NG)
@@ -796,11 +796,22 @@ bool Nodal::TryDriveGpu() {
     // (XSSet.cpp:3220-3223, `frac > EPS && frac < 1.0 - EPS`).  At 1e-9 a
     // fraction in (1e-10, 1e-9] was cusped from stale trlcff.  Matching the
     // reader can only ADD CPU fallbacks, never admit a stale-trlcff cusp.
+    //
+    // RE-ASKED EVERY DRIVE, and that is not paranoia: a rod SEARCH moves the
+    // bank inside one SolveLoop, so a deck that was integral when the loop
+    // started is fractional a few outers later.  The device outer segment asks
+    // the same question, through this function, for the same reason.
     for (int lk = 0; lk < _nxyz; ++lk) {
         const double fr = _g.rod_fraction(lk);
         if (fr > EPS && fr < 1.0 - EPS)
             return false;
     }
+    return true;
+}
+
+bool Nodal::TryDriveGpu() {
+    if (!DeviceDriveEligible())
+        return false;
 
     XsReconBackend* backend = xs.EnsureBackend();
     if (backend == nullptr || !backend->available()) {

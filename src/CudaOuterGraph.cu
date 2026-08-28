@@ -161,6 +161,9 @@ struct AtomicCounters {
     std::atomic<std::uint64_t> xsnf_uploads_elided{0};
     std::atomic<std::uint64_t> dtil_uploads_elided{0};
     std::atomic<std::uint64_t> mirror_exits{0};
+    std::atomic<std::uint64_t> canonical_nodal_outers{0};
+    std::atomic<std::uint64_t> phis_mirror_bytes{0};
+    std::atomic<std::uint64_t> jnet_mirror_bytes{0};
     std::atomic<std::uint64_t> refusals[static_cast<int>(OuterSegmentRefusal::Count)];
     std::atomic<std::uint64_t> escapes[kDeviceEscapeCount];
 
@@ -235,6 +238,9 @@ OuterSegmentCounters outerSegmentCounters() {
     out.xsnf_uploads_elided     = a.xsnf_uploads_elided.load(std::memory_order_relaxed);
     out.dtil_uploads_elided     = a.dtil_uploads_elided.load(std::memory_order_relaxed);
     out.mirror_exits            = a.mirror_exits.load(std::memory_order_relaxed);
+    out.canonical_nodal_outers  = a.canonical_nodal_outers.load(std::memory_order_relaxed);
+    out.phis_mirror_bytes       = a.phis_mirror_bytes.load(std::memory_order_relaxed);
+    out.jnet_mirror_bytes       = a.jnet_mirror_bytes.load(std::memory_order_relaxed);
     for (int i = 0; i < static_cast<int>(OuterSegmentRefusal::Count); ++i)
         out.refusals[i] = a.refusals[i].load(std::memory_order_relaxed);
     for (int i = 0; i < kDeviceEscapeCount; ++i)
@@ -260,6 +266,10 @@ std::string outerSegmentReceiptJson() {
                     ",\"xsnf_uploads_elided\":" + std::to_string(c.xsnf_uploads_elided) +
                     ",\"dtil_uploads_elided\":" + std::to_string(c.dtil_uploads_elided) +
                     ",\"mirror_exits\":" + std::to_string(c.mirror_exits) +
+                    ",\"canonical_nodal_outers\":" +
+                    std::to_string(c.canonical_nodal_outers) +
+                    ",\"phis_mirror_bytes\":" + std::to_string(c.phis_mirror_bytes) +
+                    ",\"jnet_mirror_bytes\":" + std::to_string(c.jnet_mirror_bytes) +
                     ",\"segment_budget\":" + std::to_string(outerSegmentBudget());
 
     // Only the non-zero buckets, so a healthy run's line stays readable and a
@@ -371,6 +381,16 @@ struct CudaOuterSegment::Impl {
     OuterSegmentHooks   hooks{};
     OuterSegmentBinding binding{};
     bool                is_bound = false;
+    /// Rev.7.1 Task 18-lite: has this segment told the host side that the DEVICE
+    /// owns the canonical nodal regions, and not yet taken it back?
+    ///
+    /// A LATCH AND NOT A RECOMPUTE, because it answers two questions at once and
+    /// they must give the same answer: whether the release is owed, and whether
+    /// Geometry::Jnet/Phis are behind the device at the exit.  It goes DOWN
+    /// inside a segment too -- an outer whose drive falls back to the CPU body
+    /// takes the bridge and writes the host arrays itself, and mirroring the
+    /// device over that would overwrite the newer values with the older ones.
+    bool                canonical_nodal_live = false;
 };
 
 CudaOuterSegment::CudaOuterSegment() : _impl(new Impl) {}
@@ -493,7 +513,7 @@ bool CudaOuterSegment::bindResidency(const OuterSegmentResidency& residency) {
         residency.xsnf == nullptr || residency.host_jnet == nullptr ||
         residency.host_flux == nullptr || residency.host_dhat == nullptr ||
         residency.host_psi == nullptr || residency.host_xsnf == nullptr ||
-        residency.host_dtil == nullptr)
+        residency.host_dtil == nullptr || residency.host_phis == nullptr)
         return false;
     if (residency.arena_slot < 0 || residency.arena_slot >= _impl->slot_count) return false;
 
@@ -557,6 +577,16 @@ bool CudaOuterSegment::bindResidency(const OuterSegmentResidency& residency) {
     _impl->binding.host_psi    = residency.host_psi;
     _impl->binding.device_dhat = residency.dhat;
     _impl->binding.device_psi  = residency.psi;
+    // Rev.7.1 Task 18-lite: the two ends of the canonical nodal set the stand-up
+    // half could not know.  device_phis came from the arena at stand-up; the
+    // FLUX half is the sweep's own phi, which only exists once the sweep arena
+    // does, and Geometry::Phis is the host array a statepoint consumer reads.
+    // The binding stays OFF until a backend adopts the set
+    // (setCanonicalNodalBound); a rebind that handed over a different phi would
+    // otherwise leave a backend holding an address this segment no longer uses.
+    _impl->binding.device_flux     = residency.flux;
+    _impl->binding.host_phis       = residency.host_phis;
+    _impl->binding.canonical_nodal = false;
     // A rebind may hand over different device memory, so nothing that was
     // uploaded to the old buffers describes the new ones.
     _impl->resident_flux_generation = 0;
@@ -567,6 +597,37 @@ bool CudaOuterSegment::bindResidency(const OuterSegmentResidency& residency) {
 }
 
 bool CudaOuterSegment::residencyBound() const { return _impl->residency_bound; }
+
+// ---------------------------------------------------------------------------
+// Rev.7.1 Task 18-lite: the canonical nodal set
+// ---------------------------------------------------------------------------
+
+CanonicalSlotBuffers CudaOuterSegment::canonicalNodalSet() const {
+    const OuterSegmentBinding& b = _impl->binding;
+    CanonicalSlotBuffers       out{};
+    // ALL THREE OR NONE, checked here rather than by the caller.  A partial set
+    // would pair the segment's jnet with the nodal arena's own flux -- two
+    // different outer iterations, silently blended -- which is what
+    // canonicalNodalSetIsCoherent refuses one layer down.  Answering with an
+    // empty set is the honest version of `not yet`.
+    if (!_impl->residency_bound || b.device_flux == nullptr || b.device_jnet == nullptr ||
+        b.device_phis == nullptr)
+        return out;
+    out.flux = b.device_flux;
+    out.jnet = b.device_jnet;
+    out.phis = b.device_phis;
+    return out;
+}
+
+void CudaOuterSegment::setCanonicalNodalBound(bool bound) {
+    // A binding cannot be live without the set that would be bound; saying so
+    // here keeps the runner's per-outer test to one field read plus one hook.
+    _impl->binding.canonical_nodal = bound && canonicalNodalSet().shared();
+}
+
+bool CudaOuterSegment::canonicalNodalBound() const {
+    return _impl->binding.canonical_nodal;
+}
 
 bool CudaOuterSegment::publishProbe(int slot, double eigv, double residual,
                                     bool negative_flux, bool rayleigh) {
@@ -722,11 +783,46 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
 
     const std::uint32_t clear_halt = 0u;
 
+    // --- Rev.7.1 Task 18-lite: giving the canonical nodal set back ----------
+    //
+    // WHAT THE HOST IS OWED WHEN THE BINDING STOPS.  While it is live the device
+    // nodal reads and writes the arena's jnet and phis and nothing comes back;
+    // the moment it stops -- at the segment exit, or mid-segment on an outer
+    // whose drive falls back to the CPU body -- two things are owed, and they
+    // are not interchangeable.  The OWNERSHIP, so the next drive uploads again
+    // rather than eliding against a host array somebody has since rewritten.
+    // And, at a segment exit only, the BYTES: Geometry::Jnet and Geometry::Phis
+    // have four host consumers outside a segment and all of them read.
+    //
+    // `stream_ordered` is false on the failure paths, where the segment is
+    // abandoning a stream whose state it can no longer reason about: there the
+    // mirror is a blocking copy and its errors are swallowed, because a mirror
+    // that failed must not turn a host fallback into a hard stop.
+    auto releaseCanonicalNodal = [&](bool stream_ordered) {
+        if (!m.canonical_nodal_live) return;
+        m.canonical_nodal_live = false;
+        if (!stream_ordered) {
+            const std::size_t surf_bytes =
+                static_cast<std::size_t>(bound_.geom.nsurf) *
+                static_cast<std::size_t>(bound_.ng) * sizeof(double);
+            if (bound_.host_jnet != nullptr && bound_.device_jnet != nullptr)
+                cudaMemcpy(bound_.host_jnet, bound_.device_jnet, surf_bytes,
+                           cudaMemcpyDeviceToHost);
+            if (bound_.host_phis != nullptr && bound_.device_phis != nullptr)
+                cudaMemcpy(bound_.host_phis, bound_.device_phis, surf_bytes,
+                           cudaMemcpyDeviceToHost);
+            cudaGetLastError();
+        }
+        if (m.hooks.canonical_nodal_mode != nullptr)
+            m.hooks.canonical_nodal_mode(m.hooks.ctx, 0);
+    };
+
     auto launchFailed = [&](const char* what, cudaError_t rc) {
         std::fprintf(stderr, "[RASBERY][OUTER_GPU][WARN] %s: %s -- falling back to the host "
                              "outer for this iteration\n",
                      what, cudaGetErrorString(rc));
         bump(counters().refusals[static_cast<int>(OuterSegmentRefusal::LaunchFailed)]);
+        releaseCanonicalNodal(false);
         return false;
     };
     // A hook returning false is not a CUDA error, so it does not go through
@@ -737,6 +833,7 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                              "back to the host outer for this iteration\n",
                      what);
         bump(counters().refusals[static_cast<int>(OuterSegmentRefusal::LaunchFailed)]);
+        releaseCanonicalNodal(false);
         return false;
     };
 
@@ -957,8 +1054,33 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         // runs, and the result comes back -- in the RUNNER rather than in the
         // hook, so the hook stays pure host physics with no device vocabulary.
         // Both halves are counted; see OuterSegmentCounters::jnet_bridge_bytes.
+        //
+        // Rev.7.1 Task 18-lite REMOVED THE BRIDGE WHERE THE BINDING IS LIVE.
+        // A nodal backend that has adopted the segment's own jnet reads the
+        // buffer updjnet wrote two lines up and writes the buffer upddhat reads
+        // six lines down, so the two halves of the bridge would be copying an
+        // array to the host and back so that a device kernel could read what a
+        // device kernel had just written.
+        //
+        // THE QUESTION IS ASKED PER OUTER, AND THAT IS THE WHOLE CORRECTNESS
+        // ARGUMENT.  Nodal::TryDriveGpu falls back to the CPU body on any deck
+        // with a fractional rod, and the CPU body reads Geometry::Jnet -- so an
+        // outer that will fall back must keep its bridge.  Asking once per ARM
+        // is not enough and i-SMR CY02 is the deck that proves it: the ROD
+        // SEARCH moves the bank INSIDE SolveLoop, so a loop that armed with
+        // every rod integral hits fractional ones several outers later.  Armed
+        // once, that deck ran 639 outers whose drive had quietly become a CPU
+        // body reading a jnet the device had stopped sending home, and converged
+        // to k_eff 1.000043 where the host gets 0.999975.
+        //
+        // The eligibility hook is Nodal::TryDriveGpu's own predicate, asked
+        // without running anything -- the same relationship canEnqueueDrive()
+        // has to drive().
+        const bool canonical_now =
+            bound_.canonical_nodal && m.hooks.canonical_nodal_eligible != nullptr &&
+            m.hooks.canonical_nodal_eligible(m.hooks.ctx) != 0;
         const bool bridge_jnet =
-            bound_.host_jnet != nullptr && bound_.device_jnet != nullptr;
+            !canonical_now && bound_.host_jnet != nullptr && bound_.device_jnet != nullptr;
         std::size_t jnet_bytes = 0;
         if (bridge_jnet) {
             jnet_bytes = static_cast<std::size_t>(bound_.geom.nsurf) *
@@ -1003,6 +1125,29 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
             }
         }
 
+        // Rev.7.1 Task 18-lite: WHO OWNS THE THREE REGIONS FOR THIS DRIVE.
+        //
+        // Said once per outer rather than once per segment, because the FLUX
+        // answer changes per outer: a drive that fell back to the host CMFD loop
+        // (the Wielandt warm-up, a declined enqueue) left Geometry::Phif ahead of
+        // the device phi, and the nodal call has to upload it exactly then.  The
+        // hook, not the runner, knows how to say so, because the hook is the call
+        // site that adopted the buffers.
+        //
+        // The claim is IDEMPOTENT and writes the same values on every outer of a
+        // canonical run, so repeating it does not churn the nodal backend's
+        // captured graph -- whose key carries both the ownerships and the mask.
+        if (canonical_now && m.hooks.canonical_nodal_mode != nullptr) {
+            m.canonical_nodal_live = true;
+            m.hooks.canonical_nodal_mode(m.hooks.ctx, 1);
+            bump(counters().canonical_nodal_outers);
+        } else {
+            // Not eligible: this outer's drive is the CPU body (or a host-owned
+            // device drive), it has its bridge, and it is about to write the host
+            // arrays itself.  Hand ownership back BEFORE it runs, or its upload
+            // is elided against the device copy it is trying to replace.
+            releaseCanonicalNodal(true);
+        }
         if (!m.hooks.enqueue_nodal_drive(m.hooks.ctx, m.stream, slot, i))
             return hookFailed("the nodal drive hook");
 
@@ -1130,6 +1275,49 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         bump(counters().mirror_exits);
     }
 
+    // --- the segment exit: jnet and phis back, ONCE  (Task 18-lite) ---------
+    //
+    // THE OTHER HALF OF DROPPING THE BRIDGE.  While the binding was live the
+    // device nodal wrote jnet and phis into the arena on every outer and neither
+    // came home; every host consumer of those two arrays lives OUTSIDE a
+    // segment, so this is the point -- and the only point -- at which they are
+    // owed the bytes.  The reader list, audited and pinned by the contract test:
+    //
+    //   PPR               Driver.h: pin_power_reconstruction.reset(1/eigv,
+    //                     Jnet(), Phif(), Phis()) at every statepoint.
+    //   NormalizeFluxSign XSSet.cpp: negates Jnet and Phis in place, statepoint
+    //                     level, so it both reads and writes them.
+    //   OuterTrace        Driver.h: hashDoubles(Jnet(), nsg) under
+    //                     RASBERY_OUTER_TRACE.
+    //   the host outer body  CMFD::updjnet WRITES the whole of Jnet before the
+    //                     host nodal drive reads it, so that reader is covered
+    //                     by the write -- but only because the release above put
+    //                     the ownership back and the drive uploads again.
+    //
+    // GATED ON `canonical_nodal_live` AND NOT ON `canonical_nodal`.  If the last
+    // outer of this segment fell back to the CPU body, the host arrays are the
+    // NEWER copy -- the CPU body wrote them and the bridge pushed jnet back --
+    // and mirroring the device over them would overwrite new values with old.
+    //
+    // ONE D2H EACH PER SEGMENT against the bridge's two per OUTER: at a budget
+    // of 8 that is a quarter of the traffic, and at 16 an eighth.
+    if (m.canonical_nodal_live) {
+        const std::size_t surf_bytes = static_cast<std::size_t>(bound_.geom.nsurf) *
+                                       static_cast<std::size_t>(bound_.ng) * sizeof(double);
+        if (bound_.host_jnet != nullptr && bound_.device_jnet != nullptr) {
+            if ((rc = cudaMemcpyAsync(bound_.host_jnet, bound_.device_jnet, surf_bytes,
+                                      cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+                return launchFailed("mirror jnet to the host at the segment exit", rc);
+            bump(counters().jnet_mirror_bytes, surf_bytes);
+        }
+        if (bound_.host_phis != nullptr && bound_.device_phis != nullptr) {
+            if ((rc = cudaMemcpyAsync(bound_.host_phis, bound_.device_phis, surf_bytes,
+                                      cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+                return launchFailed("mirror phis to the host at the segment exit", rc);
+            bump(counters().phis_mirror_bytes, surf_bytes);
+        }
+    }
+
     // --- the single observation ---------------------------------------------
     DeviceOuterSegmentState seg_out{};
     DeviceSlotState         state_out{};
@@ -1152,6 +1340,13 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         return launchFailed("download outer decision", rc);
     if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
         return launchFailed("segment synchronize", rc);
+
+    // THE RELEASE RIDES THE SYNC THAT JUST HAPPENED, which is the whole reason it
+    // is here and not at the call site: the exit mirror above was an ENQUEUE, and
+    // only now are Geometry::Jnet and Geometry::Phis actually current.  A release
+    // published one line earlier would let a host consumer read the arrays in the
+    // window before the copies landed.
+    releaseCanonicalNodal(true);
 
     if (seg_out.outer_in_segment == 0u) {
         // Nothing was committed, so there is nothing for the host to adopt and
@@ -1385,6 +1580,16 @@ bool rasberyStandUpOuterSegment(const OuterSegmentDeck& deck, std::ostream& rece
     // so it stays in the physics arena and the runner moves it around the host
     // nodal drive.
     binding.device_jnet   = outerArena().slotView(0).jnet;
+    // Rev.7.1 Task 18-lite: the phis half of the canonical nodal set.
+    //
+    // THE ARENA HAS A phis REGION AND NOTHING ON THE DEVICE READS IT.  Every
+    // other slot region is written by a CMFD body or read by one; SlotRegion::Phis
+    // is the one Geometry array the device outer never touches, because phis is a
+    // NODAL output and the CMFD side has no use for it.  That is what makes it
+    // the right buffer to hand the nodal drive: the sharing costs no coupling,
+    // and the region is already sized as Geometry sizes it (LR*ng*NDIRMAX*nxyz,
+    // GpuPhysicsArenaLayout.h:485).
+    binding.device_phis   = outerArena().slotView(0).phis;
     binding.nxyz          = dims.nxyz;
     binding.ng            = dims.ng;
     rasberyOuterSegment().bind(binding);

@@ -61,6 +61,8 @@ gpu::CanonicalSlotBuffers XsReconBackend::canonicalBuffers() const {
 
 void XsReconBackend::setMaterializeMask(std::uint32_t) {}
 
+void XsReconBackend::setCanonicalNodalSegmentMode(bool, bool) {}
+
 std::uint32_t XsReconBackend::materializeMask() const { return 0u; }
 
 unsigned long long XsReconBackend::canonicalUploadsElided() const { return 0; }
@@ -78,5 +80,8 @@ unsigned long long rasberyGpuNodalDrives() { return 0; }
 unsigned long long rasberyGpuXsReconNodes() { return 0; }
 
 unsigned long long rasberyGpuFlatXsNodes() { return 0; }
+
+unsigned long long rasberyGpuNodalCanonicalElidedUploadBytes() { return 0; }
+unsigned long long rasberyGpuNodalCanonicalElidedDownloadBytes() { return 0; }
 
 } // namespace rasbery

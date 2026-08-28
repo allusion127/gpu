@@ -597,9 +597,19 @@ int main(int argc, char* argv[]) {
         if (rasbery::rasberyGpuFlatXsEnabled())
             std::cout << "[RASBERY][FLATXS][GPU] {\"nodes_solved\":"
                       << rasbery::rasberyGpuFlatXsNodes() << "}" << std::endl;
-        if (rasbery::rasberyGpuNodalEnabled())
+        if (rasbery::rasberyGpuNodalEnabled()) {
             std::cout << "[RASBERY][NODAL][GPU] {\"drives_solved\":"
                       << rasbery::rasberyGpuNodalDrives() << "}" << std::endl;
+            // Rev.7.1 Task 18-lite.  The transfers the canonical nodal binding
+            // kept off the bus -- four per drive inside a device outer segment
+            // (jnet and flux up, jnet and phis back), and invisible in the
+            // segment's own receipt because the segment does not issue them.
+            std::cout << "[RASBERY][NODAL][CANON] {\"elided_upload_bytes\":"
+                      << rasbery::rasberyGpuNodalCanonicalElidedUploadBytes()
+                      << ",\"elided_download_bytes\":"
+                      << rasbery::rasberyGpuNodalCanonicalElidedDownloadBytes()
+                      << "}" << std::endl;
+        }
         // Rev.7.1 Task 9.  Printed whenever RASBERY_GPU_OUTER was set, even when
         // every segment was refused: "on and never engaged" must not look like
         // "off" (the same G0 rule the three receipts above exist for).
@@ -681,9 +691,16 @@ int main(int argc, char* argv[]) {
     if (rasbery::rasberyGpuFlatXsEnabled())
         std::cout << "[RASBERY][FLATXS][GPU] {\"nodes_solved\":"
                   << rasbery::rasberyGpuFlatXsNodes() << "}" << std::endl;
-    if (rasbery::rasberyGpuNodalEnabled())
+    if (rasbery::rasberyGpuNodalEnabled()) {
         std::cout << "[RASBERY][NODAL][GPU] {\"drives_solved\":"
                   << rasbery::rasberyGpuNodalDrives() << "}" << std::endl;
+        // See the batch arm above: Task 18-lite's elided per-drive transfers.
+        std::cout << "[RASBERY][NODAL][CANON] {\"elided_upload_bytes\":"
+                  << rasbery::rasberyGpuNodalCanonicalElidedUploadBytes()
+                  << ",\"elided_download_bytes\":"
+                  << rasbery::rasberyGpuNodalCanonicalElidedDownloadBytes()
+                  << "}" << std::endl;
+    }
     rasbery::gpu::reportOuterSegment(std::cout);
     rasbery::xsphase::report(std::cout);
     rasbery::outer_timing::report(std::cout);

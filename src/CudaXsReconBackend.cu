@@ -112,6 +112,13 @@ __global__ void kernelFlatXs(fxs::FlatXsView v) {
 namespace ndl = rasbery::nodal;
 
 std::atomic<unsigned long long> g_nodal_drives{0};
+/// Rev.7.1 Task 18-lite receipt: bytes the canonical binding kept off the bus.
+///
+/// PROCESS-WIDE AND NOT PER-INSTANCE, for the same reason g_nodal_drives is: the
+/// number a reader wants is what the RUN did, and the receipt is printed by
+/// main() long after any particular backend went away.
+std::atomic<unsigned long long> g_canon_up_bytes{0};
+std::atomic<unsigned long long> g_canon_down_bytes{0};
 std::atomic<unsigned long long> g_nodal_graph_launches{0};
 std::atomic<unsigned long long> g_nodal_graph_fallbacks{0};
 std::atomic<unsigned long long> g_nodal_d2h_bytes{0}; // per drive, last shape seen
@@ -2228,6 +2235,8 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
                                              cudaMemcpyHostToDevice, d.stream), d.status);
         } else {
             ++d.canonical_uploads_elided;
+            g_canon_up_bytes.fetch_add(
+                surf_bytes, std::memory_order_relaxed);
         }
         if (!gpu::canonicalElidesUpload(canon, gpu::CanonicalRegion::Flux,
                                         d.canonical.ownerOf(gpu::CanonicalRegion::Flux),
@@ -2237,6 +2246,8 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
                                              cudaMemcpyHostToDevice, d.stream), d.status);
         } else {
             ++d.canonical_uploads_elided;
+            g_canon_up_bytes.fetch_add(
+                nx * ndl::NG * sizeof(double), std::memory_order_relaxed);
         }
         kNodalTrl0<false><<<gng, B, 0, d.stream>>>(v, nullptr, 0, nullptr);
         kNodalTrl12<false><<<gng, B, 0, d.stream>>>(v, nullptr, 0, nullptr);
@@ -2315,6 +2326,8 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
                                              cudaMemcpyHostToDevice, d.stream), d.status);
         } else {
             ++d.canonical_uploads_elided;
+            g_canon_up_bytes.fetch_add(
+                surf_bytes, std::memory_order_relaxed);
         }
         if (!gpu::canonicalElidesUpload(canon, gpu::CanonicalRegion::Flux,
                                         d.canonical.ownerOf(gpu::CanonicalRegion::Flux),
@@ -2324,6 +2337,8 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
                                              cudaMemcpyHostToDevice, d.stream), d.status);
         } else {
             ++d.canonical_uploads_elided;
+            g_canon_up_bytes.fetch_add(
+                nx * ndl::NG * sizeof(double), std::memory_order_relaxed);
         }
         kNodalTrl0<false><<<gng, B, 0, d.stream>>>(v, nullptr, 0, nullptr);
         kNodalTrl12<false><<<gng, B, 0, d.stream>>>(v, nullptr, 0, nullptr);
@@ -2344,6 +2359,8 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
                                              cudaMemcpyDeviceToHost, d.stream), d.status);
         } else {
             ++d.canonical_downloads_elided;
+            g_canon_down_bytes.fetch_add(
+                surf_bytes, std::memory_order_relaxed);
         }
         if (!gpu::canonicalElidesDownload(canon, gpu::CanonicalRegion::Phis,
                                           d.canonical_materialize)) {
@@ -2351,6 +2368,8 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
                                              cudaMemcpyDeviceToHost, d.stream), d.status);
         } else {
             ++d.canonical_downloads_elided;
+            g_canon_down_bytes.fetch_add(
+                surf_bytes, std::memory_order_relaxed);
         }
         return true;
     };
@@ -2561,6 +2580,8 @@ bool XsReconBackend::solveNodalPost(const ndl::NodalView& host) {
                                          cudaMemcpyDeviceToHost, d.stream), d.status);
     } else {
         ++d.canonical_downloads_elided;
+        g_canon_down_bytes.fetch_add(ns * ndl::NG * sizeof(double),
+                                     std::memory_order_relaxed);
     }
     if (!gpu::canonicalElidesDownload(canon, gpu::CanonicalRegion::Phis,
                                       d.canonical_materialize)) {
@@ -2569,6 +2590,8 @@ bool XsReconBackend::solveNodalPost(const ndl::NodalView& host) {
                                          cudaMemcpyDeviceToHost, d.stream), d.status);
     } else {
         ++d.canonical_downloads_elided;
+        g_canon_down_bytes.fetch_add(ns * ndl::NG * sizeof(double),
+                                     std::memory_order_relaxed);
     }
     RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
 
@@ -2628,6 +2651,46 @@ void XsReconBackend::setMaterializeMask(std::uint32_t mask) {
 
 std::uint32_t XsReconBackend::materializeMask() const {
     return _impl->canonical_materialize;
+}
+
+void XsReconBackend::setCanonicalNodalSegmentMode(bool in_segment, bool device_owns_flux) {
+    Impl& d = *_impl;
+    // A legacy instance borrows nothing, so there is no ownership to declare and
+    // no download to suppress; answering here rather than at the call site is
+    // what lets the segment call this unconditionally.
+    if (d.canonical.buffers.jnet == nullptr) return;
+
+    if (in_segment) {
+        // WHY Nodal AND NOT Cmfd FOR jnet, when it is the CMFD updjnet that
+        // wrote it.  canonicalElidesUpload only asks `did a DEVICE side write
+        // this`, so both answers elide -- but the captured nodal graph's key
+        // carries the ownership, and solveNodal leaves Jnet on Nodal when the
+        // drive finishes.  Claiming Cmfd here would flip the key back on every
+        // outer and drop the graph on every outer with it.  The value that
+        // matches what the drive leaves behind is the one that keeps the graph.
+        d.canonical.setOwner(gpu::CanonicalRegion::Jnet, gpu::CanonicalOwner::Nodal);
+        d.canonical.setOwner(gpu::CanonicalRegion::Phis, gpu::CanonicalOwner::Nodal);
+        // FLUX IS THE ONE THAT CAN LEGITIMATELY BE THE HOST'S.  A drive that
+        // fell back to the host CMFD loop -- the Wielandt warm-up, a declined
+        // enqueue -- left Geometry::Phif ahead of the device phi, and the upload
+        // is then required rather than wasteful.  The caller is the only place
+        // that knows, which is why it is an argument and not a guess.
+        d.canonical.setOwner(gpu::CanonicalRegion::Flux,
+                             device_owns_flux ? gpu::CanonicalOwner::Cmfd
+                                              : gpu::CanonicalOwner::Host);
+        setMaterializeMask(0u);
+        return;
+    }
+
+    // Out of the segment: back to the pre-Task-7 transfers exactly.  Every
+    // region host-owned means every upload happens; jnet and phis materialised
+    // means both downloads happen.  That is what a host outer body reads --
+    // CMFD::upddhat takes Geometry::Jnet on the very next line -- and what every
+    // statepoint consumer of Geometry::Phis reads.
+    for (int r = 0; r < gpu::kCanonicalRegionCount; ++r)
+        d.canonical.setOwner(static_cast<gpu::CanonicalRegion>(r), gpu::CanonicalOwner::Host);
+    setMaterializeMask(gpu::canonicalBit(gpu::CanonicalRegion::Jnet) |
+                       gpu::canonicalBit(gpu::CanonicalRegion::Phis));
 }
 
 unsigned long long XsReconBackend::canonicalUploadsElided() const {
@@ -2705,6 +2768,14 @@ bool rasberyGpuNodalEnabled() {
 
 unsigned long long rasberyGpuNodalDrives() {
     return g_nodal_drives.load(std::memory_order_relaxed);
+}
+
+unsigned long long rasberyGpuNodalCanonicalElidedUploadBytes() {
+    return g_canon_up_bytes.load(std::memory_order_relaxed);
+}
+
+unsigned long long rasberyGpuNodalCanonicalElidedDownloadBytes() {
+    return g_canon_down_bytes.load(std::memory_order_relaxed);
 }
 
 unsigned long long rasberyGpuXsReconNodes() {

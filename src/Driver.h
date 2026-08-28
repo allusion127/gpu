@@ -1023,6 +1023,46 @@ private:
         return true;
     }
 
+    /// Rev.7.1 Task 18-lite: which side owns the canonical nodal regions.
+    ///
+    /// Called by the runner with 1 before every in-segment drive and with 0 at
+    /// the segment exit.  It is here and not in the runner because the backend
+    /// that adopted the buffers is reached through XSSet, which is Driver.h's
+    /// object and not the runner's -- the same layering that keeps the nodal
+    /// hook a plain host call.
+    ///
+    /// lastDriveLeftDeviceFlux() is the SAME source outerLiveStateHook reads for
+    /// `device_owns_flux`, so the flux upload the nodal call elides and the flux
+    /// upload the segment itself elides can never disagree about one outer.
+    static void outerCanonicalNodalHook(void* raw, int in_segment) {
+        OuterHookCtx&   h  = *static_cast<OuterHookCtx*>(raw);
+        XsReconBackend* be = h.ctx->cross_sections.EnsureBackend();
+        if (be == nullptr) return;
+        be->setCanonicalNodalSegmentMode(in_segment != 0,
+                                         h.ctx->cmfd_solver.lastDriveLeftDeviceFlux());
+    }
+
+    /// Rev.7.1 Task 18-lite: will THIS outer's drive take the device path?
+    ///
+    /// Nodal::DeviceDriveEligible is TryDriveGpu's own refusal test, so the
+    /// runner's decision to drop the bridge and the drive's decision to run on
+    /// the device are the same decision.  The backend check is the second half
+    /// of TryDriveGpu's refusal and it belongs here for the same reason: a
+    /// backend that went unavailable mid-run sends the drive to the CPU body,
+    /// which reads Geometry::Jnet.
+    ///
+    /// The hybrid arm is excluded because it downloads trlcff/matM and runs
+    /// calculateEven on the host, then finishes in solveNodalPost -- a drive
+    /// with a host half in the middle is not one the segment can hold ownership
+    /// across.
+    static int outerCanonicalNodalEligibleHook(void* raw) {
+        OuterHookCtx& h = *static_cast<OuterHookCtx*>(raw);
+        if (!rasberyGpuNodalFullEnabled()) return 0;
+        if (!h.ctx->nodal_solver.DeviceDriveEligible()) return 0;
+        XsReconBackend* be = h.ctx->cross_sections.EnsureBackend();
+        return (be != nullptr && be->available()) ? 1 : 0;
+    }
+
     /// Step 7, verbatim from the host loop.
     ///
     /// THIS IS THE WHOLE FIX FOR i-SMR CY02.  The segment used to skip cusping
@@ -1098,6 +1138,8 @@ private:
         residency.host_psi   = ctx.cmfd_solver.psiData();
         residency.host_xsnf  = ctx.cross_sections.xsnfData();
         residency.host_dtil  = ctx.cmfd_solver.dtilData();
+        // Rev.7.1 Task 18-lite: the host end of the canonical nodal set's phis.
+        residency.host_phis  = ctx.geometry.Phis();
         residency.arena_slot = 0; // the physics arena is width 1 (link 1)
         residency.valid      = true;
 
@@ -1133,11 +1175,88 @@ private:
         hooks.enqueue_nodal_drive = &outerNodalHook;
         hooks.apply_cusping       = &outerCuspingHook;
         hooks.read_live_state     = &outerLiveStateHook;
+        hooks.canonical_nodal_mode     = &outerCanonicalNodalHook;
+        hooks.canonical_nodal_eligible = &outerCanonicalNodalEligibleHook;
         hooks.ctx                 = &hc;
         hooks.sweep_synchronizes  = !stream_sweep;
         gpu::rasberyOuterSegment().setHooks(hooks);
 
         if (!gpu::rasberyBindOuterResidency(residency)) return false;
+
+        // ===================================================================
+        // Rev.7.1 Task 18-lite: CANONICAL NODAL BINDING
+        // ===================================================================
+        //
+        // WHAT IT REMOVES.  The nodal drive inside a segment is a host CALL, but
+        // with RASBERY_GPU_NODAL_FULL it is not host ARITHMETIC -- the whole
+        // drive runs on the device.  It was nevertheless reading and writing
+        // Geometry::Jnet, so the runner had to bring the device jnet down and
+        // push it back around every outer: 2 x nsurf*ng doubles that existed
+        // only because the two device buffers had different addresses.  Adopting
+        // the segment's own jnet/flux/phis as the backend's canonical set makes
+        // them the same address, and the bridge has nothing left to carry.
+        //
+        // THE SEGMENT DOES NOT FORCE `FULL`, AND THAT IS A DECISION.  It could:
+        // the flag is process-wide and the segment could flip it while it owns
+        // the outer.  It does not, for two reasons.  First, forcing would make
+        // RASBERY_GPU_OUTER silently change WHICH nodal solver runs, so an
+        // ON-vs-OFF comparison at the same environment would stop comparing the
+        // same physics -- and that comparison is the gate this whole campaign is
+        // held to.  Second, the two arms are not certified equal by anything in
+        // this tree: the device arm is measured clean on these decks, and
+        // measured is not proven.  The binding therefore engages only when the
+        // operator has already asked for the device nodal, and says so in the
+        // receipt when it does.
+        //
+        // THE FRACTIONAL-ROD REFUSAL IS NOT DECIDED HERE, AND THAT COST A DECK.
+        // Nodal::TryDriveGpu drops to the CPU body on any deck with a fractional
+        // rod (rod cusping reads the host trlcff arrays, which FULL leaves
+        // device-only), and the CPU body reads Geometry::Jnet -- which the
+        // dropped bridge has left several outers stale.  The obvious place to
+        // refuse is here, once per arm, and it is the wrong place: a rod SEARCH
+        // moves the bank INSIDE SolveLoop, so a loop that armed with every rod
+        // integral meets fractional ones a few outers later.  i-SMR CY02 armed
+        // clean, ran 639 outers whose drive had quietly become a CPU body, and
+        // converged at k_eff 1.000043 against the host's 0.999975.
+        //
+        // So the arm only decides whether the buffers are ADOPTED; whether the
+        // binding is LIVE is asked per outer, by the runner, through
+        // OuterSegmentHooks::canonical_nodal_eligible -- and an outer that says
+        // no keeps its bridge and gets its ownership handed back before the
+        // drive runs.
+        const bool nodal_on_device =
+            rasberyGpuNodalEnabled() && rasberyGpuNodalFullEnabled();
+        bool canonical_nodal = false;
+        if (nodal_on_device) {
+            const gpu::CanonicalSlotBuffers set =
+                gpu::rasberyOuterSegment().canonicalNodalSet();
+            XsReconBackend* backend = ctx.cross_sections.EnsureBackend();
+            if (set.shared() && backend != nullptr && backend->available()) {
+                // Re-adopting the same three pointers is a no-op inside the
+                // backend (it compares before it drops the captured graph), so
+                // arming once per SolveLoop entry costs nothing after the first.
+                backend->adoptCanonicalBuffers(set);
+                // START OUT OF SEGMENT.  Arming is not running: between here and
+                // the first outer the host may still take a whole outer of its
+                // own, and that outer's drive must transfer exactly as it always
+                // did.  The runner raises the claim per outer.
+                backend->setCanonicalNodalSegmentMode(false, false);
+                canonical_nodal = backend->canonicalBuffers().shared();
+            }
+        }
+        gpu::rasberyOuterSegment().setCanonicalNodalBound(canonical_nodal);
+        // ONE LINE PER PROCESS, on the first arm, because a receipt that says
+        // nothing about a binding that did not engage is the reason a reader
+        // cannot tell `off` from `on and refused`.
+        static bool canonical_said = false;
+        if (!canonical_said) {
+            canonical_said = true;
+            std::fprintf(stderr,
+                         "[RASBERY][OUTER_GPU] canonical_nodal=%d nodal_on_device=%d "
+                         "rod_fallback_at_arm=%d\n",
+                         canonical_nodal ? 1 : 0, nodal_on_device ? 1 : 0,
+                         ctx.nodal_solver.DeviceDriveEligible() ? 0 : 1);
+        }
         // The residency flag is NOT set here.  It belongs to the segment's own
         // drive() and is raised and lowered around it in outerSweepHook; a flag
         // set at arm time outlives the segment and starves the host path.

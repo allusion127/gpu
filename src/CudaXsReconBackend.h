@@ -169,6 +169,29 @@ public:
     void setMaterializeMask(std::uint32_t mask);
     [[nodiscard]] std::uint32_t materializeMask() const;
 
+    /// Rev.7.1 Task 18-lite: the device outer segment's per-drive declaration.
+    ///
+    /// THE OBSERVATION API IS AN AWKWARD FIT FOR A SEGMENT, and this is the
+    /// shape that fits.  The mask alone says which regions come BACK; it says
+    /// nothing about which ones need to go OUT, and inside a segment that is the
+    /// question that matters -- the device jnet is the only current copy, so an
+    /// upload of the host's would destroy the outer.  One call sets both halves
+    /// so they cannot disagree:
+    ///
+    ///   in_segment = true   jnet/phis device-owned, flux device-owned iff the
+    ///                       drive left it there; nothing materialised, because
+    ///                       the segment mirrors both arrays itself at its exit.
+    ///   in_segment = false  every region host-owned and jnet/phis materialised:
+    ///                       exactly the transfers a drive made before Task 7,
+    ///                       which is what a host outer body and every non-
+    ///                       segment consumer still expect.
+    ///
+    /// A NO-OP ON A LEGACY INSTANCE (no canonical set adopted), so a call site
+    /// does not have to ask whether the adoption happened.  Idempotent, and it
+    /// writes the same values on every outer of a segment, which is what keeps
+    /// it from churning the captured nodal graph.
+    void setCanonicalNodalSegmentMode(bool in_segment, bool device_owns_flux);
+
     /// Receipt: how many routine per-outer transfers the sharing removed.
     [[nodiscard]] unsigned long long canonicalUploadsElided() const;
     [[nodiscard]] unsigned long long canonicalDownloadsElided() const;
@@ -251,6 +274,17 @@ inline int rasberyNodalBatchWidth() { return rasberyNodalBatchWidthRef(); }
 
 /// Receipt accessor mirroring XsReconBackend::nodalDrivesSolved for main.cpp.
 unsigned long long rasberyGpuNodalDrives();
+
+/// Rev.7.1 Task 18-lite receipt: the per-drive transfers the canonical binding
+/// removed, in bytes, summed over the process.
+///
+/// FOUR PER DRIVE when the device outer segment holds the binding -- jnet and
+/// flux up, jnet and phis back -- and they are invisible in the segment's own
+/// receipt because the segment does not issue them; the nodal backend does.
+/// Reporting them from here rather than inferring them from the outer count is
+/// what makes the claim a measurement.
+unsigned long long rasberyGpuNodalCanonicalElidedUploadBytes();
+unsigned long long rasberyGpuNodalCanonicalElidedDownloadBytes();
 
 // The process-wide host page-locking gate (rasberyHostPinningRef /
 // rasberySetHostPinningEnabled / rasberyHostPinningEnabled) now lives in
