@@ -126,6 +126,11 @@ std::atomic<unsigned long long> g_nodal_d2h_bytes{0}; // per drive, last shape s
 /// segment's stream instead of a host block.  A deferral that never happened is
 /// the same receipt as a feature that is not there, which is why it is counted.
 std::atomic<unsigned long long> g_nodal_drains_deferred{0};
+/// Rev.7.1 W3 item 3: drives that read 1/eigv out of a device slot somebody else
+/// wrote, instead of uploading the host's copy.  Counted for the same reason:
+/// an elision that never engages is indistinguishable from a feature that is not
+/// wired, and this one is wired through four files.
+std::atomic<unsigned long long> g_nodal_reigv_device{0};
 
 // --- batch arena receipts (see NodalArena below).  Kept as TU-scope atomics,
 // not arena members, so the static-destruction receipt never has to reason
@@ -1327,7 +1332,9 @@ struct NodalReceipt {
                   << ",\"d2h_bytes_per_drive\":"
                   << g_nodal_d2h_bytes.load(std::memory_order_relaxed)
                   << ",\"drains_deferred\":"
-                  << g_nodal_drains_deferred.load(std::memory_order_relaxed) << "}"
+                  << g_nodal_drains_deferred.load(std::memory_order_relaxed)
+                  << ",\"reigv_device_drives\":"
+                  << g_nodal_reigv_device.load(std::memory_order_relaxed) << "}"
                   << std::endl;
 
         // The arena's own receipt, on its own tag so nothing consuming the line
@@ -1461,6 +1468,16 @@ struct XsReconBackend::Impl {
     cudaGraphExec_t nodal_graph      = nullptr;
     bool            nodal_use_graph  = !envFlagDisabled("RASBERY_GPU_NODAL_GRAPH");
     double*         nodal_h_reigv    = nullptr; // pinned, 1 double
+    /// Rev.7.1 W3 item 3: the device outer segment writes the reigv slot itself.
+    ///
+    /// NOT A GRAPH KEY.  It flips per DRIVE -- on for an in-segment canonical
+    /// outer, off for the Wielandt warm-up outer beside it -- so keying the
+    /// capture on it would drop and re-instantiate the graph at every flip.  The
+    /// upload it suppresses therefore lives OUTSIDE the capture (issued on
+    /// d.stream immediately before the launch, which is the same stream order
+    /// being the graph's first node gave it), and the capture is identical
+    /// either way.
+    bool            nodal_reigv_device = false;
     // Everything else the capture baked in.  Any change invalidates it.
     const void*     g_key_ndev = nullptr;
     const void*     g_key_dblk = nullptr;
@@ -2355,9 +2372,18 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
             d.nodal_use_graph = false; // no stable staging slot -> no capture
         }
     }
-    // The captured memcpy reads this address at every replay, so the current
+    // Rev.7.1 W3 item 3: WHO PUT THE RECIPROCAL IN THAT SLOT.
+    //
+    // Normally the host: it holds `eigv`, it divides, and the copy below carries
+    // the quotient down.  Inside a device outer segment the eigenvalue is the
+    // SWEEP's and it never left the device, so the segment's own one-thread
+    // kernel has already written 1/eigv into this exact address, stream-ordered
+    // ahead of this drive.  Uploading then would overwrite the device's answer
+    // with a host copy of an older one.
+    const bool reigv_device = d.nodal_reigv_device;
+    // The staged memcpy reads this address at every launch, so the current
     // eigenvalue has to be in it BEFORE the launch.
-    if (d.nodal_h_reigv != nullptr)
+    if (!reigv_device && d.nodal_h_reigv != nullptr)
         *d.nodal_h_reigv = host.reigv;
 
     const double* reigv_src =
@@ -2367,9 +2393,6 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     // gets captured.  No host callbacks, no allocation, no synchronisation
     // inside: every one of those is illegal or capture-breaking.
     auto enqueue_full = [&]() -> bool {
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_reigv, reigv_src,
-                                         sizeof(double),
-                                         cudaMemcpyHostToDevice, d.stream), d.status);
         // Task 7: elided when the region is canonical AND a device side wrote it
         // last.  When the HOST wrote last -- a perturbation, a rod move, a
         // restart -- the upload is still required, which is why the predicate
@@ -2470,6 +2493,34 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         cudaGetLastError();
         return false;
     };
+
+    // ======================================================================
+    // Rev.7.1 W3 item 3: THE reigv UPLOAD, OUTSIDE THE CAPTURE
+    // ======================================================================
+    //
+    // IT USED TO BE THE GRAPH'S FIRST NODE, and it is issued here instead for
+    // one reason: whether it should happen at all now varies per DRIVE.  Inside
+    // a device outer segment the eigenvalue never left the device and the
+    // segment wrote 1/eigv into d.ndev_dbl + n_off_reigv itself; on the Wielandt
+    // warm-up outer beside it the host owns the eigenvalue and the upload is
+    // required.  A memcpy NODE cannot be conditional, so keeping it in the
+    // capture would mean keying the graph on the flag and re-instantiating at
+    // every flip -- for an eight-byte copy.
+    //
+    // THE ORDERING IS EXACTLY WHAT IT WAS.  This is d.stream, and every consumer
+    // of the slot is a kernel launched on d.stream below (directly, or as the
+    // replay of a graph launched on d.stream).  Being the first node of that
+    // graph and being the operation immediately before it are the same position
+    // in the same stream order.  On the capture pass it also lands before
+    // cudaStreamBeginCapture -- there is a drain between the two -- so the
+    // recorded graph never contains it.
+    if (!reigv_device) {
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_reigv, reigv_src,
+                                         sizeof(double),
+                                         cudaMemcpyHostToDevice, d.stream), d.status);
+    } else {
+        g_nodal_reigv_device.fetch_add(1, std::memory_order_relaxed);
+    }
 
     bool ok = true;
     if (!d.nodal_use_graph) {
@@ -2809,6 +2860,25 @@ void* XsReconBackend::nodalCompletionEvent() {
     // stale handover that stops being harmless the moment anything overlaps.
     d.nodal_drain_deferred = false;
     return static_cast<void*>(d.nodal_done_event);
+}
+
+void* XsReconBackend::nodalReigvDeviceSlot() const {
+    const Impl& d = *_impl;
+    // NULL UNTIL THERE IS A BLOCK.  The nodal device arena is allocated inside
+    // the first solveNodal, and re-laid-out whenever nsurf changes, so this is
+    // the only honest answer before that and the reason the caller must ask
+    // again every outer rather than cache it.  The hybrid arm never sets
+    // v.reigv_dev, so a caller that got an address there would be writing a slot
+    // updateMatrix does not read -- hence the FULL gate.
+    if (!rasberyGpuNodalFullEnabled() || d.ndev_dbl == nullptr) return nullptr;
+    return static_cast<void*>(d.ndev_dbl + d.n_off_reigv);
+}
+
+void XsReconBackend::setNodalReigvDeviceResident(bool resident) {
+    // A PLAIN FLAG, WITH NO GRAPH DROP.  See the header: the upload it governs
+    // was moved out of the capture precisely so that this can flip per drive
+    // without costing an instantiation.
+    _impl->nodal_reigv_device = resident;
 }
 
 unsigned long long XsReconBackend::canonicalUploadsElided() const {

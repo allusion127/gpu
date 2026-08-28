@@ -166,6 +166,8 @@ struct AtomicCounters {
     std::atomic<std::uint64_t> mirror_exits{0};
     std::atomic<std::uint64_t> canonical_nodal_outers{0};
     std::atomic<std::uint64_t> nodal_event_waits{0};
+    std::atomic<std::uint64_t> reigv_device_outers{0};
+    std::atomic<std::uint64_t> reigv_reissued{0};
     std::atomic<std::uint64_t> phis_mirror_bytes{0};
     std::atomic<std::uint64_t> jnet_mirror_bytes{0};
     std::atomic<std::uint64_t> refusals[static_cast<int>(OuterSegmentRefusal::Count)];
@@ -245,6 +247,8 @@ OuterSegmentCounters outerSegmentCounters() {
     out.mirror_exits            = a.mirror_exits.load(std::memory_order_relaxed);
     out.canonical_nodal_outers  = a.canonical_nodal_outers.load(std::memory_order_relaxed);
     out.nodal_event_waits       = a.nodal_event_waits.load(std::memory_order_relaxed);
+    out.reigv_device_outers     = a.reigv_device_outers.load(std::memory_order_relaxed);
+    out.reigv_reissued          = a.reigv_reissued.load(std::memory_order_relaxed);
     out.phis_mirror_bytes       = a.phis_mirror_bytes.load(std::memory_order_relaxed);
     out.jnet_mirror_bytes       = a.jnet_mirror_bytes.load(std::memory_order_relaxed);
     for (int i = 0; i < static_cast<int>(OuterSegmentRefusal::Count); ++i)
@@ -276,6 +280,9 @@ std::string outerSegmentReceiptJson() {
                     ",\"canonical_nodal_outers\":" +
                     std::to_string(c.canonical_nodal_outers) +
                     ",\"nodal_event_waits\":" + std::to_string(c.nodal_event_waits) +
+                    ",\"reigv_device_outers\":" +
+                    std::to_string(c.reigv_device_outers) +
+                    ",\"reigv_reissued\":" + std::to_string(c.reigv_reissued) +
                     ",\"phis_mirror_bytes\":" + std::to_string(c.phis_mirror_bytes) +
                     ",\"jnet_mirror_bytes\":" + std::to_string(c.jnet_mirror_bytes) +
                     ",\"segment_budget\":" + std::to_string(outerSegmentBudget());
@@ -430,6 +437,16 @@ struct CudaOuterSegment::Impl {
     /// takes the bridge and writes the host arrays itself, and mirroring the
     /// device over that would overwrite the newer values with the older ones.
     bool                canonical_nodal_live = false;
+    /// Rev.7.1 W3 item 3: has this segment told the nodal backend that the reigv
+    /// slot is written on the device, and not yet taken it back?
+    ///
+    /// A LATCH FOR THE SAME REASON canonical_nodal_live IS ONE.  The declaration
+    /// is sticky on the backend -- it suppresses an upload -- so a segment that
+    /// set it and then returned without clearing it would hand every subsequent
+    /// HOST nodal drive a slot nobody writes.  That is the sticky-flag failure
+    /// that cost 169 host outers on kngr_238 in its dhat costume, and it is
+    /// cheaper to keep the latch than to audit five return paths.
+    bool                reigv_device_claimed = false;
 };
 
 CudaOuterSegment::CudaOuterSegment() : _impl(new Impl) {}
@@ -679,8 +696,42 @@ bool CudaOuterSegment::publishProbe(int slot, double eigv, double residual,
     // nonfinite is raised by k_outer_refresh_inputs, which is the one place that
     // holds both values at once; material_changed cannot fire on an eligible
     // deck.  Writing either here would be guessing at another kernel's job.
-    const cudaError_t rc = cudaMemcpy(_impl->d_probes + slot, &probe, sizeof(probe),
-                                      cudaMemcpyHostToDevice);
+    //
+    // ==================================================================
+    // ON THE SEGMENT'S STREAM, NOT THE DEFAULT ONE
+    // ==================================================================
+    //
+    // THIS WAS A RACE AND IT COST A GATE.  It used to be a plain synchronous
+    // cudaMemcpy, on the argument that "blocking" means the bytes are down
+    // before the call returns.  For an H2D out of PAGEABLE host memory that is
+    // not what cudaMemcpy promises: it returns once the source has been staged
+    // into the driver's pinned buffer, and the DMA into device memory is
+    // enqueued on the DEFAULT stream.  The segment runs on the sweep arena's
+    // stream, which is created non-blocking, so nothing orders that DMA against
+    // the next kernel this segment launches.
+    //
+    // It was invisible for as long as the probe's only device reader
+    // (k_outer_refresh_inputs) sat at the far end of the body behind a sweep, a
+    // updjnet and a synchronise.  W3 item 3 put a reader -- k_outer_publish_reigv
+    // -- immediately after the sweep hook, and on kngr3 three outers out of ~600
+    // read the PREVIOUS statepoint's converged eigenvalue: outer 0 of a segment
+    // whose drive took the host loop, where this publish is the only writer of
+    // the probe and the kernel two lines later is the only reader.  Those three
+    // were the whole ON-vs-OFF divergence (11216 outers against 12017).
+    //
+    // Async on the segment's own stream and then drained makes the copy both
+    // stream-ordered and still-blocking, which is what every caller here already
+    // believed it was getting.
+    cudaStream_t stream = _impl->stream;
+    if (stream == nullptr) {
+        const cudaError_t rc = cudaMemcpy(_impl->d_probes + slot, &probe, sizeof(probe),
+                                          cudaMemcpyHostToDevice);
+        return rc == cudaSuccess;
+    }
+    cudaError_t rc = cudaMemcpyAsync(_impl->d_probes + slot, &probe, sizeof(probe),
+                                     cudaMemcpyHostToDevice, stream);
+    if (rc != cudaSuccess) return false;
+    rc = cudaStreamSynchronize(stream);
     return rc == cudaSuccess;
 }
 
@@ -695,9 +746,21 @@ bool CudaOuterSegment::republishAfterHostSweep(int slot, double eigv, double res
     // holds the finished drive's numbers, an outer that resumed would compute
     // its convergence from the half drive the verdict kernel saw.  publishProbe
     // is a blocking H2D, so by the time this runs the new numbers are down.
+    //
+    // SAME STREAM, SAME REASON as publishProbe just above: a default-stream H2D
+    // is not ordered against the non-blocking stream the body's kernels run on,
+    // and this one lifts the gate every one of them tests.
     const std::uint32_t clear = 0u;
-    const cudaError_t   rc =
-        cudaMemcpy(_impl->d_halt + slot, &clear, sizeof(clear), cudaMemcpyHostToDevice);
+    cudaStream_t        stream = _impl->stream;
+    if (stream == nullptr) {
+        const cudaError_t rc =
+            cudaMemcpy(_impl->d_halt + slot, &clear, sizeof(clear), cudaMemcpyHostToDevice);
+        return rc == cudaSuccess;
+    }
+    cudaError_t rc = cudaMemcpyAsync(_impl->d_halt + slot, &clear, sizeof(clear),
+                                     cudaMemcpyHostToDevice, stream);
+    if (rc != cudaSuccess) return false;
+    rc = cudaStreamSynchronize(stream);
     return rc == cudaSuccess;
 }
 
@@ -847,7 +910,26 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     // abandoning a stream whose state it can no longer reason about: there the
     // mirror is a blocking copy and its errors are swallowed, because a mirror
     // that failed must not turn a host fallback into a hard stop.
+    /// Rev.7.1 W3 item 3: declare who writes the nodal drive's reigv slot.
+    ///
+    /// Idempotent and latched, so the common case -- the same answer on every
+    /// outer of a segment -- is one branch and no call, and the backend never
+    /// sees a flip it did not need.
+    auto setReigvDevice = [&](bool on) {
+        if (m.reigv_device_claimed == on) return;
+        m.reigv_device_claimed = on;
+        if (m.hooks.nodal_reigv_mode != nullptr)
+            m.hooks.nodal_reigv_mode(m.hooks.ctx, on ? 1 : 0);
+    };
+
     auto releaseCanonicalNodal = [&](bool stream_ordered) {
+        // FIRST, AND OUTSIDE THE EARLY RETURN.  The reigv claim is not tied to
+        // the canonical binding's liveness -- it is a second sticky declaration
+        // on the same backend -- so clearing it has to happen on every path
+        // through here, including the one where there was no binding to give
+        // back.  Every failure path in this function calls this lambda, which is
+        // why it and not five separate resets.
+        setReigvDevice(false);
         if (!m.canonical_nodal_live) return;
         m.canonical_nodal_live = false;
         if (!stream_ordered) {
@@ -1300,6 +1382,35 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         if (!m.hooks.enqueue_cmfd_sweep(m.hooks.ctx, m.stream, slot, i))
             return hookFailed("the CMFD sweep hook");
 
+        // ==================================================================
+        // Rev.7.1 W3 item 3: 1/eigv, WHERE BOTH ENDPOINTS ALREADY ARE
+        // ==================================================================
+        //
+        // The nodal drive reads its reciprocal from a device double
+        // (NodalView::reigv_dev).  The sweep just wrote the eigenvalue into a
+        // device probe.  Between two device facts sat three hops of host: the
+        // observation copied eigv up, Driver.h's nodal hook divided, and a
+        // staged H2D carried the quotient back down.  This kernel does the
+        // divide in place and the middle two hops stop existing.
+        //
+        // ISSUED HERE, BEHIND THE SWEEP ON THE SAME STREAM, so it reads the
+        // probe THIS outer's verdict kernel published rather than the previous
+        // one's -- and ahead of the pre-nodal synchronise, so the value has
+        // landed before the drive that reads it is launched on the other stream.
+        //
+        // THE SLOT IS ASKED FOR EVERY OUTER.  The backend allocates its device
+        // block inside the first drive and re-lays it out when nsurf changes, so
+        // a remembered address is a write into a freed allocation; and a null
+        // answer (before that first drive, on the hybrid arm) is the ordinary
+        // way of saying the host still owns the reciprocal.
+        double* const reigv_slot =
+            m.hooks.nodal_reigv_slot != nullptr
+                ? static_cast<double*>(m.hooks.nodal_reigv_slot(m.hooks.ctx))
+                : nullptr;
+        if (reigv_slot != nullptr &&
+            (rc = enqueueOuterPublishReigv(m.d_probes, reigv_slot, slot, m.stream)) !=
+                cudaSuccess)
+            return launchFailed("enqueue the reigv publish", rc);
         // (5) updjnet -- Driver.h:1569
         if ((rc = enqueueUpdJnet(m.arena, queue, bound_.geom, bound_.table, bound_.forms,
                                  m.stream, m.d_halt)) != cudaSuccess)
@@ -1409,6 +1520,21 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                 (rc = cudaMemcpyAsync(bound_.host_jnet, bound_.device_jnet, jnet_bytes,
                                       cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
                 return launchFailed("re-download jnet after the host finished the sweep", rc);
+            // AND SO DOES THE RECIPROCAL, FOR THE SAME REASON AND ONE MORE.
+            // The kernel above the sweep read the probe the VERDICT kernel
+            // published, and on this path that probe described a half drive --
+            // republishAfterHostSweep has since overwritten it with the numbers
+            // the host loop finished on.  Re-issuing is what makes the slot the
+            // finished drive's reciprocal rather than the half one's, and the
+            // nodal drive four lines down is its only reader.
+            if (reigv_slot != nullptr) {
+                bump(counters().reigv_reissued);
+                if ((rc = enqueueOuterPublishReigv(m.d_probes, reigv_slot, slot,
+                                                   m.stream)) != cudaSuccess)
+                    return launchFailed("re-enqueue the reigv publish after the host "
+                                        "finished the sweep",
+                                        rc);
+            }
             // AND THE CANONICAL ARM NEEDS IT TOO.  There the nodal drive reads
             // the DEVICE jnet, on the backend's own stream, ordered against this
             // one by nothing but this synchronise.
@@ -1462,10 +1588,25 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         // The claim is IDEMPOTENT and writes the same values on every outer of a
         // canonical run, so repeating it does not churn the nodal backend's
         // captured graph -- whose key carries both the ownerships and the mask.
+        //
+        // Rev.7.1 W3 item 3 rides the SAME predicate, and that is the whole
+        // safety argument for it.  `canonical_now` is Nodal::TryDriveGpu's own
+        // refusal test, so it is true exactly when the drive about to run is the
+        // FULL device pipeline -- the one arm that reads reigv_dev at all.  A
+        // drive that falls back to the CPU body reads Nodal::_reigv, which the
+        // host hook still sets from the host eigenvalue on every outer; a hybrid
+        // drive leaves reigv_dev null and reads the by-value scalar.  Both are
+        // exactly what they were, because the claim is not made for them.
         if (canonical_now && m.hooks.canonical_nodal_mode != nullptr) {
             m.canonical_nodal_live = true;
             m.hooks.canonical_nodal_mode(m.hooks.ctx, 1);
             bump(counters().canonical_nodal_outers);
+            if (reigv_slot != nullptr) {
+                setReigvDevice(true);
+                bump(counters().reigv_device_outers);
+            } else {
+                setReigvDevice(false);
+            }
         } else {
             // Not eligible: this outer's drive is the CPU body (or a host-owned
             // device drive), it has its bridge, and it is about to write the host

@@ -215,6 +215,43 @@ public:
     /// is a .cu.
     [[nodiscard]] void* nodalCompletionEvent();
 
+    /// Rev.7.1 W3 item 3: the device double the FULL nodal path reads 1/eigv
+    /// from, or nullptr when there is no such slot right now.
+    ///
+    /// WHY THE ADDRESS AND NOT A SETTER.  The reciprocal's journey was device ->
+    /// host -> pinned slot -> device: the sweep produced the eigenvalue on the
+    /// device, the host read it back so it could divide, and the captured H2D
+    /// carried the quotient home.  Inside a device outer segment the first hop
+    /// is the round trip the whole task is removing, so the segment writes the
+    /// quotient with a one-thread kernel instead -- and to do that it needs the
+    /// address, which only this class knows.
+    ///
+    /// ASKED PER OUTER AND NEVER CACHED.  The nodal device block is freed and
+    /// laid out again whenever nsurf changes (a restart, a different geometry),
+    /// so an address held across that is a write into a freed allocation.  It is
+    /// null before the first drive -- the block is allocated inside solveNodal --
+    /// and on the hybrid arm, where updateMatrix reads the by-value scalar and
+    /// there is no slot to write.
+    [[nodiscard]] void* nodalReigvDeviceSlot() const;
+
+    /// Rev.7.1 W3 item 3: SOMEBODY ELSE IS WRITING THAT SLOT.
+    ///
+    /// With this true the FULL path does not upload host.reigv at all: the
+    /// caller has already put 1/eigv in the device slot, stream-ordered ahead of
+    /// the drive, and an upload would overwrite the device's answer with the
+    /// host's copy of it.  With it false -- the default, and every path outside a
+    /// segment -- the upload happens exactly as it always did.
+    ///
+    /// IT IS NOT A GRAPH KEY, AND THAT IS DELIBERATE.  The declaration flips
+    /// with the drive: an in-segment canonical outer sets it, the Wielandt
+    /// warm-up outer three lines later clears it, and a key would drop and
+    /// re-instantiate the captured graph at every one of those flips.  So the
+    /// upload was moved OUT of the capture instead -- it is issued on the same
+    /// stream immediately before the graph launch, which orders it exactly as
+    /// being the graph's first node did, and the capture no longer has an
+    /// opinion about it.
+    void setNodalReigvDeviceResident(bool resident);
+
     /// Receipt: how many routine per-outer transfers the sharing removed.
     [[nodiscard]] unsigned long long canonicalUploadsElided() const;
     [[nodiscard]] unsigned long long canonicalDownloadsElided() const;

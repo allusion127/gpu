@@ -1015,6 +1015,16 @@ private:
     /// and will take the result back up, so this is the host body verbatim --
     /// which is the point: a hook that reimplemented it would be a second nodal
     /// solver to keep in step.
+    ///
+    /// Rev.7.1 W3 item 3: `1.0 / *h.eigv` IS STILL COMPUTED AND IS NOW DEAD ON
+    /// THE ARM THAT MATTERS.  Nodal::_reigv is read by the CPU body
+    /// (Nodal.cpp:290) and by the hybrid arm's by-value scalar, and both still
+    /// need it -- so the divide stays.  On the FULL device arm inside a segment
+    /// the kernel reads NodalView::reigv_dev instead (NodalKernel.h:415), which
+    /// the segment's own k_outer_publish_reigv wrote from the sweep's device
+    /// eigenvalue; this quotient is then computed and discarded.  What the
+    /// change removed is not the arithmetic, it is the DATA DEPENDENCY: the
+    /// eigenvalue no longer has to reach the host for the drive to run.
     static bool outerNodalHook(void* raw, gpu::OuterSegmentStream, int, unsigned int) {
         OuterHookCtx& h = *static_cast<OuterHookCtx*>(raw);
         h.ctx->nodal_solver.reset(1.0 / *h.eigv, h.ctx->geometry.Jnet(),
@@ -1036,6 +1046,31 @@ private:
         OuterHookCtx&   h  = *static_cast<OuterHookCtx*>(raw);
         XsReconBackend* be = h.ctx->cross_sections.EnsureBackend();
         return be != nullptr ? be->nodalCompletionEvent() : nullptr;
+    }
+
+    /// Rev.7.1 W3 item 3: where the FULL nodal drive reads 1/eigv, or nullptr.
+    ///
+    /// A PURE QUERY WITH NO SIDE EFFECT, asked at the top of the sweep so the
+    /// runner can enqueue its publish kernel behind the sweep that produced the
+    /// eigenvalue.  It is here rather than in the runner for the same reason
+    /// outerNodalCompletionHook is: the backend is reached through XSSet, which
+    /// is Driver.h's object and not the runner's.
+    static void* outerNodalReigvSlotHook(void* raw) {
+        OuterHookCtx&   h  = *static_cast<OuterHookCtx*>(raw);
+        XsReconBackend* be = h.ctx->cross_sections.EnsureBackend();
+        return be != nullptr ? be->nodalReigvDeviceSlot() : nullptr;
+    }
+
+    /// Rev.7.1 W3 item 3: the matching declaration.
+    ///
+    /// Set with 1 only for an outer whose drive is the FULL device pipeline and
+    /// whose reciprocal this segment has already written on the device; cleared
+    /// for every other drive and at every exit.  The runner latches it, so the
+    /// steady state is one call per segment rather than one per outer.
+    static void outerNodalReigvModeHook(void* raw, int device_resident) {
+        OuterHookCtx&   h  = *static_cast<OuterHookCtx*>(raw);
+        XsReconBackend* be = h.ctx->cross_sections.EnsureBackend();
+        if (be != nullptr) be->setNodalReigvDeviceResident(device_resident != 0);
     }
 
     /// Rev.7.1 Task 18-lite: which side owns the canonical nodal regions.
@@ -1189,6 +1224,8 @@ private:
         hooks.finish_cmfd_sweep   = stream_sweep ? &outerSweepFinishHook : nullptr;
         hooks.enqueue_nodal_drive = &outerNodalHook;
         hooks.nodal_completion_event = &outerNodalCompletionHook;
+        hooks.nodal_reigv_slot       = &outerNodalReigvSlotHook;
+        hooks.nodal_reigv_mode       = &outerNodalReigvModeHook;
         hooks.apply_cusping       = &outerCuspingHook;
         hooks.read_live_state     = &outerLiveStateHook;
         hooks.canonical_nodal_mode     = &outerCanonicalNodalHook;

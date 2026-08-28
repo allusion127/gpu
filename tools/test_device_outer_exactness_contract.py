@@ -69,8 +69,11 @@ two, in either direction: the drive reads the jnet updjnet wrote, and upddhat
 reads the jnet the drive wrote.
 
 The FIRST handover (segment -> nodal) is still a host synchronise and cannot yet
-be anything else: the sweep's observation hook and the nodal reset's `1.0 / eigv`
-are host reads of a device-produced eigenvalue, so the host has to see it.
+be anything else: the sweep's OBSERVATION hook (BICGCMFD::finishDrive) is a host
+read of device memory inside the body, so the host has to see the stream.  W3
+item 3 removed the OTHER reason it was there -- the nodal drive's `1.0 / eigv` --
+but one host read is as blocking as two, so the synchronise stays until the
+observation moves (Task 10 part 3).  See invariant 7.
 
 The SECOND (nodal -> segment) became an event in W3 item 2.  XsReconBackend::solveNodal
 records cudaEventRecord(d.nodal_done_event) instead of draining -- but ONLY when
@@ -148,6 +151,47 @@ statepoints 1..34 bit-identical; with the synchronise, 12017 outers and 0 of
 RULE: an async D2H issued because a host reader is next is synchronised before
 that reader runs, and the condition is the same `host_reader_next` the mirrors
 themselves are gated on.
+
+-------------------------------------------------------------------------------
+7. A DEVICE-WRITTEN SCALAR AND ITS UPLOAD ARE MUTUALLY EXCLUSIVE
+-------------------------------------------------------------------------------
+
+W3 item 3 took the eigenvalue's round trip out of the body.  The sweep produces
+eigv on the device; the FULL nodal drive consumes 1/eigv from a device double
+(NodalView::reigv_dev).  Between two device facts sat the host -- the observation
+copied eigv up, Driver.h's nodal hook divided, and a staged H2D carried the
+quotient back down from a pinned slot the host rewrote before every launch.
+k_outer_publish_reigv now does the divide in place.
+
+That makes TWO writers of one 8-byte device slot, and every failure mode here is
+one of them being wrong about the other:
+
+  * BOTH WRITE.  The upload lands after the kernel and the drive solves at the
+    host's copy of an older eigenvalue.  Harmless while the two agree, which is
+    every outer until they do not.
+  * NEITHER WRITES.  The declaration is sticky on the backend, so a segment that
+    claimed it and returned without clearing it hands every subsequent HOST
+    nodal drive a slot nobody updates -- the same shape as the dhat sticky-flag
+    bug that ran 169 kngr_238 host outers off a frozen operator.
+  * THE KERNEL WRITES THE WRONG OUTER'S.  On the exceptional launches (sweep
+    state 0 or 2) the verdict kernel's probe describes a HALF drive; the host
+    finishes it and republishAfterHostSweep overwrites the probe.  A publish
+    issued only behind the sweep would leave the half drive's reciprocal in the
+    slot -- invariant 3's failure, in the scalar.
+  * THE KERNEL IS HALT-GATED.  It looks like every other body kernel and it must
+    not be one: the halt stops steps that ADVANCE state past a decided exit, and
+    this one advances nothing -- but its consumer is a HOST call the halt cannot
+    stop, so gating it leaves the previous outer's reciprocal standing on exactly
+    the outers the host has to finish.
+
+RULE: the publish kernel is issued behind the sweep and re-issued under
+`sweep_host_continued`; it is not halt-gated; the claim is made only on the arm
+that reads reigv_dev (`canonical_now`, i.e. Nodal::TryDriveGpu's own predicate)
+and is cleared by releaseCanonicalNodal on every path out; and the backend's
+upload is gated on the negation of the claim, OUTSIDE the captured graph so the
+per-drive flip costs no instantiation.  The divide is correctly rounded
+(__ddiv_rn), because the host's `1.0 / eigv` is and the two have to agree bit for
+bit.
 
 Run:  python tools/test_device_outer_exactness_contract.py
 """
@@ -528,6 +572,120 @@ def check_host_reader_mirror_is_synchronised(problems: list[str]) -> None:
         )
 
 
+
+def check_device_reigv_has_one_writer(problems: list[str]) -> None:
+    """Invariant 7.  Two writers of one 8-byte device slot, and the whole
+    correctness argument is that exactly one of them is armed per drive."""
+    runner_src = read("src", "CudaOuterGraph.cu")
+    header = read("src", "CudaOuterGraph.h")
+    xsrecon = read("src", "CudaXsReconBackend.cu")
+    driver = read("src", "Driver.h")
+
+    kernel_at = header.find("__global__ void k_outer_publish_reigv")
+    if kernel_at < 0:
+        problems.append(
+            "CudaOuterGraph.h: no k_outer_publish_reigv.  Without it the segment has "
+            "no way to put 1/eigv where the nodal drive reads it, and the eigenvalue "
+            "goes back to travelling device -> host -> pinned slot -> device"
+        )
+        return
+    kernel = strip_comments(body_of(header, "__global__ void k_outer_publish_reigv"))
+    if "__ddiv_rn" not in kernel:
+        problems.append(
+            "k_outer_publish_reigv does not spell the divide __ddiv_rn.  The host's "
+            "1.0 / eigv is correctly rounded; an approximate reciprocal, or a plain "
+            "`/` under a build that ever acquires -use_fast_math, is a different "
+            "double and the ON arm stops being the OFF arm"
+        )
+    if "halt" in kernel:
+        problems.append(
+            "k_outer_publish_reigv is halt-gated.  The halt stops steps that advance "
+            "state past a decided exit; this one advances nothing, and its consumer "
+            "is a HOST call the halt cannot stop -- so gating it leaves the PREVIOUS "
+            "outer's reciprocal standing on exactly the outers (sweep state 0 or 2) "
+            "the host has to finish by hand"
+        )
+
+    run = strip_comments(body_of(runner_src, "bool CudaOuterSegment::runSegment"))
+    try:
+        sweep_at = run.index("enqueue_cmfd_sweep(m.hooks.ctx")
+        publish_at = run.index("enqueueOuterPublishReigv", sweep_at)
+        sync_at = run.index('launchFailed("synchronize before the nodal drive"', publish_at)
+    except ValueError:
+        problems.append(
+            "CudaOuterGraph.cu: the reigv publish is not issued between the sweep that "
+            "produces the eigenvalue and the synchronise that precedes the nodal drive "
+            "that consumes it.  Earlier and it reads the previous outer's probe; later "
+            "and the drive is launched on the other stream before the value has landed"
+        )
+        return
+    if not sweep_at < publish_at < sync_at:
+        problems.append(
+            "CudaOuterGraph.cu: the reigv publish is out of order against the sweep "
+            "and the pre-nodal synchronise"
+        )
+
+    reissue = run[run.index("if (m.sweep_host_continued)") :]
+    reissue = reissue[: reissue.index('launchFailed("synchronize after the re-issued updjnet"')]
+    if "enqueueOuterPublishReigv" not in reissue:
+        problems.append(
+            "CudaOuterGraph.cu: the reigv publish is not re-issued under "
+            "sweep_host_continued.  On sweep state 0 or 2 the verdict kernel's probe "
+            "is a HALF drive's; republishAfterHostSweep overwrites it with the numbers "
+            "the host finished on, and a slot written only behind the sweep still holds "
+            "the half drive's reciprocal when the nodal solve reads it"
+        )
+
+    release = strip_comments(body_of(runner_src, "auto releaseCanonicalNodal = [&](bool stream_ordered)"))
+    if "setReigvDevice(false)" not in release:
+        problems.append(
+            "CudaOuterGraph.cu: releaseCanonicalNodal does not clear the reigv claim.  "
+            "The claim suppresses an upload on the backend and is sticky, so a segment "
+            "that returns without clearing it hands every later HOST nodal drive a slot "
+            "nobody writes"
+        )
+    elif release.index("setReigvDevice(false)") > release.index("if (!m.canonical_nodal_live) return;"):
+        problems.append(
+            "CudaOuterGraph.cu: releaseCanonicalNodal clears the reigv claim AFTER its "
+            "early return.  The claim is a second, independent declaration on the same "
+            "backend; a release that skips it whenever the canonical binding was not "
+            "live is a release that will one day skip it when it was"
+        )
+    if "if (canonical_now && m.hooks.canonical_nodal_mode != nullptr)" not in run or            "setReigvDevice(true)" not in run[run.index("if (canonical_now && m.hooks.canonical_nodal_mode != nullptr)") :]:
+        problems.append(
+            "CudaOuterGraph.cu: the reigv claim is not made under canonical_now.  That "
+            "predicate is Nodal::TryDriveGpu's own refusal test and it is the only "
+            "thing that says the drive about to run is the FULL device pipeline -- the "
+            "one arm that reads reigv_dev at all.  Claiming for a CPU-body or hybrid "
+            "drive suppresses an upload the drive still needs"
+        )
+
+    solve = body_of(xsrecon, "bool XsReconBackend::solveNodal")
+    enqueue_full_at = solve.index("auto enqueue_full = [&]() -> bool")
+    enqueue_full = body_of(solve[enqueue_full_at:], "auto enqueue_full = [&]() -> bool")
+    if "n_off_reigv" in strip_comments(enqueue_full):
+        problems.append(
+            "XsReconBackend::solveNodal: the reigv upload is back inside enqueue_full, "
+            "i.e. inside the captured graph.  A memcpy NODE cannot be conditional, so "
+            "the per-drive flip would have to become a graph key and drop the capture "
+            "at every Wielandt warm-up outer -- for eight bytes"
+        )
+    if "if (!reigv_device)" not in strip_comments(solve):
+        problems.append(
+            "XsReconBackend::solveNodal: the reigv upload is not gated on the negation "
+            "of the device-resident claim, so both writers of the slot are armed and "
+            "the drive solves at whichever landed last"
+        )
+    for hook in ("hooks.nodal_reigv_slot", "hooks.nodal_reigv_mode"):
+        if hook not in driver:
+            problems.append(
+                "Driver.h installs no " + hook + ".  The address and the declaration "
+                "are two halves of one handover: the runner writing a slot the backend "
+                "still uploads over is waste, and a backend that stops uploading for a "
+                "runner that is not writing is wrong"
+            )
+
+
 def main() -> int:
     problems: list[str] = []
     check_form_mask_is_mined(problems)
@@ -536,6 +694,7 @@ def main() -> int:
     check_cross_stream_handovers_are_ordered(problems)
     check_xsnf_elision_is_byte_exact(problems)
     check_host_reader_mirror_is_synchronised(problems)
+    check_device_reigv_has_one_writer(problems)
 
     if problems:
         print("FAIL: device outer exactness contract")
@@ -549,6 +708,7 @@ def main() -> int:
     print("  4. both cross-stream handovers around the nodal drive are ordered")
     print("  5. the xsnf upload elision compares bytes, not a generation")
     print("  6. the psi/dhat mirror lands before the host loop that reads it")
+    print("  7. the nodal reigv slot has exactly one writer per drive")
     return 0
 
 

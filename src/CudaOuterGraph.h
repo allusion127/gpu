@@ -720,6 +720,15 @@ struct OuterSegmentCounters {
     /// feature wired means the backend never deferred, which is what a
     /// half-installed hook table looks like.
     std::uint64_t nodal_event_waits        = 0;
+
+    /// Rev.7.1 W3 item 3: outers whose 1/eigv was written by k_outer_publish_reigv
+    /// and consumed straight out of device memory by the nodal drive -- i.e. the
+    /// outers that no longer carry the eigenvalue through the host to get it
+    /// there.  Re-issues after a host-finished sweep are counted separately, so
+    /// `reigv_device_outers + reigv_reissued` is the number of launches and
+    /// `reigv_device_outers` is the number of outers.
+    std::uint64_t reigv_device_outers      = 0;
+    std::uint64_t reigv_reissued           = 0;
     /// Bytes returned to Geometry::Phis at a segment exit.
     ///
     /// THE PRICE OF THE ELIDED DOWNLOAD, and it is charged per EXIT rather than
@@ -1018,6 +1027,32 @@ struct OuterSegmentHooks {
     /// same relationship BICGCMFD::canEnqueueDrive() has to drive() -- so the
     /// bridge and the drive cannot disagree about one outer.
     int (*canonical_nodal_eligible)(void* ctx) = nullptr;
+
+    /// Rev.7.1 W3 item 3: WHERE THE NODAL DRIVE READS 1/eigv.
+    ///
+    /// Returns the nodal backend's device reigv slot, or nullptr when there is
+    /// none right now -- before the first drive, on the hybrid arm, or with the
+    /// batch arena driving.  A null answer is not a failure: it means the host
+    /// still owns the reciprocal and the segment leaves the transfer alone.
+    ///
+    /// ASKED EVERY OUTER, NEVER CACHED.  The backend frees and re-lays-out that
+    /// block when nsurf changes, and the runner writing a remembered address
+    /// after that is a write into a freed allocation.  It is here rather than in
+    /// the runner for outerCanonicalNodalHook's reason: the backend is reached
+    /// through XSSet, which is Driver.h's object.
+    void* (*nodal_reigv_slot)(void* ctx) = nullptr;
+
+    /// Rev.7.1 W3 item 3: tell the drive who wrote that slot.
+    ///
+    /// Called with 1 before the nodal hook of an outer whose reciprocal this
+    /// segment published on the device, and with 0 before every other drive and
+    /// at the segment exit.  The pairing with `canonical_nodal_mode` is exact and
+    /// deliberate: both are per-drive declarations of what the runner has already
+    /// done to device memory, and a drive that gets one without the other either
+    /// uploads over the device's reciprocal (harmless, just the old cost) or
+    /// reads a slot nobody wrote (not harmless) -- so they are set together, from
+    /// one predicate, at one point of the outer.
+    void (*nodal_reigv_mode)(void* ctx, int device_resident) = nullptr;
 
     void*            ctx                 = nullptr;
 };
@@ -1648,6 +1683,40 @@ __global__ void k_outer_refresh_inputs(DevicePhaseQueue queue, DeviceOuterProbe*
     inputs[slot].residual = probe.residual;
 }
 
+/// Rev.7.1 W3 item 3: publish 1/eigv where the nodal drive reads it.
+///
+/// ONE THREAD, ONE DIVIDE, ONE STORE, and it removes two hops of a four-hop
+/// journey.  The eigenvalue is produced on the device by the sweep's verdict
+/// kernel and lands in DeviceOuterProbe; the nodal drive consumes its reciprocal
+/// from a device double (`NodalView::reigv_dev`).  Between those two device
+/// facts sat the host: finishDrive copied eigv up, Driver.h's nodal hook divided
+/// in double precision, and a captured H2D carried the quotient back down from a
+/// pinned slot the host had to rewrite before every launch.  This kernel does
+/// the divide where both endpoints already are.
+///
+/// IT IS BIT-EXACT AND NOT APPROXIMATELY SO.  IEEE-754 makes division a
+/// correctly-rounded operation, so `1.0 / e` has exactly one right answer for a
+/// given `e` and round-to-nearest -- the host's `1.0 / eigv` and this kernel's
+/// must agree bit for bit or one of them is not IEEE.  __ddiv_rn is spelled out
+/// rather than `1.0 / e` so that a build which ever acquires -use_fast_math
+/// cannot quietly substitute the approximate reciprocal.
+///
+/// IT IS DELIBERATELY NOT HALT-GATED, which is the opposite of every other
+/// kernel in the body.  The halt exists to stop a step from ADVANCING state past
+/// a decided exit; this step advances nothing -- it is a pure function of the
+/// probe, recomputable at any time, and its consumer (the nodal drive) is a HOST
+/// call the halt cannot stop anyway.  Gating it would leave the slot holding the
+/// PREVIOUS outer's reciprocal on exactly the outers where the sweep halted
+/// itself mid-flight, and the host drive that then finishes those outers would
+/// solve the nodal problem at the wrong eigenvalue.  The runner re-issues it
+/// after republishAfterHostSweep for the same reason it re-issues updjnet, and
+/// the two together are what keep the exceptional path exact.
+__global__ void k_outer_publish_reigv(const DeviceOuterProbe* probes, double* reigv,
+                                      int slot) {
+    if (blockIdx.x != 0u || threadIdx.x != 0u) return;
+    reigv[0] = __ddiv_rn(1.0, probes[slot].eigv);
+}
+
 /// Rank the decision and the signals, publish the phase, latch the halt.
 ///
 /// ONE THREAD PER SLOT.  It is the only kernel in the segment that writes
@@ -1697,6 +1766,16 @@ inline cudaError_t enqueueOuterRefreshInputs(const DevicePhaseQueue& queue,
     if (queue.count <= 0) return cudaSuccess;
     const int grid = (queue.bucket + kCmfdOuterBlock - 1) / kCmfdOuterBlock;
     k_outer_refresh_inputs<<<grid, kCmfdOuterBlock, 0, stream>>>(queue, probes, inputs, halt);
+    return cudaGetLastError();
+}
+
+inline cudaError_t enqueueOuterPublishReigv(const DeviceOuterProbe* probes, double* reigv,
+                                            int slot, cudaStream_t stream) {
+    // A null slot is the ordinary answer before the nodal backend has allocated
+    // its device block, and on the hybrid arm; it means "the host still owns the
+    // reciprocal", which is a legal state and not a failure.
+    if (probes == nullptr || reigv == nullptr || slot < 0) return cudaSuccess;
+    k_outer_publish_reigv<<<1, 1, 0, stream>>>(probes, reigv, slot);
     return cudaGetLastError();
 }
 
