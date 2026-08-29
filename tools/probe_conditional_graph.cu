@@ -349,6 +349,27 @@ static cudaError_t add_conditional(cudaGraph_t parent, const cudaGraphNode_t* de
     // This is the ONLY cudaGraphAddNode call site in the file.  The seven
     // cudaGraphAddKernelNode calls are a different entry point whose signature
     // did NOT change -- do not "fix" them to match.
+    //
+    // TWO MORE CUDA 13 SIGNATURE CHANGES IN THE SAME FAMILY (not called from
+    // this file, but hit by src/GpuGraphSplice.h and src/GpuOuterWhile.h,
+    // fixed in commit 4b4e21c -- noted here since this is where the
+    // cudaGraphAddNode change above is documented):
+    //
+    //   cudaStreamGetCaptureInfo gained `const cudaGraphEdgeData**
+    //   edgeData_out` inserted BEFORE `numDependencies_out` (6 params -> 7):
+    //     12.x: (stream, captureStatus_out, id_out, graph_out,
+    //            dependencies_out, numDependencies_out)
+    //     13.0: (stream, captureStatus_out, id_out, graph_out,
+    //            dependencies_out, edgeData_out, numDependencies_out)
+    //
+    //   cudaStreamUpdateCaptureDependencies gained `const cudaGraphEdgeData*
+    //   dependencyData` inserted BEFORE `numDependencies` (4 params -> 5):
+    //     12.x: (stream, dependencies, numDependencies, flags)
+    //     13.0: (stream, dependencies, dependencyData, numDependencies, flags)
+    //
+    //   Same fix shape both times: an extra local `const cudaGraphEdgeData*
+    //   edge_data = nullptr;` under CUDART_VERSION >= 13000, passed in the new
+    //   slot -- nullptr means "default edge type", the 12.x implied behaviour.
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
     const cudaError_t e = cudaGraphAddNode(out_node, parent, deps, nullptr, ndeps, &np);
 #else
