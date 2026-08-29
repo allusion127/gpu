@@ -182,6 +182,13 @@ struct Counters {
     /// perturbation, and damper activation.  A reset with nothing stored is not
     /// charged, so this counts real discards rather than outers.
     long long xe_aa_history_resets = 0;
+    /// A2 staged tolerance (RASBERY_STAGED_FLUX_TOL / _XE_TOL) only.  Times the
+    /// loose stage's "everything converged" verdict did NOT survive being re-asked
+    /// at the production tolerance, so the loop dropped back to loose and committed
+    /// another trial.  Zero with the feature off.  A count comparable to
+    /// search_trials is the signature of a multiplier loose enough that the loose
+    /// stage is locating a different root than the one being published.
+    long long staged_relapses      = 0;
     long long search_trials        = 0;  ///< committed AND applied trial points
     long long th_updates           = 0;
     long long flux_limit_retries   = 0;  ///< flux limit-cycle events ([WARN][flux])
@@ -242,6 +249,7 @@ struct Counters {
         xe_aa_accepted       += step.xe_aa_accepted;
         xe_aa_rejected       += step.xe_aa_rejected;
         xe_aa_history_resets += step.xe_aa_history_resets;
+        staged_relapses      += step.staged_relapses;
         search_trials        += step.search_trials;
         th_updates           += step.th_updates;
         flux_limit_retries   += step.flux_limit_retries;
@@ -2404,6 +2412,92 @@ private:
         const double search_tol = schedule.criticalSearchTolerance();
         const double flux_tol   = std::max(keff_tol, CMFD_FLUX_L2_TOLERANCE);
 
+        // =================================================================
+        // A2: STAGED TOLERANCE -- loose while the statepoint is still moving,
+        // production tolerance for the answer it publishes.  Default OFF.
+        // =================================================================
+        //
+        // WHAT THE PROFILE SAYS (tools/outer_profile.py on kngr_238, S2 +
+        // device outer segment, Anderson Xe on): 12,017 outers over 35
+        // statepoints, of which 8,579 (71.4 %) are charged to the
+        // equilibrium-Xe cascade and 1,508 (12.5 %) to the critical search.
+        // The structure behind those two numbers is one thing, not two: 228 Xe
+        // cascades, 10.65 settled Xe steps each, 3.53 outers of flux
+        // re-convergence per step -- and a cascade is re-armed by EVERY
+        // committed search trial and T/H update.  So a single boron trial point
+        // costs ~38 outers of Xe re-equilibration, and 137 of them are taken per
+        // run.  MASTER needs ~59 outers per statepoint in total.
+        //
+        // WHY THE TOLERANCES ARE THE LEVER.  Every one of those 8,579 outers is
+        // converging the flux to |dk| < 1e-6 (1 pcm) and L2 < 1e-6 so that a Xe
+        // step can be taken, and re-converging the Xe inventory to a 1e-6
+        // relative change, at a TRIAL BORON CONCENTRATION THAT IS ABOUT TO BE
+        // THROWN AWAY.  The consumer of a trial point is the secant search,
+        // whose own tolerance is 2e-5 -- twenty times looser.  Nothing needs
+        // that precision until the point is accepted.
+        //
+        // THE SHAPE OF THE FIX, AND WHY IT CANNOT SILENTLY LOSE ACCURACY.  The
+        // loop runs in one of two stages.  In the LOOSE stage the flux and Xe
+        // tolerances are multiplied out; when every feedback reports converged
+        // there, that is NOT an exit -- it is the trigger to switch to the
+        // POLISH stage, where the production tolerances are restored, the Xe
+        // cascade is re-armed against the production-converged flux, and the
+        // SAME convergence test is asked again.  Only a convergence reached at
+        // production tolerance can end the solve.  If the loose stage put the
+        // search on the wrong boron, the polish stage sees |dk| > search_tol,
+        // commits another trial, and drops back to loose -- the loop
+        // self-corrects rather than publishing the loose answer.  What the
+        // feature can cost is outers (a thrash between the stages); what it
+        // cannot do is publish a state that never met the production tolerance.
+        //
+        // WHY IT IS NOT THE INTERIM-Xe KNOB.  RASBERY_XE_INTERIM_L2 fires the Xe
+        // step on an UNCONVERGED flux, which is not a point of the composite map
+        // Anderson extrapolates, so every interim step is a plain Picard step
+        // taken outside the history.  Measured on this deck it costs rather than
+        // saves: 12,017 -> 14,332 outers at 1e-4 and 17,755 at 1e-5, with
+        // Anderson proposals collapsing 1,472 -> 664.  Staging keeps every Xe
+        // step on a CONVERGED flux -- converged to a looser tolerance, but
+        // consistently so, which is still a fixed point of a well-defined map --
+        // so the Anderson history stays valid and stays engaged.
+        static const double staged_flux_mult = [] {
+            const char*  v = std::getenv("RASBERY_STAGED_FLUX_TOL");
+            const double m = (v != nullptr) ? std::atof(v) : 1.0;
+            return (m >= 1.0) ? m : 1.0;   // a multiplier below 1 would TIGHTEN
+        }();
+        static const double staged_xe_mult = [] {
+            const char*  v = std::getenv("RASBERY_STAGED_XE_TOL");
+            const double m = (v != nullptr) ? std::atof(v) : 1.0;
+            return (m >= 1.0) ? m : 1.0;
+        }();
+        const bool staged_tol = staged_flux_mult > 1.0 || staged_xe_mult > 1.0;
+        // THE SEARCH SAMPLE'S OWN FLOOR.  A secant search reading k_eff off a
+        // flux converged no better than its own tolerance samples noise, and the
+        // rod-crit case (rodcrit_search_floor, above) is this code base's
+        // existing record of what that costs: the search bounces and spends more
+        // outers than the loosening saved.  So the loose keff tolerance is
+        // capped a factor STAGED_SEARCH_MARGIN below search_tol whenever a
+        // search is running -- the loosening is allowed to be large where
+        // nothing reads the digits and is not allowed to reach the digits the
+        // search reads.  With no search there is no such consumer and the
+        // multiplier stands as given.
+        constexpr double STAGED_SEARCH_MARGIN = 4.0;
+        const double loose_keff_tol =
+            has_search ? std::min(keff_tol * staged_flux_mult, search_tol / STAGED_SEARCH_MARGIN)
+                       : keff_tol * staged_flux_mult;
+        const double loose_flux_tol = std::max(loose_keff_tol, flux_tol * staged_flux_mult);
+        const double loose_xe_tol   = XE_EQUILIBRIUM_TOLERANCE * staged_xe_mult;
+        // FALSE means the loose stage is in force.  Latched true the first time
+        // every feedback agrees at the loose tolerance, and cleared again by any
+        // committed perturbation, because a perturbation invalidates the
+        // agreement that set it.  With the feature off it is true from the start
+        // and never read, so every tolerance below is the production one and the
+        // convergence break is exactly the pre-existing one.
+        bool polishing = !staged_tol;
+        // Telemetry only: how many times the loose stage's agreement failed to
+        // survive the polish pass.  A candidate whose thrash count is comparable
+        // to its search-trial count is one whose loosening is too aggressive.
+        int  polish_relapses = 0;
+
         ctx.cmfd_solver.resetIteration();
         ctx.cmfd_solver.upddtil();
         double residual   = 1.0;
@@ -2636,6 +2730,16 @@ private:
                                             ? ga_feedback_passes
                                             : ((xe_relax < 1.0) ? XE_EQUILIBRIUM_MAX_ITER_DAMPED
                                                                 : XE_EQUILIBRIUM_MAX_ITER);
+            // THIS OUTER'S TOLERANCES.  Resolved once, at the top, so the device
+            // segment and the host ladder cannot be asked at different stages
+            // within one outer -- the segment is handed these and decides
+            // flux_converged with them, and the ladder below re-derives the same
+            // verdict from the same pair.  With the feature off `polishing` is
+            // true from construction and all three are the production values, so
+            // these are three copies and no behaviour.
+            const double keff_tol_now = polishing ? keff_tol : loose_keff_tol;
+            const double flux_tol_now = polishing ? flux_tol : loose_flux_tol;
+            const double xe_tol_now   = polishing ? XE_EQUILIBRIUM_TOLERANCE : loose_xe_tol;
             // ===============================================================
             // Rev.7.1 Task 10: the SolveLoop delegation
             // ===============================================================
@@ -2669,8 +2773,8 @@ private:
                 s.eigv           = eigv;
                 s.residual       = residual;
                 s.prev_inner     = prev_inner;
-                s.keff_tol       = keff_tol;
-                s.flux_tol       = flux_tol;
+                s.keff_tol       = keff_tol_now;
+                s.flux_tol       = flux_tol_now;
                 s.max_outer_iter = static_cast<unsigned int>(schedule.max_outer_iter);
                 // The gates the decision reads.  They are this outer`s, not the
                 // previous one`s, because the ladder recomputes them below from
@@ -2759,7 +2863,7 @@ private:
             // outer belongs to (plan Rev.4 Sec 8 attribution rules).
             ++ctx.telemetry.outers_by_cause[sp_cause];
             outer_timing::buckets().outers.fetch_add(1, std::memory_order_relaxed);
-            flux_converged = std::abs(prev_inner - eigv) < keff_tol && residual < flux_tol;
+            flux_converged = std::abs(prev_inner - eigv) < keff_tol_now && residual < flux_tol_now;
             prev_inner     = eigv;
 
             // 2. Nodal correction -> CNCC (d-hat) + rod cusping macro-XS update. The cusping blend
@@ -2849,7 +2953,7 @@ private:
                                      xe_total >= XE_CASCADE_TOTAL_MULTIPLIER * xe_budget);
             const bool xe_pending = has_eq_xe && !xe_starved &&
                                     (xe_count + xe_interim_count == 0 ||
-                                     prev_xe_change >= XE_EQUILIBRIUM_TOLERANCE);
+                                     prev_xe_change >= xe_tol_now);
             // ONCE mode takes its one step on a CONVERGED flux -- that is the
             // whole point of the mode, an inventory consistent with the flux the
             // segment actually publishes -- so the interim probe is excluded
@@ -2900,7 +3004,7 @@ private:
             // that spent the last unit, so a budget that has just doubled because the
             // damper engaged is already reflected and cannot raise a false alarm.
             if (has_eq_xe && !xe_cap_charged && xe_starved &&
-                prev_xe_change >= XE_EQUILIBRIUM_TOLERANCE) {
+                prev_xe_change >= xe_tol_now) {
                 xe_cap_charged = true;
                 ++ctx.telemetry.xe_budget_exhausted;
                 // GA screening deliberately truncates the feedback passes, so the
@@ -3047,7 +3151,7 @@ private:
                 // It short-circuits on xe_once_mode, so with the mode unset this
                 // is exactly `xe_change >= XE_EQUILIBRIUM_TOLERANCE` and only that
                 // is evaluated.
-                if (xe_change >= XE_EQUILIBRIUM_TOLERANCE || (xe_once_mode && !xe_once_done)) {
+                if (xe_change >= xe_tol_now || (xe_once_mode && !xe_once_done)) {
                     // Cross sections changed; re-converge the flux before
                     // taking a search or T/H feedback step.
                     prev_inner  = eigv + 1.0;
@@ -3110,8 +3214,56 @@ private:
 
             // 6. All converged?
             if (search_converged && th_converged) {
+                // A2 STAGED TOLERANCE: agreement reached at the LOOSE tolerance
+                // is not an exit, it is the trigger for the polish pass.  Three
+                // things are restored here and re-tested, in the order the loop
+                // will meet them again:
+                //
+                //   the flux -- prev_inner is poisoned so the next outer is a
+                //   real re-drive rather than a re-read of the loose iterate,
+                //   and keff_tol_now/flux_tol_now become the production pair at
+                //   the top of that outer;
+                //
+                //   the Xe inventory -- prev_xe_change is re-armed to infinity
+                //   so xe_pending fires once more.  Without this the published
+                //   inventory would be the one equilibrated against the LOOSE
+                //   flux, and the whole point of the polish pass is that
+                //   everything it publishes met the production tolerance.  A
+                //   cascade that was already converged answers in one step;
+                //
+                //   the settling gate -- clean_iters is cleared so the search
+                //   re-samples k_eff off the polished flux rather than trusting
+                //   the loose sample it just accepted.
+                //
+                // If the search then disagrees at production tolerance it
+                // commits another trial and the block below drops back to loose,
+                // which is the self-correction this design rests on; the relapse
+                // is counted so an over-loose multiplier is visible as thrash
+                // rather than as an unexplained outer count.
+                if (!polishing) {
+                    polishing   = true;
+                    prev_inner  = eigv + 1.0;
+                    clean_iters = 0;
+                    if (has_eq_xe)
+                        prev_xe_change = std::numeric_limits<double>::infinity();
+                    if (trace_sl)
+                        std::cout << std::format(
+                            "        [STAGE] loose agreement at outer {}; polishing at "
+                            "keff_tol={:.2e} flux_tol={:.2e} xe_tol={:.2e}\n",
+                            iout, keff_tol, flux_tol, XE_EQUILIBRIUM_TOLERANCE);
+                    continue;
+                }
                 exit_reason = SolveExit::CONVERGED;
                 break;
+            }
+            // Production tolerance failed to hold what the loose stage agreed
+            // on.  Back to loose for the trial the perturbation blocks below are
+            // about to commit -- the point being converged to is about to move,
+            // so there is nothing left to polish.
+            if (staged_tol && polishing) {
+                polishing = false;
+                ++polish_relapses;
+                ++ctx.telemetry.staged_relapses;
             }
 
             // Otherwise perturb the unconverged feedbacks, then re-converge the flux.
@@ -3275,10 +3427,11 @@ private:
 
         if (trace_sl)
             std::cout << std::format(
-                "      [SL] outer+={} th+={} (search={} relax={:.3f} exit={} stalls={})\n",
+                "      [SL] outer+={} th+={} (search={} relax={:.3f} exit={} stalls={} "
+                "relapses={})\n",
                 total_outer - sl_outer0, total_th - sl_th0, has_search ? 1 : 0,
                 ctx.cross_sections.rod_cusping_relaxation(), SolveExitName(exit_reason),
-                stall_events);
+                stall_events, polish_relapses);
     }
 
     /// Where this run's restart_<step>.h5 goes (plan Rev.4 Sec 7).
@@ -3647,7 +3800,7 @@ public:
                     "\"xe_aa_rejected\":{},\"xe_aa_history_resets\":{},"
                     "\"xe_outers\":{},\"search_trials\":{},\"search_outers\":{},"
                     "\"th_updates\":{},\"th_outers\":{},\"settle_outers\":{},"
-                    "\"fallback_outers\":{},\"th_search_coincident\":{},"
+                    "\"fallback_outers\":{},\"staged_relapses\":{},\"th_search_coincident\":{},"
                     "\"flux_limit_retries\":{},\"solve_loops\":{},\"cmfd_sweeps\":{},"
                     "\"bicg_iters\":{},\"graph_launches_delta\":{},\"h2d_bytes_delta\":{},"
                     "\"d2h_bytes_delta\":{},\"d2h_calls_delta\":{},\"counters_shared\":{},"
@@ -3664,7 +3817,8 @@ public:
                     c.search_trials, c.outers_by_cause[sptelem::CAUSE_SEARCH],
                     c.th_updates, c.outers_by_cause[sptelem::CAUSE_TH],
                     c.outers_by_cause[sptelem::CAUSE_SETTLE],
-                    c.outers_by_cause[sptelem::CAUSE_FALLBACK], c.th_search_coincident,
+                    c.outers_by_cause[sptelem::CAUSE_FALLBACK], c.staged_relapses,
+                    c.th_search_coincident,
                     c.flux_limit_retries, c.solve_loops, c.cmfd_sweeps, c.bicg_iters,
                     c.graph_delta, c.h2d_delta, c.d2h_delta, c.d2h_calls_delta, shared,
                     c.wall, c.io_wall, c.phase[sptelem::PH_UPDPSI],
@@ -3740,7 +3894,7 @@ public:
                 "\"xe_aa_rejected\":{},\"xe_aa_history_resets\":{},"
                 "\"xe_outers\":{},\"search_trials\":{},\"search_outers\":{},"
                 "\"th_updates\":{},\"th_outers\":{},\"settle_outers\":{},"
-                "\"fallback_outers\":{},\"th_search_coincident\":{},"
+                "\"fallback_outers\":{},\"staged_relapses\":{},\"th_search_coincident\":{},"
                 "\"flux_limit_retries\":{},\"solve_loops\":{},\"cmfd_sweeps\":{},"
                 "\"bicg_iters\":{},\"graph_launches_delta\":{},\"h2d_bytes_delta\":{},"
                 "\"d2h_bytes_delta\":{},\"d2h_calls_delta\":{},\"counters_shared\":{},"
@@ -3760,7 +3914,8 @@ public:
                 c.search_trials, c.outers_by_cause[sptelem::CAUSE_SEARCH],
                 c.th_updates, c.outers_by_cause[sptelem::CAUSE_TH],
                 c.outers_by_cause[sptelem::CAUSE_SETTLE],
-                c.outers_by_cause[sptelem::CAUSE_FALLBACK], c.th_search_coincident,
+                c.outers_by_cause[sptelem::CAUSE_FALLBACK], c.staged_relapses,
+                c.th_search_coincident,
                 c.flux_limit_retries, c.solve_loops, c.cmfd_sweeps, c.bicg_iters,
                 c.graph_delta, c.h2d_delta, c.d2h_delta, c.d2h_calls_delta,
                 sp_slot >= 0, init_seconds, init_seconds, library_seconds,
