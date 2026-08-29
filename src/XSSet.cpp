@@ -3008,8 +3008,15 @@ void XSSet::UpdateFlatXS(const XSUpdateOptions& options) {
     const int  nxyz       = _g.nxyz();
     const bool all_nodes  = options.nodes.empty();
     const int  node_count = all_nodes ? nxyz : static_cast<int>(options.nodes.size());
+    // WP9-A: the third argument mirrors this call into the per-statepoint,
+    // per-thread `nested_wall` the SPTELEM receipt publishes.  It is the ONLY
+    // nested bucket, because UpdateFlatXS is the one host phase that runs
+    // inside several different floor/loop buckets (SetBoron, UpdateTH,
+    // UpdateBurnup, the depletion steps) and therefore cannot be attributed by
+    // its call site alone.
     xsphase::Scope flatxs_scope(xsphase::tallies().flatxs,
-                                static_cast<std::uint64_t>(node_count));
+                                static_cast<std::uint64_t>(node_count),
+                                xsphase::LB_FLATXS);
     _boron_dmod_average   = FuelVolumeAverageDmod(_g);
 
     // Device arm (RASBERY_GPU_FLATXS) and capture (RASBERY_FLATXS_DUMP): both

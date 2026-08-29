@@ -218,6 +218,174 @@ for phase in ("updpsi", "setls", "drive", "updjnet", "nodal", "cusping", "upddha
         fail(f"phase_wall missing bucket {phase!r}")
 
 # ---------------------------------------------------------------------------
+# 6b. WP9-A: the host floor, re-decomposed.  THREE non-overlapping wall objects
+#     plus one that is explicitly NOT additive, and the boundary transfer bill.
+#
+#     The load-bearing property is the SEPARATION, not the presence.
+#     tools/scheduler_trace_replay.py derives a statepoint's boundary work as
+#     `wall - sum(phase_wall)` and is calibrated on that; folding a new bucket
+#     into phase_wall would silently move a number a model depends on.  So
+#     phase_wall must still hold EXACTLY the seven outer-body phases, and
+#     everything WP9-A named must live in loop_wall / floor_wall / nested_wall.
+# ---------------------------------------------------------------------------
+LOOP_BUCKETS = ("th_update", "xe_step", "search_propose", "search_apply")
+FLOOR_BUCKETS = ("ppr_reset", "ppr_drive", "ppr_recon", "depl_predictor",
+                 "depl_corrector", "result_add", "result_write")
+
+
+def json_object(block: str, key: str) -> str:
+    """The text of the `"key":{...}` object inside a receipt format string."""
+    plain = block.replace('\\"', '"')
+    i = plain.find(f'"{key}":{{{{')
+    if i < 0:
+        fail(f"receipt has no {key!r} object")
+    j = plain.find("}}", i)
+    if j < 0:
+        fail(f"receipt's {key!r} object is not closed")
+    return plain[i:j]
+
+
+for name, block in (("per-statepoint", step_block), ("summary", summary_block)):
+    phase_obj = json_object(block, "phase_wall")
+    got = tuple(re.findall(r'"([a-z_0-9]+)":', phase_obj))[1:]  # drop the key itself
+    if got != ("updpsi", "setls", "drive", "updjnet", "nodal", "cusping", "upddhat"):
+        fail(f"{name} phase_wall is no longer exactly the seven outer-body phases "
+             f"({list(got)}); tools/scheduler_trace_replay.py is calibrated on that set")
+    loop_obj = json_object(block, "loop_wall")
+    for bucket in LOOP_BUCKETS:
+        if f'"{bucket}":' not in loop_obj:
+            fail(f"{name} loop_wall missing bucket {bucket!r}")
+    floor_obj = json_object(block, "floor_wall")
+    for bucket in FLOOR_BUCKETS:
+        if f'"{bucket}":' not in floor_obj:
+            fail(f"{name} floor_wall missing bucket {bucket!r}")
+    nested_obj = json_object(block, "nested_wall")
+    for bucket in ("flatxs", "flatxs_calls"):
+        if f'"{bucket}":' not in nested_obj:
+            fail(f"{name} nested_wall missing bucket {bucket!r}")
+    transfer_obj = json_object(block, "floor_transfer")
+    for bucket in ("h2d_bytes", "h2d_calls", "d2h_bytes", "d2h_calls"):
+        if f'"{bucket}":' not in transfer_obj:
+            fail(f"{name} floor_transfer missing {bucket!r}")
+    # Negative control: a bucket may appear in exactly ONE of the three additive
+    # objects.  A name in two of them is a double count, and the residual the
+    # ledger prints would silently absorb it.
+    seen = {}
+    for obj_name, obj in (("phase_wall", phase_obj), ("loop_wall", loop_obj),
+                          ("floor_wall", floor_obj)):
+        for bucket in re.findall(r'"([a-z_0-9]+)":', obj)[1:]:
+            if bucket in seen:
+                fail(f"{name}: bucket {bucket!r} is in both {seen[bucket]!r} and "
+                     f"{obj_name!r}; the three wall objects must not overlap")
+            seen[bucket] = obj_name
+
+# The scopes that fill the new buckets sit on the calls they name.  Each is
+# checked at its site, so a bucket cannot quietly become a bucket of nothing.
+for anchor, phase in (
+    ("th_dop = ctx.cross_sections.UpdateTH(power_fraction);", "PH_TH_UPDATE"),
+    ("schedule.CommitSearchPoint(eigv, next_x, ctx.search_memory);", "PH_SEARCH_PROPOSE"),
+    ("input_output.WriteStepToResult(geometry, cross_sections, step_index);",
+     "PH_RESULT_WRITE"),
+):
+    i = DRIVER.find(anchor)
+    if i < 0:
+        fail(f"WP9-A instrumentation anchor vanished: {anchor!r}")
+    if f"sptelem::{phase}" not in DRIVER[max(0, i - 1500):i]:
+        fail(f"{phase} has no scope opened before {anchor!r}")
+# xe_step is charged over the WHOLE Xe step region -- the Anderson attempt, the
+# production Picard step and the trust-region bookkeeping -- so it is pinned by
+# position rather than by proximity: the scope opens inside the Xe step block
+# and before the production call, which is the only placement with no hole in it
+# and no edit to the call site tools/test_xe_anderson.py pins.
+xe_block = DRIVER.find("(flux_converged || xe_interim || stall_sample)) {")
+xe_scope = DRIVER.find("outer_timing::Scope xe_step_scope(sptelem::PH_XE_STEP);")
+xe_call = DRIVER.find(
+    "ctx.cross_sections.UpdateEquilibriumXenon(schedule.thermalPower(), xe_relax);")
+if not (0 <= xe_block < xe_scope < xe_call):
+    fail("PH_XE_STEP is not opened inside the Xe step block, before the production "
+         "UpdateEquilibriumXenon call")
+if DRIVER.count("outer_timing::Scope apply_scope(sptelem::PH_SEARCH_APPLY);") != 3:
+    fail("search_apply must be charged at all three SetBoron/SetRod sites "
+         "(first trial, committed trial, best-point fallback)")
+
+# The XS phase mirror: armed from the one gate, never gated on its own, and
+# differenced across the statepoint like every other bucket.
+if "xsphase::armLocalWall(sp_telem);" not in DRIVER:
+    fail("the XS phase mirror is not armed from Drive()'s telemetry gate")
+XSTIMING = (ROOT / "src" / "XSTiming.h").read_text(encoding="utf-8-sig")
+if "LB_FLATXS" not in XSTIMING or "inline LocalWall& localWall()" not in XSTIMING:
+    fail("XSTiming.h has no per-statepoint local bucket")
+if "static thread_local LocalWall wall;" not in XSTIMING:
+    fail("the XS phase mirror is not thread-local; it would mix batch decks")
+XSSET = (ROOT / "src" / "XSSet.cpp").read_text(encoding="utf-8-sig")
+if "xsphase::LB_FLATXS" not in XSSET:
+    fail("UpdateFlatXS does not feed the nested_wall bucket")
+
+# The boundary transfer baseline is armed AFTER the last SolveLoop and BEFORE
+# PPR.  Armed anywhere else, `floor_transfer` would be measuring something else.
+arm_floor = drive.find("ctx.telemetry.armFloor(")
+last_solve = drive.rfind("SolveLoop(ctx, eigv, schedule, total_outer", 0, arm_floor)
+ppr = drive.find("resetAndDriveGpu(", arm_floor)
+if not (0 <= last_solve < arm_floor < ppr):
+    fail("the floor transfer baseline is not armed between the last SolveLoop and PPR")
+if drive.count("ctx.telemetry.armFloor(") != 1:
+    fail("the floor transfer baseline is armed more than once")
+
+# ---------------------------------------------------------------------------
+# 6c. Negative control for a defect no reviewer can see and no compiler here can
+#     catch: a receipt whose std::format placeholder count and argument count
+#     have drifted apart.  Both receipts are re-counted from the source.
+# ---------------------------------------------------------------------------
+def format_call(text: str, anchor: str) -> tuple[str, list[str]]:
+    i = text.index(anchor)
+    start = text.rindex("std::format(", 0, i) + len("std::format(")
+    j, depth = start, 1
+    while depth:
+        if text[j] == "(":
+            depth += 1
+        elif text[j] == ")":
+            depth -= 1
+        j += 1
+    body = text[start:j - 1]
+    literal = re.compile(r'"(?:[^"\\]|\\.)*"')
+    pos, parts = 0, []
+    while True:
+        m = literal.match(body, pos)
+        if not m:
+            skip = re.match(r"\s*(//[^\n]*\n\s*)*", body[pos:])
+            if skip and skip.end():
+                pos += skip.end()
+                m = literal.match(body, pos)
+            if not m:
+                break
+        parts.append(m.group(0)[1:-1])
+        pos = m.end()
+    rest = body[pos:].lstrip()
+    if not rest.startswith(","):
+        fail(f"cannot split the format string from its arguments at {anchor!r}")
+    args, depth, cur = [], 0, ""
+    for ch in rest[1:]:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            args.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    args.append(cur)
+    args = [a for a in (re.sub(r"//[^\n]*", "", a).strip() for a in args) if a]
+    return "".join(parts), args
+
+
+for anchor in ('"[RASBERY][SPTELEM] {{', '"[RASBERY][SPTELEM][SUMMARY] {{'):
+    fmt, args = format_call(DRIVER, anchor)
+    holes = re.findall(r"\{[^{}]*\}", fmt.replace("{{", "\x01").replace("}}", "\x02"))
+    if len(holes) != len(args):
+        fail(f"{anchor}: {len(holes)} format placeholders but {len(args)} arguments")
+
+# ---------------------------------------------------------------------------
 # 7. The phase wall must be per-thread, and must still feed the pre-existing
 #    process-wide RASBERY_OUTER_TIMING receipt unchanged.
 # ---------------------------------------------------------------------------

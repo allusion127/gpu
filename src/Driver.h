@@ -9,6 +9,7 @@
 #include "OuterTrace.h"
 #include "PPR.h"
 #include "Scheduler.h"
+#include "XSTiming.h"
 #include "XeGpuReceipt.h"
 #include "XeKernel.h"
 
@@ -98,6 +99,22 @@ enum Phase : int {
     PH_NODAL,
     PH_CUSPING,
     PH_UPDDHAT,
+    // --- SolveLoop phases OUTSIDE the outer body (WP9 stage A) --------------
+    // GA evaluator plan Sec 3.2 measured the gap these close.  The regression
+    // slope of the statepoint cost model is d = 4.805 ms/outer; the seven outer
+    // body phases above sum to 4.428 ms/outer, and the document names the
+    // missing 0.377 ms/outer as "the things outside the Scopes (Xe update,
+    // convergence decision, search arithmetic)" without an instrument behind
+    // that sentence.  These four are that instrument.  They live INSIDE
+    // SolveLoop, so they belong to `d` and not to the statepoint floor `c` --
+    // which is why they get their own `loop_wall` object and are neither folded
+    // into `phase_wall` (that object is calibrated on by
+    // tools/scheduler_trace_replay.py) nor into `floor_wall` (that object is
+    // the statepoint boundary, and these are not on it).
+    PH_TH_UPDATE,       ///< XSSet::UpdateTH, whole call (incl. its UpdateFlatXS)
+    PH_XE_STEP,         ///< XSSet::UpdateEquilibriumXenon, the production Picard step
+    PH_SEARCH_PROPOSE,  ///< ProposeNextSearchPoint + CommitSearchPoint: the secant arithmetic
+    PH_SEARCH_APPLY,    ///< SetBoron/SetRod for a committed trial (incl. its UpdateFlatXS)
     // --- statepoint FLOOR phases (outside the outer body) -------------------
     // The regression of GPU_RASBERY_GA_EVALUATOR_PLAN Sec 2.2 splits a
     // statepoint into `c + d x outer`.  The seven phases above are `d` -- the
@@ -117,7 +134,9 @@ enum Phase : int {
     PH_DEPL_PRED,                  ///< XSSet::PredictorStep (CRAM Bateman, BOS)
     PH_DEPL_CORR,                  ///< XSSet::CorrectorStep (CRAM Bateman, EOS)
     PH_RESULT_ADD,                 ///< IO::AddResult (result packing), the head of io_wall
+    PH_RESULT_WRITE,               ///< BatchLightResult::Write | IO::WriteStepToResult
     PH_COUNT,
+    PH_LOOP_FIRST  = PH_TH_UPDATE,
     PH_FLOOR_FIRST = PH_PPR_RESET,
 };
 
@@ -130,12 +149,17 @@ inline const char* phaseName(int phase) {
         case PH_NODAL:   return "nodal";
         case PH_CUSPING: return "cusping";
         case PH_UPDDHAT: return "upddhat";
+        case PH_TH_UPDATE:      return "th_update";
+        case PH_XE_STEP:        return "xe_step";
+        case PH_SEARCH_PROPOSE: return "search_propose";
+        case PH_SEARCH_APPLY:   return "search_apply";
         case PH_PPR_RESET:  return "ppr_reset";
         case PH_PPR_DRIVE:  return "ppr_drive";
         case PH_PPR_RECON:  return "ppr_recon";
         case PH_DEPL_PRED:  return "depl_predictor";
         case PH_DEPL_CORR:  return "depl_corrector";
         case PH_RESULT_ADD: return "result_add";
+        case PH_RESULT_WRITE: return "result_write";
         default:         break;
     }
     return "unknown";
@@ -228,8 +252,29 @@ struct Counters {
     double    io_wall              = 0.0;
     double    phase[PH_COUNT]{};
 
+    /// WP9-A `nested_wall`: XS phases that run INSIDE the buckets above and are
+    /// therefore published beside them rather than summed with them.
+    double    xs_wall[xsphase::LB_COUNT]{};
+    long long xs_calls[xsphase::LB_COUNT]{};
+
+    /// WP9-A `floor_transfer`: the host copies charged to the STATEPOINT
+    /// BOUNDARY, i.e. everything after the statepoint's last SolveLoop
+    /// returned -- PPR's inputs, the result packing, the restart save.  The
+    /// existing `*_delta` fields below span the WHOLE statepoint, so
+    /// `delta - floor` is the in-iteration half and no field has to be
+    /// re-interpreted to get either.
+    std::uint64_t floor_h2d_bytes = 0, floor_h2d_calls = 0;
+    std::uint64_t floor_d2h_bytes = 0, floor_d2h_calls = 0;
+
     double        phase0[PH_COUNT]{};
+    double        xs_wall0[xsphase::LB_COUNT]{};
+    long long     xs_calls0[xsphase::LB_COUNT]{};
     std::uint64_t graph0 = 0, h2d0 = 0, d2h0 = 0, d2h_calls0 = 0;
+    /// The floor baseline, armed by armFloor() after the last SolveLoop.  A
+    /// statepoint that never armed it reports a zero floor rather than the
+    /// difference against an unrelated baseline.
+    bool          floor_armed = false;
+    std::uint64_t fh2d0 = 0, fh2d_calls0 = 0, fd2h0 = 0, fd2h_calls0 = 0;
     std::uint64_t graph_delta = 0, h2d_delta = 0, d2h_delta = 0, d2h_calls_delta = 0;
 
     [[nodiscard]] long long outers() const {
@@ -244,21 +289,52 @@ struct Counters {
         *this                 = Counters{};
         const double* current = phaseWall();
         for (int p = 0; p < PH_COUNT; ++p) phase0[p] = current[p];
+        const xsphase::LocalWall& xs = xsphase::localWall();
+        for (int b = 0; b < xsphase::LB_COUNT; ++b) {
+            xs_wall0[b]  = xs.seconds[b];
+            xs_calls0[b] = xs.calls[b];
+        }
         graph0     = graph;
         h2d0       = h2d;
         d2h0       = d2h;
         d2h_calls0 = d2h_calls;
     }
 
+    /// Arm the STATEPOINT-BOUNDARY transfer baseline.  Called once, after the
+    /// statepoint's last SolveLoop has returned and before PPR: everything
+    /// after this point is floor work, so everything it copies is a boundary
+    /// copy.  Idempotent by the `floor_armed` latch -- a second call would move
+    /// the baseline forward and silently shrink the floor.
+    void armFloor(std::uint64_t h2d, std::uint64_t h2d_calls, std::uint64_t d2h,
+                  std::uint64_t d2h_calls) {
+        if (floor_armed) return;
+        floor_armed = true;
+        fh2d0       = h2d;
+        fh2d_calls0 = h2d_calls;
+        fd2h0       = d2h;
+        fd2h_calls0 = d2h_calls;
+    }
+
     /// Close the statepoint: resolve every delta against the armed baselines.
-    void end(std::uint64_t graph, std::uint64_t h2d, std::uint64_t d2h,
-             std::uint64_t d2h_calls) {
+    void end(std::uint64_t graph, std::uint64_t h2d, std::uint64_t h2d_calls,
+             std::uint64_t d2h, std::uint64_t d2h_calls) {
         const double* current = phaseWall();
         for (int p = 0; p < PH_COUNT; ++p) phase[p] = current[p] - phase0[p];
+        const xsphase::LocalWall& xs = xsphase::localWall();
+        for (int b = 0; b < xsphase::LB_COUNT; ++b) {
+            xs_wall[b]  = xs.seconds[b] - xs_wall0[b];
+            xs_calls[b] = xs.calls[b] - xs_calls0[b];
+        }
         graph_delta     = graph - graph0;
         h2d_delta       = h2d - h2d0;
         d2h_delta       = d2h - d2h0;
         d2h_calls_delta = d2h_calls - d2h_calls0;
+        if (floor_armed) {
+            floor_h2d_bytes = h2d - fh2d0;
+            floor_h2d_calls = h2d_calls - fh2d_calls0;
+            floor_d2h_bytes = d2h - fd2h0;
+            floor_d2h_calls = d2h_calls - fd2h_calls0;
+        }
     }
 
     /// Fold one closed statepoint into a run-total accumulator.
@@ -266,6 +342,14 @@ struct Counters {
         for (int c = 0; c < CAUSE_COUNT; ++c)
             outers_by_cause[c] += step.outers_by_cause[c];
         for (int p = 0; p < PH_COUNT; ++p) phase[p] += step.phase[p];
+        for (int b = 0; b < xsphase::LB_COUNT; ++b) {
+            xs_wall[b]  += step.xs_wall[b];
+            xs_calls[b] += step.xs_calls[b];
+        }
+        floor_h2d_bytes      += step.floor_h2d_bytes;
+        floor_h2d_calls      += step.floor_h2d_calls;
+        floor_d2h_bytes      += step.floor_d2h_bytes;
+        floor_d2h_calls      += step.floor_d2h_calls;
         outers_driver        += step.outers_driver;
         solve_loops          += step.solve_loops;
         xe_updates           += step.xe_updates;
@@ -2842,6 +2926,10 @@ private:
             }
             // First entry into this schedule step: pick an initial guess and apply it.
             if (!schedule.search_initialized) {
+                // Charged to search_apply like every other trial: it IS the
+                // first trial point, and leaving it out would make the
+                // per-trial cost of a statepoint look cheaper by one.
+                outer_timing::Scope apply_scope(sptelem::PH_SEARCH_APPLY);
                 schedule.StartCriticalSearch(ctx.search_memory, ctx.geometry.bppm(0),
                                              ctx.cross_sections.rod_max_step());
                 if (schedule.searchType == SearchType::BORON)
@@ -3493,6 +3581,17 @@ private:
             // is chasing.
             if (has_eq_xe && !xe_starved && (!xe_once_mode || !xe_once_done) &&
                 (flux_converged || xe_interim || stall_sample)) {
+                // WP9-A `loop_wall.xe_step`: THE WHOLE Xe step region -- the
+                // Anderson attempt, the production Picard step it falls back
+                // to, and the trust-region / damper bookkeeping that follows.
+                // Whole, and not just the production call, for two reasons.
+                // The bucket then has no hole: `xe_updates +
+                // xe_interim_updates` is exactly its call count whichever arm
+                // took the step, and the Anderson/Picard split stays readable
+                // from `xe_aa_accepted` in the same receipt.  And it keeps the
+                // production call site textually untouched, which is what
+                // tools/test_xe_anderson.py pins.
+                outer_timing::Scope xe_step_scope(sptelem::PH_XE_STEP);
                 // ONCE sizes THIS step, here, because the size is per-step and
                 // not per-iteration: a full step unless the trust region has
                 // already been breached this cascade (xe_once_steps > 0) or the
@@ -3760,7 +3859,13 @@ private:
 
             // Otherwise perturb the unconverged feedbacks, then re-converge the flux.
             if (has_th && !th_converged) {
-                th_dop = ctx.cross_sections.UpdateTH(power_fraction);
+                {
+                    // WP9-A `loop_wall.th_update`: the whole call, including
+                    // the UpdateFlatXS it ends with.  `nested_wall.flatxs`
+                    // says how much of it that was.
+                    outer_timing::Scope th_scope(sptelem::PH_TH_UPDATE);
+                    th_dop = ctx.cross_sections.UpdateTH(power_fraction);
+                }
                 ++total_th;
                 ++th_count;
                 ++ctx.telemetry.th_updates;
@@ -3780,6 +3885,13 @@ private:
                     break;
                 }
                 {
+                    // WP9-A `loop_wall.search_propose`: the secant/bracket
+                    // arithmetic and the commit.  No cross sections move in
+                    // here -- that is the next bucket -- so the two together
+                    // are what one search TRIAL costs on the host, which is
+                    // the number WP9-D's trial-reduction options are priced
+                    // against.
+                    outer_timing::Scope propose_scope(sptelem::PH_SEARCH_PROPOSE);
                     double      next_x = schedule.search_current_x;
                     std::string method;
                     bool        bracket_not_found = false;
@@ -3801,11 +3913,18 @@ private:
                                                        schedule.search_bracket_hi_x)
                                          : std::string("none"));
                 }
-                if (schedule.searchType == SearchType::BORON)
-                    ctx.cross_sections.SetBoron(schedule.search_current_x);
-                else {
-                    ctx.cross_sections.SetRod(schedule.search_current_x);
-                    schedule.rod_step = schedule.search_current_x;
+                {
+                    // WP9-A `loop_wall.search_apply`: the trial point reaching
+                    // the macro cross sections.  SetBoron/SetRod end in
+                    // UpdateFlatXS, so this is where a boron trial's real host
+                    // cost is, and `nested_wall.flatxs` is how much of it.
+                    outer_timing::Scope apply_scope(sptelem::PH_SEARCH_APPLY);
+                    if (schedule.searchType == SearchType::BORON)
+                        ctx.cross_sections.SetBoron(schedule.search_current_x);
+                    else {
+                        ctx.cross_sections.SetRod(schedule.search_current_x);
+                        schedule.rod_step = schedule.search_current_x;
+                    }
                 }
                 // Committed AND applied: this is the trial the segment below
                 // pays for.  A T/H step in the same outer loses the tie-break
@@ -3874,11 +3993,14 @@ private:
                        std::abs(schedule.search_best_residual) < std::abs(k_res)) {
                 const double from_x = schedule.search_current_x;
                 schedule.search_current_x = schedule.search_best_x;
-                if (schedule.searchType == SearchType::BORON)
-                    ctx.cross_sections.SetBoron(schedule.search_current_x);
-                else {
-                    ctx.cross_sections.SetRod(schedule.search_current_x);
-                    schedule.rod_step = schedule.search_current_x;
+                {
+                    outer_timing::Scope apply_scope(sptelem::PH_SEARCH_APPLY);
+                    if (schedule.searchType == SearchType::BORON)
+                        ctx.cross_sections.SetBoron(schedule.search_current_x);
+                    else {
+                        ctx.cross_sections.SetRod(schedule.search_current_x);
+                        schedule.rod_step = schedule.search_current_x;
+                    }
                 }
                 const int fallback_outer0 = total_outer;
                 ReconvergeFlux(ctx, eigv, FALLBACK_RECONVERGE_ITER, keff_tol, flux_tol,
@@ -3971,6 +4093,11 @@ public:
         // Phase 2 statepoint telemetry (plan Rev.4 Sec 8).  One static-local
         // bool read; every cost beyond the plain counters hangs off it.
         const bool sp_telem = sptelem::enabled();
+        // WP9-A: the XS phase mirror (XSTiming.h) is armed from THIS gate and
+        // nowhere else, so RASBERY_STATEPOINT_TELEMETRY keeps exactly one
+        // reader in the tree and XSSet cannot form a second opinion about what
+        // the run was asked for.
+        xsphase::armLocalWall(sp_telem);
         // Inner GA evaluations only need scalar fitness/safety receipts.  Full
         // HDF5/restart/pin output remains the default and is used for selected
         // exact cases; light mode avoids queueing mutable Geometry/Schedule
@@ -4233,6 +4360,19 @@ public:
                 cross_sections.NormalizeFluxSign();
             }
 
+            // WP9-A: the statepoint's iteration is over.  Everything from here
+            // to the receipt below is FLOOR work -- PPR, result packing, the
+            // restart save -- so the transfer counters are re-baselined here
+            // and `floor_transfer` is the host-copy bill of the boundary alone.
+            // One struct read per statepoint, behind the telemetry gate.
+            if (sp_telem) {
+                const BackendCounters at_floor = cmfd_solver.backendCounters();
+                ctx.telemetry.armFloor(at_floor.bulk_h2d_bytes_during_iteration,
+                                       at_floor.bulk_h2d_calls_during_iteration,
+                                       at_floor.bulk_d2h_bytes_during_iteration,
+                                       at_floor.bulk_d2h_calls_during_iteration);
+            }
+
             // PPR
             // Corner-balance iteration cap.  The loop exits early on its own
             // corner-flux tolerance; measured on KNGR CY1 it needs ~50 rounds,
@@ -4318,17 +4458,24 @@ public:
                                          geometry, cross_sections, eigv, efpd, step_number);
             }
 
-            if (light_result) {
-                BatchLightResult::Write(_input, input_output.xs_path(),
-                                        schedule.step, schedule.substep,
-                                        schedule.efpd, schedule.bu_avg,
-                                        schedule.eigv, schedule.ppm,
-                                        schedule.ao, schedule.fqp, schedule.frp,
-                                        schedule.search_exit_status,
-                                        schedule.search_exit_dk,
-                                        schedule.search_exit_tol);
-            } else {
-                input_output.WriteStepToResult(geometry, cross_sections, step_index);
+            {
+                // WP9-A `floor_wall.result_write`: the scalar JSONL line or the
+                // HDF5 step write.  Separate from `result_add` because the two
+                // answer different questions -- AddResult is the packing every
+                // mode pays, this is what the chosen output mode costs on top.
+                outer_timing::Scope write_scope(sptelem::PH_RESULT_WRITE);
+                if (light_result) {
+                    BatchLightResult::Write(_input, input_output.xs_path(),
+                                            schedule.step, schedule.substep,
+                                            schedule.efpd, schedule.bu_avg,
+                                            schedule.eigv, schedule.ppm,
+                                            schedule.ao, schedule.fqp, schedule.frp,
+                                            schedule.search_exit_status,
+                                            schedule.search_exit_dk,
+                                            schedule.search_exit_tol);
+                } else {
+                    input_output.WriteStepToResult(geometry, cross_sections, step_index);
+                }
             }
             const double step_io_seconds =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - io_start).count();
@@ -4341,6 +4488,7 @@ public:
                 const BackendCounters now = cmfd_solver.backendCounters();
                 ctx.telemetry.end(now.graph_launches,
                                   now.bulk_h2d_bytes_during_iteration,
+                                  now.bulk_h2d_calls_during_iteration,
                                   now.bulk_d2h_bytes_during_iteration,
                                   now.bulk_d2h_calls_during_iteration);
                 ctx.telemetry.outers_driver = total_outer;
@@ -4382,10 +4530,16 @@ public:
                     "\"d2h_bytes_delta\":{},\"d2h_calls_delta\":{},\"counters_shared\":{},"
                     "\"wall\":{:.6f},\"io_wall\":{:.6f},\"phase_wall\":{{\"updpsi\":{:.6f},"
                     "\"setls\":{:.6f},\"drive\":{:.6f},\"updjnet\":{:.6f},\"nodal\":{:.6f},"
-                    "\"cusping\":{:.6f},\"upddhat\":{:.6f}}},\"floor_wall\":{{"
+                    "\"cusping\":{:.6f},\"upddhat\":{:.6f}}},\"loop_wall\":{{"
+                    "\"th_update\":{:.6f},\"xe_step\":{:.6f},"
+                    "\"search_propose\":{:.6f},\"search_apply\":{:.6f}}},"
+                    "\"floor_wall\":{{"
                     "\"ppr_reset\":{:.6f},\"ppr_drive\":{:.6f},\"ppr_recon\":{:.6f},"
                     "\"depl_predictor\":{:.6f},\"depl_corrector\":{:.6f},"
-                    "\"result_add\":{:.6f}}}}}\n",
+                    "\"result_add\":{:.6f},\"result_write\":{:.6f}}},"
+                    "\"nested_wall\":{{\"flatxs\":{:.6f},\"flatxs_calls\":{}}},"
+                    "\"floor_transfer\":{{\"h2d_bytes\":{},\"h2d_calls\":{},"
+                    "\"d2h_bytes\":{},\"d2h_calls\":{}}}}}\n",
                     sp_job_id, sp_slot, step_number, efpd, total_outer, c.outers(),
                     c.outers_by_cause[sptelem::CAUSE_INITIAL], xeModeName(),
                     c.xe_updates, c.xe_interim_updates, c.xe_cascades, xe_per_cascade,
@@ -4404,9 +4558,15 @@ public:
                     c.phase[sptelem::PH_SETLS], c.phase[sptelem::PH_DRIVE],
                     c.phase[sptelem::PH_UPDJNET], c.phase[sptelem::PH_NODAL],
                     c.phase[sptelem::PH_CUSPING], c.phase[sptelem::PH_UPDDHAT],
+                    c.phase[sptelem::PH_TH_UPDATE], c.phase[sptelem::PH_XE_STEP],
+                    c.phase[sptelem::PH_SEARCH_PROPOSE], c.phase[sptelem::PH_SEARCH_APPLY],
                     c.phase[sptelem::PH_PPR_RESET], c.phase[sptelem::PH_PPR_DRIVE],
                     c.phase[sptelem::PH_PPR_RECON], c.phase[sptelem::PH_DEPL_PRED],
-                    c.phase[sptelem::PH_DEPL_CORR], c.phase[sptelem::PH_RESULT_ADD]));
+                    c.phase[sptelem::PH_DEPL_CORR], c.phase[sptelem::PH_RESULT_ADD],
+                    c.phase[sptelem::PH_RESULT_WRITE],
+                    c.xs_wall[xsphase::LB_FLATXS], c.xs_calls[xsphase::LB_FLATXS],
+                    c.floor_h2d_bytes, c.floor_h2d_calls,
+                    c.floor_d2h_bytes, c.floor_d2h_calls));
                 sp_run.accumulate(c);
             }
 
@@ -4542,10 +4702,16 @@ public:
                 "\"solve_wall\":{:.6f},\"io_wall\":{:.6f},\"total_seconds\":{:.6f},"
                 "\"phase_wall\":{{\"updpsi\":{:.6f},\"setls\":{:.6f},\"drive\":{:.6f},"
                 "\"updjnet\":{:.6f},\"nodal\":{:.6f},\"cusping\":{:.6f},"
-                "\"upddhat\":{:.6f}}},\"floor_wall\":{{"
+                "\"upddhat\":{:.6f}}},\"loop_wall\":{{"
+                "\"th_update\":{:.6f},\"xe_step\":{:.6f},"
+                "\"search_propose\":{:.6f},\"search_apply\":{:.6f}}},"
+                "\"floor_wall\":{{"
                 "\"ppr_reset\":{:.6f},\"ppr_drive\":{:.6f},\"ppr_recon\":{:.6f},"
                 "\"depl_predictor\":{:.6f},\"depl_corrector\":{:.6f},"
-                "\"result_add\":{:.6f}}}}}\n",
+                "\"result_add\":{:.6f},\"result_write\":{:.6f}}},"
+                "\"nested_wall\":{{\"flatxs\":{:.6f},\"flatxs_calls\":{}}},"
+                "\"floor_transfer\":{{\"h2d_bytes\":{},\"h2d_calls\":{},"
+                "\"d2h_bytes\":{},\"d2h_calls\":{}}}}}\n",
                 sp_job_id, sp_slot, static_cast<int>(scheduler.schedule().size()),
                 c.outers_driver, c.outers(), c.outers_by_cause[sptelem::CAUSE_INITIAL],
                 xeModeName(), c.xe_updates, c.xe_interim_updates, c.xe_cascades,
@@ -4567,9 +4733,15 @@ public:
                 c.phase[sptelem::PH_DRIVE], c.phase[sptelem::PH_UPDJNET],
                 c.phase[sptelem::PH_NODAL], c.phase[sptelem::PH_CUSPING],
                 c.phase[sptelem::PH_UPDDHAT],
+                c.phase[sptelem::PH_TH_UPDATE], c.phase[sptelem::PH_XE_STEP],
+                c.phase[sptelem::PH_SEARCH_PROPOSE], c.phase[sptelem::PH_SEARCH_APPLY],
                 c.phase[sptelem::PH_PPR_RESET], c.phase[sptelem::PH_PPR_DRIVE],
                 c.phase[sptelem::PH_PPR_RECON], c.phase[sptelem::PH_DEPL_PRED],
-                c.phase[sptelem::PH_DEPL_CORR], c.phase[sptelem::PH_RESULT_ADD]));
+                c.phase[sptelem::PH_DEPL_CORR], c.phase[sptelem::PH_RESULT_ADD],
+                c.phase[sptelem::PH_RESULT_WRITE],
+                c.xs_wall[xsphase::LB_FLATXS], c.xs_calls[xsphase::LB_FLATXS],
+                c.floor_h2d_bytes, c.floor_h2d_calls,
+                c.floor_d2h_bytes, c.floor_d2h_calls));
             // The summary is the last line this deck emits, so flush here: an
             // abnormal exit then loses at most the lines of the decks still
             // running, never a finished deck's telemetry.

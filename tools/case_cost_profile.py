@@ -46,6 +46,18 @@ The ledger splits one case into four buckets:
   output          IO write               driver-thread charge for results;
                                          writer_busy_ms is the overlapped part
 
+WP9-A splits `physics` further, from the SPTELEM summary's four wall objects:
+
+  phase_wall      the seven outer-body phases (the `d x outer` half)
+  loop_wall       host work inside SolveLoop, outside the outer body: T/H, the
+                  Xe Picard step, the secant proposal, the trial application
+  floor_wall      the statepoint boundary: PPR, depletion, result packing/write
+  nested_wall     UpdateFlatXS, which runs INSIDE the two above and is therefore
+                  reported beside them and never summed with them
+  floor_transfer  the H2D/D2H the BOUNDARY paid, i.e. after the last SolveLoop
+
+`residual` is `solve_wall - (phase + loop + floor)`: the part still unnamed.
+
 Usage
 -----
     tools/case_cost_profile.py ~/gaplan/*.log --wall-dir ~/gaplan
@@ -147,6 +159,28 @@ def profile_log(log: Path, wall_dir: Path | None) -> dict:
         rec["init_seconds"] = sp.get("init_seconds", rec.get("init_seconds"))
         rec["io_driver_seconds"] = sp.get("io_wall", rec.get("io_driver_seconds"))
 
+    # WP9-A: the host floor, named.  THREE objects, and they do not overlap:
+    #   phase_wall     the seven outer-body phases -- the `d x outer` half of
+    #                  the GA plan Sec 2.2 cost model.
+    #   loop_wall      host work inside SolveLoop but outside the outer body:
+    #                  T/H, the Xe step, the secant, the trial application.
+    #                  This is the 0.377 ms/outer the plan's Sec 3.2 could name
+    #                  but not measure.
+    #   floor_wall     the statepoint boundary -- PPR, depletion, result -- the
+    #                  `c` half.
+    # `nested_wall` is DELIBERATELY excluded from the sum: UpdateFlatXS runs
+    # inside loop_wall/floor_wall buckets, so adding it would double count.
+    for obj, prefix in (("phase_wall", "phase_"), ("loop_wall", "loop_"),
+                        ("floor_wall", "floor_"), ("nested_wall", "nested_"),
+                        ("floor_transfer", "floortx_")):
+        block = sp.get(obj) or {}
+        for name, value in block.items():
+            rec[prefix + name] = value
+        if block and obj not in ("floor_transfer", "nested_wall"):
+            rec[prefix + "sum"] = sum(float(v) for v in block.values())
+    if "nested_flatxs" in rec:
+        rec["nested_sum"] = float(rec["nested_flatxs"])
+
     traj = first(receipts(text, "[RASBERY][TRAJECTORY]"))
     for key in ("digest", "outers", "statepoints", "th_updates", "telemetry"):
         if key in traj:
@@ -246,6 +280,18 @@ def profile_log(log: Path, wall_dir: Path | None) -> dict:
     if rec.get("outers") and rec.get("statepoints"):
         rec["outers_per_statepoint"] = rec["outers"] / float(rec["statepoints"])
 
+    # The residual is the point of the decomposition: it is what the three
+    # named objects still do not account for inside solve_wall.  A residual that
+    # stays large after WP9-A is a phase nobody has named yet, and saying so is
+    # the whole job of this line.
+    if solve is not None and ("phase_sum" in rec or "floor_sum" in rec):
+        named = (rec.get("phase_sum") or 0.0) + (rec.get("loop_sum") or 0.0) + \
+                (rec.get("floor_sum") or 0.0)
+        rec["named_seconds"] = named
+        rec["residual_seconds"] = solve - named
+        if solve > 0.0:
+            rec["named_fraction"] = named / solve
+
     base = rec.get("wall_seconds") or rec.get("driver_seconds")
     if base:
         amort = (rec.get("outside_drive_seconds") or 0.0) + (rec.get("init_seconds") or 0.0)
@@ -330,6 +376,40 @@ def render(rows: list[dict], stream=sys.stdout) -> None:
                 f"post_drive {row.get('process_post_drive_s', float('nan')):.2f} s  "
                 f"unaccounted "
                 f"{(row.get('wall_seconds') or float('nan')) - row['process_in_main_s'] - (row.get('process_exec_s') or 0.0):.2f} s\n")
+        # WP9-A floor split.  Printed only when the SPTELEM summary carried it,
+        # so a log from a run without RASBERY_STATEPOINT_TELEMETRY is silent
+        # here rather than showing a row of zeros.
+        if row.get("floor_sum") is not None or row.get("loop_sum") is not None:
+            stream.write(
+                f"{row['name']:>16}  floor      ppr "
+                f"{(row.get('floor_ppr_reset') or 0) + (row.get('floor_ppr_drive') or 0) + (row.get('floor_ppr_recon') or 0):6.2f} s  "
+                f"depl {(row.get('floor_depl_predictor') or 0) + (row.get('floor_depl_corrector') or 0):5.2f} s  "
+                f"result {(row.get('floor_result_add') or 0) + (row.get('floor_result_write') or 0):5.2f} s  "
+                f"= {row.get('floor_sum') or 0:6.2f} s\n")
+            stream.write(
+                f"{row['name']:>16}  loop       th "
+                f"{row.get('loop_th_update') or 0:6.2f} s  "
+                f"xe {row.get('loop_xe_step') or 0:6.2f} s  "
+                f"search {(row.get('loop_search_propose') or 0) + (row.get('loop_search_apply') or 0):5.2f} s  "
+                f"= {row.get('loop_sum') or 0:6.2f} s\n")
+            stream.write(
+                f"{row['name']:>16}  nested     flatxs {row.get('nested_flatxs') or 0:6.2f} s "
+                f"in {int(row.get('nested_flatxs_calls') or 0):6d} calls "
+                f"({1000.0 * (row.get('nested_flatxs') or 0) / max(1, int(row.get('nested_flatxs_calls') or 0)):.2f} ms/call)"
+                f"   [inside loop/floor, NOT additive]\n")
+            stream.write(
+                f"{row['name']:>16}  accounted  outer {row.get('phase_sum') or 0:6.2f} s  "
+                f"loop {row.get('loop_sum') or 0:6.2f} s  "
+                f"floor {row.get('floor_sum') or 0:6.2f} s  "
+                f"residual {row.get('residual_seconds', float('nan')):6.2f} s  "
+                f"({100 * (row.get('named_fraction') or 0):.1f} % of solve named)\n")
+        if row.get("floortx_d2h_bytes") is not None:
+            stream.write(
+                f"{row['name']:>16}  boundary   H2D "
+                f"{(row.get('floortx_h2d_bytes') or 0) / 1e6:8.1f} MB in "
+                f"{int(row.get('floortx_h2d_calls') or 0):6d} calls   D2H "
+                f"{(row.get('floortx_d2h_bytes') or 0) / 1e6:8.1f} MB in "
+                f"{int(row.get('floortx_d2h_calls') or 0):6d} calls\n")
         if row.get("readinput_total_s") is not None:
             stream.write(
                 f"{row['name']:>16}  readinput  deck {row.get('readinput_deck_s', float('nan')):.2f} s  "

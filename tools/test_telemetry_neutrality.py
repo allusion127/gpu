@@ -81,11 +81,29 @@ def source_contract():
     # setenv) and give two halves of one run two different answers.
     if DRIVER.count(f'std::getenv("{TELEM_ENV}")') != 1:
         fail(f"{TELEM_ENV} must be read from exactly one site (sptelem::enabled)")
+    # The rule is about READING it, not naming it: WP9-A's XS phase mirror
+    # (XSTiming.h) is armed BY Driver.h from the one gate and says so in a
+    # comment, which is the opposite of a second opinion.  So the scan looks for
+    # an environment lookup of this name in any of its spellings, in code with
+    # the comments stripped, rather than for the string anywhere in the file.
+    ENV_READ = re.compile(
+        r"(std::)?(getenv|secure_getenv|_dupenv_s|GetEnvironmentVariable[AW]?)\s*\("
+        rf"[^)]*{re.escape(TELEM_ENV)}")
     for path in sorted(SRC.glob("*")):
         if not path.is_file() or path.name == "Driver.h":
             continue
-        if TELEM_ENV in path.read_text(errors="replace"):
+        if ENV_READ.search(strip_comments(path.read_text(errors="replace"))):
             fail(f"{path.name} reads {TELEM_ENV}; the flag has one owner, Driver.h")
+
+    # ------------------------------------------------- 1b. the XS phase mirror
+    # WP9-A gave XSTiming.h a per-statepoint bucket that has to switch on with
+    # the telemetry.  It has no gate of its own (checked above); it is ARMED,
+    # once, from the single reader.  Both halves of that are pinned here so the
+    # arm cannot drift into a second env lookup or into the solve.
+    if "xsphase::armLocalWall(sp_telem);" not in code:
+        fail("Drive() no longer arms the XS phase mirror from the one telemetry gate")
+    if code.count("xsphase::armLocalWall(") != 1:
+        fail("the XS phase mirror is armed from more than one site")
 
     # ------------------------------------------------- 2. two consumers, named
     # A third consumer is not forbidden because it is wrong -- it is forbidden
