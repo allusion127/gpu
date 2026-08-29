@@ -473,8 +473,28 @@ for loop, anchor in (("batch", "job_status[static_cast<std::size_t>(i)] = driver
     at = main_code.find(anchor)
     if at < 0:
         fail(f"the {loop} deck loop does not call Drive() the way the contract describes")
-    window = main_code[max(0, at - 400):at]
-    if "try {" not in window:
+    # Walk OUT of the enclosing blocks instead of scanning a fixed window.  The
+    # window was 400 characters, which is a proxy for "in a try" that a longer
+    # Driver constructor call breaks without anything about the guard changing
+    # -- and the guard is the rule.  Ask the question directly: does some block
+    # that encloses this call open with `try`?
+    def guarded_by_try(text: str, index: int) -> bool:
+        depth = 0
+        i = index
+        while i > 0:
+            i -= 1
+            if text[i] == "}":
+                depth += 1
+            elif text[i] == "{":
+                if depth == 0:
+                    head = text[max(0, i - 60):i].rstrip()
+                    if head.endswith("try"):
+                        return True
+                else:
+                    depth -= 1
+        return False
+
+    if not guarded_by_try(main_code, at):
         fail(f"the {loop} deck loop does not guard Drive(); one bad deck would abort the process")
     after = main_code[at:at + 500]
     if "catch (const std::exception& error)" not in after or "catch (...)" not in after:
@@ -578,7 +598,15 @@ if "sink.buffer.clear();" not in flush:
 summary_at = driver_code.find("[RASBERY][SPTELEM][SUMMARY]")
 if summary_at < 0:
     fail("the SPTELEM summary receipt disappeared")
-if "iowriter::flushLines();" not in driver_code[summary_at:summary_at + 3000]:
+# Anchored on the END of the appendLine statement, not on a fixed window after
+# the format string's first byte.  The window was 3,000 characters and the
+# statement is a 40-field std::format: adding fields to the receipt pushed the
+# flush past it without anything about the flush changing, and the flush is the
+# rule.
+summary_stmt_end = driver_code.find("));", summary_at)
+if summary_stmt_end < 0:
+    fail("the SPTELEM summary receipt is not a single appendLine statement any more")
+if "iowriter::flushLines();" not in driver_code[summary_stmt_end:summary_stmt_end + 400]:
     fail("the SPTELEM run summary is not flushed; an abnormal exit would lose finished decks")
 
 py_compile.compile(str(Path(__file__).resolve()), doraise=True)

@@ -33,12 +33,31 @@ with tempfile.TemporaryDirectory() as tmp:
         "# comment\n"
         "\n"
         "d0.json  out/d0.h5\n"
-        '"a deck.json"  "out/a b.h5"   # quoted, with spaces\n',
+        '"a deck.json"  "out/a b.h5"   # quoted, with spaces\n'
+        "d1.json  out/d1.h5  light\n"
+        "d2.json  out/d2.h5  pin-off\n",
         encoding="utf-8",
     )
     jobs = mg.read_manifest(manifest)
-    check(jobs == [("d0.json", "out/d0.h5"), ("a deck.json", "out/a b.h5")],
+    # THREE fields now, the third optional: a job's own result mode, which the
+    # dispatcher has to carry into the chunk manifests it rewrites.  A job that
+    # does not name one carries the empty string and inherits --result.
+    check(jobs == [("d0.json", "out/d0.h5", ""),
+                   ("a deck.json", "out/a b.h5", ""),
+                   ("d1.json", "out/d1.h5", "light"),
+                   ("d2.json", "out/d2.h5", "pin-off")],
           f"read_manifest: wrong parse {jobs!r}")
+
+    # ...and an unknown word in that field is refused here rather than reaching
+    # RASBERY, which would refuse it once per chunk after the GPU was already
+    # claimed.
+    junk = work / "junk.txt"
+    junk.write_text("d0.json out/d0.h5 sloppy\n", encoding="utf-8")
+    try:
+        mg.read_manifest(junk)
+        failures.append("read_manifest: accepted an unknown result mode")
+    except ValueError:
+        pass
 
     # Two jobs on one output would have two Drivers race inside one HDF5 file
     # and share a restart namespace -- the rule main.cpp enforces, enforced here
