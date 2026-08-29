@@ -1,5 +1,6 @@
 #include "CudaBICGBackend.h"
 
+#include "BatchRefill.h"
 #include "CmfdAssemblyKernel.h"
 #include "CudaTransferMirror.h"
 #include "CudaXsReconBackend.h" // rasberyHostPinningEnabled(): header-only gate
@@ -4545,6 +4546,41 @@ public:
     }
 };
 
+/// Rev.7.1 Task 20: the post-condition of a tenant reset, spelled out.
+///
+/// Every field a refilled slot must NOT inherit, listed once.  Three classes,
+/// and each of them is a way one deck's numbers become another's:
+///
+///   - the borrowed host pointers.  A dead Driver's Geometry/XSSet are freed
+///     memory; staging from them is a read of whatever the allocator put there.
+///   - the residency and upload flags.  Left set, they ELIDE an upload the new
+///     tenant needs, so the device keeps computing on the previous deck's
+///     operator with no transfer and no error.
+///   - the mirrors and the sweep scalars.  A valid mirror is a claim that the
+///     device already holds these bytes, which is false for a new tenant.
+[[nodiscard]] bool batchSlotIsReset(const BatchCore::Slot& sl) {
+    const bool pointers_clear =
+        sl.host_diag == nullptr && sl.host_cc == nullptr && sl.host_diag_out == nullptr &&
+        sl.host_cc_out == nullptr && sl.host_phi == nullptr && sl.host_src == nullptr &&
+        sl.out_phi == nullptr && sl.host_chif == nullptr && sl.host_xsnf == nullptr &&
+        sl.host_xsrf == nullptr && sl.host_xssm == nullptr && sl.host_dtil == nullptr &&
+        sl.host_dhat == nullptr && sl.host_vol == nullptr && sl.host_udiag == nullptr &&
+        sl.host_psi == nullptr;
+    const bool flags_default =
+        sl.push_diag && sl.push_cc && sl.push_phi && sl.push_psi &&
+        !sl.in_use && !sl.nonfinite && !sl.dhat_resident && !sl.psi_resident &&
+        !sl.psi_downloaded && !sl.device_assembly && !sl.pushed_xsrf && !sl.pushed_xssm &&
+        !sl.pushed_xsnf && !sl.pushed_dtil && sl.nmax == -1 && sl.sweep_unroll == 0;
+    const bool mirrors_clear =
+        !sl.diag_mirror.valid && !sl.cc_mirror.valid && !sl.phi_mirror.valid &&
+        !sl.chif_mirror.valid && !sl.vol_mirror.valid && !sl.xsrf_mirror.valid() &&
+        !sl.xssm_mirror.valid() && !sl.xsnf_mirror.valid() && !sl.dtil_mirror.valid();
+    if (!pointers_clear || !flags_default || !mirrors_clear) return false;
+    for (int i = 0; i < kSweepCount; ++i)
+        if (sl.sweep_in[i] != 0.0 || sl.sweep_out[i] != 0.0) return false;
+    return true;
+}
+
 CudaBatchArena::CudaBatchArena(Geometry& geometry, int slots)
     : _impl(std::make_unique<Impl>(geometry, slots)) {
     _impl->taken.assign(static_cast<size_t>(std::max(slots, 1)), 0);
@@ -4581,7 +4617,20 @@ int CudaBatchArena::acquireSlot() {
         // assignment is a no-op -- same reset the NodalArena already does.
         BatchCore::Slot& sl = _impl->core.slot[static_cast<size_t>(m)];
         sl        = BatchCore::Slot{};
+        // Rev.7.1 Task 20 (plan Sec 3.2 "재활용 감사", Sec 8.2).  The reset above
+        // is a whole-struct assignment, so it cannot MISS a field -- but it can
+        // stop being one.  This checks the post-condition rather than trusting
+        // the statement: if a future change makes any per-slot state survive an
+        // admission, the next tenant computes its physics from the previous
+        // deck's residency flags and mirrors, every value finite and plausible,
+        // and nothing else in the process would ever say so.  Counted rather
+        // than thrown: the state IS correct by the time this runs (the reset
+        // just happened), so aborting a batch here would trade a receipt for a
+        // lost run.  The gate is `stale_tenants: 0`.
+        if (!batchSlotIsReset(sl))
+            rasbery::refill::tenancy().stale_tenants.fetch_add(1, std::memory_order_relaxed);
         sl.in_use = true;
+        rasbery::refill::tenancy().admissions.fetch_add(1, std::memory_order_relaxed);
         return m;
     }
     return -1;
@@ -4590,6 +4639,12 @@ int CudaBatchArena::acquireSlot() {
 void CudaBatchArena::releaseSlot(int m) {
     if (m < 0) return;
     std::lock_guard<std::mutex> lock(_impl->mutex);
+    // Rev.7.1 Task 20.  A release of a slot nobody holds means a Driver
+    // lifetime is not what the arena thinks it is, and the very next acquire
+    // could hand the same slot to two tenants -- the same-case-concurrency
+    // error of plan Sec 9.3, arriving through the host door.
+    if (_impl->taken[static_cast<size_t>(m)] == 0)
+        rasbery::refill::tenancy().double_releases.fetch_add(1, std::memory_order_relaxed);
     _impl->taken[static_cast<size_t>(m)]            = 0;
     _impl->core.slot[static_cast<size_t>(m)].in_use = false;
     // A lingering launcher may be waiting for this slot to show up; it never
@@ -4926,6 +4981,21 @@ void CudaBatchArena::solveCommon(int m, double* out_phi, int kind) {
     a.last_arrival  = arrival_now;
     a.have_arrival  = true;
     const unsigned long long my_batch = a.open_batch[kind];
+    // Rev.7.1 Task 20 (plan Sec 5.2 ownership rule, host arm).  A physical slot
+    // that is already queued for THIS batch must never be inserted again: the
+    // launcher stages every participant in turn, so a second entry would stage
+    // the same slot twice and the second stage would overwrite the operator the
+    // first one uploaded.  It cannot happen while one Driver owns one slot,
+    // which is exactly why it is worth counting -- this is the witness that the
+    // one-owner rule still holds after a refill.  The scan is over at most
+    // `slots` (<= 64) ints under a lock we already hold.
+    if (std::find(a.pending[kind].begin(), a.pending[kind].end(), m) !=
+        a.pending[kind].end()) {
+        rasbery::refill::tenancy().queue_duplicates.fetch_add(1, std::memory_order_relaxed);
+        throw std::runtime_error(
+            "CUDA batch arena: slot " + std::to_string(m) +
+            " arrived twice in one rendezvous batch (two tenants share a slot)");
+    }
     a.pending[kind].push_back(m);
     if (a.lingering)
         a.cv.notify_all();   // a lingering launcher is waiting for arrivals

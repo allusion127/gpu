@@ -2,6 +2,7 @@
 #include "Exporter.h"
 #include "Importer.h"
 
+#include "BatchRefill.h"
 #include "CudaXsReconBackend.h"
 #include "Driver.h"
 #include "XSTiming.h"
@@ -15,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <string>
@@ -119,6 +121,85 @@ std::string rasberyPathKey(const std::string& path) {
     return key;
 }
 
+/// Read one `--jobs` manifest, appending its pairs to the deck vectors.
+///
+/// WHY A FILE AT ALL.  Task 20's acceptance case is 1,280 jobs, and 1,280
+/// --rasi paths plus 1,280 --raso paths is a ~200 kB argument list -- past
+/// MAX_ARG_STRLEN on Linux and past every practical limit on Windows.  The
+/// manifest is the same information off the filesystem instead of off argv.
+///
+/// FORMAT.  One job per line, `<input.json> <output.h5>`, separated by
+/// whitespace.  `#` starts a comment, blank lines are skipped, and a line may
+/// quote either field with `"` so paths with spaces survive.  Deliberately not
+/// JSON: this is read before anything else is initialised, it has to fail with
+/// a line number a human can act on, and the launcher (tools/run_multi_gpu_batch.py)
+/// has to be able to split one by line count without a parser.
+///
+/// The pairs land in the SAME two vectors the --rasi/--raso flags fill, before
+/// any of the validation below runs.  So the distinct-output rule, the counts
+/// match rule and the batch predicate all apply to manifest jobs unchanged, and
+/// a manifest may be mixed with explicit flags.
+bool rasberyReadJobManifest(const std::string&        manifest_path,
+                            std::vector<std::string>& inputs,
+                            std::vector<std::string>& outputs,
+                            std::string&              error) {
+    std::ifstream file(manifest_path);
+    if (!file) {
+        error = "cannot open job manifest: " + manifest_path;
+        return false;
+    }
+
+    const auto next_field = [](const std::string& line, std::size_t& pos) -> std::string {
+        while (pos < line.size() && std::isspace(static_cast<unsigned char>(line[pos]))) ++pos;
+        if (pos >= line.size()) return {};
+        if (line[pos] == '"') {
+            const std::size_t open = ++pos;
+            while (pos < line.size() && line[pos] != '"') ++pos;
+            const std::string value = line.substr(open, pos - open);
+            if (pos < line.size()) ++pos; // closing quote
+            return value;
+        }
+        const std::size_t start = pos;
+        while (pos < line.size() && !std::isspace(static_cast<unsigned char>(line[pos]))) ++pos;
+        return line.substr(start, pos - start);
+    };
+
+    std::string line;
+    int         lineno = 0;
+    while (std::getline(file, line)) {
+        ++lineno;
+        // Manifests written on Windows and read in WSL are the campaign's
+        // standing trap (see the APR1400 CRLF finding): a trailing \r would
+        // become part of the output path and every deck would write to a file
+        // nothing downstream can find.
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        const std::size_t hash = line.find('#');
+        if (hash != std::string::npos) line.erase(hash);
+
+        std::size_t       pos    = 0;
+        const std::string input  = next_field(line, pos);
+        if (input.empty()) continue; // blank or comment-only
+        const std::string output = next_field(line, pos);
+        if (output.empty()) {
+            error = manifest_path + ":" + std::to_string(lineno) +
+                    ": every manifest line needs both an input deck and an output path "
+                    "(`<input.json> <output.h5>`). A missing --raso would make every job "
+                    "write the same default result.h5.";
+            return false;
+        }
+        const std::string trailing = next_field(line, pos);
+        if (!trailing.empty()) {
+            error = manifest_path + ":" + std::to_string(lineno) +
+                    ": expected exactly two fields, found a third (" + trailing +
+                    "). Quote a path that contains spaces.";
+            return false;
+        }
+        inputs.push_back(input);
+        outputs.push_back(output);
+    }
+    return true;
+}
+
 void rasberyPrepareOpenMPStartup(char* argv[]) {
 #if !defined(_WIN32)
     if (std::getenv("RASBERY_OMP_ENV_READY") != nullptr)
@@ -187,6 +268,7 @@ int main(int argc, char* argv[]) {
     std::string              iso_csv;   // --isocsv: output CSV (offline correlation/VIF study)
     std::vector<std::string> validate_args; // --validate <input.json> <out.csv> [fineKey coarseKey]
     int                      batch_width = 0; // --batch-mode M: M instances in one process
+    std::vector<std::string> job_manifests;   // --jobs: deck/output pairs read from a file
 
     int argi = 1;
     while (argi < argc) {
@@ -213,7 +295,7 @@ int main(int argc, char* argv[]) {
         if (option != "--chiffoni" && option != "--chiffono" &&
             option != "--rasi" && option != "--raso" &&
             option != "--isohgc" && option != "--isocsv" && option != "--validate" &&
-            option != "--batch-mode") {
+            option != "--batch-mode" && option != "--jobs") {
             std::cerr << "Unknown option: " << option << std::endl;
             return 1;
         }
@@ -243,6 +325,8 @@ int main(int argc, char* argv[]) {
                 validate_args.push_back(value);
             else if (option == "--batch-mode")
                 batch_width = std::max(0, std::atoi(value.c_str()));
+            else if (option == "--jobs")
+                job_manifests.push_back(value);
             else
                 iso_csv = value;
 
@@ -253,6 +337,17 @@ int main(int argc, char* argv[]) {
     if (chiffon_inputs.size() != chiffon_outputs.size()) {
         std::cerr << "The number of --chiffoni and --chiffono paths must match." << std::endl;
         return 1;
+    }
+
+    // Manifest jobs are appended BEFORE every check below, so a manifest is
+    // validated by exactly the rules an argv deck list is -- one namespace, one
+    // counts-match test, one batch predicate.
+    for (const std::string& manifest : job_manifests) {
+        std::string manifest_error;
+        if (!rasberyReadJobManifest(manifest, rasbery_inputs, rasbery_outputs, manifest_error)) {
+            std::cerr << manifest_error << std::endl;
+            return 1;
+        }
     }
 
     if (rasbery_inputs.size() != rasbery_outputs.size()) {
@@ -537,17 +632,46 @@ int main(int argc, char* argv[]) {
         std::vector<int> job_status(static_cast<std::size_t>(jobs), 0);
         std::vector<std::string> job_error(static_cast<std::size_t>(jobs));
 
+        // Rev.7.1 Task 20.  THE REFILL IS THIS LOOP, and it always was: the
+        // OpenMP queue is dynamic with a chunk of one, so a worker that
+        // finishes a deck takes the next job immediately rather than waiting
+        // for its siblings.  The Driver's destructor releases the arena slot
+        // (CudaBatchArena::releaseSlot, NodalArena::releaseSlot), which drops
+        // inUseCount() and wakes the rendezvous, so the remaining decks stop
+        // waiting on a slot that is between tenants; the next Driver's
+        // constructor acquires a slot again and gets a full reset with it.
+        // The batch is never drained in between.
+        //
+        // What the ledger adds is the arithmetic: how many admissions reused a
+        // lane, how long each lane actually held a deck, and how long the lanes
+        // sat empty at the end.  Without it "the tail went away" is a claim
+        // about a stopwatch.
+        rasbery::refill::ledger().begin(jobs, batch_width, host_threads);
+
 #ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic, 1) num_threads(host_threads)
 #endif
         for (int i = 0; i < jobs; ++i) {
+#ifdef _OPENMP
+            const int lane = omp_get_thread_num();
+#else
+            const int lane = 0;
+#endif
+            rasbery::refill::ledger().jobStarted(i, lane);
             // An escaping exception would terminate the whole parallel region,
             // taking the other instances' partial results with it.  One bad
             // deck must only fail its own job.
             try {
-                rasbery::Driver driver(rasbery_inputs[static_cast<std::size_t>(i)],
-                                       rasbery_outputs[static_cast<std::size_t>(i)]);
-                job_status[static_cast<std::size_t>(i)] = driver.Drive();
+                // The Driver is scoped so its destructor -- which is what
+                // releases the slot -- runs BEFORE jobFinished stamps the
+                // tenancy end.  Otherwise the refill latency measured below
+                // would exclude the teardown, which is exactly the part of the
+                // refill this task has to keep small.
+                {
+                    rasbery::Driver driver(rasbery_inputs[static_cast<std::size_t>(i)],
+                                           rasbery_outputs[static_cast<std::size_t>(i)]);
+                    job_status[static_cast<std::size_t>(i)] = driver.Drive();
+                }
             } catch (const std::exception& error) {
                 job_status[static_cast<std::size_t>(i)] = 1;
                 job_error[static_cast<std::size_t>(i)]  = error.what();
@@ -555,7 +679,9 @@ int main(int argc, char* argv[]) {
                 job_status[static_cast<std::size_t>(i)] = 1;
                 job_error[static_cast<std::size_t>(i)]  = "unknown exception";
             }
+            rasbery::refill::ledger().jobFinished(i);
         }
+        rasbery::refill::ledger().end();
 
         // Same rule as the CUDA teardown below: every Driver has joined, so the
         // writer queue can only shrink from here.  Drain and join it BEFORE the
@@ -589,6 +715,11 @@ int main(int argc, char* argv[]) {
         std::cout << "[RASBERY][BATCH_HOST][PIN] {";
         rasbery::rasberyAppendHostPinReceiptFields(std::cout);
         std::cout << "}" << std::endl;
+        // Rev.7.1 Task 20.  Printed HERE, after the arena has been released, so
+        // the tenancy counters it carries are final: releaseSlot runs in the
+        // Driver destructors (all joined) and the arena teardown above is the
+        // last thing that can touch a slot.
+        rasbery::refill::ledger().report(std::cout);
         // Receipt for the xsrecon device path: a zero here means it never ran,
         // whatever the flag said, and an A/B built on it is void (G0).
         if (rasbery::rasberyGpuXsReconEnabled())

@@ -1,5 +1,6 @@
 #include "CudaXsReconBackend.h"
 
+#include "BatchRefill.h"
 #include "CudaTransferMirror.h"
 #include "FlatXsKernel.h"
 #include "GpuCanonicalState.h"
@@ -639,7 +640,6 @@ public:
             // A fresh tenant inherits nothing: the previous tenant's residency
             // flags would elide uploads the new one needs.
             sl              = Slot{};
-            sl.in_use       = true;
             // Rev.7.1 Task 18: AND NOT THE PREVIOUS TENANT'S CANONICAL BINDING
             // EITHER.  _canon lives outside Slot because the view table is
             // indexed by physical slot, so the `sl = Slot{}` above does not
@@ -650,6 +650,18 @@ public:
             // solveNodal, at the moment it learns which slot it got.
             _canon[static_cast<std::size_t>(m)] = gpu::CanonicalSlotBuffers{};
             _views_dirty                        = true;
+            // Rev.7.1 Task 20 (plan Sec 3.2 / 8.2).  The post-condition of the
+            // two resets above, checked rather than assumed.  This arena is the
+            // one that has ALREADY been bitten by out-of-struct per-slot state:
+            // `_canon` lives outside Slot because the view table is indexed by
+            // physical slot, so `sl = Slot{}` does not reach it, and a borrowed
+            // pointer into a dead deck's physics arena left there would have the
+            // kernels read and write another deck's jnet with every value
+            // finite.  The audit is what notices if a third such field appears.
+            if (!nodalSlotIsReset(sl, _canon[static_cast<std::size_t>(m)]))
+                rasbery::refill::tenancy().stale_tenants.fetch_add(1, std::memory_order_relaxed);
+            sl.in_use = true;
+            rasbery::refill::tenancy().admissions.fetch_add(1, std::memory_order_relaxed);
             return m;
         }
         return -1;
@@ -660,6 +672,10 @@ public:
         {
             std::lock_guard<std::mutex> lock(_mutex);
             Slot& sl  = _slot[static_cast<std::size_t>(m)];
+            // Rev.7.1 Task 20: see CudaBatchArena::releaseSlot.  A release of a
+            // slot nobody held means the next acquire could hand it to two.
+            if (!sl.in_use)
+                rasbery::refill::tenancy().double_releases.fetch_add(1, std::memory_order_relaxed);
             sl.in_use = false;
             // Drop the pin memo with the tenant.  These are NOT leases -- the
             // lease belongs to the buffer's owner (Geometry/XSSet), which
@@ -740,6 +756,16 @@ public:
         _have_arrival = true;
 
         const unsigned long long my_batch = _open_batch;
+        // Rev.7.1 Task 20: see CudaBatchArena::solveCommon.  The nodal arena has
+        // the same one-owner rule and the same failure if it breaks -- the
+        // launcher would stage this slot twice and the second stage would
+        // overwrite the first participant's xs.
+        if (std::find(_pending.begin(), _pending.end(), m) != _pending.end()) {
+            rasbery::refill::tenancy().queue_duplicates.fetch_add(1, std::memory_order_relaxed);
+            throw std::runtime_error(
+                "nodal batch arena: slot " + std::to_string(m) +
+                " arrived twice in one rendezvous batch (two tenants share a slot)");
+        }
         _pending.push_back(m);
         if (_lingering) _cv.notify_all();
 
@@ -880,6 +906,32 @@ private:
         for (const Slot& s : _slot)
             if (s.in_use) ++c;
         return c;
+    }
+
+    /// Rev.7.1 Task 20: the post-condition of a nodal tenant reset.
+    ///
+    /// Slot fields AND the out-of-struct canonical binding, because the second
+    /// is the one that has actually gone wrong here before (Task 18) and the
+    /// audit is worthless if it only covers the half that never broke.
+    [[nodiscard]] static bool nodalSlotIsReset(const Slot&                     sl,
+                                               const gpu::CanonicalSlotBuffers& canon) {
+        if (sl.in_use || sl.h_jnet != nullptr || sl.h_flux != nullptr ||
+            sl.h_phis != nullptr || sl.h_xsrf != nullptr || sl.h_xsnf != nullptr ||
+            sl.h_xssm != nullptr || sl.h_chif != nullptr || sl.pin_chif != nullptr)
+            return false;
+        if (sl.have_const || sl.have_chif || sl.pushed_xsrf || sl.pushed_xsnf ||
+            sl.pushed_xssm || sl.reigv != 0.0)
+            return false;
+        if (sl.xsrf_mirror.valid() || sl.xsnf_mirror.valid() || sl.xssm_mirror.valid())
+            return false;
+        for (int i = 0; i < 6; ++i)
+            if (sl.pin_bulk[i] != nullptr) return false;
+        for (int i = 0; i < 9; ++i)
+            if (sl.h_const[i] != nullptr || sl.pin_const[i] != nullptr) return false;
+        for (int i = 0; i < gpu::kCanonicalNodalRegionCount; ++i)
+            if (sl.canon_owner[i] != gpu::CanonicalOwner::Host) return false;
+        return canon.flux == nullptr && canon.jnet == nullptr && canon.phis == nullptr &&
+               canon.dtil == nullptr && canon.dhat == nullptr && canon.live_xs == nullptr;
     }
 
     bool fail(const char* what, cudaError_t e) {
