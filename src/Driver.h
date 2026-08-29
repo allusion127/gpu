@@ -130,7 +130,15 @@ enum Phase : int {
     // would silently move a number that model is calibrated on.  They get their
     // own `floor_wall` object instead, and the residual stays readable as
     // `wall - sum(phase_wall) - sum(floor_wall)`.
-    PH_PPR_RESET = PH_UPDDHAT + 1, ///< PPR::reset (buckling, corner flux, fitting, leakage, source)
+    // NO EXPLICIT INITIALISER.  It used to read `PH_PPR_RESET = PH_UPDDHAT + 1`,
+    // which is 7 -- the value PH_TH_UPDATE already has, because the four loop
+    // phases were added between PH_UPDDHAT and here after that line was written.
+    // The floor phases therefore ALIASED the loop phases, `phaseName`'s switch
+    // had four duplicate case labels (ill-formed: every translation unit that
+    // includes Driver.h fails to compile), and PH_COUNT was four short of the
+    // number of phases it counts.  Following on from PH_SEARCH_APPLY is what
+    // the block comment above has always said this is.
+    PH_PPR_RESET,                  ///< PPR::reset (buckling, corner flux, fitting, leakage, source)
     PH_PPR_DRIVE,                  ///< PPR::drive(100) corner-balance iteration
     PH_PPR_RECON,                  ///< PPR::reconstructPinPower (+ normalisation, Fq/FdH)
     PH_DEPL_PRED,                  ///< XSSet::PredictorStep (CRAM Bateman, BOS)
