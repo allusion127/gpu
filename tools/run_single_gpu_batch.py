@@ -26,6 +26,9 @@ import sys
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from exact_audit import audit_physics_mode  # noqa: E402
+
 
 # `[RASBERY][BATCH_HOST] {...}` -- the JSON receipt only; main() also emits a
 # plain-prose BATCH_HOST line, which this deliberately does not match.
@@ -36,39 +39,18 @@ BATCH_HOST_RECEIPT = re.compile(r"\[RASBERY\]\[BATCH_HOST\]\s*(\{.*\})")
 # run is not the configuration the benchmark claims to measure.
 GRAPH_FALLBACK_COUNTER = re.compile(r'"([A-Za-z_]*graph_fallbacks)"\s*:\s*(\d+)')
 # `[RASBERY][PHYSICS_MODE] {...}` -- main() emits this before any deck starts.
-# The exact-only campaign accepts full-exact runs only (plan Rev.4 Sec 2), so a
-# missing receipt or any field that is not the exact value voids the run.
-PHYSICS_MODE_RECEIPT = re.compile(r"\[RASBERY\]\[PHYSICS_MODE\]\s*(\{.*\})")
-EXACT_PHYSICS_MODE = {
-    "physics_mode": "full_exact_nodal",
-    "screening": False,
-    "feedback_pass_limit": 0,
-    "full_hdf5": True,
-}
-# `--result light` is an OUTPUT-shape switch, not a fidelity one: the same
-# physics runs and the same trajectory digest comes out (GA plan Sec 2.4), but
-# main.cpp classifies a light job as a screening run because it writes no
-# result HDF5, so the receipt reads `screening:true` /
-# `physics_mode:ga_screen_feedback_limited` / `full_hdf5:false`.  Auditing a
-# light run against EXACT_PHYSICS_MODE therefore fails every light arm on a
-# field that says nothing about the physics.
+# The audit of that receipt lives in tools/exact_audit.py and is keyed on
+# FIDELITY (`policy` / `acceptance_eligible`), never on what the run WROTE.
 #
-# What must NOT be relaxed is `feedback_pass_limit`: that is the GA feedback
-# APPROXIMATION, and it is the one field here that changes the answer.  A light
-# run with a nonzero feedback limit is still not an acceptance measurement.
-SCREENING_PHYSICS_MODE = {
-    "physics_mode": "ga_screen_feedback_limited",
-    "screening": True,
-    "feedback_pass_limit": 0,
-    "full_hdf5": False,
-}
-
-
-def expected_physics_mode(result_mode: str | None) -> dict:
-    """The PHYSICS_MODE receipt a chunk in *result_mode* is required to print."""
-    return SCREENING_PHYSICS_MODE if result_mode == "light" else EXACT_PHYSICS_MODE
-
-
+# WHAT WP1 REMOVED FROM HERE, AND WHY (review doc R5).  This module used to hold
+# EXACT_PHYSICS_MODE / SCREENING_PHYSICS_MODE and pick between them with
+# expected_physics_mode(plan.result_mode).  Both halves were wrong, in opposite
+# directions: a strict run that wrote scalars (`--result light`) was voided on
+# `full_hdf5:false`, a field that says nothing about the physics; and the
+# workaround -- EXPECTING the screening receipt for a light chunk -- accepted
+# `screening:true` for a run that was not screening at all.  Since WP1 the
+# binary reports the two axes separately (src/RunContract.h), so the audit reads
+# the fidelity and `result_mode` is reporting only.
 # ---------------------------------------------------------------------------
 # The 238 production reference environment
 # ---------------------------------------------------------------------------
@@ -234,8 +216,9 @@ class LaunchPlan:
     # this plan", which is what the older callers that predate the field mean.
     solver_threads: int = 0
     # The EFFECTIVE result mode of this launch: "light" if any job in it writes
-    # scalar-only output, else "full"/"pin-off".  It selects which PHYSICS_MODE
-    # receipt the audit demands; see expected_physics_mode().
+    # scalar-only output, else "full"/"pin-off".  REPORTING ONLY since WP1: the
+    # acceptance audit is keyed on the run's FIDELITY (tools/exact_audit.py) and
+    # what a case writes is never a reason to void it.
     result_mode: str = "full"
 
 
@@ -365,47 +348,11 @@ def validate_deck_paths(command: Sequence[str]) -> list[str]:
     return rasi
 
 
-def check_physics_mode(output: str, expected: dict | None = None) -> list[str]:
-    """Exact-only audit (plan Rev.4 Sec 2.2).
-
-    A run whose physics-mode receipt is missing, unparseable, or not the mode it
-    was launched in is not an acceptance measurement, however good its
-    throughput looked.  *expected* defaults to full-exact; a light (scalar-only)
-    launch passes SCREENING_PHYSICS_MODE instead.
-    """
-    expected_mode = EXACT_PHYSICS_MODE if expected is None else expected
-    problems = []
-    receipt = None
-    for match in PHYSICS_MODE_RECEIPT.finditer(output):
-        try:
-            receipt = json.loads(match.group(1))
-        except ValueError:
-            problems.append(
-                "could not parse the [RASBERY][PHYSICS_MODE] receipt: %s" % match.group(1)
-            )
-            receipt = None
-    if receipt is None:
-        if not problems:
-            problems.append(
-                "no [RASBERY][PHYSICS_MODE] receipt in the run output: the exact-only "
-                "contract (plan Sec 2) is unverified, so this run is not an acceptance "
-                "measurement"
-            )
-        return problems
-    for key, expected in expected_mode.items():
-        if key not in receipt:
-            problems.append("[RASBERY][PHYSICS_MODE] is missing %r" % key)
-        elif receipt[key] != expected:
-            problems.append(
-                "[RASBERY][PHYSICS_MODE] %s=%r but full-exact requires %r: this run used a "
-                "screening/approximate path" % (key, receipt[key], expected)
-            )
-    return problems
-
-
 def check_run_receipts(output: str, plan: "LaunchPlan") -> list[str]:
     """Post-run receipt audit: did the run have the shape that was asked for?"""
-    problems = check_physics_mode(output, expected_physics_mode(plan.result_mode))
+    # Keyed on FIDELITY, not on what the run wrote: `plan.result_mode` is no
+    # longer an argument (review doc R5).
+    problems = audit_physics_mode(output)
 
     receipt = None
     for match in BATCH_HOST_RECEIPT.finditer(output):
@@ -567,8 +514,8 @@ def parser() -> argparse.ArgumentParser:
             "pin output), light (scalar JSONL, no HDF5).  All three run the same physics "
             "and produce the same trajectory digest -- this is an output-shape switch, not "
             "a fidelity one.  Appended to the RASBERY command as --result MODE; a --jobs "
-            "manifest line's own third field still wins.  light additionally needs "
-            "RASBERY_ALLOW_SCREENING=1"
+            "manifest line's own third field still wins.  Since WP1 light is NOT a "
+            "screening run and needs no RASBERY_ALLOW_SCREENING"
         ),
     )
     p.add_argument("--set", dest="set_values", action="append", default=[], metavar="KEY=VALUE", help="override one profile environment variable")

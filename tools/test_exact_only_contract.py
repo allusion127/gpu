@@ -70,24 +70,51 @@ module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 
-EXACT = ('[RASBERY][PHYSICS_MODE] {"physics_mode":"full_exact_nodal","screening":false,'
-         '"feedback_pass_limit":0,"full_hdf5":true}\n')
+# The audit is keyed on FIDELITY since WP1 (review R5): `full_hdf5` and
+# `result_mode` are reported and never judged, because `--result light` is an
+# output-shape switch that leaves the solve, the PPR and the trajectory digest
+# untouched.  What still voids a run is the POLICY.
+import json  # noqa: E402
 
-if module.check_physics_mode(EXACT):
+
+def receipt(**fields: object) -> str:
+    base = {"physics_mode": "full_exact_nodal", "screening": False,
+            "feedback_pass_limit": 0, "full_hdf5": True,
+            "physics_fidelity": "full_exact", "policy": "strict",
+            "acceptance_eligible": True, "requires_exact_rerun": False,
+            "result_mode": "full", "fidelity_declared": None, "gpu_full": False}
+    base.update(fields)
+    return "[RASBERY][PHYSICS_MODE] " + json.dumps(base) + "\n"
+
+
+EXACT = receipt()
+
+if module.audit_physics_mode(EXACT):
     problems.append("run_single_gpu_batch: rejected a valid full-exact receipt")
-if not module.check_physics_mode("nothing here\n"):
+if module.audit_physics_mode(receipt(result_mode="light", full_hdf5=False)):
+    problems.append(
+        "run_single_gpu_batch: voided a strict run because it wrote scalar-only output; "
+        "the acceptance audit is keyed on fidelity, not on what the case writes")
+if not module.audit_physics_mode("nothing here\n"):
     problems.append("run_single_gpu_batch: accepted a run with no PHYSICS_MODE receipt")
 for bad in (
-    '[RASBERY][PHYSICS_MODE] {"physics_mode":"ga_screen_feedback_limited","screening":true,'
-    '"feedback_pass_limit":2,"full_hdf5":false}\n',
+    # feedback-limited: the one approximation that changes the answer.
+    receipt(policy="feedback_limited", physics_fidelity="feedback_limited",
+            physics_mode="ga_screen_feedback_limited", screening=True,
+            acceptance_eligible=False, feedback_pass_limit=2,
+            result_mode="light", full_hdf5=False),
+    # strict claimed WITH a nonzero feedback limit: a self-contradicting receipt.
+    receipt(feedback_pass_limit=3),
+    # coarse statepoints, writing the full HDF5: output shape must not rescue it.
+    receipt(policy="L3coarse", physics_fidelity="coarse10", screening=True,
+            acceptance_eligible=False, requires_exact_rerun=True),
+    # A pre-WP1 binary: it cannot be audited on fidelity, so it is void.
     '[RASBERY][PHYSICS_MODE] {"physics_mode":"full_exact_nodal","screening":false,'
-    '"feedback_pass_limit":3,"full_hdf5":true}\n',
-    '[RASBERY][PHYSICS_MODE] {"physics_mode":"full_exact_nodal","screening":false,'
-    '"feedback_pass_limit":0,"full_hdf5":false}\n',
+    '"feedback_pass_limit":0,"full_hdf5":true}\n',
     '[RASBERY][PHYSICS_MODE] {"physics_mode":"full_exact_nodal"}\n',
     '[RASBERY][PHYSICS_MODE] {not json}\n',
 ):
-    if not module.check_physics_mode(bad):
+    if not module.audit_physics_mode(bad):
         problems.append("run_single_gpu_batch: accepted a non-exact receipt: " + bad.strip())
 
 # A missing receipt must reach the exit-3 path, not just print.

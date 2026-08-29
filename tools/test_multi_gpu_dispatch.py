@@ -432,41 +432,66 @@ with tempfile.TemporaryDirectory() as tmp:
           "claimants are threads of ONE dispatcher, and on Windows there is no flock at "
           "all -- the read-modify-write was observed interleaving into a truncated file")
 
-# --- the audit has to expect the receipt the mode will actually print -------
+# --- the audit is keyed on FIDELITY, not on what the chunk wrote ------------
 #
-# `--result light` is an output-shape switch, but main.cpp:541 classifies a
-# light job as a screening run, so its PHYSICS_MODE receipt reads
-# screening:true / full_hdf5:false.  Audited against the full-exact expectation
-# EVERY light arm returns 3 -- on fields that say nothing about the physics.
+# BEFORE WP1 this block pinned the opposite rule: `expected_physics_mode()`
+# picked SCREENING_PHYSICS_MODE for a light chunk, so a light launch PASSED by
+# printing `screening:true` and FAILED by printing the exact receipt.  That
+# accepted a screening claim from a run that was not screening, and voided a
+# strict run for writing scalars.  Both names are gone; the audit now lives in
+# tools/exact_audit.py and reads `policy`/`acceptance_eligible` (review R5).
 import run_single_gpu_batch as sg  # noqa: E402
 
-check(sg.expected_physics_mode("light") is sg.SCREENING_PHYSICS_MODE
-      and sg.expected_physics_mode("full") is sg.EXACT_PHYSICS_MODE
-      and sg.expected_physics_mode("pin-off") is sg.EXACT_PHYSICS_MODE,
-      "the expected PHYSICS_MODE must follow the result mode: pin-off still writes the "
-      "result HDF5 and is still an exact run; only light is a screening receipt")
-check(sg.SCREENING_PHYSICS_MODE["feedback_pass_limit"] == 0,
-      "the screening expectation must STILL demand feedback_pass_limit=0: the GA "
-      "feedback approximation is the one field here that changes the answer, and "
-      "relaxing it would let an approximate run pass as a measurement")
+for gone in ("EXACT_PHYSICS_MODE", "SCREENING_PHYSICS_MODE", "expected_physics_mode",
+             "check_physics_mode"):
+    check(not hasattr(sg, gone),
+          f"run_single_gpu_batch.{gone} is back: the acceptance audit is keyed on the "
+          "OUTPUT mode again, which voids a strict/light arm and accepts a receipt that "
+          "claims screening from a run that is not screening (review R5)")
+check(sg.audit_physics_mode is not None,
+      "run_single_gpu_batch does not import the fidelity audit from tools/exact_audit.py")
+check("audit_physics_mode(output)" in
+      (Path(__file__).resolve().parents[1] / "tools" / "run_single_gpu_batch.py")
+      .read_text(encoding="utf-8"),
+      "check_run_receipts no longer calls audit_physics_mode(output) with no result-mode "
+      "argument: what a case WRITES is back in the acceptance decision")
 
-LIGHT_RECEIPT = ('[RASBERY][PHYSICS_MODE] {"physics_mode":"ga_screen_feedback_limited",'
-                 '"screening":true,"feedback_pass_limit":0,"full_hdf5":false}\n')
-FULL_RECEIPT = ('[RASBERY][PHYSICS_MODE] {"physics_mode":"full_exact_nodal",'
-                '"screening":false,"feedback_pass_limit":0,"full_hdf5":true}\n')
-check(sg.check_physics_mode(LIGHT_RECEIPT, sg.expected_physics_mode("light")) == [],
-      "a light run printing the screening receipt must pass its own audit")
-check(sg.check_physics_mode(LIGHT_RECEIPT) != [],
-      "negative control: the DEFAULT expectation must still refuse a screening receipt, "
-      "so an unannounced screening run cannot pass as an acceptance measurement")
-check(sg.check_physics_mode(FULL_RECEIPT, sg.expected_physics_mode("light")) != [],
-      "negative control: a light launch that printed a FULL receipt did not do what it "
-      "was told and must not pass either")
-approx = ('[RASBERY][PHYSICS_MODE] {"physics_mode":"ga_screen_feedback_limited",'
-          '"screening":true,"feedback_pass_limit":2,"full_hdf5":false}\n')
-check(sg.check_physics_mode(approx, sg.expected_physics_mode("light")) != [],
+
+def wp1_receipt(**fields: object) -> str:
+    base = {"physics_mode": "full_exact_nodal", "screening": False,
+            "feedback_pass_limit": 0, "full_hdf5": True,
+            "physics_fidelity": "full_exact", "policy": "strict",
+            "acceptance_eligible": True, "requires_exact_rerun": False,
+            "result_mode": "full", "fidelity_declared": None, "gpu_full": False}
+    base.update(fields)
+    return "[RASBERY][PHYSICS_MODE] " + json.dumps(base) + "\n"
+
+
+LIGHT_RECEIPT = wp1_receipt(result_mode="light", full_hdf5=False)
+FULL_RECEIPT = wp1_receipt()
+check(sg.audit_physics_mode(LIGHT_RECEIPT) == [],
+      "a strict run that wrote scalar-only output is an acceptance measurement and the "
+      "dispatcher's audit must accept it")
+check(sg.audit_physics_mode(FULL_RECEIPT) == [],
+      "the audit rejects a plain strict/full run")
+# NEGATIVE CONTROLS: fidelity, not output shape, is what voids a run.
+check(sg.audit_physics_mode(wp1_receipt(
+          policy="feedback_limited", physics_fidelity="feedback_limited",
+          physics_mode="ga_screen_feedback_limited", screening=True,
+          acceptance_eligible=False, feedback_pass_limit=2,
+          result_mode="light", full_hdf5=False)) != [],
       "negative control: light output with a NONZERO GA feedback limit is the "
-      "approximation, and it must fail even the screening audit")
+      "approximation and must still be voided")
+check(sg.audit_physics_mode(wp1_receipt(
+          policy="L3coarse", physics_fidelity="coarse10", screening=True,
+          acceptance_eligible=False, requires_exact_rerun=True)) != [],
+      "negative control: a coarse-statepoint run that wrote the FULL HDF5 is still "
+      "screening -- the output shape must not rescue it")
+check(sg.audit_physics_mode(
+          '[RASBERY][PHYSICS_MODE] {"physics_mode":"full_exact_nodal","screening":false,'
+          '"feedback_pass_limit":0,"full_hdf5":true}\n') != [],
+      "negative control: a pre-WP1 receipt cannot be audited on fidelity at all, and a "
+      "run that cannot be audited is void, not a pass")
 
 # The dispatcher decides which jobs share a process, so it has to agree with
 # main.cpp's any_of(): one light job makes the whole chunk a screening run.
@@ -511,28 +536,35 @@ with tempfile.TemporaryDirectory() as tmp:
                    "--mps-optional", "--", sys.executable]) == 2,
           "--mps-optional without --mps must be refused rather than silently ignored")
 
-    # A light run without RASBERY_ALLOW_SCREENING is refused by main.cpp once
-    # per chunk, AFTER the queue was claimed.  Asked here it costs nothing.
+    # A light wave is NOT a screening run since WP1 (src/RunContract.h), so the
+    # dispatcher must not demand a screening permission for it.  A guard that is
+    # stricter than the executable refuses runs that would have worked -- and
+    # this one used to refuse every strict/light L5 wave before the queue was
+    # even claimed.
     saved_allow = os.environ.pop("RASBERY_ALLOW_SCREENING", None)
     try:
         check(mg.main(base + ["--result", "light", "--device-memory-gb", "64",
-                              "--", sys.executable]) == 2,
-              "--result light without RASBERY_ALLOW_SCREENING must be refused before "
-              "the queue is claimed: RASBERY refuses it once per chunk anyway")
+                              "--", sys.executable]) == 0,
+              "--result light without RASBERY_ALLOW_SCREENING must now be ACCEPTED: "
+              "light is an output shape and the binary no longer refuses it")
         check(mg.main(base + ["--result", "light", "--device-memory-gb", "64",
                               "--set", "RASBERY_ALLOW_SCREENING=1",
                               "--", sys.executable]) == 0,
-              "--set RASBERY_ALLOW_SCREENING=1 must be an accepted way to say it")
+              "--set RASBERY_ALLOW_SCREENING=1 must remain harmless: it still means "
+              "'a non-strict fidelity is allowed', which is a different statement")
         os.environ["RASBERY_ALLOW_SCREENING"] = "0"
         check(mg.main(base + ["--result", "light", "--device-memory-gb", "64",
-                              "--", sys.executable]) == 2,
-              "RASBERY_ALLOW_SCREENING=0 is main.cpp's falsey spelling and must be "
-              "refused here the same way, or the guard is stricter or laxer than the "
-              "executable it is guarding")
+                              "--", sys.executable]) == 0,
+              "RASBERY_ALLOW_SCREENING=0 must not refuse a light wave either")
     finally:
         os.environ.pop("RASBERY_ALLOW_SCREENING", None)
         if saved_allow is not None:
             os.environ["RASBERY_ALLOW_SCREENING"] = saved_allow
+    # NEGATIVE CONTROL for the removal: the refusal text must be gone from the
+    # dispatcher, or it can come back by being re-guarded somewhere else.
+    check("classifies as a screening run and refuses unless" not in source,
+          "run_multi_gpu_batch still refuses a light wave for want of "
+          "RASBERY_ALLOW_SCREENING (review R5)")
 
 if failures:
     raise SystemExit("multi-gpu dispatch: FAIL\n  " + "\n  ".join(failures))

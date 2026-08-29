@@ -917,8 +917,9 @@ def parser() -> argparse.ArgumentParser:
         help=(
             "what every job writes unless its manifest line says otherwise: full (result "
             "HDF5 + restarts + pin CSV), pin-off (no pin output), light (scalar JSONL, no "
-            "HDF5).  All three run the same physics and produce the same trajectory digest; "
-            "light additionally needs RASBERY_ALLOW_SCREENING=1"
+            "HDF5).  All three run the same physics and produce the same trajectory digest, "
+            "and since WP1 none of them is a screening run: light needs no "
+            "RASBERY_ALLOW_SCREENING"
         ),
     )
     p.add_argument(
@@ -1054,24 +1055,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    # A light job needs RASBERY_ALLOW_SCREENING, and main.cpp refuses without
-    # it -- once per chunk, AFTER the queue was claimed and the arenas stood up.
-    # Asked here, the campaign loses nothing.  The parse mirrors main.cpp:545
-    # exactly (set and not one of the falsey words), because a guard that is
-    # stricter than the executable refuses runs that would have worked.
-    if args.result == "light" or any(mode == "light" for _i, _o, mode in jobs):
-        allow = overrides.get("RASBERY_ALLOW_SCREENING",
-                              os.environ.get("RASBERY_ALLOW_SCREENING", ""))
-        if allow == "" or allow in ("0", "off", "OFF", "false", "FALSE"):
-            print(
-                "error: this run writes scalar-only (light) results, which RASBERY "
-                "classifies as a screening run and refuses unless "
-                "RASBERY_ALLOW_SCREENING=1 is set. Export it, or pass "
-                "--set RASBERY_ALLOW_SCREENING=1, if a screening campaign is what you "
-                "meant. Screening results are never acceptance results.",
-                file=sys.stderr,
-            )
-            return 2
+    # WHAT USED TO BE HERE, AND WHY IT IS GONE (review doc R5).  This refused a
+    # `--result light` wave unless RASBERY_ALLOW_SCREENING was set, because
+    # main.cpp used to compute `screening = (ga_feedback_passes > 0) ||
+    # light_result` and would refuse the chunk itself -- once per chunk, after
+    # the queue was claimed.  Since WP1 `screening` is a property of the
+    # FIDELITY alone (src/RunContract.h), a strict/light wave starts with no
+    # permission at all, and a guard STRICTER than the executable refuses runs
+    # that would have worked.  RASBERY_ALLOW_SCREENING still means exactly one
+    # thing -- "a non-strict fidelity is allowed" -- and it stays the
+    # OPERATOR's: tools/test_harness_env_parity.py keeps both harnesses from
+    # granting it to themselves.
 
     workdir = Path(args.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
