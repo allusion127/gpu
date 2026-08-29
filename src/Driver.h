@@ -815,6 +815,10 @@ class Driver {
 private:
     std::string _input;
     std::string _result_output;
+    /// What this case is asked to produce.  Per DRIVER, not per process: one
+    /// --batch-mode wave may carry light screening cases and full elite cases
+    /// side by side (see ResultMode in BatchLightResult.h).
+    ResultMode  _result_mode = ResultMode::Full;
 
     static constexpr double CMFD_FLUX_L2_TOLERANCE = 1.0e-6;
     // Search / T-H feedbacks engage once the CMFD flux L2 residual drops below this, so they
@@ -3817,9 +3821,11 @@ private:
     }
 
 public:
-    explicit Driver(const std::string& input, const std::string& result_output = "")
+    explicit Driver(const std::string& input, const std::string& result_output = "",
+                    ResultMode result_mode = BatchLightResult::DefaultMode())
         : _input(input),
-          _result_output(result_output) {
+          _result_output(result_output),
+          _result_mode(result_mode) {
     }
 
     int Drive() {
@@ -3831,7 +3837,13 @@ public:
         // HDF5/restart/pin output remains the default and is used for selected
         // exact cases; light mode avoids queueing mutable Geometry/Schedule
         // references while preserving every scalar computed below.
-        const bool light_result = BatchLightResult::Enabled();
+        const bool light_result = (_result_mode == ResultMode::Light);
+        // pin-off drops the ~119 MB/case pin-power CSV and the fmap flux
+        // reconstruction.  It does NOT skip PPR: Fq and FdH are PPR outputs and
+        // the GA reads both, so the reconstruction runs and only the printing
+        // stops.  Applied after ReadInput, over every schedule entry, because
+        // the deck states it per entry ("pin-wise information").
+        const bool pin_off = (_result_mode == ResultMode::PinOff);
 
         // 1. Build solver objects and read input deck
         Geometry  geometry;
@@ -3843,6 +3855,12 @@ public:
         // can be separated from the XSLIB-cache track (plan Rev.4 Sec 14).
         const auto library_start = std::chrono::steady_clock::now();
         input_output.ReadInput(_input);
+        if (pin_off) {
+            for (auto& entry : scheduler.schedule()) {
+                entry.print_opt.pin_info = false;
+                entry.print_opt.pin_flux = false;
+            }
+        }
         const double library_seconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - library_start).count();
 

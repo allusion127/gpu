@@ -279,6 +279,8 @@ def build_plan(args: argparse.Namespace, command: list[str]) -> tuple[LaunchPlan
         )
     if command_width is None:
         command.extend(["--batch-mode", str(batch_width)])
+    if getattr(args, "result", None) and "--result" not in command:
+        command.extend(["--result", args.result])
 
     rasi = validate_deck_paths(command)
     jobs = len(rasi) if rasi else batch_width
@@ -331,6 +333,18 @@ def parser() -> argparse.ArgumentParser:
         default=1.0,
         help="auto-mode host oversubscription factor; benchmark 1.0, 1.5 and 2.0 on the target host",
     )
+    p.add_argument(
+        "--result",
+        choices=("full", "pin-off", "light"),
+        help=(
+            "what every job writes: full (result HDF5 + restarts + pin CSV), pin-off (no "
+            "pin output), light (scalar JSONL, no HDF5).  All three run the same physics "
+            "and produce the same trajectory digest -- this is an output-shape switch, not "
+            "a fidelity one.  Appended to the RASBERY command as --result MODE; a --jobs "
+            "manifest line's own third field still wins.  light additionally needs "
+            "RASBERY_ALLOW_SCREENING=1"
+        ),
+    )
     p.add_argument("--set", dest="set_values", action="append", default=[], metavar="KEY=VALUE", help="override one profile environment variable")
     p.add_argument("--dry-run", action="store_true", help="print the plan without executing RASBERY")
     p.add_argument("command", nargs=argparse.REMAINDER, help="RASBERY executable and arguments, preceded by --")
@@ -362,6 +376,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "visible_cpus": plan.visible_cpus,
         "host_workers": plan.host_workers,
         "worker_policy": plan.worker_policy,
+        "result_mode": args.result or "default",
         "cmfd_wait_us": env.get("RASBERY_BATCH_WAIT_US"),
         "nodal_wait_us": env.get("RASBERY_NODAL_BATCH_WAIT_US"),
         "command": command,

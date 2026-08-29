@@ -27,11 +27,54 @@
 
 namespace rasbery {
 
+/// What a case is asked to produce.  Orthogonal to the physics: all three
+/// modes run the same solve and the same PPR, and the campaign has measured
+/// all three to the same trajectory digest (814201df0583e1d2, GA evaluator
+/// plan Sec 2.1).  What differs is only what leaves the process.
+///
+///   Full    result HDF5 + restarts + pin-power CSV   (~301.6 MB/case)
+///   PinOff  result HDF5 + restarts, no pin output    (~12.0 MB/case)
+///   Light   one JSONL line per statepoint, no HDF5   (~25.1 kB/case)
+///
+/// PER JOB, not per process.  A GA wave wants Light for the population and
+/// Full for the handful of elites it promotes, in ONE batch; the environment
+/// variable cannot express that, because every worker in a --batch-mode
+/// process shares it.
+enum class ResultMode { Full, PinOff, Light };
+
+inline const char* ResultModeName(ResultMode mode) {
+    switch (mode) {
+        case ResultMode::Light:  return "light";
+        case ResultMode::PinOff: return "pin-off";
+        case ResultMode::Full:   break;
+    }
+    return "full";
+}
+
+/// Parse `full` | `pin-off` | `light`.  False (and `out` untouched) on anything
+/// else, so the caller can name the offending word in its own error.
+inline bool ParseResultMode(const std::string& text, ResultMode& out) {
+    if (text == "full") { out = ResultMode::Full; return true; }
+    if (text == "light") { out = ResultMode::Light; return true; }
+    if (text == "pin-off" || text == "pinoff" || text == "pin_off") {
+        out = ResultMode::PinOff;
+        return true;
+    }
+    return false;
+}
+
 class BatchLightResult {
 public:
     static bool Enabled() {
         const char* value = std::getenv("RASBERY_BATCH_LIGHT_RESULT");
         return value && *value && std::string(value) != "0";
+    }
+
+    /// The process default, from the environment.  `--result` overrides it and
+    /// a manifest's third field overrides that; nothing here changes when
+    /// neither is given, which is why the flag is additive.
+    static ResultMode DefaultMode() {
+        return Enabled() ? ResultMode::Light : ResultMode::Full;
     }
 
     static int FeedbackPasses() {
@@ -247,7 +290,14 @@ public:
                       int search_status,
                       double search_dk,
                       double search_tol) {
-        if (!Enabled()) return;
+        // NO SECOND OPINION ON WHETHER TO WRITE.  This used to re-read
+        // RASBERY_BATCH_LIGHT_RESULT here, which was harmless while the
+        // environment was the only way to ask for a light result and became a
+        // silent no-op the moment `--result light` existed: the case ran, the
+        // scalars were computed, and nothing was written anywhere.  The caller
+        // (Driver::Drive, on its own per-case ResultMode) has already decided;
+        // a writer that second-guesses its caller from a process global cannot
+        // serve a per-job mode at all.
 
         nlohmann::ordered_json receipt;
         receipt["mode"] = "batch_light";

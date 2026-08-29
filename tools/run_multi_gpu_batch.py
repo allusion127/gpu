@@ -77,15 +77,23 @@ LOADER_THREADS_PER_GPU_MAX = 16
 # ---------------------------------------------------------------------------
 
 
-def read_manifest(path: Path) -> list[tuple[str, str]]:
+RESULT_MODES = ("full", "pin-off", "light")
+
+
+def read_manifest(path: Path) -> list[tuple[str, str, str]]:
     """Parse the same `--jobs` manifest main.cpp reads.
 
-    Kept deliberately in lockstep with rasberyReadJobManifest(): two fields per
-    line, `#` comments, `"` quoting, blank lines skipped.  The dispatcher has to
-    agree with the executable about what a job is, because it is the dispatcher
-    that decides which jobs go to which GPU.
+    Kept deliberately in lockstep with rasberyReadJobManifest(): two paths per
+    line plus an OPTIONAL third field (that job's result mode), `#` comments,
+    `"` quoting, blank lines skipped.  The dispatcher has to agree with the
+    executable about what a job is, because it is the dispatcher that decides
+    which jobs go to which GPU -- and, since it rewrites the chunk manifests, a
+    third field it did not understand would be silently dropped and every
+    promoted elite would come back as a screening receipt.
+
+    A job with no third field carries the empty string and inherits --result.
     """
-    jobs: list[tuple[str, str]] = []
+    jobs: list[tuple[str, str, str]] = []
     for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = raw.split("#", 1)[0].strip()
         if not line:
@@ -94,15 +102,22 @@ def read_manifest(path: Path) -> list[tuple[str, str]]:
             fields = shlex.split(line)
         except ValueError as exc:
             raise ValueError(f"{path}:{lineno}: {exc}") from exc
-        if len(fields) != 2:
+        if len(fields) not in (2, 3):
             raise ValueError(
-                f"{path}:{lineno}: expected `<input.json> <output.h5>`, got {len(fields)} field(s)"
+                f"{path}:{lineno}: expected `<input.json> <output.h5> [result-mode]`, "
+                f"got {len(fields)} field(s)"
             )
-        jobs.append((fields[0], fields[1]))
+        mode = fields[2] if len(fields) == 3 else ""
+        if mode and mode not in RESULT_MODES:
+            raise ValueError(
+                f"{path}:{lineno}: third field must be a result mode "
+                f"{'|'.join(RESULT_MODES)}, got {mode!r}"
+            )
+        jobs.append((fields[0], fields[1], mode))
     if not jobs:
         raise ValueError(f"{path}: no jobs")
     seen: dict[str, int] = {}
-    for index, (_, output) in enumerate(jobs):
+    for index, (_, output, _mode) in enumerate(jobs):
         key = path_key(output)
         if key in seen:
             raise ValueError(
@@ -266,10 +281,11 @@ def run_gpu(
     gpu: str,
     index: int,
     queue: Queue,
-    jobs: list[tuple[str, str]],
+    jobs: list[tuple[str, str, str]],
     budget: HostBudget,
     batch_width: int,
     claim: str,
+    result_mode: str | None,
     executable: list[str],
     workdir: Path,
     cwd: Path | None,
@@ -307,7 +323,10 @@ def run_gpu(
         chunk_index += 1
         manifest = workdir / f"gpu{gpu}.chunk{chunk_index:04d}.txt"
         manifest.write_text(
-            "".join(f'"{i}" "{o}"\n' for i, o in jobs[start:end]),
+            "".join(
+                f'"{i}" "{o}"' + (f" {m}" if m else "") + "\n"
+                for i, o, m in jobs[start:end]
+            ),
             encoding="utf-8",
             newline="\n",
         )
@@ -323,6 +342,7 @@ def run_gpu(
             pin_prefix(budget, index)
             + list(executable)
             + ["--jobs", str(manifest), "--batch-mode", str(batch_width)]
+            + (["--result", result_mode] if result_mode else [])
         )
         log = workdir / f"gpu{gpu}.chunk{chunk_index:04d}.log"
         # The manifest carries absolute paths, but a deck's own references (its
@@ -398,7 +418,19 @@ def parser() -> argparse.ArgumentParser:
         "single-GPU form; use it where a second device is off limits",
     )
     p.add_argument("--batch-width", type=int, required=True, help="CUDA arena width per process")
-    p.add_argument("--jobs", required=True, help="job manifest: `<input.json> <output.h5>` per line")
+    p.add_argument("--jobs", required=True,
+                   help="job manifest: `<input.json> <output.h5> [result-mode]` per line; the "
+                        "optional third field overrides --result for that job alone")
+    p.add_argument(
+        "--result",
+        choices=RESULT_MODES,
+        help=(
+            "what every job writes unless its manifest line says otherwise: full (result "
+            "HDF5 + restarts + pin CSV), pin-off (no pin output), light (scalar JSONL, no "
+            "HDF5).  All three run the same physics and produce the same trajectory digest; "
+            "light additionally needs RASBERY_ALLOW_SCREENING=1"
+        ),
+    )
     p.add_argument(
         "--claim",
         default="auto",
@@ -501,7 +533,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         results.append(
             run_gpu(
                 gpu=gpus[0], index=0, queue=queue, jobs=jobs, budget=budget,
-                batch_width=args.batch_width, claim=args.claim, executable=executable,
+                batch_width=args.batch_width, claim=args.claim, result_mode=args.result,
+                executable=executable,
                 workdir=workdir, cwd=cwd, overrides=overrides, dry_run=args.dry_run,
             )
         )
@@ -513,7 +546,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 pool.submit(
                     run_gpu,
                     gpu=gpu, index=index, queue=queue, jobs=jobs, budget=budget,
-                    batch_width=args.batch_width, claim=args.claim, executable=executable,
+                    batch_width=args.batch_width, claim=args.claim, result_mode=args.result,
+                    executable=executable,
                     workdir=workdir, cwd=cwd, overrides=overrides, dry_run=args.dry_run,
                 )
                 for index, gpu in enumerate(gpus)

@@ -97,6 +97,15 @@ bool rasberySetEnvIfNeeded(const char* key, const char* value, bool overwrite = 
     return true;
 }
 
+/// One word for what a whole run was asked to write: the common mode, or
+/// "mixed" when the jobs disagree.  Empty job lists report the default.
+std::string rasberyResultModeSummary(const std::vector<rasbery::ResultMode>& modes) {
+    if (modes.empty()) return rasbery::ResultModeName(rasbery::BatchLightResult::DefaultMode());
+    for (const rasbery::ResultMode m : modes)
+        if (m != modes.front()) return "mixed";
+    return rasbery::ResultModeName(modes.front());
+}
+
 /// Comparison key for job-namespace collisions (plan Rev.4 Sec 7).
 ///
 /// weakly_canonical resolves symlinks and `..` for the part of the path that
@@ -128,21 +137,30 @@ std::string rasberyPathKey(const std::string& path) {
 /// MAX_ARG_STRLEN on Linux and past every practical limit on Windows.  The
 /// manifest is the same information off the filesystem instead of off argv.
 ///
-/// FORMAT.  One job per line, `<input.json> <output.h5>`, separated by
-/// whitespace.  `#` starts a comment, blank lines are skipped, and a line may
-/// quote either field with `"` so paths with spaces survive.  Deliberately not
-/// JSON: this is read before anything else is initialised, it has to fail with
-/// a line number a human can act on, and the launcher (tools/run_multi_gpu_batch.py)
-/// has to be able to split one by line count without a parser.
+/// FORMAT.  One job per line, `<input.json> <output.h5> [result-mode]`,
+/// separated by whitespace.  `#` starts a comment, blank lines are skipped, and
+/// a line may quote either path with `"` so paths with spaces survive.
+/// Deliberately not JSON: this is read before anything else is initialised, it
+/// has to fail with a line number a human can act on, and the launcher
+/// (tools/run_multi_gpu_batch.py) has to be able to split one by line count
+/// without a parser.
+///
+/// THE THIRD FIELD is optional and is this job's result mode -- `full`,
+/// `pin-off` or `light` -- overriding `--result` and the environment FOR THIS
+/// JOB ONLY.  That is the whole reason it exists: a GA wave runs its population
+/// light and its promoted elites full, and both belong in one --batch-mode
+/// process, which one process-wide environment variable cannot express.
 ///
 /// The pairs land in the SAME two vectors the --rasi/--raso flags fill, before
 /// any of the validation below runs.  So the distinct-output rule, the counts
 /// match rule and the batch predicate all apply to manifest jobs unchanged, and
 /// a manifest may be mixed with explicit flags.
-bool rasberyReadJobManifest(const std::string&        manifest_path,
-                            std::vector<std::string>& inputs,
-                            std::vector<std::string>& outputs,
-                            std::string&              error) {
+bool rasberyReadJobManifest(const std::string&              manifest_path,
+                            std::vector<std::string>&       inputs,
+                            std::vector<std::string>&       outputs,
+                            std::vector<rasbery::ResultMode>& modes,
+                            rasbery::ResultMode             default_mode,
+                            std::string&                    error) {
     std::ifstream file(manifest_path);
     if (!file) {
         error = "cannot open job manifest: " + manifest_path;
@@ -187,15 +205,24 @@ bool rasberyReadJobManifest(const std::string&        manifest_path,
                     "write the same default result.h5.";
             return false;
         }
+        rasbery::ResultMode mode = default_mode;
+        const std::string   third = next_field(line, pos);
+        if (!third.empty() && !rasbery::ParseResultMode(third, mode)) {
+            error = manifest_path + ":" + std::to_string(lineno) +
+                    ": third field must be a result mode (full | pin-off | light), got \"" +
+                    third + "\". Quote a path that contains spaces.";
+            return false;
+        }
         const std::string trailing = next_field(line, pos);
         if (!trailing.empty()) {
             error = manifest_path + ":" + std::to_string(lineno) +
-                    ": expected exactly two fields, found a third (" + trailing +
+                    ": expected at most three fields, found a fourth (" + trailing +
                     "). Quote a path that contains spaces.";
             return false;
         }
         inputs.push_back(input);
         outputs.push_back(output);
+        modes.push_back(mode);
     }
     return true;
 }
@@ -269,6 +296,11 @@ int main(int argc, char* argv[]) {
     std::vector<std::string> validate_args; // --validate <input.json> <out.csv> [fineKey coarseKey]
     int                      batch_width = 0; // --batch-mode M: M instances in one process
     std::vector<std::string> job_manifests;   // --jobs: deck/output pairs read from a file
+    // --result: what every job produces unless its manifest line says otherwise.
+    // Unset means "whatever the environment says", so the default path is byte
+    // for byte what it was before the flag existed.
+    rasbery::ResultMode      result_mode = rasbery::BatchLightResult::DefaultMode();
+    std::vector<rasbery::ResultMode> rasbery_result_modes;
 
     int argi = 1;
     while (argi < argc) {
@@ -278,7 +310,7 @@ int main(int argc, char* argv[]) {
             std::cout << "Usage:\n"
                       << "  RASBERY [--chiffoni input1.json input2.json ...] [--chiffono output1.h5 output2.h5 ...]\n"
                       << "          [--rasi input1.json input2.json ...] [--raso output1.h5 output2.h5 ...]\n"
-                      << "          [--batch-mode M]\n\n"
+                      << "          [--batch-mode M] [--result full|pin-off|light]\n\n"
                       << "Notes:\n"
                       << "  - Values after each flag are consumed until the next --flag.\n"
                       << "  - The number of --chiffoni and --chiffono paths must match.\n"
@@ -288,14 +320,25 @@ int main(int argc, char* argv[]) {
                       << "    batched into a single GPU grid.  Every deck must share one\n"
                       << "    geometry; only the state (temperatures, power, rods, schedule)\n"
                       << "    may differ.  Requires a CUDA build.  Each instance is\n"
-                      << "    bit-identical to running that deck on its own.\n";
+                      << "    bit-identical to running that deck on its own.\n"
+                      << "  - --result selects what every job WRITES; the physics and the\n"
+                      << "    trajectory are identical in all three (same digest):\n"
+                      << "      full     result HDF5 + restarts + pin-power CSV  (default)\n"
+                      << "      pin-off  result HDF5 + restarts, no pin output\n"
+                      << "      light    one JSONL line per statepoint, no HDF5\n"
+                      << "    It mirrors RASBERY_BATCH_LIGHT_RESULT=1 (which is --result\n"
+                      << "    light) and overrides it.  light and pin-off are screening\n"
+                      << "    modes: light still needs RASBERY_ALLOW_SCREENING=1.\n"
+                      << "  - A --jobs manifest line may carry a THIRD field, that job's own\n"
+                      << "    result mode, which overrides --result for that job alone --\n"
+                      << "    how one wave runs a light population beside full elites.\n";
             return 0;
         }
 
         if (option != "--chiffoni" && option != "--chiffono" &&
             option != "--rasi" && option != "--raso" &&
             option != "--isohgc" && option != "--isocsv" && option != "--validate" &&
-            option != "--batch-mode" && option != "--jobs") {
+            option != "--batch-mode" && option != "--jobs" && option != "--result") {
             std::cerr << "Unknown option: " << option << std::endl;
             return 1;
         }
@@ -327,6 +370,13 @@ int main(int argc, char* argv[]) {
                 batch_width = std::max(0, std::atoi(value.c_str()));
             else if (option == "--jobs")
                 job_manifests.push_back(value);
+            else if (option == "--result") {
+                if (!rasbery::ParseResultMode(value, result_mode)) {
+                    std::cerr << "--result must be one of full | pin-off | light, got: "
+                              << value << std::endl;
+                    return 1;
+                }
+            }
             else
                 iso_csv = value;
 
@@ -342,9 +392,12 @@ int main(int argc, char* argv[]) {
     // Manifest jobs are appended BEFORE every check below, so a manifest is
     // validated by exactly the rules an argv deck list is -- one namespace, one
     // counts-match test, one batch predicate.
+    // argv decks take the flag's mode; a manifest line may override its own.
+    rasbery_result_modes.assign(rasbery_inputs.size(), result_mode);
     for (const std::string& manifest : job_manifests) {
         std::string manifest_error;
-        if (!rasberyReadJobManifest(manifest, rasbery_inputs, rasbery_outputs, manifest_error)) {
+        if (!rasberyReadJobManifest(manifest, rasbery_inputs, rasbery_outputs,
+                                    rasbery_result_modes, result_mode, manifest_error)) {
             std::cerr << manifest_error << std::endl;
             return 1;
         }
@@ -354,6 +407,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "The number of --rasi and --raso paths must match." << std::endl;
         return 1;
     }
+    rasbery_result_modes.resize(rasbery_inputs.size(), result_mode);
 
     // Job namespace policy (plan Rev.4 Sec 7).  Repeating a --rasi deck is
     // ALLOWED and is how a batch sweeps states off one input file.  Repeating a
@@ -407,7 +461,14 @@ int main(int argc, char* argv[]) {
     // which one this was for the benchmark parser.
     // -----------------------------------------------------------------------
     const int  ga_feedback_passes = rasbery::BatchLightResult::FeedbackPasses();
-    const bool light_result       = rasbery::BatchLightResult::Enabled();
+    // ANY light job makes the run a screening run.  Reading only the
+    // environment would let `--result light` walk straight past the guard the
+    // environment variable is guarded by -- the flag is a second door to the
+    // same room, so it gets the same lock.
+    const bool any_light =
+        std::any_of(rasbery_result_modes.begin(), rasbery_result_modes.end(),
+                    [](rasbery::ResultMode m) { return m == rasbery::ResultMode::Light; });
+    const bool light_result       = rasbery::BatchLightResult::Enabled() || any_light;
     const bool screening          = (ga_feedback_passes > 0) || light_result;
     const bool allow_screening    = [] {
         const char* value = std::getenv("RASBERY_ALLOW_SCREENING");
@@ -421,8 +482,10 @@ int main(int argc, char* argv[]) {
         std::cerr << "[RASBERY][EXACT_ONLY][FAIL] this build runs full-exact physics only.\n"
                   << "  RASBERY_GA_FEEDBACK_PASSES=" << ga_feedback_passes
                   << " (required: 0 or unset)\n"
-                  << "  RASBERY_BATCH_LIGHT_RESULT=" << (light_result ? "1" : "0")
-                  << " (required: 0 or unset; full HDF5 output is part of the contract)\n"
+                  << "  light result requested=" << (light_result ? "1" : "0")
+                  << " (RASBERY_BATCH_LIGHT_RESULT or --result light / a manifest's third "
+                     "field; required: none of them; full HDF5 output is part of the "
+                     "contract)\n"
                   << "  Unset them to run exact, or set RASBERY_ALLOW_SCREENING=1 to run a "
                      "screening job on purpose. Screening results are never acceptance "
                      "results."
@@ -459,8 +522,12 @@ int main(int argc, char* argv[]) {
               // A/B of the thing it claims to be.
               << ",\"exec_mode\":\"" << rasbery::executionModeName() << "\""
               << ",\"xe_anderson\":" << (rasbery::xeAnderson() ? "true" : "false")
-              << ",\"xe_anderson_source\":\"" << rasbery::xeAndersonSourceName() << "\"}"
-              << std::endl;
+              << ",\"xe_anderson_source\":\"" << rasbery::xeAndersonSourceName() << "\""
+              // Additive field: what the jobs of this run were asked to WRITE.
+              // "mixed" is a legitimate value -- one wave, light population,
+              // full elites -- and is why this is not a boolean.
+              << ",\"result_mode\":\"" << rasberyResultModeSummary(rasbery_result_modes)
+              << "\"}" << std::endl;
 
     if (screening) {
         std::cout << "[RASBERY][GA][SCREEN] {\"physics_mode\":"
@@ -669,7 +736,8 @@ int main(int argc, char* argv[]) {
                 // refill this task has to keep small.
                 {
                     rasbery::Driver driver(rasbery_inputs[static_cast<std::size_t>(i)],
-                                           rasbery_outputs[static_cast<std::size_t>(i)]);
+                                           rasbery_outputs[static_cast<std::size_t>(i)],
+                                           rasbery_result_modes[static_cast<std::size_t>(i)]);
                     job_status[static_cast<std::size_t>(i)] = driver.Drive();
                 }
             } catch (const std::exception& error) {
@@ -768,6 +836,10 @@ int main(int argc, char* argv[]) {
         // once per deck (XsLibrary.h).  loads == 1 with hits == jobs - 1 is the
         // shape the batch is supposed to have.
         rasbery::PrintXsLibraryCacheReceipt(std::cout);
+        // Read beside [HDF5][LOCK]: what that lock used to hold was this parse,
+        // once per deck (XsLibrary.h).  loads == 1 with hits == jobs - 1 is the
+        // shape the batch is supposed to have.
+        rasbery::PrintXsLibraryCacheReceipt(std::cout);
         // Final writer counters.  Read together with [HDF5][LOCK] above, but
         // note the ACQUISITION count does not move: inline already took the
         // guard once per write function.  What the thread path changes is who
@@ -805,7 +877,8 @@ int main(int argc, char* argv[]) {
         int         driver_exit_code = 0;
         std::string driver_error;
         try {
-            rasbery::Driver driver(rasbery_input_path.string(), rasbery_output_path.string());
+            rasbery::Driver driver(rasbery_input_path.string(), rasbery_output_path.string(),
+                                   rasbery_result_modes[i]);
             driver_exit_code = driver.Drive();
         } catch (const std::exception& error) {
             driver_exit_code = 1;
@@ -865,6 +938,7 @@ int main(int argc, char* argv[]) {
               << hdf5_stats.acquisitions << ",\"wait_ms\":"
               << static_cast<double>(hdf5_stats.wait_nanoseconds) / 1.0e6
               << "}" << std::endl;
+    rasbery::PrintXsLibraryCacheReceipt(std::cout);
     rasbery::PrintXsLibraryCacheReceipt(std::cout);
     rasbery::iowriter::reportSummary(std::cout);
     return exit_code;
