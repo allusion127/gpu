@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""Fold RASBERY run logs into a per-case cost ledger.
+
+The GA evaluator question is not "how fast is the solver" but "what does one
+case cost, and how much of that cost would a persistent evaluator never pay
+again".  This tool answers exactly that, from receipts the binary already
+prints, and it refuses to guess: every column below is a receipt field or a
+difference of two receipt fields, never a model.
+
+Receipts consumed (all optional; missing ones become blank cells):
+
+  ``  [TIMING] Init+IO=<s>``          Driver.h:3950  deck+XSLIB parse, solver
+                                      construction, arena admission, OpenResult
+  ``  [TIMING] IO write=<s>``         Driver.h:4232  driver-thread I/O charge
+  ``  TOTAL DRIVER TIME=<s>``         Driver.h:4233  Drive() entry -> exit
+  ``[RASBERY][SPTELEM][SUMMARY]``     Driver.h:4249  the full per-run counters,
+                                      including library_seconds and solve_wall
+  ``[RASBERY][IO_WRITER][SUMMARY]``   IoWriter.h     bytes, writer_busy_ms
+  ``[RASBERY][TRAJECTORY]``           Driver.h:4305  outers, statepoints, digest
+  ``[RASBERY][CUDA][BATCH_OCCUPANCY]`` CudaBICGBackend.cu:5525  mean_width
+  ``[RASBERY][REFILL]``               BatchRefill.h  tail_idle_s, slot_busy
+
+The process wall is NOT a receipt -- the Driver cannot observe its own startup
+or teardown.  Pass it with ``--wall-dir DIR``: for a log ``NAME.log`` the tool
+reads ``DIR/NAME.wall`` (the first float in it), which is what
+``/usr/bin/time -f "%e" -o NAME.wall`` writes.  ``outside_drive`` is then
+``wall - TOTAL DRIVER TIME``: process start, CUDA context creation, arena
+teardown, context destruction.  Without a .wall file that column stays blank
+rather than being invented.
+
+The ledger splits one case into four buckets:
+
+  fixed_startup   outside_drive          once per PROCESS in batch, once per
+                                         case in one-case-per-process runs
+  fixed_percase   Init+IO                once per CASE today; a persistent
+                                         evaluator amortises library_seconds
+                                         and the arena admission inside it
+  physics         solve_wall             the only bucket that is the answer
+  output          IO write               driver-thread charge for results;
+                                         writer_busy_ms is the overlapped part
+
+Usage
+-----
+    tools/case_cost_profile.py ~/gaplan/*.log --wall-dir ~/gaplan
+    tools/case_cost_profile.py run.log --json > ledger.json
+    tools/case_cost_profile.py batchrun.log --batch
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+TIMING_INIT = re.compile(r"\[TIMING\]\s+Init\+IO=([0-9.]+)\s*s")
+TIMING_IO = re.compile(r"\[TIMING\]\s+IO write=([0-9.]+)\s*s")
+TIMING_TOTAL = re.compile(r"TOTAL DRIVER TIME=\s*([0-9.]+)\s*s")
+STEP_LINE = re.compile(
+    r"NO\.=\s*(\d+)\s+EFPD=\s*([0-9.eE+-]+)\s+K-EFF=([0-9.]+)\s+PPM=\s*([0-9.eE+-]+)"
+    r"\s+outer=\s*(\d+)\s+TH=\s*(\d+)\s+t=\s*([0-9.]+)s")
+
+
+def receipts(text: str, tag: str) -> list[dict]:
+    """Every JSON object printed after `tag` on its own line."""
+    out = []
+    for line in text.splitlines():
+        idx = line.find(tag)
+        if idx < 0:
+            continue
+        brace = line.find("{", idx)
+        if brace < 0:
+            continue
+        try:
+            out.append(json.loads(line[brace:]))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def first(seq: list[dict]) -> dict:
+    return seq[0] if seq else {}
+
+
+def read_wall(wall_dir: Path | None, log: Path) -> float | None:
+    if wall_dir is None:
+        return None
+    cand = wall_dir / (log.stem + ".wall")
+    if not cand.exists():
+        return None
+    for token in cand.read_text(errors="replace").split():
+        try:
+            return float(token)
+        except ValueError:
+            continue
+    return None
+
+
+def profile_log(log: Path, wall_dir: Path | None) -> dict:
+    text = log.read_text(errors="replace")
+    rec: dict = {"log": str(log), "name": log.stem}
+
+    # A batch log holds one [TIMING] set PER CASE.  Charging the whole process
+    # wall against the first case's Drive() would invent an "outside_drive" of
+    # the entire batch, so a multi-case log gets a different ledger: the wall is
+    # the batch's, the per-case numbers are a distribution, and the amortisation
+    # split (which is a statement about ONE case) is not printed at all.
+    inits = [float(x) for x in TIMING_INIT.findall(text)]
+    ios = [float(x) for x in TIMING_IO.findall(text)]
+    drives = [float(x) for x in TIMING_TOTAL.findall(text)]
+    rec["cases"] = max(len(drives), 1)
+    batch = len(drives) > 1
+    rec["batch"] = batch
+    if batch:
+        rec["init_seconds_min"] = min(inits) if inits else None
+        rec["init_seconds_max"] = max(inits) if inits else None
+        rec["driver_seconds_min"] = min(drives)
+        rec["driver_seconds_max"] = max(drives)
+        rec["driver_seconds_mean"] = sum(drives) / len(drives)
+        rec["io_driver_seconds_sum"] = sum(ios)
+    else:
+        if inits:
+            rec["init_seconds"] = inits[0]
+        if ios:
+            rec["io_driver_seconds"] = ios[0]
+        if drives:
+            rec["driver_seconds"] = drives[0]
+
+    sp = {} if batch else first(receipts(text, "[RASBERY][SPTELEM][SUMMARY]"))
+    for key in ("library_seconds", "solve_wall", "io_wall", "total_seconds",
+                "outers", "statepoints", "cmfd_sweeps", "bicg_iters",
+                "graph_launches_delta", "h2d_bytes_delta", "d2h_bytes_delta",
+                "d2h_calls_delta", "search_trials", "th_updates",
+                "xe_cascades", "xe_updates", "xe_outers", "search_outers",
+                "settle_outers", "outers_initial", "th_outers", "solve_loops"):
+        if key in sp:
+            rec[key] = sp[key]
+    if "solve_wall" in sp:
+        rec["driver_seconds"] = sp.get("total_seconds", rec.get("driver_seconds"))
+        rec["init_seconds"] = sp.get("init_seconds", rec.get("init_seconds"))
+        rec["io_driver_seconds"] = sp.get("io_wall", rec.get("io_driver_seconds"))
+
+    traj = first(receipts(text, "[RASBERY][TRAJECTORY]"))
+    for key in ("digest", "outers", "statepoints", "th_updates", "telemetry"):
+        if key in traj:
+            rec.setdefault(key, traj[key])
+    rec["digest"] = traj.get("digest", rec.get("digest"))
+
+    iow = first(receipts(text, "[RASBERY][IO_WRITER][SUMMARY]"))
+    for src, dst in (("bytes", "out_bytes"), ("writer_busy_ms", "writer_busy_ms"),
+                     ("enqueue_block_ms", "enqueue_block_ms"), ("ops", "io_ops"),
+                     ("failures", "io_failures"), ("skipped", "io_skipped")):
+        if src in iow:
+            rec[dst] = iow[src]
+
+    lock = first(receipts(text, "[RASBERY][HDF5][LOCK]"))
+    if lock:
+        rec["hdf5_acquires"] = lock.get("acquires")
+        rec["hdf5_wait_ms"] = lock.get("wait_ms")
+
+    occ = receipts(text, "[RASBERY][CUDA][BATCH_OCCUPANCY]")
+    if occ:
+        widest = max(occ, key=lambda o: o.get("launches", 0))
+        rec["slots"] = widest.get("slots")
+        rec["mean_width"] = widest.get("mean_width")
+        rec["effective_mean_width"] = widest.get("effective_mean_width")
+        rend = widest.get("claim_rendezvous") or {}
+        rec["rendezvous_wait_ms"] = rend.get("wait_ms")
+
+    ref = first(receipts(text, "[RASBERY][REFILL]"))
+    for key in ("jobs", "slots", "lanes", "refills", "wall_s", "tail_idle_s",
+                "slot_busy_fraction", "duplicates", "stale_tenants",
+                "double_releases"):
+        if key in ref:
+            rec["refill_" + key] = ref[key]
+
+    steps = [(int(a), float(b), float(c), float(d), int(e), int(f), float(g))
+             for a, b, c, d, e, f, g in STEP_LINE.findall(text)]
+    if steps:
+        rec["step_count"] = len(steps)
+        rec["step_seconds_sum"] = sum(s[6] for s in steps)
+        rec["step_seconds_max"] = max(s[6] for s in steps)
+        rec["step_seconds_min"] = min(s[6] for s in steps)
+        rec["efpd_last"] = steps[-1][1]
+
+    wall = read_wall(wall_dir, log)
+    if wall is not None:
+        rec["wall_seconds"] = wall
+        if batch:
+            rec["cases_per_hour"] = 3600.0 * rec["cases"] / wall
+            rec["effective_seconds_per_case"] = wall / rec["cases"]
+        elif rec.get("driver_seconds") is not None:
+            rec["outside_drive_seconds"] = wall - rec["driver_seconds"]
+
+    if batch:
+        # No per-case ledger from a batch log: the fields above are the batch's.
+        return rec
+
+    solve = rec.get("solve_wall")
+    if solve is None and "driver_seconds" in rec:
+        # Without the telemetry summary, solve is what is left of Drive().
+        known = (rec.get("init_seconds") or 0.0) + (rec.get("io_driver_seconds") or 0.0)
+        solve = rec["driver_seconds"] - known
+        rec["solve_wall_inferred"] = solve
+    if solve is not None and rec.get("outers"):
+        rec["ms_per_outer"] = 1000.0 * solve / float(rec["outers"])
+    if rec.get("outers") and rec.get("statepoints"):
+        rec["outers_per_statepoint"] = rec["outers"] / float(rec["statepoints"])
+
+    base = rec.get("wall_seconds") or rec.get("driver_seconds")
+    if base:
+        amort = (rec.get("outside_drive_seconds") or 0.0) + (rec.get("init_seconds") or 0.0)
+        rec["amortisable_seconds"] = amort
+        rec["amortisable_fraction"] = amort / base
+        if solve is not None:
+            rec["physics_fraction"] = solve / base
+        if rec.get("io_driver_seconds") is not None:
+            rec["output_fraction"] = rec["io_driver_seconds"] / base
+    return rec
+
+
+COLUMNS = [
+    ("name", "run", "{}", 16),
+    ("cases", "n", "{:d}", 3),
+    ("wall_seconds", "wall", "{:.2f}", 8),
+    ("driver_seconds", "drive", "{:.2f}", 7),
+    ("outside_drive_seconds", "outside", "{:.2f}", 8),
+    ("init_seconds", "init+io", "{:.2f}", 8),
+    ("library_seconds", "library", "{:.2f}", 8),
+    ("solve_wall", "solve", "{:.2f}", 8),
+    ("io_driver_seconds", "io(drv)", "{:.2f}", 8),
+    ("writer_busy_ms", "wr_busy_ms", "{:.0f}", 11),
+    ("out_bytes", "out_bytes", "{:d}", 12),
+    ("statepoints", "sp", "{:d}", 4),
+    ("outers", "outers", "{:d}", 7),
+    ("outers_per_statepoint", "out/sp", "{:.1f}", 7),
+    ("ms_per_outer", "ms/outer", "{:.2f}", 9),
+    ("mean_width", "width", "{:.2f}", 7),
+    ("digest", "digest", "{}", 17),
+]
+
+
+def render(rows: list[dict], stream=sys.stdout) -> None:
+    header = "  ".join(f"{label:>{w}}" for _, label, _, w in COLUMNS)
+    stream.write(header + "\n")
+    stream.write("-" * len(header) + "\n")
+    for row in rows:
+        cells = []
+        for key, _, fmt, w in COLUMNS:
+            value = row.get(key)
+            if value is None:
+                cells.append(" " * w)
+                continue
+            try:
+                cells.append(f"{fmt.format(value):>{w}}")
+            except (ValueError, TypeError):
+                cells.append(f"{str(value):>{w}}")
+        stream.write("  ".join(cells) + "\n")
+    stream.write("\n")
+    for row in rows:
+        if row.get("batch"):
+            stream.write(
+                f"{row['name']:>16}  BATCH  cases {row['cases']}  "
+                f"c/h {row.get('cases_per_hour', float('nan')):8.1f}  "
+                f"eff {row.get('effective_seconds_per_case', float('nan')):7.2f} s/case  "
+                f"drive/case {row.get('driver_seconds_min', 0):6.1f}–"
+                f"{row.get('driver_seconds_max', 0):.1f} s  "
+                f"init/case {row.get('init_seconds_min') or 0:5.2f}–"
+                f"{row.get('init_seconds_max') or 0:.2f} s  "
+                f"hdf5_lock_wait {row.get('hdf5_wait_ms', 0) / 1000.0:8.1f} s\n")
+            continue
+        if "amortisable_fraction" not in row:
+            continue
+        stream.write(
+            f"{row['name']:>16}  amortisable {row['amortisable_seconds']:6.2f} s "
+            f"({100 * row['amortisable_fraction']:5.1f} %)   "
+            f"physics {100 * row.get('physics_fraction', float('nan')):5.1f} %   "
+            f"output {100 * row.get('output_fraction', float('nan')):5.1f} %\n")
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("logs", nargs="+", type=Path)
+    ap.add_argument("--wall-dir", type=Path, default=None,
+                    help="directory holding NAME.wall sidecars from /usr/bin/time -f %%e")
+    ap.add_argument("--json", action="store_true", help="emit the rows as JSON")
+    ap.add_argument("--sort", default=None, help="sort rows by this key")
+    args = ap.parse_args(argv)
+
+    logs: list[Path] = []
+    for entry in args.logs:
+        if entry.is_dir():
+            logs.extend(sorted(entry.glob("*.log")))
+        else:
+            logs.append(entry)
+
+    rows = [profile_log(log, args.wall_dir) for log in logs if log.exists()]
+    if args.sort:
+        rows.sort(key=lambda r: (r.get(args.sort) is None, r.get(args.sort)))
+    if args.json:
+        json.dump(rows, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+    else:
+        render(rows)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
