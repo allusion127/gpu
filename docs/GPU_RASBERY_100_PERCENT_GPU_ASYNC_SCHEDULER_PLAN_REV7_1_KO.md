@@ -1598,6 +1598,26 @@ FULL이 기본 OFF인 것은 **실측 판정**이다: exit word를 보지 않으
 
 exactness 계약에 invariant 10 신설, invariant 4에 outbound event 절 추가.
 
+- [x] **Step 10 (신설, 2026-08-31): part 4 — capture 스파이크와 `graphLaunchOrSplice`.** 상세는 `docs/TASK10_CONDITIONAL_WHILE_20260831_KO.md`.
+
+Step 9가 남긴 열린 질문 — **capturing stream에 대한 `cudaGraphLaunch`가 child graph node로 기록되는가** — 에 `tools/probe_while_body_capture.cu`가 답했다: **아니다.** `cudaErrorStreamCaptureUnsupported`로 거부하고, 거부가 capture 전체를 무효화한다(그 전에 기록된 노드까지 잃는다). 그리고 Step 9가 "남은 구멍은 하나"라고 적은 것은 틀렸다 — nodal drive(`CudaXsReconBackend.cu`)와 **CMFD sweep**(`CudaBICGBackend.cu`)이 둘 다 캐시된 graph를 launch한다.
+
+```text
+로컬 12.6 / sm_61 측정 (probe_while_body_capture.cu)
+capture_while            true   root capture 중 WHILE 구축 + BeginCaptureToGraph body, trip 7/7
+graph_launch_in_capture  false  cudaErrorStreamCaptureUnsupported + capture 무효화
+child_graph_node         true   소스 cudaGraph_t를 splice, mark == trip
+fork_join_in_body        true   conditional body 안 event fork/join
+memcpy_in_body           true   conditional body 안 pinned H2D node
+device_launch_in_body    미측정  로컬에서 refusal이 아니라 HANG (opt-in으로 격리)
+```
+
+`src/GpuGraphSplice.h`의 `graphLaunchOrSplice`가 두 자리를 모두 덮는다(capture 중이면 `cudaGraphAddChildGraphNode`, 아니면 원래의 launch). 입장료는 두 캐시가 소스 `cudaGraph_t`를 exec와 **쌍으로** 보존하는 것이다. capture를 한 번도 하지 않는 런은 프로세스 전역 플래그 뒤에서 아무 비용도 내지 않는다.
+
+**WHILE은 아직 서지 않았고**, 코드가 드러낸 전제 셋이 남아 있다(같은 문서 §3): (a) sweep 스테이징 블록 `Slot::sweep_in`/`sweep_out`이 **pageable**이라 memcpy node가 되지 못한다, (b) `g_key_materialize`가 세그먼트마다 nodal graph를 drop시켜 child graph 객체가 세그먼트를 넘어 살지 못한다(오늘도 세그먼트당 재인스턴스화 2회를 내고 있다), (c) sweep 캐시 miss가 nested capture다 — 세그먼트의 **outer 0을 eager로 돌리고 body는 outer 1을 캡처**하면 (c)는 warm-up으로 닫히고, 그것이 `cmfd_sweep_patch`가 첫 outer를 patch하지 않는다는 part 3의 사실과도 맞물린다.
+
+조건은 device state에 이미 있다 — `seg.exit == 0 && seg.outer_in_segment < seg.budget` — 이므로 **budget은 capture key에 들어가지 않는다.**
+
 ## Task 11: GPU Rod Cusping and Fractional-Rod Nodal Path
 
 **[Rev.7.1 수정]** — **W5+ 재판정 대상.** 본문 Rev.7 유지. 단 Step 3의 커널 매핑에 `RodOp` phase(Driver.h:2252-2255) 연결을 추가한다(M2 요건, §9.2).

@@ -5,6 +5,7 @@
 #include "FlatXsKernel.h"
 #include "GpuCanonicalState.h"
 #include "GpuCaptureArbiter.h"
+#include "GpuGraphSplice.h"
 #include "NodalKernel.h"
 #include "XeFormMask.h"
 #include "XeKernel.h"
@@ -1824,6 +1825,23 @@ struct XsReconBackend::Impl {
     // the A/B knob that proves the capture (and the reigv indirection it
     // needs) changes nothing numerically: graph on vs off must be bit-equal.
     cudaGraphExec_t nodal_graph      = nullptr;
+    /// Rev.7.1 Task 10: THE GRAPH THE EXEC WAS MADE FROM, KEPT.
+    ///
+    /// The drive below used to destroy it on the line after the instantiate.
+    /// That was right until the outer body became something a conditional WHILE
+    /// captures: a cudaGraphLaunch into a capturing stream is REFUSED
+    /// (cudaErrorStreamCaptureUnsupported) and the refusal invalidates the whole
+    /// capture, so the only way this drive enters a captured body is as a child
+    /// graph node -- and cudaGraphAddChildGraphNode takes a cudaGraph_t, which an
+    /// exec cannot be turned back into.  Measured in
+    /// tools/probe_while_body_capture.cu: `graph_launch_in_capture` false,
+    /// `child_graph_node` true, both on the local 12.6/sm_61 box.
+    ///
+    /// It is the EXEC'S TWIN and dropNodalGraph destroys the pair: a key change
+    /// that dropped one and kept the other would splice a body that no longer
+    /// matches the exec the stream path launches, which is the one failure this
+    /// mechanism must not have.
+    cudaGraph_t     nodal_graph_src  = nullptr;
     bool            nodal_use_graph  = !envFlagDisabled("RASBERY_GPU_NODAL_GRAPH");
     double*         nodal_h_reigv    = nullptr; // pinned, 1 double
     /// Rev.7.1 W3 item 3: the device outer segment writes the reigv slot itself.
@@ -1922,6 +1940,10 @@ struct XsReconBackend::Impl {
             cudaGraphExecDestroy(nodal_graph);
             nodal_graph = nullptr;
         }
+        if (nodal_graph_src != nullptr) {
+            cudaGraphDestroy(nodal_graph_src);
+            nodal_graph_src = nullptr;
+        }
         g_key_ndev = nullptr;
     }
 
@@ -1986,6 +2008,10 @@ struct XsReconBackend::Impl {
         if (dev_sx) cudaFree(dev_sx);
         if (dev_sscale) cudaFree(dev_sscale);
         if (nodal_graph) cudaGraphExecDestroy(nodal_graph);
+        // The exec's twin (Rev.7.1 Task 10): the capture keeps the source graph
+        // so the drive can be spliced into a captured outer body, and this is the
+        // other place that has to know it exists.
+        if (nodal_graph_src) cudaGraphDestroy(nodal_graph_src);
         if (nodal_h_reigv) cudaFreeHost(nodal_h_reigv);
         // W3 item 2: one event per backend, created lazily on the first
         // deferred drain.  Destroyed beside the other lazily-created nodal
@@ -3327,7 +3353,16 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     if (!d.nodal_use_graph) {
         ok = enqueue_full();
     } else if (d.nodal_graph != nullptr) {
-        const cudaError_t lrc = cudaGraphLaunch(d.nodal_graph, d.stream);
+        // Rev.7.1 Task 10: LAUNCHED, OR SPLICED IF d.stream IS RECORDING.
+        //
+        // d.stream is pulled into the outer body's capture by the handover event
+        // (CudaOuterGraph.cu records it on the segment stream and
+        // waitOnSegmentEvent makes this one wait), so inside a captured body this
+        // stream is capturing without ever having been begun -- and a graph
+        // LAUNCH there is refused and takes the capture down with it.  See
+        // src/GpuGraphSplice.h for the measurement and the three-call splice.
+        const cudaError_t lrc =
+            rasbery::graphLaunchOrSplice(d.nodal_graph, d.nodal_graph_src, d.stream);
         if (lrc != cudaSuccess) {
             d.status = std::string("cudaGraphLaunch -> ") + cudaGetErrorString(lrc);
             ok = false;
@@ -3354,7 +3389,13 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
             // 3-argument form: the legacy (errorNode, logBuffer, size) overload
             // is gone in CUDA 13, which the 238 server builds with.
             rc = cudaGraphInstantiate(&d.nodal_graph, graph, 0ull);
-        if (graph != nullptr) cudaGraphDestroy(graph);
+        // Rev.7.1 Task 10: the graph is KEPT on success (see nodal_graph_src) and
+        // destroyed only when the instantiate did not take it.  dropNodalGraph
+        // owns the pair from here.
+        if (rc == cudaSuccess && enq_ok)
+            d.nodal_graph_src = graph;
+        else if (graph != nullptr)
+            cudaGraphDestroy(graph);
         if (rc != cudaSuccess || !enq_ok) {
             // Capture is a pure optimisation; a driver that refuses it must
             // not take the solver down.  Work submitted to a stream in capture
@@ -3363,6 +3404,7 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
             // and only execution, not a double application.
             cudaGetLastError();
             d.nodal_graph     = nullptr;
+            d.nodal_graph_src = nullptr;
             d.nodal_use_graph = false;
             g_nodal_graph_fallbacks.fetch_add(1, std::memory_order_relaxed);
             ok = enqueue_full();
@@ -3385,7 +3427,8 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
                 static_cast<int>(d.canonical.ownerOf(gpu::CanonicalRegion::Flux));
             d.g_key_halt      = d.nodal_halt;
             d.g_key_halt_slot = d.nodal_halt_slot;
-            const cudaError_t lrc = cudaGraphLaunch(d.nodal_graph, d.stream);
+            const cudaError_t lrc =
+                rasbery::graphLaunchOrSplice(d.nodal_graph, d.nodal_graph_src, d.stream);
             if (lrc != cudaSuccess) {
                 d.status = std::string("cudaGraphLaunch -> ") + cudaGetErrorString(lrc);
                 ok = false;

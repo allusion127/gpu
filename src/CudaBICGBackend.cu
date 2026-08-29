@@ -6,6 +6,7 @@
 #include "CudaXsReconBackend.h" // rasberyHostPinningEnabled(): header-only gate
 #include "Geometry.h"
 #include "GpuCaptureArbiter.h"
+#include "GpuGraphSplice.h"
 #include "pch.h"
 
 #include <cublas_v2.h>
@@ -3555,16 +3556,18 @@ public:
             // nine buckets x two precisions x one nmax -- so the list is short
             // by construction and needs no eviction.
             graph_exec = nullptr;
+            graph_src  = nullptr;
             for (const OuterGraph& e : outer_graphs)
                 if (e.nmax == nmax && e.lanes == lanes && e.precision == precisionTag()) {
                     graph_exec = e.exec;
+                    graph_src  = e.src;
                     break;
                 }
             if (graph_exec != nullptr) {
                 graph_nmax      = nmax;
                 graph_lanes     = lanes;
                 graph_precision = precisionTag();
-                CUDA_CHECK(cudaGraphLaunch(graph_exec, stream));
+                CUDA_CHECK(rasbery::graphLaunchOrSplice(graph_exec, graph_src, stream));
                 ++telemetry.graph_launches;
                 if (iter_batch_used >= 2) ++telemetry.batched_graph_launches;
                 return;
@@ -3606,8 +3609,8 @@ public:
                               << ",\"captured_iterations\":" << iter_batch_used
                               << ",\"nodes\":" << node_count << "}" << std::endl;
             }
-            if (graph != nullptr) cudaGraphDestroy(graph);
             if (rc != cudaSuccess) {
+                if (graph != nullptr) cudaGraphDestroy(graph);
                 // Capture is a pure optimisation; a driver that refuses it
                 // must not take the solver down with it.
                 //
@@ -3621,20 +3624,23 @@ public:
                 // and only execution of this outer.
                 cudaGetLastError();
                 graph_exec = nullptr;
+                graph_src  = nullptr;
                 destroyGraphCaches();
                 use_graph  = false;
                 ++telemetry.graph_fallbacks;
                 enqueue_outer(nmax);
                 return;
             }
+            graph_src       = graph;
             graph_nmax      = nmax;
             graph_lanes     = lanes;
             graph_precision = precisionTag();
-            outer_graphs.push_back(OuterGraph{graph_exec, nmax, lanes, precisionTag()});
+            outer_graphs.push_back(
+                OuterGraph{graph_exec, nmax, lanes, precisionTag(), graph_src});
             g_cmfd_bucket_graphs.fetch_add(1, std::memory_order_relaxed);
             // The capture itself enqueued nothing: replay it now.
         }
-        CUDA_CHECK(cudaGraphLaunch(graph_exec, stream));
+        CUDA_CHECK(rasbery::graphLaunchOrSplice(graph_exec, graph_src, stream));
         ++telemetry.graph_launches;
         // Counted only alongside a real graph launch, so the invariant
         // `batched_graph_launches <= graph_launches` holds on every path --
@@ -3716,14 +3722,17 @@ public:
             // shallower launch only at the same grid.y, because grid.y is
             // baked and a wider one would dispatch padding blocks again.
             sweep_graph_exec = nullptr;
+            sweep_graph_src  = nullptr;
             for (const SweepGraph& e : sweep_graphs)
                 if (e.key.serves(nmax, unroll, precisionTag(), lanes)) {
                     sweep_graph_exec = e.exec;
+                    sweep_graph_src  = e.src;
                     sweep_graph      = e.key;
                     break;
                 }
             if (sweep_graph_exec != nullptr) {
-                CUDA_CHECK(cudaGraphLaunch(sweep_graph_exec, stream));
+                CUDA_CHECK(rasbery::graphLaunchOrSplice(sweep_graph_exec, sweep_graph_src,
+                                                        stream));
                 ++telemetry.graph_launches;
                 if (iter_batch_used >= 2) ++telemetry.batched_graph_launches;
                 return;
@@ -3757,13 +3766,14 @@ public:
             }
             if (rc == cudaSuccess)
                 rc = cudaGraphInstantiate(&sweep_graph_exec, graph, 0ull);
-            if (graph != nullptr) cudaGraphDestroy(graph);
             if (rc != cudaSuccess) {
                 // Same fallback contract as launch_outer: nothing ran during a
                 // failed capture, so the direct enqueue below is the first and
                 // only execution.
+                if (graph != nullptr) cudaGraphDestroy(graph);
                 cudaGetLastError();
                 sweep_graph_exec = nullptr;
+                sweep_graph_src  = nullptr;
                 sweep_graph      = SweepGraphCapacity{};
                 destroyGraphCaches();
                 use_graph        = false;
@@ -3771,11 +3781,21 @@ public:
                 enqueue_sweeps(nmax, unroll);
                 return;
             }
+            // Rev.7.1 Task 10: THE cudaGraphDestroy THAT USED TO BE HERE IS GONE.
+            //
+            // It stood on the line after the instantiate and it was right until
+            // the outer body became capturable: a cudaGraphLaunch into a
+            // capturing stream is refused AND invalidates the capture, so the
+            // only way this sweep enters a captured outer body is as a child
+            // graph node -- and cudaGraphAddChildGraphNode needs the graph, which
+            // an exec cannot be turned back into.  Ownership moves into the cache
+            // entry below; destroyGraphCaches() destroys the pair.
+            sweep_graph_src = graph;
             sweep_graph = SweepGraphCapacity{nmax, depth, precisionTag(), lanes};
-            sweep_graphs.push_back(SweepGraph{sweep_graph_exec, sweep_graph});
+            sweep_graphs.push_back(SweepGraph{sweep_graph_exec, sweep_graph, sweep_graph_src});
             g_cmfd_bucket_graphs.fetch_add(1, std::memory_order_relaxed);
         }
-        CUDA_CHECK(cudaGraphLaunch(sweep_graph_exec, stream));
+        CUDA_CHECK(rasbery::graphLaunchOrSplice(sweep_graph_exec, sweep_graph_src, stream));
         ++telemetry.graph_launches;
         if (iter_batch_used >= 2) ++telemetry.batched_graph_launches;
     }
@@ -4344,6 +4364,9 @@ public:
     /// What the last capture actually carried.
     int           iter_batch_used = 0;
     cudaGraphExec_t graph_exec = nullptr;
+    /// The cudaGraph_t `graph_exec` was instantiated from.  Owned by the
+    /// matching outer_graphs entry, not by this pointer.
+    cudaGraph_t   graph_src  = nullptr;
     int           graph_nmax = -1;
     /// One instantiation per (nmax, grid.y, precision) for the outer, and per
     /// (nmax, capture depth, precision, grid.y) for the sweep sequence.  Both
@@ -4354,29 +4377,60 @@ public:
         int             nmax;
         int             lanes;
         int             precision;
+        /// The graph the exec was made from, kept for the same reason
+        /// SweepGraph::src is: a cudaGraphLaunch cannot enter a capture, and
+        /// cudaGraphAddChildGraphNode cannot take an exec.  This one is not on
+        /// the outer-segment path today -- launch_outer is reached through the
+        /// non-arena solveInner and the batch rendezvous -- and it is kept
+        /// anyway, because "not reachable today" is the kind of premise that
+        /// stops being true without anybody editing this line.
+        cudaGraph_t     src = nullptr;
     };
     struct SweepGraph {
         cudaGraphExec_t    exec;
         SweepGraphCapacity key;
+        /// Rev.7.1 Task 10: THE GRAPH THE EXEC WAS MADE FROM, KEPT.
+        ///
+        /// Every other cache in this file destroys it on the next line, which is
+        /// idiomatic and was right until the outer body became something that
+        /// gets CAPTURED.  A cudaGraphLaunch into a capturing stream is refused
+        /// -- cudaErrorStreamCaptureUnsupported -- and the refusal invalidates
+        /// the whole capture, so the sweep can only enter a captured outer body
+        /// as a CHILD GRAPH NODE, and cudaGraphAddChildGraphNode takes a
+        /// cudaGraph_t.  An exec cannot be turned back into one.  Measured:
+        /// tools/probe_while_body_capture.cu, records `graph_launch_in_capture`
+        /// (false) and `child_graph_node` (true).
+        ///
+        /// It costs the node descriptors -- kilobytes per bucket entry, and the
+        /// ladder saturates at a handful -- for the life of the run, and it must
+        /// be destroyed WITH its exec or the cache leaks two objects per entry
+        /// instead of one.
+        cudaGraph_t        src = nullptr;
     };
     std::vector<OuterGraph> outer_graphs;
     std::vector<SweepGraph> sweep_graphs;
 
     void destroyGraphCaches() {
-        for (const OuterGraph& e : outer_graphs)
+        for (const OuterGraph& e : outer_graphs) {
             if (e.exec != nullptr) cudaGraphExecDestroy(e.exec);
-        for (const SweepGraph& e : sweep_graphs)
+            if (e.src != nullptr) cudaGraphDestroy(e.src);
+        }
+        for (const SweepGraph& e : sweep_graphs) {
             if (e.exec != nullptr) cudaGraphExecDestroy(e.exec);
+            if (e.src != nullptr) cudaGraphDestroy(e.src);
+        }
         if (!outer_graphs.empty() || !sweep_graphs.empty())
             telemetry.graph_reinstantiations +=
                 outer_graphs.size() + sweep_graphs.size();
         outer_graphs.clear();
         sweep_graphs.clear();
         graph_exec       = nullptr;
+        graph_src        = nullptr;
         graph_nmax       = -1;
         graph_lanes      = -1;
         graph_precision  = -1;
         sweep_graph_exec = nullptr;
+        sweep_graph_src  = nullptr;
         sweep_graph      = SweepGraphCapacity{};
     }
 
@@ -4428,6 +4482,10 @@ public:
     std::uint32_t* sweep_halt = nullptr; ///< all-zero outside the sweep path
     std::uint32_t* device_assembly_active = nullptr;
     cudaGraphExec_t sweep_graph_exec = nullptr;
+    /// The cudaGraph_t `sweep_graph_exec` was instantiated from, kept so the
+    /// sweep can be SPLICED into a capturing stream instead of launched into
+    /// one.  Owned by the matching sweep_graphs entry, not by this pointer.
+    cudaGraph_t     sweep_graph_src  = nullptr;
     /// Replaces the old (nmax, unroll, precision) triple.  `unroll` is gone from
     /// the key entirely -- it lives in kSweepSlotBudget now -- and what is left
     /// is a capacity that only grows.  See SweepGraphCapacity in the header.
