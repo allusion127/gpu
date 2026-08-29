@@ -27,7 +27,12 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from exact_audit import audit_physics_mode  # noqa: E402
+from exact_audit import (  # noqa: E402
+    DECLARABLE_FIDELITIES,
+    NON_STRICT_ENV_KEYS,
+    audit_physics_mode,
+    derive_declared_fidelity,
+)
 
 
 # `[RASBERY][BATCH_HOST] {...}` -- the JSON receipt only; main() also emits a
@@ -166,6 +171,7 @@ def resolve_profile_env(
     pin_omp: bool = False,
     extra: dict[str, str] | None = None,
     overrides: dict[str, str] | None = None,
+    unset: Iterable[str] | None = None,
 ) -> dict[str, str]:
     """The env a RASBERY child is launched with, ON TOP of the inherited one.
 
@@ -176,8 +182,12 @@ def resolve_profile_env(
 
     Precedence, lowest to highest: DEFAULT_ENV, the width-derived thread
     counts, --pin-omp, CUDA_VISIBLE_DEVICES, *extra* (what the run itself
-    computed, e.g. the MPS client env), *overrides* (--set).  The operator's
-    --set is last so that an arm can always be taken deliberately.
+    computed, e.g. the MPS client env), *overrides* (--set), *unset*
+    (--set-unset / --strict).  The operator's --set is last but one so that an
+    arm can always be taken deliberately, and a deletion beats every setter
+    because it is the only way to say "this key must not reach the child" --
+    which is what the strict-policy control arm needs, DEFAULT_ENV carrying the
+    A2 staged tolerances since 7099e54.
 
     WHY driver_workers IS NOT CAPPED AT THE CORE COUNT.  A Driver lane is not a
     CPU-bound worker: it spends nearly all of its life blocked on the GPU
@@ -200,6 +210,25 @@ def resolve_profile_env(
         env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     env.update(extra or {})
     env.update(overrides or {})
+    for key in unset or ():
+        env.pop(key, None)
+    return env
+
+
+def launch_env(profile: dict[str, str], unset: Iterable[str] | None = None) -> dict[str, str]:
+    """The child's WHOLE environment: this process's, plus the profile.
+
+    The unset list is applied again here, and it has to be: a key the harness
+    never set can still be exported in the operator's shell, and popping it out
+    of the profile alone would leave it in the inherited environment where
+    src/RunContract.h reads it.  That is the difference between `--strict`
+    meaning "the harness does not set the staged tolerances" and `--strict`
+    meaning "this child runs strict".
+    """
+    env = os.environ.copy()
+    env.update(profile)
+    for key in unset or ():
+        env.pop(key, None)
     return env
 
 
@@ -220,6 +249,14 @@ class LaunchPlan:
     # acceptance audit is keyed on the run's FIDELITY (tools/exact_audit.py) and
     # what a case writes is never a reason to void it.
     result_mode: str = "full"
+    # The fidelity this launch DECLARES: strict | A2 | L3coarse | feedback_limited.
+    # The audit passes iff the child's [PHYSICS_MODE] receipt says exactly this.
+    # Default `strict` so a caller that predates the field still gets the old
+    # rule; every real launch derives it from the resolved child environment.
+    declared_fidelity: str = "strict"
+    # "operator" (--fidelity) or "env" (derived).  Reported, so a receipt says
+    # whether the word was typed or computed.
+    fidelity_source: str = "env"
 
 
 def visible_cpu_threads() -> int:
@@ -351,8 +388,10 @@ def validate_deck_paths(command: Sequence[str]) -> list[str]:
 def check_run_receipts(output: str, plan: "LaunchPlan") -> list[str]:
     """Post-run receipt audit: did the run have the shape that was asked for?"""
     # Keyed on FIDELITY, not on what the run wrote: `plan.result_mode` is no
-    # longer an argument (review doc R5).
-    problems = audit_physics_mode(output)
+    # longer an argument (review doc R5).  What IS an argument is the fidelity
+    # the launch declared -- the audit verifies the run solved at the fidelity
+    # that was asked for, in both directions (tools/exact_audit.py).
+    problems = audit_physics_mode(output, plan.declared_fidelity)
 
     receipt = None
     for match in BATCH_HOST_RECEIPT.finditer(output):
@@ -383,6 +422,41 @@ def check_run_receipts(output: str, plan: "LaunchPlan") -> list[str]:
                 "launches, so this run is not the captured-graph configuration" % (name, value)
             )
     return problems
+
+
+def resolve_unset(args: argparse.Namespace) -> list[str]:
+    """Keys deleted from the child environment (--set-unset, --strict).
+
+    `--strict` is not a synonym for "do not set the staged tolerances": the
+    campaign's DEFAULT_ENV sets them, an operator's shell may also export them,
+    and RASBERY_GA_FEEDBACK_PASSES / RASBERY_PHYSICS_FIDELITY can move a run off
+    strict from the inherited environment alone.  So the switch names every key
+    that can, and deletes all of them (tools/exact_audit.NON_STRICT_ENV_KEYS).
+    """
+    keys = list(getattr(args, "set_unset", None) or [])
+    if getattr(args, "strict", False):
+        keys.extend(k for k in NON_STRICT_ENV_KEYS if k not in keys)
+    for key in keys:
+        if not key or not key.replace("_", "").isalnum():
+            raise ValueError(f"invalid environment key: {key!r}")
+    return keys
+
+
+def resolve_declared_fidelity(args: argparse.Namespace,
+                              env: dict[str, str]) -> tuple[str, str]:
+    """(fidelity, source) for this launch.
+
+    The operator's `--fidelity` wins; otherwise it is DERIVED from the child
+    environment by the binary's own rule.  A derivation is not a guess: the
+    default environment IS the A2 arm, and a harness that defaulted the
+    declaration to `strict` would fail every production wave on a mismatch --
+    which is the defect this argument exists to end, arriving from the other
+    side.
+    """
+    stated = getattr(args, "fidelity", None)
+    if stated:
+        return stated, "operator"
+    return derive_declared_fidelity(env), "env"
 
 
 def parse_overrides(items: Iterable[str]) -> dict[str, str]:
@@ -427,6 +501,7 @@ def build_plan(args: argparse.Namespace, command: list[str]) -> tuple[LaunchPlan
     # The reference's RASBERY_OMP_THREADS is the arena width, not a core count.
     solver_threads = getattr(args, "solver_threads", None) or batch_width
 
+    unset = resolve_unset(args)
     profile = resolve_profile_env(
         batch_width=batch_width,
         driver_workers=workers,
@@ -434,9 +509,10 @@ def build_plan(args: argparse.Namespace, command: list[str]) -> tuple[LaunchPlan
         gpu=str(args.gpu),
         pin_omp=getattr(args, "pin_omp", False),
         overrides=parse_overrides(args.set_values),
+        unset=unset,
     )
-    env = os.environ.copy()
-    env.update(profile)
+    env = launch_env(profile, unset)
+    fidelity, fidelity_source = resolve_declared_fidelity(args, env)
 
     plan = LaunchPlan(
         batch_width=batch_width,
@@ -450,6 +526,8 @@ def build_plan(args: argparse.Namespace, command: list[str]) -> tuple[LaunchPlan
         # build_plan appended ours when there was none; either way the audit
         # has to expect the receipt the executable will actually print.
         result_mode=(values_after(command, "--result") or ["full"])[0],
+        declared_fidelity=fidelity,
+        fidelity_source=fidelity_source,
     )
     return plan, command, env
 
@@ -518,6 +596,32 @@ def parser() -> argparse.ArgumentParser:
             "screening run and needs no RASBERY_ALLOW_SCREENING"
         ),
     )
+    p.add_argument(
+        "--fidelity", "--expect-fidelity", dest="fidelity",
+        choices=DECLARABLE_FIDELITIES,
+        help=(
+            "the convergence/statepoint policy this run DECLARES. The audit passes iff "
+            "the child's [RASBERY][PHYSICS_MODE] receipt reports exactly this policy -- "
+            "a mismatch either way is a hard failure, because a number measured at a "
+            "fidelity other than the declared one belongs in neither column (plan Sec "
+            "6.2 forbids mixing strict and A2 in one table). The DEFAULT is derived "
+            "from the resolved child environment by the binary's own rule "
+            "(src/RunContract.h): the staged tolerances in DEFAULT_ENV make it A2"
+        ),
+    )
+    p.add_argument(
+        "--strict", action="store_true",
+        help="run the STRICT-policy control arm: delete RASBERY_STAGED_FLUX_TOL / "
+             "_XE_TOL / _LOOSE_SETTLE, RASBERY_GA_FEEDBACK_PASSES and "
+             "RASBERY_PHYSICS_FIDELITY from the child environment, inherited ones "
+             "included, so the run really does solve strict. Without it the harness "
+             "measures the A2 arm, which is what DEFAULT_ENV configures",
+    )
+    p.add_argument(
+        "--set-unset", dest="set_unset", action="append", default=[], metavar="KEY",
+        help="delete one key from the child environment. Beats --set and the inherited "
+             "environment both; the only way to say a key must not reach the child",
+    )
     p.add_argument("--set", dest="set_values", action="append", default=[], metavar="KEY=VALUE", help="override one profile environment variable")
     p.add_argument("--dry-run", action="store_true", help="print the plan without executing RASBERY")
     p.add_argument("command", nargs=argparse.REMAINDER, help="RASBERY executable and arguments, preceded by --")
@@ -552,6 +656,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         gpu=plan.gpu,
         pin_omp=args.pin_omp,
         overrides=parse_overrides(args.set_values),
+        unset=resolve_unset(args),
     )
     receipt = {
         "gpu": plan.gpu,
@@ -562,6 +667,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "worker_policy": plan.worker_policy,
         "solver_threads": plan.solver_threads,
         "result_mode": args.result or "default",
+        # What this run says it is solving, and whether the word was typed or
+        # derived.  --print-env exists so a mismatch is visible before the GPU
+        # time is spent, and the fidelity is the field that voided a whole 238
+        # wave while every receipt in it said rc=0.
+        "declared_fidelity": plan.declared_fidelity,
+        "declared_fidelity_source": plan.fidelity_source,
         "cmfd_wait_us": env.get("RASBERY_BATCH_WAIT_US"),
         "cmfd_wait_max_us": env.get("RASBERY_BATCH_WAIT_MAX_US"),
         "command": command,
@@ -604,7 +715,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if problems:
         return 3
     print("[RASBERY][SINGLE_GPU_PROFILE][OK] "
-          + json.dumps({"host_threads": plan.host_workers, "graph_fallbacks": 0},
+          + json.dumps({"host_threads": plan.host_workers, "graph_fallbacks": 0,
+                        "fidelity": plan.declared_fidelity},
                        separators=(",", ":")))
     return 0
 

@@ -79,11 +79,15 @@ from run_single_gpu_batch import (  # noqa: E402
     DEFAULT_ENV,
     LaunchPlan,
     check_run_receipts,
+    launch_env,
     parse_overrides,
     path_key,
+    resolve_declared_fidelity,
     resolve_profile_env,
+    resolve_unset,
     visible_cpu_threads,
 )
+from exact_audit import DECLARABLE_FIDELITIES, receipt_policy  # noqa: E402
 
 REFILL_RECEIPT = re.compile(r"\[RASBERY\]\[REFILL\]\s*(\{.*\})")
 OCCUPANCY_RECEIPT = re.compile(r"\[RASBERY\]\[CUDA\]\[BATCH_OCCUPANCY\]\s*(\{.*\})")
@@ -263,9 +267,27 @@ class Queue:
     span -- there is no per-GPU serialisation anywhere else.
     """
 
-    def __init__(self, state_path: Path, total: int) -> None:
+    def __init__(self, state_path: Path, total: int, processes: int = 1) -> None:
         self._path = state_path
         self._total = total
+        # EVERY WORKER GETS A TURN BEFORE ANY WORKER GETS SECONDS.
+        #
+        # The fair-share cap in auto_claim_size() sizes a claim; it cannot keep a
+        # worker that finished its chunk from coming back and taking the share of
+        # a worker whose thread had not reached its first claim yet.  Measured
+        # here with a millisecond-long fake child at K=12: worker 4 claimed
+        # twice (10 jobs) and worker 11 got NOTHING -- the same artefact the cap
+        # was added to remove, one layer up.  Real chunks take minutes, so the
+        # race is narrow, but "narrow" is how the 115.6 c/h control arm was
+        # reported as data three times.
+        #
+        # So the queue holds back one job for each worker that has not claimed
+        # yet: a REPEAT claimant may not take work that would leave a first-time
+        # claimant with nothing, and gets an empty span (it stops) instead.  Once
+        # every worker has had a turn the reservation is zero and stealing is
+        # exactly as free as it was.
+        self._processes = max(1, processes)
+        self._claimants: set[int] = set()
         # flock covers OTHER processes; it does not exist on Windows, and where
         # it does exist it is per-open-file-description, so two threads of THIS
         # process each opening the file would both take it and both win.  The
@@ -276,15 +298,26 @@ class Queue:
         self._mutex = threading.Lock()
         self._path.write_text(json.dumps({"claimed": 0, "total": total}), encoding="utf-8")
 
-    def claim(self, size: int) -> tuple[int, int]:
-        """Reserve up to *size* jobs; returns [start, end) into the manifest."""
+    def claim(self, size: int, index: int | None = None) -> tuple[int, int]:
+        """Reserve up to *size* jobs; returns [start, end) into the manifest.
+
+        *index* is the global process index of the claimant.  Given one, the
+        queue keeps a job in hand for every worker that has not claimed yet (see
+        __init__); an empty span means "there is work, but it is not yours" and
+        the caller stops so the worker it is held for can have it.
+        """
         with self._mutex:
+            if index is not None:
+                self._claimants.add(index)
+            pending = (self._processes - len(self._claimants)
+                       if index is not None else 0)
             with open(self._path, "r+", encoding="utf-8") as handle:
                 _lock(handle)
                 try:
                     state = json.load(handle)
                     start = int(state["claimed"])
-                    end = min(self._total, start + max(1, size))
+                    allowed = max(0, self._total - start - max(0, pending))
+                    end = min(self._total, start + min(max(1, size), allowed))
                     state["claimed"] = end
                     handle.seek(0)
                     handle.truncate()
@@ -793,6 +826,51 @@ def chunk_result_mode(chunk: Sequence[tuple[str, str, str]], default: str | None
     return "full"
 
 
+def fair_share(*, index: int, processes: int, jobs: int) -> int:
+    """This worker's share of *jobs* under `--claim auto`: floor, then remainder.
+
+    floor(jobs / processes) each, and the remainder handed out ROUND-ROBIN by
+    global process index, so the shares tile the manifest exactly and every
+    process gets at least one job whenever there are at least as many jobs as
+    processes.
+    """
+    processes = max(1, processes)
+    base, remainder = divmod(max(0, jobs), processes)
+    return base + (1 if index < remainder else 0)
+
+
+def auto_claim_size(*, index: int, processes: int, jobs: int, remaining: int,
+                    batch_width: int) -> int:
+    """How many jobs this worker claims next under `--claim auto`.
+
+    THE DEFECT THIS FIXES (238, 12 x M6).  The size was
+    `max(batch_width, ceil(remaining / (2 * processes)))` -- a width floor over a
+    halved share.  With 64 jobs across 12 processes of width 6 that floor is 6
+    while the fair share is 5.33, so the first ten workers took 60, the eleventh
+    took 4 and the TWELFTH GOT NOTHING.  A process that never claims a job
+    starts, prints its receipts, measures a wall of pure startup and reports 0
+    cases/hour, which is not a datum about width -- and at K=12 it is a twelfth
+    of the device's declared slots standing idle for the whole wave.
+
+    So the fair share is a CEILING on the claim, not a replacement for the
+    policy: a worker never takes more than floor(jobs/processes) (+1 for the
+    first `jobs % processes` workers), which is exactly enough to make the
+    shares tile and nobody starve.  The halving stays UNDER that ceiling and is
+    what leaves work to steal on a long manifest -- with 128 jobs at K=8 the
+    claim is 8 (sixteen chunks, refill measured, docs/W4_L5 Sec 4.6), where a
+    plain fair share would hand each worker 16 in one go and there would be no
+    refill left in the arm at all.
+    """
+    processes = max(1, processes)
+    share = fair_share(index=index, processes=processes, jobs=jobs)
+    halved = max(batch_width, -(-max(0, remaining) // (2 * processes)))
+    if share <= 0:
+        # More processes than jobs: nobody is owed a share, and whoever asks
+        # first may have what is left.  Refusing here would leave jobs unrun.
+        return max(1, halved)
+    return max(1, min(halved, share))
+
+
 @dataclass
 class WorkerResult:
     gpu: str
@@ -812,6 +890,22 @@ class WorkerResult:
     # is the one defect that shows up as a THROUGHPUT number and nothing else,
     # so the run has to say what it ran with, not what it meant to.
     env: dict[str, str] = field(default_factory=dict)
+    # The fidelity this worker's children were told to solve at, and what each
+    # chunk's [PHYSICS_MODE] receipt actually said.  One entry per chunk (the
+    # receipt is printed once per process, before any deck starts, so a chunk IS
+    # the finest grain there is), carrying the job count so a campaign table can
+    # be labelled with the fidelity its cases were measured at.
+    declared_fidelity: str = "strict"
+    case_fidelity: list[dict] = field(default_factory=list)
+
+    @property
+    def fidelities(self) -> dict[str, int]:
+        """jobs measured, keyed by the policy word the run printed."""
+        counts: dict[str, int] = {}
+        for entry in self.case_fidelity:
+            key = entry.get("policy") or "unreported"
+            counts[key] = counts.get(key, 0) + int(entry.get("jobs", 0))
+        return counts
 
     @property
     def mean_width(self) -> float:
@@ -870,6 +964,8 @@ def run_worker(
     extra_env: dict[str, str],
     pin_omp: bool,
     dry_run: bool,
+    declared_fidelity: str = "strict",
+    unset: Sequence[str] = (),
     deadline: float | None = None,
 ) -> WorkerResult:
     """One process SEQUENCE: claim, run, repeat, on device *gpu* as slot *proc*.
@@ -884,6 +980,7 @@ def run_worker(
     result = WorkerResult(
         gpu=gpu, proc=proc, index=index,
         cpus=f"{cpus[0]}-{cpus[-1]}" if cpus else "",
+        declared_fidelity=declared_fidelity,
         env=resolve_profile_env(
             batch_width=batch_width,
             driver_workers=budget.driver_workers,
@@ -892,6 +989,7 @@ def run_worker(
             pin_omp=pin_omp,
             extra=extra_env,
             overrides=overrides,
+            unset=unset,
         ),
     )
     started = time.monotonic()
@@ -920,11 +1018,14 @@ def run_worker(
                 # lets the in-process refill do the work.
                 size = remaining
             else:
-                size = max(batch_width, -(-remaining // (2 * budget.processes)))
+                size = auto_claim_size(
+                    index=index, processes=budget.processes, jobs=len(jobs),
+                    remaining=remaining, batch_width=batch_width,
+                )
         else:
             size = int(claim)
 
-        start, end = queue.claim(size)
+        start, end = queue.claim(size, index)
         if start >= end:
             break
 
@@ -939,8 +1040,7 @@ def run_worker(
             newline="\n",
         )
 
-        env = os.environ.copy()
-        env.update(result.env)
+        env = launch_env(result.env, unset)
 
         command = (
             pin_prefix(budget, index)
@@ -992,10 +1092,21 @@ def run_worker(
             worker_policy="multi_gpu",
             gpu=gpu,
             result_mode=chunk_result_mode(jobs[start:end], result_mode),
+            declared_fidelity=declared_fidelity,
         )
         result.problems.extend(
             f"gpu{gpu} p{proc} chunk{chunk_index}: {p}" for p in check_run_receipts(text, plan)
         )
+        # Per case, in the sense the receipt allows: [PHYSICS_MODE] is printed
+        # once per process before any deck starts, so a chunk is the finest
+        # grain that exists, and the job count is what makes the aggregate a
+        # count of CASES rather than of chunks.
+        result.case_fidelity.append({
+            "chunk": chunk_index,
+            "jobs": end - start,
+            "policy": receipt_policy(text),
+            "result_mode": plan.result_mode,
+        })
         for match in REFILL_RECEIPT.finditer(text):
             try:
                 result.refill_receipts.append(json.loads(match.group(1)))
@@ -1111,6 +1222,12 @@ class TuneCandidate:
     fail_lines: int = 0
     problems: list[str] = field(default_factory=list)
     refused: str = ""  # nonempty: never measured, and why
+    # What the wave DECLARED and what its chunks reported.  A candidate that is
+    # disqualified on fidelity has to say so in its own receipt: the 238 tuner
+    # disqualified all six candidates with every wave at rc=0 / dup=0, and the
+    # only line that could have explained it printed `problems: 6`.
+    declared_fidelity: str = "strict"
+    fidelities: dict[str, int] = field(default_factory=dict)
 
     @property
     def cases_per_hour(self) -> float:
@@ -1148,6 +1265,10 @@ class TuneCandidate:
         return ""
 
     def receipt(self) -> dict:
+        # The first three problems verbatim, not a count.  `problems: 6` is what
+        # the 238 tuner printed while disqualifying every candidate for an A2
+        # receipt under a strict declaration, and it named neither word.
+        detail = [p for p in self.problems[:3]]
         return {
             "procs_per_gpu": self.procs,
             "batch_width": self.width,
@@ -1166,6 +1287,9 @@ class TuneCandidate:
             "rc": self.rc,
             "fail_lines": self.fail_lines,
             "problems": len(self.problems),
+            "problem_detail": detail,
+            "declared_fidelity": self.declared_fidelity,
+            "fidelity_measured": self.fidelities,
             "eligible": self.eligible,
             "disqualified": self.disqualified,
         }
@@ -1311,6 +1435,8 @@ def _measure_candidate(
     cwd: Path | None,
     tune_root: Path,
     repeat: int,
+    declared_fidelity: str,
+    unset: Sequence[str],
 ) -> tuple[TuneCandidate, list[WorkerResult]]:
     """Run ONE candidate wave and score it.  Never raises for a measurement."""
     budget = plan_host_budget(
@@ -1330,6 +1456,7 @@ def _measure_candidate(
         vram_per_device_gb=vram.per_device_gb,
         cpus_per_proc=budget.cpus_per_proc,
         host_thread_demand=budget.host_thread_demand,
+        declared_fidelity=declared_fidelity,
     )
     cand.refused = candidate_refusal(
         procs=procs, width=width, gpus=gpus, visible_cpus=visible_cpus, vram=vram,
@@ -1356,7 +1483,8 @@ def _measure_candidate(
                 return cand, []
         cand.mps = mps.active
         cand.mps_thread_percent = mps.thread_percent if mps.active else None
-        queue = Queue(workdir / "queue.json", len(subset))
+        queue = Queue(workdir / "queue.json", len(subset),
+                      processes=len(gpus) * procs)
         workers = [
             (gpu, proc, gpu_index * procs + proc)
             for gpu_index, gpu in enumerate(gpus)
@@ -1367,6 +1495,7 @@ def _measure_candidate(
             claim=args.claim, result_mode=args.result, executable=list(executable),
             workdir=workdir, cwd=cwd, overrides=overrides, extra_env=mps.client_env(),
             pin_omp=args.pin_omp, dry_run=args.dry_run,
+            declared_fidelity=declared_fidelity, unset=unset,
             deadline=time.monotonic() + max(1.0, float(args.tune_budget_s)),
         )
         if len(workers) == 1:
@@ -1397,6 +1526,9 @@ def _measure_candidate(
     cand.rc = next((r.returncode for r in results if r.returncode != 0), 0)
     cand.fail_lines = sum(r.fail_lines for r in results)
     cand.problems = [p for r in results for p in r.problems]
+    for result in results:
+        for policy, count in result.fidelities.items():
+            cand.fidelities[policy] = cand.fidelities.get(policy, 0) + count
     return cand, results
 
 
@@ -1410,6 +1542,8 @@ def calibrate(
     overrides: dict[str, str],
     cwd: Path | None,
     workdir: Path,
+    declared_fidelity: str,
+    unset: Sequence[str],
 ) -> tuple[TuneCandidate | None, list[TuneCandidate], float, int | None]:
     """Measure every candidate K and pick one.
 
@@ -1432,6 +1566,7 @@ def calibrate(
                 procs=procs, width=width, gpus=gpus, jobs=jobs,
                 visible_cpus=visible_cpus, args=args, executable=executable,
                 overrides=overrides, cwd=cwd, tune_root=tune_root, repeat=repeat,
+                declared_fidelity=declared_fidelity, unset=unset,
             )
             if merged is None:
                 merged = cand
@@ -1444,6 +1579,8 @@ def calibrate(
                 merged.fail_lines += cand.fail_lines
                 merged.problems.extend(cand.problems)
                 merged.refused = merged.refused or cand.refused
+                for policy, count in cand.fidelities.items():
+                    merged.fidelities[policy] = merged.fidelities.get(policy, 0) + count
             if observed_writer is None:
                 for log in sorted((tune_root / f"k{procs:02d}").rglob("*.log")):
                     observed_writer = writer_threads_from_receipt(
@@ -1475,6 +1612,11 @@ def tune_payload(
         "schema": TUNE_SCHEMA,
         "source": source,
         "key": key,
+        # A K measured under A2 is not a K measured under strict: the staged
+        # tolerances change how many outers a case costs, which is the whole
+        # quantity being divided between processes.  The saved result says which
+        # one it was so a reuse can be read for what it is.
+        "declared_fidelity": chosen.declared_fidelity,
         "tie_rel": tie_rel,
         "calibration_s": round(calibration_s, 3),
         "calibration_jobs": calibration_jobs_run,
@@ -1606,6 +1748,33 @@ def parser() -> argparse.ArgumentParser:
         "relative inputs needs this; absolute manifests do not",
     )
     p.add_argument("--set", dest="set_values", action="append", default=[], metavar="KEY=VALUE")
+    p.add_argument(
+        "--fidelity", "--expect-fidelity", dest="fidelity",
+        choices=DECLARABLE_FIDELITIES,
+        help=(
+            "the convergence/statepoint policy this campaign DECLARES. Every chunk's "
+            "[RASBERY][PHYSICS_MODE] receipt must report exactly this policy; a "
+            "mismatch either way is a hard failure, because a throughput number "
+            "measured at a fidelity other than the declared one belongs in neither "
+            "column (plan Sec 6.2: never mix strict and A2 in one table). The DEFAULT "
+            "is DERIVED from the resolved child environment by the binary's own rule "
+            "(src/RunContract.h) -- and DEFAULT_ENV carries the A2 staged tolerances, "
+            "so the default declaration of a production wave is A2"
+        ),
+    )
+    p.add_argument(
+        "--strict", action="store_true",
+        help="run the STRICT-policy control arm: delete RASBERY_STAGED_FLUX_TOL / "
+             "_XE_TOL / _LOOSE_SETTLE, RASBERY_GA_FEEDBACK_PASSES and "
+             "RASBERY_PHYSICS_FIDELITY from every child's environment, inherited ones "
+             "included. Without it the campaign measures the A2 arm; the two must "
+             "never share a table, and this is how the second row is produced",
+    )
+    p.add_argument(
+        "--set-unset", dest="set_unset", action="append", default=[], metavar="KEY",
+        help="delete one key from every child's environment. Beats --set and the "
+             "inherited environment both",
+    )
 
     mps = p.add_argument_group("CUDA MPS")
     mps.add_argument(
@@ -1780,9 +1949,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         jobs = read_manifest(Path(args.jobs))
         overrides = parse_overrides(args.set_values)
+        unset = resolve_unset(args)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+
+    # THE DECLARED FIDELITY, decided once and before anything is measured.
+    # It is a property of the child ENVIRONMENT, not of the width or the K, so
+    # one resolution covers the calibration waves and the campaign alike: the
+    # per-process env differs only in CUDA_VISIBLE_DEVICES and the width-derived
+    # thread counts, none of which src/RunContract.h reads.
+    declared_fidelity, fidelity_source = resolve_declared_fidelity(
+        args,
+        launch_env(
+            resolve_profile_env(
+                batch_width=args.batch_width or (args.total_width or 1),
+                driver_workers=1, solver_threads=1, gpu=gpus[0],
+                pin_omp=args.pin_omp, overrides=overrides, unset=unset,
+            ),
+            unset,
+        ),
+    )
 
     # WHAT USED TO BE HERE, AND WHY IT IS GONE (review doc R5).  This refused a
     # `--result light` wave unless RASBERY_ALLOW_SCREENING was set, because
@@ -1856,6 +2043,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             chosen, candidates, calibration_s, writer_observed = calibrate(
                 gpus=gpus, jobs=jobs, visible_cpus=visible_cpus, args=args,
                 executable=executable, overrides=overrides, cwd=cwd, workdir=workdir,
+                declared_fidelity=declared_fidelity, unset=unset,
             )
             calibration_jobs_run = sum(c.jobs for c in candidates)
             if chosen is None:
@@ -1867,7 +2055,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "[RASBERY][MULTI_GPU][FAIL] the calibration produced no usable "
                     "candidate: every K was refused by the guards or failed its own "
                     "receipt audit. The campaign is not started, because a K chosen "
-                    "from failed waves is not a measurement.",
+                    "from failed waves is not a measurement. Each [TUNE][CAND] line "
+                    "above carries `disqualified` and `problem_detail`; this wave "
+                    "declared fidelity %r (%s), so a candidate whose chunks reported "
+                    "another policy was disqualified for THAT and not for its speed."
+                    % (declared_fidelity, fidelity_source),
                     file=sys.stderr)
                 return 2
             procs_per_gpu = chosen.procs
@@ -1905,7 +2097,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         io_writer_mode=overrides.get("RASBERY_IO_WRITER"),
         writer_threads_observed=writer_observed,
     )
-    queue = Queue(workdir / "queue.json", len(jobs))
+    queue = Queue(workdir / "queue.json", len(jobs),
+                  processes=budget.processes)
 
     print(
         "[RASBERY][MULTI_GPU][PLAN] "
@@ -1933,6 +2126,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "procs_policy": ("tuned" if tune_receipt else "explicit"),
                 "pin": budget.pin,
                 "pin_omp": bool(args.pin_omp),
+                # The word every chunk's receipt will be audited against, and
+                # the label this campaign's throughput row has to carry.
+                "declared_fidelity": declared_fidelity,
+                "declared_fidelity_source": fidelity_source,
+                "env_unset": list(unset),
             },
             separators=(",", ":"),
         )
@@ -2020,6 +2218,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             pin_omp=args.pin_omp,
             extra=extra_env,
             overrides=overrides,
+            unset=unset,
         )
         print(
             "[RASBERY][MULTI_GPU][ENV] "
@@ -2030,6 +2229,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "cpus": (f"{budget.cpu_sets[index][0]}-{budget.cpu_sets[index][-1]}"
                              if budget.cpu_sets else ""),
                     "pin_prefix": pin_prefix(budget, index),
+                    "declared_fidelity": declared_fidelity,
+                    "declared_fidelity_source": fidelity_source,
+                    "env_unset": list(unset),
                     "env": env_receipt,
                 },
                 separators=(",", ":"),
@@ -2047,6 +2249,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             claim=args.claim, result_mode=args.result, executable=executable,
             workdir=workdir, cwd=cwd, overrides=overrides, extra_env=extra_env,
             pin_omp=args.pin_omp, dry_run=args.dry_run,
+            declared_fidelity=declared_fidelity, unset=unset,
         )
         if len(workers) == 1:
             # One process: run it inline so the operator sees the failure
@@ -2100,6 +2303,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "slot_busy_fraction": round(sum(busy) / len(busy), 4) if busy else 0.0,
                     "rc": r.returncode,
                     "fail_lines": r.fail_lines,
+                    "declared_fidelity": r.declared_fidelity,
+                    # Cases by the policy their chunk's receipt REPORTED, not by
+                    # the one the plan declared.  The audit already fails a
+                    # mismatch; this is what lets a table say which arm it is.
+                    "fidelity_measured": r.fidelities,
+                    "case_fidelity": r.case_fidelity,
                     # What the children were launched with, not what the plan
                     # intended: the [ENV] line above is a prediction, this is
                     # the record, and the two disagreeing is itself the bug.
@@ -2155,6 +2364,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     all_widths = [r.mean_width for r in results if r.mean_width > 0]
     all_fills = [r.width_fill for r in results if r.width_fill > 0]
+    # One count for the whole campaign, so the row this run becomes in a table
+    # carries its own fidelity label.  Plan Sec 6.2: strict and A2 numbers do
+    # not go in one table, and the only way to keep that rule is for every
+    # number to say which one it is.
+    fidelity_measured: dict[str, int] = {}
+    for r in results:
+        for policy, count in r.fidelities.items():
+            fidelity_measured[policy] = fidelity_measured.get(policy, 0) + count
     print(
         "[RASBERY][MULTI_GPU][TOTAL] "
         + json.dumps(
@@ -2186,6 +2403,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "tuned": bool(tune_receipt),
                 "tune_source": (tune_receipt or {}).get("source"),
                 "calibration_jobs": calibration_jobs_run,
+                "declared_fidelity": declared_fidelity,
+                "declared_fidelity_source": fidelity_source,
+                "fidelity_measured": fidelity_measured,
                 "rc": exit_code,
                 "fail_lines": total_fail,
             },
@@ -2199,7 +2419,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return exit_code
     if problems or total_fail:
         return 3
-    print("[RASBERY][MULTI_GPU][OK] " + json.dumps({"jobs": total_jobs}, separators=(",", ":")))
+    print("[RASBERY][MULTI_GPU][OK] "
+          + json.dumps({"jobs": total_jobs, "fidelity": declared_fidelity},
+                       separators=(",", ":")))
     return 0
 
 

@@ -461,11 +461,28 @@ for fields in jobs:
     out = Path(fields[1])
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("fake")
+# The receipt is DERIVED from this child's own environment, exactly the way
+# src/RunContract.h derives it -- so the end-to-end run is a real parity check
+# between what the harness declares and what a binary reading the same
+# environment would print.  A fake that always said `strict` would hide the
+# defect: DEFAULT_ENV is the A2 arm.
+def mult(name):
+    try:
+        m = float(os.environ.get(name, "1"))
+    except ValueError:
+        m = 1.0
+    return m if m >= 1.0 else 1.0
+if int(os.environ.get("RASBERY_GA_FEEDBACK_PASSES") or 0) > 0:
+    policy, fidelity = "feedback_limited", "feedback_limited"
+elif mult("RASBERY_STAGED_FLUX_TOL") > 1.0 or mult("RASBERY_STAGED_XE_TOL") > 1.0:
+    policy, fidelity = "A2", "staged_a2"
+else:
+    policy, fidelity = "strict", "full_exact"
 print('[RASBERY][IO_WRITER] {"mode":"thread","mode_source":"default","queue_limit":8}')
 print("[RASBERY][PHYSICS_MODE] " + json.dumps({
     "physics_mode": "full_exact_nodal", "screening": False, "feedback_pass_limit": 0,
-    "full_hdf5": True, "physics_fidelity": "full_exact", "policy": "strict",
-    "acceptance_eligible": True, "requires_exact_rerun": False,
+    "full_hdf5": True, "physics_fidelity": fidelity, "policy": policy,
+    "acceptance_eligible": policy == "strict", "requires_exact_rerun": False,
     "result_mode": "full", "fidelity_declared": None, "gpu_full": False}))
 print("[RASBERY][BATCH_HOST] " + json.dumps({"host_threads": min(host, width, n)}))
 print("[RASBERY][CUDA][BATCH_OCCUPANCY] " + json.dumps(
@@ -569,6 +586,93 @@ with tempfile.TemporaryDirectory() as tmp:
         check(found.returncode != 0 or not found.stdout.strip(),
               "a calibration must leave no MPS control daemon behind: the next arm's "
               "no-MPS control would silently be an MPS run")
+
+# ===========================================================================
+# 11b.  The tuner audits candidates at the DECLARED fidelity (WP4 defect)
+# ===========================================================================
+#
+# THE DEFECT, measured on 238 after 5ccf879.  DEFAULT_ENV has carried the A2
+# staged tolerances since 7099e54, so every calibration child printed
+# `policy:'A2'`; the candidate audit compared it against a hardcoded `strict`;
+# and the tuner disqualified ALL SIX candidates -- rc=2, no winner, campaign not
+# started -- with every wave at rc=0, fail_lines=0, duplicates=0.  The only line
+# that could have explained it printed `problems: 6` and named neither word.
+#
+# The same fake child as Sec 11, which now derives its receipt from its own
+# environment the way src/RunContract.h does.  Three arms: declare nothing (the
+# A2 production default), declare strict AND make it strict (--strict), declare
+# strict over the A2 environment (must fail, loudly).
+with tempfile.TemporaryDirectory() as tmp:
+    work = Path(tmp)
+    child = work / "fake_rasbery.py"
+    child.write_text(FAKE_CHILD, encoding="utf-8")
+    import contextlib  # noqa: E402
+    import io  # noqa: E402
+
+    def calibration(name: str, extra: list[str]) -> tuple[int, str]:
+        outdir = work / f"prod_{name}"
+        outdir.mkdir()
+        jobs_file = work / f"jobs_{name}.txt"
+        jobs_file.write_text(
+            "".join(f'"d{i}.json" "{(outdir / f"case{i}.h5").as_posix()}"\n'
+                    for i in range(4)),
+            encoding="utf-8")
+        argv = ["--gpus", "0", "--procs-per-gpu", "auto", "--total-width", "4",
+                "--tune-candidates", "1,2", "--tune-jobs", "2", "--tune-budget-s", "120",
+                "--jobs", str(jobs_file), "--workdir", str(work / f"run_{name}"),
+                "--pin", "none", "--device-memory-gb", "96", "--claim", "auto"]
+        buffer = io.StringIO()
+        errors = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(errors):
+            rc = mg.main(argv + extra + ["--", sys.executable, str(child)])
+        return rc, buffer.getvalue() + errors.getvalue()
+
+
+    def cand_receipts(text: str) -> list[dict]:
+        return [json.loads(line.split("] ", 1)[1]) for line in text.splitlines()
+                if line.startswith("[RASBERY][MULTI_GPU][TUNE][CAND] ")]
+
+    rc, out = calibration("a2", [])
+    cands = cand_receipts(out)
+    check(rc == 0,
+          f"the DEFAULT calibration must finish (rc={rc}): DEFAULT_ENV is the A2 arm, "
+          "and a tuner that audits it against a hardcoded `strict` disqualifies every "
+          "candidate it measures -- which is exactly what 238 reported\\n" + out[-1500:])
+    check(all(c["declared_fidelity"] == "A2" for c in cands),
+          f"every candidate receipt must carry the declared fidelity: "
+          f"{[c.get('declared_fidelity') for c in cands]}")
+    check(all(c["fidelity_measured"] == {"A2": c["jobs"]} for c in cands if c["jobs"]),
+          f"each candidate must report the policy its chunks actually printed, per "
+          f"case: {[c.get('fidelity_measured') for c in cands]}")
+    check(all(c["eligible"] and not c["disqualified"] for c in cands),
+          f"no candidate may be disqualified when every wave ran clean at the declared "
+          f"fidelity: {[(c['procs_per_gpu'], c['disqualified']) for c in cands]}")
+
+    rc, out = calibration("strict", ["--strict"])
+    check(rc == 0, f"--strict must calibrate too (rc={rc})\\n" + out[-1500:])
+    check(all(c["fidelity_measured"] == {"strict": c["jobs"]}
+              for c in cand_receipts(out) if c["jobs"]),
+          "--strict must actually reach the child: the receipt has to say `strict`, not "
+          "merely the declaration")
+
+    # NEGATIVE CONTROL: declaring strict over the A2 environment.  Every wave is
+    # clean, and the campaign must still refuse -- an A2 number filed in a strict
+    # table is the mixing plan Sec 6.2 forbids.
+    rc, out = calibration("mismatch", ["--fidelity", "strict"])
+    bad = cand_receipts(out)
+    check(rc == 2,
+          f"declaring `strict` over the A2 environment must refuse the campaign "
+          f"(rc={rc}): the runs are fine, but they are not the runs that were asked for")
+    check(bad and all(not c["eligible"] for c in bad),
+          "every candidate measured at the wrong fidelity must be disqualified")
+    check(bad and all(any("A2" in p and "strict" in p for p in c["problem_detail"])
+                      for c in bad if c["problems"]),
+          f"the [TUNE][CAND] line must NAME BOTH the declared and the measured word -- "
+          f"`problems: 6` is what the 238 tuner printed and it explained nothing: "
+          f"{[c.get('problem_detail') for c in bad]}")
+    check("declared fidelity 'strict'" in out,
+          "the no-winner refusal must say which fidelity was declared, or the operator "
+          "is left re-running a calibration that cannot succeed")
 
 # ===========================================================================
 # 12.  The source says what the receipts promise

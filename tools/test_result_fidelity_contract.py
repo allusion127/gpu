@@ -266,12 +266,71 @@ for label, bad in (
     check(audit.audit_physics_mode(bad) != [],
           f"the fidelity audit accepted a run it must void: {label}")
 
-# An A2 campaign audits itself by widening `require`, not by relaxing a field.
+# ===========================================================================
+# DECLARED vs SOLVED (WP4 defect: the A2 environment under a strict audit)
+# ===========================================================================
+#
+# The audit is an EQUALITY against the fidelity the operator declared, and the
+# reason is measured, not stylistic.  DEFAULT_ENV has carried
+# RASBERY_STAGED_FLUX_TOL=50 / _XE_TOL=1000 / _LOOSE_SETTLE=1 since 7099e54, so
+# every 238 batch child prints `policy:'A2'`.  Audited against a hardcoded
+# `strict` that voided a 12 x M6 wave (rc=3) and made the WP4 tuner disqualify
+# ALL SIX candidates with every wave at rc=0 / dup=0.
+A2_RECEIPT = receipt_line(policy="A2", physics_fidelity="staged_a2",
+                          acceptance_eligible=False)
+check(audit.audit_physics_mode(A2_RECEIPT, "A2") == [],
+      "an A2 receipt under an A2 declaration must PASS: this is the production "
+      "batch arm, and refusing it is the defect that voided the 238 12 x M6 wave")
+check(audit.audit_physics_mode(A2_RECEIPT, "strict") != [],
+      "negative control: an A2 receipt under a STRICT declaration must fail -- that "
+      "is an approximation walking into an acceptance table")
+check(audit.audit_physics_mode(receipt_line(), "A2") != [],
+      "negative control: a STRICT receipt under an A2 declaration must ALSO fail. The "
+      "operator asked for A2 and got something else; filing that number in the A2 "
+      "column mixes two convergence policies in one table (plan Sec 6.2)")
+check(audit.audit_physics_mode(receipt_line(), "strict") == [],
+      "a strict receipt under a strict declaration must pass")
 check(audit.audit_physics_mode(
-          receipt_line(policy="A2", physics_fidelity="staged_a2",
-                       acceptance_eligible=False),
-          require={"strict", "A2"}) == [],
-      "the fidelity audit cannot be pointed at an A2 arm")
+          receipt_line(policy="L3coarse", physics_fidelity="coarse10", screening=True,
+                       acceptance_eligible=False, requires_exact_rerun=True),
+          "L3coarse") == [],
+      "a declared screening campaign must be auditable as itself")
+check(audit.audit_physics_mode(receipt_line(), "banana") != [],
+      "a declared fidelity that is not a policy word must be refused, not defaulted")
+for word, problems in (("A2", audit.audit_physics_mode(A2_RECEIPT, "strict")),
+                       ("strict", audit.audit_physics_mode(receipt_line(), "A2"))):
+    check(any("A2" in p and "strict" in p for p in problems),
+          f"the mismatch message must NAME BOTH words (received {word} receipt): a "
+          "message that says only one of them cannot be acted on")
+
+# ...and the declaration DEFAULT is derived from the environment by the
+# binary's own rule (src/RunContract.h), or the harness declares one thing and
+# the child prints another with nothing between them but a failed run.
+check(audit.derive_declared_fidelity({"RASBERY_STAGED_FLUX_TOL": "50",
+                                      "RASBERY_STAGED_XE_TOL": "1000",
+                                      "RASBERY_STAGED_LOOSE_SETTLE": "1"}) == "A2",
+      "the 238 production environment must derive as A2")
+check(audit.derive_declared_fidelity({}) == "strict",
+      "an empty environment is strict")
+check(audit.derive_declared_fidelity({"RASBERY_STAGED_LOOSE_SETTLE": "1"}) == "strict",
+      "negative control: loose-settle ALONE is inert (Driver.h:3882 -- it is only read "
+      "inside a loose stage), the binary reports strict, and a derivation that said A2 "
+      "would fail every such run on a mismatch it invented")
+check(audit.derive_declared_fidelity({"RASBERY_STAGED_FLUX_TOL": "1"}) == "strict",
+      "a multiplier of exactly 1.0 does not loosen anything; RunContract.h compares > 1")
+check(audit.derive_declared_fidelity({"RASBERY_STAGED_FLUX_TOL": "0.5"}) == "strict",
+      "a multiplier below 1 would TIGHTEN and is clamped to 1.0, as in RunContract.h:120")
+check(audit.derive_declared_fidelity({"RASBERY_GA_FEEDBACK_PASSES": "2"})
+      == "feedback_limited",
+      "a nonzero GA feedback-pass limit is the feedback_limited fidelity")
+check(audit.derive_declared_fidelity({"RASBERY_STAGED_XE_TOL": "1000",
+                                      "RASBERY_PHYSICS_FIDELITY": "strict"}) == "A2",
+      "a declaration can only make the fidelity COARSER: declaring strict on a staged "
+      "run must not flatter it (RunContract.h effectivePhysicsFidelity)")
+check(audit.derive_declared_fidelity({"RASBERY_PHYSICS_FIDELITY": "L3coarse"})
+      == "L3coarse",
+      "L3coarse has no environment signature of its own and must come from the "
+      "declaration channel")
 
 if failures:
     for problem in failures:

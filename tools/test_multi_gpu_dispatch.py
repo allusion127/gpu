@@ -182,10 +182,12 @@ check(mg.plan_writer_threads(result_mode="full")[0] == 1,
 # L5 sweeps (103-116 c/h) that were reported as data.  So: one resolver, shared
 # with the single-GPU harness, and the resolved set printed before the run.
 source = (root / "tools" / "run_multi_gpu_batch.py").read_text(encoding="utf-8")
-check("resolve_profile_env" in source and "env.update(result.env)" in source,
-      "the child env must come from run_single_gpu_batch.resolve_profile_env(), not be "
-      "reassembled here: a difference between the two harnesses' defaults is invisible "
-      "in every receipt either of them prints")
+check("resolve_profile_env" in source and "launch_env(result.env" in source,
+      "the child env must come from run_single_gpu_batch.resolve_profile_env(), and the "
+      "child's WHOLE environment from launch_env(), not be reassembled here: a "
+      "difference between the two harnesses' defaults is invisible in every receipt "
+      "either of them prints, and only launch_env() also applies --set-unset to the "
+      "INHERITED environment, which is what makes --strict mean anything")
 check("[RASBERY][MULTI_GPU][ENV]" in source and '"env": r.env' in source,
       "the resolved per-process env must be printed BEFORE the run ([MULTI_GPU][ENV]) and "
       "recorded in the [MULTI_GPU][PROC] receipt, so a mismatch is visible before the "
@@ -218,6 +220,99 @@ check("min(budget.driver_workers, batch_width, end - start)" in source,
       "last chunk of every run fails its own receipt audit")
 check('"duplicates"' in source and '"stale_tenants"' in source,
       "the aggregate receipt must carry the Task 20 tenancy counters")
+
+# --- `auto` must not starve a worker ----------------------------------------
+#
+# THE 238 ARTEFACT.  `--claim auto` was max(batch_width, ceil(remaining/(2K))).
+# At 12 x M6 over 64 jobs that floor is 6 against a fair share of 5.33: the
+# first ten workers took 60, the eleventh took 4, and the TWELFTH GOT NOTHING.
+# A process with no jobs still starts, still prints its receipts, and reports a
+# wall of pure startup -- and a twelfth of the device's declared slots stood
+# idle for the whole wave while the arm was recorded as 12 x M6.
+shares = [mg.fair_share(index=i, processes=12, jobs=64) for i in range(12)]
+check(sum(shares) == 64 and min(shares) >= 1 and shares == [6, 6, 6, 6] + [5] * 8,
+      f"fair_share must be floor(64/12)=5 each with the remainder ROUND-ROBIN over the "
+      f"first four, tiling the manifest exactly: {shares}")
+sizes = [mg.auto_claim_size(index=i, processes=12, jobs=64, remaining=64, batch_width=6)
+         for i in range(12)]
+check(min(sizes) >= 1 and sum(sizes) == 64,
+      f"`--claim auto` at 12 x M6 over 64 jobs must give every worker at least one job "
+      f"and hand out exactly 64: {sizes}")
+check(max(sizes) <= 6,
+      f"no worker may claim more than its fair share under auto: {sizes}")
+# The arms that already worked must not move: at K=8/W=8 over 64 jobs each
+# worker still takes exactly one width (docs/W4_L5 Sec 4.3, "리필도 없고 스틸도
+# 없다"), and on the 128-job refill arm (Sec 4.6) the claim is still a width, so
+# there is still something left to steal.
+check([mg.auto_claim_size(index=i, processes=8, jobs=64, remaining=64, batch_width=8)
+       for i in range(8)] == [8] * 8,
+      "K=8 W=8 over 64 jobs must still be one width per worker: the L5 matrix arm is "
+      "defined by having no refill and no steal in it")
+check(mg.auto_claim_size(index=0, processes=8, jobs=128, remaining=128, batch_width=8) == 8,
+      "on the 128-job refill arm the claim must stay a WIDTH (16 chunks), not jump to "
+      "the 16-job fair share -- a fair share claimed in one go removes the refill the "
+      "arm exists to measure")
+check(mg.auto_claim_size(index=7, processes=8, jobs=4, remaining=4, batch_width=8) >= 1,
+      "with fewer jobs than processes nobody is owed a share and whoever asks may take "
+      "what is left; refusing there would leave jobs unrun")
+check("auto_claim_size(" in source and "size = max(batch_width, -(-remaining" not in source,
+      "the claim size must come from auto_claim_size(), not from the bare width floor "
+      "that starved the twelfth worker")
+
+# ...and the SIZE alone is not the guarantee.  A worker that finishes its chunk
+# can come back before a worker whose thread has not reached its first claim,
+# and take the share the cap computed for it: measured with a millisecond-long
+# fake child at K=12, worker 4 claimed twice (10 jobs) and worker 11 got NOTHING.
+# So the queue holds one job back for every worker that has not claimed yet.
+with tempfile.TemporaryDirectory() as tmp:
+    work = Path(tmp)
+    queue = mg.Queue(work / "q.json", 64, processes=12)
+    greedy: list[tuple[int, int]] = []
+    while True:
+        span = queue.claim(6, 0)   # one worker, looping as fast as it can
+        if span[0] >= span[1]:
+            break
+        greedy.append(span)
+    taken = sum(end - start for start, end in greedy)
+    check(taken <= 64 - 11,
+          f"a repeat claimant took {taken} of 64 with 11 workers still to claim: the "
+          "queue must keep one job in hand for every worker that has not had a turn")
+    late = [queue.claim(6, i) for i in range(1, 12)]
+    check(all(end > start for start, end in late),
+          f"every worker that arrives late must still get at least one job: {late}")
+    check(taken + sum(end - start for start, end in late) == 64,
+          "the reservation must not strand jobs: everything is still handed out")
+    check(queue.remaining() == 0, "the queue must drain")
+
+with tempfile.TemporaryDirectory() as tmp:
+    import threading  # noqa: E402
+
+    # The same thing under the real shape: 12 threads, staggered starts, each
+    # looping until the queue refuses it.  Nobody may finish with zero.
+    work = Path(tmp)
+    queue = mg.Queue(work / "q.json", 64, processes=12)
+    got = [0] * 12
+    guard = threading.Lock()
+
+    def worker(index: int) -> None:
+        while True:
+            start, end = queue.claim(
+                mg.auto_claim_size(index=index, processes=12, jobs=64,
+                                   remaining=max(0, queue.remaining()), batch_width=6),
+                index)
+            if start >= end:
+                return
+            with guard:
+                got[index] += end - start
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(12)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    check(min(got) >= 1 and sum(got) == 64,
+          f"12 concurrent workers over 64 jobs: every one must get at least one job and "
+          f"all 64 must be handed out, got {got}")
 
 # ===========================================================================
 # L5 -- K processes per GPU (GA evaluator plan Sec 5.5)
@@ -475,11 +570,13 @@ for gone in ("EXACT_PHYSICS_MODE", "SCREENING_PHYSICS_MODE", "expected_physics_m
           "claims screening from a run that is not screening (review R5)")
 check(sg.audit_physics_mode is not None,
       "run_single_gpu_batch does not import the fidelity audit from tools/exact_audit.py")
-check("audit_physics_mode(output)" in
+check("audit_physics_mode(output, plan.declared_fidelity)" in
       (Path(__file__).resolve().parents[1] / "tools" / "run_single_gpu_batch.py")
       .read_text(encoding="utf-8"),
-      "check_run_receipts no longer calls audit_physics_mode(output) with no result-mode "
-      "argument: what a case WRITES is back in the acceptance decision")
+      "check_run_receipts must audit on (output, declared fidelity) and nothing else: "
+      "with the result mode back in it, what a case WRITES is back in the acceptance "
+      "decision; without the declared fidelity, the audit is against a hardcoded "
+      "`strict` that the A2 production environment can never satisfy")
 
 
 def wp1_receipt(**fields: object) -> str:
@@ -590,6 +687,102 @@ with tempfile.TemporaryDirectory() as tmp:
     check("classifies as a screening run and refuses unless" not in source,
           "run_multi_gpu_batch still refuses a light wave for want of "
           "RASBERY_ALLOW_SCREENING (review R5)")
+
+# ===========================================================================
+# The DECLARED fidelity: printed before the run, audited after it
+# ===========================================================================
+#
+# THE DEFECT (238, after 5ccf879).  The production batch environment IS the A2
+# staged-tolerance arm -- RASBERY_STAGED_FLUX_TOL=50 / _XE_TOL=1000 /
+# _LOOSE_SETTLE=1 have been in DEFAULT_ENV since 7099e54 -- so every child
+# printed `policy:'A2'` and every audit compared it against a hardcoded
+# `strict`.  Result: rc=3 on a 12 x M6 wave and a WP4 tuner that disqualified
+# ALL SIX candidates (rc=2, no winner) with every wave at rc=0, dup=0.  Nothing
+# in any receipt said the word "fidelity".
+import contextlib  # noqa: E402
+import io  # noqa: E402
+
+
+def dispatch_receipts(argv: list[str]) -> dict[str, list[dict]]:
+    """Run main() and index the JSON receipts it printed by tag."""
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        mg.main(argv)
+    out: dict[str, list[dict]] = {}
+    for line in buffer.getvalue().splitlines():
+        if not line.startswith("[RASBERY][MULTI_GPU][") or "] {" not in line:
+            continue
+        tag, payload = line.split("] ", 1)
+        out.setdefault(tag.rsplit("[", 1)[1], []).append(json.loads(payload))
+    return out
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    work = Path(tmp)
+    manifest = work / "one.txt"
+    manifest.write_text("d0.json out/d0.h5\n", encoding="utf-8")
+    base = ["--gpus", "0", "--batch-width", "8", "--jobs", str(manifest),
+            "--workdir", str(work / "run"), "--pin", "none",
+            "--device-memory-gb", "96", "--print-env", "--", sys.executable]
+
+    seen = dispatch_receipts(base)
+    plan = (seen.get("PLAN") or [{}])[0]
+    env_lines = seen.get("ENV") or [{}]
+    check(plan.get("declared_fidelity") == "A2",
+          f"the default declaration must be DERIVED from the resolved environment, and "
+          f"DEFAULT_ENV is the A2 arm: [PLAN].declared_fidelity="
+          f"{plan.get('declared_fidelity')!r}. Declaring `strict` by default is the "
+          "defect: it voids every production wave on a policy the harness itself set")
+    check(plan.get("declared_fidelity_source") == "env",
+          "a derived declaration must say it was derived, or a receipt cannot be read "
+          "back as an explanation of what was audited")
+    check(env_lines[0].get("declared_fidelity") == "A2",
+          "--print-env must show the declared fidelity in [MULTI_GPU][ENV]: it is a "
+          "pre-flight check for exactly the mismatches that cost seven minutes each")
+
+    strict = dispatch_receipts(base[:-2] + ["--strict", "--", sys.executable])
+    strict_plan = (strict.get("PLAN") or [{}])[0]
+    strict_env = (strict.get("ENV") or [{}])[0].get("env", {})
+    check(strict_plan.get("declared_fidelity") == "strict",
+          f"--strict must DECLARE strict: {strict_plan.get('declared_fidelity')!r}")
+    check(not [k for k in strict_env if k.startswith("RASBERY_STAGED_")],
+          f"--strict must remove the staged tolerances from the child environment, not "
+          f"merely relabel the run: {sorted(k for k in strict_env if 'STAGED' in k)}")
+    check(strict_plan.get("env_unset") and
+          "RASBERY_GA_FEEDBACK_PASSES" in strict_plan["env_unset"],
+          "--strict must also delete RASBERY_GA_FEEDBACK_PASSES and "
+          "RASBERY_PHYSICS_FIDELITY: either can move an inherited environment off "
+          "strict, and a control arm that only unsets what the HARNESS set is not one")
+
+    stated = dispatch_receipts(base[:-2] + ["--fidelity", "A2", "--", sys.executable])
+    check((stated.get("PLAN") or [{}])[0].get("declared_fidelity_source") == "operator",
+          "--fidelity must be recorded as the OPERATOR's word, not as a derivation")
+    aliased = dispatch_receipts(
+        base[:-2] + ["--expect-fidelity", "L3coarse", "--", sys.executable])
+    check((aliased.get("PLAN") or [{}])[0].get("declared_fidelity") == "L3coarse",
+          "--expect-fidelity must be an alias for --fidelity")
+    refused = None
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            refused = mg.main(["--gpus", "0", "--batch-width", "8", "--jobs", str(manifest),
+                               "--workdir", str(work / "run2"), "--pin", "none",
+                               "--device-memory-gb", "96", "--print-env",
+                               "--fidelity", "sloppy", "--", sys.executable])
+    except SystemExit as exit_code:  # argparse refuses an unknown choice itself
+        refused = exit_code.code
+    check(refused == 2,
+          f"a fidelity word that is not a policy must be refused (rc={refused!r}), not "
+          "defaulted: a typo that silently became `strict` would void the wave it named")
+
+    # A --set that turns the staged tolerance off is the same statement as
+    # --strict for the FLUX knob alone, and the derivation has to follow the
+    # environment rather than the flag.
+    off = dispatch_receipts(
+        base[:-2] + ["--set-unset", "RASBERY_STAGED_FLUX_TOL",
+                     "--set-unset", "RASBERY_STAGED_XE_TOL", "--", sys.executable])
+    check((off.get("PLAN") or [{}])[0].get("declared_fidelity") == "strict",
+          "--set-unset of both staged tolerances leaves a strict child, and the "
+          "derivation must read the ENVIRONMENT, not the presence of --strict")
 
 if failures:
     raise SystemExit("multi-gpu dispatch: FAIL\n  " + "\n  ".join(failures))

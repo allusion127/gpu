@@ -248,6 +248,90 @@ check({k: v for k, v in k4_env.items() if k not in width_keys}
       "the L5 matrix are not comparable to each other")
 
 
+# ===========================================================================
+# 5. The environment decides the FIDELITY, and both harnesses must read it the
+#    same way the binary does
+# ===========================================================================
+#
+# The reference line is not a strict line.  It exports
+# RASBERY_STAGED_FLUX_TOL=50 / _XE_TOL=1000 / _LOOSE_SETTLE=1, which
+# src/RunContract.h reads as the A2 staged-tolerance policy, so every child of
+# either harness prints `policy:'A2'` and every throughput number measured
+# against this environment is an A2 number.  Auditing that against a hardcoded
+# `strict` is the WP4 defect: rc=3 on the 238 12 x M6 wave and a tuner that
+# disqualified all six candidates with every wave clean.
+import exact_audit  # noqa: E402
+
+check(exact_audit.derive_declared_fidelity(expected) == "A2",
+      "the 238 REFERENCE environment must derive as A2 -- it exports the staged "
+      "tolerances. If this ever says strict, either the reference changed or the "
+      "derivation stopped matching src/RunContract.h, and the harness is about to "
+      "declare a fidelity its children cannot print")
+check(exact_audit.derive_declared_fidelity(control) == "A2",
+      "the dispatcher's control arm must derive the same fidelity as the reference: "
+      "the arm and the line it reproduces cannot be two different physics policies")
+check(exact_audit.derive_declared_fidelity(single) == "A2",
+      "the two harnesses must derive ONE fidelity from one environment, for the same "
+      "reason they share one resolver")
+
+# The strict control arm: the same environment with every non-strict key
+# deleted -- including any the operator's shell exported, which is why the
+# switch names RASBERY_GA_FEEDBACK_PASSES and RASBERY_PHYSICS_FIDELITY too.
+strict_env = mg.resolve_profile_env(
+    batch_width=64, driver_workers=64, solver_threads=64, gpu="0",
+    unset=exact_audit.NON_STRICT_ENV_KEYS,
+)
+check(exact_audit.derive_declared_fidelity(strict_env) == "strict",
+      "the --strict arm must actually BE strict, not merely be labelled so")
+check(diff(comparable(strict_env), expected),
+      "negative control: the strict arm resolved an environment IDENTICAL to the "
+      "reference. Then --strict changed nothing and the 'both fidelities' table has one "
+      "row measured twice")
+check(all(k not in strict_env for k in exact_audit.NON_STRICT_ENV_KEYS),
+      "--strict must delete every key that can move a run off strict, not only the "
+      "two tolerance multipliers")
+# ...and it has to reach the PLAN, not only the resolver: what the single-GPU
+# harness audits is plan.declared_fidelity.
+SimpleNamespace = __import__("types").SimpleNamespace
+
+
+def single_plan(**extra):
+    args = SimpleNamespace(
+        batch_width=64, gpu="0", host_workers="legacy", worker_factor=1.0,
+        set_values=[], result=None, no_oversubscribe=False, solver_threads=None,
+        pin_omp=False, fidelity=None, strict=False, set_unset=[],
+    )
+    for key, value in extra.items():
+        setattr(args, key, value)
+    plan, _command, env = sg.build_plan(
+        args,
+        ["RASBERY", "--rasi"] + [f"d{i}.json" for i in range(64)]
+        + ["--raso"] + [f"o{i}.h5" for i in range(64)])
+    return plan, env
+
+
+plan_default, env_default = single_plan()
+check(plan_default.declared_fidelity == "A2"
+      and plan_default.fidelity_source == "env",
+      f"single-GPU harness: build_plan declared {plan_default.declared_fidelity!r} "
+      f"({plan_default.fidelity_source}); the default environment is the A2 arm and the "
+      "plan is what check_run_receipts() audits against")
+plan_strict, env_strict = single_plan(strict=True)
+check(plan_strict.declared_fidelity == "strict"
+      and not [k for k in env_strict if k.startswith("RASBERY_STAGED_")],
+      "single-GPU --strict must both declare strict AND remove the staged keys from the "
+      "child environment it will launch with")
+plan_stated, _ = single_plan(fidelity="A2")
+check(plan_stated.fidelity_source == "operator",
+      "--fidelity must be recorded as the operator's word")
+
+check(set(sg.DEFAULT_ENV) & set(exact_audit.STAGED_KEYS) == set(exact_audit.STAGED_KEYS),
+      "DEFAULT_ENV must still carry the three staged keys: they are the A2 production "
+      "arm and the reference line exports them. If they are removed, every stored 238 "
+      "throughput number stops being reproducible by this harness -- and the fix is a "
+      "documented arm change, not a quiet edit")
+
+
 if failures:
     raise SystemExit("harness env parity: FAIL\n  " + "\n  ".join(failures))
 print("harness env parity: PASS")
