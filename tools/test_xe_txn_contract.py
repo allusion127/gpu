@@ -63,7 +63,12 @@ BACKEND_H = read(os.path.join("src", "CudaXsReconBackend.h"))
 STUB = read(os.path.join("src", "CudaXsReconBackendStub.cpp"))
 DRIVER = read(os.path.join("src", "Driver.h"))
 RECEIPT = read(os.path.join("src", "XeGpuReceipt.h"))
-REFERENCE = read(os.path.join("src", "XeAndersonReference.cpp"))
+# The WP7-C quotation lives in its OWN translation unit, not beside the WP7-A
+# one: XeAndersonReference.cpp holds refDot/refCandidate, which are what the
+# PRODUCTION Xe forms mask (bits 0..4) is mined against, and an edit to that
+# file is an edit to the codegen those two are measured by.  See
+# tools/test_xe_forms_default_contract.py, which enforces the separation.
+REFERENCE = read(os.path.join("src", "XeAlgebraReference.cpp"))
 MINE = read(os.path.join("src", "XeFormMine.h"))
 XSSET_H = read(os.path.join("src", "XSSet.h"))
 XSSET = read(os.path.join("src", "XSSet.cpp"))

@@ -216,6 +216,7 @@ if (RASBERY_ENABLE_TESTS)
                 "${CMAKE_CURRENT_SOURCE_DIR}/test/xsrecon_device_consistency_test.cpp"
                 "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaXsReconBackend.cu"
                 "${CMAKE_CURRENT_SOURCE_DIR}/src/XeAndersonReference.cpp"
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/XeAlgebraReference.cpp"
                 "${CMAKE_CURRENT_SOURCE_DIR}/src/XeFormMiner.cpp")
         target_compile_features(rasbery_xsrecon_device_consistency PRIVATE cxx_std_20)
         target_include_directories(rasbery_xsrecon_device_consistency PRIVATE
@@ -317,6 +318,7 @@ if (RASBERY_ENABLE_TESTS)
     add_executable(rasbery_xe_form_probe
             "${CMAKE_CURRENT_SOURCE_DIR}/test/xe_form_probe.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/XeAndersonReference.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/XeAlgebraReference.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/XeFormMiner.cpp")
     target_compile_features(rasbery_xe_form_probe PRIVATE cxx_std_20)
     target_include_directories(rasbery_xe_form_probe PRIVATE

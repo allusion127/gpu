@@ -26,15 +26,17 @@
 #include "XeFormMask.h"
 #include "GpuFormMask.h"
 
+#include <iostream>
+
 namespace rasbery::xe {
 
-unsigned long long mineXeFormsOnThisHost(bool& sound) {
+unsigned long long mineXeFormsOnThisHost(bool& sound, bool& algebra_sound) {
     // 4096 ordinals: above the fuel-node count of the trimmed decks and the
     // same order as kngr_238's, so the inner product's accumulation runs long
     // enough for a contraction difference to survive into the sum rather than
     // being scored on a handful of terms.
-    static const xeref::Fixture fixture = xeref::buildFixture(4096);
-    return xemine::mineStable(fixture, sound);
+    static const xeref::Fixture fixture = xemine::buildMiningFixture(4096);
+    return xemine::mineStable(fixture, sound, algebra_sound);
 }
 
 unsigned long long xeFormMask() {
@@ -46,10 +48,25 @@ unsigned long long xeFormMask() {
     // RASBERY_GPU_XE unset never mines and never prints -- a feature that is
     // off must not add a line to the log of the run it is off in.
     static const unsigned long long mask = [] {
-        bool                     sound = false;
-        const unsigned long long mined = mineXeFormsOnThisHost(sound);
-        return gpu::resolveCalibratedFormMask("RASBERY_XE_FORMS", XE_FORMS_DEFAULT,
-                                              mined, sound, "XE_FORMS");
+        bool                     sound         = false;
+        bool                     algebra_sound = false;
+        const unsigned long long mined = mineXeFormsOnThisHost(sound, algebra_sound);
+        // THE VERDICT THAT DECIDES THE MASK IS THE SHIPPED CHANNEL'S, and only
+        // it.  WP7-C (71092e2) folded four new sites into one `sound`, so a
+        // host that could not mine the new ones would have fallen back to
+        // XE_FORMS_DEFAULT for the dot and the candidate too -- changing the
+        // contraction contract of the RASBERY_GPU_XE arm with no flag moved and
+        // no gate asked, which is exactly what the campaign's B0 rule forbids.
+        // The WP7-C channel gets its own line and its own consequence below.
+        const unsigned long long resolved = gpu::resolveCalibratedFormMask(
+            "RASBERY_XE_FORMS", XE_FORMS_DEFAULT, mined, sound, "XE_FORMS");
+        if (!algebra_sound)
+            std::cerr << "[RASBERY][WARN][FORMS] the WP7-C normal-equations sites (bits "
+                         "5..12) could not be mined to zero mismatches on this host; the "
+                         "shipped dot/candidate mask above is unaffected, but "
+                         "RASBERY_GPU_XE_TXN=1 has no measured contraction contract on "
+                         "this build and must not be trusted for a bit-identity claim\n";
+        return resolved;
     }();
     return mask;
 }

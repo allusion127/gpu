@@ -12,9 +12,14 @@
 namespace rasbery::xe {
 
 /// Derive this host's mask from the shipped bodies and the verbatim quotation.
-/// `sound` is false when no descent reached zero mismatches -- at which point
-/// nothing here knows the contract and the caller must say so loudly.
-unsigned long long mineXeFormsOnThisHost(bool& sound);
+///
+/// TWO VERDICTS, ONE PER CHANNEL.  `sound` covers the sites the PRODUCTION
+/// device Xe arm reads -- the fixed-partition dot and the candidate loop, bits
+/// 0..4 -- and is the only one the resolution below is allowed to act on.
+/// `algebra_sound` covers WP7-C's normal-equations sites (bits 5..12), which
+/// only RASBERY_GPU_XE_TXN evaluates.  Merging the two, as 71092e2 did, lets a
+/// site nobody shipped demote a mask everybody runs.
+unsigned long long mineXeFormsOnThisHost(bool& sound, bool& algebra_sound);
 
 /// The mask this process runs under: the mined value, overridden by
 /// RASBERY_XE_FORMS, falling back to XE_FORMS_DEFAULT only when the mining

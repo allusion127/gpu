@@ -10,7 +10,6 @@
 
 #include "XeAndersonReference.h"
 
-#include <cmath>
 #include <cstdint>
 
 namespace xeref {
@@ -80,33 +79,6 @@ Fixture buildFixture(int n) {
     }
     f.gamma[0] = 0.4371283945612;
     f.gamma[1] = -1.2094857361204;
-
-    // WP7-C.  64 Gram cases, every one of them CONDITIONED: a and c positive
-    // and decades apart, |b| < 0.86*sqrt(a*c) so det clears the 1e-8 relative
-    // floor with room, p and q of the size <dG,g> actually takes and signed
-    // because g changes sign across the core.  std::sqrt here is fixture
-    // construction, not scored arithmetic -- nothing below the `refAlgebra`
-    // quotation is measured.
-    f.alg_cases = 64;
-    f.alg.resize(static_cast<std::size_t>(6 * f.alg_cases));
-    for (int ci = 0; ci < f.alg_cases; ++ci) {
-        const double a    = nextScaled(s, -40, -20);
-        const double c2   = nextScaled(s, -40, -20);
-        const double root = std::sqrt(a * c2);
-        const double frac = 0.05 + 0.85 * static_cast<double>(nextBits(s) >> 12) /
-                                       4503599627370496.0;
-        const double b  = root * frac * ((nextBits(s) & 1ull) ? 1.0 : -1.0);
-        const double p  = nextScaled(s, -35, -18) * ((nextBits(s) & 1ull) ? 1.0 : -1.0);
-        const double q  = nextScaled(s, -35, -18) * ((nextBits(s) & 1ull) ? 1.0 : -1.0);
-        const double gg = nextScaled(s, -30, -14);
-        const auto   u  = static_cast<std::size_t>(6 * ci);
-        f.alg[u + 0] = gg; // XE_DOT_GG
-        f.alg[u + 1] = a;  // XE_DOT_A
-        f.alg[u + 2] = b;  // XE_DOT_B
-        f.alg[u + 3] = c2; // XE_DOT_C
-        f.alg[u + 4] = p;  // XE_DOT_P
-        f.alg[u + 5] = q;  // XE_DOT_Q
-    }
     return f;
 }
 
@@ -151,52 +123,6 @@ void refCandidate(const Fixture& f, int ncol, std::vector<double>& ci,
         cx[i] = vx;
         cm[i] = vm;
     }
-}
-
-// Driver.h  TryAndersonXeStepGpu, the normal-equations block, quoted.  The
-// `dots[]` reads are spelled out as locals with the SAME NAMES the production
-// arm uses, because what is being measured is what the compiler does to the
-// four expressions below and to nothing else.
-bool refAlgebra(const Fixture& f, int idx, int ncol, double min_gram, double gamma_out[2],
-                double* proj_out, double* det_out) {
-    const auto   u        = static_cast<std::size_t>(6 * idx);
-    const double gg       = f.alg[u + 0];
-    double       gamma[2] = {0.0, 0.0};
-    double       proj     = 0.0;
-    bool         solved   = false;
-    *det_out              = 0.0;
-    if (ncol == 2) {
-        const double a   = f.alg[u + 1];
-        const double b   = f.alg[u + 2];
-        const double c   = f.alg[u + 3];
-        const double p   = f.alg[u + 4];
-        const double q   = f.alg[u + 5];
-        const double det = a * c - b * b;
-        *det_out         = det;
-        if (a > 0.0 && c > 0.0 && std::isfinite(det) && std::isfinite(p) &&
-            std::isfinite(q) && det > min_gram * a * c) {
-            gamma[0] = (c * p - b * q) / det;
-            gamma[1] = (a * q - b * p) / det;
-            proj     = gamma[0] * p + gamma[1] * q;
-            solved   = true;
-        }
-    }
-    if (!solved) {
-        const int    j = ncol - 1;
-        const double a = (j == 1) ? f.alg[u + 3] : f.alg[u + 1];
-        const double p = (j == 1) ? f.alg[u + 5] : f.alg[u + 4];
-        if (a > 0.0 && std::isfinite(a) && std::isfinite(p) && a > min_gram * gg) {
-            for (double& gj : gamma)
-                gj = 0.0;
-            gamma[j] = p / a;
-            proj     = gamma[j] * p;
-            solved   = true;
-        }
-    }
-    gamma_out[0] = gamma[0];
-    gamma_out[1] = gamma[1];
-    *proj_out    = proj;
-    return solved;
 }
 
 } // namespace xeref

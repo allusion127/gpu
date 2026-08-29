@@ -66,6 +66,16 @@ double refDot(const Fixture& f, int i0, int i1);
 void refCandidate(const Fixture& f, int ncol, std::vector<double>& ci,
                   std::vector<double>& cx, std::vector<double>& cm);
 
+/// WP7-C.  Fill `alg` / `alg_cases`.  DEFINED IN src/XeAlgebraReference.cpp,
+/// not beside buildFixture(), and that separation is load-bearing: the WP7-C
+/// block used to live inside buildFixture in the same translation unit as the
+/// `refDot` / `refCandidate` quotations, so every edit to it was an edit to the
+/// codegen those two are measured by -- and they are what bits 0..4 of the
+/// PRODUCTION Xe forms mask are mined against (XeFormMiner.cpp -> kXeDotStage1 /
+/// kXeCandidate).  A case that wants the WP7-C sites scored calls this after
+/// buildFixture(); one that does not gets `alg_cases == 0` and pays nothing.
+void buildAlgebraFixture(Fixture& f);
+
 /// WP7-C.  TryAndersonXeStepGpu's normal equations, quoted verbatim: the two
 /// coefficients, the projection, the determinant, and the `solved` flag the
 /// conditioning test sets.  `det_out` is an output only so the mining can score

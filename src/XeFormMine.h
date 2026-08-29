@@ -66,9 +66,19 @@ inline xe::XeTripleConst rightOf(const xeref::Fixture& f) {
     return t;
 }
 
-/// Output words on which the shipped bodies under `mask` disagree with the
-/// separately compiled reference.
-inline long scoreMask(const xeref::Fixture& f, unsigned long long mask) {
+/// Output words on which the SHIPPED (pre-WP7-C) bodies under `mask` disagree
+/// with the separately compiled reference: the fixed-partition inner product
+/// and the candidate loop, i.e. the sites at bits 0..4.
+///
+/// THIS IS THE WHOLE OF WHAT `scoreMask` WAS BEFORE WP7-C, and it is a separate
+/// function now for one reason: bits 0..4 are the mask the PRODUCTION device Xe
+/// arm runs under (XeFormMiner.cpp -> kXeDotStage1 / kXeCandidate), and nothing
+/// added later is allowed to change either the value they descend to or the
+/// verdict on whether that descent was sound.  WP7-C added four more sites into
+/// the one `bad` total, so a host on which the new sites could not reach zero
+/// would report the WHOLE mask unsound and fall back to XE_FORMS_DEFAULT --
+/// silently swapping the contraction contract of an arm nobody had touched.
+inline long scoreShippedMask(const xeref::Fixture& f, unsigned long long mask) {
     long bad = 0;
 
     const xe::XeTripleConst a = leftOf(f);
@@ -117,6 +127,16 @@ inline long scoreMask(const xeref::Fixture& f, unsigned long long mask) {
         }
     }
 
+    return bad;
+}
+
+/// Output words on which the WP7-C normal-equations body under `mask` disagrees
+/// with its quotation: the sites at bits 5..12, and NOTHING ELSE.  Scored and
+/// descended separately from the shipped sites above so the two cannot move
+/// each other -- see scoreShippedMask.  Returns 0 when the fixture carries no
+/// algebra cases, which is what a caller that never asked for them gets.
+inline long scoreAlgebraMask(const xeref::Fixture& f, unsigned long long mask) {
+    long bad = 0;
     // WP7-C.  The normal equations, both window widths.  The one-column branch
     // has no site of its own, but it is scored anyway for the reason the
     // candidate loop's two widths are: it is what the fallback runs, and a mask
@@ -147,27 +167,53 @@ inline long scoreMask(const xeref::Fixture& f, unsigned long long mask) {
     return bad;
 }
 
-/// Coordinate descent from `seed`.  The seed is a parameter so the caller can
-/// establish that the answer is a property of the HOST rather than of where the
-/// search happened to start.
-inline unsigned long long mineForms(const xeref::Fixture& f, unsigned long long seed,
-                                    bool verbose) {
-    struct Site {
-        int bit;
-        int states;
-    };
-    const Site sites[8] = {{xe::XE_DOT_FIRST_BIT, 3},
-                           {xe::XE_DOT_THIRD_BIT, 2},
-                           {xe::XE_CAND1_BIT, 2},
-                           {xe::XE_CAND2_BIT, 2},
-                           {xe::XE_TXN_DET_BIT, 3},
-                           {xe::XE_TXN_G0_BIT, 3},
-                           {xe::XE_TXN_G1_BIT, 3},
-                           {xe::XE_TXN_PROJ_BIT, 3}};
+/// The two together, for a reader (test/xe_form_probe.cpp) that wants one
+/// number for the whole mask.  Not used by the descent or by the soundness
+/// verdict, both of which are per-channel on purpose.
+inline long scoreMask(const xeref::Fixture& f, unsigned long long mask) {
+    return scoreShippedMask(f, mask) + scoreAlgebraMask(f, mask);
+}
 
+
+struct Site {
+    int bit;
+    int states;
+};
+
+/// The four sites that existed before WP7-C, in the order they have always been
+/// visited.  THE PRODUCTION MASK IS THESE FOUR: the device Xe dot and candidate
+/// kernels read bits 0..4 and nothing above them.
+inline constexpr Site kShippedSites[4] = {{xe::XE_DOT_FIRST_BIT, 3},
+                                          {xe::XE_DOT_THIRD_BIT, 2},
+                                          {xe::XE_CAND1_BIT, 2},
+                                          {xe::XE_CAND2_BIT, 2}};
+
+/// WP7-C's four, which only the RASBERY_GPU_XE_TXN arm evaluates.
+inline constexpr Site kAlgebraSites[4] = {{xe::XE_TXN_DET_BIT, 3},
+                                          {xe::XE_TXN_G0_BIT, 3},
+                                          {xe::XE_TXN_G1_BIT, 3},
+                                          {xe::XE_TXN_PROJ_BIT, 3}};
+
+/// The pass budget the shipped descent has always had.  A CHANNEL CONSTANT, not
+/// a shared one: raising it for a new channel would be a change to the old
+/// channel's answer on any host where the descent had not converged.
+constexpr int SHIPPED_PASSES = 6;
+constexpr int ALGEBRA_PASSES = 6;
+
+/// One coordinate descent: `sites` scored by `score`, from `seed`, keeping every
+/// bit outside `sites` exactly as the seed left it.
+///
+/// `score` MUST depend only on the bits `sites` names.  That is what makes the
+/// two channels independent rather than merely separate, and it is the whole
+/// point of the split: a channel added tomorrow cannot move the mask an arm
+/// that shipped yesterday runs under.
+template <int N, typename Score>
+inline unsigned long long descend(const xeref::Fixture& f, unsigned long long seed,
+                                  const Site (&sites)[N], Score score, int max_passes,
+                                  const char* tag, bool verbose) {
     unsigned long long best       = seed;
-    long               best_score = scoreMask(f, best);
-    for (int pass = 0; pass < 10 && best_score > 0; ++pass) {
+    long               best_score = score(f, best);
+    for (int pass = 0; pass < max_passes && best_score > 0; ++pass) {
         const long before = best_score;
         for (const Site& s : sites)
             for (int state = 0; state < s.states; ++state) {
@@ -176,21 +222,34 @@ inline unsigned long long mineForms(const xeref::Fixture& f, unsigned long long 
                     (best & ~(field << s.bit)) |
                     (static_cast<unsigned long long>(state) << s.bit);
                 if (mask == best) continue;
-                const long score = scoreMask(f, mask);
-                if (score < best_score) {
-                    best_score = score;
+                const long candidate = score(f, mask);
+                if (candidate < best_score) {
+                    best_score = candidate;
                     best       = mask;
                 }
             }
         if (verbose)
-            std::printf("  mine pass %d: %ld mismatching words, mask 0x%llXull\n", pass,
-                        best_score, best);
+            std::printf("  mine %s pass %d: %ld mismatching words, mask 0x%llXull\n",
+                        tag, pass, best_score, best);
         if (best_score == before) break;
     }
     return best;
 }
 
-/// Mine from four different seeds and report whether the DERIVATION is sound.
+/// Coordinate descent from `seed`, ONE CHANNEL AT A TIME.  The seed is a
+/// parameter so the caller can establish that the answer is a property of the
+/// HOST rather than of where the search happened to start.
+inline unsigned long long mineForms(const xeref::Fixture& f, unsigned long long seed,
+                                    bool verbose) {
+    const unsigned long long shipped =
+        descend(f, seed, kShippedSites, scoreShippedMask, SHIPPED_PASSES, "shipped",
+                verbose);
+    return descend(f, shipped, kAlgebraSites, scoreAlgebraMask, ALGEBRA_PASSES,
+                   "algebra", verbose);
+}
+
+/// Mine from four different seeds and report whether the DERIVATION is sound --
+/// PER CHANNEL.
 ///
 /// "Sound" is every descent reaching ZERO mismatches -- NOT every descent
 /// producing the same bit pattern.  Those are different properties and the
@@ -200,17 +259,36 @@ inline unsigned long long mineForms(const xeref::Fixture& f, unsigned long long 
 /// correct.  What under-determination of a site that DOES matter looks like is a
 /// seed that cannot reach zero, and that is what this reports.  Same rule, same
 /// words, as cmfdmine::mineStable.
-inline unsigned long long mineStable(const xeref::Fixture& f, bool& sound) {
+///
+/// TWO VERDICTS, NOT ONE, and that is the fix for the WP7-C regression.
+/// `sound` is the verdict on the sites the PRODUCTION device Xe arm runs under,
+/// and it is computed from scoreShippedMask alone -- exactly the predicate this
+/// function used before WP7-C existed.  `algebra_sound` is the verdict on the
+/// RASBERY_GPU_XE_TXN sites.  A host that cannot mine the WP7-C sites now fails
+/// the WP7-C gate instead of demoting a mask nobody asked it to touch.
+inline unsigned long long mineStable(const xeref::Fixture& f, bool& sound,
+                                     bool& algebra_sound) {
     const unsigned long long seeds[4] = {
         0ull, ((1ull << xe::XE_BIT_COUNT) - 1ull), 0x1ull, xe::XE_FORMS_DEFAULT};
     unsigned long long mined = 0ull;
     sound                    = true;
+    algebra_sound            = true;
     for (int i = 0; i < 4; ++i) {
         const unsigned long long m = mineForms(f, seeds[i], false);
-        if (scoreMask(f, m) != 0) sound = false;
+        if (scoreShippedMask(f, m) != 0) sound = false;
+        if (scoreAlgebraMask(f, m) != 0) algebra_sound = false;
         if (i == 0) mined = m;
     }
     return mined;
+}
+
+/// The fixture the mining runs on: the WP7-A one, plus the WP7-C algebra cases
+/// its own translation unit builds.  ONE ENTRY POINT so no caller can score the
+/// algebra channel against an empty `alg` and mine four don't-cares.
+inline xeref::Fixture buildMiningFixture(int n) {
+    xeref::Fixture f = xeref::buildFixture(n);
+    xeref::buildAlgebraFixture(f);
+    return f;
 }
 
 } // namespace xemine

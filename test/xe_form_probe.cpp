@@ -70,15 +70,28 @@ double partitionedDot(const xeref::Fixture& f, int parts, unsigned long long mas
 
 int main(int argc, char** argv) {
     const int n = (argc > 1) ? std::atoi(argv[1]) : 4096;
-    const xeref::Fixture f = xeref::buildFixture(n);
+    // buildMiningFixture, not buildFixture: the WP7-C sites are scored against
+    // the `alg` cases its own translation unit builds, and a probe that skipped
+    // them would mine four don't-cares and call them measured.
+    const xeref::Fixture f = xemine::buildMiningFixture(n);
 
     // ---- 1. the mining is sound -------------------------------------------
-    bool                     sound = false;
-    const unsigned long long mined = xemine::mineStable(f, sound);
-    std::printf("mined XE_FORMS = 0x%llXull (sound=%d), build default 0x%llXull\n",
-                mined, sound ? 1 : 0,
+    bool                     sound         = false;
+    bool                     algebra_sound = false;
+    const unsigned long long mined = xemine::mineStable(f, sound, algebra_sound);
+    std::printf("mined XE_FORMS = 0x%llXull (shipped_sound=%d, algebra_sound=%d), "
+                "build default 0x%llXull\n",
+                mined, sound ? 1 : 0, algebra_sound ? 1 : 0,
                 static_cast<unsigned long long>(xe::XE_FORMS_DEFAULT));
-    check(sound, "the contraction mining reached zero mismatches from every seed");
+    // TWO CHECKS, because there are two channels and only one of them is in the
+    // production arm.  A build on which the WP7-C sites cannot be mined still
+    // has a well-defined RASBERY_GPU_XE mask; what it does not have is a
+    // bit-identity claim for RASBERY_GPU_XE_TXN.
+    check(sound, "the shipped-site mining reached zero mismatches from every seed");
+    check(algebra_sound,
+          "the WP7-C normal-equations mining reached zero mismatches from every seed");
+    check(xemine::scoreShippedMask(f, mined) == 0,
+          "the mined mask scores zero mismatching words on the shipped sites");
     check(xemine::scoreMask(f, mined) == 0, "the mined mask scores zero mismatching words");
     if (mined != xe::XE_FORMS_DEFAULT)
         std::printf("NOTE: this host contracts 0x%llXull where the build default says "
