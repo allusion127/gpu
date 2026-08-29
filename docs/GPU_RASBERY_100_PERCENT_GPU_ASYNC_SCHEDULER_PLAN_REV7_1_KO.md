@@ -1871,7 +1871,7 @@ bridge 복귀 + outer당 동기화가 그 값이다.
 **남은 일(진짜 Task 18).**
 
 - [x] batched nodal arena가 canonical ownership을 이행하게 한다 → bridge 제거, `canonicalNodalIsHonoured()` 삭제. — **[완료]** §Task 18a
-- [x] CMFD sweep을 슬롯당 스트림(또는 capture-safe 제출 경로)로 바꿔 배치에서도 budget 8을 열어준다. — **[완료]** §Task 18b
+- [x] CMFD sweep을 슬롯당 스트림(또는 capture-safe 제출 경로)로 바꿔 배치에서도 budget 8을 열어준다. — **[완료, 그리고 기본값에서 철회]** §Task 18b가 경로를 열었고 §Task 18c가 **기본값을 rendezvous로 되돌렸다**. 열린 것은 `RASBERY_GPU_OUTER_BATCH_STREAM_SWEEP=1` opt-in으로 남는다. 이유: 그 경로는 슬롯 하나만 stage하므로 배치가 **폭 M launch 1개를 폭 1 launch M개**로 바꾼다(238 M64에서 2배 이상 회귀).
 - [ ] scheduler refill — 한 슬롯이 비면 다음 덱을 넣는 곳. Task 18-lite는 슬롯을 열었을 뿐 채우지 않는다.
 - [ ] M64 메모리 — kngr_238 mesh에서 per-slot 235 MB면 64슬롯은 15 GB다. 사이즈가 안 맞으면 arena가
       거부하고 사다리가 `batch_mode`를 그대로 말한다(이제는 상수가 아니라 사실이다). 부분 폭
@@ -1982,6 +1982,137 @@ RASBERY_GPU=1 RASBERY_GPU_CMFD_SWEEP=1 RASBERY_GPU_CMFD_RESIDENT_SINGLE=1 RASBER
 `segment_launches < device_outers`(= budget이 실제로 8) · `jnet_bridge_bytes: 0` ·
 `refusals: {}`. 슬롯 하나라도 `no_runner` / `batch_mode`를 말하면 그것이 M64 메모리 한계이며,
 per-slot 235 MB × 64 ≈ 15 GB가 그 자리다.
+
+**[Task 18c 정정] 이 판정 기준의 두 번째 항은 틀렸다.** M64에서 실제로 돌려 보니
+`segment_launches < device_outers`는 **비용의 수신증이지 이득의 수신증이 아니다**. 아래를 읽을 것.
+
+### Task 18c: 배치는 rendezvous를 되찾고, stream-ordered sweep은 opt-in이 된다 — **[완료]**
+
+**증상.** 238(RTX PRO 6000 sm_120) M64, arm X + `RASBERY_GPU_OUTER=1
+RASBERY_GPU_OUTER_SEGMENT_MAX=8`, serial fold. cad0c0f(Task 18-lite)에서 **224.5 c/h · 약 17분**
+이던 실행이 d0d6f07(Task 18b)에서 **40분을 넘겨도 끝나지 않는다** — GPU 사용률 93 %, 26.5 GB.
+**단일 모드는 무회귀**(S2 ON b8 45.0 s). 즉 회귀는 배치에만 있다.
+
+**진단 — 무너진 것은 폭이다. 뮤텍스는 그 증상이다.**
+
+두 sweep arm이 각각 무엇인지 나란히 놓으면 끝난다.
+
+| arm | 경로 | 한 launch가 서비스하는 슬롯 수 | segment budget |
+| --- | --- | --- | --- |
+| 동기식(blocking) hook | `outerSweepHook` → `solveSweeps` → `solveCommon(kind=1)` = **rendezvous** | 그 outer에 도착한 덱 전부(≤ M) | 1 (`sweep_synchronizes`) |
+| stream-ordered hook | `outerSweepEnqueueHook` → `enqueueSweeps` → `issueSweepUploads(&m, **1**, unroll)` | **항상 1** | 8 |
+
+`CudaBICGBackend.cu:4589` `enqueueSweeps`는 **슬롯 하나**를 stage해서 arena의 **스트림 하나**에
+`stream_mutex` 아래 넣는다. Task 18b가 `Driver.h`의 arm을 `const bool stream_sweep =
+have_sweep_stream;`으로 바꾼 순간, 배치의 **모든 덱**이 그 경로를 탄다 — 즉 배치는 **폭 M의
+launch 하나를 폭 1의 launch M개**로 바꿨다. 그 폭이 `--batch-mode`가 존재하는 이유 전부다.
+
+**둘은 배타적이며, 그것이 이 정정이 "고침"이 아니라 "선택"인 이유다.** budget > 1은 "outer i+1을
+host에 돌아오지 않고 device에서 돈다"는 뜻이고, host rendezvous는 정의상 host 복귀다. **폭 M ·
+budget 1**과 **폭 1 · budget 8** 중 하나만 고를 수 있다. M이 커질수록 폭이 이긴다.
+
+**신설 수신증.** `[CUDA][BATCH_OCCUPANCY]`에 `enqueue_launches`(stream-ordered launch 수, 폭은
+정의상 1) · `effective_mean_width` · **네 claim 사이트의 `wait_ms`/`hold_ms`**를 붙였다
+(`enqueue` / `finish` / `sync` / `rendezvous`). host-only 계측이고 궤적은 불변이다 — 로컬
+kngr_238 단일 5조합에서 `digest` 전부 동일. 그리고 `[OUTER_GPU]` arm 줄이 이제
+`sweep_arm=rendezvous|stream`을 말한다.
+
+이 수신증이 회귀를 한 줄로 설명한다 (로컬 1080 Ti, 같은 바이너리, arm만 env로 바꿈):
+
+| | M=8 rendezvous | M=8 stream | M=16 rendezvous | M=16 stream |
+| --- | --- | --- | --- | --- |
+| rendezvous `launches` / `mean_width` | 3,672 / **1.59** | 238 / 1.01 | 4,330 / **2.70** | 479 / 1.00 |
+| `enqueue_launches` / `effective_mean_width` | 0 / 1.59 | 5,596 / **1.0003** | 0 / 2.70 | 11,192 / **1.0001** |
+| claim `hold_ms` ÷ wall | 16.1 s / 24.4 s = 66 % (rendezvous) | 23.8 s / 33.2 s = **72 %** (enqueue) | 35.7 s / 42.1 s = 85 % (rendezvous) | 43.3 s / 50.1 s = **86 %** (enqueue) |
+| claim `wait_ms` 합(전 스레드) | **0.26 ms** | **27,913 ms** | **0.29 ms** | **180,257 ms** |
+
+읽는 법은 두 가지다. 첫째, **rendezvous의 폭은 M과 함께 자란다**(1.59 → 2.70). stream의 폭은
+정의상 1.000에 못 박혀 있다. 둘째, stream arm에서 `stream_mutex`를 **쥐고 있는** 시간이 wall의
+72 %(M8) → 86 %(M16)로 오른다 — 배타 구간이 wall을 삼키면 덱을 더 넣어도 처리량이 늘지 않는다.
+M64가 바로 그 점근선이다. 대기 시간이 0.26 ms에서 27.9 s로 뛰는 것은 원인이 아니라 그 결과다
+(rendezvous의 승객은 cv에서 자고, enqueue의 승객은 뮤텍스에서 줄을 선다).
+
+**wall (로컬 1080 Ti, 5회 교차, 같은 덱·같은 env, arm만 다름; 중앙값).**
+
+| M | rendezvous(기본) | stream(opt-in = Task 18b) | cad0c0f(Task 18-lite) | stream ÷ rendezvous |
+| --- | --- | --- | --- | --- |
+| 8 | **20.13 s** | 23.46 s | 20.70 s | 1.17× |
+| 16 | **30.91 s** | 44.20 s | 32.69 s | **1.43×** |
+| 64 (238) | 224.5 c/h · ~17 min | > 2× wall (미완주) | 224.5 c/h | **> 2×** |
+
+회귀가 **M에 대해 단조 증가**한다는 것이 진단의 확증이다. 폭 M → 폭 1의 손실은 정확히 그렇게
+자란다. 로컬 4·8덱만 봤을 때 §Task 18b가 "무회귀"로 읽은 이유도 여기 있다 — M=8에서 1.17배는
+로컬 잡음 폭 안이다.
+
+**결정: 배치 기본값은 rendezvous(= 18-lite 동작), stream-ordered는 opt-in.**
+
+```cpp
+// src/Driver.h
+const bool stream_sweep = have_sweep_stream && (solo || batch_stream_sweep);
+```
+
+`batch_stream_sweep`은 `RASBERY_GPU_OUTER_BATCH_STREAM_SWEEP`(기본 off)이다. **단일은 손대지
+않는다** — solo에는 잃을 rendezvous가 없고, 경로는 Task 10 이래 그대로다.
+
+**Task 18b에서 지키는 것.** claim · 슬롯당 staging lane · event join은 **전부 남는다**: 그것들이
+opt-in arm을 *올바르게* 만드는 것이고, arm이 꺼져 있을 때 비용은 0이다(위 표의 rendezvous
+`wait_ms` 0.26 ms). **§Task 18a의 canonical binding 이행도 그대로**이므로 배치는 어느 arm에서든
+`jnet_bridge_bytes: 0`을 유지한다 — 그리고 그것이 공짜가 아니라 **이득**임이 위 wall 표에서
+보인다(M16 기본 30.91 s vs cad0c0f 32.69 s, **1.06배**).
+
+**bit 게이트 (로컬 WSL, sm_61, 최종 바이너리).**
+
+| 게이트 | 결과 |
+| --- | --- |
+| 8덱 배치 OFF vs ON b8(기본) | 0/84 × 8덱 |
+| 8덱 배치 ON b8 × 2 | 0/84 × 8덱 |
+| 8덱 배치 ON b8 vs 단일 ON b8(덱별) | 0/84 × 8덱 |
+| 8덱 배치 OFF vs accf997 OFF (feature-off 동일성) | 0/84 × 8덱 |
+| 8덱 배치 ON 기본(rendezvous) vs ON opt-in(stream) | 0/84 × 8덱 — **두 arm은 bit 동일하고 오직 wall만 다르다** |
+| 4덱 배치 OFF vs ON · ON × 2 · OFF vs accf997 OFF | 0/84 × 4덱 × 3 |
+| kngr_238 단일 arm P(S2) OFF vs ON b8 · ON × 2 · OFF vs accf997 OFF · ON vs accf997 ON | **0/500** × 4 |
+| kngr_238 `[TRAJECTORY] digest` (위 5 실행 전부) | `78e58de0db8b4484` · `outers 12017` 전부 동일 |
+| ctest | 12/12 |
+| contracts (`test_batch_outer_budget_contract` · `test_outer_stream_sweep_contract` · `test_telemetry_neutrality`) | PASS |
+
+**238 M64 재판정 명령 (기본 arm — env 추가 없음).**
+
+```bash
+RASBERY_GPU=1 RASBERY_GPU_CMFD_SWEEP=1 RASBERY_GPU_CMFD_RESIDENT_SINGLE=1 RASBERY_GPU_NODAL=1 RASBERY_GPU_NODAL_FULL=1 RASBERY_GPU_XSRECON=1 RASBERY_GPU_FLATXS=1 RASBERY_GPU_WIEL_FOLD=chunked RASBERY_GPU_XE=1 RASBERY_GPU_OUTER=1 RASBERY_GPU_OUTER_SEGMENT_MAX=8 python tools/run_single_gpu_batch.py --batch-width 64 --gpu 0 --   ./RASBERY --rasi <64 decks> --raso <64 outputs> --batch-mode 64
+```
+
+기대 수신증:
+
+- `[OUTER_GPU] slot=… sweep_arm=rendezvous` (64행)
+- `[OUTER_GPU][SLOT]`: `segment_launches == device_outers` — **이것이 이제 정상이다.** budget 1은
+  rendezvous의 대가이고, 사야 할 것은 폭이다. `jnet_bridge_bytes: 0` · `refusals: {}`는 그대로 요구한다.
+- `[CUDA][BATCH_OCCUPANCY]`: `enqueue_launches: 0` · `claim_enqueue.n: 0` ·
+  `claim_rendezvous.wait_ms` ≈ 0 · **`mean_width`가 판정 수치다**. 1에 가까우면 배치가 폭을 못 쓰고
+  있다는 뜻이고, 그때 손댈 것은 sweep arm이 아니라 **도착 폭**(`RASBERY_BATCH_WAIT_US=auto`)이다.
+- wall ≥ cad0c0f의 224.5 c/h.
+
+회귀 재현(대조군)은 같은 명령에 `RASBERY_GPU_OUTER_BATCH_STREAM_SWEEP=1`만 더한다. `sweep_arm=stream` ·
+`enqueue_launches` = Σ `device_outers` · `effective_mean_width` ≈ 1.000 ·
+`claim_enqueue.hold_ms / wall → 1`이 보이면 그것이 이 절이 말하는 그 회귀다.
+
+**남은 일 — 폭과 budget을 동시에 갖는 길.** 지금의 배타성은 rendezvous가 **host** 랑데부이기
+때문이다. 슬롯마다 arena 스트림을 따로 주면(= per-slot device mask · per-slot graph cache) 폭 1
+launch M개가 **동시에** 돌 수 있고, 그러면 budget 8과 병렬성을 동시에 가질 수 있다. 그것은
+W3의 device-side outer가 가려는 방향이며 이 절의 범위가 아니다.
+
+**별건으로 관측된 결함(이 작업이 만든 것이 아니다).** 로컬 배치에서 드물게(M=8 약 1/9, M=16 약
+1/6) **두 arm 모두** 초기 1.7–9 s에 전 덱이 다음으로 죽는다:
+
+```text
+[RASBERY][FAIL] … cudaStreamSynchronize(_impl->core.stream): operation not permitted when stream is capturing
+[RASBERY][FAIL] … cudaMemcpyAsync(d_slot_map, …): operation failed due to a previous error during capture
+```
+
+기본 arm(rendezvous만 도는 경로)에서도 나므로 §Task 18b가 들여온 것이 아니다. 가장 유력한
+용의자는 `BICGCMFD.cpp:397-422`의 최초 1회 `pinHost` 묶음이다 — `cudaHostRegister`는 드라이버에
+따라 암묵적 device 동기화를 하고, 다른 스레드가 `core.stream`에 열어 둔 capture는 그걸로 무효화
+된다. 발생 시점(각 덱의 첫 sweep 준비 구간)과 정확히 겹친다. `stream_mutex` 아래로 넣거나 첫
+launch 전에 전부 끝내는 것이 후보 처방이며, **자체 게이트가 필요한 별도 작업**이다.
 
 ## Task 19: GPU Output Packing and CPU Writer-Only I/O
 
