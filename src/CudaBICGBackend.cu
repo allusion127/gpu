@@ -91,6 +91,32 @@ enum ScalarSlot : int {
 constexpr int kSweepFirst = kEigv;
 constexpr int kSweepCount = kScalarCount - kSweepFirst;
 
+// ---------------------------------------------------------------------------
+// Rev.7.1 Task 10 part 3: the segment-scoped accumulator's layout.
+// ---------------------------------------------------------------------------
+//
+// ONE FLAT BLOCK OF DOUBLES, and deliberately not the nested struct itself:
+// a __global__ signature that names CudaBatchArena::CmfdSweepProbeSink::Accum
+// drags a host header's nesting into device code for no benefit, while a
+// `double*` plus these indices is the same bytes with none of it.  The
+// static_assert below is what keeps the two spellings from drifting.
+enum AccumSlot : int {
+    kAccAttempts = 0, ///< sum of kIcmfdDone over the launches whose verdict ran
+    kAccSweeps,       ///< sum of kSweepsDone
+    kAccLaunches,     ///< how many those were
+    kAccState,        ///< the last such launch's kSweepState
+    kAccNegative,     ///< the last such launch's negative census, as 0/1
+    kAccExceptional,  ///< 1 once a launch ended in state 0 or 2
+    kAccSaved,        ///< [kSweepCount] the abandoned launch's whole block
+    kAccCount = kAccSaved + kSweepCount
+};
+static_assert(sizeof(CudaBatchArena::CmfdSweepProbeSink::Accum) ==
+                  static_cast<std::size_t>(kAccCount) * sizeof(double),
+              "the accumulator's host struct and its device slot map disagree");
+static_assert(sizeof(CudaBatchArena::CmfdSweepProbeSink::Accum::saved) ==
+                  static_cast<std::size_t>(kSweepCount) * sizeof(double),
+              "the saved scalar block is not one sweep block wide");
+
 /// Device-side tallies harvested once per outer instead of once per iteration.
 enum CounterSlot : int {
     kRestartCount = 0,
@@ -2358,7 +2384,8 @@ __global__ void cmfd_sweep_verdict(const double* __restrict__ scalars, const int
                                    std::uint32_t* negative_out,
                                    std::uint32_t* rayleigh_out,
                                    std::uint32_t* nonfinite_out,
-                                   std::uint32_t* outer_halt, const int outer_slot) {
+                                   std::uint32_t* outer_halt, const int outer_slot,
+                                   double* acc) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
     if (outer_halt != nullptr && outer_halt[outer_slot] != 0u) return;
     const double* sm = scalars + static_cast<long long>(m) * kScalarCount;
@@ -2371,7 +2398,77 @@ __global__ void cmfd_sweep_verdict(const double* __restrict__ scalars, const int
 
     const int state = static_cast<int>(sm[kSweepState]);
     if (rayleigh_out != nullptr) *rayleigh_out = (state == 2) ? 1u : 0u;
+
+    // =====================================================================
+    // Rev.7.1 Task 10 part 3: THE OBSERVATION THE HOST NO LONGER HAS TO MAKE
+    // =====================================================================
+    //
+    // BEHIND THE SAME EARLY RETURN AS EVERYTHING ELSE HERE, and that is what
+    // makes the total mean what the host reconstruction needs it to mean: a
+    // launch enqueued behind a halt that had already fired ran nothing, so it
+    // contributes nothing.  `launches` is therefore the count of drives this
+    // segment actually performed, not the count it submitted.
+    //
+    // ONE THREAD, NO ATOMICS.  Every launch of one slot is serialised by the
+    // stream it rides, and a slot is never in two launches at once (the
+    // enqueue path holds the arena's stream claim), so the read-modify-write
+    // below has no second writer.
+    if (acc != nullptr) {
+        acc[kAccAttempts] += sm[kIcmfdDone];
+        acc[kAccSweeps] += sm[kSweepsDone];
+        acc[kAccLaunches] += 1.0;
+        acc[kAccState]    = sm[kSweepState];
+        acc[kAccNegative] = (sm[kNegative] != 0.0) ? 1.0 : 0.0;
+        // THE ABANDONED LAUNCH, SAVED WHERE IT IS STILL READABLE.  States 0 and
+        // 2 hand the drive back to the host, and the host finishes it from THIS
+        // block -- eigv, reigv, reigvs, errl2, icmfd_done, and the three
+        // exported wiel sums.  The outers enqueued behind this one will each
+        // upload their own staged block over it before the host ever gets to
+        // look, so a copy taken here is the only copy there is.
+        if (state == 0 || state == 2) {
+            acc[kAccExceptional] = 1.0;
+            for (int i = 0; i < kSweepCount; ++i) acc[kAccSaved + i] = sm[kSweepFirst + i];
+        }
+    }
+
     if (outer_halt != nullptr && (state == 0 || state == 2)) outer_halt[outer_slot] = 1u;
+}
+
+/// Rev.7.1 Task 10 part 3: THE NEXT SWEEP'S EIGENVALUE, WHERE IT ALREADY IS.
+///
+/// THE ONLY HOST INPUT A DEFERRED OUTER STILL NEEDED.  BICGCMFD::setls is a
+/// no-op on the device-assembly arm (it records `_device_assembly_pending` and
+/// returns), so of everything stageSweepIO writes into the staged block only
+/// eigv, its two reciprocals and the residual carry a value the PREVIOUS
+/// outer's observation would have produced.  Everything else -- epsl2, eshift,
+/// the budgets, the array pointers -- is constant across a segment.
+///
+/// So the block is staged and uploaded exactly as it always was, and this
+/// kernel then overwrites those four from the device probe the previous outer's
+/// verdict wrote.  Nothing about the launch changes; the host simply stops being
+/// the courier.
+///
+/// THE ARITHMETIC IS THE HOST'S, SPELLED THE HOST'S WAY.  BICGCMFD::enqueueDrive
+/// computes `1. / eigv` and `(_eshift != 0.0) ? 1. / (eigv + _eshift) : 0.0`;
+/// __ddiv_rn is IEEE division with round-to-nearest, which is what the host's
+/// `/` is, and the add is a plain add.  Same inputs, same operations, same bits.
+///
+/// NOT HALT-GATED, for k_outer_publish_reigv's reason (exactness invariant 7):
+/// it advances nothing, and gating it would only leave a stale value standing
+/// in a block whose H2D has already overwritten everything else anyway.
+__global__ void cmfd_sweep_patch(double* scalars, const int m,
+                                 const double* __restrict__ probe_eigv,
+                                 const double* __restrict__ probe_residual) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    double* sm = scalars + static_cast<long long>(m) * kScalarCount;
+    if (probe_eigv != nullptr) {
+        const double eigv = *probe_eigv;
+        sm[kEigv]         = eigv;
+        sm[kReigv]        = __ddiv_rn(1.0, eigv);
+        sm[kReigvs] =
+            (sm[kEshift] != 0.0) ? __ddiv_rn(1.0, eigv + sm[kEshift]) : 0.0;
+    }
+    if (probe_residual != nullptr) sm[kErrl2] = *probe_residual;
 }
 
 // ---------------------------------------------------------------------------
@@ -3698,7 +3795,19 @@ public:
     void enqueueSweepVerdict(int m, const CudaBatchArena::CmfdSweepProbeSink& p) {
         cmfd_sweep_verdict<<<1, 1, 0, stream>>>(scalars, m, p.eigv, p.residual, p.negative,
                                                 p.rayleigh, p.nonfinite, p.halt,
-                                                p.halt_slot);
+                                                p.halt_slot,
+                                                reinterpret_cast<double*>(p.accum));
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    /// Rev.7.1 Task 10 part 3: take this launch's eigenvalue from the probe.
+    ///
+    /// Issued in the same window cmfd_sweep_gate is -- AFTER issueSweepUploads,
+    /// whose H2D of the staged block is what it overwrites, and BEFORE
+    /// launch_sweeps, whose first kernel reads it.
+    void enqueueSweepPatch(int m, const CudaBatchArena::CmfdSweepProbeSink& p) {
+        if (!p.patch_from_probe) return;
+        cmfd_sweep_patch<<<1, 1, 0, stream>>>(scalars, m, p.eigv, p.residual);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -3806,6 +3915,41 @@ public:
                     return;
                 }
                 push(dst, src_host, cnt);
+                // ==========================================================
+                // Rev.7.1 Task 10 part 3: COMMITTED AT THE ISSUE, NOT AT THE
+                // OBSERVATION
+                // ==========================================================
+                //
+                // WHAT A SHADOW IS SUPPOSED TO MEAN: `this is what the DEVICE
+                // holds`.  It used to be written at the OBSERVATION instead, from
+                // inside absorb() -- i.e. from the host bytes AS THEY ARE WHEN
+                // THE LAUNCH IS OBSERVED, which is a different moment from when
+                // the copy was handed its source.  While the observation
+                // followed every launch immediately that distinction had no
+                // room to matter.
+                //
+                // A HOST-FREE SEGMENT GIVES IT ROOM.  There the observation is
+                // deferred to the segment exit, so `pushed` survives from a
+                // launch inside the segment until an absorb outside it -- and
+                // whatever rewrote the host array in between (the boron trial
+                // commit is the one that bit) is then recorded as if it had been
+                // uploaded.  The very next launch compares equal and skips the
+                // upload it needed most.
+                //
+                // MEASURED, kngr3, budget 2: statepoint 2's second boron trial.
+                // The host xsrf moved to 0c514dd11a55b1b7, the shadow claimed
+                // it, the device kept 95425148870c3384, and the sweep solved a
+                // reactor with the previous trial's removal cross sections --
+                // k_eff 1.0000507 where the host gets 0.9999139, 41 of 644
+                // datasets and four extra outers.
+                //
+                // COMMITTING HERE IS WHAT pushOrSkip HAS ALWAYS DONE (three
+                // lines up, `mirror.shadow.assign(host_buffer, ...)`) and what
+                // the segment's own stageXsnf does with the same justification:
+                // the shadow records the bytes the copy was HANDED, so a writer
+                // that arrives afterwards is caught by the next comparison
+                // instead of being absorbed into it.
+                mirror.commit(src_host, cnt);
             };
 
             if (sl.device_assembly) {
@@ -3945,27 +4089,31 @@ public:
         }
     }
 
-    void commitAssemblyMirrors(const int* active_slots, int count) {
-        for (int i = 0; i < count; ++i) {
-            Slot& sl = slot[static_cast<size_t>(active_slots[i])];
-            if (!sl.device_assembly) continue;
-            if (sl.pushed_xsrf) sl.xsrf_mirror.commit(sl.host_xsrf, static_cast<size_t>(n));
-            if (sl.pushed_xssm) sl.xssm_mirror.commit(sl.host_xssm, matrix_count);
-            if (sl.pushed_xsnf) sl.xsnf_mirror.commit(sl.host_xsnf, static_cast<size_t>(n));
-            if (sl.pushed_dtil) sl.dtil_mirror.commit(sl.host_dtil, surface_group_count);
-        }
-    }
+    // THE DEFERRED MIRROR COMMIT IS GONE.  Rev.7.1 Task 10 part 3 moved all four
+    // of the assembly shadows (xsnf, xsrf, xssm, dtil) to their own issue site,
+    // in issueSweepUploads' push_pending, where a shadow can only ever record
+    // bytes a copy was actually handed.  Written at the OBSERVATION instead --
+    // which is where they used to be, inside absorb() -- they record whatever the
+    // host array holds THEN, and a deferred observation gives a boron trial
+    // commit a whole segment in which to slip inside that window.
+    // The `pushed_*` flags stay: they are what slotIsPristine tests, and they
+    // still say `this launch uploaded this array`.
 
     /// A degenerate Wielandt gamma hands control to the host Rayleigh branch.
     /// Only those exceptional slots need a host copy of the operator that the
     /// assembly kernel produced; the normal path never downloads diag/cc/udiag.
-    void issueExceptionalOperatorDownloads(const int* active_slots, int count) {
+    /// @param forced when true the caller has established `state == 2` from
+    ///        somewhere other than the staging block.  A deferred segment's
+    ///        block belongs to whichever launch was enqueued LAST, which is not
+    ///        the launch that handed back -- the accumulator holds that one.
+    void issueExceptionalOperatorDownloads(const int* active_slots, int count,
+                                           bool forced = false) {
         bool queued = false;
         for (int i = 0; i < count; ++i) {
             const int m = active_slots[i];
             Slot& sl = slot[static_cast<size_t>(m)];
             const int state = static_cast<int>(sl.sweep_out[kSweepState - kSweepFirst]);
-            if (state != 2) continue;
+            if (!forced && state != 2) continue;
             // The Rayleigh hand-back in BICGCMFD reads psi(l) for sumf/summ,
             // and this is the one launch on which it does.  Unconditional on
             // device_assembly: the host arm needs the new fission source too.
@@ -4023,8 +4171,6 @@ public:
     /// would be the round trip that path exists to remove.  drain() is this plus
     /// the sync, so there is still one body and the two cannot drift.
     void absorb(const int* active_slots, int count) {
-        commitAssemblyMirrors(active_slots, count);
-
         const bool fp32_was_active = fp32Active();
         bool       fp32_failed     = false;
 
@@ -4855,6 +5001,10 @@ bool CudaBatchArena::enqueueSweeps(int m, double* out_phi, const CmfdSweepIO& io
     const int unroll = sl.sweep_unroll;
     a.core.issueSweepUploads(&m, 1, unroll);
     a.core.enqueueSweepGate(m, probe.halt, probe.halt_slot);
+    // Rev.7.1 Task 10 part 3: AFTER the gate, so the two orderings this launch
+    // depends on are both `between the upload and the graph`, and the patch
+    // reads the kEshift the upload has just landed.
+    a.core.enqueueSweepPatch(m, probe);
     a.core.launch_sweeps(nmax, unroll);
     ++a.enqueue_launches; // one slot, therefore width one -- see the field's note
     // The verdict BEFORE the downloads: it reads the scalar block the graph just
@@ -4902,6 +5052,30 @@ bool CudaBatchArena::finishSweeps(int m, CmfdSweepIO& io) {
     return true;
 }
 
+bool CudaBatchArena::finishSweepsDeferred(int m, int state) {
+    Impl& a = *_impl;
+    // THE SAME CLAIM finishSweeps TAKES, for the same reasons: absorb() folds
+    // into shared telemetry and can latch the FP32 fallback, and the
+    // exceptional download enqueues on the arena stream and drains it.
+    TimedStreamClaim stream_claim(a.stream_mutex, a.claim_finish);
+    // ONE ABSORB FOR A WHOLE SEGMENT, and what that costs is TELEMETRY, not
+    // correctness.  `host_status` is refreshed by the D2H at the end of every
+    // launch, so the flag this reads -- NONFINITE_DETECTED -- is the LAST
+    // launch's and is the one that matters; the four cumulative tallies beside
+    // it are folded once instead of once per outer, which under-reports them on
+    // this arm.  The receipt says so (hostfree_segments), and nothing numerical
+    // reads them.
+    a.core.absorb(&m, 1);
+    // NO readSweepObservation.  The staging block belongs to whichever launch
+    // was enqueued last -- on a segment that halted, one whose every kernel was
+    // masked -- so reading it would hand the caller a drive that never ran.
+    // Everything the caller needs comes from the accumulator instead.
+    if (state == 2) a.core.issueExceptionalOperatorDownloads(&m, 1, /*forced=*/true);
+    if (a.core.slot[static_cast<size_t>(m)].nonfinite) return false;
+    a.core.adoptFluxMirror(m);
+    return true;
+}
+
 void CudaBatchArena::syncSweepStream() {
     if (!_impl->core.available) return;
     // Rev.7.1 Task 18: UNDER THE STREAM CLAIM, and this is not bookkeeping.
@@ -4921,6 +5095,22 @@ void CudaBatchArena::syncSweepStream() {
     TimedStreamClaim stream_claim(_impl->stream_mutex, _impl->claim_sync);
     CUDA_CHECK(cudaStreamSynchronize(_impl->core.stream));
     CUDA_CHECK(cudaGetLastError());
+}
+
+void CudaBatchArena::unpackSavedSweepBlock(const CmfdSweepProbeSink::Accum& acc,
+                                          CmfdSweepIO& io) {
+    const double* out = acc.saved;
+    io.eigv          = out[kEigv - kSweepFirst];
+    io.reigv         = out[kReigv - kSweepFirst];
+    io.reigvs        = out[kReigvs - kSweepFirst];
+    io.errl2         = out[kErrl2 - kSweepFirst];
+    io.sweeps_done   = static_cast<int>(out[kSweepsDone - kSweepFirst]);
+    io.icmfd_done    = static_cast<int>(out[kIcmfdDone - kSweepFirst]);
+    io.state         = static_cast<int>(out[kSweepState - kSweepFirst]);
+    io.negative_last = static_cast<int>(out[kNegative - kSweepFirst]);
+    io.gammad        = out[kGammaD - kSweepFirst];
+    io.gamman        = out[kGammaN - kSweepFirst];
+    io.err_acc       = out[kErrAcc - kSweepFirst];
 }
 
 void CudaBatchArena::readSweepObservation(int m, CmfdSweepIO& io) const {
