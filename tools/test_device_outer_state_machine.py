@@ -446,16 +446,22 @@ if "cudaGraph" in GRAPH_H_CODE:
     problems.append("CudaOuterGraph.h: uses the graph API.  The header is the pure state "
                     "machine and the enqueue helpers; the WHILE lives in GpuOuterWhile.h "
                     "and in one lambda of the .cu")
-_WHILE_ARM = body_of(GRAPH_CU_CODE, "auto runGraphWhile = [&]", "if (graph_arm && i == 1u)")
-for _m in re.finditer(r"cudaGraph[A-Za-z]*", GRAPH_CU_CODE):
+#
+# BY POSITION, NOT BY PRESENCE.  The obvious spelling -- "is this token also
+# somewhere inside runGraphWhile?" -- exempts every occurrence in the file as
+# soon as one legal one exists, which is a rule that passes its own negative
+# control.  The fence is a span, so the test is whether the OFFSET is inside it.
+_WHILE_FROM = GRAPH_CU_CODE.find("auto runGraphWhile = [&]")
+_WHILE_TO = GRAPH_CU_CODE.find("if (graph_arm && i == 1u)")
+for _m in re.finditer(r"cudaGraph[A-Za-z_]*", GRAPH_CU_CODE):
     if _m.group(0) in ("cudaGraphExec_t", "cudaGraph_t"):
+        continue  # types, not calls: the cache holds both and names them
+    if 0 <= _WHILE_FROM <= _m.start() < _WHILE_TO:
         continue
-    if _WHILE_ARM and _m.group(0) in _WHILE_ARM:
-        continue
-    problems.append("CudaOuterGraph.cu: %s outside runGraphWhile.  Every step of the outer "
-                    "except the WHILE that wraps it must be a stream-ordered enqueue, or "
-                    "the graph arm and the stream arm stop being the same body"
-                    % _m.group(0))
+    problems.append("CudaOuterGraph.cu:%d: %s outside runGraphWhile.  Every step of the "
+                    "outer except the WHILE that wraps it must be a stream-ordered "
+                    "enqueue, or the graph arm and the stream arm stop being the same body"
+                    % (GRAPH_CU_CODE[:_m.start()].count(chr(10)) + 1, _m.group(0)))
     break
 
 # --- 8. the gate is opt-in ---------------------------------------------------
