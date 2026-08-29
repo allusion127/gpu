@@ -367,7 +367,8 @@ eval "$($HOME/opt/bin/micromamba shell hook -s bash)"; micromamba activate gpu
 # --- v3 생산 arm(arm X + chunked + GPU_XE + Anderson + A2 CAND)은 이제
 #     DEFAULT_ENV가 준다. 여기서 export할 필요가 없다. ---
 unset  RASBERY_GPU_OUTER RASBERY_GPU_OUTER_SEGMENT_MAX RASBERY_GPU_OUTER_GRAPH   # segment OFF
-export RASBERY_ALLOW_SCREENING=1        # --result light 는 screening run 으로 분류된다
+# RASBERY_ALLOW_SCREENING 은 더 이상 필요 없다 (WP1): --result light 는 출력 모양이지
+# screening 이 아니다. export 해도 무해하지만, 그것으로 고쳐지는 문제는 하나도 없다.
 unset  RASBERY_STATEPOINT_TELEMETRY     # 타이밍과 텔레메트리를 섞지 말 것
 export B=$HOME/<BUILD>                  # RASBERY 바이너리 디렉터리
 export O=$HOME/l5out; mkdir -p $O
@@ -386,6 +387,15 @@ export O=$HOME/l5out; mkdir -p $O
 **하네스가 주지 않는 것 셋.** `RASBERY_ALLOW_SCREENING`(권한 — 운영자가 export),
 `RASBERY_BATCH_LIGHT_RESULT`(= `--result light`),
 `RASBERY_BATCH_RECEIPT_JSONL`(경로 — K개 프로세스가 한 파일에 append하면 섞인다).
+
+> **이 환경은 strict가 아니라 A2다 — 그리고 그것이 기본 arm이다.**
+> `DEFAULT_ENV`의 `RASBERY_STAGED_FLUX_TOL=50` / `_XE_TOL=1000`을
+> `src/RunContract.h`가 **A2 staged tolerance** 정책으로 읽는다. 따라서 모든 자식은
+> `[PHYSICS_MODE].policy="A2"`를 인쇄하고, **§4.8 표와 원시 582 c/h를 포함해 이
+> 문서의 모든 처리량 숫자는 A2 숫자다**. 계획 §6.2가 strict와 A2를 한 표에 섞는 것을
+> 금지하므로, 인용할 때마다 라벨을 붙일 것. 하네스는 이제 실행마다
+> `declared_fidelity`를 인쇄하고(`[PLAN]`, `[MULTI_GPU][ENV]`, `[TOTAL]`), 자식이
+> 다른 policy를 인쇄하면 **양방향 모두 실패**한다(§4.10).
 
 > **`RASBERY_PPR_MODE=master`는 더 이상 기본값이 아니다.** 기준선이 이 키를 설정하지
 > 않는데 예전 `DEFAULT_ENV`는 강제하고 있었다 — 선언되지 않은 편차이고, 공짜도 아니다:
@@ -476,8 +486,13 @@ taskset --cpu-list 0-23 $B/RASBERY --rasi <64덱> --raso <64출력> --batch-mode
 ```
 
 - **`--claim auto`는 이 행렬에서 각 워커에게 정확히 폭 하나씩 준다**
-  (`max(W, ceil(64/(2·G·K)))` = `W`). 리필도 없고 스틸도 없다 — **폭 비교만 남는
-  깨끗한 arm**이다. 리필까지 함께 재려면 매니페스트를 128잡으로 늘린다(§4.6).
+  (`min(max(W, ceil(64/(2·G·K))), 공정몫)` = `W`, K = 1/2/4/8에서). 리필도 없고
+  스틸도 없다 — **폭 비교만 남는 깨끗한 arm**이다. 리필까지 함께 재려면 매니페스트를
+  128잡으로 늘린다(§4.6).
+  공정몫 = `floor(잡수/(G·K))` + 나머지 라운드로빈이며, **상한**으로만 쓴다.
+  이것이 없을 때 12×M6/64잡에서 12번째 워커가 0잡을 받았다(함정 20): 폭 바닥 6이
+  공정몫 5.33보다 컸다. 128잡 리필 arm에서는 공정몫(16)이 폭(8)보다 크므로 청크는
+  여전히 폭 하나이고 스틸도 그대로다.
 - `--cwd`는 필수다. 덱의 단면 HDF5와 restart 네임스페이스가 덱 디렉터리 기준 상대
   경로다.
 - `--pin taskset`은 K≥2에서 실제로 쪼갠다. **`--pin none`으로 재지 말 것** — K개
@@ -654,10 +669,14 @@ dispatcher 대조  --gpus 0 --procs-per-gpu 1 --batch-width 64       → 115.6 c
 
 ---
 
-### 4.8 238 실측 행렬 — 결과 (2026-09-01)
+### 4.8 238 실측 행렬 — 결과 (2026-09-01), **정책 = A2**
 
 RTX PRO 6000 96 GB, 24코어 호스트, 64잡, `DEFAULT_ENV` 생산 arm, `--result light`.
 `--claim auto`이므로 워커마다 정확히 폭 하나, 리필도 스틸도 없다(§4.3).
+
+> **표 전체의 fidelity 라벨: `policy = A2`** (staged tolerance 50/1000, §4.1).
+> 원시 582 c/h 기준선도 같은 환경에서 잰 것이므로 같은 라벨이다. strict 숫자와 같은
+> 표에 놓지 말 것(계획 §6.2). strict 대조 행은 §4.10에서 따로 잰다.
 
 | arm | MPS | `cases_per_hour` | control 대비 | `width_fill` | VRAM | rc |
 |---|---|---:|---:|---:|---:|---:|
@@ -800,7 +819,8 @@ python3 tools/run_multi_gpu_batch.py --gpus 0 --procs-per-gpu 1 --total-width 64
     {"procs_per_gpu":8,"batch_width":8,"declared_width_per_gpu":64,"jobs":16,
      "cases_per_hour":878.0,"width_fill":0.41,"tail_idle_max_s":...,
      "vram_per_device_gb":30.9,"mps":true,"mps_thread_percent":12,
-     "eligible":true,"disqualified":""}
+     "declared_fidelity":"A2","fidelity_measured":{"A2":16},
+     "eligible":true,"disqualified":"","problem_detail":[]}
 [RASBERY][MULTI_GPU][TUNE]        하나. candidates / chosen / calibration_s /
                                   calibration_jobs / key / tie_rel
 [RASBERY][MULTI_GPU][PLAN]        procs_policy:"tuned", width_policy:"total_width",
@@ -817,6 +837,71 @@ python3 tools/run_multi_gpu_batch.py --gpus 0 --procs-per-gpu 1 --total-width 64
 
 ---
 
+### 4.10 선언 fidelity와 strict 대조 arm (WP4 하네스 수정)
+
+**무엇이 고장나 있었나 (238, `5ccf879` 이후).** 감사가 receipt의 `policy`를
+하드코딩된 `strict`와 비교했다. 그런데 `DEFAULT_ENV`는 `7099e54` 이후 A2 staged
+tolerance를 담고 있으므로 **모든 실행이** `policy='A2' vs strict`로 걸렸다:
+
+```text
+12×M6 wave              → dispatcher rc=3   (모든 wave 는 rc=0, dup=0)
+--procs-per-gpu auto    → rc=2, 승자 없음   (후보 6개 전부 실격)
+```
+
+`RASBERY_ALLOW_SCREENING=1`은 아무 관계가 없다 — **A2는 screening이 아니다**
+(`src/RunContract.h` `kFidelityTraits`). 하네스가 근사를 잡은 것이 아니라, 자기가
+설정한 arm을 거절하고 있었다.
+
+**규칙(계획 §6.2).** strict / A2 / L3coarse는 **선언되는 fidelity**이고, 감사는
+“운영자가 선언한 fidelity로 실제로 풀었는가”를 검증한다. 더 낮은 fidelity를 조용히
+받아들이지도, 더 높은 것을 조용히 받아들이지도 않는다 — **양방향 모두 실패**다.
+strict receipt를 A2로 선언한 것도 실패인 이유: A2 칸에 다른 정책의 숫자를 넣는 것이
+§6.2가 금지하는 그 혼합이다.
+
+```bash
+# 지금 무엇을 선언하고 도는지 먼저 본다 (GPU 시간 0)
+python3 tools/run_multi_gpu_batch.py --gpus 0 --procs-per-gpu 1 --batch-width 64 \
+    --jobs $O/m64.txt --workdir /tmp/envcheck --print-env -- $B/RASBERY \
+  | grep -o '"declared_fidelity":"[^"]*"'      # → "A2"  (환경에서 유도)
+```
+
+- `--fidelity strict|A2|L3coarse` (별칭 `--expect-fidelity`)로 **명시**할 수 있고,
+  생략하면 자식 환경에서 유도한다(`src/RunContract.h`와 **같은 규칙**:
+  `_STAGED_FLUX_TOL`/`_XE_TOL` > 1.0 → A2, `RASBERY_GA_FEEDBACK_PASSES` > 0 →
+  feedback_limited, 그 외 strict, 그리고 `RASBERY_PHYSICS_FIDELITY`는 **더 거칠게만**).
+- 인쇄되는 자리: `[MULTI_GPU][PLAN].declared_fidelity`(+`_source`),
+  `[MULTI_GPU][ENV]`, `[MULTI_GPU][PROC].fidelity_measured`(케이스 수 단위),
+  `[MULTI_GPU][TOTAL].fidelity_measured`, `[TUNE][CAND].declared_fidelity` /
+  `problem_detail`, 단일 GPU 쪽은 `[SINGLE_GPU_PROFILE].declared_fidelity`.
+- 튜너의 후보 감사도 **같은 선언**을 쓴다 — 그래서 A2를 선언한 캠페인의 후보가 A2라는
+  이유로 실격되지 않는다. 실격되면 `[TUNE][CAND]`의 `disqualified`와
+  `problem_detail`이 **두 단어를 모두** 적는다(`problems: 6`만 찍히던 것이 결함이었다).
+
+**strict 대조 arm (표의 두 번째 행).** 같은 행렬을 strict로 한 번 더 돌린다. 세
+STAGED 키뿐 아니라 `RASBERY_GA_FEEDBACK_PASSES`·`RASBERY_PHYSICS_FIDELITY`까지
+**상속된 것도 포함해** 지운다 — 그것이 `--strict`가 하는 일이다:
+
+```bash
+# A2 (기본, §4.8 의 그 arm)
+run_arm m64_a2   1 64 ""
+run_arm m8_a2    8  8 "--mps"
+
+# strict 대조 — 같은 덱, 같은 폭, 정책만 다르다
+run_arm m64_strict 1 64 "--strict"
+run_arm m8_strict  8  8 "--mps --strict"
+
+# 확인: 선언과 실측이 모두 strict 여야 한다
+grep -o '"declared_fidelity":"[^"]*"' $O/m64_strict.out | head -1
+grep -o '"fidelity_measured":{[^}]*}' $O/m64_strict.out | tail -1   # {"strict":64}
+```
+
+`--set-unset KEY`는 같은 일을 키 하나 단위로 한다(`--set`과 상속 환경을 모두 이긴다).
+**두 arm의 c/h는 한 표에 넣지 말고 두 표에 넣거나, 행마다 `policy` 열을 붙인다.**
+A2는 수렴 정책이 다르므로 케이스당 outer 수가 다르고, 그것이 바로 나누어지고 있는 그
+양이다 — 라벨 없는 비교는 폭 레버가 아니라 tolerance를 재는 것이 된다.
+
+---
+
 ## 5. 함정 목록 (runner용)
 
 | # | 함정 | 증상 | 대응 |
@@ -827,7 +912,7 @@ python3 tools/run_multi_gpu_batch.py --gpus 0 --procs-per-gpu 1 --total-width 64
 | 4 | `mean_width` 하락을 실패로 읽음 | 작동하는 arm을 버린다 | `width_fill`로 본다 (§0.1) |
 | 5 | `--workdir`를 arm 간 재사용 | 로그·MPS 파이프가 섞인다 | arm마다 다른 workdir |
 | 6 | `[GPU].wall_s`를 합으로 오해 | 처리량이 K로 나뉜다 | 이미 최대값이다. `[TOTAL].cases_per_hour`를 쓸 것 |
-| 7 | `RASBERY_ALLOW_SCREENING` 미설정 | `--result light` arm이 시작도 못 한다 | dispatcher가 claim 전에 rc=2로 알려 준다 |
+| 7 | ~~`RASBERY_ALLOW_SCREENING` 미설정~~ **(WP1에서 소멸)** | 없음 — light는 screening이 아니다 | export해도 무해하지만 아무것도 고치지 않는다. rc=3의 원인은 fidelity 선언 불일치이지 이 권한이 아니다(함정 18) |
 | 8 | control이 **582 c/h**를 ±5 %로 재현하지 못함 | 모든 배수가 무의미 | 배수를 보고하기 전에 control부터 맞출 것 (§4.7) |
 | 9 | `--driver-workers`/`--no-oversubscribe`로 레인을 코어 수까지 낮춤 | `width_fill`이 무너지고 c/h가 5배 떨어진다. 오류는 없다 | `[PLAN].driver_workers`가 폭 W와 같은지, `driver_worker_policy`가 `binary_default_width`인지 확인 |
 | 10 | 물리 키를 export로만 주고 `--set`을 안 씀 | `DEFAULT_ENV`가 이겨서 조용히 다른 arm이 돈다 | A/B는 반드시 `--set KEY=VALUE`로. `[MULTI_GPU][ENV]`로 확인 |
@@ -838,6 +923,9 @@ python3 tools/run_multi_gpu_batch.py --gpus 0 --procs-per-gpu 1 --total-width 64
 | 15 | 튜닝 결과를 다른 장비·드라이버에서 재사용 | rc=2 (거절) | 결과는 UUID+드라이버에 keyed다. 의도적이면 `--allow-tune-mismatch`, 그러면 `key_match:false`가 남는다 |
 | 16 | 캘리브레이션 잡을 캠페인 처리량에 섞어 읽음 | 배수가 “튜닝이 얼마나 걸렸나”의 함수가 된다 | `[TOTAL].jobs`는 매니페스트 잡만, 재실행은 `calibration_jobs` |
 | 17 | `--total-width` 없이 튜닝 | 선언 폭이 K에 비례해 커져 큰 후보가 전부 VRAM 거절 | `--total-width 64`. 하네스가 경고는 하지만 막지는 않는다 |
+| 18 | **fidelity 선언과 실행 불일치** | `[PHYSICS_MODE] policy='A2' ... DECLARED 'strict'` → dispatcher rc=3, 튜너는 rc=2·승자 없음. **wave 자체는 rc=0, dup=0이라 무엇이 틀렸는지 안 보인다** | `--print-env`로 `declared_fidelity`를 먼저 본다(§4.10). A2 arm이면 아무것도 하지 않아도 되고, strict를 재려면 `--strict`. `RASBERY_ALLOW_SCREENING`은 이것과 무관하다 |
+| 19 | A2 숫자와 strict 숫자를 한 표에 | 폭 레버가 아니라 tolerance를 재게 된다 | 행마다 `policy` 열. `[TOTAL].fidelity_measured`가 케이스 단위로 적어 준다(계획 §6.2, §4.10) |
+| 20 | **K가 잡 수를 나누지 못할 때 워커 하나가 0잡** | 12×M6/64잡에서 12번째 프로세스가 아무것도 claim하지 못했다. c/h는 0, 그 슬롯은 wave 내내 놀았고 arm은 “12×M6”으로 기록된다 | 수정됨: `auto`의 claim은 이제 `floor(jobs/(G·K))` + 나머지 라운드로빈을 **상한**으로 쓴다. `[PROC].jobs`가 전부 ≥1인지 확인할 것 |
 
 ---
 
@@ -850,4 +938,4 @@ python3 tools/run_multi_gpu_batch.py --gpus 0 --procs-per-gpu 1 --total-width 64
 | **무릎의 위치** | 부분 실측 | 8까지는 단조 증가(MPS). 12×M6 / 16×M4가 다음이고, 그 뒤로는 24코어에서 프로세스당 1코어 미만이 되어 튜너가 거절한다 |
 | **다중 GPU × K** | 미실측 | 코드 경로는 같다(`processes = G × K`). GPU 1장 전용 정책 때문에 로컬에서 잴 수 없다 |
 | **per-slot VRAM 재측정** | **두 항 모델로 교체 (§4.8-5)** | 슬롯 항 0.203 GB는 그대로(K에 대해 평평한 것이 실측으로 확인되었다). 새로 생긴 것은 프로세스 고정비 2.56 GB — `--vram-per-extra-process-gb`. `--result light`의 실제 peak은 여전히 더 작고, 가드는 **보수적인 쪽**이 옳다 |
-| **`--claim auto`의 K 인식** | 구현됨, 미튜닝 | `max(W, ceil(remaining/(2·G·K)))`. K가 크면 청크가 폭으로 고정되어 스틸이 사실상 사라진다. 128잡 이상에서 다시 볼 것 |
+| **`--claim auto`의 K 인식** | 구현됨, 미튜닝 | `min(max(W, ceil(remaining/(2·G·K))), floor(잡수/(G·K))+나머지)`. 공정몫 상한이 워커 기아를 막고(함정 20), 그 아래에서는 예전 정책 그대로다. K가 크면 청크가 폭으로 고정되어 스틸이 사실상 사라진다 — 128잡 이상에서 다시 볼 것 |

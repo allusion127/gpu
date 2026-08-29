@@ -233,7 +233,7 @@ strict와 A2 **둘 다** 지금까지 `full_exact_nodal`을 찍어 왔고 238 �
 | **WP1** | 출력/충실도 분리 + GPU full fail-closed | **done (코드·계약·하네스)** — 바이너리 `9dff6ff`, 하네스 감사 전환 `5ccf879`, 죽은 receipt 필드 `666e123` | 본 작업 | 238에서 §8 runbook **7줄** 통과 + 오버헤드 <1% | ~~R5~~ 종결. **238 빌드만 남았다** |
 | **WP2** | 착지 기능 238 재가격 | **not-started** (단, 판정 근거는 준비됨 — F9/F10 종결로 engagement receipt가 상수를 읽지 않는다) | 하네스 담당 + 본 작업 | 6개 기능 각각 `adopt`/`keep-opt-in`/`reject`. **판정은 `[GPU_FULL].*_fallbacks` + `[BACKEND_COUNTERS].{xs,cmfd,nodal}_cpu_fallbacks` + `[XE_GPU].fused_*`로 한다** | WP0, WP1(모드 일치 비교가 성립해야 함), R4. **잔여 F9: 네 개의 `*_gpu_calls`(`xs`,`nodal`,`th`,`depletion`)는 아직 죽어 있다** — `tools/test_receipt_counters_live.py`의 `KNOWN_DEAD`에 이유와 함께 열거되어 있고, 배선하면 목록이 줄어든다 |
 | **WP3** | CMFD compaction 검증·채택 | **landed-unpriced, 계약 하드닝 done** (`79c1880`: 커널 12개의 outer 계열까지 스캔 확대 + 15개 음성 대조군, R2 종결) | 본 작업 | **238 가격 평가만 남았다 — §9 runbook**. M64 mode-matched +5%, padding 유의 감소, ON×2 digest 동일 | WP2, ~~R2~~ 종결, R4. **코드 작업 없음** |
-| **WP4** | 단일 GPU K-process 자동 튜닝 | **priced + tuner landed** (`6ad1de7`) — 238 8-arm 행렬 실측(docs/W4_L5 §4.8), `--procs-per-gpu auto`/`--tune-from` 착지 | 하네스 담당 + 본 작업 | ~~K=2가 1×64 대비 ≥1.05×~~ **통과: 2×M32 = 1.121× (MPS 없음)**. 최고 arm 8×M8+MPS = **878 c/h = 1.519×**. 다음: 12×M6/16×M4로 무릎 확정, 3연속 wave 회귀 없음 | ~~R1~~ 해소(§4.7 결함 재발 없음: control 578 vs 원시 582), R4 |
+| **WP4** | 단일 GPU K-process 자동 튜닝 | **priced + tuner landed** (`6ad1de7`) — 238 8-arm 행렬 실측(docs/W4_L5 §4.8), `--procs-per-gpu auto`/`--tune-from` 착지. **하네스 결함 2건 수정**: (1) 감사가 선언 fidelity와의 등식이 되었다(`--fidelity`/`--strict`, §5.2) — 그 전에는 A2 환경이 strict 감사에 걸려 12×M6이 rc=3, 튜너가 후보 6개 전부 실격이었다; (2) `--claim auto`의 폭 바닥이 공정 몫을 넘어 12프로세스에서 한 워커가 0잡을 받던 것 | 하네스 담당 + 본 작업 | ~~K=2가 1×64 대비 ≥1.05×~~ **통과: 2×M32 = 1.121× (MPS 없음)**. 최고 arm 8×M8+MPS = **878 c/h = 1.519×**. **이 숫자는 전부 A2 정책이다(§5.2).** 다음: 12×M6/16×M4로 무릎 확정, 3연속 wave 회귀 없음, 그리고 §5.2의 strict 대조 arm 1행 | ~~R1~~ 해소(§4.7 결함 재발 없음: control 578 vs 원시 582), R4 |
 | **WP5** | FlatXS CTA-per-node + XS residency | **not-started** | 본 작업 | 단계 A(ptxas/ncu spill 증명) → 분기 | **R1: 재측정은 이제 가능해졌다** — dispatcher control이 원시 라인을 ±5%로 재현했다(578 vs 582). 남은 것은 §3.3 커널 지분을 **폭이 찬 실행에서 다시 재는 것**이고, 그 실행은 8×M8+MPS다(width_fill 0.28→0.41). WP3+WP4 |
 | **WP6** | GPU PPR device loop/reconstruct/canonical | **부분 landed-unpriced** (`c502856` 장치 PPR, 기본 OFF·fail-open) | 본 작업 | 단계 A: `ppr_device_calls == statepoints`, `ppr_host_calls == 0` (GPU full), N1 Gate A/B | WP2(PPR 1차 A/B), WP1(fail-closed로 engagement 증명) |
 | **WP7** | 단일 launch/sync 축소 + Xe transaction | 단계 A **부분 landed-unpriced** (WHILE 구현·기본 OFF) / **단계 B 코드·계약 done, 미가격** — census + `RASBERY_GPU_CMFD_FUSE` 4비트(기본 0), `[RASBERY][CMFD][GRAPH]` receipt, `tools/test_cmfd_fuse_contract.py`, `docs/WP7_CMFD_GRAPH_CENSUS_20260831_KO.md` / **단계 C 코드·계약 done, 미가격** — `RASBERY_GPU_XE_TXN`(기본 0), device Anderson control 2커널 + history fusion(14 node→1), `[XE_GPU]`에 `txn_steps`/`host_syncs_per_step`/`d2h_bytes_per_step`, `XE_FORMS` 4 site 추가(비트 5..12, 채굴), `tools/test_xe_txn_contract.py`(129검사·음성대조 8), `docs/WP7C_XE_TXN_20260831_KO.md` | 본 작업 | 단계 A: 단일 WHILE ≥5% (교대 5쌍). 필수 receipt에 `refusals{no_residency}` / `refusals{unbound}` 포함. **단계 B: 238에서 mask별 h5diff 0/644 + digest `0d15abf29d222a02`/`4382` 동일(B0)이 먼저, 그 다음 단일 wall ≥3%(16.9 s 기준) — 미달이면 기본값 유지.** census 실측: outer 90 node, sweep 98 node/sweep → `FUSE=7`에서 78 / 85(−13.3%). **단계 C: 단일 production arm에서 `XE_TXN=0` vs `1` h5diff 0/644 + digest `0d15abf29d222a02`/`4382` 동일(B0, `RASBERY_GPU_XE=1` arm 대비) + ON×2 결정론이 먼저**, 그 다음 8×M8+MPS c/h vs **878**(§3.3에서 Xe = 배치 GPU 시간 26.9 %이므로 값은 배치에서 난다) 또는 배치 Xe phase −20 %. 단일 16.9 s는 hot median of 3으로 확인만 하고 판정 기준으로 쓰지 않는다. sync census 실측(소스 계약): accepted step 4→1, rejected step 3~5→1, D2D 12→0, device API call 45→26 | WP2. ~~F11~~ 종결(`666e123`). **단계 B·C 모두 238 컴파일이 첫 관문**(로컬에 nvcc 없음). 단계 C 잔여: `_xs/_iden` residency가 없어 step당 1.96 MB drain D2H와 마지막 sync 1개는 남는다(계획이 residency 조건부로 적은 그대로), full-transaction graph capture는 §6.3 수치를 보고 결정 |
@@ -246,6 +246,38 @@ strict와 A2 **둘 다** 지금까지 `full_exact_nodal`을 찍어 왔고 238 �
 
 “landed-unpriced”는 **계획이 그렇게 부르라고 한 상태**다(§4.3 제목). 이 표에서 그것은 **“새로 구현하지 말 것”**을 뜻한다 — WP3과 WP9-B가 특히 그렇다.
 
+### 5.2 238 처리량 표의 fidelity 라벨 — **7099e54 이후 모든 배치 숫자는 A2다**
+
+**사실.** `DEFAULT_ENV`(`tools/run_single_gpu_batch.py`)는 `7099e54` 이후
+`RASBERY_STAGED_FLUX_TOL=50`, `RASBERY_STAGED_XE_TOL=1000`,
+`RASBERY_STAGED_LOOSE_SETTLE=1`을 담고 있다. `src/RunContract.h`는 두 tolerance
+배수 중 하나라도 1.0을 넘으면 **A2**로 판정하므로, 두 하네스의 모든 자식은
+`[RASBERY][PHYSICS_MODE].policy = "A2"`를 인쇄한다.
+
+**따라서 `docs/W4_L5` §4.8의 8-arm 행렬, 원시 582 c/h 기준선, 그리고 그 이후의
+모든 배치 처리량 숫자는 A2 정책에서 잰 것이다.** 계획 §6.2는 strict와 A2를 한
+표에 섞는 것을 금지한다 — 그러므로 그 숫자들은 **A2로 라벨링해야 하고**, strict
+숫자와 나란히 놓을 수 없다. 라벨이 필요한 자리는 §4.8 표 제목, §4.9 튜너 결과,
+그리고 이후 어떤 c/h 인용이든 전부다.
+
+**결함(238, `5ccf879` 이후 측정).** 감사는 receipt의 `policy`를 하드코딩된
+`strict`와 비교했다. 환경이 A2이므로 **모든 실행이 `policy='A2' vs strict`로
+탈락**했다 — 12×M6 wave가 dispatcher rc=3, WP4 튜너는 **후보 6개 전부 실격**
+(rc=2, 승자 없음)이며 그 와중에 모든 wave는 rc=0/dup=0이었다.
+`RASBERY_ALLOW_SCREENING=1`은 이것과 무관하므로 도움이 되지 않았다(A2는 screening이
+아니다). 하네스는 근사를 잡은 것이 아니라 **자기가 설정한 arm을 거절**하고 있었다.
+
+**수정.** 감사는 이제 **선언한 fidelity와의 등식**이다(`tools/exact_audit.py`
+`audit_physics_mode(output, declared)`). 선언은 `--fidelity strict|A2|L3coarse`
+(별칭 `--expect-fidelity`)로 주고, 기본값은 **자식 환경에서 유도**하며
+(`derive_declared_fidelity()`, `src/RunContract.h`와 같은 규칙),
+`[PLAN]`/`[MULTI_GPU][ENV]`/`[SINGLE_GPU_PROFILE]`에 `declared_fidelity`로
+인쇄된다. **양방향 모두 hard failure다**: A2 receipt를 strict로 선언해도, strict
+receipt를 A2로 선언해도 실패한다 — 두 번째 방향이 실패인 이유는 A2 칸에 다른 정책의
+숫자가 들어가는 것이 §6.2가 금지하는 그 혼합이기 때문이다. strict 대조 arm은
+`--strict`(세 STAGED 키 + `RASBERY_GA_FEEDBACK_PASSES` +
+`RASBERY_PHYSICS_FIDELITY`를 **상속된 것까지** 삭제) 또는 `--set-unset KEY`로 만든다.
+
 ---
 
 ## 6. WP1 구현 요약 (`file:line`)
@@ -256,7 +288,7 @@ strict와 A2 **둘 다** 지금까지 `full_exact_nodal`을 찍어 왔고 238 �
 |---|---|
 | `src/RunContract.h` | `PhysicsFidelity{FullExact,StagedA2,Coarse10State,FeedbackLimited}`, 단일 진실 표 `kFidelityTraits[4]`(`:80-90` 부근), A2 탐지(Driver.h와 **같은 읽기**), `RASBERY_PHYSICS_FIDELITY` 선언 채널(더 거칠게만) |
 | `src/GpuFullContract.h` | `Subsystem{Cmfd,Outer,Nodal,FlatXs,Xe,Ppr,Cram}`, `Violation : std::runtime_error`(site를 이름 짓는다), `required()`(**기본 OFF**, `RASBERY_GPU_FULL` / 별칭 `RASBERY_GPU_STRICT`, 한 번만 읽음), `note()`/`noteIf()`/`count()`, `appendReceiptFields()`, 매크로 `RASBERY_GPU_FULL_GUARD(_IF)` / `RASBERY_GPU_FULL_COUNT` |
-| `tools/exact_audit.py` | fidelity에 건 acceptance 감사. `audit_physics_mode(output, require={"strict"})`. `result_mode`는 읽되 **절대 판정하지 않는다** |
+| `tools/exact_audit.py` | fidelity에 건 acceptance 감사. `audit_physics_mode(output, declared)` — **선언한 fidelity와의 등식**이고, `derive_declared_fidelity(env)`가 그 기본값을 자식 환경에서 `src/RunContract.h`와 **같은 규칙으로** 유도한다. `result_mode`는 읽되 **절대 판정하지 않는다** |
 | `tools/test_result_fidelity_contract.py` | WP1(a)/(c) 계약. `kFidelityTraits` 표 파싱 + 음성 대조군, Driver.h와 RunContract.h의 A2 술어 고정, main.cpp의 `screening`이 fidelity에서 나오는지, receipt 10개 필드, 감사의 12개 음성 대조군 |
 | `tools/test_gpu_full_fail_closed.py` | WP1(b) 계약. 13개 fallback seam 전수 스캔 + seam마다 음성 대조군, count-only 예외 allowlist, per-case catch 두 개, receipt 양쪽 분기, `kArmEnv` 부재 |
 
