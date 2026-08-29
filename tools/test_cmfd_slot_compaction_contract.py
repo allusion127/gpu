@@ -39,7 +39,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 FULL_WIDTH_KERNELS = ("initialize_solver_state", "finalize_status")
 
-# Rev.7.1 Task 10 part 2: the two kernels of the STREAM-ORDERED sweep enqueue.
+# Rev.7.1 Task 10 part 2/3: the THREE kernels of the STREAM-ORDERED sweep enqueue.
 #
 # THEY TAKE THE PHYSICAL SLOT AS AN ARGUMENT, and that is not a compaction
 # escape -- it is the absence of a batch.  CudaBatchArena::enqueueSweeps serves
@@ -53,7 +53,9 @@ FULL_WIDTH_KERNELS = ("initialize_solver_state", "finalize_status")
 # The rule they must obey instead is the thread-0/block-0 filter, which is
 # checked below, because a launch geometry that ever widened would otherwise
 # have every thread write the same scalars.
-EXPLICIT_SLOT_KERNELS = ("cmfd_sweep_gate", "cmfd_sweep_verdict")
+# Rev.7.1 Task 10 part 3 adds the third, cmfd_sweep_patch, on exactly the same
+# footing: <<<1, 1>>>, a slot the caller named, and a thread-0/block-0 filter.
+EXPLICIT_SLOT_KERNELS = ("cmfd_sweep_gate", "cmfd_sweep_verdict", "cmfd_sweep_patch")
 
 
 def read(*parts: str) -> str:

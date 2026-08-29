@@ -1102,7 +1102,7 @@ private:
     // ends, and the convergence kernel reads them from device memory, so the
     // host was only ever carrying them from one device buffer to another.
     static bool outerSweepEnqueueHook(void* raw, gpu::OuterSegmentStream stream, int slot,
-                                      unsigned int) {
+                                      unsigned int outer_index) {
         OuterHookCtx& h = *static_cast<OuterHookCtx*>(raw);
         const gpu::CudaOuterSegment::ProbeAddresses a =
             gpu::rasberyOuterSegment(slot).probeAddresses(slot);
@@ -1116,6 +1116,23 @@ private:
         sink.nonfinite = a.nonfinite;
         sink.halt      = a.halt;
         sink.halt_slot = slot;
+        // Rev.7.1 Task 10 part 3: THE TWO FIELDS THAT MAKE A DRIVE UNOBSERVED.
+        //
+        // `accum` is non-null exactly while a HOST-FREE segment is running (the
+        // runner scopes it, not the arm), and it says `nobody will look at this
+        // launch on its own -- keep the summary yourself`.
+        //
+        // `patch_from_probe` is why outer 0 is different.  setls is a no-op on
+        // the device-assembly arm, so of everything staged for a launch only the
+        // eigenvalue and its two reciprocals carry a value the previous outer's
+        // OBSERVATION would have produced -- and on outer 0 there was no
+        // previous outer in this segment, so `*h.eigv` is the current one and
+        // the probe may still describe a drive several host outers old.  From
+        // outer 1 the probe holds outer i-1's verdict, which is exactly what
+        // finishDrive would have written into `*h.eigv`.
+        sink.accum =
+            static_cast<CudaBatchArena::CmfdSweepProbeSink::Accum*>(a.accum);
+        sink.patch_from_probe = sink.accum != nullptr && outer_index > 0;
         // RAISED HERE, LOWERED IN THE FINISH HALF.  stageSweepIO reads the
         // residency, and on this path it runs inside enqueueDrive AND again
         // inside finishDrive's exceptional blocking launches -- so the flag has
@@ -1186,6 +1203,77 @@ private:
         return gpu::rasberyOuterSegment(slot).republishAfterHostSweep(
             slot, *h.eigv, *h.residual, h.ctx->cmfd_solver.lastSweepNegativeFlux(),
             h.ctx->cmfd_solver.lastSweepRayleigh());
+    }
+
+    // =======================================================================
+    // Rev.7.1 Task 10 part 3: the observation half, ONCE PER SEGMENT
+    // =======================================================================
+    //
+    // THE SAME TWO THINGS outerSweepFinishHook DOES, over N drives instead of
+    // one: absorb what the sweep did, and -- when the device abandoned a drive
+    // -- finish it on the host and overrule the verdict kernel's half-drive
+    // probe.  What it does NOT do is read a scalar block: the block belongs to
+    // whichever launch was enqueued last, and on a segment that halted that is
+    // one whose every kernel was masked.  Everything comes from @p raw_accum,
+    // the summary the verdict kernel kept as the segment ran.
+    //
+    // THE RESIDENCY FLAG SPANS THE WHOLE SEGMENT HERE, for the reason it spans
+    // one drive on the per-outer arm: stageSweepIO reads it, and on the
+    // exceptional path finishDeferredDrives stages further blocking launches of
+    // its own.  Raised by the enqueue half of every outer, lowered here, on
+    // every exit including the failure -- leaving it up would hand the next HOST
+    // outer a sweep that elides the dhat and psi H2D, which is the sticky-flag
+    // failure that cost 169 kngr_238 outers in its original costume.
+    static bool outerSweepFinishDeferredHook(void* raw, const void* raw_accum, int slot) {
+        OuterHookCtx& h = *static_cast<OuterHookCtx*>(raw);
+        h.enqueued      = false;
+        if (raw_accum == nullptr) return false;
+        const auto& acc =
+            *static_cast<const CudaBatchArena::CmfdSweepProbeSink::Accum*>(raw_accum);
+        bool       host_continued = false;
+        const bool ok             = h.ctx->cmfd_solver.finishDeferredDrives(
+            acc, *h.eigv, h.ctx->geometry.PhifMutable(), *h.residual, host_continued);
+        h.ctx->cmfd_solver.setOuterSegmentResident(false);
+        if (!ok) return false;
+        if (!host_continued) return true;
+        return gpu::rasberyOuterSegment(slot).republishAfterHostSweep(
+            slot, *h.eigv, *h.residual, h.ctx->cmfd_solver.lastSweepNegativeFlux(),
+            h.ctx->cmfd_solver.lastSweepRayleigh());
+    }
+
+    /// Rev.7.1 Task 10 part 3: may the segment stop asking about cusping?
+    ///
+    /// A PURE QUERY ON XSSet's OWN STATE, and it is the same state
+    /// ApplyRodCusping consults on its first three lines -- which is what makes
+    /// `skip it` an identity rather than an optimisation.  See
+    /// XSSet::RodCuspingQuiescent for why a segment-scope answer is sound.
+    static int outerCuspingQuiescentHook(void* raw) {
+        OuterHookCtx& h = *static_cast<OuterHookCtx*>(raw);
+        return h.ctx->cross_sections.RodCuspingQuiescent() ? 1 : 0;
+    }
+
+    /// Rev.7.1 Task 10 part 3: hand the nodal backend the segment's halt word.
+    ///
+    /// HERE AND NOT IN THE RUNNER for outerNodalCompletionHook's reason: the
+    /// backend is reached through XSSet, which is Driver.h's object.  The runner
+    /// owns the halt table and knows nothing about a nodal graph key; the
+    /// backend owns the key and knows nothing about a segment.
+    static void outerNodalHaltGateHook(void* raw, const void* halt, int slot) {
+        OuterHookCtx&   h  = *static_cast<OuterHookCtx*>(raw);
+        XsReconBackend* be = h.ctx->cross_sections.EnsureBackend();
+        if (be != nullptr) be->setNodalHaltGate(halt, slot);
+    }
+
+    /// Rev.7.1 Task 10 part 3: make the nodal stream wait for the segment's.
+    ///
+    /// The mirror image of outerNodalCompletionHook, which orders the OTHER
+    /// direction.  Both halves of the outer's cross-stream pair are events now,
+    /// on the host-free arm; the per-outer arm still uses its drain for this one
+    /// and never calls this.
+    static bool outerNodalWaitHook(void* raw, void* event) {
+        OuterHookCtx&   h  = *static_cast<OuterHookCtx*>(raw);
+        XsReconBackend* be = h.ctx->cross_sections.EnsureBackend();
+        return be == nullptr || be->waitOnSegmentEvent(event);
     }
 
     /// The nodal drive, exactly as SolveLoop runs it.
@@ -1572,6 +1660,15 @@ private:
         hooks.read_live_state     = &outerLiveStateHook;
         hooks.canonical_nodal_mode     = &outerCanonicalNodalHook;
         hooks.canonical_nodal_eligible = &outerCanonicalNodalEligibleHook;
+        // Rev.7.1 Task 10 part 3.  Supplied unconditionally: WHETHER a segment
+        // runs host-free is the runner's per-segment decision, and it needs all
+        // three of these to be able to make it.  Installing them on the
+        // rendezvous arm too costs nothing -- that arm fails the
+        // `not_stream_sweep` term of the ladder and never calls them.
+        hooks.finish_cmfd_sweep_deferred = &outerSweepFinishDeferredHook;
+        hooks.cusping_quiescent          = &outerCuspingQuiescentHook;
+        hooks.nodal_halt_gate            = &outerNodalHaltGateHook;
+        hooks.nodal_wait_event           = &outerNodalWaitHook;
         hooks.ctx                 = &hc;
         hooks.sweep_synchronizes  = !stream_sweep;
         gpu::rasberyOuterSegment(slot).setHooks(hooks);

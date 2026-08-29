@@ -201,6 +201,36 @@ struct NodalView {
     const double* reigv_dev;
     int           nxyz;
     int           nsurf;
+
+    // =======================================================================
+    // Rev.7.1 Task 10 part 3: THE SEGMENT'S HALT, CARRIED INTO THE NODAL DRIVE
+    // =======================================================================
+    //
+    // WHY A DEVICE OUTER NEEDS IT.  A host-free segment enqueues its whole
+    // budget back to back and never looks at the exit word in between, so the
+    // outers past the exit are already in flight when the transition latches.
+    // Every kernel of the CMFD body tests that halt and returns
+    // (CudaCmfdOuterKernels.h); the nodal drive did not, because it is a HOST
+    // call and a host call cannot read a device word.  Its kernels can.
+    //
+    // AND IT IS NOT A TIDY-UP.  The drive is NOT idempotent: nodalTrlcff0Group
+    // builds the transverse leakage FROM jnet and nodalCalculateJnet writes
+    // jnet, so a drive re-run on a halted outer computes its leakage from its
+    // own previous output.  Left ungated, a budget-8 segment that exited at
+    // outer 3 would run four more nodal drives over the answer it had already
+    // decided -- finite, plausible, and not the host's.
+    //
+    // NULL IS THE DEFAULT AND THE FEATURE-OFF SHAPE.  Every arm that is not a
+    // host-free segment leaves it null: the host outer body, the hybrid drive,
+    // the replay tools, the batch arena.  `halt_slot` indexes the segment's
+    // per-slot halt table, which is the same word cmfd_sweep_gate and every
+    // CMFD body kernel read.
+    //
+    // BAKED INTO THE CAPTURED GRAPH, so both fields are part of the nodal
+    // graph key (CudaXsReconBackend.cu): the POINTER is stable for a run, and
+    // a run that flips between gated and ungated re-instantiates once.
+    const unsigned int* halt      = nullptr;
+    int                 halt_slot = 0;
 };
 
 /// Rebase a batch arena's SLOT-0 view onto slot `m`.

@@ -101,6 +101,11 @@
 
 #include "CudaOuterGraph.h"
 
+// Rev.7.1 Task 10 part 3: the sweep accumulator the host-free arm allocates and
+// hands to every enqueued drive of a segment lives in the CMFD backend's
+// vocabulary (CmfdSweepProbeSink::Accum), so the runner has to see it.
+#include "CudaBICGBackend.h"
+
 #include "CudaTransferMirror.h"
 #include "GpuCaptureArbiter.h"
 #include "GpuPhysicsArena.h"
@@ -177,6 +182,12 @@ struct AtomicCounters {
     std::atomic<std::uint64_t> sync_pre_nodal{0};
     std::atomic<std::uint64_t> sync_sweep_reissue{0};
     std::atomic<std::uint64_t> sync_segment_exit{0};
+    std::atomic<std::uint64_t> hostfree_segments{0};
+    std::atomic<std::uint64_t> hostfree_outers{0};
+    std::atomic<std::uint64_t> hostfree_enqueued{0};
+    std::atomic<std::uint64_t> sync_hostfree_exit{0};
+    std::atomic<std::uint64_t> hostfree_repairs{0};
+    std::atomic<std::uint64_t> hostfree_refusals[static_cast<int>(OuterHostFreeRefusal::Count)];
     std::atomic<std::uint64_t> phis_mirror_bytes{0};
     std::atomic<std::uint64_t> jnet_mirror_bytes{0};
     std::atomic<std::uint64_t> refusals[static_cast<int>(OuterSegmentRefusal::Count)];
@@ -185,6 +196,7 @@ struct AtomicCounters {
     AtomicCounters() {
         for (auto& c : refusals) c.store(0, std::memory_order_relaxed);
         for (auto& c : escapes) c.store(0, std::memory_order_relaxed);
+        for (auto& c : hostfree_refusals) c.store(0, std::memory_order_relaxed);
     }
 };
 
@@ -230,6 +242,57 @@ void outerSetThreadSlot(int slot) {
 
 bool outerGpuEnabled() {
     static const bool on = envFlagOn("RASBERY_GPU_OUTER");
+    return on;
+}
+
+/// Rev.7.1 Task 10 part 3: may a segment run with no in-body synchronise?
+///
+/// DEFAULT ON, KILL-SWITCH OFF, which is the opposite of how a new arm usually
+/// arrives -- and it is deliberate.  The arm is not a different physics path
+/// with its own risk: it is the SAME body with the host's per-outer look
+/// removed, and it is admitted only where that removal is proved inert (the
+/// hostfree_refusals ladder).  A default-off flag would mean the exactness gate
+/// and the production run exercise different code, which is exactly how the
+/// batch-mode divergence of invariant 8 survived six gates.
+///
+/// RASBERY_GPU_OUTER_HOSTFREE=0 restores the per-outer arm byte for byte, which
+/// is what an A/B against this task's commit compares.
+bool outerHostFreeEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("RASBERY_GPU_OUTER_HOSTFREE");
+        return v == nullptr || std::string(v) != "0";
+    }();
+    return on;
+}
+
+/// Rev.7.1 Task 10 part 3: ZERO in-body synchronises, at the price of the overrun.
+///
+/// THE TASK'S DELIVERABLE, AND OFF BY DEFAULT ON A MEASUREMENT.  A host-free
+/// segment removes TWO drains, and they are not the same trade:
+///
+///   the PRE-NODAL drain (the sweep observation) is pure cost.  Removing it
+///       removes nothing else -- the segment commits exactly the outers it
+///       committed before -- so it is on by default (RASBERY_GPU_OUTER_HOSTFREE).
+///
+///   the TOP-OF-PASS drain (the exit word) is what lets the segment STOP.
+///       Without it a segment cannot know its exit has latched, so it enqueues
+///       its whole budget every time and the halt gate turns the remainder into
+///       no-ops.  That is `hostfree_enqueued - hostfree_outers` in the receipt,
+///       and on kngr3 at budget 8 it is 2322 no-op outers against 638 real ones
+///       -- 4.29 s becomes 7.45 s locally.  Bit-exact, and slower.
+///
+/// SO THE ZERO-SYNC ARM SHIPS OFF, AND IT SHIPS ANYWAY, because it is the thing
+/// the conditional WHILE needs: with the loop captured, the DEVICE decides the
+/// trip count, the overrun stops existing, and the arm that is a loss at a fixed
+/// budget becomes the only one that can run a segment without a host at all.
+/// RASBERY_GPU_OUTER_HOSTFREE_FULL=1 turns it on and drives
+/// `in_body_host_syncs` to zero for every non-exit outer; leaving it off keeps
+/// the exit observation and one drain per outer instead of two.
+bool outerHostFreeFull() {
+    static const bool on = [] {
+        const char* v = std::getenv("RASBERY_GPU_OUTER_HOSTFREE_FULL");
+        return v != nullptr && std::string(v) != "0";
+    }();
     return on;
 }
 
@@ -292,6 +355,13 @@ OuterSegmentCounters snapshotSlotCounters(const AtomicCounters& a) {
     out.sync_pre_nodal         = a.sync_pre_nodal.load(std::memory_order_relaxed);
     out.sync_sweep_reissue     = a.sync_sweep_reissue.load(std::memory_order_relaxed);
     out.sync_segment_exit      = a.sync_segment_exit.load(std::memory_order_relaxed);
+    out.hostfree_segments      = a.hostfree_segments.load(std::memory_order_relaxed);
+    out.hostfree_outers        = a.hostfree_outers.load(std::memory_order_relaxed);
+    out.hostfree_enqueued      = a.hostfree_enqueued.load(std::memory_order_relaxed);
+    out.sync_hostfree_exit     = a.sync_hostfree_exit.load(std::memory_order_relaxed);
+    out.hostfree_repairs       = a.hostfree_repairs.load(std::memory_order_relaxed);
+    for (int i = 0; i < static_cast<int>(OuterHostFreeRefusal::Count); ++i)
+        out.hostfree_refusals[i] = a.hostfree_refusals[i].load(std::memory_order_relaxed);
     out.phis_mirror_bytes       = a.phis_mirror_bytes.load(std::memory_order_relaxed);
     out.jnet_mirror_bytes       = a.jnet_mirror_bytes.load(std::memory_order_relaxed);
     for (int i = 0; i < static_cast<int>(OuterSegmentRefusal::Count); ++i)
@@ -329,6 +399,13 @@ void addCounters(OuterSegmentCounters& into, const OuterSegmentCounters& add) {
     into.sync_pre_nodal          += add.sync_pre_nodal;
     into.sync_sweep_reissue      += add.sync_sweep_reissue;
     into.sync_segment_exit       += add.sync_segment_exit;
+    into.hostfree_segments       += add.hostfree_segments;
+    into.hostfree_outers         += add.hostfree_outers;
+    into.hostfree_enqueued       += add.hostfree_enqueued;
+    into.sync_hostfree_exit      += add.sync_hostfree_exit;
+    into.hostfree_repairs        += add.hostfree_repairs;
+    for (int i = 0; i < static_cast<int>(OuterHostFreeRefusal::Count); ++i)
+        into.hostfree_refusals[i] += add.hostfree_refusals[i];
     into.phis_mirror_bytes       += add.phis_mirror_bytes;
     into.jnet_mirror_bytes       += add.jnet_mirror_bytes;
     for (int i = 0; i < static_cast<int>(OuterSegmentRefusal::Count); ++i)
@@ -382,8 +459,14 @@ std::string outerSegmentReceiptJson() {
                     ",\"sync_pre_nodal\":" + std::to_string(c.sync_pre_nodal) +
                     ",\"sync_sweep_reissue\":" + std::to_string(c.sync_sweep_reissue) +
                     ",\"sync_segment_exit\":" + std::to_string(c.sync_segment_exit) +
+                    ",\"hostfree_segments\":" + std::to_string(c.hostfree_segments) +
+                    ",\"hostfree_outers\":" + std::to_string(c.hostfree_outers) +
+                    ",\"hostfree_enqueued\":" + std::to_string(c.hostfree_enqueued) +
+                    ",\"sync_hostfree_exit\":" + std::to_string(c.sync_hostfree_exit) +
+                    ",\"hostfree_repairs\":" + std::to_string(c.hostfree_repairs) +
                     ",\"phis_mirror_bytes\":" + std::to_string(c.phis_mirror_bytes) +
                     ",\"jnet_mirror_bytes\":" + std::to_string(c.jnet_mirror_bytes) +
+                    ",\"hostfree_full\":" + std::to_string(outerHostFreeFull() ? 1 : 0) +
                     ",\"segment_budget\":" + std::to_string(outerSegmentBudget());
 
     // Only the non-zero buckets, so a healthy run's line stays readable and a
@@ -409,6 +492,20 @@ std::string outerSegmentReceiptJson() {
         s += "\"";
         s += outerRefusalName(static_cast<OuterSegmentRefusal>(i));
         s += "\":" + std::to_string(c.refusals[i]);
+    }
+    s += "}";
+
+    // Rev.7.1 Task 10 part 3: why the segments that DID run still paid a
+    // synchronise per outer.  Non-zero buckets only, same rule as above.
+    s += ",\"hostfree_refusals\":{";
+    first = true;
+    for (int i = 0; i < static_cast<int>(OuterHostFreeRefusal::Count); ++i) {
+        if (c.hostfree_refusals[i] == 0) continue;
+        if (!first) s += ",";
+        first = false;
+        s += "\"";
+        s += outerHostFreeRefusalName(static_cast<OuterHostFreeRefusal>(i));
+        s += "\":" + std::to_string(c.hostfree_refusals[i]);
     }
     s += "},";
     // Printed ONLY when nothing ran: on a healthy run the reason is "none" and
@@ -530,6 +627,24 @@ struct CudaOuterSegment::Impl {
     cmfd::CmfdOuterInputs*   d_inputs    = nullptr;
     CmfdOuterDecision*       d_decisions = nullptr;
     unsigned long long*      d_halted    = nullptr;
+    // ---- Rev.7.1 Task 10 part 3: the host-free arm's two device records -----
+    //
+    // The sweep summary the verdict kernel keeps as the segment runs, so the
+    // host can reconstruct BICGCMFD's counters at the exit instead of observing
+    // every outer.  One per slot; zeroed at each host-free segment entry, which
+    // is what makes it a SEGMENT total.  See
+    // CudaBatchArena::CmfdSweepProbeSink::Accum.
+    CudaBatchArena::CmfdSweepProbeSink::Accum* d_sweep_accum = nullptr;
+    CudaBatchArena::CmfdSweepProbeSink::Accum* h_sweep_accum = nullptr;
+    /// Rev.7.1 Task 10 part 3: the segment -> nodal handover on the host-free
+    /// arm.  Recorded on `stream` after updjnet and waited on by the XS-recon
+    /// backend's own stream, which is the ordering the per-outer arm gets from
+    /// its `sync_pre_nodal` drain.  Created lazily, once per runner.
+    cudaEvent_t              nodal_handover_ev = nullptr;
+    /// Is a HOST-FREE segment running on this runner right now?  Read by
+    /// probeAddresses, which is how the sweep hook learns to hand the arena an
+    /// accumulator instead of expecting to be observed.
+    bool                     hostfree_active = false;
 
     OuterSegmentResidency residency{};
     /// The generation each device copy was last filled AT.  Zero is `never
@@ -684,8 +799,24 @@ bool CudaOuterSegment::initialize(const DeviceArenaView& arena, int slot_count, 
     if ((rc = cudaMalloc(&_impl->d_halted, sizeof(unsigned long long))) != cudaSuccess)
         return fail("cudaMalloc(halted)", rc);
 
+    if ((rc = cudaMalloc(&_impl->d_sweep_accum,
+                         n * sizeof(CudaBatchArena::CmfdSweepProbeSink::Accum))) !=
+        cudaSuccess)
+        return fail("cudaMalloc(sweep accumulator)", rc);
+    // PINNED, because it is D2H'd on the segment exit observation that is
+    // already carrying four other small copies, and a pageable destination
+    // there would stage through the driver on the critical path.
+    if ((rc = cudaMallocHost(&_impl->h_sweep_accum,
+                             sizeof(CudaBatchArena::CmfdSweepProbeSink::Accum))) !=
+        cudaSuccess)
+        return fail("cudaMallocHost(sweep accumulator)", rc);
+
     if ((rc = cudaMemset(_impl->d_halted, 0, sizeof(unsigned long long))) != cudaSuccess)
         return fail("cudaMemset(halted)", rc);
+    if ((rc = cudaMemset(_impl->d_sweep_accum, 0,
+                         n * sizeof(CudaBatchArena::CmfdSweepProbeSink::Accum))) !=
+        cudaSuccess)
+        return fail("cudaMemset(sweep accumulator)", rc);
 
     _impl->ready  = true;
     _impl->status = "ready";
@@ -701,7 +832,10 @@ void CudaOuterSegment::release() {
     if (_impl->d_inputs != nullptr) cudaFree(_impl->d_inputs);
     if (_impl->d_decisions != nullptr) cudaFree(_impl->d_decisions);
     if (_impl->d_halted != nullptr) cudaFree(_impl->d_halted);
+    if (_impl->d_sweep_accum != nullptr) cudaFree(_impl->d_sweep_accum);
+    if (_impl->nodal_handover_ev != nullptr) cudaEventDestroy(_impl->nodal_handover_ev);
     if (_impl->h_seg != nullptr) cudaFreeHost(_impl->h_seg);
+    if (_impl->h_sweep_accum != nullptr) cudaFreeHost(_impl->h_sweep_accum);
     if (_impl->own_stream != nullptr) cudaStreamDestroy(_impl->own_stream);
     _impl->d_probes    = nullptr;
     _impl->d_segments  = nullptr;
@@ -709,7 +843,11 @@ void CudaOuterSegment::release() {
     _impl->d_inputs    = nullptr;
     _impl->d_decisions = nullptr;
     _impl->d_halted    = nullptr;
+    _impl->d_sweep_accum = nullptr;
+    _impl->nodal_handover_ev = nullptr;
     _impl->h_seg       = nullptr;
+    _impl->h_sweep_accum = nullptr;
+    _impl->hostfree_active = false;
     _impl->stream      = nullptr;
     _impl->own_stream  = nullptr;
     _impl->ready       = false;
@@ -736,6 +874,17 @@ CudaOuterSegment::ProbeAddresses CudaOuterSegment::probeAddresses(int slot) cons
     a.rayleigh  = &probe->rayleigh;
     a.nonfinite = &probe->nonfinite;
     a.halt      = _impl->d_halt;
+    // Rev.7.1 Task 10 part 3: NON-NULL EXACTLY WHILE A HOST-FREE SEGMENT RUNS.
+    //
+    // It is the hook's whole signal.  A null accumulator means `you will be
+    // observed after this launch, as you always were`; a non-null one means
+    // `nobody is going to look until the segment ends, so keep the summary
+    // yourself`.  Scoped to the segment rather than to the arm, because the
+    // very same hook serves the per-outer arm two lines later on a deck that
+    // cusps or a statepoint still inside its Wielandt warm-up.
+    a.accum     = _impl->hostfree_active
+                      ? static_cast<void*>(_impl->d_sweep_accum + slot)
+                      : nullptr;
     a.valid    = true;
     return a;
 }
@@ -1418,6 +1567,503 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         return p.eigv;
     };
 
+    // =======================================================================
+    // Rev.7.1 Task 10 part 3: IS THIS SEGMENT HOST-FREE?
+    // =======================================================================
+    //
+    // ASKED ONCE, HERE, AND EVERY TERM IS FROZEN FOR THE SEGMENT.  That is the
+    // whole safety argument, and it is the argument Task 18-lite got wrong the
+    // other way round (an arm-scope canonical-nodal answer, which a rod search
+    // moving the bank INSIDE SolveLoop falsified a few outers later).  So each
+    // term below carries the fact that makes a segment-scope answer sound:
+    //
+    //   stream_sweep        a property of the arm, decided at armOuterSegment.
+    //   sweep_will_enqueue  canEnqueueDrive(): `_wiel_sweep >= 5`, and
+    //                       _wiel_sweep only GROWS except at resetIteration(),
+    //                       which is a statepoint boundary and therefore outside
+    //                       any segment.  True here means true for every outer.
+    //   canonical_nodal     Nodal::TryDriveGpu's own predicate.  It turns on
+    //                       Geometry::rod_fraction, which moves only when the
+    //                       rod BANK moves -- the Search phase, which is not an
+    //                       Outer -> Outer transition and so ends the segment.
+    //   cusping_quiescent   the same fact, one level up: with no fractional node
+    //                       and an empty carry-over set, ApplyRodCusping returns
+    //                       false without writing anything, for every outer of
+    //                       this segment.  i-SMR CY02 fails this and keeps the
+    //                       per-outer arm, which is the intended outcome.
+    //   !trace_steps        the per-step tracer synchronises and copies by
+    //                       construction; a traced run is a diagnostic run.
+    //
+    // THE THREE HOOKS ARE ASKED FOR TOGETHER because they are one mechanism:
+    // without the deferred observation there is nothing to defer, without the
+    // halt gate the overrun outers would re-solve the nodal problem on their own
+    // output, and without the quiescence question cusping could blend cross
+    // sections off a leakage that was never produced.
+    OuterHostFreeRefusal hostfree_why = OuterHostFreeRefusal::None;
+    {
+        OuterSegmentLiveState hf_live;
+        if (m.hooks.read_live_state != nullptr) m.hooks.read_live_state(m.hooks.ctx, hf_live);
+        if (!outerHostFreeEnabled())
+            hostfree_why = OuterHostFreeRefusal::FeatureOff;
+        else if (m.hooks.finish_cmfd_sweep_deferred == nullptr ||
+                 m.hooks.cusping_quiescent == nullptr ||
+                 m.hooks.nodal_halt_gate == nullptr)
+            hostfree_why = OuterHostFreeRefusal::NoHooks;
+        else if (!stream_sweep)
+            hostfree_why = OuterHostFreeRefusal::NotStreamSweep;
+        else if (!hf_live.sweep_will_enqueue)
+            hostfree_why = OuterHostFreeRefusal::SweepWontEnqueue;
+        else if (!bound_.canonical_nodal || m.hooks.canonical_nodal_eligible == nullptr ||
+                 m.hooks.canonical_nodal_eligible(m.hooks.ctx) == 0)
+            hostfree_why = OuterHostFreeRefusal::NoCanonicalNodal;
+        else if (m.hooks.cusping_quiescent(m.hooks.ctx) == 0)
+            hostfree_why = OuterHostFreeRefusal::CuspingLive;
+        // Rev.7.1 Task 10 part 3: THE TRACER DOES NOT REFUSE THIS ARM, and that
+        // is a debuggability decision taken on purpose.  outertrace only READS
+        // -- it synchronises the segment stream and copies device memory to
+        // hash it -- so a traced host-free segment computes exactly what an
+        // untraced one computes, with extra observation around it.  Refusing
+        // here would make the one arm whose whole point is that the host never
+        // looks the one arm nobody can look at, and localising a trajectory
+        // difference is precisely what the tracer exists for.  (It does mean a
+        // traced run cannot prove the ABSENCE of a race, because its drains
+        // would mask one; the ON == OFF gate is run untraced for that reason.)
+    }
+    const bool hostfree = hostfree_why == OuterHostFreeRefusal::None;
+    const bool keep_exit_obs = hostfree && !outerHostFreeFull();
+    if (!hostfree) bump(counters().hostfree_refusals[static_cast<int>(hostfree_why)]);
+
+    // THE FLAG THE SWEEP HOOK READS, AND THE ONE THING THAT MUST NOT LEAK.
+    //
+    // probeAddresses hands the arena an accumulator only while this is up, so a
+    // failure path that left it up would tell the NEXT segment's per-outer arm
+    // to keep a summary nobody reads -- and, worse, would leave the halt gate
+    // installed with no segment to clear the halt word.  Both come down in a
+    // destructor rather than at five returns.
+    struct HostFreeScope {
+        Impl* impl = nullptr;
+        ~HostFreeScope() {
+            if (impl != nullptr) impl->hostfree_active = false;
+        }
+    } hostfree_scope;
+    if (hostfree) {
+        bump(counters().hostfree_segments);
+        m.hostfree_active   = true;
+        hostfree_scope.impl = &m;
+        // INSTALLED AND LEFT INSTALLED, and that is a performance decision with
+        // a correctness consequence.  The pair is a nodal GRAPH KEY, so taking
+        // it off at every segment exit would re-instantiate the captured drive
+        // twice per segment -- 6422 instantiations on kngr_238.  Left on, the
+        // gate is inert exactly while `d_halt[slot]` is zero, which is why the
+        // exit below now clears that word: a halt allowed to outlive its segment
+        // would mask the HOST outers that follow it.
+        m.hooks.nodal_halt_gate(m.hooks.ctx, static_cast<const void*>(m.d_halt), slot);
+        // The handover event, created on the first host-free segment of the run
+        // and reused for every outer after it.  cudaEventDisableTiming because
+        // nothing measures it: it exists to carry a dependency, and the timing
+        // variant costs a device-side timestamp per record.
+        if (m.nodal_handover_ev == nullptr &&
+            (rc = cudaEventCreateWithFlags(&m.nodal_handover_ev, cudaEventDisableTiming)) !=
+                cudaSuccess)
+            return launchFailed("create the nodal handover event", rc);
+        if (m.d_sweep_accum != nullptr &&
+            (rc = cudaMemsetAsync(m.d_sweep_accum + slot, 0,
+                                  sizeof(*m.d_sweep_accum), m.stream)) != cudaSuccess)
+            return launchFailed("clear the sweep accumulator", rc);
+    }
+
+    // =======================================================================
+    // Rev.7.1 Task 10 part 3: THE TAIL OF AN OUTER, AS ONE NAMED THING
+    // =======================================================================
+    //
+    // WHY IT IS A LAMBDA NOW AND WAS STRAIGHT-LINE BEFORE.  A host-free segment
+    // learns that the device abandoned a sweep only at its EXIT, and the outer
+    // that was abandoned still owes the host everything from the re-issued
+    // updjnet onwards: the nodal drive, upddhat, the refresh, the decision and
+    // the transition that commits it.  That is exactly this block.  Written
+    // twice it would be two spellings of the most delicate sequence in the tree
+    // -- and the three-in-twelve-thousand path is precisely the one nobody
+    // would notice drifting -- so it is written once and called from both.
+    //
+    // NOTHING IN IT CHANGED.  The extraction is mechanical: the same statements
+    // in the same order, with the four values the head decided passed in
+    // instead of read from enclosing scope.
+    auto runOuterTail = [&](const unsigned int i, double* const reigv_slot,
+                            const bool canonical_now, const bool bridge_jnet,
+                            const std::size_t jnet_bytes) -> bool {
+            // ==================================================================
+            // THE STEP THE HALT SWALLOWED
+            // ==================================================================
+            //
+            // cmfd_sweep_verdict raises the segment's halt when the drive did not
+            // finish on the device -- sweep state 0 (the launch's slot budget ran
+            // out) or 2 (the Wielandt gamma degenerated) -- so that the rest of the
+            // body does not correct the current from a half sweep.  That is right,
+            // and it is why the halt is there.  What it did not account for is that
+            // updjnet is enqueued BEHIND the verdict on the same stream: it is
+            // therefore already in flight as a no-op by the time the host finishes
+            // the drive, and republishAfterHostSweep taking the halt off cannot
+            // un-skip it.  Everything after that point in the body -- upddhat, the
+            // refresh, the decision, the transition -- then ran normally, against
+            // the jnet of the PREVIOUS outer.
+            //
+            // The host loop has no such window: drive() returns only when the drive
+            // is over, and updjnet runs after it (Driver.h:1569).  So the repair is
+            // to run the step where the host runs it, on the outers where the device
+            // could not.
+            //
+            // MEASURED, NOT HYPOTHETICAL.  kngr_238, budget 8: three outers out of
+            // 11,993 take this path -- statepoint 23 outer 208, 25/113, 29/19 -- and
+            // before this block those three were the entire remaining ON-vs-OFF
+            // divergence.  Statepoints 1..22 were already bit-identical; 23 onward
+            // were not, and the per-step trace named `updjnet` at exactly 23/208
+            // with a hash equal to the previous outer's nodal jnet, which is what a
+            // step that did not run looks like.
+            //
+            // IT COSTS A SYNCHRONISE, ON THREE OUTERS IN TWELVE THOUSAND.  The
+            // common path is untouched: no extra transfer, no extra sync, and the
+            // branch is one predicted test per outer.
+            if (m.sweep_host_continued) {
+                bump(counters().updjnet_reissued);
+                if ((rc = enqueueUpdJnet(m.arena, queue, bound_.geom, bound_.table, bound_.forms,
+                                         m.stream, m.d_halt)) != cudaSuccess)
+                    return launchFailed("re-enqueue updjnet after the host finished the sweep",
+                                        rc);
+                // The bridge copy above carried the pre-updjnet bytes, so it has to
+                // be taken again -- and the nodal drive below is a HOST call reading
+                // a HOST array, so it has to have landed before that call, not
+                // merely been enqueued.
+                if (bridge_jnet &&
+                    (rc = cudaMemcpyAsync(bound_.host_jnet, bound_.device_jnet, jnet_bytes,
+                                          cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+                    return launchFailed("re-download jnet after the host finished the sweep", rc);
+                // AND SO DOES THE RECIPROCAL, FOR THE SAME REASON AND ONE MORE.
+                // The kernel above the sweep read the probe the VERDICT kernel
+                // published, and on this path that probe described a half drive --
+                // republishAfterHostSweep has since overwritten it with the numbers
+                // the host loop finished on.  Re-issuing is what makes the slot the
+                // finished drive's reciprocal rather than the half one's, and the
+                // nodal drive four lines down is its only reader.
+                if (reigv_slot != nullptr) {
+                    bump(counters().reigv_reissued);
+                    if ((rc = enqueueOuterPublishReigv(m.d_probes, reigv_slot, slot,
+                                                       m.stream)) != cudaSuccess)
+                        return launchFailed("re-enqueue the reigv publish after the host "
+                                            "finished the sweep",
+                                            rc);
+                }
+                // AND THE CANONICAL ARM NEEDS IT TOO.  There the nodal drive reads
+                // the DEVICE jnet, on the backend's own stream, ordered against this
+                // one by nothing but this synchronise.
+                bump(counters().in_body_host_syncs);
+                bump(counters().sync_sweep_reissue);
+                if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
+                    return launchFailed("synchronize after the re-issued updjnet", rc);
+            }
+
+            // The sweep and updjnet step lines are emitted HERE, after the
+            // observation, because that is the first point at which the sweep's
+            // output has actually landed -- before it, the enqueue has only been
+            // issued.  updjnet was enqueued behind the sweep on the same stream, so
+            // one synchronise serves both.
+            if (trace_steps) {
+                outertrace::emitStepEigv("dev", "sweep",
+                                         traceHash(bound_.device_flux, trace_nn),
+                                         traceProbeEigv());
+                outertrace::emitStep("dev", "updjnet", "jnet",
+                                     traceHash(bound_.device_jnet, trace_nsg), nullptr, 0);
+            }
+
+            // WHAT THE DRIVE LEFT BEHIND.  This is the only point at which the
+            // host flux and the device flux are known to agree -- the sweep's
+            // observation has just adopted the device phi into Geometry::Phif -- so
+            // it is the only point at which the next outer's elision can be earned.
+            //
+            // The generation is re-read here rather than reused from the top of the
+            // outer because the drive itself bumped it: drive() is handed
+            // PhifMutable(), which is what makes it a declared writer.
+            if (m.hooks.read_live_state != nullptr) {
+                OuterSegmentLiveState after;
+                m.hooks.read_live_state(m.hooks.ctx, after);
+                // Rev.7.1 Task 10 part 3: ON THE HOST-FREE ARM THE ANSWER IS
+                // KNOWN, AND THE FLAG CANNOT GIVE IT.
+                //
+                // `device_owns_flux` is BICGCMFD::_last_drive_device_flux, which
+                // absorbSweepLaunch sets -- and absorbSweepLaunch is exactly the
+                // observation this arm defers, so inside a host-free segment the
+                // flag still describes the drive BEFORE the segment.  Reading it
+                // here would forget the residency after the first outer and
+                // re-upload Geometry::Phif over the device phi on the second,
+                // while the flux D2H of the previous launch is still filling it.
+                //
+                // The answer it cannot give is the arm's own precondition: every
+                // outer of a host-free segment took the enqueued device drive
+                // (canEnqueueDrive() is frozen true), and an enqueued drive ends
+                // with issueFluxDownloads writing Geometry::Phif FROM the device
+                // phi.  So the device owns the flux, by construction, at every
+                // outer of this segment.
+                if (hostfree || after.device_owns_flux) {
+                    m.resident_flux_generation = after.flux_generation;
+                    bump(counters().device_flux_outers);
+                } else {
+                    // The Wielandt warm-up, or a declined enqueue: the host loop
+                    // moved Phif and the device never saw it.  Forget the copy.
+                    m.resident_flux_generation = 0;
+                }
+            }
+
+            // Rev.7.1 Task 18-lite: WHO OWNS THE THREE REGIONS FOR THIS DRIVE.
+            //
+            // Said once per outer rather than once per segment, because the FLUX
+            // answer changes per outer: a drive that fell back to the host CMFD loop
+            // (the Wielandt warm-up, a declined enqueue) left Geometry::Phif ahead of
+            // the device phi, and the nodal call has to upload it exactly then.  The
+            // hook, not the runner, knows how to say so, because the hook is the call
+            // site that adopted the buffers.
+            //
+            // The claim is IDEMPOTENT and writes the same values on every outer of a
+            // canonical run, so repeating it does not churn the nodal backend's
+            // captured graph -- whose key carries both the ownerships and the mask.
+            //
+            // Rev.7.1 W3 item 3 rides the SAME predicate, and that is the whole
+            // safety argument for it.  `canonical_now` is Nodal::TryDriveGpu's own
+            // refusal test, so it is true exactly when the drive about to run is the
+            // FULL device pipeline -- the one arm that reads reigv_dev at all.  A
+            // drive that falls back to the CPU body reads Nodal::_reigv, which the
+            // host hook still sets from the host eigenvalue on every outer; a hybrid
+            // drive leaves reigv_dev null and reads the by-value scalar.  Both are
+            // exactly what they were, because the claim is not made for them.
+            // Rev.7.1 Task 10 part 3: THE ONE TERM OF THE ARM THAT IS RE-ASKED.
+            //
+            // It cannot change -- Nodal::TryDriveGpu's predicate turns on
+            // rod_fraction and a bank move ends the segment -- and it is checked
+            // anyway, because the failure it would cause is silent: the CPU body
+            // reads Geometry::Jnet, which a host-free segment has stopped
+            // filling, and it is not halt-gated, so an overrun outer would solve
+            // on its own output.  That is i-SMR CY02's 639-outer divergence in a
+            // rarer costume, and it is cheaper to refuse than to audit.
+            if (hostfree && !canonical_now)
+                return hookFailed("the canonical nodal binding inside a host-free segment");
+            if (canonical_now && m.hooks.canonical_nodal_mode != nullptr) {
+                m.canonical_nodal_live = true;
+                m.hooks.canonical_nodal_mode(m.hooks.ctx, 1);
+                bump(counters().canonical_nodal_outers);
+                if (reigv_slot != nullptr) {
+                    setReigvDevice(true);
+                    bump(counters().reigv_device_outers);
+                } else {
+                    setReigvDevice(false);
+                }
+            } else {
+                // Not eligible: this outer's drive is the CPU body (or a host-owned
+                // device drive), it has its bridge, and it is about to write the host
+                // arrays itself.  Hand ownership back BEFORE it runs, or its upload
+                // is elided against the device copy it is trying to replace.
+                releaseCanonicalNodal(true);
+            }
+            // ==============================================================
+            // Rev.7.1 Task 10 part 3: THE FIRST HANDOVER, AS AN EVENT
+            // ==============================================================
+            //
+            // WHAT THE DRAIN WAS ALSO DOING.  `sync_pre_nodal` was described as
+            // the sweep observation's cost, and it was -- but it was also the
+            // only thing ordering THIS stream's updjnet against the nodal
+            // backend's stream, which is where the drive reads that jnet.
+            // Removing it for the observation's sake removed the ordering with
+            // it, and the drive then read whichever jnet happened to be resident
+            // -- usually this outer's, because the segment stream is usually
+            // ahead, and occasionally the previous outer's.  On the trimmed
+            // kngr3 deck that was 51 of 644 datasets and one outer, at every
+            // budget including 1, which is the signature of a race and not of an
+            // arithmetic change.
+            //
+            // The exactness contract's invariant 4 always allowed the other
+            // mechanism -- "a synchronise or an event" -- and W3 item 2 had
+            // already taken the RETURN half of this pair that way
+            // (nodal_completion_event, twenty lines below).  This is the
+            // outbound half, and with it the outer's cross-stream pair is two
+            // events and no host.
+            //
+            // RECORDED HERE, AFTER EVERYTHING THE DRIVE READS: the sweep, the
+            // reigv publish and updjnet are all behind it on this stream.
+            if (hostfree && m.nodal_handover_ev != nullptr &&
+                m.hooks.nodal_wait_event != nullptr) {
+                if ((rc = cudaEventRecord(m.nodal_handover_ev, m.stream)) != cudaSuccess)
+                    return launchFailed("record the nodal handover event", rc);
+                if (!m.hooks.nodal_wait_event(m.hooks.ctx,
+                                              static_cast<void*>(m.nodal_handover_ev)))
+                    return hookFailed("the nodal handover wait hook");
+            }
+            if (!m.hooks.enqueue_nodal_drive(m.hooks.ctx, m.stream, slot, i))
+                return hookFailed("the nodal drive hook");
+
+            // ==================================================================
+            // Rev.7.1 W3 item 2: THE NODAL -> SEGMENT HANDOVER, WITHOUT THE BLOCK
+            // ==================================================================
+            //
+            // The drive runs on the nodal backend's OWN stream and upddhat, twenty
+            // lines below, runs on this one and reads the jnet the drive produced.
+            // Nothing but a host synchronise or an event orders the two, and until
+            // now it was the synchronise -- XsReconBackend::solveNodal ended in
+            // cudaStreamSynchronize(d.stream) on every outer, so the host blocked
+            // once per outer for work whose only consumer is a kernel.
+            //
+            // THE CONTRACT IS THE SAME, THE MECHANISM IS THE CHEAPER OF THE TWO
+            // THE EXACTNESS GATE ALREADY ALLOWS (tools/test_device_outer_exactness_contract.py
+            // invariant 4: "a synchronise or an event").  The backend defers its
+            // drain only when the drive left NOTHING on the host -- both canonical
+            // downloads elided, which is what setCanonicalNodalSegmentMode(true)
+            // establishes and nothing outside a segment asks for -- and reports the
+            // event here.  On every other outer (the Wielandt warm-up, the CPU
+            // body, a materialised drive) it blocks for itself and hands back
+            // nullptr, and this is a branch not taken.
+            //
+            // A NULL HOOK IS ALSO `ALREADY ORDERED`.  A caller that installs no
+            // completion hook gets a backend that never defers, because the deferral
+            // and the wait were added together and the backend's condition does not
+            // consult the hook -- so the failure mode of a half-installed hook table
+            // is the old synchronise, not an unordered read.  The state-machine test
+            // pins that the two are installed together.
+            if (m.hooks.nodal_completion_event != nullptr) {
+                void* const nodal_done = m.hooks.nodal_completion_event(m.hooks.ctx);
+                if (nodal_done != nullptr) {
+                    if ((rc = cudaStreamWaitEvent(
+                             m.stream, static_cast<cudaEvent_t>(nodal_done), 0)) != cudaSuccess)
+                        return launchFailed("wait for the nodal drive on the segment stream",
+                                            rc);
+                    bump(counters().nodal_event_waits);
+                }
+            }
+            if (trace_steps)
+                outertrace::emitStep("dev", "nodal", "jnet",
+                                     traceHash(bound_.device_jnet, trace_nsg), "phis",
+                                     traceHash(bound_.device_phis, trace_nsg));
+
+            // (7) cusping -- Driver.h, between the nodal drive and upddhat.
+            //
+            // RUN, NOT SKIPPED, AND NOT REFUSED.  Stage A used to refuse any deck
+            // with a fractional rod and skip this step on the rest, on the argument
+            // that eligibility made it a no-op.  It does not: ApplyRodCusping can
+            // return true from its own prev_scratch even when no node is fractional
+            // NOW, and eligibility was evaluated once per SolveLoop entry while the
+            // host asks once per OUTER.  i-SMR CY02 is the deck that shows the
+            // difference -- 298 outers and k_eff 1.000003 against the host's 707 and
+            // 0.999975, with the same converged-looking answer.
+            //
+            // The fix is not a device port and not an escape: the nodal drive above
+            // is already a host call in an already-synchronised window, so cusping
+            // runs in that window, at the point of the outer the host runs it, with
+            // the leakage the host nodal drive just produced.
+            //
+            // Rev.7.1 Task 10 part 3: NOT CALLED AT ALL ON THE HOST-FREE ARM,
+            // and that is an identity rather than a skip.  The arm is admitted
+            // only when OuterSegmentHooks::cusping_quiescent says no node is
+            // fractional and XSSet's carry-over set is empty, and in that state
+            // ApplyRodCusping walks its loop, writes nothing, bumps nothing and
+            // returns false -- so calling it and not calling it leave the same
+            // bytes.  What NOT calling it buys is that the question cannot be
+            // asked on a HALTED outer, where the leakage it would read was never
+            // produced and the blend it would write could not be undone.
+            if (!hostfree && m.hooks.apply_cusping != nullptr &&
+                m.hooks.apply_cusping(m.hooks.ctx, slot, i)) {
+                bump(counters().cusping_fired);
+                // IT REBUILT THE HOST d-TILDE, AND upddhat READS THE DEVICE ONE.
+                //
+                // The top-of-outer sync cannot cover this: it ran before the nodal
+                // drive that produced the leakage cusping needed.  Without the
+                // re-upload the outer would blend the cross sections and then
+                // correct the current with the d-tilde from before the blend, which
+                // is neither the host's outer nor a consistent one.
+                if (bound_.host_dtil != nullptr && bound_.device_dtil != nullptr) {
+                    const std::size_t dtil_bytes =
+                        static_cast<std::size_t>(bound_.geom.nsurf) *
+                        static_cast<std::size_t>(bound_.ng) * sizeof(double);
+                    if ((rc = cudaMemcpyAsync(bound_.device_dtil, bound_.host_dtil, dtil_bytes,
+                                              cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
+                        return launchFailed("re-upload dtil after cusping", rc);
+                    bump(counters().cusping_dtil_bytes, dtil_bytes);
+                    // upddtil() bumped the generation; the re-upload above made the
+                    // device copy current AT the new one.  Re-reading it here is
+                    // what stops the top of the next outer copying the same array
+                    // again -- on a deck that cusps every outer, that is the whole
+                    // d-tilde traffic doubled.
+                    if (m.hooks.read_live_state != nullptr) {
+                        OuterSegmentLiveState after_cusp;
+                        m.hooks.read_live_state(m.hooks.ctx, after_cusp);
+                        m.resident_dtil_generation = after_cusp.dtil_generation;
+                    }
+                }
+                // AND IT BLENDED THE CROSS SECTIONS, which is the other half of what
+                // ApplyRodCusping does and the half the segment used to catch by
+                // accident.  While the xsnf memcmp ran at the top of every outer,
+                // the NEXT outer's gate saw the blended bytes and uploaded them.
+                // W3 item 4 moved that gate to the segment entry -- on the proof
+                // that this hook is the only writer of _xs inside a segment -- so
+                // the proof has to be discharged HERE, where the writer is.
+                //
+                // updpsi of the next outer is the reader that makes it load-bearing:
+                // psi = flux . xsnf . vol runs before the sweep's own byte-exact
+                // upload can correct the buffer, so a missed re-stage is a fission
+                // source built from the pre-blend cross sections while the rest of
+                // the outer uses the post-blend ones.
+                if (!stageXsnf()) return false;
+            }
+
+            if (bridge_jnet) {
+                if ((rc = cudaMemcpyAsync(bound_.device_jnet, bound_.host_jnet, jnet_bytes,
+                                          cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
+                    return launchFailed("upload jnet after the nodal drive", rc);
+                bump(counters().jnet_bridge_bytes, jnet_bytes);
+            }
+
+
+            // (8) upddhat -- Driver.h:1584
+            if ((rc = enqueueUpdDhat(m.arena, queue, bound_.geom, bound_.table, bound_.forms,
+                                     bound_.dhat_clamp, bound_.dhat_counters, m.stream,
+                                     m.d_halt)) != cudaSuccess)
+                return launchFailed("enqueue upddhat", rc);
+            if (trace_steps)
+                outertrace::emitStep("dev", "upddhat", "dhat",
+                                     traceHash(bound_.device_dhat, trace_nsg), nullptr, 0);
+
+            // dhat back to the host, for the same reason psi went back: setls/axb on
+            // the host drive path read _dhat, and the segment replaced
+            // BICGCMFD::upddhat.  The sweep itself does NOT need this -- it reads the
+            // device buffer and its H2D is elided (CmfdSweepIO::dhat_device_resident)
+            // -- so this copy exists only to keep the fallback path honest.
+            // (4) the convergence INPUTS -- Driver.h:1562.
+            //
+            // MOVED BEHIND THE OBSERVATION, deliberately.  The plan puts this right
+            // after the drive because that is where Driver.h forms eigv and
+            // residual; nothing between there and the decision reads
+            // CmfdOuterInputs, so the only thing the position decides is WHICH
+            // probe it reads.  On the exceptional launches the host finished, the
+            // probe the verdict kernel published is a half drive's -- so refreshing
+            // before the observation would carry that half drive into the decision.
+            if ((rc = enqueueOuterRefreshInputs(queue, m.d_probes, m.d_inputs, m.d_halt,
+                                                m.stream)) != cudaSuccess)
+                return launchFailed("enqueue input refresh", rc);
+
+            // the decision -- Driver.h:1601-1705, 1834-1860
+            if ((rc = enqueueOuterConvergence(m.arena, queue, m.d_inputs, m.d_decisions, m.stream,
+                                              m.d_halt)) != cudaSuccess)
+                return launchFailed("enqueue outer convergence", rc);
+
+            // the transition -- this is what latches the halt
+            if ((rc = enqueueOuterTransition(m.arena, queue, m.d_decisions, m.d_probes,
+                                             m.d_segments, m.d_halt, m.d_halted, m.stream)) !=
+                cudaSuccess)
+                return launchFailed("enqueue outer transition", rc);
+
+            // The exit word, straight behind the transition that writes it, so the
+            // NEXT pass's synchronise makes it visible without one of its own.
+            if (m.h_seg != nullptr &&
+                (rc = cudaMemcpyAsync(m.h_seg, m.d_segments + slot, sizeof(*m.h_seg),
+                                      cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+                return launchFailed("download segment exit", rc);
+        return true;
+    };
+
     // --- the body, budget times, on ONE stream -------------------------------
     //
     // Rev.7.1 Task 10 part 2 CHANGED WHERE THE SYNCHRONISE IS, NOT HOW MANY.
@@ -1588,13 +2234,28 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         // nodal drive, so in practice it returns immediately.  It is what bounds
         // the overrun at ZERO outers rather than the budget - 1 the v1 note
         // priced at 3.9us.
-        if (i > 0) {
+        //
+        // Rev.7.1 Task 10 part 3: AND WHY A HOST-FREE SEGMENT DOES NOT PAY IT.
+        // Both of those host calls now refuse a halted outer for themselves --
+        // the nodal drive through NodalView::halt, the sweep through
+        // cmfd_sweep_gate as it always did -- and the third, cusping, is proved
+        // unable to fire for the whole segment before the arm is taken.  With
+        // nothing left in the body that a stale halt could mislead, the exit
+        // does not have to be observed until the segment ends.
+        //
+        // WHAT IT COSTS INSTEAD is the overrun the observation used to prevent:
+        // this segment will enqueue its whole budget whatever the exit says, and
+        // `hostfree_enqueued - hostfree_outers` is how many of those outers were
+        // no-ops.  At a fixed budget that is real launches doing nothing; it is
+        // the conditional WHILE, not this task, that removes them.
+        if (i > 0 && (!hostfree || keep_exit_obs)) {
             bump(counters().in_body_host_syncs);
             bump(counters().sync_exit_observation);
             if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
                 return launchFailed("synchronize on the segment exit", rc);
             if (m.h_seg != nullptr && m.h_seg->exit != 0u) break;
         }
+        if (hostfree) bump(counters().hostfree_enqueued);
 
         // THE LIVE STATE, RE-READ PER OUTER.
         //
@@ -1827,10 +2488,20 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         }
 
         // THE ONE SYNCHRONISE OF THE OUTER, and it belongs to the nodal drive.
-        bump(counters().in_body_host_syncs);
-        bump(counters().sync_pre_nodal);
-        if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
-            return launchFailed("synchronize before the nodal drive", rc);
+        //
+        // Rev.7.1 Task 10 part 3 REMOVED ITS ONLY REASON on the host-free arm.
+        // Since W3 item 3 this drain existed for the sweep OBSERVATION alone --
+        // the nodal drive's `1.0 / eigv` had already stopped needing the host --
+        // and the observation is now a per-SEGMENT summary the verdict kernel
+        // keeps in device memory (CmfdSweepProbeSink::Accum).  Nothing between
+        // here and the exit reads a device word from the host, so nothing here
+        // waits.
+        if (!hostfree) {
+            bump(counters().in_body_host_syncs);
+            bump(counters().sync_pre_nodal);
+            if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
+                return launchFailed("synchronize before the nodal drive", rc);
+        }
 
         // The sweep's observation, on the sync that just happened.  It adopts
         // the flux into Geometry::Phif and the eigenvalue into the host local
@@ -1838,309 +2509,92 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         // launches the device could not finish (sweep state 0 or 2), it runs the
         // remaining blocking launches and republishes the probe the verdict
         // kernel had to guess at.
-        if (stream_sweep && !m.hooks.finish_cmfd_sweep(m.hooks.ctx, m.stream, slot, i))
+        if (stream_sweep && !hostfree &&
+            !m.hooks.finish_cmfd_sweep(m.hooks.ctx, m.stream, slot, i))
             return hookFailed("the CMFD sweep observation hook");
 
-        // ==================================================================
-        // THE STEP THE HALT SWALLOWED
-        // ==================================================================
-        //
-        // cmfd_sweep_verdict raises the segment's halt when the drive did not
-        // finish on the device -- sweep state 0 (the launch's slot budget ran
-        // out) or 2 (the Wielandt gamma degenerated) -- so that the rest of the
-        // body does not correct the current from a half sweep.  That is right,
-        // and it is why the halt is there.  What it did not account for is that
-        // updjnet is enqueued BEHIND the verdict on the same stream: it is
-        // therefore already in flight as a no-op by the time the host finishes
-        // the drive, and republishAfterHostSweep taking the halt off cannot
-        // un-skip it.  Everything after that point in the body -- upddhat, the
-        // refresh, the decision, the transition -- then ran normally, against
-        // the jnet of the PREVIOUS outer.
-        //
-        // The host loop has no such window: drive() returns only when the drive
-        // is over, and updjnet runs after it (Driver.h:1569).  So the repair is
-        // to run the step where the host runs it, on the outers where the device
-        // could not.
-        //
-        // MEASURED, NOT HYPOTHETICAL.  kngr_238, budget 8: three outers out of
-        // 11,993 take this path -- statepoint 23 outer 208, 25/113, 29/19 -- and
-        // before this block those three were the entire remaining ON-vs-OFF
-        // divergence.  Statepoints 1..22 were already bit-identical; 23 onward
-        // were not, and the per-step trace named `updjnet` at exactly 23/208
-        // with a hash equal to the previous outer's nodal jnet, which is what a
-        // step that did not run looks like.
-        //
-        // IT COSTS A SYNCHRONISE, ON THREE OUTERS IN TWELVE THOUSAND.  The
-        // common path is untouched: no extra transfer, no extra sync, and the
-        // branch is one predicted test per outer.
-        if (m.sweep_host_continued) {
-            bump(counters().updjnet_reissued);
-            if ((rc = enqueueUpdJnet(m.arena, queue, bound_.geom, bound_.table, bound_.forms,
-                                     m.stream, m.d_halt)) != cudaSuccess)
-                return launchFailed("re-enqueue updjnet after the host finished the sweep",
-                                    rc);
-            // The bridge copy above carried the pre-updjnet bytes, so it has to
-            // be taken again -- and the nodal drive below is a HOST call reading
-            // a HOST array, so it has to have landed before that call, not
-            // merely been enqueued.
-            if (bridge_jnet &&
-                (rc = cudaMemcpyAsync(bound_.host_jnet, bound_.device_jnet, jnet_bytes,
-                                      cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
-                return launchFailed("re-download jnet after the host finished the sweep", rc);
-            // AND SO DOES THE RECIPROCAL, FOR THE SAME REASON AND ONE MORE.
-            // The kernel above the sweep read the probe the VERDICT kernel
-            // published, and on this path that probe described a half drive --
-            // republishAfterHostSweep has since overwritten it with the numbers
-            // the host loop finished on.  Re-issuing is what makes the slot the
-            // finished drive's reciprocal rather than the half one's, and the
-            // nodal drive four lines down is its only reader.
-            if (reigv_slot != nullptr) {
-                bump(counters().reigv_reissued);
-                if ((rc = enqueueOuterPublishReigv(m.d_probes, reigv_slot, slot,
-                                                   m.stream)) != cudaSuccess)
-                    return launchFailed("re-enqueue the reigv publish after the host "
-                                        "finished the sweep",
-                                        rc);
-            }
-            // AND THE CANONICAL ARM NEEDS IT TOO.  There the nodal drive reads
-            // the DEVICE jnet, on the backend's own stream, ordered against this
-            // one by nothing but this synchronise.
-            bump(counters().in_body_host_syncs);
-            bump(counters().sync_sweep_reissue);
-            if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
-                return launchFailed("synchronize after the re-issued updjnet", rc);
-        }
-
-        // The sweep and updjnet step lines are emitted HERE, after the
-        // observation, because that is the first point at which the sweep's
-        // output has actually landed -- before it, the enqueue has only been
-        // issued.  updjnet was enqueued behind the sweep on the same stream, so
-        // one synchronise serves both.
-        if (trace_steps) {
-            outertrace::emitStepEigv("dev", "sweep",
-                                     traceHash(bound_.device_flux, trace_nn),
-                                     traceProbeEigv());
-            outertrace::emitStep("dev", "updjnet", "jnet",
-                                 traceHash(bound_.device_jnet, trace_nsg), nullptr, 0);
-        }
-
-        // WHAT THE DRIVE LEFT BEHIND.  This is the only point at which the
-        // host flux and the device flux are known to agree -- the sweep's
-        // observation has just adopted the device phi into Geometry::Phif -- so
-        // it is the only point at which the next outer's elision can be earned.
-        //
-        // The generation is re-read here rather than reused from the top of the
-        // outer because the drive itself bumped it: drive() is handed
-        // PhifMutable(), which is what makes it a declared writer.
-        if (m.hooks.read_live_state != nullptr) {
-            OuterSegmentLiveState after;
-            m.hooks.read_live_state(m.hooks.ctx, after);
-            if (after.device_owns_flux) {
-                m.resident_flux_generation = after.flux_generation;
-                bump(counters().device_flux_outers);
-            } else {
-                // The Wielandt warm-up, or a declined enqueue: the host loop
-                // moved Phif and the device never saw it.  Forget the copy.
-                m.resident_flux_generation = 0;
-            }
-        }
-
-        // Rev.7.1 Task 18-lite: WHO OWNS THE THREE REGIONS FOR THIS DRIVE.
-        //
-        // Said once per outer rather than once per segment, because the FLUX
-        // answer changes per outer: a drive that fell back to the host CMFD loop
-        // (the Wielandt warm-up, a declined enqueue) left Geometry::Phif ahead of
-        // the device phi, and the nodal call has to upload it exactly then.  The
-        // hook, not the runner, knows how to say so, because the hook is the call
-        // site that adopted the buffers.
-        //
-        // The claim is IDEMPOTENT and writes the same values on every outer of a
-        // canonical run, so repeating it does not churn the nodal backend's
-        // captured graph -- whose key carries both the ownerships and the mask.
-        //
-        // Rev.7.1 W3 item 3 rides the SAME predicate, and that is the whole
-        // safety argument for it.  `canonical_now` is Nodal::TryDriveGpu's own
-        // refusal test, so it is true exactly when the drive about to run is the
-        // FULL device pipeline -- the one arm that reads reigv_dev at all.  A
-        // drive that falls back to the CPU body reads Nodal::_reigv, which the
-        // host hook still sets from the host eigenvalue on every outer; a hybrid
-        // drive leaves reigv_dev null and reads the by-value scalar.  Both are
-        // exactly what they were, because the claim is not made for them.
-        if (canonical_now && m.hooks.canonical_nodal_mode != nullptr) {
-            m.canonical_nodal_live = true;
-            m.hooks.canonical_nodal_mode(m.hooks.ctx, 1);
-            bump(counters().canonical_nodal_outers);
-            if (reigv_slot != nullptr) {
-                setReigvDevice(true);
-                bump(counters().reigv_device_outers);
-            } else {
-                setReigvDevice(false);
-            }
-        } else {
-            // Not eligible: this outer's drive is the CPU body (or a host-owned
-            // device drive), it has its bridge, and it is about to write the host
-            // arrays itself.  Hand ownership back BEFORE it runs, or its upload
-            // is elided against the device copy it is trying to replace.
-            releaseCanonicalNodal(true);
-        }
-        if (!m.hooks.enqueue_nodal_drive(m.hooks.ctx, m.stream, slot, i))
-            return hookFailed("the nodal drive hook");
-
-        // ==================================================================
-        // Rev.7.1 W3 item 2: THE NODAL -> SEGMENT HANDOVER, WITHOUT THE BLOCK
-        // ==================================================================
-        //
-        // The drive runs on the nodal backend's OWN stream and upddhat, twenty
-        // lines below, runs on this one and reads the jnet the drive produced.
-        // Nothing but a host synchronise or an event orders the two, and until
-        // now it was the synchronise -- XsReconBackend::solveNodal ended in
-        // cudaStreamSynchronize(d.stream) on every outer, so the host blocked
-        // once per outer for work whose only consumer is a kernel.
-        //
-        // THE CONTRACT IS THE SAME, THE MECHANISM IS THE CHEAPER OF THE TWO
-        // THE EXACTNESS GATE ALREADY ALLOWS (tools/test_device_outer_exactness_contract.py
-        // invariant 4: "a synchronise or an event").  The backend defers its
-        // drain only when the drive left NOTHING on the host -- both canonical
-        // downloads elided, which is what setCanonicalNodalSegmentMode(true)
-        // establishes and nothing outside a segment asks for -- and reports the
-        // event here.  On every other outer (the Wielandt warm-up, the CPU
-        // body, a materialised drive) it blocks for itself and hands back
-        // nullptr, and this is a branch not taken.
-        //
-        // A NULL HOOK IS ALSO `ALREADY ORDERED`.  A caller that installs no
-        // completion hook gets a backend that never defers, because the deferral
-        // and the wait were added together and the backend's condition does not
-        // consult the hook -- so the failure mode of a half-installed hook table
-        // is the old synchronise, not an unordered read.  The state-machine test
-        // pins that the two are installed together.
-        if (m.hooks.nodal_completion_event != nullptr) {
-            void* const nodal_done = m.hooks.nodal_completion_event(m.hooks.ctx);
-            if (nodal_done != nullptr) {
-                if ((rc = cudaStreamWaitEvent(
-                         m.stream, static_cast<cudaEvent_t>(nodal_done), 0)) != cudaSuccess)
-                    return launchFailed("wait for the nodal drive on the segment stream",
-                                        rc);
-                bump(counters().nodal_event_waits);
-            }
-        }
-        if (trace_steps)
-            outertrace::emitStep("dev", "nodal", "jnet",
-                                 traceHash(bound_.device_jnet, trace_nsg), "phis",
-                                 traceHash(bound_.device_phis, trace_nsg));
-
-        // (7) cusping -- Driver.h, between the nodal drive and upddhat.
-        //
-        // RUN, NOT SKIPPED, AND NOT REFUSED.  Stage A used to refuse any deck
-        // with a fractional rod and skip this step on the rest, on the argument
-        // that eligibility made it a no-op.  It does not: ApplyRodCusping can
-        // return true from its own prev_scratch even when no node is fractional
-        // NOW, and eligibility was evaluated once per SolveLoop entry while the
-        // host asks once per OUTER.  i-SMR CY02 is the deck that shows the
-        // difference -- 298 outers and k_eff 1.000003 against the host's 707 and
-        // 0.999975, with the same converged-looking answer.
-        //
-        // The fix is not a device port and not an escape: the nodal drive above
-        // is already a host call in an already-synchronised window, so cusping
-        // runs in that window, at the point of the outer the host runs it, with
-        // the leakage the host nodal drive just produced.
-        if (m.hooks.apply_cusping != nullptr &&
-            m.hooks.apply_cusping(m.hooks.ctx, slot, i)) {
-            bump(counters().cusping_fired);
-            // IT REBUILT THE HOST d-TILDE, AND upddhat READS THE DEVICE ONE.
-            //
-            // The top-of-outer sync cannot cover this: it ran before the nodal
-            // drive that produced the leakage cusping needed.  Without the
-            // re-upload the outer would blend the cross sections and then
-            // correct the current with the d-tilde from before the blend, which
-            // is neither the host's outer nor a consistent one.
-            if (bound_.host_dtil != nullptr && bound_.device_dtil != nullptr) {
-                const std::size_t dtil_bytes =
-                    static_cast<std::size_t>(bound_.geom.nsurf) *
-                    static_cast<std::size_t>(bound_.ng) * sizeof(double);
-                if ((rc = cudaMemcpyAsync(bound_.device_dtil, bound_.host_dtil, dtil_bytes,
-                                          cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
-                    return launchFailed("re-upload dtil after cusping", rc);
-                bump(counters().cusping_dtil_bytes, dtil_bytes);
-                // upddtil() bumped the generation; the re-upload above made the
-                // device copy current AT the new one.  Re-reading it here is
-                // what stops the top of the next outer copying the same array
-                // again -- on a deck that cusps every outer, that is the whole
-                // d-tilde traffic doubled.
-                if (m.hooks.read_live_state != nullptr) {
-                    OuterSegmentLiveState after_cusp;
-                    m.hooks.read_live_state(m.hooks.ctx, after_cusp);
-                    m.resident_dtil_generation = after_cusp.dtil_generation;
-                }
-            }
-            // AND IT BLENDED THE CROSS SECTIONS, which is the other half of what
-            // ApplyRodCusping does and the half the segment used to catch by
-            // accident.  While the xsnf memcmp ran at the top of every outer,
-            // the NEXT outer's gate saw the blended bytes and uploaded them.
-            // W3 item 4 moved that gate to the segment entry -- on the proof
-            // that this hook is the only writer of _xs inside a segment -- so
-            // the proof has to be discharged HERE, where the writer is.
-            //
-            // updpsi of the next outer is the reader that makes it load-bearing:
-            // psi = flux . xsnf . vol runs before the sweep's own byte-exact
-            // upload can correct the buffer, so a missed re-stage is a fission
-            // source built from the pre-blend cross sections while the rest of
-            // the outer uses the post-blend ones.
-            if (!stageXsnf()) return false;
-        }
-
-        if (bridge_jnet) {
-            if ((rc = cudaMemcpyAsync(bound_.device_jnet, bound_.host_jnet, jnet_bytes,
-                                      cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
-                return launchFailed("upload jnet after the nodal drive", rc);
-            bump(counters().jnet_bridge_bytes, jnet_bytes);
-        }
-
-
-        // (8) upddhat -- Driver.h:1584
-        if ((rc = enqueueUpdDhat(m.arena, queue, bound_.geom, bound_.table, bound_.forms,
-                                 bound_.dhat_clamp, bound_.dhat_counters, m.stream,
-                                 m.d_halt)) != cudaSuccess)
-            return launchFailed("enqueue upddhat", rc);
-        if (trace_steps)
-            outertrace::emitStep("dev", "upddhat", "dhat",
-                                 traceHash(bound_.device_dhat, trace_nsg), nullptr, 0);
-
-        // dhat back to the host, for the same reason psi went back: setls/axb on
-        // the host drive path read _dhat, and the segment replaced
-        // BICGCMFD::upddhat.  The sweep itself does NOT need this -- it reads the
-        // device buffer and its H2D is elided (CmfdSweepIO::dhat_device_resident)
-        // -- so this copy exists only to keep the fallback path honest.
-        // (4) the convergence INPUTS -- Driver.h:1562.
-        //
-        // MOVED BEHIND THE OBSERVATION, deliberately.  The plan puts this right
-        // after the drive because that is where Driver.h forms eigv and
-        // residual; nothing between there and the decision reads
-        // CmfdOuterInputs, so the only thing the position decides is WHICH
-        // probe it reads.  On the exceptional launches the host finished, the
-        // probe the verdict kernel published is a half drive's -- so refreshing
-        // before the observation would carry that half drive into the decision.
-        if ((rc = enqueueOuterRefreshInputs(queue, m.d_probes, m.d_inputs, m.d_halt,
-                                            m.stream)) != cudaSuccess)
-            return launchFailed("enqueue input refresh", rc);
-
-        // the decision -- Driver.h:1601-1705, 1834-1860
-        if ((rc = enqueueOuterConvergence(m.arena, queue, m.d_inputs, m.d_decisions, m.stream,
-                                          m.d_halt)) != cudaSuccess)
-            return launchFailed("enqueue outer convergence", rc);
-
-        // the transition -- this is what latches the halt
-        if ((rc = enqueueOuterTransition(m.arena, queue, m.d_decisions, m.d_probes,
-                                         m.d_segments, m.d_halt, m.d_halted, m.stream)) !=
-            cudaSuccess)
-            return launchFailed("enqueue outer transition", rc);
-
-        // The exit word, straight behind the transition that writes it, so the
-        // NEXT pass's synchronise makes it visible without one of its own.
-        if (m.h_seg != nullptr &&
-            (rc = cudaMemcpyAsync(m.h_seg, m.d_segments + slot, sizeof(*m.h_seg),
-                                  cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
-            return launchFailed("download segment exit", rc);
+        if (!runOuterTail(i, reigv_slot, canonical_now, bridge_jnet, jnet_bytes))
+            return false;
     }
+
+    // =======================================================================
+    // Rev.7.1 Task 10 part 3: THE OBSERVATION, ONCE, FOR THE WHOLE SEGMENT
+    // =======================================================================
+    //
+    // ONE SYNCHRONISE WHERE THERE WERE `budget` OF THEM.  Everything the host
+    // used to read per outer is either reconstructed from DeviceSlotState at the
+    // exit observation twenty lines below (eigv, the residual, flux_stall,
+    // total_outer) or summed on the device as the segment ran (BICGCMFD's
+    // attempt counters, the last verdict, and -- if there was one -- the whole
+    // scalar block of a drive the device abandoned).
+    //
+    // IT IS A SECOND SYNCHRONISE OF THE SEGMENT AND NOT A SPARE ONE.  The exit
+    // observation below cannot serve: it must be issued AFTER the exit mirrors,
+    // and the mirrors' correctness depends on what this observation decides --
+    // whether an abandoned outer still owes its tail.
+    if (hostfree) {
+        if (m.h_sweep_accum != nullptr && m.d_sweep_accum != nullptr) {
+            if ((rc = cudaMemcpyAsync(m.h_sweep_accum, m.d_sweep_accum + slot,
+                                      sizeof(*m.h_sweep_accum), cudaMemcpyDeviceToHost,
+                                      m.stream)) != cudaSuccess)
+                return launchFailed("download the sweep accumulator", rc);
+        }
+        bump(counters().sync_hostfree_exit);
+        if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
+            return launchFailed("synchronize on the host-free segment exit", rc);
+        m.sweep_host_continued = false;
+        if (!m.hooks.finish_cmfd_sweep_deferred(m.hooks.ctx, m.h_sweep_accum, slot))
+            return hookFailed("the deferred CMFD sweep observation hook");
+
+        // THE OUTER THE DEVICE ABANDONED STILL OWES ITS TAIL.
+        //
+        // sweep state 0 or 2: the verdict kernel raised the segment's halt, so
+        // that outer's updjnet, nodal drive, upddhat, refresh, decision and
+        // transition were all no-ops, and every outer enqueued behind it was a
+        // no-op too.  The host has just finished the drive verbatim and
+        // republishAfterHostSweep has taken the halt off, so the device state is
+        // exactly what it was when that sweep ended -- which is where the tail
+        // starts.  Running it here commits that outer, which is what the
+        // per-outer arm does in place.
+        //
+        // ONE PASS AND THEN THE SEGMENT ENDS.  The outers past it were never
+        // committed and the budget is spent; the caller's next segment picks up
+        // from the state this one leaves.
+        // THE OBSERVATION MOVED Geometry::Phif's GENERATION, and the elision has
+        // to be told.  finishDeferredDrives is handed PhifMutable(), which is
+        // what makes it a declared writer, so without this re-read the NEXT
+        // segment's first outer would find a generation it does not recognise
+        // and re-upload the flux it already owns.  Same rule as the body's own
+        // post-drive read: adopt the generation only when the device still owns
+        // the bytes, forget the copy when the host loop took the drive.
+        if (m.hooks.read_live_state != nullptr) {
+            OuterSegmentLiveState after_obs;
+            m.hooks.read_live_state(m.hooks.ctx, after_obs);
+            m.resident_flux_generation =
+                after_obs.device_owns_flux ? after_obs.flux_generation : 0;
+        }
+
+        if (m.sweep_host_continued) {
+            bump(counters().hostfree_repairs);
+            double* const repair_reigv_slot =
+                m.hooks.nodal_reigv_slot != nullptr
+                    ? static_cast<double*>(m.hooks.nodal_reigv_slot(m.hooks.ctx))
+                    : nullptr;
+            const bool repair_canonical =
+                bound_.canonical_nodal && m.hooks.canonical_nodal_eligible != nullptr &&
+                m.hooks.canonical_nodal_eligible(m.hooks.ctx) != 0;
+            const bool repair_bridge = !repair_canonical && bound_.host_jnet != nullptr &&
+                                       bound_.device_jnet != nullptr;
+            const std::size_t repair_jnet_bytes =
+                repair_bridge ? static_cast<std::size_t>(bound_.geom.nsurf) *
+                                    static_cast<std::size_t>(bound_.ng) * sizeof(double)
+                              : 0;
+            if (!runOuterTail(budget, repair_reigv_slot, repair_canonical, repair_bridge,
+                              repair_jnet_bytes))
+                return false;
+        }
+    }
+
     // --- the segment exit: psi and dhat back, ONCE ---------------------------
     //
     // THE ONE PLACE A HOST READER IS CERTAIN.  When runSegment returns, the
@@ -2212,6 +2666,30 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         }
     }
 
+    // --- the halt does not outlive the segment -------------------------------
+    //
+    // Rev.7.1 Task 10 part 3.  It never had to before: `d_halt` was read only by
+    // the body's own kernels, and the next segment's entry cleared it before any
+    // of them ran, so a halt left standing between segments was invisible.  The
+    // nodal halt gate makes it visible -- once installed it stays installed, for
+    // the graph-key reason at the arm -- and a HOST outer's nodal drive between
+    // two segments reads the same word.  Left raised by the transition that
+    // ended this segment, it would mask that drive completely: five kernels that
+    // return on their first instruction, a jnet nobody updated, and a run that
+    // is finite, plausible and wrong.
+    //
+    // ONE 4-BYTE H2D PER SEGMENT, on a stream that is about to be synchronised
+    // anyway, and issued for EVERY segment rather than only the host-free ones:
+    // the gate is process-lived, so the segment that raises the halt is not
+    // necessarily the one that installed it.
+    {
+        const std::uint32_t clear_exit_halt = 0u;
+        if ((rc = cudaMemcpyAsync(m.d_halt + slot, &clear_exit_halt,
+                                  sizeof(clear_exit_halt), cudaMemcpyHostToDevice,
+                                  m.stream)) != cudaSuccess)
+            return launchFailed("clear the halt at the segment exit", rc);
+    }
+
     // --- the single observation ---------------------------------------------
     DeviceOuterSegmentState seg_out{};
     DeviceSlotState         state_out{};
@@ -2251,6 +2729,7 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         return false;
     }
 
+    if (hostfree) bump(counters().hostfree_outers, seg_out.outer_in_segment);
     resume.device_outers      = seg_out.outer_in_segment;
     resume.next_phase         = seg_out.next_phase;
     resume.escape             = seg_out.escape;

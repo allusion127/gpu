@@ -172,9 +172,22 @@ SEQ_ORDER = ["enqueueUpdPsi", "enqueue_cmfd_sweep",
              "enqueueUpdJnet", "enqueue_nodal_drive", "enqueueUpdDhat",
              "enqueueOuterRefreshInputs",
              "enqueueOuterConvergence", "enqueueOuterTransition"]
+#
+# READ OFF THE LOGICAL BODY, WHICH IS NOW TWO PIECES OF TEXT.  Rev.7.1 Task 10
+# part 3 lifted the tail of an outer -- from the re-issued updjnet through the
+# transition -- into a lambda defined before the loop, so a host-free segment can
+# re-run it for the one outer the device abandoned.  The ORDER the rule is about
+# is the order the loop executes: the head (inside the `for`) and then the tail
+# (the lambda it calls).  Concatenating them in that order is what makes the
+# check read the sequence rather than the file layout.
+_HEAD_AT = GRAPH_CU_CODE.find("for (unsigned int i = 0")
+_TAIL_AT = GRAPH_CU_CODE.find("auto runOuterTail = [&](")
+if _TAIL_AT < 0:
+    problems.append("CudaOuterGraph.cu: runOuterTail is gone; the order check has no tail")
+_BODY_TEXT = GRAPH_CU_CODE[_HEAD_AT:] + GRAPH_CU_CODE[_TAIL_AT:]
 positions = []
 for name in SEQ_ORDER:
-    idx = GRAPH_CU_CODE.find(name + "(", GRAPH_CU_CODE.find("for (unsigned int i = 0"))
+    idx = _BODY_TEXT.find(name + "(")
     if idx < 0:
         problems.append(f"CudaOuterGraph.cu: the segment loop does not issue {name}")
     positions.append(idx)
@@ -386,9 +399,17 @@ for bridge, counter in (("mirror psi to the host", "host_mirror_bytes"),
 #      probe.  Both are inside `if (trace_steps)`, which is a cached environment
 #      read, so an untraced run issues neither and pays one predicted branch.
 #
+# EIGHTEEN since Rev.7.1 Task 10 part 3, and the new one is an EXIT:
+#
+#   1  the sweep accumulator, 200 bytes read once per host-free segment on the
+#      observation that replaced `budget` of them.  It is what carries
+#      BICGCMFD's attempt counters -- and, when the device abandoned a drive,
+#      that drive's whole scalar block -- back to a host that looked at none of
+#      the launches individually.
+#
 # The invariant this number defends is unchanged: no D2H may appear inside the
 # per-outer loop that is not one of the named bridges or a debug-gated hash.
-if GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost") > 17:
+if GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost") > 18:
     problems.append("CudaOuterGraph.cu: more D2H sites than the four named bridges plus "
                     "the observation, the four exit mirrors and the two traced hashes "
                     "(%d).  Each one is a rendezvous and needs a name"
@@ -1062,11 +1083,24 @@ for _need in ("ApplyRodCusping(", "cmfd_solver.upddtil()"):
         problems.append(f"Driver.h: outerCuspingHook does not call {_need} -- step 7 is "
                         "XSSet's own call and the upddtil it forces, not a second copy of "
                         "the cusping rule")
-# PER OUTER: the call must be INSIDE the segment's body loop.
-_LOOPBODY = body_of(GRAPH_CU_CODE, "for (unsigned int i = 0", "DeviceOuterSegmentState seg_out")
+# PER OUTER: the call must be part of the segment's per-outer body.
+#
+# Rev.7.1 Task 10 part 3 LIFTED THAT BODY'S TAIL INTO A NAMED LAMBDA
+# (runOuterTail), defined before the loop so that a host-free segment's repair
+# pass can re-run it for the one outer the device abandoned.  The statements are
+# unchanged and in the same order; what moved is where they are written.  So the
+# region to check is the lambda, and what has to be true of the LOOP is that it
+# calls it -- once per outer, which is the property this rule is about.
+_TAIL = body_of(GRAPH_CU_CODE, "auto runOuterTail = [&](", "// --- the segment exit")
+_LOOP = body_of(GRAPH_CU_CODE, "for (unsigned int i = 0", "// --- the segment exit")
+if "runOuterTail(i," not in _LOOP:
+    problems.append("CudaOuterGraph.cu: the per-outer body loop does not call "
+                    "runOuterTail.  A tail that is only reachable from the repair path "
+                    "is a body that runs once per SEGMENT")
+_LOOPBODY = _TAIL
 if "apply_cusping" not in _LOOPBODY:
     problems.append("CudaOuterGraph.cu: apply_cusping is not called inside the per-outer "
-                    "loop.  Once per segment is the same mistake as once per SolveLoop "
+                    "body.  Once per segment is the same mistake as once per SolveLoop "
                     "entry: the host asks once per OUTER")
 # And it must sit between the nodal drive and upddhat, as in Driver.h.
 _nodal = _LOOPBODY.find("enqueue_nodal_drive")

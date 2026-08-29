@@ -88,6 +88,21 @@ of the event form -- the record in solveNodal and the cudaStreamWaitEvent in
 runSegment, between the drive and the upddhat that reads it -- are pinned
 together.  Either half alone is not a slower ordering, it is no ordering.
 
+Rev.7.1 Task 10 part 3 MADE THE FIRST HANDOVER AN EVENT TOO, because it removed
+the synchronise that was doing the job.  `sync_pre_nodal` was described as the
+sweep observation's cost, and it was -- but it was ALSO the only thing ordering
+the segment's updjnet against the stream the nodal drive reads it on.  Deferring
+the observation without replacing that ordering left the drive reading whichever
+jnet happened to be resident: usually this outer's, because the segment stream is
+usually ahead, and occasionally the previous outer's.  On the trimmed kngr3 deck
+that was 51 of 644 datasets and one outer, at EVERY budget including 1 -- the
+signature of a race and not of an arithmetic change.
+
+RULE (part 3): the outbound half is `cudaEventRecord` on the segment stream after
+updjnet plus XsReconBackend::waitOnSegmentEvent on the backend's, installed
+through OuterSegmentHooks::nodal_wait_event.  Both halves are pinned here, for
+the reason the inbound pair is.
+
 -------------------------------------------------------------------------------
 5. AN UPLOAD ELISION IS DECIDED FROM SOMETHING THAT CANNOT MISS A WRITER
 -------------------------------------------------------------------------------
@@ -276,6 +291,60 @@ RULE, and every clause of it is a place the old code had a singleton:
   * the ladder's batch test is `batch_width > arena_slots` and a deck whose shape
     is not the one the arena was stood on is refused `geometry_mismatch` --
     because one ArenaDims lays out every slot, so a second shape cannot share it.
+
+-------------------------------------------------------------------------------
+10. AN OBSERVATION DEFERRED IS A WRITER THAT MOVED
+-------------------------------------------------------------------------------
+
+Rev.7.1 Task 10 part 3 moves the sweep's observation from once per OUTER to once
+per SEGMENT, which is what drives `sync_pre_nodal` to zero.  Four things had to
+move with it, and each is a rule below.
+
+(a) THE NEXT SWEEP'S EIGENVALUE.  BICGCMFD::setls is a no-op on the
+    device-assembly arm, so of everything stageSweepIO writes into the staged
+    scalar block only eigv, its two reciprocals and the residual carry a value
+    the previous outer's OBSERVATION would have produced.  cmfd_sweep_patch
+    overwrites those four from the device probe, spelled the host's way
+    (__ddiv_rn, and `(eigv + eshift)` before the divide) -- and it is issued only
+    from the SECOND outer of a segment, because on the first the host's
+    eigenvalue is the current one and the probe may still describe a drive
+    several host outers old.
+
+(b) THE COUNTERS.  iter, _wiel_sweep and _bicg_iters are advanced from
+    `io.icmfd_done` per launch, and the device now keeps that sum itself
+    (cmfd_sweep_verdict -> CmfdSweepProbeSink::Accum).  _wiel_sweep is the one
+    with teeth: canEnqueueDrive() gates on it and resetIteration() zeroes it per
+    statepoint, so it must end a segment holding exactly what N per-outer
+    observations would have left.  The accumulator sits behind the verdict's own
+    halt gate, so a launch enqueued past a halt contributes nothing -- which is
+    the definition the reconstruction needs.
+
+(c) THE OUTERS PAST THE EXIT.  With no per-outer look the segment cannot stop, so
+    the outers behind a latched exit must be no-ops for the HOST calls too.  The
+    nodal drive is the one that was not: its five FULL-arm kernels now read the
+    segment's halt through NodalView::halt, because the drive is NOT idempotent
+    (the transverse leakage is built FROM jnet and the last phase WRITES jnet).
+    Cusping cannot be gated by a device word at all, so a deck where
+    XSSet::RodCuspingQuiescent() is false keeps the per-outer arm.
+
+(d) A BYTE MIRROR IS COMMITTED WHERE THE COPY IS ISSUED.  This is the one that
+    bit.  The arena's assembly mirrors (xsnf, xsrf, xssm, dtil) were committed by
+    commitAssemblyMirrors from inside absorb() -- from the host bytes as they are
+    when the launch is OBSERVED.  While the observation followed every launch
+    that distinction had no room to matter; a deferred observation gives it a
+    whole segment of room, and the boron trial commit walks into it.  Measured on
+    kngr3 at budget 2: the host xsrf moved to 0c514dd11a55b1b7, the shadow
+    claimed it without an upload, the device kept 95425148870c3384, and the next
+    sweep solved a reactor with the previous trial's removal cross sections --
+    k_eff 1.0000507 against the host's 0.9999139, 41 of 644 datasets, four extra
+    outers.  The shadow now records the bytes the copy was HANDED, which is what
+    pushOrSkip and the segment's own stageXsnf have always done.
+
+RULE: (a) the patch kernel exists and is skipped on the segment's first outer;
+(b) the accumulator is written behind the verdict's halt gate and read once at
+the exit; (c) NodalView carries the halt and every nodal phase tests it, and the
+host-free arm refuses a deck whose cusping is not quiescent; (d) no mirror in
+CudaBICGBackend.cu is committed anywhere but at its own upload site.
 
 Run:  python tools/test_device_outer_exactness_contract.py
 """
@@ -546,6 +615,35 @@ def check_cross_stream_handovers_are_ordered(problems: list[str]) -> None:
                 "never see the event solveNodal recorded"
             )
 
+    # --- the OUTBOUND half, once the pre-nodal drain became conditional -----
+    #
+    # Task 10 part 3 made `sync_pre_nodal` conditional on the arm, so the text
+    # match above can be satisfied by a synchronise the host-free arm never
+    # executes.  What has to exist beside it is the event pair.
+    if "hostfree" in strip_comments(run):
+        if "cudaEventRecord(m.nodal_handover_ev" not in run:
+            problems.append(
+                "runSegment defers the sweep observation but records no handover "
+                "event.  The drain it removed was the ONLY thing ordering updjnet "
+                "against the stream the nodal drive reads it on -- 51 of 644 "
+                "datasets on kngr3, at every budget including 1"
+            )
+        if "nodal_wait_event" not in run:
+            problems.append(
+                "runSegment records a handover event nobody waits on.  Half an "
+                "ordering is no ordering"
+            )
+        if "bool XsReconBackend::waitOnSegmentEvent" not in xsrecon:
+            problems.append(
+                "XsReconBackend has no waitOnSegmentEvent, so the backend's stream "
+                "cannot be made to wait for the segment's"
+            )
+        if "waitOnSegmentEvent" not in read("src", "Driver.h"):
+            problems.append(
+                "Driver.h installs no nodal_wait_event hook, so the runner cannot "
+                "reach the backend's stream"
+            )
+
 
 def check_xsnf_elision_is_byte_exact(problems: list[str]) -> None:
     runner = read("src", "CudaOuterGraph.cu")
@@ -809,16 +907,22 @@ def check_staged_uploads_have_one_in_body_writer(problems: list[str]) -> None:
 
     # The cusping hook is the only in-body writer of the two staged arrays, so it
     # owes both re-stages.  It already owed the d-tilde one.
+    #
+    # SEARCHED OVER THE WHOLE FUNCTION, not just the loop.  Rev.7.1 Task 10 part
+    # 3 lifted the outer's TAIL into a named lambda defined before the loop, so
+    # that a host-free segment's repair pass can re-run it -- the statements are
+    # unchanged and in the same order, but they no longer live textually after
+    # the `for`.
     try:
-        cusp_at = body.index("m.hooks.apply_cusping(m.hooks.ctx, slot, i)")
-        cusp_end = body.index("if (bridge_jnet)", cusp_at)
+        cusp_at = run.index("m.hooks.apply_cusping(m.hooks.ctx, slot, i)")
+        cusp_end = run.index("if (bridge_jnet)", cusp_at)
     except ValueError:
         problems.append(
             "CudaOuterGraph.cu: cannot find the cusping branch; the re-stage rule has "
             "nothing to check"
         )
         return
-    cusp = body[cusp_at:cusp_end]
+    cusp = run[cusp_at:cusp_end]
     if "stageXsnf()" not in cusp:
         problems.append(
             "CudaOuterGraph.cu: a cusping that fired does not re-stage xsnf.  "
@@ -1051,6 +1155,112 @@ def check_batch_slot_is_one_index_space(problems: list[str]) -> None:
             "and must not be served one")
 
 
+def maybe_body(code: str, signature: str) -> str:
+    """body_of, but an empty string when the signature is gone."""
+    if signature not in code:
+        return ""
+    return body_of(code, signature)
+
+
+def check_deferred_observation_moved_its_writers(problems: list[str]) -> None:
+    """Invariant 10: the four writers that had to move with the observation."""
+    bicg = read("src", "CudaBICGBackend.cu")
+    driver = read("src", "Driver.h")
+    nodal_h = read("src", "NodalKernel.h")
+    xsrecon = read("src", "CudaXsReconBackend.cu")
+    xsset = read("src", "XSSet.cpp")
+
+    # (a) the eigenvalue patch, and its first-outer exception.
+    if "__global__ void cmfd_sweep_patch" not in bicg:
+        problems.append(
+            "there is no cmfd_sweep_patch kernel.  A deferred observation leaves the "
+            "host holding the PREVIOUS outer's eigenvalue, and staging it would run "
+            "every outer of the segment from the same starting point"
+        )
+    patch = strip_comments(maybe_body(bicg, "__global__ void cmfd_sweep_patch"))
+    if "__ddiv_rn" not in patch:
+        problems.append(
+            "cmfd_sweep_patch does not use __ddiv_rn.  The host computes `1. / eigv` "
+            "and `1. / (eigv + _eshift)` with IEEE round-to-nearest division, and the "
+            "two have to agree bit for bit"
+        )
+    if "kEshift" not in patch:
+        problems.append(
+            "cmfd_sweep_patch does not read the Wielandt shift, so reigvs cannot be "
+            "the host's `1. / (eigv + _eshift)`"
+        )
+    if "outer_index > 0" not in strip_comments(driver):
+        problems.append(
+            "Driver.h does not skip the probe patch on the segment's FIRST outer.  "
+            "There the host's eigenvalue is the current one and the probe may still "
+            "describe a drive several host outers old"
+        )
+
+    # (b) the accumulator, behind the verdict's own halt gate.
+    verdict = strip_comments(maybe_body(bicg, "__global__ void cmfd_sweep_verdict"))
+    if "kAccAttempts" not in verdict or "kAccExceptional" not in verdict:
+        problems.append(
+            "cmfd_sweep_verdict keeps no per-segment summary.  Without it the host "
+            "cannot reconstruct _wiel_sweep -- which gates canEnqueueDrive() and is "
+            "zeroed per statepoint -- from a segment it never observed"
+        )
+    elif verdict.index("outer_halt[outer_slot] != 0u") > verdict.index("kAccAttempts"):
+        problems.append(
+            "the accumulator is written before the verdict's halt test, so a launch "
+            "enqueued past a latched halt would contribute attempts it never made"
+        )
+    if "finishDeferredDrives" not in read("src", "BICGCMFD.cpp"):
+        problems.append("BICGCMFD has no finishDeferredDrives to apply that summary")
+
+    # (c) the outers past the exit: the nodal halt gate, and cusping quiescence.
+    if "const unsigned int* halt" not in nodal_h:
+        problems.append(
+            "NodalView carries no halt.  The nodal drive is NOT idempotent -- the "
+            "transverse leakage is built FROM jnet and the last phase WRITES jnet -- "
+            "so an outer enqueued past a latched exit would re-solve on its own output"
+        )
+    guard = xsrecon[xsrecon.index("#define RASBERY_NODAL_SLOT_GUARD"):]
+    guard = guard[: guard.index("template <bool BATCHED>")]
+    if "(v).halt" not in guard:
+        problems.append(
+            "the nodal slot guard does not test NodalView::halt, so the halt reaches "
+            "no kernel"
+        )
+    if "d.g_key_halt" not in xsrecon:
+        problems.append(
+            "the halt pointer is a kernel ARGUMENT and is not in the nodal graph key.  "
+            "A graph captured ungated cannot be replayed gated"
+        )
+    if "bool XSSet::RodCuspingQuiescent" not in xsset:
+        problems.append(
+            "there is no XSSet::RodCuspingQuiescent.  Cusping cannot be gated by a "
+            "device word, so the arm has to REFUSE a deck where it could fire -- and "
+            "ApplyRodCusping can fire from its own carry-over set with no node "
+            "fractional now, which is the i-SMR CY02 shape"
+        )
+    if "CuspingLive" not in read("src", "CudaOuterGraph.h"):
+        problems.append(
+            "the host-free ladder has no cusping refusal, so a cusping deck would take "
+            "an arm that cannot ask about it"
+        )
+
+    # (d) every mirror is committed where its copy is issued.
+    if "commitAssemblyMirrors" in bicg:
+        problems.append(
+            "CudaBICGBackend.cu still commits assembly mirrors away from their upload "
+            "site.  A shadow written at the OBSERVATION records the host bytes as they "
+            "are then -- and with the observation deferred to a segment exit, the "
+            "boron trial commit lands inside that window and is absorbed into the "
+            "shadow without ever being uploaded"
+        )
+    uploads = strip_comments(maybe_body(bicg, "void issueSweepUploads"))
+    if uploads.count("mirror.commit(src_host, cnt);") != 1:
+        problems.append(
+            "issueSweepUploads' push_pending does not commit the mirror from the bytes "
+            "it just handed the copy"
+        )
+
+
 def main() -> int:
     problems: list[str] = []
     check_form_mask_is_mined(problems)
@@ -1063,6 +1273,7 @@ def main() -> int:
     check_staged_uploads_have_one_in_body_writer(problems)
     check_refused_segment_is_not_armed(problems)
     check_batch_slot_is_one_index_space(problems)
+    check_deferred_observation_moved_its_writers(problems)
 
     if problems:
         print("FAIL: device outer exactness contract")
@@ -1082,6 +1293,9 @@ def main() -> int:
     print("  8. a refusal the caller can see coming is not armed for")
     print("  9. one deck, one slot: arena width, runner, hook ctx, residency,")
     print("     canonical set and the ladder all index the same way")
+    print(" 10. the deferred sweep observation moved its four writers with it:")
+    print("     the eigenvalue patch, the device counter sum, the nodal halt")
+    print("     gate plus the cusping refusal, and mirrors committed at issue")
     return 0
 
 

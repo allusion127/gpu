@@ -84,7 +84,12 @@ for path in sorted(SRC.glob("*.h")) + sorted(SRC.glob("*.cpp")) + sorted(SRC.glo
 EXPECTED = {
     "XSSet.cpp": 2,   # ResetFluxAndCurrents (fill_n) + the fission-source sign flip
     "IO.cpp": 1,      # the restart flux load
-    "Driver.h": 6,    # drive x2 in the loops, drive x2 + enqueueDrive + finishDrive in the hooks
+    # Rev.7.1 Task 10 part 3 adds the seventh: finishDeferredDrives, which is
+    # finishDrive's per-SEGMENT twin and writes Geometry::Phif for the same
+    # reason -- the Rayleigh hand-back on an abandoned drive moves the flux on
+    # the host.  Handing it PhifMutable() is what declares that.
+    "Driver.h": 7,    # drive x2 in the loops, drive x2 + enqueueDrive + finishDrive
+                      # + finishDeferredDrives in the hooks
 }
 for name, want in EXPECTED.items():
     # comments mention the door by name; only CALLS count

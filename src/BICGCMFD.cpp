@@ -729,6 +729,99 @@ bool BICGCMFD::finishDrive(double& eigv, double* flux, double& errl2,
 }
 
 
+// ---------------------------------------------------------------------------
+// Rev.7.1 Task 10 part 3: the observation, once per SEGMENT
+// ---------------------------------------------------------------------------
+
+bool BICGCMFD::finishDeferredDrives(
+    const CudaBatchArena::CmfdSweepProbeSink::Accum& acc, double& eigv, double* flux,
+    double& errl2, bool& host_continued) {
+    host_continued = false;
+    if (!_enqueued.active) return false;
+    EnqueuedDrive d = _enqueued;
+    _enqueued       = EnqueuedDrive{};
+
+    // THE ABANDONED LAUNCH, IF THERE WAS ONE.  `saved` is that launch's whole
+    // scalar block, copied by the verdict kernel at the moment it raised the
+    // segment's halt -- the only moment it was still readable, because every
+    // outer enqueued behind it uploads its own staged block over the same
+    // sixteen doubles before the host is ever allowed to look.
+    const bool                     exceptional = acc.exceptional != 0.0;
+    CudaBatchArena::CmfdSweepIO    saved{};
+    if (exceptional) CudaBatchArena::unpackSavedSweepBlock(acc, saved);
+
+    // The arena's end-of-launch bookkeeping, once.  `state` decides only whether
+    // the Rayleigh hand-back's operator downloads run, so it is the ABANDONED
+    // launch's state that matters and not the last one's.
+    if (!_ls->finishSweepsDeferredCuda(exceptional ? saved.state
+                                                   : static_cast<int>(acc.state)))
+        throw std::runtime_error("CUDA BiCGSTAB detected a non-finite value");
+
+    // ---- the counters absorbSweepLaunch would have advanced, summed on the
+    // ---- device instead of once per outer on the host.
+    //
+    // ONE SUM, NOT N SUMS, AND THE SAME TOTAL.  Every launch's contribution is
+    // `io.icmfd_done - icmfd`, and `icmfd` is 0 at the top of each enqueued
+    // drive (stageSweepIO is called with icmfd = 0), so each contribution is
+    // just that launch's kIcmfdDone -- which is exactly what the verdict kernel
+    // added.  A launch enqueued behind a halt that had already fired ran
+    // nothing and contributed nothing, because the verdict returns first.
+    const int attempts = static_cast<int>(acc.attempts);
+    _wiel_sweep += attempts;
+    iter += attempts;
+    _bicg_iters += static_cast<long long>(attempts) * (1 + _nmaxbicg);
+
+    _last_sweep_negative = (acc.negative != 0.0) ? 1 : 0;
+    _last_sweep_state    = static_cast<int>(acc.state);
+
+    if (!exceptional) {
+        // States 1 and 3 only.  issueFluxDownloads wrote Geometry::Phif FROM
+        // the device phi at the end of every launch and the host never touched
+        // it in between, so the two agree byte for byte -- which is
+        // absorbSweepLaunch's own condition for this flag, reached by the same
+        // reasoning on a whole segment instead of one launch.
+        _last_drive_device_flux = true;
+        return true;
+    }
+
+    // ---- the drive the device could not finish, finished verbatim ----------
+    //
+    // FROM HERE THIS IS BICGCMFD::finishDrive'S TAIL, ON THE SAVED BLOCK.  The
+    // only difference is where the block came from, and the two counter
+    // seedings that follow from it: `icmfd` starts at the abandoned launch's
+    // own kIcmfdDone so absorbSweepLaunch's `attempts` for it is zero -- the
+    // accumulator has already charged those attempts -- while `iout` starts at
+    // zero so the drive's sweep count is built up exactly as the host's is.
+    int    iout   = 0;
+    int    icmfd  = saved.icmfd_done;
+    double reigv  = d.reigv;
+    double reigvs = d.reigvs;
+    _last_drive_device_flux = false;
+    if (absorbSweepLaunch(saved, eigv, flux, errl2, reigv, reigvs, iout, icmfd))
+        return true;
+
+    host_continued = true;
+    bool psi_dirty = false;
+    while (iout < _ncmfd) {
+        double r20 = 0.0;
+        _ls->reset(_diag, _cc, flux, _src, r20);
+        _ls->solveInner(_nmaxbicg, _epsbicg);
+
+        CudaBatchArena::CmfdSweepIO io;
+        stageSweepIO(io, d.prep, eigv, reigv, reigvs, errl2, iout, icmfd, psi_dirty);
+        io.device_assembly = d.use_device_assembly;
+
+        if (!_ls->driveSweepsCuda(flux, io)) {
+            if (d.use_device_assembly) assembleHostLinearSystem(eigv);
+            return false;
+        }
+        psi_dirty = false;
+        if (absorbSweepLaunch(io, eigv, flux, errl2, reigv, reigvs, iout, icmfd))
+            return true;
+    }
+    return true;
+}
+
 void BICGCMFD::drive(double& eigv, double* flux, double& errl2) {
     // Assume the HOST will own the flux.  Every path out of this function
     // leaves that true except the device-sweep states that download it, and

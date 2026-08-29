@@ -390,6 +390,56 @@ public:
         /// where it stands rather than letting the body run on a half sweep.
         std::uint32_t* halt      = nullptr;
         int            halt_slot = 0;
+
+        // -------------------------------------------------------------------
+        // Rev.7.1 Task 10 part 3: THE SWEEP, OBSERVED ONCE PER SEGMENT
+        // -------------------------------------------------------------------
+        //
+        // WHAT THE PER-OUTER OBSERVATION COSTS.  BICGCMFD::finishDrive reads
+        // this launch's scalar block out of pinned host memory the stream
+        // filled, so the stream has to be DRAINED first -- `sync_pre_nodal` in
+        // the receipt, one per outer on every arm and every budget, and the
+        // whole of what a host-free outer was blocked on.
+        //
+        // WHAT THE HOST ACTUALLY DOES WITH WHAT IT READS, on the normal path
+        // (sweep state 1 or 3): it copies eigv/residual into locals the segment
+        // already reconstructs from DeviceSlotState at the exit, and it advances
+        // three counters from `icmfd_done`.  Only the counters are irreplaceable,
+        // and they are a SUM -- so the device can keep the sum.
+        //
+        // WHAT IS NOT REPLACEABLE is the exceptional launch (state 0, the slot
+        // budget ran out mid-retry; state 2, the Wielandt gamma degenerated).
+        // There the host has to finish the drive verbatim, from THAT launch's
+        // scalar block -- which the launches enqueued behind it would have
+        // overwritten.  So the accumulator keeps a copy of it.
+        struct Accum {
+            double attempts    = 0; ///< sum of kIcmfdDone over observed launches
+            double sweeps      = 0; ///< sum of kSweepsDone
+            double launches    = 0; ///< launches whose verdict actually ran
+            double state       = 0; ///< the last observed launch's sweep state
+            double negative    = 0; ///< the last observed launch's negative census
+            double exceptional = 0; ///< 1 once some launch ended in state 0 or 2
+            /// The abandoned launch's whole scalar block, saved where it is
+            /// still readable.  Width is asserted against kSweepCount in the .cu.
+            double saved[19]   = {};
+        };
+        /// Device pointer to one Accum, or null for the per-outer arm.
+        ///
+        /// ZEROED BY THE CALLER at the segment entry, and only there: it is a
+        /// SEGMENT-scoped total, and a launch that finds the halt already up
+        /// contributes nothing to it (the verdict kernel returns first), which
+        /// is exactly the definition the host reconstruction needs.
+        Accum*         accum = nullptr;
+        /// Take this launch's eigv/reigv/reigvs/errl2 from the probe above
+        /// rather than from the host's staged copy.
+        ///
+        /// FALSE ON THE FIRST OUTER OF A SEGMENT.  There the host's eigenvalue
+        /// IS the current one -- it came out of the previous segment's exit
+        /// observation -- while the probe may still describe a drive several
+        /// host outers old.  From the second outer on, the probe holds the
+        /// PREVIOUS outer's verdict, which is precisely what finishDrive would
+        /// have handed the host.
+        bool           patch_from_probe = false;
     };
 
     /// Enqueue one resident sweep run on sweepStream() and RETURN.
@@ -428,6 +478,35 @@ public:
     ///
     /// Returns false when the device flagged this slot's flux non-finite.
     bool finishSweeps(int slot, CmfdSweepIO& io);
+
+    /// Rev.7.1 Task 10 part 3: the same bookkeeping for a WHOLE SEGMENT of
+    /// launches that were never observed one at a time.
+    ///
+    /// The two differences from finishSweeps, and both are forced by the same
+    /// fact -- the staging block belongs to whichever launch was enqueued LAST,
+    /// which on a segment that halted is one whose every kernel was masked:
+    ///
+    ///   * readSweepObservation is NOT called.  The caller reconstructs eigv and
+    ///     the residual from DeviceSlotState and the counters from the
+    ///     accumulator, which are the only two records that survive a masked
+    ///     launch.
+    ///   * @p state comes from the accumulator, not from the block, and it is
+    ///     what decides whether the Rayleigh hand-back's operator downloads run.
+    ///
+    /// Returns false when the device flagged this slot's flux non-finite.
+    bool finishSweepsDeferred(int slot, int state);
+
+    /// Rev.7.1 Task 10 part 3: unpack the accumulator's saved scalar block into
+    /// the OUTPUT half of an IO block.
+    ///
+    /// The one place the sweep block's slot map is spelled outside the backend
+    /// would be BICGCMFD, which cannot see it -- the map is an anonymous-
+    /// namespace enum in the .cu, and putting a second copy of it in a header
+    /// is how two spellings of one layout start disagreeing.  So the caller
+    /// hands the bytes back and this fills the fields readSweepObservation
+    /// would have filled, from exactly the same indices.
+    static void unpackSavedSweepBlock(const CmfdSweepProbeSink::Accum& acc,
+                                      CmfdSweepIO& io);
 
     /// Drain sweepStream().  For the caller that has to fall back to a BLOCKING
     /// drive after issuing stream-ordered work of its own -- the Wielandt

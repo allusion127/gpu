@@ -514,6 +514,44 @@ inline const char* outerRefusalName(OuterSegmentRefusal r) {
     return "?";
 }
 
+// ===========================================================================
+// Rev.7.1 Task 10 part 3: why a segment is not HOST-FREE
+// ===========================================================================
+//
+// A SECOND LADDER, AND DELIBERATELY NOT MORE ENTRIES IN THE FIRST.  The refusal
+// above answers `did a segment run at all`; this one answers `did the segment
+// that ran pay a synchronise per outer`, which is a different question with
+// different consequences -- a run can be entirely healthy and entirely
+// per-outer, on a cusping deck or during a Wielandt warm-up, and folding the
+// two would make the receipt unable to say so.
+//
+// Asked ONCE PER SEGMENT, at its entry.  Every reason below is a property that
+// cannot move inside a segment, and the entries say which fact makes that true.
+enum class OuterHostFreeRefusal : int {
+    None = 0,
+    FeatureOff,      ///< RASBERY_GPU_OUTER_HOSTFREE=0
+    NoHooks,         ///< the caller supplied fewer than all three part-3 hooks
+    NotStreamSweep,  ///< the rendezvous sweep arm; a batch, by default
+    SweepWontEnqueue,///< canEnqueueDrive() is false -- the Wielandt warm-up
+    NoCanonicalNodal,///< the drive is not the FULL device pipeline this outer
+    CuspingLive,     ///< ApplyRodCusping could fire, and it cannot be halt-gated
+    Count
+};
+
+inline const char* outerHostFreeRefusalName(OuterHostFreeRefusal r) {
+    switch (r) {
+        case OuterHostFreeRefusal::None:             return "none";
+        case OuterHostFreeRefusal::FeatureOff:       return "feature_off";
+        case OuterHostFreeRefusal::NoHooks:          return "no_hooks";
+        case OuterHostFreeRefusal::NotStreamSweep:   return "not_stream_sweep";
+        case OuterHostFreeRefusal::SweepWontEnqueue: return "sweep_wont_enqueue";
+        case OuterHostFreeRefusal::NoCanonicalNodal: return "no_canonical_nodal";
+        case OuterHostFreeRefusal::CuspingLive:      return "cusping_live";
+        case OuterHostFreeRefusal::Count:            break;
+    }
+    return "?";
+}
+
 /// What the caller knows about the deck, reduced to the bits eligibility turns
 /// on.  Pure, so the predicate is testable with no device.
 struct OuterSegmentEligibility {
@@ -846,6 +884,32 @@ struct OuterSegmentCounters {
     /// entitled to and Task 10 does not remove.  Carried so the per-outer
     /// rendezvous arithmetic can be done from the receipt alone.
     std::uint64_t sync_segment_exit        = 0;
+    // ---- Rev.7.1 Task 10 part 3: the host-free arm --------------------------
+    /// Segments that ran with NO in-body synchronise at all.
+    ///
+    /// THE PAIR TO READ IS (hostfree_outers, sync_pre_nodal).  Before this task
+    /// sync_pre_nodal was exactly device_outers on every arm and every budget;
+    /// afterwards it is device_outers MINUS hostfree_outers, and the ratio
+    /// in_body_host_syncs / device_outers is what the claim is made of.
+    std::uint64_t hostfree_segments        = 0;
+    /// Outers COMMITTED inside those segments.
+    std::uint64_t hostfree_outers          = 0;
+    /// Outers ENQUEUED inside those segments -- the budget, every time, because
+    /// a host-free segment cannot stop early.  The difference against
+    /// hostfree_outers is the overrun the halt gate turned into no-ops, and it
+    /// is the price of the arm: at a fixed budget it is real device launches
+    /// doing nothing, and it is what the conditional WHILE removes.
+    std::uint64_t hostfree_enqueued        = 0;
+    /// The one synchronise a host-free segment does pay, at its exit, to read
+    /// the accumulator.  Not per outer; carried so the receipt's arithmetic
+    /// closes without assuming it.
+    std::uint64_t sync_hostfree_exit       = 0;
+    /// Host-free segments whose sweep was abandoned by the device (state 0 or 2)
+    /// and whose abandoned outer therefore took a repair pass at the exit.
+    std::uint64_t hostfree_repairs         = 0;
+    /// Why a segment did NOT run host-free, by reason.  Indexed by
+    /// OuterHostFreeRefusal.
+    std::uint64_t hostfree_refusals[static_cast<int>(OuterHostFreeRefusal::Count)] = {};
     /// Bytes returned to Geometry::Phis at a segment exit.
     ///
     /// THE PRICE OF THE ELIDED DOWNLOAD, and it is charged per EXIT rather than
@@ -1050,6 +1114,73 @@ using OuterSegmentHook = bool (*)(void* ctx, OuterSegmentStream stream, int slot
 /// NULLPTR IS A LEGAL ANSWER AND MEANS `ALREADY ORDERED`, never `do not bother`.
 using OuterNodalCompletionHook = void* (*)(void* ctx);
 
+// ===========================================================================
+// Rev.7.1 Task 10 part 3: the three hooks a HOST-FREE outer needs
+// ===========================================================================
+//
+// WHAT `HOST-FREE` MEANS HERE, precisely: inside one segment, a non-escaping
+// outer costs the host ZERO cudaStreamSynchronize.  It does not mean zero host
+// CALLS -- the nodal drive stays a host call that enqueues a device graph, and
+// so does the sweep -- it means no host call inside the body ever READS device
+// memory, so the device never goes idle waiting for the host to look.
+//
+// Three things stood in the way and each gets one hook.
+
+/// (1) THE SWEEP OBSERVATION, DEFERRED TO THE EXIT.
+///
+/// BICGCMFD::finishDrive reads the launch's scalar block out of pinned host
+/// memory the stream filled, which is what `sync_pre_nodal` paid for on every
+/// outer of every budget.  Deferring it needs a summary the device kept as it
+/// went; @p accum is the host copy of that summary (a
+/// CudaBatchArena::CmfdSweepProbeSink::Accum, passed as const void* so this
+/// header stays free of the CMFD backend).
+///
+/// Returning true with the runner's `sweep_host_continued` raised means a
+/// launch ended in sweep state 0 or 2 and the hook has finished that drive on
+/// the host: the runner then owes the abandoned outer its tail, exactly as the
+/// per-outer arm owes it after republishAfterHostSweep.
+using OuterDeferredSweepHook = bool (*)(void* ctx, const void* accum, int slot);
+
+/// (2) CAN ApplyRodCusping FIRE ANYWHERE IN THIS SEGMENT?  Non-zero = no.
+///
+/// Cusping is a host call that reads the nodal drive's leakage and WRITES the
+/// cross sections, so on a halted outer it would blend from a leakage that was
+/// never produced.  It cannot be gated by a device word, and porting it is
+/// Task 11 -- so a deck where it can fire keeps the per-outer arm.
+///
+/// ASKED ONCE PER SEGMENT AND THAT IS SOUND, which is the whole reason this is
+/// a separate question from `did it fire`.  XSSet::ApplyRodCusping returns false
+/// without touching anything when no node is fractional AND its own carry-over
+/// set is empty; Geometry::rod_fraction moves only when the rod bank moves, and
+/// a bank move is the Search phase, which is not an Outer -> Outer transition
+/// and therefore ends the segment.  So an answer taken at the entry holds for
+/// every outer of that segment.
+using OuterCuspingQuiescentHook = int (*)(void* ctx);
+
+/// (3) THE NODAL DRIVE'S OWN HALT.
+///
+/// Installs (or clears, with a null pointer) the segment's per-slot halt word
+/// on the nodal backend, so the five kernels of the FULL device drive test it
+/// exactly as every CMFD body kernel already does.  Without it an overrunning
+/// outer would re-solve the nodal problem on its own previous output -- the
+/// drive is not idempotent, see NodalView::halt.
+using OuterNodalHaltGateHook = void (*)(void* ctx, const void* halt, int slot);
+
+/// (4) THE SEGMENT -> NODAL HANDOVER, WHEN THERE IS NO SYNCHRONISE LEFT TO DO IT.
+///
+/// The nodal drive runs on the XS-recon backend's OWN stream and reads the jnet
+/// updjnet wrote on the segment's.  Exactness invariant 4 requires that handover
+/// to be ordered by a synchronise or an event; the per-outer arm used the
+/// synchronise it was paying anyway (`sync_pre_nodal`), and a host-free outer
+/// has none -- so it records an event on its own stream and the backend's stream
+/// waits on it.  Same contract, same guarantee, no host.
+///
+/// GETTING THIS WRONG IS NOT A CRASH.  Without the wait the drive reads whatever
+/// jnet happens to be resident: usually the right one, because the segment
+/// stream is usually ahead, and occasionally the previous outer's.  Measured on
+/// the trimmed kngr3 deck, that is 51 of 644 datasets and one outer.
+using OuterNodalWaitHook = bool (*)(void* ctx, void* event);
+
 struct OuterSegmentHooks {
     OuterSegmentHook enqueue_cmfd_sweep = nullptr; ///< setls + drive (+ probe)
     OuterSegmentHook enqueue_nodal_drive = nullptr; ///< nodal reset + drive
@@ -1090,6 +1221,14 @@ struct OuterSegmentHooks {
     ///
     /// Supplying it is what makes `sweep_synchronizes` false legal.
     OuterSegmentHook finish_cmfd_sweep = nullptr;
+
+    /// Rev.7.1 Task 10 part 3.  All three must be present for a segment to run
+    /// host-free; a caller that supplies none gets the per-outer arm verbatim,
+    /// which is the feature-off shape.
+    OuterDeferredSweepHook    finish_cmfd_sweep_deferred = nullptr;
+    OuterCuspingQuiescentHook cusping_quiescent          = nullptr;
+    OuterNodalHaltGateHook    nodal_halt_gate            = nullptr;
+    OuterNodalWaitHook        nodal_wait_event           = nullptr;
 
     /// TRUE while the sweep hook is a HOST call that rendezvouses.
     ///
@@ -1555,6 +1694,15 @@ public:
         std::uint32_t* rayleigh  = nullptr;
         std::uint32_t* nonfinite = nullptr;
         std::uint32_t* halt      = nullptr;
+        /// Rev.7.1 Task 10 part 3: where an unobserved segment's sweep keeps its
+        /// own summary, or null when every launch is observed as it always was.
+        ///
+        /// void* AND NOT THE TYPE, on purpose.  The type is
+        /// CudaBatchArena::CmfdSweepProbeSink::Accum and this header is included
+        /// by the host-only arm too (CudaOuterGraphStub.cpp), which has no CMFD
+        /// backend at all; the one caller that needs the type -- Driver.h's
+        /// sweep hook -- already includes the backend header and casts.
+        void*          accum     = nullptr;
         bool           valid     = false;
     };
     [[nodiscard]] ProbeAddresses probeAddresses(int slot) const;

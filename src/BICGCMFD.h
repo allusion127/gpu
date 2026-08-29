@@ -217,6 +217,45 @@ public:
     /// republish it from lastSweep*() and clear its halt.
     bool finishDrive(double& eigv, double* flux, double& errl2, bool& host_continued);
 
+    // -------------------------------------------------------------------
+    // Rev.7.1 Task 10 part 3: the observation, once per SEGMENT
+    // -------------------------------------------------------------------
+    //
+    // WHY finishDrive COULD NOT SIMPLY BE MOVED.  It reads the arena's staging
+    // block, and a segment that enqueues N drives back to back overwrites that
+    // block N times -- the last writer being, on a segment that halted, a
+    // launch whose every kernel was masked.  So what the host needs at the exit
+    // is not the last block, it is a SUMMARY the device kept as it went:
+    // CudaBatchArena::CmfdSweepProbeSink::Accum.
+    //
+    // WHAT THIS RECONSTRUCTS, AND FROM WHERE.
+    //   iter / _wiel_sweep / _bicg_iters   the accumulator's `attempts` sum.
+    //                     _wiel_sweep is the one with teeth: canEnqueueDrive()
+    //                     gates on it and resetIteration() zeroes it per
+    //                     statepoint, so it must end the segment holding exactly
+    //                     what N per-outer observations would have left.
+    //   _last_sweep_state / _last_sweep_negative   the accumulator's record of
+    //                     the last launch whose verdict actually ran.
+    //   _last_drive_device_flux   true on states 1 and 3, which is
+    //                     absorbSweepLaunch's own rule -- issueFluxDownloads
+    //                     wrote Geometry::Phif from the device phi at the end of
+    //                     every launch, so the two agree byte for byte.
+    //   eigv / errl2      NOT from here.  The segment reconstructs them from
+    //                     DeviceSlotState at its exit observation, which is the
+    //                     same numbers by a shorter path; they move only on the
+    //                     exceptional branch below, where the host finishes the
+    //                     drive and therefore owns them again.
+    //
+    // @p acc must be the host copy of the device accumulator the segment zeroed
+    //        at its entry and handed to every enqueueDrive of the segment.
+    /// Sets @p host_continued when a launch ended in sweep state 0 or 2 and this
+    /// call ran the remaining blocking launches -- same contract as finishDrive,
+    /// including that the caller must then republish the segment's probe and
+    /// re-issue the steps the verdict's halt swallowed.
+    bool finishDeferredDrives(const CudaBatchArena::CmfdSweepProbeSink::Accum& acc,
+                              double& eigv, double* flux, double& errl2,
+                              bool& host_continued);
+
     /// The stream enqueueDrive issues on.  Null when there is no arena.
     [[nodiscard]] void* sweepStream() const { return _ls ? _ls->sweepStream() : nullptr; }
 

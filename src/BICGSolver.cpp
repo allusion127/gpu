@@ -381,6 +381,11 @@ bool BICGSolver::finishSweepsCuda(CudaBatchArena::CmfdSweepIO& io) {
     return _arena->finishSweeps(_batch_slot, io);
 }
 
+bool BICGSolver::finishSweepsDeferredCuda(int state) {
+    if (_arena == nullptr || _batch_slot < 0) return false;
+    return _arena->finishSweepsDeferred(_batch_slot, state);
+}
+
 void* BICGSolver::sweepStream() const {
     if (_arena == nullptr) return nullptr;
     return _arena->sweepStream();

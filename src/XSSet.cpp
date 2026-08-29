@@ -3262,6 +3262,20 @@ void XSSet::ResetCuspingNodesToBase(const std::vector<int>& nodes) {
     }
 }
 
+bool XSSet::RodCuspingQuiescent() const {
+    // Term 1 and term 3 are free; term 2 is one pass over rod_fraction, paid
+    // once per SEGMENT rather than once per outer -- which is cheaper than the
+    // call it replaces, since ApplyRodCusping walks the same array.
+    if (_axial_rod_division <= 0) return true;
+    if (!_rod_cusping_nodes_scratch.empty()) return false;
+    const int nxyz = _g.nxyz();
+    for (int l = 0; l < nxyz; ++l) {
+        const double frac = _g.rod_fraction(l);
+        if (frac > EPS && frac < 1.0 - EPS) return false;
+    }
+    return true;
+}
+
 bool XSSet::ApplyRodCusping(double eigv, const AxialTransverseLeakageView& leakage) {
     if (_axial_rod_division <= 0 || eigv <= 1.0e-20)
         return false;

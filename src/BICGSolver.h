@@ -155,6 +155,13 @@ public:
     /// The post-synchronise half of enqueueSweepsCuda.  False = non-finite flux.
     bool finishSweepsCuda(CudaBatchArena::CmfdSweepIO& io);
 
+    /// Rev.7.1 Task 10 part 3: the post-synchronise half for a whole SEGMENT of
+    /// enqueues that were never observed one at a time.  @p state is the
+    /// abandoned launch's sweep state, taken from the device accumulator rather
+    /// than from a staging block a masked launch has since overwritten.
+    /// See CudaBatchArena::finishSweepsDeferred.
+    bool finishSweepsDeferredCuda(int state);
+
     /// The stream enqueueSweepsCuda issues on, so the caller can order its own
     /// work against it.  Null when there is no arena.
     [[nodiscard]] void* sweepStream() const;

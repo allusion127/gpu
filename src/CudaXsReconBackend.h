@@ -344,6 +344,53 @@ public:
     /// opinion about it.
     void setNodalReigvDeviceResident(bool resident);
 
+    // -----------------------------------------------------------------------
+    // Rev.7.1 Task 10 part 3: THE DRIVE THAT REFUSES TO RUN PAST A DECIDED EXIT
+    // -----------------------------------------------------------------------
+    //
+    // A HOST-FREE SEGMENT CANNOT ASK.  It enqueues its whole budget without
+    // returning to the host, so the outers past the exit are already submitted
+    // when the transition latches.  Every kernel of the CMFD body reads the
+    // segment's per-slot halt word and returns; the nodal drive is a HOST call
+    // and could not, so its five kernels now read the same word.
+    //
+    // AND IT IS NOT OPTIONAL FOR THAT ARM.  The drive is not idempotent -- the
+    // transverse leakage is built FROM jnet and the last phase WRITES jnet --
+    // so an ungated overrun re-solves on its own output.  Four extra drives on
+    // a budget-8 segment that exited at outer 3 is a different answer, not a
+    // slower one.
+    //
+    // @param halt device pointer to the segment's per-slot halt table
+    ///       (std::uint32_t*), or nullptr to run ungated -- the default, and
+    ///       what every arm outside a host-free segment passes.
+    /// @param slot which entry of that table describes this deck.
+    ///
+    /// BOTH ARE GRAPH KEYS.  The pair is baked into the captured nodal graph,
+    /// so flipping the gate re-instantiates once and then never again; the
+    /// pointer itself is stable for the life of a run.
+    void setNodalHaltGate(const void* halt, int slot);
+
+    /// Rev.7.1 Task 10 part 3: THE OTHER HALF OF THE HANDOVER, AS AN EVENT.
+    ///
+    /// The nodal drive runs on THIS backend's stream and reads the jnet the
+    /// segment's updjnet wrote on the SEGMENT's stream.  Exactness invariant 4
+    /// requires that handover to be ordered by a synchronise or an event, and
+    /// until now it was the synchronise -- the per-outer `sync_pre_nodal` drain,
+    /// which is precisely what a host-free outer removes.  So the runner records
+    /// an event on its stream after updjnet and hands it here; this makes the
+    /// backend's stream wait on it, which is the same ordering with no host in
+    /// it.
+    ///
+    /// ISSUED PER DRIVE AND OUTSIDE THE CAPTURE, for the reigv upload's reason:
+    /// the event handle changes meaning every outer, and a wait recorded INTO
+    /// the captured graph would freeze one outer's dependency into every replay.
+    ///
+    /// @param event an opaque cudaEvent_t already recorded on the caller's
+    ///        stream, or nullptr for `no wait` -- the per-outer arm, every host
+    ///        outer, and every path that still drains for itself.
+    /// Returns false only when the wait itself failed.
+    bool waitOnSegmentEvent(void* event);
+
     /// Receipt: how many routine per-outer transfers the sharing removed.
     [[nodiscard]] unsigned long long canonicalUploadsElided() const;
     [[nodiscard]] unsigned long long canonicalDownloadsElided() const;

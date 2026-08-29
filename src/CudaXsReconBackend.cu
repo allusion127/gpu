@@ -446,7 +446,13 @@ std::atomic<unsigned long long> g_nodal_batch_xs_h2d_skipped_bytes{0};
     const ndl::NodalView v =                                                   \
         !BATCHED                 ? (base)                                      \
         : ((views) != nullptr)   ? (views)[_m]                                 \
-                                 : ndl::nodalSlotView(base, _m)
+                                 : ndl::nodalSlotView(base, _m);               \
+    /* Rev.7.1 Task 10 part 3: the segment's halt, in the one place every    */ \
+    /* nodal phase already passes through.  Null on every arm but a          */ \
+    /* host-free device outer segment, so this is a predicted branch over a  */ \
+    /* baked null for the whole rest of the tree.  See NodalView::halt for   */ \
+    /* why the drive may not simply be re-run past a decided exit.           */ \
+    if ((v).halt != nullptr && (v).halt[(v).halt_slot] != 0u) return
 
 template <bool BATCHED>
 __global__ void kNodalTrl0(ndl::NodalView base, const int* __restrict__ slot_map,
@@ -1830,6 +1836,12 @@ struct XsReconBackend::Impl {
     /// being the graph's first node gave it), and the capture is identical
     /// either way.
     bool            nodal_reigv_device = false;
+    /// Rev.7.1 Task 10 part 3: the device outer segment's per-slot halt table,
+    /// or null.  UNLIKE nodal_reigv_device this IS a graph key: it is a kernel
+    /// ARGUMENT (NodalView::halt), and a graph captured with it null cannot be
+    /// replayed gated.  It settles once per run, so it costs one instantiation.
+    const void*     nodal_halt      = nullptr;
+    int             nodal_halt_slot = 0;
     // Everything else the capture baked in.  Any change invalidates it.
     const void*     g_key_ndev = nullptr;
     const void*     g_key_dblk = nullptr;
@@ -1901,6 +1913,9 @@ struct XsReconBackend::Impl {
     std::uint32_t g_key_materialize = 0xFFFFFFFFu;
     int           g_key_canon_owner_jnet = -1;
     int           g_key_canon_owner_flux = -1;
+    /// Rev.7.1 Task 10 part 3: the halt gate is a kernel argument, so it is a key.
+    const void*   g_key_halt      = reinterpret_cast<const void*>(~static_cast<std::uintptr_t>(0));
+    int           g_key_halt_slot = -1;
 
     void dropNodalGraph() {
         if (nodal_graph != nullptr) {
@@ -3137,6 +3152,16 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     // cusping is the only host reader of trlcff, and it never runs when that
     // guard let us get here.
     v.reigv_dev = d.ndev_dbl + d.n_off_reigv;
+    // Rev.7.1 Task 10 part 3: the halt gate, on the FULL arm only.
+    //
+    // THE HYBRID ARM IS DELIBERATELY LEFT UNGATED.  It runs calculateEven on
+    // the host in the middle of the drive, so half of it could not be gated by
+    // a device word anyway -- and a host-free segment refuses that arm for
+    // exactly that reason (outerCanonicalNodalEligibleHook requires FULL).
+    // Setting the pointer only here means a hybrid run cannot inherit a gate
+    // some earlier arm installed.
+    v.halt      = static_cast<const unsigned int*>(d.nodal_halt);
+    v.halt_slot = d.nodal_halt_slot;
     if (d.nodal_h_reigv == nullptr) {
         rasbery::AllocWindow _alloc_window("nodal.reigv.hostalloc");
         if (cudaHostAlloc(reinterpret_cast<void**>(&d.nodal_h_reigv),
@@ -3255,7 +3280,9 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
                         d.g_key_canon_owner_jnet ==
                             static_cast<int>(d.canonical.ownerOf(gpu::CanonicalRegion::Jnet)) &&
                         d.g_key_canon_owner_flux ==
-                            static_cast<int>(d.canonical.ownerOf(gpu::CanonicalRegion::Flux));
+                            static_cast<int>(d.canonical.ownerOf(gpu::CanonicalRegion::Flux)) &&
+                        d.g_key_halt == d.nodal_halt &&
+                        d.g_key_halt_slot == d.nodal_halt_slot;
     if (d.nodal_graph != nullptr && !key_ok)
         d.dropNodalGraph();
 
@@ -3356,6 +3383,8 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
                 static_cast<int>(d.canonical.ownerOf(gpu::CanonicalRegion::Jnet));
             d.g_key_canon_owner_flux =
                 static_cast<int>(d.canonical.ownerOf(gpu::CanonicalRegion::Flux));
+            d.g_key_halt      = d.nodal_halt;
+            d.g_key_halt_slot = d.nodal_halt_slot;
             const cudaError_t lrc = cudaGraphLaunch(d.nodal_graph, d.stream);
             if (lrc != cudaSuccess) {
                 d.status = std::string("cudaGraphLaunch -> ") + cudaGetErrorString(lrc);
@@ -3654,6 +3683,35 @@ void XsReconBackend::setNodalReigvDeviceResident(bool resident) {
     // was moved out of the capture precisely so that this can flip per drive
     // without costing an instantiation.
     _impl->nodal_reigv_device = resident;
+}
+
+bool XsReconBackend::waitOnSegmentEvent(void* event) {
+    Impl& d = *_impl;
+    if (!d.available || event == nullptr) return true;
+    // NOT RECORDED INTO ANYTHING.  This is a stream-order dependency issued on
+    // d.stream at the moment the caller asks, exactly like the reigv upload two
+    // functions down -- and for the same reason it may not become a graph node:
+    // the event describes ONE outer's updjnet, and a captured wait would make
+    // every later replay depend on that outer's copy of it.
+    const cudaError_t rc =
+        cudaStreamWaitEvent(d.stream, static_cast<cudaEvent_t>(event), 0);
+    if (rc != cudaSuccess) {
+        d.status = std::string("nodal segment wait -> ") + cudaGetErrorString(rc);
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
+void XsReconBackend::setNodalHaltGate(const void* halt, int slot) {
+    // NO EXPLICIT GRAPH DROP HERE, and that is not an omission: the pair is in
+    // the key solveNodal tests on its next call (`d.g_key_halt`), so the drop
+    // happens where every other key change's drop happens.  Doing it here as
+    // well would destroy a graph exec while the previous drive may still be in
+    // flight on d.stream -- the whole point of the deferred drain is that the
+    // host does not wait for it.
+    _impl->nodal_halt      = halt;
+    _impl->nodal_halt_slot = slot;
 }
 
 unsigned long long XsReconBackend::canonicalUploadsElided() const {

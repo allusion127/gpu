@@ -634,6 +634,32 @@ public:
     [[nodiscard]] double rod_cusping_relaxation() const { return _rod_cusping_relaxation; }
     bool                 ApplyRodCusping(double eigv, const AxialTransverseLeakageView& leakage = {});
 
+    /// Rev.7.1 Task 10 part 3: can ApplyRodCusping do ANYTHING right now?
+    ///
+    /// THE QUESTION A DEVICE OUTER SEGMENT HAS TO ASK BEFORE IT STOPS ASKING.
+    /// Cusping is a host call that reads the nodal drive's leakage and writes
+    /// the macroscopic cross sections, so a segment that runs its outers without
+    /// looking at the exit cannot afford to call it -- on an outer past the exit
+    /// the leakage was never produced and the blend could not be undone.  It can
+    /// afford to SKIP it exactly when skipping is an identity, and this is that
+    /// condition, read off ApplyRodCusping's own body:
+    ///
+    ///   * no axial rod division  -> it returns false on its first line;
+    ///   * no node with a partial rod -> the stencil never runs, so nothing is
+    ///     written and the generation is not bumped;
+    ///   * an EMPTY carry-over set -> nothing "left" the cusped set either, so
+    ///     ResetCuspingNodesToBase does not run and the return value is false.
+    ///
+    /// The third term is the one that is easy to miss and it is what made i-SMR
+    /// CY02 diverge under a Stage A eligibility check: ApplyRodCusping can
+    /// answer YES from its own previous scratch with no node fractional now.
+    ///
+    /// AND THE ANSWER HOLDS FOR A WHOLE SEGMENT.  Geometry::rod_fraction moves
+    /// only when the rod bank moves, which is the Search phase and therefore not
+    /// an Outer -> Outer transition; the scratch is written only by
+    /// ApplyRodCusping itself, which this answer forbids from running.
+    [[nodiscard]] bool   RodCuspingQuiescent() const;
+
     // Rod profile matrix interface
     void                 BuildRodProfileMatrix(const std::map<std::string, std::vector<double>>& profiles);
     [[nodiscard]] double rod_max_step() const { return _rod_ncols > 1 ? static_cast<double>(_rod_ncols - 1) : 0.0; }
