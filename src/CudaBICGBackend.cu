@@ -4215,6 +4215,56 @@ void CudaBICGBackend::synchronize(double* host_phi) {
 // Multi-instance arena.
 // ===========================================================================
 
+namespace {
+
+/// Rev.7.1 Task 18: WHAT THE STREAM CLAIM COSTS, measured rather than argued.
+///
+/// The claim below is the one piece of the batch's CMFD path that is a HOST
+/// serialisation, and the first regression it produced (238, M64: 224.5 c/h ->
+/// under half) was diagnosed from source alone because nothing counted it.  It
+/// is counted now: how long a thread waited to take it, and how long it held
+/// it, split by the four sites that take it -- because the sites are not
+/// interchangeable.  `enqueue` is bounded host work; `sync` drains a stream and
+/// is therefore expected to hold for as long as the device takes; `rendezvous`
+/// covers a whole batched launch.  A wait total that approaches the run's wall
+/// says the claim is the bottleneck; a hold total dominated by `sync` says the
+/// drain is.
+struct ClaimStats {
+    unsigned long long events  = 0;
+    double             wait_us = 0.0;
+    double             hold_us = 0.0;
+};
+
+/// A `lock_guard` that leaves a receipt.  Every field it touches is written
+/// with the mutex held (`wait_us` after the acquire, the other two before the
+/// release), so the counters need no atomicity of their own.
+class TimedStreamClaim {
+public:
+    TimedStreamClaim(std::mutex& m, ClaimStats& stats) : _m(m), _stats(stats) {
+        const auto before = std::chrono::steady_clock::now();
+        _m.lock();
+        _held = std::chrono::steady_clock::now();
+        _stats.wait_us +=
+            std::chrono::duration<double, std::micro>(_held - before).count();
+    }
+    ~TimedStreamClaim() {
+        _stats.hold_us += std::chrono::duration<double, std::micro>(
+                              std::chrono::steady_clock::now() - _held)
+                              .count();
+        ++_stats.events;
+        _m.unlock();
+    }
+    TimedStreamClaim(const TimedStreamClaim&)            = delete;
+    TimedStreamClaim& operator=(const TimedStreamClaim&) = delete;
+
+private:
+    std::mutex&                           _m;
+    ClaimStats&                           _stats;
+    std::chrono::steady_clock::time_point _held{};
+};
+
+} // namespace
+
 class CudaBatchArena::Impl {
 public:
     Impl(Geometry& geometry, int slots) : core(geometry, slots) {
@@ -4343,6 +4393,14 @@ public:
     unsigned long long      launches       = 0;
     unsigned long long      batched_solves = 0;
     std::vector<unsigned long long> width_histogram;
+    /// Rev.7.1 Task 18: the stream-ordered path's own width, which is ONE by
+    /// construction -- `enqueueSweeps` stages a single slot.  Counted beside
+    /// the rendezvous launches because the two are alternatives, and the
+    /// question the M64 regression asked is precisely "which of the two ran,
+    /// and how wide was it".  A batch whose sweeps all come through here has
+    /// traded one launch of width M for M launches of width 1.
+    unsigned long long      enqueue_launches = 0;
+    ClaimStats              claim_enqueue, claim_finish, claim_sync, claim_rendezvous;
     /// Batch index whose launch threw, so its passengers report the same fatal
     /// condition the launcher did instead of carrying on with a stale flux.
     unsigned long long      failed_batch[2] = {~0ull, ~0ull};
@@ -4554,7 +4612,7 @@ bool CudaBatchArena::enqueueSweeps(int m, double* out_phi, const CmfdSweepIO& io
     // THE STAGE IS INSIDE THE CLAIM, and it has to be: stageSweeps writes
     // slot m's own scalar block, but issueSweepUploads reads `stage_lane`,
     // `lanes` and the graph caches, all of which the claim guards.
-    std::lock_guard<std::mutex> stream_claim(a.stream_mutex);
+    TimedStreamClaim stream_claim(a.stream_mutex, a.claim_enqueue);
 
     // ---- join the caller's stream to the arena's ---------------------------
     //
@@ -4600,6 +4658,7 @@ bool CudaBatchArena::enqueueSweeps(int m, double* out_phi, const CmfdSweepIO& io
     a.core.issueSweepUploads(&m, 1, unroll);
     a.core.enqueueSweepGate(m, probe.halt, probe.halt_slot);
     a.core.launch_sweeps(nmax, unroll);
+    ++a.enqueue_launches; // one slot, therefore width one -- see the field's note
     // The verdict BEFORE the downloads: it reads the scalar block the graph just
     // wrote, and issueSweepDownloads ends by clearing sweep_halt for the next
     // launch, which would erase the very state the verdict is reading if the
@@ -4632,7 +4691,7 @@ bool CudaBatchArena::finishSweeps(int m, CmfdSweepIO& io) {
     // stream and synchronises it.  No device wait is held across the claim on
     // the normal path -- the caller has already synchronised its own stream,
     // which the enqueue joined to the arena's.
-    std::lock_guard<std::mutex> stream_claim(a.stream_mutex);
+    TimedStreamClaim stream_claim(a.stream_mutex, a.claim_finish);
     a.core.absorb(&m, 1);
     readSweepObservation(m, io);
     // The Rayleigh hand-back is the one launch whose host branch reads psi and
@@ -4661,7 +4720,7 @@ void CudaBatchArena::syncSweepStream() {
     // the other decks' enqueues -- for exactly as long as the arena stream was
     // going to take anyway, on the path where the caller is about to run a
     // blocking host CMFD drive.
-    std::lock_guard<std::mutex> stream_claim(_impl->stream_mutex);
+    TimedStreamClaim stream_claim(_impl->stream_mutex, _impl->claim_sync);
     CUDA_CHECK(cudaStreamSynchronize(_impl->core.stream));
     CUDA_CHECK(cudaGetLastError());
 }
@@ -4823,7 +4882,7 @@ void CudaBatchArena::solveCommon(int m, double* out_phi, int kind) {
             // The rendezvous claim (`launching`) keeps other RENDEZVOUS
             // launchers out; the stream claim keeps the stream-ordered enqueue
             // path out, which has no election of its own.
-            std::lock_guard<std::mutex> stream_claim(a.stream_mutex);
+            TimedStreamClaim stream_claim(a.stream_mutex, a.claim_rendezvous);
             a.core.stage_lane = a.core.slots; // the rendezvous lane
             try {
                 if (kind == 0) {
@@ -4884,14 +4943,43 @@ void CudaBatchArena::solveCommon(int m, double* out_phi, int kind) {
 
 void CudaBatchArena::reportBatchOccupancy(const char* tag) const {
     const Impl& a = *_impl;
-    if (a.launches == 0) return;
+    // The stream-ordered path is counted too, and that is why the gate is an
+    // OR: a batch that took it exclusively has zero rendezvous launches, and
+    // returning early there is exactly how the M64 regression hid -- the one
+    // receipt that answers "how wide were the sweeps" printed nothing at all.
+    if (a.launches == 0 && a.enqueue_launches == 0) return;
+    const double all_launches =
+        static_cast<double>(a.launches) + static_cast<double>(a.enqueue_launches);
     std::ostringstream line;
     line << "[RASBERY][CUDA][BATCH_OCCUPANCY] {\"tag\":\"" << (tag ? tag : "") << "\","
          << "\"slots\":" << a.core.slots << ','
          << "\"launches\":" << a.launches << ','
          << "\"instance_solves\":" << a.batched_solves << ','
          << "\"mean_width\":"
-         << (static_cast<double>(a.batched_solves) / static_cast<double>(a.launches)) << ','
+         << (a.launches ? static_cast<double>(a.batched_solves) / static_cast<double>(a.launches)
+                        : 0.0)
+         << ','
+         // The stream-ordered sweep enqueue: one slot per launch, always.
+         << "\"enqueue_launches\":" << a.enqueue_launches << ','
+         << "\"effective_mean_width\":"
+         << (all_launches > 0.0
+                 ? (static_cast<double>(a.batched_solves) +
+                    static_cast<double>(a.enqueue_launches)) /
+                       all_launches
+                 : 0.0)
+         << ','
+         << "\"claim_enqueue\":{\"n\":" << a.claim_enqueue.events
+         << ",\"wait_ms\":" << (a.claim_enqueue.wait_us / 1.0e3)
+         << ",\"hold_ms\":" << (a.claim_enqueue.hold_us / 1.0e3) << "},"
+         << "\"claim_finish\":{\"n\":" << a.claim_finish.events
+         << ",\"wait_ms\":" << (a.claim_finish.wait_us / 1.0e3)
+         << ",\"hold_ms\":" << (a.claim_finish.hold_us / 1.0e3) << "},"
+         << "\"claim_sync\":{\"n\":" << a.claim_sync.events
+         << ",\"wait_ms\":" << (a.claim_sync.wait_us / 1.0e3)
+         << ",\"hold_ms\":" << (a.claim_sync.hold_us / 1.0e3) << "},"
+         << "\"claim_rendezvous\":{\"n\":" << a.claim_rendezvous.events
+         << ",\"wait_ms\":" << (a.claim_rendezvous.wait_us / 1.0e3)
+         << ",\"hold_ms\":" << (a.claim_rendezvous.hold_us / 1.0e3) << "},"
          << "\"wait_us\":" << (a.wait_auto ? -1 : a.wait_us) << ','
          << "\"wait_mode\":\"" << (a.wait_auto ? "auto" : "fixed") << "\","
          << "\"wait_budget_us\":" << a.last_wait_budget_us << ','
