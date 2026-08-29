@@ -3149,8 +3149,9 @@ private:
                 // to hold even for a RASBERY_XE_ONCE_TRUST set below the
                 // equilibrium tolerance, where the first term would not fire.
                 // It short-circuits on xe_once_mode, so with the mode unset this
-                // is exactly `xe_change >= XE_EQUILIBRIUM_TOLERANCE` and only that
-                // is evaluated.
+                // is exactly the first term and only that is evaluated -- and
+                // with A2 staging also unset, xe_tol_now IS
+                // XE_EQUILIBRIUM_TOLERANCE, so the whole line is what it was.
                 if (xe_change >= xe_tol_now || (xe_once_mode && !xe_once_done)) {
                     // Cross sections changed; re-converge the flux before
                     // taking a search or T/H feedback step.

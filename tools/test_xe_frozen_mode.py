@@ -490,10 +490,30 @@ for counter in ("xe_once_extra_steps", "xe_once_trust_trips"):
 
 # --- Every extra step gets a re-converged flux, including for a trust region set
 # --- below the equilibrium tolerance, where the first term would not fire.
-RECONV = "if (xe_change >= XE_EQUILIBRIUM_TOLERANCE || (xe_once_mode && !xe_once_done)) {"
+#
+# The first term reads `xe_tol_now`, not XE_EQUILIBRIUM_TOLERANCE directly: A2's
+# staged tolerance (RASBERY_STAGED_XE_TOL) loosens the equilibrium tolerance for
+# the loose stage and restores it for the polish pass, and it has to reach every
+# site that decides whether the cascade is finished or this gate would keep the
+# cascade running against a tolerance no other site uses.  What the once mode
+# needs from this line is unchanged and is the SECOND term, which does not go
+# through the staged value at all.  The block below pins `xe_tol_now` back to
+# the production constant when staging is off, so the two readings agree there.
+RECONV = "if (xe_change >= xe_tol_now || (xe_once_mode && !xe_once_done)) {"
 if RECONV not in SOLVE_LOOP:
     fail("an open once cascade does not force the flux re-convergence `continue`; a second "
          "Xe step would then land on the flux the first one invalidated")
+
+# --- The staged tolerance must be the production one whenever it is not asked
+# --- for, or every gate above is measuring against a different number than the
+# --- one this file's contracts are written in terms of.
+STAGED = "const double xe_tol_now   = polishing ? XE_EQUILIBRIUM_TOLERANCE : loose_xe_tol;"
+if STAGED not in SOLVE_LOOP:
+    fail("xe_tol_now is not resolved from XE_EQUILIBRIUM_TOLERANCE at the polish stage, so "
+         "the once-mode gates above cannot be read as tests against the equilibrium tolerance")
+if "bool polishing = !staged_tol;" not in SOLVE_CODE:
+    fail("the staged-tolerance stage does not start at production tolerance when the feature "
+         "is off; xe_tol_now would then be a loose value on the default path")
 
 # --- The re-arm: all three per-cascade fields, together, outside the unrelated
 # --- RASBERY_XE_CASCADE_BUDGET branch.
