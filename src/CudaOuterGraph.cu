@@ -108,6 +108,8 @@
 
 #include "CudaTransferMirror.h"
 #include "GpuCaptureArbiter.h"
+#include "GpuGraphSplice.h"
+#include "GpuOuterWhile.h"
 #include "GpuPhysicsArena.h"
 #include "OuterTrace.h"
 
@@ -118,6 +120,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 #include <mutex>
 #include <ostream>
 #include <string>
@@ -188,6 +191,12 @@ struct AtomicCounters {
     std::atomic<std::uint64_t> sync_hostfree_exit{0};
     std::atomic<std::uint64_t> hostfree_repairs{0};
     std::atomic<std::uint64_t> hostfree_refusals[static_cast<int>(OuterHostFreeRefusal::Count)];
+    // Rev.7.1 Task 10 part 4: the device-side WHILE.
+    std::atomic<std::uint64_t> graph_segments{0};
+    std::atomic<std::uint64_t> graph_launches{0};
+    std::atomic<std::uint64_t> graph_iterations{0};
+    std::atomic<std::uint64_t> graph_instantiations{0};
+    std::atomic<std::uint64_t> graph_refusals[static_cast<int>(OuterGraphRefusal::Count)];
     std::atomic<std::uint64_t> phis_mirror_bytes{0};
     std::atomic<std::uint64_t> jnet_mirror_bytes{0};
     std::atomic<std::uint64_t> refusals[static_cast<int>(OuterSegmentRefusal::Count)];
@@ -197,6 +206,7 @@ struct AtomicCounters {
         for (auto& c : refusals) c.store(0, std::memory_order_relaxed);
         for (auto& c : escapes) c.store(0, std::memory_order_relaxed);
         for (auto& c : hostfree_refusals) c.store(0, std::memory_order_relaxed);
+        for (auto& c : graph_refusals) c.store(0, std::memory_order_relaxed);
     }
 };
 
@@ -362,6 +372,14 @@ OuterSegmentCounters snapshotSlotCounters(const AtomicCounters& a) {
     out.hostfree_repairs       = a.hostfree_repairs.load(std::memory_order_relaxed);
     for (int i = 0; i < static_cast<int>(OuterHostFreeRefusal::Count); ++i)
         out.hostfree_refusals[i] = a.hostfree_refusals[i].load(std::memory_order_relaxed);
+    out.graph_segments         = a.graph_segments.load(std::memory_order_relaxed);
+    out.graph_launches         = a.graph_launches.load(std::memory_order_relaxed);
+    out.graph_iterations       = a.graph_iterations.load(std::memory_order_relaxed);
+    out.graph_instantiations   = a.graph_instantiations.load(std::memory_order_relaxed);
+    out.graph_warmup_misses =
+        rasbery::g_graph_warmup_misses.load(std::memory_order_relaxed);
+    for (int i = 0; i < static_cast<int>(OuterGraphRefusal::Count); ++i)
+        out.graph_refusals[i] = a.graph_refusals[i].load(std::memory_order_relaxed);
     out.phis_mirror_bytes       = a.phis_mirror_bytes.load(std::memory_order_relaxed);
     out.jnet_mirror_bytes       = a.jnet_mirror_bytes.load(std::memory_order_relaxed);
     for (int i = 0; i < static_cast<int>(OuterSegmentRefusal::Count); ++i)
@@ -406,6 +424,16 @@ void addCounters(OuterSegmentCounters& into, const OuterSegmentCounters& add) {
     into.hostfree_repairs        += add.hostfree_repairs;
     for (int i = 0; i < static_cast<int>(OuterHostFreeRefusal::Count); ++i)
         into.hostfree_refusals[i] += add.hostfree_refusals[i];
+    into.graph_segments          += add.graph_segments;
+    into.graph_launches          += add.graph_launches;
+    into.graph_iterations        += add.graph_iterations;
+    into.graph_instantiations    += add.graph_instantiations;
+    // NOT summed: the warm-up misses are a PROCESS-wide atomic that every slot's
+    // snapshot already reports in full, so adding them per slot would multiply
+    // the same number by the slot count.
+    into.graph_warmup_misses      = add.graph_warmup_misses;
+    for (int i = 0; i < static_cast<int>(OuterGraphRefusal::Count); ++i)
+        into.graph_refusals[i] += add.graph_refusals[i];
     into.phis_mirror_bytes       += add.phis_mirror_bytes;
     into.jnet_mirror_bytes       += add.jnet_mirror_bytes;
     for (int i = 0; i < static_cast<int>(OuterSegmentRefusal::Count); ++i)
@@ -467,7 +495,23 @@ std::string outerSegmentReceiptJson() {
                     ",\"phis_mirror_bytes\":" + std::to_string(c.phis_mirror_bytes) +
                     ",\"jnet_mirror_bytes\":" + std::to_string(c.jnet_mirror_bytes) +
                     ",\"hostfree_full\":" + std::to_string(outerHostFreeFull() ? 1 : 0) +
-                    ",\"segment_budget\":" + std::to_string(outerSegmentBudget());
+                    ",\"segment_budget\":" + std::to_string(outerSegmentBudget()) +
+                    // Rev.7.1 Task 10 part 4.  iterations_per_launch is printed
+                    // rather than left to the reader because it is THE number
+                    // the WHILE exists to move: it is 1.0 on the stream arm by
+                    // definition (one host launch per outer) and the segment's
+                    // mean outer count on the graph arm.
+                    ",\"graph_arm\":" + std::to_string(outerGraphEnabled() ? 1 : 0) +
+                    ",\"graph_segments\":" + std::to_string(c.graph_segments) +
+                    ",\"graph_launches\":" + std::to_string(c.graph_launches) +
+                    ",\"graph_iterations\":" + std::to_string(c.graph_iterations) +
+                    ",\"iterations_per_launch\":" +
+                    (c.graph_launches == 0
+                         ? std::string("0")
+                         : std::to_string(static_cast<double>(c.graph_iterations) /
+                                          static_cast<double>(c.graph_launches))) +
+                    ",\"graph_instantiations\":" + std::to_string(c.graph_instantiations) +
+                    ",\"graph_warmup_misses\":" + std::to_string(c.graph_warmup_misses);
 
     // Only the non-zero buckets, so a healthy run's line stays readable and a
     // nonzero escape stands out instead of hiding among ten zeros.
@@ -506,6 +550,19 @@ std::string outerSegmentReceiptJson() {
         s += "\"";
         s += outerHostFreeRefusalName(static_cast<OuterHostFreeRefusal>(i));
         s += "\":" + std::to_string(c.hostfree_refusals[i]);
+    }
+    s += "}";
+
+    // Rev.7.1 Task 10 part 4: why the host-free segments still walked the loop.
+    s += ",\"graph_refusals\":{";
+    first = true;
+    for (int i = 0; i < static_cast<int>(OuterGraphRefusal::Count); ++i) {
+        if (c.graph_refusals[i] == 0) continue;
+        if (!first) s += ",";
+        first = false;
+        s += "\"";
+        s += outerGraphRefusalName(static_cast<OuterGraphRefusal>(i));
+        s += "\":" + std::to_string(c.graph_refusals[i]);
     }
     s += "},";
     // Printed ONLY when nothing ran: on a healthy run the reason is "none" and
@@ -717,6 +774,12 @@ struct CudaOuterSegment::Impl {
     /// that cost 169 host outers on kngr_238 in its dhat costume, and it is
     /// cheaper to keep the latch than to audit five return paths.
     bool                reigv_device_claimed = false;
+    /// Rev.7.1 Task 10 part 4: the instantiated outer WHILEs, by shape.
+    ///
+    /// PER RUNNER AND NOT PROCESS-WIDE, because every address the body bakes
+    /// is this runner's -- its segment state, its halt word, its arena slot --
+    /// and a cache shared between slots would hand one deck another's outer.
+    OuterWhileCache     while_cache{};
 };
 
 CudaOuterSegment::CudaOuterSegment() : _impl(new Impl) {}
@@ -826,6 +889,10 @@ bool CudaOuterSegment::initialize(const DeviceArenaView& arena, int slot_count, 
 void CudaOuterSegment::release() {
     if (_impl == nullptr) return;
     rasbery::AllocWindow _alloc_window("outer.segment.release");
+    // Rev.7.1 Task 10 part 4: FIRST, because every cached WHILE bakes the
+    // addresses freed below.  A cache that outlived them would hand the next
+    // arm an exec whose nodes point into freed device memory.
+    _impl->while_cache.release();
     if (_impl->d_probes != nullptr) cudaFree(_impl->d_probes);
     if (_impl->d_segments != nullptr) cudaFree(_impl->d_segments);
     if (_impl->d_halt != nullptr) cudaFree(_impl->d_halt);
@@ -898,6 +965,26 @@ void CudaOuterSegment::setHooks(const OuterSegmentHooks& hooks) { _impl->hooks =
 OuterSegmentHooks CudaOuterSegment::hooks() const { return _impl->hooks; }
 
 bool CudaOuterSegment::bindResidency(const OuterSegmentResidency& residency) {
+    // Rev.7.1 Task 10 part 4: A CHANGED RESIDENCY INVALIDATES EVERY CAPTURED
+    // BODY -- AND ONLY A CHANGED ONE.
+    //
+    // The WHILE's nodes carry the residency's addresses: the flux the H2D
+    // targets, the psi updpsi writes, the jnet the nodal drive reads.  A re-bind
+    // is the one event that can move them without moving the shape key, so it
+    // has to throw the cache away.
+    //
+    // WHAT IT MUST NOT DO IS THROW IT AWAY AT EVERY ARM, and the first
+    // measurement of this arm is why the test is here rather than an
+    // unconditional clear: armOuterSegment runs at every SolveLoop and every
+    // ReconvergeFlux, so kngr_238 re-binds about seventy times -- and with an
+    // unconditional clear it re-instantiated seventy times too, for a residency
+    // whose twelve pointers are the arena's and had not moved once.  The
+    // comparison is a memcmp because the struct is trivially copyable and every
+    // field is load-bearing; padding can only make it say "changed", which
+    // costs an instantiation and cannot cost correctness.
+    static_assert(std::is_trivially_copyable_v<OuterSegmentResidency>);
+    if (std::memcmp(&_impl->residency, &residency, sizeof(residency)) != 0)
+        _impl->while_cache.clear();
     _impl->residency       = residency;
     _impl->residency_bound = false;
     if (!_impl->ready || !_impl->is_bound) return false;
@@ -2216,47 +2303,23 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     // against the plan's 250 ms gate.  At 4.55 us per outer a WHILE over this
     // deck's 12017 outers costs 55 ms of a 60 s run, so the control flow has
     // never been what decides this -- hole (1) is.
-    for (unsigned int i = 0; i < budget; ++i) {
-        // THE PREVIOUS OUTER'S EXIT, AND WHY IT COSTS A SYNCHRONISE.
-        //
-        // The halt gate makes an outer past the exit a sequence of no-op
-        // KERNELS, but two steps of the body are host CALLS -- the nodal drive
-        // and, on the arm that has no stream-ordered drive, the sweep itself --
-        // and a host call cannot read a device word.  Running either on a halted
-        // outer would not be a no-op: the nodal drive would re-solve on the
-        // previous outer's jnet, and a blocking drive would advance the
-        // eigenvalue past the exit the segment already published.
-        //
-        // So the exit is observed here, before anything of this outer is
-        // enqueued.  The sync is on a stream whose only outstanding work is the
-        // tail of the previous outer -- upddhat, the decision, the transition
-        // and three small copies -- all of which ran while the host was in the
-        // nodal drive, so in practice it returns immediately.  It is what bounds
-        // the overrun at ZERO outers rather than the budget - 1 the v1 note
-        // priced at 3.9us.
-        //
-        // Rev.7.1 Task 10 part 3: AND WHY A HOST-FREE SEGMENT DOES NOT PAY IT.
-        // Both of those host calls now refuse a halted outer for themselves --
-        // the nodal drive through NodalView::halt, the sweep through
-        // cmfd_sweep_gate as it always did -- and the third, cusping, is proved
-        // unable to fire for the whole segment before the arm is taken.  With
-        // nothing left in the body that a stale halt could mislead, the exit
-        // does not have to be observed until the segment ends.
-        //
-        // WHAT IT COSTS INSTEAD is the overrun the observation used to prevent:
-        // this segment will enqueue its whole budget whatever the exit says, and
-        // `hostfree_enqueued - hostfree_outers` is how many of those outers were
-        // no-ops.  At a fixed budget that is real launches doing nothing; it is
-        // the conditional WHILE, not this task, that removes them.
-        if (i > 0 && (!hostfree || keep_exit_obs)) {
-            bump(counters().in_body_host_syncs);
-            bump(counters().sync_exit_observation);
-            if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
-                return launchFailed("synchronize on the segment exit", rc);
-            if (m.h_seg != nullptr && m.h_seg->exit != 0u) break;
-        }
-        if (hostfree) bump(counters().hostfree_enqueued);
-
+    // =======================================================================
+    // Rev.7.1 Task 10 part 4: ONE OUTER, AS ONE NAMED THING
+    // =======================================================================
+    //
+    // WHY IT IS A LAMBDA NOW AND WAS THE BODY OF A `for` BEFORE.  The device-side
+    // WHILE (src/GpuOuterWhile.h) has to CAPTURE exactly one outer, and a capture
+    // is a call, not a loop iteration.  Written twice -- once for the stream arm
+    // to run and once for the graph arm to record -- the two would be two
+    // spellings of the same thirty enqueues, and the whole exactness claim of
+    // this task is that they are ONE.  So the loop calls it and the capture calls
+    // it, and neither has a body of its own.
+    //
+    // NOTHING IN IT CHANGED.  The extraction is mechanical: the same statements
+    // in the same order, with the per-pass preamble (the exit observation and the
+    // `hostfree_enqueued` bump, both of which belong to the LOOP and not to the
+    // outer) left behind at the call site.
+    auto runOneOuter = [&](const unsigned int i) -> bool {
         // THE LIVE STATE, RE-READ PER OUTER.
         //
         // Not once per segment: a segment with a budget above one runs outers
@@ -2513,8 +2576,241 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
             !m.hooks.finish_cmfd_sweep(m.hooks.ctx, m.stream, slot, i))
             return hookFailed("the CMFD sweep observation hook");
 
-        if (!runOuterTail(i, reigv_slot, canonical_now, bridge_jnet, jnet_bytes))
-            return false;
+        return runOuterTail(i, reigv_slot, canonical_now, bridge_jnet, jnet_bytes);
+    };
+
+    // =======================================================================
+    // Rev.7.1 Task 10 part 4: IS THIS SEGMENT ONE DEVICE-SIDE WHILE?
+    // =======================================================================
+    //
+    // A STRICT SUBSET OF THE HOST-FREE ARM, asked in the same place and with the
+    // same rule: every term is a property that cannot move inside a segment.
+    // What is added to the ladder above is the four things a CAPTURE needs and a
+    // host loop does not.
+    //
+    //   hostfree            everything that arm proved -- the sweep enqueues,
+    //                       the nodal drive is canonical, cusping cannot fire --
+    //                       the body needs too, and needs frozen, because it is
+    //                       recorded once and replayed.
+    //   batch_width <= 1    A CAPTURE WINDOW IS EXCLUSIVE OF EVERY ALLOCATION IN
+    //                       THE PROCESS (GpuCaptureArbiter.h, and the measurement
+    //                       in its header: four runs in twenty died 1.8 s in).
+    //                       The arbiter serialises the ones it can see, but a
+    //                       batch's whole point is M host threads on one arena
+    //                       and the window here is a whole OUTER wide, not a
+    //                       bucket capture.  Refused by name; the receipt says
+    //                       so, and graph_refusals{"batch":N} is the gate.
+    //   !trace_steps        the per-step tracer synchronises the segment stream
+    //                       and copies device memory to hash it.  Unlike the
+    //                       host-free arm -- where that is merely extra
+    //                       observation -- here it is a host call reading device
+    //                       memory INSIDE the recorded body, which is not a node
+    //                       but a hole.  Refused, and the ON == OFF gate is run
+    //                       untraced anyway.
+    //   budget >= 2         outer 0 runs eagerly (the warm-up rule), so a budget
+    //                       of one leaves nothing to capture.  Not a failure --
+    //                       b1 is a legitimate arm and it simply has no WHILE.
+    //
+    // CY02 needs no entry of its own: the host-free ladder already refuses it by
+    // name (cusping_live), and this ladder refuses whatever that one did.
+    OuterGraphRefusal graph_why = OuterGraphRefusal::None;
+#if RASBERY_HAS_OUTER_WHILE
+    if (!outerGraphEnabled())        graph_why = OuterGraphRefusal::FeatureOff;
+    else if (!hostfree)              graph_why = OuterGraphRefusal::NotHostFree;
+    else if (batch_width > 1)        graph_why = OuterGraphRefusal::Batch;
+    else if (trace_steps)            graph_why = OuterGraphRefusal::Traced;
+    else if (budget < 2u)            graph_why = OuterGraphRefusal::BudgetOne;
+#else
+    // Built against a runtime with no conditional nodes.  Asking for the arm and
+    // silently not getting it is the one answer a receipt must never give.
+    graph_why = outerGraphEnabled() ? OuterGraphRefusal::Unsupported
+                                    : OuterGraphRefusal::FeatureOff;
+#endif
+    const bool graph_arm = graph_why == OuterGraphRefusal::None;
+    bool       graph_ran = false;
+    if (!graph_arm) bump(counters().graph_refusals[static_cast<int>(graph_why)]);
+
+    // Capture outer 1 into a WHILE body, instantiate (or reuse), and launch.
+    //
+    // RETURNS THREE ANSWERS, not two:  1 = the WHILE ran and the caller must
+    // stop walking the loop;  0 = the arm was not taken and the stream loop
+    // continues from outer 1 exactly as it would have;  -1 = a failure the
+    // caller must propagate.
+    //
+    // THE DIFFERENCE BETWEEN 0 AND -1 IS WHERE THE BUILD REFUSED.  Everything up
+    // to record(body) is pure graph plumbing: nothing host-side has moved and
+    // nothing device-side has run, so falling back is free.  From record(body)
+    // on, the body's thirty enqueue helpers HAVE run as host calls -- they moved
+    // the CMFD backend's byte-exact upload shadows and the nodal backend's
+    // residency claims -- while the capture that was to carry their work has
+    // been discarded.  Re-running them on the stream arm would elide uploads
+    // whose bytes never left the host, which is a plausible wrong answer rather
+    // than a slow one.  So that half is a hard stop.
+    auto runGraphWhile = [&]() -> int {
+#if !RASBERY_HAS_OUTER_WHILE
+        return 0;
+#else
+        // THE DYNAMIC PRECONDITION, and it is the flux.  A body captured at
+        // outer 1 has no flux H2D node in it; that is right only if outer 1
+        // would not have issued one.  The host-free arm makes it so (no host
+        // writer of Geometry::Phif inside the segment, so the generation the
+        // eager outer 0 adopted is still live) -- and "makes it so" is checked
+        // here rather than assumed, because a captured upload whose source
+        // generation has moved is the one shape this mechanism must not have.
+        OuterSegmentLiveState live1{};
+        if (m.hooks.read_live_state != nullptr) m.hooks.read_live_state(m.hooks.ctx, live1);
+        const bool flux_current = m.hooks.read_live_state != nullptr &&
+                                  m.resident_flux_generation != 0 &&
+                                  m.resident_flux_generation == live1.flux_generation;
+        if (!flux_current && bound_.host_flux != nullptr && m.residency.flux != nullptr) {
+            bump(counters()
+                     .graph_refusals[static_cast<int>(OuterGraphRefusal::FluxUploadLive)]);
+            return 0;
+        }
+
+        OuterWhileKey key{};
+        key.budget        = budget;
+        key.slot          = slot;
+        key.nxyz          = bound_.nxyz;
+        key.ng            = bound_.ng;
+        key.nsurf         = bound_.geom.nsurf;
+        key.canonical     = bound_.canonical_nodal ? 1u : 0u;
+        key.hostfree_full = outerHostFreeFull() ? 1u : 0u;
+        // THE ONE ADDRESS IN THE BODY THAT CAN MOVE.  Everything else the
+        // capture bakes is an arena pointer, and the arena's contract is that
+        // its addresses never move; the nodal backend allocates its own device
+        // block inside its first drive and re-lays it out when nsurf changes, so
+        // a cached body holding the previous layout's slot would publish 1/eigv
+        // into freed memory.  In the key, it cannot.
+        key.reigv_slot = m.hooks.nodal_reigv_slot != nullptr
+                             ? m.hooks.nodal_reigv_slot(m.hooks.ctx)
+                             : nullptr;
+
+        cudaGraphExec_t exec = m.while_cache.find(key);
+        if (exec == nullptr) {
+            // The scratch stream the ROOT is captured on.  It carries two nodes
+            // and never executes anything: the root graph is LAUNCHED on the
+            // segment stream, and which stream a node was captured on decides
+            // topology, not where it runs.
+            if (m.while_cache.root_stream == nullptr &&
+                (rc = cudaStreamCreateWithFlags(&m.while_cache.root_stream,
+                                                cudaStreamNonBlocking)) != cudaSuccess) {
+                launchFailed("create the WHILE root stream", rc);
+                return -1;
+            }
+            // Before the capture, not after: the splice reads this flag on the
+            // sweep and nodal drive launch sites, both of which are inside the
+            // body about to be recorded.
+            rasbery::graphCapturePossible();
+            const char* stage = "";
+            cudaGraph_t root  = nullptr;
+            {
+                // The arbiter's exclusive window.  Single mode has no sibling to
+                // exclude, so this costs an uncontended lock once per shape --
+                // and it is what makes the refusal above ("batch") a policy
+                // rather than the only thing standing between this capture and a
+                // sibling deck's cudaDeviceSynchronize.
+                rasbery::CaptureWindow window(m.stream, "outer.while");
+                rc = buildOuterWhile(m.while_cache.root_stream, m.stream, m.d_segments,
+                                     m.d_halt, slot, &stage,
+                                     [&](cudaStream_t) { return runOneOuter(1u); },
+                                     &root, &exec);
+            }
+            if (rc != cudaSuccess) {
+                std::fprintf(stderr,
+                             "[RASBERY][OUTER_GPU][WARN] the outer WHILE refused at %s: %s\n",
+                             stage, cudaGetErrorString(rc));
+                cudaGetLastError();
+                bump(counters()
+                         .graph_refusals[static_cast<int>(OuterGraphRefusal::CaptureFailed)]);
+                const bool host_state_moved =
+                    std::strcmp(stage, "BeginCapture(root)") != 0 &&
+                    std::strcmp(stage, "GetCaptureInfo(root)") != 0 &&
+                    std::strcmp(stage, "ConditionalHandleCreate") != 0 &&
+                    std::strcmp(stage, "arm") != 0 &&
+                    std::strcmp(stage, "GetCaptureInfo(arm)") != 0 &&
+                    std::strcmp(stage, "AddNode(while)") != 0 &&
+                    std::strcmp(stage, "UpdateCaptureDependencies") != 0 &&
+                    std::strcmp(stage, "BeginCaptureToGraph(body)") != 0;
+                if (!host_state_moved) return 0;
+                bump(counters().refusals[static_cast<int>(OuterSegmentRefusal::LaunchFailed)]);
+                releaseCanonicalNodal(false);
+                return -1;
+            }
+            // The cap is a leak guard and not a policy, exactly as the nodal
+            // cache's is: a key space wider than expected degrades to
+            // re-instantiating, which is what a tree with no cache would do.
+            if (m.while_cache.entries.size() >= OuterWhileCache::kMax) m.while_cache.clear();
+            m.while_cache.entries.push_back(OuterWhileGraph{key, root, exec});
+            bump(counters().graph_instantiations);
+        }
+
+        if ((rc = cudaGraphLaunch(exec, m.stream)) != cudaSuccess) {
+            launchFailed("launch the outer WHILE", rc);
+            return -1;
+        }
+        bump(counters().graph_launches);
+        graph_ran = true;
+        return 1;
+#endif
+    };
+
+    for (unsigned int i = 0; i < budget; ++i) {
+        // THE ONE PLACE THE GRAPH ARM DIVERGES FROM THE STREAM ARM, and it is
+        // one break.  Outer 0 has run eagerly above (the warm-up rule), its
+        // transition has published outer_in_segment = 1, and everything the body
+        // will bake is now frozen.  What follows is outers 1..N as ONE launch,
+        // with the stop rule -- exit, halt, budget -- evaluated on the device
+        // after each one.
+        if (graph_arm && i == 1u) {
+            const int taken = runGraphWhile();
+            if (taken < 0) return false;
+            if (taken > 0) break;
+            // Not taken, and not a failure: the ladder above says why, and this
+            // segment finishes on the stream arm from outer 1 exactly as it
+            // would have with the feature off.
+        }
+        // THE PREVIOUS OUTER'S EXIT, AND WHY IT COSTS A SYNCHRONISE.
+        //
+        // The halt gate makes an outer past the exit a sequence of no-op
+        // KERNELS, but two steps of the body are host CALLS -- the nodal drive
+        // and, on the arm that has no stream-ordered drive, the sweep itself --
+        // and a host call cannot read a device word.  Running either on a halted
+        // outer would not be a no-op: the nodal drive would re-solve on the
+        // previous outer's jnet, and a blocking drive would advance the
+        // eigenvalue past the exit the segment already published.
+        //
+        // So the exit is observed here, before anything of this outer is
+        // enqueued.  The sync is on a stream whose only outstanding work is the
+        // tail of the previous outer -- upddhat, the decision, the transition
+        // and three small copies -- all of which ran while the host was in the
+        // nodal drive, so in practice it returns immediately.  It is what bounds
+        // the overrun at ZERO outers rather than the budget - 1 the v1 note
+        // priced at 3.9us.
+        //
+        // Rev.7.1 Task 10 part 3: AND WHY A HOST-FREE SEGMENT DOES NOT PAY IT.
+        // Both of those host calls now refuse a halted outer for themselves --
+        // the nodal drive through NodalView::halt, the sweep through
+        // cmfd_sweep_gate as it always did -- and the third, cusping, is proved
+        // unable to fire for the whole segment before the arm is taken.  With
+        // nothing left in the body that a stale halt could mislead, the exit
+        // does not have to be observed until the segment ends.
+        //
+        // WHAT IT COSTS INSTEAD is the overrun the observation used to prevent:
+        // this segment will enqueue its whole budget whatever the exit says, and
+        // `hostfree_enqueued - hostfree_outers` is how many of those outers were
+        // no-ops.  At a fixed budget that is real launches doing nothing; it is
+        // the conditional WHILE, not this task, that removes them.
+        if (i > 0 && (!hostfree || keep_exit_obs)) {
+            bump(counters().in_body_host_syncs);
+            bump(counters().sync_exit_observation);
+            if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
+                return launchFailed("synchronize on the segment exit", rc);
+            if (m.h_seg != nullptr && m.h_seg->exit != 0u) break;
+        }
+        if (hostfree) bump(counters().hostfree_enqueued);
+
+        if (!runOneOuter(i)) return false;
     }
 
     // =======================================================================
@@ -2730,6 +3026,21 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     }
 
     if (hostfree) bump(counters().hostfree_outers, seg_out.outer_in_segment);
+    // Rev.7.1 Task 10 part 4: WHAT THE WHILE DID, COUNTED WHERE THE HOST CAN SEE
+    // IT.  The host was not present for the body iterations -- that is the whole
+    // point -- so the count comes from the device: outer 0 was the eager one and
+    // every committed outer after it was one iteration.  hostfree_enqueued gains
+    // the same number, which is what makes hostfree_enqueued - hostfree_outers
+    // exactly zero on this arm instead of the 21 (or 13,639) the stream arm pays.
+    if (graph_ran) {
+        bump(counters().graph_segments);
+        const std::uint64_t iters =
+            seg_out.outer_in_segment > 0u
+                ? static_cast<std::uint64_t>(seg_out.outer_in_segment) - 1u
+                : 0u;
+        bump(counters().graph_iterations, iters);
+        bump(counters().hostfree_enqueued, iters);
+    }
     resume.device_outers      = seg_out.outer_in_segment;
     resume.next_phase         = seg_out.next_phase;
     resume.escape             = seg_out.escape;

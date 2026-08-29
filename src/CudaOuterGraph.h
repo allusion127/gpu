@@ -552,6 +552,47 @@ inline const char* outerHostFreeRefusalName(OuterHostFreeRefusal r) {
     return "?";
 }
 
+// ---------------------------------------------------------------------------
+// Rev.7.1 Task 10 part 4: why a segment did NOT run as a device-side WHILE
+// ---------------------------------------------------------------------------
+//
+// A STRICT SUBSET OF THE HOST-FREE LADDER ABOVE, which is why `NotHostFree` is
+// one entry and not six: everything the host-free arm refuses for, this refuses
+// for too, and the receipt already says which.  What is added here is the four
+// things a CAPTURE needs that a host-free loop does not -- a runtime with
+// conditional nodes, a process with one deck in it, no tracer synchronising
+// inside the body, and a budget with something left in it after the eager outer
+// 0.  See src/GpuOuterWhile.h for what each one would break.
+enum class OuterGraphRefusal : int {
+    None = 0,
+    FeatureOff,     ///< RASBERY_GPU_OUTER_GRAPH unset or 0
+    Unsupported,    ///< built against a CUDA runtime without conditional nodes
+    NotHostFree,    ///< the arm above refused; the WHILE is a strict subset
+    Batch,          ///< rasberyBatchWidth() > 1: a sibling deck's stand-up
+                    ///< allocates and drains inside this capture's window
+    Traced,         ///< RASBERY_OUTER_TRACE: the tracer synchronises by design
+    BudgetOne,      ///< nothing left to capture after the eager outer 0
+    FluxUploadLive, ///< outer 1 would still upload the flux
+    CaptureFailed,  ///< the build refused; the segment finished on the stream arm
+    Count
+};
+
+inline const char* outerGraphRefusalName(OuterGraphRefusal r) {
+    switch (r) {
+        case OuterGraphRefusal::None:           return "none";
+        case OuterGraphRefusal::FeatureOff:     return "feature_off";
+        case OuterGraphRefusal::Unsupported:    return "unsupported_runtime";
+        case OuterGraphRefusal::NotHostFree:    return "not_hostfree";
+        case OuterGraphRefusal::Batch:          return "batch";
+        case OuterGraphRefusal::Traced:         return "traced";
+        case OuterGraphRefusal::BudgetOne:      return "budget_one";
+        case OuterGraphRefusal::FluxUploadLive: return "flux_upload_live";
+        case OuterGraphRefusal::CaptureFailed:  return "capture_failed";
+        case OuterGraphRefusal::Count:          break;
+    }
+    return "?";
+}
+
 /// What the caller knows about the deck, reduced to the bits eligibility turns
 /// on.  Pure, so the predicate is testable with no device.
 struct OuterSegmentEligibility {
@@ -910,6 +951,28 @@ struct OuterSegmentCounters {
     /// Why a segment did NOT run host-free, by reason.  Indexed by
     /// OuterHostFreeRefusal.
     std::uint64_t hostfree_refusals[static_cast<int>(OuterHostFreeRefusal::Count)] = {};
+    // ---- Rev.7.1 Task 10 part 4: the device-side WHILE -----------------------
+    /// Segments whose outers 1..N-1 ran as ONE conditional graph launch.
+    std::uint64_t graph_segments           = 0;
+    /// cudaGraphLaunch of that root exec.  Exactly one per graph segment, which
+    /// is what makes `graph_iterations / graph_launches` the mean outers a
+    /// single host launch bought.
+    std::uint64_t graph_launches           = 0;
+    /// Body iterations the DEVICE ran, read from seg.outer_in_segment at the
+    /// exit rather than counted by the host -- the host, by construction, was
+    /// not there.
+    std::uint64_t graph_iterations         = 0;
+    /// cudaGraphInstantiate of a WHILE root.  The gate is "a handful per deck":
+    /// one per (budget, slot, mesh, canonical) shape, and a number that tracks
+    /// segment_launches means the key is wrong.
+    std::uint64_t graph_instantiations     = 0;
+    /// A backend that met a graph-cache MISS while the outer body was being
+    /// captured and enqueued its kernels directly instead of opening a nested
+    /// capture.  Exact (the direct enqueue is the same work the graph replays)
+    /// but it means the warm-up rule did not hold -- the gate is 0.
+    std::uint64_t graph_warmup_misses      = 0;
+    /// Why a segment did NOT run as a WHILE.  Indexed by OuterGraphRefusal.
+    std::uint64_t graph_refusals[static_cast<int>(OuterGraphRefusal::Count)] = {};
     /// Bytes returned to Geometry::Phis at a segment exit.
     ///
     /// THE PRICE OF THE ELIDED DOWNLOAD, and it is charged per EXIT rather than

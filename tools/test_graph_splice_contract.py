@@ -37,6 +37,31 @@ ways they can grow back.
      next thing captured on that stream depends on what the child depended on
      rather than on the child: the sweep and updjnet run CONCURRENTLY, which is
      not a slower answer, it is a different one.
+
+Part 4's WHILE adds five more, and each one is a way the capture could stay
+legal while stopping being the outer the stream arm runs.
+
+  6. THE BODY IS THE STREAM ARM'S BODY.  One `runOneOuter` lambda, called by the
+     loop and called by the capture.  Two spellings of thirty enqueues is the
+     one thing that would make ON == OFF an accident.
+
+  7. OUTER 0 IS EAGER AND THE CACHES ARE WARM.  The graph arm engages at
+     `i == 1`, never at 0 -- the warm-up rule -- and both backends REFUSE to
+     open a cache-miss capture on a stream that is already recording, because
+     that is a nested capture and a nested capture is fatal.  They enqueue
+     directly and count it (graphWarmupMiss).
+
+  8. THE STOP RULE HAS ALL THREE TERMS.  exit, halt, budget.  Drop `halt` and a
+     segment whose sweep the device abandoned never increments
+     `outer_in_segment` again: not a wrong answer, an infinite one.
+
+  9. THE CAPTURE IS INSIDE THE ARBITER'S WINDOW, and the arm refuses a batch by
+     name.  A window a whole outer wide, with M sibling Drivers allocating on
+     one arena, is exactly the defect GpuCaptureArbiter.h was written for.
+
+ 10. cudaGraphAddNode IS GUARDED FOR CUDA 13.  Its signature changed (edge data
+     before numDependencies); the 238 server builds with 13.0 and the local box
+     with 12.6, and both must compile.
 """
 from __future__ import annotations
 
@@ -51,6 +76,8 @@ SRC = ROOT / "src"
 SPLICE = SRC / "GpuGraphSplice.h"
 BICG = SRC / "CudaBICGBackend.cu"
 NODAL = SRC / "CudaXsReconBackend.cu"
+WHILE_H = SRC / "GpuOuterWhile.h"
+RUNNER = SRC / "CudaOuterGraph.cu"
 PROBE = ROOT / "tools" / "probe_while_body_capture.cu"
 
 problems: list[str] = []
@@ -90,9 +117,14 @@ def strip_comments(text: str) -> str:
     return re.sub(r'"(?:[^"\\\n]|\\.)*"', '""', text)
 
 
+WHILE_TEXT = read(WHILE_H)
+RUNNER_TEXT = read(RUNNER)
+
 BICG_CODE = strip_comments(BICG_TEXT)
 NODAL_CODE = strip_comments(NODAL_TEXT)
 SPLICE_CODE = strip_comments(SPLICE_TEXT)
+WHILE_CODE = strip_comments(WHILE_TEXT)
+RUNNER_CODE = strip_comments(RUNNER_TEXT)
 
 # ---------------------------------------------------------------------------
 # 1. every cached launch goes through the splice
@@ -242,10 +274,139 @@ elif pos != sorted(pos):
     problems.append("GpuGraphSplice.h: the three splice calls are out of order -- "
                     "GetCaptureInfo, AddChildGraphNode, UpdateCaptureDependencies")
 
+# ---------------------------------------------------------------------------
+# 6. the body the WHILE captures is the body the loop runs
+# ---------------------------------------------------------------------------
+#
+# ONE definition, and both callers name it.  A second spelling of the outer --
+# a capture that re-derives the thirty enqueues instead of calling the lambda --
+# is the one change that would make the ON == OFF table an accident rather than
+# a consequence.
+if RUNNER_CODE.count("auto runOneOuter = [&]") != 1:
+    problems.append("CudaOuterGraph.cu: runOneOuter is not defined exactly once -- the "
+                    "stream arm and the capture must record the SAME body")
+for caller, why in (("if (!runOneOuter(i)) return false;", "the stream loop"),
+                    ("return runOneOuter(1u);", "the WHILE body capture")):
+    if caller.replace(" ", "") not in RUNNER_CODE.replace(" ", ""):
+        problems.append(f"CudaOuterGraph.cu: {why} does not call runOneOuter -- {caller!r}")
+
+# ---------------------------------------------------------------------------
+# 7. outer 0 is eager, and a cache miss inside a capture is not a capture
+# ---------------------------------------------------------------------------
+if "if (graph_arm && i == 1u)" not in RUNNER_CODE:
+    problems.append("CudaOuterGraph.cu: the graph arm does not engage at outer 1 -- the "
+                    "warm-up rule is what stops a cache miss opening a nested capture "
+                    "inside the body")
+# Both backends: the miss path must ASK whether its stream is recording before
+# it opens a capture on it, and it must say so when the answer is yes.
+#
+# The needle is the capture the MISS PATH opens, not the RAII type's own
+# definition: CudaBICGBackend.cu declares ScopedStreamCapture two thousand lines
+# above the site, and a scanner that matched the declaration would report the
+# guard as late no matter where it was put.
+#
+# EVERY capture-opening site is checked, not the first one.  Both backends have
+# more than one (CudaBICGBackend.cu opens one for the BiCG outer graph and one
+# for the sweep), and a rule that looked only at file order would be satisfied
+# by whichever site happened to come first -- which is how the sweep's guard
+# could be deleted and this file still print PASS.
+GUARD_WINDOW = 1500
+for path, code, capture_call in (
+        (BICG, BICG_CODE, "ScopedStreamCapture capture(stream"),
+        (NODAL, NODAL_CODE, "cudaStreamBeginCapture(d.stream")):
+    sites = [m.start() for m in re.finditer(re.escape(capture_call), code)]
+    if not sites:
+        problems.append(f"{path.name}: no {capture_call!r} -- the miss path this rule "
+                        "guards has moved or gone")
+    for at in sites:
+        window = code[max(0, at - GUARD_WINDOW):at]
+        if "rasbery::graphCaptureActive(" not in window:
+            line = code[:at].count("\n") + 1
+            problems.append(
+                f"{path.name}:{line}: this capture is opened without testing "
+                "rasbery::graphCaptureActive first -- a graph-cache miss inside a "
+                "captured outer body would open a NESTED capture, which is fatal")
+        elif "rasbery::graphWarmupMiss()" not in window:
+            line = code[:at].count("\n") + 1
+            problems.append(
+                f"{path.name}:{line}: the guard before this capture does not count the "
+                "miss (rasbery::graphWarmupMiss) -- the gate is graph_warmup_misses 0, "
+                "and an uncounted demotion is a silent one")
+
+# ---------------------------------------------------------------------------
+# 8. the stop rule has all three terms
+# ---------------------------------------------------------------------------
+cond = re.search(r"k_outer_graph_cond\s*\([^)]*\)\s*\{(.{0,600}?)\n\}", WHILE_CODE, flags=re.S)
+cond_body = cond.group(1) if cond else ""
+if not cond:
+    problems.append("GpuOuterWhile.h: no k_outer_graph_cond definition")
+else:
+    for term, why in (
+            ("s.exit", "the segment's own exit latch"),
+            # The PREDICATE, not the local: reading `halt[slot]` into a variable
+            # and then not testing it is exactly the shape a careless edit leaves
+            # behind, and it is the one that never terminates.
+            ("halted == 0u", "the halt word -- without it an abandoned sweep stops "
+                             "incrementing outer_in_segment and the WHILE never "
+                             "terminates"),
+            ("s.outer_in_segment < s.budget", "the budget, which is what makes the "
+                                              "predicate the stream loop's `i < budget`")):
+        if term.replace(" ", "") not in cond_body.replace(" ", ""):
+            problems.append(f"GpuOuterWhile.h: the stop rule does not test {term} -- {why}")
+    if "cudaGraphSetConditional" not in cond_body:
+        problems.append("GpuOuterWhile.h: the stop rule does not write the conditional "
+                        "handle")
+# ONE kernel, used as the arm AND as the body's tail.  Two spellings of a stop
+# rule are two chances to spell it differently.
+if WHILE_CODE.count("k_outer_graph_cond<<<") != 2:
+    problems.append("GpuOuterWhile.h: k_outer_graph_cond is not launched exactly twice "
+                    "(the root's arm node and the body's tail) -- the two questions are "
+                    "the same question and must be the same kernel")
+
+# ---------------------------------------------------------------------------
+# 9. the arbiter's window, and the batch refusal
+# ---------------------------------------------------------------------------
+if "rasbery::CaptureWindow window(m.stream" not in RUNNER_CODE:
+    problems.append("CudaOuterGraph.cu: the WHILE capture is not inside a "
+                    "rasbery::CaptureWindow -- see GpuCaptureArbiter.h for the four runs "
+                    "in twenty that measured why")
+raise_at = RUNNER_CODE.find("rasbery::graphCapturePossible()")
+build_at = RUNNER_CODE.find("buildOuterWhile(")
+if raise_at < 0:
+    problems.append("CudaOuterGraph.cu: nothing raises rasbery::graphCapturePossible() -- "
+                    "the splice inside the body would take the bare-launch path")
+elif build_at >= 0 and raise_at > build_at:
+    problems.append("CudaOuterGraph.cu: graphCapturePossible() is raised after the capture "
+                    "is built; the sweep and nodal launch sites inside the body read it")
+if "OuterGraphRefusal::Batch" not in RUNNER_CODE or "batch_width > 1" not in RUNNER_CODE:
+    problems.append("CudaOuterGraph.cu: the graph arm does not refuse a batch by name")
+for needle, why in (("while_cache.release()", "release() must destroy the cached execs "
+                                              "before the addresses they bake are freed"),
+                    ("while_cache.clear()", "a re-bind changes the residency the bodies "
+                                            "carry and must throw the cache away"),
+                    ("OuterWhileCache::kMax", "an uncapped cache is a leak with a polite "
+                                              "name")):
+    if needle not in RUNNER_CODE and needle not in WHILE_CODE:
+        problems.append(f"the WHILE cache: no {needle} -- {why}")
+
+# ---------------------------------------------------------------------------
+# 10. cudaGraphAddNode is guarded for CUDA 13
+# ---------------------------------------------------------------------------
+add_calls = WHILE_CODE.count("cudaGraphAddNode(")
+if add_calls != 2:
+    problems.append("GpuOuterWhile.h: expected exactly two cudaGraphAddNode spellings (the "
+                    "CUDA 13 form and the 12.x form), found %d" % add_calls)
+if "CUDART_VERSION >= 13000" not in WHILE_TEXT:
+    problems.append("GpuOuterWhile.h: cudaGraphAddNode is not guarded for CUDA 13, whose "
+                    "signature inserts an edge-data pointer before numDependencies")
+
 # The probe is the evidence for all of the above and must stay reachable.
 for needle, why in (("graph_launch_in_capture", "the refusal this header exists for"),
                     ("child_graph_node", "the route it takes instead"),
                     ("fork_join_in_body", "the nodal stream joining the body capture"),
+                    ("exec_update_conditional",
+                     "whether an exec holding a conditional node can be re-pointed -- the "
+                     "row that decided the WHILE keys its instantiation instead"),
                     ("RASBERY_PROBE_DEVICE_LAUNCH",
                      "the opt-in that keeps the hanging sub-probe from taking the run")):
     if needle not in PROBE_TEXT:
