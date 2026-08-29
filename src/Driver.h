@@ -3183,7 +3183,36 @@ private:
             // moving keff by up to 8.2 pcm and the rod step by 0.014.  The rod search already
             // has its own answer to sampling noise -- rodcrit_search_floor raises the search
             // tolerance to 5e-5, above the cusping noise floor -- and that one is validated.
+            // A2 (RASBERY_STAGED_LOOSE_SETTLE=1, default off, staged tolerance
+            // only): the LOOSE stage does not pay for the gate.
+            //
+            // The gate exists so the search reads k_eff off a d-hat that has had
+            // the same chance to settle the flux has.  That argument is about
+            // the sample the search TRUSTS.  Under staging there are two kinds
+            // of sample: the loose ones, which only steer the secant toward the
+            // neighbourhood and are all re-tested at production tolerance before
+            // anything is published, and the polish one, which is the sample the
+            // exit test and the published k_eff are taken from.  The gate is
+            // worth its two outers on the second and is spending them on the
+            // first: measured at RASBERY_STAGED_FLUX_TOL=50 / _XE_TOL=1000 the
+            // settle bucket is 1,199 outers, 21.1 % of the run, having been
+            // 8.5 % before staging -- staging shrank everything else around it.
+            //
+            // The risk it takes is a noisier secant, so it is its own flag and
+            // its own arm: a loosening that costs more search trials than it
+            // saves settle outers is a loss, and that has to be measured rather
+            // than assumed.  It is inert unless staging is on, because with a
+            // single stage `polishing` is true throughout and this is the
+            // original gate exactly.
+            static const bool staged_loose_settle = [] {
+                const char* v = std::getenv("RASBERY_STAGED_LOOSE_SETTLE");
+                if (v == nullptr) return false;
+                const std::string s(v);
+                return !(s.empty() || s == "0" || s == "off" || s == "OFF" ||
+                         s == "false" || s == "FALSE");
+            }();
             if (has_search && schedule.searchType == SearchType::BORON &&
+                !(staged_loose_settle && !polishing) &&
                 clean_iters < SEARCH_SETTLE_ITERS) {
                 ++clean_iters;
                 prev_inner = eigv + 1.0;   // force a real re-drive before the next check
