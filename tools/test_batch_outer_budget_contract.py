@@ -26,11 +26,25 @@ batch could not run it at more than budget 1:
 
 Both are fixed, and this file pins the fixes in the four files that carry them.
 
+WHAT TASK 18c MEASURED, AND WHY THE DEFAULT MOVED BACK.  Both fixes stand; the
+CHOICE Task 18 made on top of them did not.  Routing a batch's sweep through
+`enqueueSweeps` stages ONE slot per launch onto the arena's ONE stream, so a
+batch trades one rendezvous launch of width M for M launches of width 1 -- and
+that width is the entire reason `--batch-mode` exists.  Measured on 238 (RTX PRO
+6000, M64): 224.5 c/h on the rendezvous arm at budget 1, against a run past 2x
+that wall on the stream-ordered arm at budget 8.  The two are exclusive -- a
+budget above one means not returning to the host, and a host rendezvous IS a
+host return -- so the default is the rendezvous and the stream-ordered arm is
+opt-in through RASBERY_GPU_OUTER_BATCH_STREAM_SWEEP.  A SOLO run is unaffected:
+it has no rendezvous to lose, and keeps the stream-ordered sweep unconditionally.
+
 THE EIGHT CHECKS
 
-  1. THE ARM DOES NOT DECIDE THE SWEEP ARM FROM THE BATCH WIDTH.  `stream_sweep`
-     must not be gated on the run being solo; only the choice of WHOSE stream
-     the segment binds may be.
+  1. THE ARM DECIDES THE SWEEP ARM FROM THE BATCH WIDTH *AND AN OPT-IN*, never
+     from the batch width alone.  `solo` alone would make Task 18's arm
+     unreachable; `have_sweep_stream` alone is the M64 regression.  So the
+     expression must carry both `solo` and the opt-in flag, and the flag must
+     default to off.
 
   2. A BATCH DOES NOT BIND THE ARENA STREAM.  M segments on one stream capture
      each other's kernels.  `useStream` may be called with the arena's stream
@@ -104,12 +118,24 @@ def main() -> int:
                         "rasberyBatchWidth(); the batch/solo stream decision has moved or "
                         "gone, and this gate can no longer see which arm a batch gets")
     else:
-        # 1. the sweep arm is about the STREAM's existence, not the batch width.
-        if "const bool stream_sweep = have_sweep_stream;" not in arm:
-            problems.append("Driver.h: `stream_sweep` is not `have_sweep_stream`.  Gating it "
-                            "on `solo` puts a batch back on the blocking sweep hook, which "
-                            "the runner answers by forcing the segment budget to 1 -- and "
-                            "the only visible trace is segment_launches == device_outers")
+        # 1. the sweep arm needs a stream, and a batch needs the opt-in on top.
+        if ("const bool stream_sweep = have_sweep_stream && (solo || batch_stream_sweep);"
+                not in arm):
+            problems.append("Driver.h: `stream_sweep` is not "
+                            "`have_sweep_stream && (solo || batch_stream_sweep)`.  Making it "
+                            "`have_sweep_stream` alone puts every deck of a batch on the "
+                            "stream-ordered sweep, which stages ONE slot per launch: M "
+                            "launches of width 1 instead of one of width M, and 238/M64 "
+                            "lost more than half its throughput to it.  Making it `solo` "
+                            "alone makes the opt-in arm unreachable")
+        if "RASBERY_GPU_OUTER_BATCH_STREAM_SWEEP" not in arm:
+            problems.append("Driver.h: the opt-in that restores Task 18's arm in a batch is "
+                            "gone.  The trade it names reverses at small M, and an arm with "
+                            "no way to ask for it cannot be measured again")
+        opt = body_after(arm, "static const bool batch_stream_sweep", "}();")
+        if 'v != nullptr && std::string(v) != "0"' not in opt:
+            problems.append("Driver.h: the batch stream-sweep opt-in no longer defaults to "
+                            "OFF.  Default-on is the M64 regression with extra steps")
         # 2. ...but the arena stream is still adopted only when solo.
         adopt = body_after(arm, "const bool shared_stream", "if (!shared_stream)")
         if "solo &&" not in adopt:
@@ -182,9 +208,10 @@ def main() -> int:
             print("batch outer budget contract: FAIL " + problem, file=sys.stderr)
         return 1
     py_compile.compile(str(Path(__file__).resolve()), doraise=True)
-    print("batch outer budget contract: PASS (stream arm decided by the stream, arena stream "
-          "solo-only, hook carries it, both streams settled on the fallback, claim + lanes + "
-          "join in place, nodal binding honoured, budget-1 arm intact)")
+    print("batch outer budget contract: PASS (stream arm needs a stream and, in a batch, the "
+          "opt-in; arena stream solo-only, hook carries it, both streams settled on the "
+          "fallback, claim + lanes + join in place, nodal binding honoured, budget-1 arm "
+          "intact)")
     return 0
 
 

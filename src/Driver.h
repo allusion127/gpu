@@ -377,6 +377,7 @@ inline constexpr const char* kArmEnv[] = {
     "RASBERY_GPU_XE_DOT_PARTITIONS",
     "RASBERY_GPU_OUTER",
     "RASBERY_GPU_OUTER_SEGMENT_MAX",
+    "RASBERY_GPU_OUTER_BATCH_STREAM_SWEEP",
     "RASBERY_GPU_WIEL_FOLD",
     "RASBERY_CMFD_OUTER_FORMS",
     "RASBERY_XE_FORMS",
@@ -1507,7 +1508,57 @@ private:
             solo && have_sweep_stream &&
             gpu::rasberyOuterSegment(slot).useStream(ctx.cmfd_solver.sweepStream());
         if (!shared_stream) gpu::rasberyOuterSegment(slot).useStream(nullptr);
-        const bool stream_sweep = have_sweep_stream;
+        // ===================================================================
+        // Rev.7.1 Task 18c: A BATCH TAKES THE RENDEZVOUS BACK, BY DEFAULT
+        // ===================================================================
+        //
+        // Task 18 made `stream_sweep` unconditional -- `have_sweep_stream`
+        // alone -- on the reasoning that the only thing standing between a
+        // batch and a budget of 8 was the enqueue path's refusal to serve a
+        // second live instance.  That reasoning was right about the REFUSAL and
+        // wrong about the COST, and the cost is the whole point of batch mode.
+        //
+        // WHAT THE TWO ARMS ACTUALLY ARE.  The blocking hook routes the
+        // segment's CMFD sweep through CudaBatchArena::solveCommon(kind=1) --
+        // the RENDEZVOUS -- which collects every deck that has reached this
+        // outer and launches ONE batched sweep of width M.  That width is the
+        // entire reason `--batch-mode` is faster than M processes.  The
+        // stream-ordered hook routes it through enqueueSweeps, which stages ONE
+        // slot (`issueSweepUploads(&m, 1, unroll)`, CudaBICGBackend.cu) onto
+        // the arena's ONE stream under `stream_mutex`.  So a batch on the
+        // stream-ordered arm does not run M sweeps concurrently; it runs M
+        // sweeps of width 1, serialised on the host by the claim and on the
+        // device by the stream.
+        //
+        // MEASURED, 238 / RTX PRO 6000 / M64, arm X + RASBERY_GPU_OUTER=1
+        // SEGMENT_MAX=8: 224.5 c/h at Task 18-lite (rendezvous, budget 1)
+        // against a run still unfinished at 2x the wall with the stream-ordered
+        // arm -- at 93 % GPU utilisation, which is what 64 narrow launches back
+        // to back look like.  Locally, 8 decks on a 1080 Ti reproduce the same
+        // sign.
+        //
+        // WHY THE TRADE CANNOT BE SPLIT.  Budget > 1 means the segment runs
+        // outer i+1 on the device without returning to the host, and a HOST
+        // rendezvous is a host return by definition.  So the two are exclusive:
+        // width M at budget 1, or width 1 at budget 8.  At M=64 the width is
+        // worth far more than the budget, and it is worth more the wider the
+        // batch gets -- which is the direction this campaign is going.
+        //
+        // WHAT IS KEPT.  Everything in Task 18 except this one choice: the
+        // claim, the per-slot staging lanes and the event join stay (they are
+        // what make the opt-in arm CORRECT, and they cost nothing when it is
+        // off), and the batched nodal arena still honours the canonical binding
+        // -- so a batch keeps `jnet_bridge_bytes` 0 on either arm.  A solo run
+        // is untouched: it has no rendezvous to lose.
+        //
+        // THE OPT-IN EXISTS because the trade reverses at small M and on a
+        // device that cannot fill itself from one deck.  RASBERY_GPU_OUTER_
+        // BATCH_STREAM_SWEEP=1 restores Task 18's arm exactly.
+        static const bool batch_stream_sweep = [] {
+            const char* v = std::getenv("RASBERY_GPU_OUTER_BATCH_STREAM_SWEEP");
+            return v != nullptr && std::string(v) != "0";
+        }();
+        const bool stream_sweep = have_sweep_stream && (solo || batch_stream_sweep);
 
         gpu::OuterSegmentHooks hooks;
         hooks.enqueue_cmfd_sweep =
@@ -1622,9 +1673,17 @@ private:
         if (!canonical_said[said_i].exchange(true, std::memory_order_relaxed)) {
             std::fprintf(stderr,
                          "[RASBERY][OUTER_GPU] slot=%d canonical_nodal=%d nodal_on_device=%d "
-                         "rod_fallback_at_arm=%d\n",
+                         "rod_fallback_at_arm=%d sweep_arm=%s\n",
                          slot, canonical_nodal ? 1 : 0, nodal_on_device ? 1 : 0,
-                         ctx.nodal_solver.DeviceDriveEligible() ? 0 : 1);
+                         ctx.nodal_solver.DeviceDriveEligible() ? 0 : 1,
+                         // Rev.7.1 Task 18c: WHICH SWEEP ARM THIS DECK GOT, on
+                         // the line that already reports what the arm decided.
+                         // A batch on `stream` has traded one rendezvous launch
+                         // of width M for M launches of width 1, and that trade
+                         // is the difference between 224.5 c/h at M64 and less
+                         // than half of it.  Naming it here means an operator
+                         // never has to infer the arm from a wall time.
+                         stream_sweep ? "stream" : "rendezvous");
         }
         // The residency flag is NOT set here.  It belongs to the segment's own
         // drive() and is raised and lowered around it in outerSweepHook; a flag
