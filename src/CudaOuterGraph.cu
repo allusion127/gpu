@@ -2546,20 +2546,6 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         if (!m.hooks.finish_cmfd_sweep_deferred(m.hooks.ctx, m.h_sweep_accum, slot))
             return hookFailed("the deferred CMFD sweep observation hook");
 
-        // THE OUTER THE DEVICE ABANDONED STILL OWES ITS TAIL.
-        //
-        // sweep state 0 or 2: the verdict kernel raised the segment's halt, so
-        // that outer's updjnet, nodal drive, upddhat, refresh, decision and
-        // transition were all no-ops, and every outer enqueued behind it was a
-        // no-op too.  The host has just finished the drive verbatim and
-        // republishAfterHostSweep has taken the halt off, so the device state is
-        // exactly what it was when that sweep ended -- which is where the tail
-        // starts.  Running it here commits that outer, which is what the
-        // per-outer arm does in place.
-        //
-        // ONE PASS AND THEN THE SEGMENT ENDS.  The outers past it were never
-        // committed and the budget is spent; the caller's next segment picks up
-        // from the state this one leaves.
         // THE OBSERVATION MOVED Geometry::Phif's GENERATION, and the elision has
         // to be told.  finishDeferredDrives is handed PhifMutable(), which is
         // what makes it a declared writer, so without this re-read the NEXT
@@ -2574,6 +2560,20 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                 after_obs.device_owns_flux ? after_obs.flux_generation : 0;
         }
 
+        // THE OUTER THE DEVICE ABANDONED STILL OWES ITS TAIL.
+        //
+        // sweep state 0 or 2: the verdict kernel raised the segment's halt, so
+        // that outer's updjnet, nodal drive, upddhat, refresh, decision and
+        // transition were all no-ops, and every outer enqueued behind it was a
+        // no-op too.  The host has just finished the drive verbatim and
+        // republishAfterHostSweep has taken the halt off, so the device state is
+        // exactly what it was when that sweep ended -- which is where the tail
+        // starts.  Running it here commits that outer, which is what the
+        // per-outer arm does in place.
+        //
+        // ONE PASS AND THEN THE SEGMENT ENDS.  The outers past it were never
+        // committed and the budget is spent; the caller's next segment picks up
+        // from the state this one leaves.
         if (m.sweep_host_continued) {
             bump(counters().hostfree_repairs);
             double* const repair_reigv_slot =

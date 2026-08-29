@@ -1585,6 +1585,19 @@ Rev.7.1: 이 봉쇄를 삭제한다. W3.6(Task 13a)이 interim-Xe device 발화�
 - [ ] **Step 8 (개정): host observation 감소 측정** — 목표를 `host 수치 0`(M1) + `host observation 감소 ≥95%`로 명시한다.
 - [ ] **Step 8b (신설): trace replay 예측 대조** — W0 Task 0 Step 10이 산출한 idle/tail 예측치와 실측을 대조한다. 편차가 크면 예측 모델을 폐기하고 실측 기반으로 정책을 재선택한다. **W3 종료 게이트의 나머지 절반.**
 
+- [x] **Step 9 (신설, 2026-08-30): part 3 — host-free outer.** 커밋 `984e4ca`(mirror commit-at-issue) + `1535daf`. 상세는 `docs/TASK10_HOSTFREE_OUTER_20260830_KO.md`.
+
+sweep 관측(`BICGCMFD::finishDrive`)을 outer당 1회에서 **세그먼트당 1회**로 내렸다. 같이 움직여야 했던 것이 넷이다 — (a) 다음 sweep의 eigv/reigv/reigvs/errl2를 device probe에서 쓰는 `cmfd_sweep_patch`(세그먼트 첫 outer는 제외), (b) `cmfd_sweep_verdict`가 halt 게이트 뒤에서 유지하는 세그먼트 누산기와 그것으로 `_wiel_sweep`/`iter`/`_bicg_iters`를 복원하는 `BICGCMFD::finishDeferredDrives`, (c) `NodalView::halt` — nodal drive는 idempotent가 아니므로(횡방향 누설을 jnet에서 만들고 마지막 phase가 jnet을 쓴다) exit를 지난 outer에서 반드시 no-op이어야 한다, (d) drain이 겸하고 있던 segment→nodal handover를 event로 대체(`XsReconBackend::waitOnSegmentEvent`).
+
+```text
+RASBERY_GPU_OUTER_HOSTFREE=1        기본 ON.  sync_pre_nodal → 세그먼트당 0
+RASBERY_GPU_OUTER_HOSTFREE_FULL=1   기본 OFF. exit 관측까지 제거 → in-body 동기화 0
+```
+
+FULL이 기본 OFF인 것은 **실측 판정**이다: exit word를 보지 않으면 세그먼트가 멈출 수 없어 매번 budget 전부를 enqueue하고 나머지는 halt gate가 no-op으로 만든다(kngr3 b8: 실 outer 638에 no-op 2322, 4.29 s → 7.45 s, bit-exact). 이 낭비를 없애는 것이 Step 1~3의 conditional WHILE이고, **FULL arm이 그 전제**다 — body 안에 device 메모리를 읽는 host call이 없고, H2D node 집합이 고정이며, nodal drive가 halt로 gating된다. 남은 구멍은 nodal drive가 여전히 `cudaGraphLaunch`를 부르는 host call이라는 점 하나다.
+
+exactness 계약에 invariant 10 신설, invariant 4에 outbound event 절 추가.
+
 ## Task 11: GPU Rod Cusping and Fractional-Rod Nodal Path
 
 **[Rev.7.1 수정]** — **W5+ 재판정 대상.** 본문 Rev.7 유지. 단 Step 3의 커널 매핑에 `RodOp` phase(Driver.h:2252-2255) 연결을 추가한다(M2 요건, §9.2).
