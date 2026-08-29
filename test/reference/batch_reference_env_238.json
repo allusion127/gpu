@@ -1,0 +1,86 @@
+{
+  "_provenance": {
+    "what": "The environment of the RAW production line on the 238 host: the M64 light batch that measured 582 cases/hour at 12.3 GB device peak. It is the number every dispatcher arm is compared against, so it is the number the dispatcher has to be able to reproduce with no --set flags at all.",
+    "command": "taskset --cpu-list 0-23 RASBERY --rasi <64 decks> --raso <64 outputs> --batch-mode 64",
+    "host": "238 server, 24-core host, one RTX PRO 6000, GPU0 only",
+    "measured_cases_per_hour": 582.0,
+    "measured_device_peak_gb": 12.3,
+    "batch_width": 64,
+    "procs_per_gpu": 1,
+    "recorded_by": "tools/run_multi_gpu_batch.py runner, from the raw line's own `env | grep -E '^(RASBERY_|OMP_|CUDA_|MKL_|KMP_|GOMP_)'` dump",
+    "no_host_identifiers": "paths, hostnames and addresses are deliberately absent; see ignored_keys"
+  },
+
+  "env": {
+    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+    "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+    "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": "100",
+    "CUDA_VISIBLE_DEVICES": "0",
+    "GOMP_SPINCOUNT": "0",
+    "KMP_BLOCKTIME": "0",
+    "MKL_NUM_THREADS": "1",
+    "OMP_DYNAMIC": "FALSE",
+    "OMP_MAX_ACTIVE_LEVELS": "1",
+    "OMP_NESTED": "FALSE",
+    "OMP_NUM_THREADS": "64",
+    "OMP_STACKSIZE": "128M",
+    "OMP_THREAD_LIMIT": "64",
+    "OMP_WAIT_POLICY": "PASSIVE",
+    "RASBERY_BATCH_HOST_THREADS": "64",
+    "RASBERY_BATCH_WAIT_MAX_US": "2000",
+    "RASBERY_BATCH_WAIT_US": "auto",
+    "RASBERY_GPU": "1",
+    "RASBERY_GPU_CMFD_RESIDENT_SINGLE": "1",
+    "RASBERY_GPU_CMFD_SWEEP": "1",
+    "RASBERY_GPU_FLATXS": "1",
+    "RASBERY_GPU_NODAL": "1",
+    "RASBERY_GPU_NODAL_FULL": "1",
+    "RASBERY_GPU_RB_SWEEPS": "4",
+    "RASBERY_GPU_WIEL_FOLD": "chunked",
+    "RASBERY_GPU_XE": "1",
+    "RASBERY_GPU_XSRECON": "1",
+    "RASBERY_OMP_THREADS": "64",
+    "RASBERY_PC_MODE": "decart",
+    "RASBERY_STAGED_FLUX_TOL": "50",
+    "RASBERY_STAGED_LOOSE_SETTLE": "1",
+    "RASBERY_STAGED_XE_TOL": "1000",
+    "RASBERY_XE_ANDERSON": "1"
+  },
+
+  "width_derived_keys": {
+    "RASBERY_BATCH_HOST_THREADS": "batch_width",
+    "RASBERY_OMP_THREADS": "batch_width",
+    "OMP_NUM_THREADS": "batch_width",
+    "OMP_THREAD_LIMIT": "batch_width",
+    "_why": "The reference's four 64s are the ARENA WIDTH, not the constant 64 and not the core count. A K-process arm of width 16 wants 16, which is what the dispatcher derives. RASBERY_BATCH_HOST_THREADS is the one the reference leaves UNSET: main.cpp:698 then computes min(batch_width, jobs) = 64 by itself. The harness states it explicitly instead, because a declared number is what the [RASBERY][BATCH_HOST] receipt audit can check; the value is identical."
+  },
+
+  "operator_env": {
+    "RASBERY_ALLOW_SCREENING": "1",
+    "RASBERY_BATCH_LIGHT_RESULT": "1",
+    "RASBERY_BATCH_RECEIPT_JSONL": "batch_light_receipts.jsonl",
+    "_why": "The reference exported these for its light arm. The harnesses must NOT set them: `--result light` on the command line is main.cpp's own equivalent of RASBERY_BATCH_LIGHT_RESULT (main.cpp:399), the receipt path is a path, and RASBERY_ALLOW_SCREENING is a permission -- a harness that grants itself permission to run a screening job is not a guard. The operator exports it; the dispatcher refuses the run before the queue is claimed if they did not."
+  },
+
+  "harness_removed": {
+    "OMP_PROC_BIND": "The old DEFAULT_ENV forced TRUE; the reference sets neither this nor OMP_PLACES. --pin-omp restores them. Note that RASBERY sets both itself and re-execs (main.cpp:286-287), with overwrite, so the child is bound either way -- what changed is whether the declared environment matches the run.",
+    "OMP_PLACES": "See OMP_PROC_BIND.",
+    "RASBERY_BATCH_WAIT_US_zero": "The old DEFAULT_ENV forced \"0\" (never linger). The reference runs the bounded adaptive linger, `auto` with RASBERY_BATCH_WAIT_MAX_US=2000 (CudaBICGBackend.cu:4705-4722). A rendezvous that never lingers is one way a 64-slot arena gathers three participants.",
+    "RASBERY_NODAL_BATCH_WAIT_US": "The old DEFAULT_ENV stated \"0\"; the reference sets no nodal wait key and the arena's own default is already 0 (CudaXsReconBackend.cu:1637), so stating it bought nothing.",
+    "RASBERY_PPR_MODE": "The old DEFAULT_ENV forced \"master\" and the reference does not set it -- an undeclared deviation, and not a free one: pin-power reconstruction runs on every statepoint (Driver.h:4166 ff), light result or not, so the mode moves the throughput as well as the pin powers. MASTER-comparison campaigns now pass --set RASBERY_PPR_MODE=master explicitly."
+  },
+
+  "ignored_keys": [
+    "LD_LIBRARY_PATH",
+    "MAMBA_ROOT_PREFIX",
+    "PATH",
+    "PWD",
+    "RASBERY_BATCH_RECEIPT_JSONL",
+    "RASBERY_CANDIDATE_ID",
+    "RASBERY_CYCLE_ID",
+    "RASBERY_OMP_ENV_READY",
+    "RASBERY_STARTUP_CPUS",
+    "RASBERY_STARTUP_STAMP_NS"
+  ],
+  "ignored_keys_why": "Paths, the operator's workdir, and the keys RASBERY stamps into its own re-exec'd image (main.cpp:266-303). None of them is a physics or a scheduling decision, and half of them cannot be compared across two hosts at all."
+}

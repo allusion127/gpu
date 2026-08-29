@@ -191,7 +191,9 @@
   `test_device_outer_exactness_contract.py`(1,326줄, 불변식 10),
   `test_device_outer_state_machine.py`(1,397줄), `test_graph_splice_contract.py`(규칙 10),
   `test_gpu_capture_arbiter_contract.py`, `test_staged_tolerance.py`,
-  `test_telemetry_neutrality.py`, `test_batch_refill_contract.py`, `test_multi_gpu_dispatch.py`
+  `test_telemetry_neutrality.py`, `test_batch_refill_contract.py`, `test_multi_gpu_dispatch.py`,
+  `test_harness_env_parity.py`(하네스가 해석한 자식 환경 = 238 원시 생산 라인의 환경,
+  `test/reference/batch_reference_env_238.json` 기준)
 - **ctest 12종**: `test/*.cpp` / `*.cu` replay·probe 바이너리
   (`xsrecon_consistency`, `gpu_arena_layout`, `gpu_phase_compaction`, `nodal_constant_gpu_replay`,
   `cmfd_outer_form_probe`, `cmfd_outer_replay`, `xe_form_probe`, `canonical_state`,

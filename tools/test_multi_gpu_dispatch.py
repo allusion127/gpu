@@ -92,13 +92,49 @@ with tempfile.TemporaryDirectory() as tmp:
           "Queue: the state file must record the total")
 
 # --- the host split ---------------------------------------------------------
+#
+# CORES are partitioned; LANES are not.  A Driver lane is blocked on the GPU
+# rendezvous nearly all of its life, so capping the lanes at the per-process
+# core count caps the ACHIEVABLE rendezvous width before the run starts.  That
+# cap is what made this dispatcher's own single-GPU control measure 115.6 c/h
+# where the raw production line measured 582 with the same binary, the same
+# decks and the same physics env (width_fill 0.03).
 budget = mg.plan_host_budget(
     gpus=["0", "1", "2", "3"], batch_width=64, visible_cpus=96,
     pin="taskset", driver_workers=None, solver_threads=None,
 )
 check(budget.cpus_per_gpu == 24, f"host budget: cpus_per_gpu={budget.cpus_per_gpu}, expected 24")
-check(budget.driver_workers == 24,
-      f"host budget: driver_workers={budget.driver_workers}, expected the CPU share (24)")
+check(budget.driver_workers == 64,
+      f"host budget: driver_workers={budget.driver_workers}, expected the ARENA WIDTH (64) "
+      "-- the executable's own default with RASBERY_BATCH_HOST_THREADS absent "
+      "(main.cpp:698), which is what the reference line runs. Capping at the 24-core "
+      "share is the defect, not the policy")
+check(budget.solver_threads == 64,
+      f"host budget: solver_threads={budget.solver_threads}, expected the arena width "
+      "(the reference's RASBERY_OMP_THREADS=64 at width 64)")
+check(budget.worker_policy == "binary_default_width",
+      f"host budget: worker_policy={budget.worker_policy!r} must name the policy in the "
+      "receipt, or a silent change of default is invisible in the log")
+
+# --no-oversubscribe restores the OLD policy, deliberately and by name.
+capped = mg.plan_host_budget(
+    gpus=["0", "1", "2", "3"], batch_width=64, visible_cpus=96,
+    pin="taskset", driver_workers=None, solver_threads=None, oversubscribe=False,
+)
+check(capped.driver_workers == 24 and capped.worker_policy == "no_oversubscribe_cpu_capped",
+      f"--no-oversubscribe must give back the CPU-capped policy: "
+      f"{capped.driver_workers} / {capped.worker_policy!r}")
+check(capped.cpu_sets == budget.cpu_sets,
+      "--no-oversubscribe must change the LANE count only: the cores are partitioned by "
+      "taskset either way, and two processes sharing a taskset range is a different bug")
+
+explicit = mg.plan_host_budget(
+    gpus=["0"], batch_width=64, visible_cpus=24, pin="taskset",
+    driver_workers=32, solver_threads=7,
+)
+check(explicit.driver_workers == 32 and explicit.solver_threads == 7
+      and explicit.worker_policy == "explicit",
+      "--driver-workers/--solver-threads must win over both policies")
 # Disjoint CPU sets: two processes pinned to the same places oversubscribe by
 # exactly the factor OMP_PROC_BIND makes invisible.
 flat = [cpu for cpus in budget.cpu_sets for cpu in cpus]
@@ -128,6 +164,35 @@ check(none.driver_workers == 4,
 # --- the writer budget is the plan's, stated once ---------------------------
 check(mg.WRITER_THREADS_PER_PROCESS == 8,
       "the plan Sec 13.3 host budget is writer ~8 threads per process")
+
+# --- the child environment is resolved in ONE place and PRINTED -------------
+#
+# An env mismatch between this dispatcher and the raw production line is the
+# only defect class here that produces no error, no [FAIL] line and no bad
+# receipt -- only a throughput number that reads like physics.  It cost three
+# L5 sweeps (103-116 c/h) that were reported as data.  So: one resolver, shared
+# with the single-GPU harness, and the resolved set printed before the run.
+source = (root / "tools" / "run_multi_gpu_batch.py").read_text(encoding="utf-8")
+check("resolve_profile_env" in source and "env.update(result.env)" in source,
+      "the child env must come from run_single_gpu_batch.resolve_profile_env(), not be "
+      "reassembled here: a difference between the two harnesses' defaults is invisible "
+      "in every receipt either of them prints")
+check("[RASBERY][MULTI_GPU][ENV]" in source and '"env": r.env' in source,
+      "the resolved per-process env must be printed BEFORE the run ([MULTI_GPU][ENV]) and "
+      "recorded in the [MULTI_GPU][PROC] receipt, so a mismatch is visible before the "
+      "seven minutes rather than after them")
+
+with tempfile.TemporaryDirectory() as tmp:
+    work = Path(tmp)
+    manifest = work / "one.txt"
+    manifest.write_text("d0.json out/d0.h5\n", encoding="utf-8")
+    rc = mg.main(["--gpus", "0", "--batch-width", "64", "--jobs", str(manifest),
+                  "--workdir", str(work / "run"), "--pin", "none",
+                  "--device-memory-gb", "64", "--print-env", "--", sys.executable])
+    check(rc == 0, f"--print-env must resolve and exit 0 (rc={rc})")
+    check(not (work / "run" / "gpu0.p0.chunk0001.txt").exists(),
+          "--print-env must not claim the queue or write a chunk manifest: it is a "
+          "pre-flight check, and a pre-flight that consumes jobs is not one")
 
 # --- claim policy -----------------------------------------------------------
 source = (root / "tools" / "run_multi_gpu_batch.py").read_text(encoding="utf-8")
@@ -177,8 +242,12 @@ check(len(flat4) == len(set(flat4)),
       "K>1: CPU sets overlap between the processes on one GPU")
 check(mg.pin_prefix(k4, 0)[2] == "0-5" and mg.pin_prefix(k4, 3)[2] == "18-23",
       f"K>1: taskset ranges must tile the host: {[mg.pin_prefix(k4, i)[2] for i in range(4)]!r}")
-check(k4.driver_workers == 6,
-      f"K>1: driver_workers={k4.driver_workers}, expected min(width 16, cpus_per_proc 6)")
+check(k4.driver_workers == 16,
+      f"K>1: driver_workers={k4.driver_workers}, expected the WIDTH PER PROCESS (16). The "
+      "cores are split K ways; the lanes are not, because a lane is GPU-wait-blocked and "
+      "K arenas of 16 slots still need 16 lanes each to fill")
+check(k4.solver_threads == 16,
+      f"K>1: solver_threads={k4.solver_threads}, expected the width per process (16)")
 check(k4.solver_threads >= 1, "K>1: a zero solver thread count is a silently serial solver")
 
 # Negative control: the same GPU list with K=1 must get a STRICTLY larger share

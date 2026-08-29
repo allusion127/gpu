@@ -81,6 +81,7 @@ from run_single_gpu_batch import (  # noqa: E402
     check_run_receipts,
     parse_overrides,
     path_key,
+    resolve_profile_env,
     visible_cpu_threads,
 )
 
@@ -264,6 +265,7 @@ class HostBudget:
     writer_threads: int
     cpu_sets: list[list[int]]
     pin: str
+    worker_policy: str = "binary_default_width"
 
     @property
     def cpus_per_gpu(self) -> int:
@@ -280,40 +282,63 @@ def plan_host_budget(
     driver_workers: int | None,
     solver_threads: int | None,
     procs_per_gpu: int = 1,
+    oversubscribe: bool = True,
 ) -> HostBudget:
     """Split the host between the RASBERY processes (plan Sec 13.3, Sec 5.5).
 
-    The split is by CPU COUNT, not by preference: two processes that both think
-    they own all 96 cores oversubscribe by 2x, and OMP_PROC_BIND=TRUE then pins
-    their threads onto the same places.  That costs more than the GPU work it is
-    feeding, and it is invisible in any per-GPU receipt.
+    TWO RESOURCES, SPLIT DIFFERENTLY.  The CORES are partitioned: with K
+    processes on a device, each gets visible_cpus // (G*K) of them and a taskset
+    range that does not overlap anybody else's, because two processes that both
+    believe they own all 96 cores really do oversubscribe by 2x on the
+    CPU-bound parts and that contention is what L5 exists to remove.
 
-    With `--procs-per-gpu K` the denominator is the PROCESS count, G*K, not the
-    GPU count.  L5 exists because the host is the bottleneck; handing K
-    processes the whole host each would recreate the contention it is meant to
-    remove, one layer up.
+    The LANES are not.  `RASBERY_BATCH_HOST_THREADS` is the number of Driver
+    refill lanes, and a lane is not a CPU worker: it spends nearly all of its
+    life blocked on the GPU rendezvous, and the arena can only gather the lanes
+    that are inside it.  So the default is the EXECUTABLE's own default --
+    min(batch_width, jobs), main.cpp:698 -- i.e. one lane per arena slot,
+    regardless of how many cores the process was given.  That is what the raw
+    238 production line runs (64 lanes on 24 cores, 582 c/h), and capping the
+    lanes at the core count instead is what made this dispatcher's own control
+    arm measure 115.6 c/h with the same binary and the same decks: 24 lanes
+    cannot fill 64 slots, so `width_fill` collapsed to 0.03.
 
-    The two thread budgets are derived from that per-process share and not from
-    it directly: RASBERY_BATCH_HOST_THREADS is the number of Driver refill
-    lanes (capped at the arena width, because main.cpp will not run more
-    Drivers than there are slots) and RASBERY_OMP_THREADS is what EACH of those
-    lanes may spend inside its solver region.  Setting the latter to the whole
-    per-process core count would oversubscribe by the lane count, which is the
-    exact mistake the split is here to prevent.
+    What keeps 64 lanes on 24 cores from exploding is OMP_MAX_ACTIVE_LEVELS=1
+    (DEFAULT_ENV): the lanes do not spawn nested solver teams, so the thread
+    count is the lane count and the lanes are mostly blocked.
+
+    `oversubscribe=False` (--no-oversubscribe) restores the old CPU-capped
+    policy as a deliberate arm, and `driver_workers` states a count outright.
+    `RASBERY_OMP_THREADS` defaults to the arena width per process -- the
+    reference's 64 at width 64 -- rather than to a share of the cores.
     """
     n_gpus = len(gpus)
     procs_per_gpu = max(1, procs_per_gpu)
     processes = n_gpus * procs_per_gpu
     cpus_per_proc = max(1, visible_cpus // processes)
-    # The Driver workers are the refill lanes; capping them at the arena width
-    # matches main.cpp, which will not run more Drivers than there are slots.
-    workers = driver_workers if driver_workers else min(batch_width, cpus_per_proc)
+    if driver_workers:
+        workers, policy = driver_workers, "explicit"
+    elif oversubscribe:
+        # main.cpp caps at min(batch_width, jobs) itself; the chunk size is not
+        # known here, so declare the width and let the executable do the rest.
+        workers, policy = batch_width, "binary_default_width"
+    else:
+        workers, policy = min(batch_width, cpus_per_proc), "no_oversubscribe_cpu_capped"
     workers = max(1, min(workers, batch_width))
-    # What is left of this process's share, after the writer pool, is what the
-    # per-Driver solver regions may spend.  At least 1: a zero would be a
-    # silently serial solver.
-    spare = max(0, cpus_per_proc - workers - WRITER_THREADS_PER_PROCESS)
-    threads = solver_threads if solver_threads else max(1, min(3, 1 + spare // max(1, workers)))
+    if solver_threads:
+        threads = solver_threads
+    elif oversubscribe:
+        # The reference sets OMP_NUM_THREADS = OMP_THREAD_LIMIT =
+        # RASBERY_OMP_THREADS = the arena width (tools/ga_two_stage_40x_pipeline
+        # .py:209-212 does the same).  One active level makes it a ceiling, not
+        # a multiplier.
+        threads = batch_width
+    else:
+        # What is left of this process's share, after the writer pool, is what
+        # the per-Driver solver regions may spend.  At least 1: a zero would be
+        # a silently serial solver.
+        spare = max(0, cpus_per_proc - workers - WRITER_THREADS_PER_PROCESS)
+        threads = max(1, min(3, 1 + spare // max(1, workers)))
 
     sets: list[list[int]] = []
     if pin != "none":
@@ -331,6 +356,7 @@ def plan_host_budget(
         writer_threads=WRITER_THREADS_PER_PROCESS,
         cpu_sets=sets,
         pin=pin,
+        worker_policy=policy,
     )
 
 
@@ -656,6 +682,11 @@ class WorkerResult:
     refill_receipts: list[dict] = field(default_factory=list)
     occupancy_receipts: list[dict] = field(default_factory=list)
     wall_s: float = 0.0
+    # The env this worker's children were actually launched with, on top of the
+    # inherited one.  Carried into the [PROC] receipt: an environment mismatch
+    # is the one defect that shows up as a THROUGHPUT number and nothing else,
+    # so the run has to say what it ran with, not what it meant to.
+    env: dict[str, str] = field(default_factory=dict)
 
     @property
     def mean_width(self) -> float:
@@ -712,6 +743,7 @@ def run_worker(
     cwd: Path | None,
     overrides: dict[str, str],
     extra_env: dict[str, str],
+    pin_omp: bool,
     dry_run: bool,
 ) -> WorkerResult:
     """One process SEQUENCE: claim, run, repeat, on device *gpu* as slot *proc*."""
@@ -719,6 +751,15 @@ def run_worker(
     result = WorkerResult(
         gpu=gpu, proc=proc, index=index,
         cpus=f"{cpus[0]}-{cpus[-1]}" if cpus else "",
+        env=resolve_profile_env(
+            batch_width=batch_width,
+            driver_workers=budget.driver_workers,
+            solver_threads=budget.solver_threads,
+            gpu=gpu,
+            pin_omp=pin_omp,
+            extra=extra_env,
+            overrides=overrides,
+        ),
     )
     started = time.monotonic()
     chunk_index = 0
@@ -764,12 +805,7 @@ def run_worker(
         )
 
         env = os.environ.copy()
-        env.update(DEFAULT_ENV)
-        env["CUDA_VISIBLE_DEVICES"] = gpu
-        env["RASBERY_BATCH_HOST_THREADS"] = str(budget.driver_workers)
-        env["RASBERY_OMP_THREADS"] = str(budget.solver_threads)
-        env.update(extra_env)
-        env.update(overrides)
+        env.update(result.env)
 
         command = (
             pin_prefix(budget, index)
@@ -893,9 +929,40 @@ def parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--pin", default="taskset", choices=("taskset", "numactl", "none"),
                    help="how each process is bound to its CPU share")
-    p.add_argument("--driver-workers", type=int,
-                   help="Driver refill lanes per process; default min(width, cpus/process)")
-    p.add_argument("--solver-threads", type=int, help="RASBERY_OMP_THREADS per process")
+    p.add_argument(
+        "--driver-workers", type=int,
+        help="Driver refill lanes per process. Default is the ARENA WIDTH -- the "
+        "executable's own default with RASBERY_BATCH_HOST_THREADS absent "
+        "(main.cpp:698), which is what the 582 c/h reference line runs. It "
+        "oversubscribes the process's cores on purpose: a lane is blocked on the GPU "
+        "rendezvous nearly all of its life, so lanes are not CPU workers, and capping "
+        "them at the core count caps the achievable rendezvous width before the run "
+        "starts (24 lanes into 64 slots measured 115.6 c/h against the same binary's "
+        "582, width_fill 0.03). OMP_MAX_ACTIVE_LEVELS=1 is what keeps the lanes from "
+        "spawning nested solver teams",
+    )
+    p.add_argument(
+        "--no-oversubscribe", action="store_true",
+        help="lanes = min(width, cpus per process), the old policy. A deliberate arm: it "
+        "measures the core count, not the rendezvous. Cores are ALWAYS partitioned by "
+        "taskset regardless of this flag -- what it changes is the lane count",
+    )
+    p.add_argument("--solver-threads", type=int,
+                   help="RASBERY_OMP_THREADS / OMP_NUM_THREADS / OMP_THREAD_LIMIT per "
+                        "process; default is the arena width per process (the reference's "
+                        "64 at --batch-width 64)")
+    p.add_argument(
+        "--pin-omp", action="store_true",
+        help="also export OMP_PROC_BIND=TRUE and OMP_PLACES=cores. The reference line sets "
+        "neither, and RASBERY sets both itself and re-execs (main.cpp:286), so this "
+        "changes what the harness DECLARES rather than what libgomp does",
+    )
+    p.add_argument(
+        "--print-env", action="store_true",
+        help="print the resolved per-process environment as [MULTI_GPU][ENV] receipts and "
+        "exit, so a mismatch against test/reference/batch_reference_env_238.json is "
+        "visible before a seven-minute run",
+    )
     p.add_argument("--workdir", default="multi_gpu_run",
                    help="where chunk manifests, per-chunk logs and the MPS pipe/log land")
     p.add_argument(
@@ -1021,6 +1088,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         driver_workers=args.driver_workers,
         solver_threads=args.solver_threads,
         procs_per_gpu=args.procs_per_gpu,
+        oversubscribe=not args.no_oversubscribe,
     )
     queue = Queue(workdir / "queue.json", len(jobs))
 
@@ -1039,9 +1107,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "cpus_per_proc": budget.cpus_per_proc,
                 "cpus_per_gpu": budget.cpus_per_gpu,
                 "driver_workers": budget.driver_workers,
+                "driver_worker_policy": budget.worker_policy,
                 "solver_threads": budget.solver_threads,
                 "writer_threads": budget.writer_threads,
                 "pin": budget.pin,
+                "pin_omp": bool(args.pin_omp),
             },
             separators=(",", ":"),
         )
@@ -1111,6 +1181,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         for proc in range(budget.procs_per_gpu)
     ]
 
+    # The resolved child environment, PER PROCESS, before anything runs.  An
+    # env mismatch is the one defect class here that produces no error, no FAIL
+    # line and no bad receipt -- only a throughput number that looks like
+    # physics.  Three L5 sweeps (103-116 c/h) were reported as data before
+    # anyone compared this against the reference line; printing it costs one
+    # line per process and `--print-env` turns the whole run into that line.
+    for gpu, proc, index in workers:
+        env_receipt = resolve_profile_env(
+            batch_width=args.batch_width,
+            driver_workers=budget.driver_workers,
+            solver_threads=budget.solver_threads,
+            gpu=gpu,
+            pin_omp=args.pin_omp,
+            extra=extra_env,
+            overrides=overrides,
+        )
+        print(
+            "[RASBERY][MULTI_GPU][ENV] "
+            + json.dumps(
+                {
+                    "gpu": gpu,
+                    "proc": proc,
+                    "cpus": (f"{budget.cpu_sets[index][0]}-{budget.cpu_sets[index][-1]}"
+                             if budget.cpu_sets else ""),
+                    "pin_prefix": pin_prefix(budget, index),
+                    "env": env_receipt,
+                },
+                separators=(",", ":"),
+            )
+        )
+    if args.print_env:
+        mps.stop()
+        return 0
+
     started = time.monotonic()
     results: list[WorkerResult] = []
     try:
@@ -1118,7 +1222,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             queue=queue, jobs=jobs, budget=budget, batch_width=args.batch_width,
             claim=args.claim, result_mode=args.result, executable=executable,
             workdir=workdir, cwd=cwd, overrides=overrides, extra_env=extra_env,
-            dry_run=args.dry_run,
+            pin_omp=args.pin_omp, dry_run=args.dry_run,
         )
         if len(workers) == 1:
             # One process: run it inline so the operator sees the failure
@@ -1172,6 +1276,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "slot_busy_fraction": round(sum(busy) / len(busy), 4) if busy else 0.0,
                     "rc": r.returncode,
                     "fail_lines": r.fail_lines,
+                    # What the children were launched with, not what the plan
+                    # intended: the [ENV] line above is a prediction, this is
+                    # the record, and the two disagreeing is itself the bug.
+                    "env": r.env,
                 },
                 separators=(",", ":"),
             )

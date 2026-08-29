@@ -3,10 +3,13 @@
 브랜치 `codex/exact-throughput-campaign`, 기준 `617bac7`
 대상: GA evaluator 계획 §5.5 / §6.2 Task 7
 변경 파일: `tools/run_multi_gpu_batch.py`, `tools/run_single_gpu_batch.py`,
-`tools/test_multi_gpu_dispatch.py` — **`src/`는 한 줄도 건드리지 않는다.**
+`tools/test_multi_gpu_dispatch.py`, `tools/test_harness_env_parity.py`,
+`test/reference/batch_reference_env_238.json` — **`src/`는 한 줄도 건드리지 않는다.**
 로컬 실측: WSL, GTX 1080 Ti(sm_61) 1장, nvcc 12.6, 24 코어, `~/bfdecks` d0..d3 + e0..e3
 238 인용치: nsys osrt(`pthread_cond_wait` 72.6 %, `pthread_mutex_lock` 17.6 %),
-`mean_width` **14.5/64 = 22.7 %**, SM 62 %, GPU 메모리 처리량 7 %, M64 = **524 c/h**
+`mean_width` **14.5/64 = 22.7 %**, SM 62 %, GPU 메모리 처리량 7 %,
+M64 원시 생산 라인 = **582 c/h (12.3 GB)** — 이것이 대조군이다(예전 인용치 524는 다른
+빌드의 값이다). dispatcher 대조군이 이 값을 ±5 %로 재현하지 못하면 배수는 무효다(§4.7).
 
 ---
 
@@ -82,41 +85,70 @@ width_fill = mean_width / slots        (수신증 [MULTI_GPU][PROC].width_fill)
 
 | 값 | 소스 |
 |---|---|
-| 인자 정의 | `tools/run_multi_gpu_batch.py:867` (`--procs-per-gpu`) |
-| 워커 격자 (GPU-major 전역 인덱스) | `tools/run_multi_gpu_batch.py:1109` |
-| 프로세스열 본체 | `tools/run_multi_gpu_batch.py:699` (`run_worker`) |
+| 인자 정의 | `tools/run_multi_gpu_batch.py:903` (`--procs-per-gpu`) |
+| 워커 격자 (GPU-major 전역 인덱스) | `tools/run_multi_gpu_batch.py:1179` |
+| 프로세스열 본체 | `tools/run_multi_gpu_batch.py:730` (`run_worker`) |
 
 ### 2.2 호스트 분할 — 분모는 GPU가 아니라 **프로세스**
 
-`plan_host_budget`(`tools/run_multi_gpu_batch.py:274`)의 분모가
+`plan_host_budget`(`tools/run_multi_gpu_batch.py:276`)의 분모가
 `len(gpus) * procs_per_gpu`로 바뀌었다.
 
 ```text
 processes      = G × K
 cpus_per_proc  = visible_cpus // processes
 cpu_sets       = [0..c), [c..2c), ...   (프로세스마다 하나, 겹치지 않음)
-driver_workers = min(W, cpus_per_proc)          → RASBERY_BATCH_HOST_THREADS
-solver_threads = f(cpus_per_proc - workers - 8) → RASBERY_OMP_THREADS
+driver_workers = W                              → RASBERY_BATCH_HOST_THREADS
+solver_threads = W                              → RASBERY_OMP_THREADS
+                                                  (= OMP_NUM_THREADS = OMP_THREAD_LIMIT)
 ```
 
-**K개의 프로세스가 각자 호스트 전체를 가졌다고 믿으면 정확히 K배 오버섭스크립션이 나고,
-`OMP_PROC_BIND=TRUE`가 그 스레드들을 같은 place에 고정한다.** L5는 호스트 경합을
-없애려는 레버인데, 그 경합을 한 층 위에서 그대로 재현하는 셈이 된다. 단위 테스트가
-집합 disjoint와 `cpus_per_proc` 축소를 고정한다(`test_multi_gpu_dispatch.py:161-205`).
+**나뉘는 것은 코어이고, 레인은 나뉘지 않는다.** 두 자원은 성격이 다르다.
 
-> **`RASBERY_OMP_THREADS`를 "프로세스당 코어 수"로 두지 않은 이유.**
-> `RASBERY_BATCH_HOST_THREADS`는 Driver 리필 레인 수이고 `RASBERY_OMP_THREADS`는
-> **레인 하나가** 솔버 영역에서 쓸 스레드 수다. 후자를 프로세스당 코어 수로 두면
-> 레인 수만큼 오버섭스크립션이 되며, 그것이 이 분할이 막으려는 바로 그 실수다.
-> 238에서는 `--set RASBERY_OMP_THREADS=<값>`으로 arm마다 명시한다(§4.3).
+- **코어**는 쪼갠다. K개의 프로세스가 각자 호스트 전체를 가졌다고 믿으면 CPU 바운드
+  구간에서 정확히 K배 오버섭스크립션이 난다. `--pin taskset`이 겹치지 않는 범위를
+  준다. 단위 테스트가 집합 disjoint와 `cpus_per_proc` 축소를 고정한다
+  (`test_multi_gpu_dispatch.py`).
+- **레인은 쪼개지 않는다.** `RASBERY_BATCH_HOST_THREADS`는 Driver 리필 레인 수이고,
+  **레인은 CPU 워커가 아니다** — 수명의 대부분을 GPU 랑데부에서 블록된 채 보내고,
+  아레나는 *그 안에 들어와 있는* 레인만 모을 수 있다. 그래서 기본값은 **바이너리 자신의
+  기본값**인 `min(batch_width, jobs)`(`src/main.cpp:698`), 즉 **슬롯당 레인 하나**이며,
+  프로세스가 받은 코어 수와 무관하다. 238의 원시 생산 라인이 정확히 이렇게 돈다
+  (24코어에 64레인, 582 c/h).
+
+> **레인을 코어 수로 캡했을 때의 실측 비용: 582 → 115.6 c/h (5.0배), `width_fill`
+> 0.03.** 24개 레인은 64슬롯을 채울 수 없고, 이 실패는 오류도 FAIL 줄도 남기지 않는다.
+> 처리량 숫자 하나로만 나타난다. §4.7을 볼 것.
+
+64레인이 24코어 위에서 터지지 않는 이유는 `OMP_MAX_ACTIVE_LEVELS=1`(DEFAULT_ENV)이다.
+레인은 중첩 솔버 팀을 만들지 않으므로 스레드 수는 레인 수이고, 그 레인들은 대부분
+블록되어 있다(`src/main.cpp:764-769`).
+
+`--no-oversubscribe`는 예전 정책(`min(W, cpus_per_proc)`)을 **의도적인 arm으로** 되살린다.
+`--driver-workers N`은 숫자를 직접 지정한다. `RASBERY_OMP_THREADS`/`OMP_NUM_THREADS`/
+`OMP_THREAD_LIMIT`는 **프로세스당 폭 W**가 기본값이다 — 기준선의 64는 코어 수가 아니라
+`--batch-mode 64`의 폭이다.
+
+### 2.2.1 자식 환경은 한 곳에서 만들고, 실행 전에 인쇄한다
+
+`resolve_profile_env()`(`tools/run_single_gpu_batch.py`)가 두 하네스의 유일한 환경
+조립 지점이다. 단일 GPU 프로파일러와 dispatcher가 서로 다른 기본 환경을 갖는 것은
+**어느 수신증에도 나타나지 않는다.** 그래서:
+
+- `DEFAULT_ENV`는 238 기준선의 환경을 **키 단위로 그대로** 담는다
+  (`test/reference/batch_reference_env_238.json`).
+- `[RASBERY][MULTI_GPU][ENV]`가 프로세스마다 **실행 전에** 해석된 환경을 인쇄하고,
+  `[MULTI_GPU][PROC]`의 `env` 필드가 **실제로 실행된** 환경을 기록한다.
+- `--print-env`는 해석만 하고 종료한다(큐를 claim하지 않는다). 7분을 쓰기 전에 볼 것.
+- `tools/test_harness_env_parity.py`가 이 동등성을 계약으로 고정한다(음성 대조군 포함).
 
 ### 2.3 공유 큐 — claim 정책의 분모도 프로세스다
 
 - `--claim auto`에서 "혼자면 큐 전체를 claim한다"의 조건이 `budget.gpus == 1`에서
-  **`budget.processes == 1`**로 바뀌었다(`:740`). GPU 1장이라도 K개면 서로 훔칠 상대가
+  **`budget.processes == 1`**로 바뀌었다(`:781`). GPU 1장이라도 K개면 서로 훔칠 상대가
   있다.
-- `--claim all`의 정적 분할도 `budget.processes`로 나눈다(`:735`).
-- **큐에 in-process 뮤텍스가 추가되었다**(`:200`). flock은 *다른 프로세스*를 막는다.
+- `--claim all`의 정적 분할도 `budget.processes`로 나눈다(`:776`).
+- **큐에 in-process 뮤텍스가 추가되었다**(`:201`). flock은 *다른 프로세스*를 막는다.
   `--procs-per-gpu`에서 한 디바이스의 K개 워커는 **이 dispatcher의 스레드**이고,
   Windows에는 flock이 아예 없다. 실제로 K=4 계약 테스트에서 read-modify-write가
   끼어들어 **queue.json이 잘린 채로 읽히는** 것을 잡았다. 회귀는
@@ -129,12 +161,16 @@ solver_threads = f(cpus_per_proc - workers - 8) → RASBERY_OMP_THREADS
 
 ```text
 [RASBERY][MULTI_GPU][PLAN]  procs_per_gpu, processes, declared_width_per_gpu,
-                            cpus_per_proc, cpus_per_gpu, driver_workers, solver_threads
+                            cpus_per_proc, cpus_per_gpu, driver_workers,
+                            driver_worker_policy, solver_threads, pin, pin_omp
+[RASBERY][MULTI_GPU][ENV]   프로세스마다 하나. 실행 전에 해석된 자식 환경 전체와
+                            taskset 접두사. `--print-env`면 여기서 멈춘다
 [RASBERY][MULTI_GPU][VRAM]  per_slot_gb, per_process_gb, per_device_gb, aggregate_gb,
                             devices[].{total_gb, budget_gb, demand_gb, verdict}
 [RASBERY][MULTI_GPU][MPS]   requested, active, control, thread_percent, pipe_dir, reason
 [RASBERY][MULTI_GPU][PROC]  gpu, proc, cpus, jobs, wall_s, cases_per_hour,
-                            mean_width, width_fill, refills, tail_idle_s, rc   ← 프로세스마다
+                            mean_width, width_fill, refills, tail_idle_s, rc,
+                            env   ← 프로세스마다. env는 **실제로 실행된** 환경이다
 [RASBERY][MULTI_GPU][GPU]   디바이스 집계. wall_s는 **가장 느린 워커의 것**(합이 아니다)
 [RASBERY][MULTI_GPU][TOTAL] cases_per_hour, mean_width_per_proc[], width_fill_per_proc[],
                             tail_idle_max_s, mps, duplicates, stale_tenants, rc
@@ -246,9 +282,11 @@ tip 커밋을 아카이브해서 빌드했다.**
 (`V3_FREEZE` §2가 단일 기본값을 명시적으로 지목한다). 명시하지 않은 단일 모드 기준은
 **기준이 아니라 다른 arm**이다. `RASBERY_XE_ANDERSON=0`으로 고정하니 전부 일치했다.
 
-> 238에서는 반대 방향으로 같은 함정이 있다: 생산 arm은 `RASBERY_XE_ANDERSON=1`이므로
-> **배치 arm에도 명시적으로 export해야 한다.** DEFAULT_ENV는 이 키를 설정하지 않으므로
-> 환경에서 그대로 상속된다.
+> 238에서는 반대 방향으로 같은 함정이 있었다: 생산 arm은 `RASBERY_XE_ANDERSON=1`인데
+> 예전 `DEFAULT_ENV`는 이 키를 설정하지 않아 환경 상속에 의존했다. **지금은 아니다** —
+> `DEFAULT_ENV`가 238 기준선 환경을 키 단위로 담으므로 `RASBERY_XE_ANDERSON=1`은
+> 하네스가 직접 준다(§2.2.1). 로컬에서 `=0` arm을 재려면 `--set RASBERY_XE_ANDERSON=0`
+> 으로 **명시적으로** 뒤집어야 한다. 무엇이 실제로 갔는지는 `[MULTI_GPU][ENV]`가 말한다.
 
 ### 3.2 게이트 표
 
@@ -316,13 +354,8 @@ A·B와 A′·B′ 사이의 절대 wall 차이는 전부 호스트 경합이다
 export MAMBA_ROOT_PREFIX=$HOME/micromamba
 eval "$($HOME/opt/bin/micromamba shell hook -s bash)"; micromamba activate gpu
 
-# --- v3 생산 arm: arm X + chunked + GPU_XE + Anderson + A2 CAND, segment OFF ---
-export RASBERY_GPU=1 RASBERY_GPU_CMFD_SWEEP=1 RASBERY_GPU_CMFD_RESIDENT_SINGLE=1
-export RASBERY_GPU_NODAL=1 RASBERY_GPU_NODAL_FULL=1
-export RASBERY_GPU_XSRECON=1 RASBERY_GPU_FLATXS=1
-export RASBERY_GPU_WIEL_FOLD=chunked
-export RASBERY_GPU_XE=1 RASBERY_XE_ANDERSON=1
-export RASBERY_STAGED_FLUX_TOL=50 RASBERY_STAGED_XE_TOL=1000 RASBERY_STAGED_LOOSE_SETTLE=1
+# --- v3 생산 arm(arm X + chunked + GPU_XE + Anderson + A2 CAND)은 이제
+#     DEFAULT_ENV가 준다. 여기서 export할 필요가 없다. ---
 unset  RASBERY_GPU_OUTER RASBERY_GPU_OUTER_SEGMENT_MAX RASBERY_GPU_OUTER_GRAPH   # segment OFF
 export RASBERY_ALLOW_SCREENING=1        # --result light 는 screening run 으로 분류된다
 unset  RASBERY_STATEPOINT_TELEMETRY     # 타이밍과 텔레메트리를 섞지 말 것
@@ -330,8 +363,33 @@ export B=$HOME/<BUILD>                  # RASBERY 바이너리 디렉터리
 export O=$HOME/l5out; mkdir -p $O
 ```
 
-**`RASBERY_XE_ANDERSON=1`을 반드시 export할 것.** 배치 모드의 기본값은 OFF이고,
-`DEFAULT_ENV`는 이 키를 건드리지 않는다(§3.1).
+**환경은 이제 하네스가 준다.** `DEFAULT_ENV`(`tools/run_single_gpu_batch.py`)가 238
+원시 생산 라인의 환경을 키 단위로 그대로 담는다 —
+`RASBERY_GPU_XE=1`, `RASBERY_XE_ANDERSON=1`, `RASBERY_GPU_WIEL_FOLD=chunked`,
+`RASBERY_STAGED_*`, `RASBERY_BATCH_WAIT_US=auto` + `_MAX_US=2000`,
+`OMP_DYNAMIC/NESTED/MAX_ACTIVE_LEVELS/STACKSIZE/WAIT_POLICY`, `GOMP_SPINCOUNT=0`,
+`MKL_NUM_THREADS=1`, `KMP_BLOCKTIME=0`, `CUBLAS_WORKSPACE_CONFIG=:4096:8`,
+`CUDA_DEVICE_ORDER=PCI_BUS_ID`, `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=100`.
+기준 사본은 `test/reference/batch_reference_env_238.json`이고
+`tools/test_harness_env_parity.py`가 동등성을 고정한다.
+
+**하네스가 주지 않는 것 셋.** `RASBERY_ALLOW_SCREENING`(권한 — 운영자가 export),
+`RASBERY_BATCH_LIGHT_RESULT`(= `--result light`),
+`RASBERY_BATCH_RECEIPT_JSONL`(경로 — K개 프로세스가 한 파일에 append하면 섞인다).
+
+> **`RASBERY_PPR_MODE=master`는 더 이상 기본값이 아니다.** 기준선이 이 키를 설정하지
+> 않는데 예전 `DEFAULT_ENV`는 강제하고 있었다 — 선언되지 않은 편차이고, 공짜도 아니다:
+> PPR은 light 여부와 무관하게 **모든 statepoint에서 돈다**(`src/Driver.h:4166` 이하).
+> MASTER 대조 캠페인은 `--set RASBERY_PPR_MODE=master`를 **명시**할 것.
+
+**실행 전에 한 번 확인한다** (7분을 쓰기 전에):
+
+```bash
+python3 tools/run_multi_gpu_batch.py --gpus 0 --procs-per-gpu 1 --batch-width 64 \
+    --jobs $O/m64.txt --workdir /tmp/envcheck --print-env -- $B/RASBERY \
+  | grep "MULTI_GPU\]\[ENV\]"
+python3 tools/test_harness_env_parity.py     # "harness env parity: PASS"
+```
 
 ### 4.2 매니페스트 (64잡, 한 번)
 
@@ -351,22 +409,24 @@ wc -l $O/m64.txt      # 64
 
 ### 4.3 arm 행렬 — 64잡, 선언 폭 64 고정
 
-| arm | `--procs-per-gpu` | `--batch-width` | GPU당 선언 폭 | `cpus_per_proc` | `--set RASBERY_OMP_THREADS` | `--mps-thread-percent` |
-|---|---:|---:|---:|---:|---:|---:|
-| **control** | 1 | 64 | 64 | 24 | **12** | — |
-| **2×M32** | 2 | 32 | 64 | 12 | **6** | 50 |
-| **4×M16** | 4 | 16 | 64 | 6 | **3** | 25 |
-| **8×M8** | 8 | 8 | 64 | 3 | **1** | 12 |
+| arm | `--procs-per-gpu` | `--batch-width` | GPU당 선언 폭 | `cpus_per_proc` (taskset) | `RASBERY_BATCH_HOST_THREADS` | `RASBERY_OMP_THREADS` | `--mps-thread-percent` |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **control** | 1 | 64 | 64 | 24 (`0-23`) | **64** | **64** | — |
+| **2×M32** | 2 | 32 | 64 | 12 (`0-11`,`12-23`) | **32** | **32** | 50 |
+| **4×M16** | 4 | 16 | 64 | 6 | **16** | **16** | 25 |
+| **8×M8** | 8 | 8 | 64 | 3 | **8** | **8** | 12 |
 
-`RASBERY_OMP_THREADS`는 `max(1, 12 // K)`다 — control의 코어당 오버섭스크립션 비율을
-그대로 유지하는 값이다. `--mps-thread-percent`는 생략하면 `100 // K`가 자동으로 쓰인다
-(표의 값과 같다; `K=8`은 `100//8 = 12`).
+**두 스레드 값은 모두 "프로세스당 폭 W"이고, `--set`으로 줄 필요가 없다** — dispatcher가
+계산해서 넣는다. 코어만 K등분되고(`taskset`), **레인은 등분되지 않는다**(§2.2). control의
+`64 / 24코어`는 오버섭스크립션이 맞고, **그것이 기준선이 도는 방식이다.**
+`--mps-thread-percent`는 생략하면 `100 // K`가 자동으로 쓰인다(표의 값과 같다;
+`K=8`은 `100//8 = 12`).
 
 각 arm은 **MPS 없음 / MPS 있음** 두 번 돈다. 총 **8회**.
 
 ```bash
 # ---------- 공통 러너 ----------
-run_arm () {                       # $1=이름  $2=K  $3=W  $4=OMP  $5=extra
+run_arm () {                       # $1=이름  $2=K  $3=W  $4=extra
   W=$O/work/$1; mkdir -p $W
   nvidia-smi dmon -i 0 -s pucm -d 1 -o T > $O/dmon.$1.csv 2>&1 &
   DMON=$!
@@ -375,7 +435,7 @@ run_arm () {                       # $1=이름  $2=K  $3=W  $4=OMP  $5=extra
       --gpus 0 --procs-per-gpu $2 --batch-width $3 \
       --claim auto --result light \
       --jobs $O/m64.txt --cwd ~/t18decks/kngr --workdir $W \
-      --pin taskset --set RASBERY_OMP_THREADS=$4 $5 \
+      --pin taskset $4 \
       -- $B/RASBERY > $O/$1.out 2>&1
   echo "$1 rc=$?"
   kill $DMON 2>/dev/null
@@ -385,16 +445,24 @@ run_arm () {                       # $1=이름  $2=K  $3=W  $4=OMP  $5=extra
 cd <REPO>
 
 # ---------- MPS 없음 ----------
-run_arm m64_nomps  1 64 12 ""
-run_arm m32_nomps  2 32  6 ""
-run_arm m16_nomps  4 16  3 ""
-run_arm m8_nomps   8  8  1 ""
+run_arm m64_nomps  1 64 ""
+run_arm m32_nomps  2 32 ""
+run_arm m16_nomps  4 16 ""
+run_arm m8_nomps   8  8 ""
 
 # ---------- MPS 있음 ----------
-run_arm m64_mps    1 64 12 "--mps"
-run_arm m32_mps    2 32  6 "--mps"
-run_arm m16_mps    4 16  3 "--mps"
-run_arm m8_mps     8  8  1 "--mps"
+run_arm m64_mps    1 64 "--mps"
+run_arm m32_mps    2 32 "--mps"
+run_arm m16_mps    4 16 "--mps"
+run_arm m8_mps     8  8 "--mps"
+```
+
+**control이 먼저다.** `m64_nomps`가 원시 생산 라인의 **582 c/h를 5 % 이내로**
+재현하지 못하면 나머지 7개 arm은 돌리지 말 것 — §4.7이 그 이유다.
+
+```bash
+# 원시 기준선 (비교 대상). 하네스 없이, 같은 덱, 같은 폭.
+taskset --cpu-list 0-23 $B/RASBERY --rasi <64덱> --raso <64출력> --batch-mode 64
 ```
 
 - **`--claim auto`는 이 행렬에서 각 워커에게 정확히 폭 하나씩 준다**
@@ -424,10 +492,10 @@ mkdir -p $O/full_k1 $O/full_k8
 
 python3 tools/run_multi_gpu_batch.py --gpus 0 --procs-per-gpu 1 --batch-width 64 \
     --claim auto --result full --jobs $O/m64full.txt --cwd ~/t18decks/kngr \
-    --workdir $O/work/full_k1 --pin taskset --set RASBERY_OMP_THREADS=12 -- $B/RASBERY
+    --workdir $O/work/full_k1 --pin taskset -- $B/RASBERY
 python3 tools/run_multi_gpu_batch.py --gpus 0 --procs-per-gpu 8 --batch-width 8 \
     --claim auto --result full --jobs $O/m64full8.txt --cwd ~/t18decks/kngr \
-    --workdir $O/work/full_k8 --pin taskset --set RASBERY_OMP_THREADS=1 -- $B/RASBERY
+    --workdir $O/work/full_k8 --pin taskset -- $B/RASBERY
 
 for i in $(seq 0 63); do
   h5diff -c $O/full_k1/case$i.h5 $O/full_k8/case$i.h5 > /dev/null \
@@ -455,20 +523,30 @@ grep -h "MULTI_GPU\]\[TOTAL\]\|MULTI_GPU\]\[PROC\]\|MULTI_GPU\]\[MPS\]" $O/*.out
 grep -h "BATCH_OCCUPANCY\|REFILL\]\|HDF5\]\[LOCK\]" $O/work/*/*.log
 ```
 
-**기대 수신증 — control (1×M64, MPS 없음).** 이 arm이 기존 524 c/h를 재현하지 않으면
-나머지 arm의 배수는 의미가 없다.
+**기대 수신증 — control (1×M64, MPS 없음).** 이 arm이 원시 라인의 **582 c/h를 5 % 이내로**
+재현하지 않으면 나머지 arm의 배수는 의미가 없다(§4.7).
 
 ```text
 [RASBERY][MULTI_GPU][PLAN]  {"gpus":["0"],"procs_per_gpu":1,"processes":1,"jobs":64,
                              "batch_width":64,"declared_width_per_gpu":64,
-                             "cpus_per_proc":24,"driver_workers":24,...}
+                             "cpus_per_proc":24,"driver_workers":64,
+                             "driver_worker_policy":"binary_default_width",
+                             "solver_threads":64,"pin":"taskset","pin_omp":false,...}
+[RASBERY][MULTI_GPU][ENV]   {"gpu":"0","proc":0,"cpus":"0-23",
+                             "pin_prefix":["taskset","-c","0-23"],
+                             "env":{...RASBERY_BATCH_HOST_THREADS:"64",
+                                    RASBERY_OMP_THREADS:"64",
+                                    RASBERY_BATCH_WAIT_US:"auto",...}}
 [RASBERY][MULTI_GPU][VRAM]  {"per_device_gb":13.0,...,"verdict":"fits"}
 [RASBERY][MULTI_GPU][MPS]   {"requested":false,"active":false,...}
-[RASBERY][MULTI_GPU][PROC]  {"gpu":"0","proc":0,"jobs":64,"cases_per_hour":~524,
+[RASBERY][MULTI_GPU][PROC]  {"gpu":"0","proc":0,"jobs":64,"cases_per_hour":~582,
                              "mean_width":~14.5,"width_fill":~0.227,"refills":0,...}
-[RASBERY][MULTI_GPU][TOTAL] {"cases_per_hour":~524,"width_fill_mean":~0.227,
+[RASBERY][MULTI_GPU][TOTAL] {"cases_per_hour":~582,"width_fill_mean":~0.227,
                              "duplicates":0,"stale_tenants":0,"rc":0,"fail_lines":0}
 ```
+
+**`driver_workers`가 64가 아니면 그 자리에서 멈출 것.** 24라면 예전 결함이 돌아온 것이고
+(§4.7), 그 arm의 숫자는 데이터가 아니다.
 
 **기대 수신증 — 8×M8 + MPS.** `mean_width`가 **작아지는 것이 정상**이다(§0.1).
 
@@ -500,6 +578,7 @@ grep -h "BATCH_OCCUPANCY\|REFILL\]\|HDF5\]\[LOCK\]" $O/work/*/*.log
 
 | 지표 | 어디 | 읽는 법 |
 |---|---|---|
+| `cases_per_hour` (control) | `[TOTAL]` | **원시 라인 582 c/h의 ±5 % 안이어야 한다.** 아니면 여기서 멈춘다 |
 | `cases_per_hour` | `[TOTAL]` | control 대비 배수. **킬 기준 1.05×** (2×M32 기준) |
 | `width_fill_per_proc` | `[TOTAL]` | control 0.227을 얼마나 올렸는가 — **레버가 작동하는지의 직접 증거** |
 | `tail_idle_max_s` | `[TOTAL]` | 합이 아니라 최대. 워커 하나가 남아 끄는 시간 |
@@ -514,6 +593,55 @@ grep -h "BATCH_OCCUPANCY\|REFILL\]\|HDF5\]\[LOCK\]" $O/work/*/*.log
 (`[PROC].refills > 0`). 폭 비교에 리필 비용이 섞이므로 **§4.3의 64잡 행렬을 먼저 끝낸
 뒤에** 할 것.
 
+### 4.7 앞선 103–116 c/h 스윕이 왜 무효였는가
+
+**증상.** 238에서 같은 바이너리, 같은 64덱, 같은 물리 환경으로
+
+```text
+원시 생산 라인   taskset --cpu-list 0-23 RASBERY --batch-mode 64   → 582 c/h (12.3 GB)
+dispatcher 대조  --gpus 0 --procs-per-gpu 1 --batch-width 64       → 115.6 c/h, width_fill 0.03
+```
+
+**5.0배.** rc는 0이었고, `[FAIL]`은 없었고, physics-mode·graph-fallback 감사도 전부
+통과했다. 틀린 수신증은 하나도 없었다. **차이는 전부 하네스가 자식에게 넘긴 환경과,
+하네스가 계산한 정수 하나에 있었다.**
+
+**세 가지 원인.**
+
+1. **`plan_host_budget()`이 레인을 코어 수로 캡했다.** `RASBERY_BATCH_HOST_THREADS =
+   min(width, cpus_per_proc) = 24`. 바이너리의 기본값은 `min(width, jobs) = 64`
+   (`src/main.cpp:698`)이고, 기준선은 **24코어에 64레인을 일부러 태운다.** 레인은
+   GPU 랑데부에서 블록되어 있으므로 CPU 워커가 아니다 — 24레인으로는 64슬롯 랑데부가
+   채워질 수 없고, `width_fill`이 0.03으로 무너졌다.
+2. **`DEFAULT_ENV`가 `RASBERY_BATCH_WAIT_US="0"`을 조용히 강제했다.** 기준선은
+   `auto` + `RASBERY_BATCH_WAIT_MAX_US=2000`(유계 적응 linger)로 돈다. 절대 기다리지
+   않는 랑데부는 64슬롯 아레나가 서너 명만 모으는 또 하나의 방법이다.
+3. **`DEFAULT_ENV`가 기준선 키 절반을 갖고 있지 않았다.** `RASBERY_GPU_XE`,
+   `RASBERY_XE_ANDERSON`, `RASBERY_GPU_WIEL_FOLD=chunked`, `RASBERY_STAGED_*`,
+   `OMP_*`/`MKL_*`/`KMP_*`/`CUBLAS_*` 일습. 운영자의 export에 의존했고, 운영자가
+   빠뜨리면 **다른 arm이 조용히 실행된다.** 반대로 기준선이 설정하지 **않는**
+   `OMP_PROC_BIND=TRUE`/`OMP_PLACES=cores`와 `RASBERY_PPR_MODE=master`는 강제하고
+   있었다.
+
+**따라서 그 스윕들은 폐기한다.** L5 arm들의 103–116 c/h는 K의 함수가 아니라 **결함 상수의
+함수**였다. 하나의 arm이 아니라 **대조군 자체가 5배 느렸으므로, 그 위에서 계산한 어떤
+배수도 의미가 없다** — 배수가 1.0 근처였다는 사실조차 정보가 아니다.
+
+**같은 실패가 다시 조용히 지나가지 못하게 하는 것.**
+
+| 장치 | 어디 |
+|---|---|
+| 기준 환경이 파일로 기록됨 | `test/reference/batch_reference_env_238.json` |
+| 계약 테스트(음성 대조군 포함) | `tools/test_harness_env_parity.py` |
+| 두 하네스가 환경 조립기를 공유 | `resolve_profile_env()` (`tools/run_single_gpu_batch.py`) |
+| 실행 **전** 해석된 환경 인쇄 | `[RASBERY][MULTI_GPU][ENV]`, `--print-env` |
+| 실행 **된** 환경 기록 | `[RASBERY][MULTI_GPU][PROC].env` |
+| 레인 정책이 수신증에 이름으로 남음 | `[PLAN].driver_worker_policy` |
+
+**교훈은 일반적이다.** 환경 불일치는 이 캠페인에서 **오류도, FAIL 줄도, 잘못된 수신증도
+남기지 않는 유일한 결함 종류**다. 물리처럼 보이는 처리량 숫자 하나로만 나타난다. 그래서
+새 arm의 첫 번째 게이트는 언제나 **"대조군이 원시 라인을 재현하는가"**여야 한다.
+
 ---
 
 ## 5. 함정 목록 (runner용)
@@ -527,7 +655,10 @@ grep -h "BATCH_OCCUPANCY\|REFILL\]\|HDF5\]\[LOCK\]" $O/work/*/*.log
 | 5 | `--workdir`를 arm 간 재사용 | 로그·MPS 파이프가 섞인다 | arm마다 다른 workdir |
 | 6 | `[GPU].wall_s`를 합으로 오해 | 처리량이 K로 나뉜다 | 이미 최대값이다. `[TOTAL].cases_per_hour`를 쓸 것 |
 | 7 | `RASBERY_ALLOW_SCREENING` 미설정 | `--result light` arm이 시작도 못 한다 | dispatcher가 claim 전에 rc=2로 알려 준다 |
-| 8 | control이 524 c/h를 재현하지 못함 | 모든 배수가 무의미 | 배수를 보고하기 전에 control부터 맞출 것 |
+| 8 | control이 **582 c/h**를 ±5 %로 재현하지 못함 | 모든 배수가 무의미 | 배수를 보고하기 전에 control부터 맞출 것 (§4.7) |
+| 9 | `--driver-workers`/`--no-oversubscribe`로 레인을 코어 수까지 낮춤 | `width_fill`이 무너지고 c/h가 5배 떨어진다. 오류는 없다 | `[PLAN].driver_workers`가 폭 W와 같은지, `driver_worker_policy`가 `binary_default_width`인지 확인 |
+| 10 | 물리 키를 export로만 주고 `--set`을 안 씀 | `DEFAULT_ENV`가 이겨서 조용히 다른 arm이 돈다 | A/B는 반드시 `--set KEY=VALUE`로. `[MULTI_GPU][ENV]`로 확인 |
+| 11 | MASTER 대조인데 `RASBERY_PPR_MODE`를 안 줌 | 핀 파워가 SENM 경로로 나온다 | `--set RASBERY_PPR_MODE=master` (더 이상 기본값이 아니다, §4.1) |
 
 ---
 
