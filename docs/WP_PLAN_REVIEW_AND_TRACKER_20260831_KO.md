@@ -7,6 +7,7 @@
 | 검토 시점 트리 | `codex/exact-throughput-campaign` @ `8bd5112` (= `8b8f18e` + Task 16 GPU CRAM). 검토 도중 하네스 커밋 `7099e54`가 착지했고, 아래 하네스 인용은 그 이후 줄번호다. |
 | 검토 방법 | 정적 소스 검토만. **이 검토에서 서버 238 실행·빌드·프로파일은 수행하지 않았다.** |
 | 작성 | 2026-08-31 KST |
+| 갱신 | 2026-08-31 KST — R5·F9·F10·F11 종결. `5ccf879`(하네스 감사 전환), `666e123`(죽은 receipt 필드 배선). 여전히 **로컬 빌드 없음**: §7과 §8-7)이 238에서 확인할 것을 적는다. |
 
 > 이 문서는 두 가지를 한다. (1) 계획 §4.3/§4.4가 트리에 대해 주장하는 사실을 `file:line`으로 확인하거나 반박한다. (2) WP0–WP11 추적표를 만든다. 추적표는 이후 계속 갱신한다.
 
@@ -83,13 +84,29 @@ WP1 이전 `src/main.cpp`는 `const bool screening = (ga_feedback_passes > 0) ||
 또한 같은 트리 안에서 **두 receipt가 이미 서로 모순**이었다: JSONL 쪽 `include/chiffon/BatchLightResult.h`의 `Write()`는 feedback pass가 0이면 `"physics_mode":"exact"`를 적는데, stdout 쪽은 같은 실행을 `ga_screen_feedback_limited`라고 적었다.
 
 **F9. 세 개의 receipt 필드가 인쇄되지만 한 번도 증가하지 않는다.**
-`BackendCounters::xs_cpu_fallbacks`(선언 `src/CudaBICGBackend.h:53`, 인쇄 `src/BICGSolver.cpp:108`), `cmfd_cpu_fallbacks`(`:55` / `:110`), `nodal_cpu_fallbacks`(`:84` / `:131`) — **소스 어디에도 `++`가 없다.** 늘 0을 보고한다. WP2가 “기능 flag가 켜짐이 아니라 engagement receipt가 0보다 큰 실행만 유효하다”를 이 필드들로 판정하려 했다면, 그 판정은 상수를 읽고 있었다. WP1의 `[RASBERY][GPU_FULL]`이 cmfd/nodal/flatxs/xe/ppr/cram/outer를 실제로 센다. **남은 작업: 세 죽은 필드를 배선하거나 삭제한다(WP2).**
+`BackendCounters::xs_cpu_fallbacks`(선언 `src/CudaBICGBackend.h:53`, 인쇄 `src/BICGSolver.cpp:108`), `cmfd_cpu_fallbacks`(`:55` / `:110`), `nodal_cpu_fallbacks`(`:84` / `:131`) — **소스 어디에도 `++`가 없다.** 늘 0을 보고한다. WP2가 “기능 flag가 켜짐이 아니라 engagement receipt가 0보다 큰 실행만 유효하다”를 이 필드들로 판정하려 했다면, 그 판정은 상수를 읽고 있었다. WP1의 `[RASBERY][GPU_FULL]`이 cmfd/nodal/flatxs/xe/ppr/cram/outer를 실제로 센다. ~~**남은 작업: 세 죽은 필드를 배선하거나 삭제한다(WP2).**~~
+
+> **종결 (`666e123`).** 배선했다. 삭제가 아니라 **하나의 진실을 읽게** 했다 — 세 필드는 WP1 가드가 이미 세고 있는 seam tally(`gpufull::fallbacks`)에서 채워진다. 자리:
+> `src/BICGSolver.cpp:129-133`(비-arena 판)과 `src/CudaBICGBackend.cu:5671-5675`(arena 판, 그리고 `:5678-5680`에 세 필드를 **처음으로** 인쇄). 두 판 모두 고친 이유: `BICGSolver::~BICGSolver`는 arena 실행에서 조기 반환하므로(`src/BICGSolver.cpp:95-101`) **M64는 비-arena 판을 한 줄도 인쇄하지 않는다.** 한 판만 고치면 캠페인이 실제로 재는 팔에서 보이지 않는다.
+> 매핑: `cmfd_cpu_fallbacks`←`Subsystem::Cmfd`, `nodal_cpu_fallbacks`←`Nodal`, `xs_cpu_fallbacks`←`FlatXs+Xe+Cram`(XSSet의 세 드라이브).
+> **두 번째 카운터를 seam에 심지 않은 것은 결정이다** — 한 사건을 두 tally가 세면 어긋날 수 있고, 그 어긋남은 두 receipt 어디에도 보이지 않는다(F13이 적은 규칙).
+> 계약: `tools/test_receipt_counters_live.py`. `BackendCounters`의 모든 `*fallbacks*` 필드가 `src/` 안에 write site를 갖는지 전수 스캔하고, 음성 대조군 셋(없는 필드 이름은 0건, `gf::fallbacks(` 줄을 지우면 세 필드가 다시 죽어야 함)을 붙인다. 아직 죽은 네 필드(`xs_gpu_calls`, `nodal_gpu_calls`, `th_gpu_calls`, `depletion_gpu_calls` — 전부 “engage 했다”의 양성 쪽)는 테스트의 `KNOWN_DEAD`에 **이유와 함께 열거**했다: WP2가 배선하면 목록이 눈에 보이게 줄어든다.
 
 **F10. 융합 Xe 팔(`RASBERY_GPU_XSRECON`)의 fallback은 카운터가 전혀 없었다.**
 분할 팔은 `src/XSSet.cpp`의 `tally.host_fallbacks`로 세지만, 융합 팔은 “any failure falls through to the unchanged CPU loop” 주석만 있고 아무것도 세지 않았다. 즉 `[RASBERY][XE_GPU]`의 `device_updates=0`을 보고도 “팔이 꺼졌나 거절했나”를 구분할 수 없었다. WP1이 두 자리 모두 가드했다.
 
+> **종결 (`666e123`).** 융합 팔에 **자기 삼중항**을 줬다: `fused_updates` / `fused_device_updates` / `fused_host_fallbacks` — 선언 `src/XeGpuReceipt.h:36-55`, 인쇄 `:88-93`, 청구 `src/XSSet.cpp:4136-4149`.
+> **`host_fallbacks`에 합치지 않은 것이 요점이다.** `XSSet::UpdateEquilibriumXenon`은 분할 팔이 거절하면 **이어서** 융합 팔을 시도한다(`src/XSSet.cpp:4116-4149`). 합쳤다면 Xe 스텝 하나에 두 번 청구되어 분할 팔의 회계 항등식 `xe_updates == device_updates + host_fallbacks`가 깨진다. 삼중항을 따로 두면 **두 팔 각각이 자기 receipt 안에서 항등식**으로 남는다.
+> `fused_updates`는 시도 **전에** 청구한다(분할 팔이 `xe_updates`를 그렇게 하는 것과 같은 이유). 계약 테스트가 소스 줄 순서로 그것을 붙든다.
+
 **F11. outer segment의 두 arm 실패는 이름조차 없다.**
-`src/Driver.h`의 `armOuterSegment`에서 `if (!view.valid) return false;`(`src/Driver.h:1570`)와 `if (!gpu::rasberyBindOuterResidency(residency)) return false;`(`src/Driver.h:1738`)는 `noteOuterSegmentRefusal`을 부르지 않고 반환한다. 따라서 `[OUTER_GPU].refusals`에 사유가 남지 않는다. WP1의 pre-arm 가드가 GPU full에서 이를 치명적으로 만들지만, **사유는 여전히 무명**이다. → **WP7 단계 A의 “필수 receipt” 목록에 이 둘을 추가할 것.**
+`src/Driver.h`의 `armOuterSegment`에서 `if (!view.valid) return false;`(`src/Driver.h:1570`)와 `if (!gpu::rasberyBindOuterResidency(residency)) return false;`(`src/Driver.h:1738`)는 `noteOuterSegmentRefusal`을 부르지 않고 반환한다. 따라서 `[OUTER_GPU].refusals`에 사유가 남지 않는다. WP1의 pre-arm 가드가 GPU full에서 이를 치명적으로 만들지만, ~~**사유는 여전히 무명**이다.~~
+
+> **종결 (`666e123`).** 둘 다 이름을 얻었다. `view.valid == false` → `OuterSegmentRefusal::NoResidency`(`src/Driver.h:1570-1580`), `rasberyBindOuterResidency` 실패 → `OuterSegmentRefusal::Unbound`(`src/Driver.h:1756-1765`). enum은 손대지 않았다 — 두 값 모두 이미 있었고 뜻이 정확히 맞는다(`src/CudaOuterGraph.h:489`, `:483`).
+> **왜 이 둘이 살아남았는지가 계약 테스트의 설계를 정했다.** 둘 다 *자기 이름을 부르는* 다른 거절(`no_arena`, `sweep_not_resident`) 바로 몇 줄 아래에 있다. 함수를 훑는 사람 눈에는 note가 사방에 보이고, 고정 창(window) 스캔도 **이웃의 note로 만족**한다. 그래서 `tools/test_receipt_counters_live.py`는 창이 아니라 **직전 `return`까지**를 구간으로 잡는다. 음성 대조군: note 줄을 전부 지우면 feature-off를 뺀 세 개 return이 전부 보고되어야 한다.
+> 주석 안의 “~~return false~~” 인용을 세지 않도록 스캐너는 줄 수를 보존한 채 `//` 주석을 지운 뒤 읽는다.
+
+→ **WP7 단계 A의 “필수 receipt” 목록에 이 둘이 들어간다(이제 실제로 인쇄된다).**
 
 **F12. L3coarse는 바이너리가 탐지할 수 없다.**
 계획 §6.2는 fidelity를 “실제 env/deck에서 도출”하라고 하지만, `tools/make_screening_deck.py`는 **덱의 연소도 격자만 다시 쓴다**(`:418-419`, `COARSE_BURNUPS`) — 환경변수를 세우지 않는다(`:109-111`에 적힌 env 블록은 A2 knob이지 coarse가 아니다). 그리고 `[PHYSICS_MODE]` receipt는 어떤 덱도 파싱하기 전에 나온다. → WP1은 `RASBERY_PHYSICS_FIDELITY` **선언 채널**을 두되, **선언은 오직 더 거칠게만 만들 수 있다**는 규칙(rank max)으로 닫았다. 덱에서 도출하는 per-case 검사는 WP0의 manifest parser에 속한다.
@@ -120,7 +137,7 @@ dispatcher가 Driver lane을 호스트 코어 수(24)로 제한했고, 바이너
 이 검토 도중 그 작업의 1차분이 `7099e54`로 착지했다(두 하네스 + `tools/test_multi_gpu_dispatch.py`). 아직 워킹트리에 남은 것: `?? tools/test_harness_env_parity.py`, `?? test/reference/batch_reference_env_238.json`.
 → **순서 강제:** 하네스 env-parity 작업이 커밋된 뒤에 WP0의 `run_exact_throughput_matrix.py`/`parse_perf_receipts.py`를 얹는다. WP4의 tuner는 그 위에.
 
-**R5. WP1의 acceptance 감사 전환은 하네스 파일을 고쳐야 완결된다 — 이번 커밋에 포함하지 않았다.**
+**R5. WP1의 acceptance 감사 전환은 하네스 파일을 고쳐야 완결된다.** — **종결 (`5ccf879`).** 아래는 그때 적은 요구사항이고, 실제로 그렇게 했다. 종결 내역은 이 절 끝에 붙였다.
 바이너리 쪽은 끝났다(`policy`/`acceptance_eligible` 필드 + `tools/exact_audit.py`). 그러나 감사 자체는 `tools/run_single_gpu_batch.py`에 있고 그 파일은 내 소유가 아니다. **필요한 변경은 정확히 다음 한 덩어리다:**
 
 ```python
@@ -136,6 +153,27 @@ from exact_audit import audit_physics_mode          # tools/ 를 sys.path 에 �
 ```
 
 `tools/run_multi_gpu_batch.py:921`, `:1057-1071`의 “light wave는 `RASBERY_ALLOW_SCREENING=1`이 필요하다” 거부도 함께 제거해야 한다 — WP1 이후 바이너리는 그것을 요구하지 않는다(무해하지만 이제 틀린 문장이다).
+
+**R5 종결 내역 (`5ccf879`).**
+
+| 자리 | 무엇을 했나 |
+|---|---|
+| `tools/run_single_gpu_batch.py:30-32` | `sys.path`에 `tools/`를 넣고 `from exact_audit import audit_physics_mode` |
+| `tools/run_single_gpu_batch.py:38-52` | `EXACT_PHYSICS_MODE` / `SCREENING_PHYSICS_MODE` / `expected_physics_mode()` / `check_physics_mode()` **전부 삭제**. 그 자리에는 무엇이 왜 사라졌는지가 남아 있다 |
+| `tools/run_single_gpu_batch.py:351-355` | `check_run_receipts()`가 `audit_physics_mode(output)` — **`result_mode`는 더 이상 인자가 아니다** |
+| `tools/run_single_gpu_batch.py:217-222` | `LaunchPlan.result_mode`는 **보고 전용**이라고 명시 |
+| `tools/run_multi_gpu_batch.py:1058-1068` | light wave 사전 거부 **삭제**. 바이너리가 더는 거절하지 않으며, 실행 파일보다 엄한 가드는 **통과했을 실행을 거절한다** |
+| `tools/run_single_gpu_batch.py:517-518`, `tools/run_multi_gpu_batch.py:918-922` | `--result` 도움말에서 “light는 `RASBERY_ALLOW_SCREENING=1`이 추가로 필요” 삭제 |
+
+`RASBERY_ALLOW_SCREENING`의 뜻은 **하나로 유지**한다 — “strict가 아닌 fidelity를 허용한다”. 그리고 여전히 **운영자의 것**이다: `tools/test_harness_env_parity.py:134-140`이 두 하네스 중 어느 쪽도 스스로에게 그 권한을 주지 못하게 붙든다.
+
+계약 테스트(음성 대조군 포함):
+
+- `tools/test_multi_gpu_dispatch.py:435-497` — 삭제된 네 이름이 **돌아오면 FAIL**(`hasattr` 음성 대조군), `check_run_receipts`가 `audit_physics_mode(output)`를 인자 없이 부르는지, strict/light가 **통과**하고 coarse·feedback-limited·pre-WP1 receipt가 **거절**되는지
+- `tools/test_multi_gpu_dispatch.py:539-567` — light wave가 권한 **없이/있게/거짓값으로** 모두 rc=0, 그리고 거부 문구가 dispatcher에 **남아 있지 않은지**
+- `tools/test_exact_only_contract.py:71-119` — 감사가 fidelity로 옮겨간 뒤에도 exact-only 계약이 성립하는지(“scalar 출력이라는 이유로 strict 실행을 무효화하면 FAIL”이 추가되었다)
+
+`tools/test_*.py` 실패 집합은 `9dff6ff`와 동일한 **사전 실패 9개**.
 
 **R6. WP1 §변경 파일과 실제 구현의 의도적 차이.**
 계획은 `RunContract.{h,cpp}`, `GpuFullContract.{h,cpp}`, `CMakeLists.txt`, 그리고 `CudaBICGBackend/{XsRecon,Ppr}Backend.{h,cu}` 수정을 적었다. 실제로는 **헤더 온리**, CMake 무변경, `.cu` 무변경으로 구현했다.
@@ -156,13 +194,13 @@ strict와 A2 **둘 다** 지금까지 `full_exact_nodal`을 찍어 왔고 238 �
 | WP | 범위 | 상태 | 소유 | 다음 게이트 | 차단 의존성 |
 |---|---|---|---|---|---|
 | **WP0** | 재현 가능한 baseline + 자동 판정 하네스 | **not-started** | 하네스 담당 | `tools/test_perf_manifest_contract.py`가 mode/fidelity 불일치 arm 비교를 거부 | R4: `run_{single,multi}_gpu_batch.py` env-parity 작업 커밋 |
-| **WP1** | 출력/충실도 분리 + GPU full fail-closed | **done (코드·계약)** / 하네스 절반 **not-started** | 본 작업 | 238에서 §8 runbook 4줄 통과 + 오버헤드 <1% | R5(하네스 감사 전환), 238 빌드 |
-| **WP2** | 착지 기능 238 재가격 | **not-started** | 하네스 담당 + 본 작업 | 6개 기능 각각 `adopt`/`keep-opt-in`/`reject` | WP0, WP1(모드 일치 비교가 성립해야 함), R4 |
+| **WP1** | 출력/충실도 분리 + GPU full fail-closed | **done (코드·계약·하네스)** — 바이너리 `9dff6ff`, 하네스 감사 전환 `5ccf879`, 죽은 receipt 필드 `666e123` | 본 작업 | 238에서 §8 runbook **7줄** 통과 + 오버헤드 <1% | ~~R5~~ 종결. **238 빌드만 남았다** |
+| **WP2** | 착지 기능 238 재가격 | **not-started** (단, 판정 근거는 준비됨 — F9/F10 종결로 engagement receipt가 상수를 읽지 않는다) | 하네스 담당 + 본 작업 | 6개 기능 각각 `adopt`/`keep-opt-in`/`reject`. **판정은 `[GPU_FULL].*_fallbacks` + `[BACKEND_COUNTERS].{xs,cmfd,nodal}_cpu_fallbacks` + `[XE_GPU].fused_*`로 한다** | WP0, WP1(모드 일치 비교가 성립해야 함), R4. **잔여 F9: 네 개의 `*_gpu_calls`(`xs`,`nodal`,`th`,`depletion`)는 아직 죽어 있다** — `tools/test_receipt_counters_live.py`의 `KNOWN_DEAD`에 이유와 함께 열거되어 있고, 배선하면 목록이 줄어든다 |
 | **WP3** | CMFD compaction 검증·채택 | **landed-unpriced** (계약 테스트까지 존재, F1–F5) | 본 작업 | M64 mode-matched +5%, padding −30%, ON×3 digest 동일 | WP2, R2(ladder 결정), R4 |
 | **WP4** | 단일 GPU K-process 자동 튜닝 | **landed-unpriced** (launcher만) | 하네스 담당 | K=2가 1×64 대비 ≥1.05× | WP0, R1(하네스 결함 수정), R4 |
 | **WP5** | FlatXS CTA-per-node + XS residency | **not-started** | 본 작업 | 단계 A(ptxas/ncu spill 증명) → 분기 | **R1: 고친 하네스에서 §3.3 재측정**, WP3+WP4 |
 | **WP6** | GPU PPR device loop/reconstruct/canonical | **부분 landed-unpriced** (`c502856` 장치 PPR, 기본 OFF·fail-open) | 본 작업 | 단계 A: `ppr_device_calls == statepoints`, `ppr_host_calls == 0` (GPU full), N1 Gate A/B | WP2(PPR 1차 A/B), WP1(fail-closed로 engagement 증명) |
-| **WP7** | 단일 launch/sync 축소 + Xe transaction | **부분 landed-unpriced** (WHILE 구현·기본 OFF) | 본 작업 | 단계 A: 단일 WHILE ≥5% (교대 5쌍) | WP2, F11(무명 refusal 두 개를 receipt에 추가) |
+| **WP7** | 단일 launch/sync 축소 + Xe transaction | **부분 landed-unpriced** (WHILE 구현·기본 OFF) | 본 작업 | 단계 A: 단일 WHILE ≥5% (교대 5쌍). 필수 receipt에 `refusals{no_residency}` / `refusals{unbound}` 포함 | WP2. ~~F11~~ 종결(`666e123`) |
 | **WP8** | 장수명 GA evaluator | **not-started** | 본 작업 | 단계 1: `--evaluator-jsonl` wave 프로토콜 + A-B-A 동일성 | WP1+WP2 안정화 |
 | **WP9** | 잔여 상태점 바닥 (CRAM/TH/search) | **B는 landed-unpriced** (`8bd5112` GPU CRAM), TH/search **not-started** | 본 작업 | CRAM: N1 Gate A/B + `[CRAM_GPU].host_fallbacks == 0` (GPU full) | WP2에 `RASBERY_GPU_CRAM` arm 추가 (F7) |
 | **WP10** | GA 중복 캐시·warm-start·multi-fidelity | **not-started** | GA 담당 | `CandidateKey` 계약 테스트 + 실제 hit rate 측정 | WP8 |
@@ -239,9 +277,15 @@ strict와 A2 **둘 다** 지금까지 `full_exact_nodal`을 찍어 왔고 238 �
 5. **오버헤드 <1%** (계획 §WP1 성능 판정). 단일과 M64 각각, 게이트 OFF에서.
 6. **`RASBERY_GPU_FULL=1`에서 현재 arm이 실제로 통과하는지.** 통과하지 못하면 그것이 이 WP의 첫 발견이다 — 어느 팔이 조용히 CPU였는지 receipt가 site로 말한다.
 
+**F9/F10/F11(`666e123`)이 추가한 238 전용 확인:**
+
+- **(7)** **`src/CudaBICGBackend.cu`가 이제 `GpuFullContract.h`를 포함한다.** §7-1(a)가 “향후 `.cu`에서 포함될 때를 위한 확인”이라고 적어 둔 그 일이 **지금 일어났다.** 함수 지역 static `std::array<std::atomic<unsigned long long>, N>`가 nvcc의 host pass에서 컴파일되고, 그 함수 지역 static이 host `.cpp` TU들과 **한 인스턴스로 링크되는지**가 이 커밋의 첫 컴파일 위험이다. (헤더에 `__device__` 코드는 없고 device 코드에서 호출되지도 않는다.)
+- **(8)** **`[XE_GPU]` receipt에 필드 3개가 늘었다.** 저장된 매니페스트를 키 단위로 읽는 파서는 무해하지만, **필드 수를 세는** 파서가 있으면 거기서 깨진다. `tools/test_xe_gpu_contract.py`는 통과한다.
+- **(9)** **카운터가 실제로 움직이는지.** 소스 스캔은 “쓰는 자리가 있다”까지만 증명한다. 값이 0에서 벗어나는 것은 §8-7)에서만 확인된다.
+
 ---
 
-## 8. 238 runbook — WP1 acceptance
+## 8. 238 runbook — WP1 acceptance (7단계)
 
 ```bash
 export REPO=$HOME/gpu
@@ -312,9 +356,72 @@ ls -l "$OUT"/m4_*.h5     # 기대: 3개
 # 6) 성능 판정 -- 계약 계측 오버헤드 <1% (게이트 OFF, 교대 5쌍)
 #    A = 8bd5112 바이너리, B = WP1 바이너리, 같은 arm/같은 result mode
 #    warm-up 1회 버리고 A1 B1 A2 B2 ... A5 B5, median/p10/p90
+
+# ===========================================================================
+# 7) ACCEPTANCE 6 -- F9/F10/F11: 죽어 있던 카운터가 실제로 움직인다
+# ===========================================================================
+#    소스 스캔(tools/test_receipt_counters_live.py)은 "쓰는 자리가 있다"까지만
+#    증명한다.  0 에서 벗어나는 것은 여기서만 확인된다.  그리고 그 확인은
+#    반드시 두 방향이어야 한다: 정상 arm 에서 0 이고, 강제 fallback 에서 0 이
+#    아니어야 한다.  둘 중 하나만 보면 "항상 0" 과 "항상 1" 을 구분하지 못한다.
+
+# 7a) 정상 arm: 세 필드 전부 0, 그리고 융합 Xe 삼중항이 합이 맞는다
+source "$REPO/docs/238_gpu_arms.env" 2>/dev/null || true
+CUDA_VISIBLE_DEVICES=0 \
+  "$BLD/RASBERY" --rasi "$DATA/kngr_238.json" --raso "$OUT/f9_ok.h5" --result full \
+  2>&1 | tee "$OUT/f9_ok.log" \
+  | grep -oE '"(xs|cmfd|nodal)_cpu_fallbacks":[0-9]+|"fused_[a-z_]+":[0-9]+'
+#    기대: xs/cmfd/nodal_cpu_fallbacks 전부 0
+#          fused_updates == fused_device_updates + fused_host_fallbacks (항등식)
+#    주의: --batch-mode 없이 RASBERY_GPU_CMFD_RESIDENT_SINGLE 도 없으면 비-arena
+#          판(src/BICGSolver.cpp)이, 있으면 arena 판(CudaBICGBackend.cu)이 찍힌다.
+#          두 판 모두 세 필드를 인쇄해야 한다 -- 한쪽만 나오면 그것이 결함이다.
+
+# 7b) 강제 fallback 하나: nodal 이 가장 싸다.
+#     ACCEPTANCE 5 가 이미 쓰는 rod-fraction(또는 ng!=2) 덱은 TryDriveGpu 를
+#     확실히 거절시킨다.  게이트는 OFF 로 둔다 -- 여기서 보려는 것은 실패가
+#     아니라 "숫자가 움직이는가" 다.
+env -u RASBERY_GPU_FULL -u RASBERY_GPU_STRICT CUDA_VISIBLE_DEVICES=0 \
+    RASBERY_GPU=1 RASBERY_GPU_NODAL=1 \
+  "$BLD/RASBERY" --rasi "$DATA/kngr_238_rodfrac.json" --raso "$OUT/f9_fb.h5" \
+  --result full 2>&1 | tee "$OUT/f9_fb.log" \
+  | grep -oE '"nodal_cpu_fallbacks":[0-9]+|"nodal_fallbacks":[0-9]+|"contract_pass":[a-z]+'
+#    기대: [BACKEND_COUNTERS].nodal_cpu_fallbacks > 0
+#          그리고 [GPU_FULL].nodal_fallbacks 와 **같은 값**  <- 하나의 진실
+#          contract_pass:false
+#    두 숫자가 다르면 F9 의 배선이 두 번째 tally 가 되어 버린 것이다.
+
+# 7c) 같은 실행을 게이트 ON 으로: 케이스가 실패해야 한다
+CUDA_VISIBLE_DEVICES=0 RASBERY_GPU=1 RASBERY_GPU_NODAL=1 RASBERY_GPU_FULL=1 \
+  "$BLD/RASBERY" --rasi "$DATA/kngr_238_rodfrac.json" --raso "$OUT/f9_gate.h5" \
+  --result full 2>&1 | grep -E '\[GPU_FULL\]\[VIOLATION\]|\[RASBERY\]\[FAIL\]'; echo "exit=$?"
+#    기대: subsystem=nodal site=Nodal::drive 가 이름으로 찍히고 종료코드 != 0
+
+# 7d) 융합 Xe 팔(F10): 분할 팔을 끄고 융합 팔만 켠다
+env -u RASBERY_GPU_XE CUDA_VISIBLE_DEVICES=0 \
+    RASBERY_GPU=1 RASBERY_GPU_XSRECON=1 \
+  "$BLD/RASBERY" --rasi "$DATA/kngr_238.json" --raso "$OUT/f10.h5" --result full \
+  2>&1 | grep -o '\[RASBERY\]\[XE_GPU\].*'
+#    기대: fused_updates > 0 (팔이 실제로 불렸다)
+#          fused_device_updates > 0 이면 engage, 0 이면 "켜졌지만 전부 거절"
+#          -- WP1 이전에는 이 둘을 구분할 방법이 아예 없었다.
+
+# 7e) outer 거절 사유(F11): 무명 거절이 남지 않는다
+env -u RASBERY_GPU_CMFD_SWEEP CUDA_VISIBLE_DEVICES=0 \
+    RASBERY_GPU=1 RASBERY_GPU_OUTER=1 \
+  "$BLD/RASBERY" --rasi "$DATA/kngr_238.json" --raso "$OUT/f11.h5" --result full \
+  2>&1 | grep -o '\[RASBERY\]\[OUTER_GPU\].*'
+#    기대: device_outers:0 이면서 refusals{} 가 **비어 있지 않다**.
+#    판정 규칙(이것이 F11 의 계약이다): 세그먼트가 하나도 안 섰는데
+#    sum(refusals.values()) == 0 이면 어딘가에 아직 무명 거절이 있다.
+#    no_residency / unbound 는 이 arm 으로는 나오지 않는다(sweep_not_resident 가
+#    먼저 잡는다).  둘은 arena/bind 가 실패해야 나오므로 여기서는 "이름이 있는
+#    사유로 전부 설명되는가" 만 본다.
 ```
 
 > **주의:** 3)의 `[GPU_FULL]`이 0이 아니면 **그것이 결과다.** 그 실행은 A/B의 기준선으로 쓸 수 없고, `site=`가 어느 팔이 조용히 CPU였는지 말한다. 그 경우 WP2의 대상 기능 표에 “그 팔은 238에서 실제로 engage 하지 않는다”를 먼저 기록한다.
+
+> **7)에 대한 주의:** 7b)의 두 숫자(`[BACKEND_COUNTERS].nodal_cpu_fallbacks`와 `[GPU_FULL].nodal_fallbacks`)가 **다르면** F9의 수정이 목적을 잃은 것이다. 두 필드는 같은 원자(`gpufull::detail::counter`)를 읽도록 배선했고, 다르다는 것은 어딘가에서 두 번째 tally가 생겼다는 뜻이다 — F13이 금지한 바로 그 상태.
 
 ---
 
