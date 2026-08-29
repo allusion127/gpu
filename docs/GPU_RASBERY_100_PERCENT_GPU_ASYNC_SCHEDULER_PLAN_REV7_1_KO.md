@@ -1677,6 +1677,20 @@ TH→Xenon / Search→Xenon / Material→Xenon / Depletion 진입에서 `xe_aa_n
 
 ## Task 13a: Interim-Xe Device Productionize (A2) — **[Rev.7.1 신설]**
 
+> ### ⛔ 2026-08-29 실측 판정: **철회 권고 (NO-GO)** — `docs/A2_OUTER_REDUCTION_20260829_KO.md` §3
+>
+> `RASBERY_XE_INTERIM_L2` 스캔 결과 kngr_238 총 outer가 12,017 → **14,332(1e-4) / 17,755(1e-5)** 로
+> **악화**했다. 원인은 구조적이다: interim 스텝은 미수렴 flux 위에서 발화하고, 그것은 Anderson이
+> 외삽하는 합성사상의 점이 아니므로 `Driver.h`의 `flux_converged` 게이트가 그 스텝을 **history 밖의
+> 순수 Picard 스텝**으로 강제한다(제안 1,472 → 664). Xe Anderson 단독으로 outer의 51 %를 담당하므로
+> 그것을 굶기는 변경은 순손해다. **본 태스크는 Anderson 채택(캠페인 §8.2) 이전에 설계되었고 채택
+> 이후에는 성립하지 않는다.**
+>
+> **A2 목표는 대신 허용오차 단계화로 달성**: 12,017 → **4,614 outer (131.8/상태, −61.6 %)**, 로컬 1.88×,
+> Gate A 전 항목 통과. 브랜치 `a2/outer-reduction`, 커밋 `c303b3a`·`e7b66a5`, 기본 OFF, Gate B 대기.
+> Task 13b(flux-space Anderson)는 **착수 전 상한 재계산 필요** — 남은 여지는 약 2,000 outer다(같은 문서 §7).
+
+
 **Files:**
 - Modify: `src/CudaXeKernels.h`, `src/Driver.h`, `src/CudaPhaseScheduler.cu`
 - Create: `tools/test_interim_xe_a2_contract.py`
