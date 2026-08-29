@@ -452,12 +452,17 @@ if "iowriter::fence(_result_session);" not in dtor:
     fail("~IO drops the file handle without fencing the queued batches")
 
 main_code = strip_comments(MAIN)
-if main_code.count("rasbery::iowriter::reportConfig(std::cout);") != 2:
-    fail("the [IO_WRITER] configuration receipt is not emitted from both main() branches")
-if main_code.count("rasbery::iowriter::reportSummary(std::cout);") != 2:
-    fail("the [IO_WRITER][SUMMARY] receipt is not emitted from both main() branches")
-if main_code.count("rasbery::iowriter::shutdown()") != 2:
-    fail("the writer is not drained from both main() branches")
+# THREE branches since WP8: batch, serial, and the long-lived evaluator.  Each
+# one has to configure the writer before its first deck and drain it after its
+# last, or a run's I/O path is undeclared in its own log and a write that failed
+# after the last Driver returned never reaches the exit code.
+MAIN_BRANCHES = 3
+if main_code.count("rasbery::iowriter::reportConfig(std::cout);") != MAIN_BRANCHES:
+    fail("the [IO_WRITER] configuration receipt is not emitted from every main() branch")
+if main_code.count("rasbery::iowriter::reportSummary(std::cout);") != MAIN_BRANCHES:
+    fail("the [IO_WRITER][SUMMARY] receipt is not emitted from every main() branch")
+if main_code.count("rasbery::iowriter::shutdown()") != MAIN_BRANCHES:
+    fail("the writer is not drained from every main() branch")
 if "if (io_writer_failures > 0 && exit_code == 0) exit_code = 1;" not in main_code:
     fail("a lost write does not reach the batch branch's exit code")
 if "if (rasbery::iowriter::shutdown() > 0 && exit_code == 0) exit_code = 1;" not in main_code:

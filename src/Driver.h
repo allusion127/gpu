@@ -861,6 +861,30 @@ inline bool xeAndersonDebug() {
 }
 
 class Driver {
+public:
+    /// The trajectory receipt's payload, as a value.
+    ///
+    /// WHY IT EXISTS.  The trajectory digest is the campaign's identity check
+    /// between two runs of the same binary, and until now the only way to read
+    /// it was to grep this process's own stdout.  That is fine for a launcher
+    /// and impossible for WP8's `--evaluator`: the per-case receipt has to
+    /// carry the digest of the case it is reporting, on the thread that ran it,
+    /// interleaved with sixty-three siblings' output.  So the same numbers the
+    /// receipt prints are also kept as a value.
+    ///
+    /// `complete` is false when Drive() threw before the fold closed, which is
+    /// how a caller tells "this case has no digest" from "this case digested to
+    /// zero".  Nothing here is read by the solver; it is a pure output, and it
+    /// is deliberately NOT folded into the digest itself.
+    struct CaseReceipt {
+        unsigned long long digest      = 0;
+        int                statepoints = 0;
+        long long          outers      = 0;
+        long long          th_updates  = 0;
+        int                slot        = -1;
+        bool               complete    = false;
+    };
+
 private:
     std::string _input;
     std::string _result_output;
@@ -868,6 +892,10 @@ private:
     /// --batch-mode wave may carry light screening cases and full elite cases
     /// side by side (see ResultMode in BatchLightResult.h).
     ResultMode  _result_mode = ResultMode::Full;
+    /// The trajectory fold of the last Drive(), for a caller that cannot grep
+    /// stdout (WP8's --evaluator).  Written once, at the same place the
+    /// trajectory receipt is printed; never read by the solver.
+    CaseReceipt _case_receipt{};
 
     static constexpr double CMFD_FLUX_L2_TOLERANCE = 1.0e-6;
     // Search / T-H feedbacks engage once the CMFD flux L2 residual drops below this, so they
@@ -3935,6 +3963,9 @@ public:
           _result_mode(result_mode) {
     }
 
+    /// What the last Drive() folded.  Valid only after Drive() returns.
+    [[nodiscard]] const CaseReceipt& caseReceipt() const { return _case_receipt; }
+
     int Drive() {
         const auto driver_start = std::chrono::steady_clock::now();
         // Phase 2 statepoint telemetry (plan Rev.4 Sec 8).  One static-local
@@ -4544,6 +4575,17 @@ public:
             // running, never a finished deck's telemetry.
             iowriter::flushLines();
         }
+
+        // The same fold, as a value, for a caller that cannot grep this
+        // process's stdout (WP8 --evaluator; see CaseReceipt).  Stamped from
+        // the SAME variables the trajectory line below prints, immediately
+        // before it, so the two can never disagree about what this case did.
+        _case_receipt.digest      = sp_traj.h;
+        _case_receipt.statepoints = sp_traj.statepoints;
+        _case_receipt.outers      = sp_traj.outers;
+        _case_receipt.th_updates  = sp_traj.th;
+        _case_receipt.slot        = cmfd_solver.batchSlot();
+        _case_receipt.complete    = true;
 
         // The trajectory receipt, unconditionally, as the last line of the run.
         //

@@ -5,6 +5,7 @@
 #include "BatchRefill.h"
 #include "CudaXsReconBackend.h"
 #include "Driver.h"
+#include "EvaluatorServer.h"
 #include "GpuFullContract.h"
 #include "RunContract.h"
 #include "XSTiming.h"
@@ -374,9 +375,52 @@ int main(int argc, char* argv[]) {
     rasbery::ResultMode      result_mode = rasbery::BatchLightResult::DefaultMode();
     std::vector<rasbery::ResultMode> rasbery_result_modes;
 
+    // WP8 stage 1 (BOTTLENECK plan Sec 5.1 / GA evaluator plan Sec 6.2 Task 6).
+    // `--evaluator-jsonl [path]` turns this process into a long-lived case
+    // server instead of a one-shot job runner.  Everything ABOVE this branch --
+    // the exact-only gate, the [PHYSICS_MODE] receipt, the OpenMP startup -- is
+    // unchanged and still runs first: an evaluator that skipped the fidelity
+    // contract would be the fastest way yet to get a screening result into an
+    // acceptance table.
+    bool        evaluator_mode            = false;
+    std::string evaluator_request_path    = "-"; ///< "-" is stdin
+    double      evaluator_idle_timeout    = -1.0;
+    bool        evaluator_isolation_check = false;
+
     int argi = 1;
     while (argi < argc) {
         const std::string option = argv[argi];
+
+        // The three evaluator flags are handled HERE, before the generic
+        // value-consuming loop below, because that loop requires every option
+        // to be followed by at least one non-`--` value.  `--evaluator-jsonl`
+        // takes an OPTIONAL path (default stdin) and
+        // `--evaluator-isolation-check` takes none, so both would be rejected
+        // by it with a misleading "Missing value after option".
+        if (option == "--evaluator" || option == "--evaluator-jsonl") {
+            evaluator_mode = true;
+            ++argi;
+            if (argi < argc && std::string(argv[argi]).rfind("--", 0) != 0) {
+                evaluator_request_path = argv[argi];
+                ++argi;
+            }
+            continue;
+        }
+        if (option == "--evaluator-idle-timeout") {
+            ++argi;
+            if (argi >= argc || std::string(argv[argi]).rfind("--", 0) == 0) {
+                std::cerr << "Missing value after option: " << option << std::endl;
+                return 1;
+            }
+            evaluator_idle_timeout = std::atof(argv[argi]);
+            ++argi;
+            continue;
+        }
+        if (option == "--evaluator-isolation-check") {
+            evaluator_isolation_check = true;
+            ++argi;
+            continue;
+        }
 
         if (option == "-h" || option == "--help") {
             std::cout << "Usage:\n"
@@ -418,7 +462,29 @@ int main(int argc, char* argv[]) {
                       << "    either way.\n"
                       << "  - A --jobs manifest line may carry a THIRD field, that job's own\n"
                       << "    result mode, which overrides --result for that job alone --\n"
-                      << "    how one wave runs a light population beside full elites.\n";
+                      << "    how one wave runs a light population beside full elites.\n"
+                      << "  - --evaluator-jsonl [path] (alias --evaluator) keeps ONE process\n"
+                      << "    alive -- CUDA context, immutable XSLIB parse, T/H tables,\n"
+                      << "    device library and arenas -- and reads JSONL case requests\n"
+                      << "    from `path` (default stdin, `-`).  Requires --batch-mode M,\n"
+                      << "    which is latched for the process: the arena is ONE allocation\n"
+                      << "    sized at the first admission.  Requests:\n"
+                      << "      {\"op\":\"case\",\"deck\":\"a.json\",\"output\":\"a.h5\",\n"
+                      << "       \"result_mode\":\"light\",\"key\":\"cand-17\"}\n"
+                      << "      {\"op\":\"wave\",\"wave_id\":17,\"jobs_manifest\":\"w17.jobs\"}\n"
+                      << "      {\"op\":\"run\"}        run the cases enqueued since the last wave\n"
+                      << "      {\"op\":\"shutdown\"}   stop, release the arena, print receipts\n"
+                      << "    Each case still builds a fresh Driver/CaseContext, so its\n"
+                      << "    trajectory digest is the one the same deck produces from a\n"
+                      << "    one-shot --jobs run.  A case that throws (including a\n"
+                      << "    RASBERY_GPU_FULL=1 fail-closed refusal) fails alone and the\n"
+                      << "    process keeps answering.\n"
+                      << "  - --evaluator-idle-timeout S stops the process after S seconds\n"
+                      << "    with no new request.  It applies to a FILE request stream,\n"
+                      << "    which the controller may append to; stdin stops at EOF.\n"
+                      << "  - --evaluator-isolation-check re-runs each wave's FIRST deck once\n"
+                      << "    more at the END of that wave and compares the two digests --\n"
+                      << "    the A -> ... -> A cross-case leak test, run in production.\n";
             return 0;
         }
 
@@ -530,7 +596,18 @@ int main(int argc, char* argv[]) {
     // (Driver.h) resolves on first read and caches, and the receipt is the
     // first read.
     // -----------------------------------------------------------------------
-    const bool batch_execution = (batch_width > 0 && !rasbery_inputs.empty());
+    //
+    // WP8 ADDS ONE PRODUCER, NOT A SECOND PREDICATE.  An evaluator process is a
+    // batch process whose job list arrives later: it stands the same arenas up
+    // at the same width and runs its cases through the same OpenMP queue, so it
+    // must resolve the SAME mode-dependent defaults (the Anderson default is
+    // single-ON / batch-OFF, Driver.h).  Declaring Single here and then running
+    // waves would make every evaluator digest differ from the `--jobs
+    // --batch-mode M` run it is supposed to reproduce bit for bit -- the B0
+    // gate would fail for a reason that has nothing to do with the lifetime
+    // change under test.  The evaluator branch below returns before
+    // `if (batch_execution)`, so one predicate still selects exactly one path.
+    const bool batch_execution = (batch_width > 0 && !rasbery_inputs.empty()) || evaluator_mode;
     rasbery::declareExecutionMode(batch_execution ? rasbery::ExecutionMode::Batch
                                                   : rasbery::ExecutionMode::Single);
 
@@ -699,7 +776,10 @@ int main(int argc, char* argv[]) {
                   << ",\"requires_exact_rerun\":true}" << std::endl;
     }
 
-    if (chiffon_inputs.empty() && rasbery_inputs.empty() && iso_csv.empty() && validate_args.empty()) {
+    // An evaluator has no jobs on argv BY DESIGN -- they arrive on the request
+    // stream -- so it is the one mode that may start with an empty deck list.
+    if (chiffon_inputs.empty() && rasbery_inputs.empty() && iso_csv.empty() &&
+        validate_args.empty() && !evaluator_mode) {
         std::cerr << "No jobs were provided. Use --help for usage." << std::endl;
         return 1;
     }
@@ -762,6 +842,134 @@ int main(int argc, char* argv[]) {
     }
 
     int exit_code = 0;
+
+    // -----------------------------------------------------------------------
+    // WP8 stage 1 -- the long-lived evaluator.
+    //
+    // Placed HERE, and not earlier, because everything above it is the part of
+    // a run that must not change: the exact-only gate, the [PHYSICS_MODE]
+    // receipt, the isotope registry and the depletion chain.  An evaluator is a
+    // batch process whose job list arrives on a stream instead of on argv, so
+    // it enters with the same execution mode declared, the same host-pinning
+    // decision and the same I/O writer configuration, and it leaves through the
+    // same teardown order (plan Sec 6.6): every Driver gone, the writer drained
+    // and joined, the arena released, then the pin registry.
+    //
+    // The ONE difference is when those last three happen -- once, at shutdown,
+    // instead of once per process image per chunk -- and that difference is the
+    // whole work package.
+    // -----------------------------------------------------------------------
+    if (evaluator_mode) {
+        if (batch_width <= 0) {
+            std::cerr << "--evaluator requires --batch-mode M: the arena is one allocation "
+                         "sized at the first admission and fixed for the process, so the "
+                         "width has to be known before the first request. Its comparand is a "
+                         "`--jobs ... --batch-mode M` run at the same M."
+                      << std::endl;
+            return 1;
+        }
+        if (!rasbery_inputs.empty()) {
+            std::cerr << "--evaluator takes its jobs from the request stream, not from --rasi/"
+                         "--jobs. " << rasbery_inputs.size()
+                      << " deck(s) were also given on the command line; they would run under "
+                         "a different job-namespace rule than the waves. Feed them as "
+                         "{\"op\":\"case\"} lines or a {\"op\":\"wave\",\"jobs_manifest\":...} "
+                         "instead."
+                      << std::endl;
+            return 1;
+        }
+
+        rasbery::evaluator::Options options;
+        options.request_path        = evaluator_request_path;
+        options.batch_width         = batch_width;
+        options.default_result_mode = result_mode;
+        options.idle_timeout_s      = evaluator_idle_timeout;
+        options.isolation_check     = evaluator_isolation_check;
+        options.visible_cpus        = startup_visible_cpus;
+        if (const char* host_env = std::getenv("RASBERY_BATCH_HOST_THREADS"))
+            options.host_threads_override = std::atoi(host_env);
+        // ONE manifest grammar.  The evaluator does not reimplement the `--jobs`
+        // reader; it is handed the same function, so the quoting, the optional
+        // third result-mode field, the CRLF strip and the line-numbered errors
+        // have exactly one definition.
+        options.read_manifest = rasberyReadJobManifest;
+
+#ifdef _OPENMP
+    #ifndef _MSC_VER
+        omp_set_max_active_levels(1);
+    #else
+        omp_set_nested(0);
+    #endif
+#endif
+        rasbery::iowriter::reportConfig(std::cout);
+
+        rasbery::evaluator::Server server(options, std::cout);
+        pre_drive_seconds = since_start(std::chrono::steady_clock::now());
+        exit_code         = server.run();
+        drive_end         = std::chrono::steady_clock::now();
+
+        // Same order, same tags, same reasons as the batch branch below: every
+        // Driver has joined, so the writer queue can only shrink; then the
+        // arena; then the leases that outlived it.  This is the ONLY place the
+        // evaluator tears any of it down.
+        const std::uint64_t io_writer_failures = rasbery::iowriter::shutdown();
+        if (io_writer_failures > 0 && exit_code == 0) exit_code = 1;
+        rasbery::rasberyReleaseBatchArena();
+        server.stampArenaRelease();
+        rasbery::rasberyDrainPinnedRegistry();
+
+        std::cout << "[RASBERY][BATCH_HOST][PIN] {";
+        rasbery::rasberyAppendHostPinReceiptFields(std::cout);
+        std::cout << "}" << std::endl;
+        std::cout << "[RASBERY][GPU_FULL] {";
+        rasbery::gpufull::appendReceiptFields(std::cout);
+        std::cout << "}" << std::endl;
+        if (rasbery::rasberyGpuXsReconEnabled())
+            std::cout << "[RASBERY][XSRECON][GPU] {\"nodes_solved\":"
+                      << rasbery::rasberyGpuXsReconNodes() << "}" << std::endl;
+        if (rasbery::rasberyGpuFlatXsEnabled())
+            std::cout << "[RASBERY][FLATXS][GPU] {\"nodes_solved\":"
+                      << rasbery::rasberyGpuFlatXsNodes() << "}" << std::endl;
+        if (rasbery::rasberyGpuXeEnabled()) {
+            std::cout << "[RASBERY][XE_GPU] {";
+            rasbery::xe::appendXeGpuReceiptFields(std::cout);
+            std::cout << ",\"fuel_node_evaluations\":" << rasbery::rasberyGpuXeEvaluations()
+                      << ",\"fuel_node_commits\":" << rasbery::rasberyGpuXeCommits()
+                      << ",\"dot_partitions\":" << rasbery::rasberyGpuXeDotPartitions()
+                      << "}" << std::endl;
+        }
+        if (rasbery::rasberyGpuNodalEnabled()) {
+            std::cout << "[RASBERY][NODAL][GPU] {\"drives_solved\":"
+                      << rasbery::rasberyGpuNodalDrives() << "}" << std::endl;
+            std::cout << "[RASBERY][NODAL][CANON] {\"elided_upload_bytes\":"
+                      << rasbery::rasberyGpuNodalCanonicalElidedUploadBytes()
+                      << ",\"elided_download_bytes\":"
+                      << rasbery::rasberyGpuNodalCanonicalElidedDownloadBytes()
+                      << "}" << std::endl;
+        }
+        rasbery::gpu::reportOuterSegment(std::cout);
+        rasbery::xsphase::report(std::cout);
+        rasbery::outer_timing::report(std::cout);
+        const auto evaluator_hdf5_stats = Chiffon::GetHdf5LockStats();
+        std::cout << "[RASBERY][HDF5][LOCK] {\"acquires\":"
+                  << evaluator_hdf5_stats.acquisitions << ",\"wait_ms\":"
+                  << static_cast<double>(evaluator_hdf5_stats.wait_nanoseconds) / 1.0e6
+                  << "}" << std::endl;
+        // THE FIELD THE WHOLE WORK PACKAGE IS JUDGED ON: loads must be the
+        // number of distinct library CONTENTS this process saw, and must not
+        // grow with the case count or the wave count.
+        rasbery::PrintXsLibraryCacheReceipt(std::cout);
+        rasberyPrintProcessLedger(std::cout, exec_seconds, pre_drive_seconds,
+                                  since_start(drive_end) - pre_drive_seconds,
+                                  since_start(std::chrono::steady_clock::now()) -
+                                      since_start(drive_end),
+                                  static_cast<int>(server.summary().cases));
+        // AFTER PrintXsLibraryCacheReceipt and after the arena release, so its
+        // xslib and arena_releases fields are final.
+        server.reportProcess(std::cout);
+        rasbery::iowriter::reportSummary(std::cout);
+        return exit_code;
+    }
 
     // -----------------------------------------------------------------------
     // Multi-instance batch mode.

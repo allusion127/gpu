@@ -270,7 +270,14 @@ MAIN_FLAT = squash(MAIN_CODE)
 # THREE sites, named individually: the definition, the declaration and the
 # branch.  (A bare occurrence count would also be satisfied by three mentions in
 # the wrong places, and would break on an unrelated fourth use.)
-DEFINITION = "const bool batch_execution = (batch_width > 0 && !rasbery_inputs.empty());"
+# WP8 added a SECOND PRODUCER of the same predicate, not a second predicate:
+# `--evaluator` is a batch process whose job list arrives on a stream, so it has
+# to resolve the same mode-dependent Anderson default as the `--jobs
+# --batch-mode M` run whose per-case digests it must reproduce.  The rule this
+# block enforces is unchanged -- ONE expression, declared once, and the same
+# name selects the branch that runs.
+DEFINITION = ("const bool batch_execution = (batch_width > 0 && !rasbery_inputs.empty()) "
+              "|| evaluator_mode;")
 DECLARATION = ("rasbery::declareExecutionMode(batch_execution ? rasbery::ExecutionMode::Batch "
                ": rasbery::ExecutionMode::Single);")
 BRANCH = "if (batch_execution) {"

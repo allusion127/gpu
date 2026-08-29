@@ -250,8 +250,10 @@ for field in (
 
 main = read("main.cpp")
 check(
-    main.count('"[RASBERY][XE_GPU] {"') == 2,
-    "the receipt is emitted on both the batch and the serial shutdown path",
+    # Three shutdown paths since WP8: batch, serial, and the long-lived
+    # evaluator.  "on and never engaged" must not look like "off" in ANY of them.
+    main.count('"[RASBERY][XE_GPU] {"') == 3,
+    "the receipt is emitted on every main() shutdown path (batch, serial, evaluator)",
 )
 check(
     "xe_updates.fetch_add" in read("XSSet.cpp"),
