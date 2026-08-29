@@ -1567,7 +1567,17 @@ private:
         }
 
         const CudaBatchArena::CmfdResidentView view = arena->residentView(slot);
-        if (!view.valid) return false;
+        if (!view.valid) {
+            // F11 (review doc Sec 3).  This used to be a bare `return false`.
+            // The arena existed, the slot was ours and the sweep was resident,
+            // so every earlier refusal had already been ruled out -- and then
+            // the segment declined with NOTHING in `[OUTER_GPU].refusals`.  A
+            // run that lost the outer here looked exactly like a run that never
+            // reached armOuterSegment at all, which is the one thing this
+            // receipt exists to tell apart.
+            gpu::noteOuterSegmentRefusal(gpu::OuterSegmentRefusal::NoResidency);
+            return false;
+        }
 
         gpu::OuterSegmentResidency residency;
         residency.flux       = view.phi;
@@ -1735,7 +1745,16 @@ private:
         hooks.sweep_synchronizes  = !stream_sweep;
         gpu::rasberyOuterSegment(slot).setHooks(hooks);
 
-        if (!gpu::rasberyBindOuterResidency(residency)) return false;
+        if (!gpu::rasberyBindOuterResidency(residency)) {
+            // F11 (review doc Sec 3).  The second nameless refusal: the hooks
+            // were installed and the bind is the LAST thing between this and an
+            // armed segment, so a silent false here is the most expensive one
+            // to diagnose -- everything upstream reports success.  `unbound` is
+            // the enum's own word for "nobody handed the runner the
+            // arena-derived views", which is precisely what just failed.
+            gpu::noteOuterSegmentRefusal(gpu::OuterSegmentRefusal::Unbound);
+            return false;
+        }
 
         // ===================================================================
         // Rev.7.1 Task 18-lite: CANONICAL NODAL BINDING

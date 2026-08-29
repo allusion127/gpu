@@ -4134,15 +4134,25 @@ double XSSet::UpdateEquilibriumXenon(double power, double relax) {
     }
 
     if (rasberyGpuXsReconEnabled()) {
-        double gpu_max = 0.0;
+        double          gpu_max = 0.0;
+        xe::XeGpuTally& tally   = xe::xeGpuTally();
+        // F10 (review doc Sec 3).  Charged BEFORE the attempt, the same way the
+        // split arm above charges xe_updates, so
+        // `fused_updates == fused_device_updates + fused_host_fallbacks` is an
+        // accounting identity and a receipt whose parts do not sum to its whole
+        // is a bug rather than a reading.
+        tally.fused_updates.fetch_add(1, std::memory_order_relaxed);
         if (TryUpdateEquilibriumXenonGpu(power, relax, gpu_max)) {
+            tally.fused_device_updates.fetch_add(1, std::memory_order_relaxed);
             xsreconDebugHash(_xs, _iden, _g.ng(), _g.nxyz(), gpu_max);
             return gpu_max;
         }
+        tally.fused_host_fallbacks.fetch_add(1, std::memory_order_relaxed);
         // any failure falls through to the unchanged CPU loop
         // WP1 (plan Sec 6.3).  Unlike the split arm above, this one had NO
         // tally at all -- the fused RASBERY_GPU_XSRECON arm could decline every
-        // step of every statepoint and no receipt would say so.
+        // step of every statepoint and no receipt would say so.  The counter on
+        // the line above is F10's half of that; the guard is WP1's.
         RASBERY_GPU_FULL_GUARD(Xe, "XSSet::UpdateEquilibriumXenon(fused)",
                                "the fused device Xe arm declined; the host Xe loop "
                                "runs");

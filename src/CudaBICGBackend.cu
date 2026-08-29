@@ -6,6 +6,7 @@
 #include "CudaXsReconBackend.h" // rasberyHostPinningEnabled(): header-only gate
 #include "Geometry.h"
 #include "GpuCaptureArbiter.h"
+#include "GpuFullContract.h" // F9: the seam tally the three fallback fields read
 #include "GpuGraphSplice.h"
 #include "pch.h"
 
@@ -5658,9 +5659,26 @@ void rasberyReleaseBatchArena() {
     // occupancy raises: the batch is this wide, and this is what it cost to
     // keep its captures away from its allocations.
     std::cout << rasbery::captureArbiterReceipt("run") << std::endl;
-    const BackendCounters c = g_arena->counters();
+    BackendCounters c = g_arena->counters();
+    // F9 (review doc Sec 3).  The arena spelling of this receipt never carried
+    // the three host-fallback fields at all, and the non-arena spelling in
+    // src/BICGSolver.cpp carried them as a hard 0.  A batch run is the arm the
+    // campaign actually measures, so the fields have to be HERE or the fix is
+    // invisible where it matters.  One source: the WP1 seam tally, not a second
+    // set of counters that could disagree with it (F13).
+    {
+        namespace gf = ::rasbery::gpufull;
+        c.cmfd_cpu_fallbacks  = gf::fallbacks(gf::Subsystem::Cmfd);
+        c.nodal_cpu_fallbacks = gf::fallbacks(gf::Subsystem::Nodal);
+        c.xs_cpu_fallbacks    = gf::fallbacks(gf::Subsystem::FlatXs) +
+                                gf::fallbacks(gf::Subsystem::Xe) +
+                                gf::fallbacks(gf::Subsystem::Cram);
+    }
     std::cout << "[RASBERY][CUDA][BACKEND_COUNTERS] {"
               << "\"cmfd_gpu_calls\":" << c.cmfd_gpu_calls << ','
+              << "\"cmfd_cpu_fallbacks\":" << c.cmfd_cpu_fallbacks << ','
+              << "\"nodal_cpu_fallbacks\":" << c.nodal_cpu_fallbacks << ','
+              << "\"xs_cpu_fallbacks\":" << c.xs_cpu_fallbacks << ','
               << "\"cmfd_assembly_gpu_calls\":" << c.cmfd_assembly_gpu_calls << ','
               << "\"cmfd_assembly_cpu_fallbacks\":"
               << c.cmfd_assembly_cpu_fallbacks << ','

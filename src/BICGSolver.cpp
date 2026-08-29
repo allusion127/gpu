@@ -1,5 +1,7 @@
 #include "BICGSolver.h"
 
+#include "GpuFullContract.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -101,7 +103,35 @@ BICGSolver::~BICGSolver() {
         return;
     }
     if (!_cuda) return;
-    const BackendCounters c = _cuda->counters();
+    BackendCounters c = _cuda->counters();
+    // F9 (review doc Sec 3).  THE THREE FIELDS THAT WERE PRINTED AND NEVER
+    // WRITTEN.  `xs_cpu_fallbacks`, `cmfd_cpu_fallbacks` and
+    // `nodal_cpu_fallbacks` have been declared in src/CudaBICGBackend.h and
+    // emitted here since the backend was written, and NOTHING in the tree ever
+    // incremented one of them: they reported 0 on every run, including runs
+    // that spent every statepoint on the CPU.  WP2 planned to judge "the
+    // feature engaged" from these fields; that judgment was reading a constant.
+    //
+    // They are filled from the ONE tally that is already incremented at the
+    // seams where those fallbacks actually happen -- the WP1 guards at
+    // BICGCMFD::drive, Nodal::drive, XSSet::UpdateFlatXS,
+    // XSSet::UpdateEquilibriumXenon (both arms) and XSSet::Deplete /
+    // PredictorCorrectorStep.  Filling them here rather than bumping a second
+    // set of counters at those seams is deliberate: two tallies of one event
+    // can disagree, and the disagreement is invisible in either receipt (the
+    // rule the review doc records as F13).
+    //
+    // `xs_cpu_fallbacks` is the XS DRIVES: FlatXS reconstruction, the Xe
+    // equilibrium update and the CRAM depletion step all live in XSSet and all
+    // fall back to the same host bodies.
+    {
+        namespace gf = ::rasbery::gpufull;
+        c.cmfd_cpu_fallbacks  = gf::fallbacks(gf::Subsystem::Cmfd);
+        c.nodal_cpu_fallbacks = gf::fallbacks(gf::Subsystem::Nodal);
+        c.xs_cpu_fallbacks    = gf::fallbacks(gf::Subsystem::FlatXs) +
+                                gf::fallbacks(gf::Subsystem::Xe) +
+                                gf::fallbacks(gf::Subsystem::Cram);
+    }
     std::cout
         << "[RASBERY][CUDA][BACKEND_COUNTERS] {"
         << "\"xs_gpu_calls\":" << c.xs_gpu_calls << ','
