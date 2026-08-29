@@ -41,6 +41,7 @@ if (RASBERY_ENABLE_CUDA)
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaXsReconBackendStub.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaOuterGraphStub.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/GpuPhysicsBackendStub.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaPprBackendStub.cpp"
     )
     list(APPEND RASBERY_SOURCES
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaBICGBackend.cu"
@@ -49,6 +50,7 @@ if (RASBERY_ENABLE_CUDA)
             "${CMAKE_CURRENT_SOURCE_DIR}/src/GpuPhysicsArenaCuda.cu"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/GpuPhaseScheduler.cu"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/GpuPhysicsBackendCuda.cu"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaPprBackend.cu"
     )
     # Task 9 composes the Task 4/5 phase kernels, whose contract is bit-identical
     # reproduction of the host loops: nvcc must not contract a*b+c into an fma
@@ -60,6 +62,13 @@ if (RASBERY_ENABLE_CUDA)
     # loop; nvcc must not contract a*b+c into fma where the host compiler did
     # not.  Scoped to this one file so the CMFD backend keeps its flags.
     set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/CudaXsReconBackend.cu"
+            PROPERTIES COMPILE_OPTIONS "--fmad=false")
+    # GA evaluator plan Task 10 (GPU PPR).  The kernels are a transcription of
+    # PPR.cpp's node bodies in the host's statement order; contracting a*b+c
+    # into an fma where the host did not would put the arm's deviation at the
+    # mercy of nvcc's scheduler instead of at the one place the gate documents
+    # (the device libm's exp, and the corner-sum chunking).
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/CudaPprBackend.cu"
             PROPERTIES COMPILE_OPTIONS "--fmad=false")
 endif ()
 

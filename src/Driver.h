@@ -391,6 +391,18 @@ namespace trajectory {
 /// disagree with the solver's own reading of them.  RASBERY_STATEPOINT_TELEMETRY
 /// is deliberately absent: it is the thing under test, and it rides in its own
 /// field so an arm comparison can hold every OTHER knob equal.
+///
+/// RASBERY_GPU_PPR is deliberately absent for a DIFFERENT reason, and the
+/// difference is the whole point of the arm.  Pin-power reconstruction is
+/// strictly downstream of the iteration: it runs after the statepoint's final
+/// SolveLoop, reads Jnet/Phif/Phis, and writes only Geometry's PPR coefficient
+/// arrays and the pin map -- nothing SolveLoop, the boron search, the T/H
+/// update or the depletion will read again.  So the knob cannot move a
+/// trajectory, and listing it here would say it could.  Its own
+/// `[RASBERY][PPR_GPU]` line answers "which arm was this" for the one thing it
+/// does change.  If a future change ever lets PPR feed back, this list is where
+/// that change has to be declared -- tools/test_ppr_gpu_contract.py asserts the
+/// absence so the declaration cannot be forgotten.
 inline constexpr const char* kArmEnv[] = {
     "RASBERY_GPU",
     "RASBERY_GPU_CMFD_SWEEP",
@@ -4022,8 +4034,12 @@ public:
         // 3. Main schedule loop.  The bound is re-read every iteration because a
         // depletion entry carrying until_boron_ppm re-queues itself (natural EOC);
         // decks without that key never grow the vector, so their path is unchanged.
-        double total_io_seconds    = 0.0;
-        int    natural_eoc_inserts = 0;
+        double    total_io_seconds     = 0.0;
+        int       natural_eoc_inserts  = 0;
+        // Statepoints whose PPR ran on the host.  With RASBERY_GPU_PPR unset
+        // that is all of them and the [PPR_GPU] receipt is not printed; with it
+        // set, any non-zero value is a fallback and the receipt says so.
+        long long ppr_host_statepoints = 0;
 
         for (int step_index = 0; step_index < static_cast<int>(scheduler.schedule().size()); ++step_index) {
             auto& schedule = scheduler.schedule(step_index);
@@ -4119,10 +4135,6 @@ public:
             }
 
             // PPR
-            {
-            outer_timing::Scope ppr_reset_scope(sptelem::PH_PPR_RESET);
-            pin_power_reconstruction.reset(1.0 / eigv, geometry.Jnet(), geometry.Phif(), geometry.Phis());
-            }
             // Corner-balance iteration cap.  The loop exits early on its own
             // corner-flux tolerance; measured on KNGR CY1 it needs ~50 rounds,
             // and the historical cap of 5 shipped an unconverged reconstruction
@@ -4135,9 +4147,32 @@ public:
                 const int   v = e ? std::atoi(e) : 100;
                 return v > 0 ? v : 100;
             }();
+            // GA evaluator plan Sec 6.3 Task 10.  RASBERY_GPU_PPR=1 runs
+            // reset()+drive() as one device sequence; anything else -- arm off,
+            // no CUDA, ng != 2, RASBERY_PPR_MODE=master, a CUDA failure --
+            // returns false having touched nothing, and the two host calls run
+            // exactly as they did before.  The fused device call is charged to
+            // ppr_drive, so `ppr_reset + ppr_drive` is the like-for-like
+            // comparison between the two arms and `ppr_reset == 0` is how the
+            // receipt says which one ran.
+            bool ppr_on_device = false;
             {
                 outer_timing::Scope ppr_drive_scope(sptelem::PH_PPR_DRIVE);
-                pin_power_reconstruction.drive(ppr_iters);
+                ppr_on_device = pin_power_reconstruction.resetAndDriveGpu(
+                    1.0 / eigv, geometry.Jnet(), geometry.Phif(),
+                    geometry.Phis(), ppr_iters);
+            }
+            if (!ppr_on_device) {
+                ++ppr_host_statepoints;
+                {
+                    outer_timing::Scope ppr_reset_scope(sptelem::PH_PPR_RESET);
+                    pin_power_reconstruction.reset(1.0 / eigv, geometry.Jnet(),
+                                                   geometry.Phif(), geometry.Phis());
+                }
+                {
+                    outer_timing::Scope ppr_drive_scope(sptelem::PH_PPR_DRIVE);
+                    pin_power_reconstruction.drive(ppr_iters);
+                }
             }
             // MASTER reports pin-volume-averaged reconstructed power.  A pin-centre
             // sample biases Fq high once intra-node curvature grows during burnup,
@@ -4302,6 +4337,32 @@ public:
         // One-line accounting of how often the nonlinear correction had to be
         // guarded/damped over the whole run. Silent when nothing fired.
         cmfd_solver.reportDhatGuardStats(_input.c_str());
+
+        // GA evaluator plan Task 10 receipt.  Printed only when the arm is on,
+        // and it carries the two numbers that decide whether the arm actually
+        // ran: `statepoints` (device) against `host_fallbacks`.  `iterations`
+        // is the corner-balance count the device loop actually spent, so the
+        // "did the break test move?" question is answered by the receipt rather
+        // than assumed -- it is directly comparable to the host arm's, which is
+        // 100 x statepoints minus whatever the tolerance saved.
+        {
+            const PprBackend& g = pin_power_reconstruction.gpu();
+            // Printed when the arm is on (or ran at all), and additionally under
+            // RASBERY_STATEPOINT_TELEMETRY so the HOST arm's iteration count is
+            // obtainable at all -- without that the "did the break test move?"
+            // comparison would have only one side.  A run with neither is
+            // byte-identical on stdout to the binary before this change.
+            if (g.available() || g.statepoints() > 0 || sp_telem) {
+                std::cout << std::format(
+                    "  [RASBERY][PPR_GPU] {{\"schema_version\":1,\"slot\":{},"
+                    "\"statepoints\":{},\"device\":{},\"host_fallbacks\":{},"
+                    "\"iterations\":{},\"host_iterations\":{},"
+                    "\"wall_ms\":{:.3f},\"status\":\"{}\"}}\n",
+                    cmfd_solver.batchSlot(), g.statepoints(), g.deviceOrdinal(),
+                    ppr_host_statepoints, g.iterations(),
+                    pin_power_reconstruction.hostIterations(), g.wallMs(), g.status());
+            }
+        }
 
         const double total_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - driver_start).count();
         std::cout << std::format("  [TIMING] IO write={:.3f} s\n", total_io_seconds);

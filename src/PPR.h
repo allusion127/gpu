@@ -1,9 +1,12 @@
 #pragma once
 
+#include "CudaPprBackend.h"
 #include "Geometry.h"
 #include "XSSet.h"
 #include "pch.h"
 #include <cmath>
+#include <memory>
+#include <vector>
 
 // PPR coefficient macros
 // All underlying arrays are owned by Geometry; PPR holds raw pointers to them.
@@ -108,6 +111,24 @@ private:
     // source iteration.  RASBERY_PPR_MODE=master selects it.
     bool _mode_master = false;
 
+    // GA evaluator plan Task 10: the device arm for reset()+drive().  ONE per
+    // PPR object, and a PPR object is a local of Driver::Drive(), so this is
+    // per-Driver -- per batch slot -- with no process-wide state to mix two
+    // decks' buffers.  Null is impossible; unavailable is the normal state
+    // (RASBERY_GPU_PPR unset), and then resetAndDriveGpu() returns false and
+    // the host path runs untouched.
+    std::unique_ptr<PprBackend> _gpu;
+
+    /// Staging for the one macroscopic block XSSet does not publish as a raw
+    /// SoA pointer.  Sized once, refilled per statepoint (ng*nxyz doubles).
+    std::vector<double> _xsdf_stage;
+    /// Fuel flags as bytes -- Geometry keeps `bool*`, whose object
+    /// representation is not something a device upload may assume.
+    std::vector<unsigned char> _isfuel_stage;
+
+    /// Corner-balance iterations spent by the host drive() over this run.
+    unsigned long long _host_iters = 0;
+
     /// @brief MASTER MM 6.1 reconstruction: fill _c with the 13-term Legendre
     /// coefficients (even terms from surfaces/currents, cross terms from the
     /// CPB corner solve).
@@ -156,6 +177,30 @@ public:
 
     /// @brief Run the pin power reconstruction iteration
     void drive(int niter);
+
+    /// @brief reset() + drive(niter) on the device (RASBERY_GPU_PPR).
+    ///
+    /// Returns false -- having touched nothing -- when the arm is off, the
+    /// build has no CUDA, the deck is not 2-group, RASBERY_PPR_MODE=master is
+    /// selected, or any CUDA call fails.  The caller must then run reset() and
+    /// drive() exactly as before.  On success the host coefficient arrays
+    /// reconstructPinPower() reads (_p, _a, _c, _bt, and _phic/_q/_l for
+    /// completeness) hold the device result and the nodal pointers are set the
+    /// same way reset() sets them.
+    bool resetAndDriveGpu(double reigv, double* jnet, const double* phif,
+                          double* phis, int niter);
+
+    /// @brief The device arm's receipt source (never null).
+    [[nodiscard]] const PprBackend& gpu() const { return *_gpu; }
+
+    /// @brief Corner-balance iterations the HOST drive() has spent this run.
+    ///
+    /// The device arm reports its own (PprBackend::iterations()).  Both are
+    /// printed so "did the break test move?" is a comparison and not a claim:
+    /// the two arms apply the same RelativeChange test to the same tolerance,
+    /// but the device sums the corner fluxes on a 256-chunk partition, so the
+    /// iteration counts are allowed to differ and have to be seen.
+    [[nodiscard]] unsigned long long hostIterations() const { return _host_iters; }
 
     /// @brief Update axial leakage expansion
     void updateAxialLeakage();

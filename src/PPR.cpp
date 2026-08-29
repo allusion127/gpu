@@ -56,6 +56,81 @@ PPR::PPR(Geometry& g, XSSet& xs)
     _q    = _g.CoeffExp();
     _l    = _g.CoeffLeak();
     _bt   = _g.CoeffBuckling();
+
+    // Task 10 device arm.  Constructed unconditionally and cheaply: with
+    // RASBERY_GPU_PPR unset the constructor reads one environment variable and
+    // stops.  One instance per PPR, i.e. per Driver, i.e. per batch slot.
+    _gpu = std::make_unique<PprBackend>();
+}
+
+bool PPR::resetAndDriveGpu(const double reigv, double* jnet, const double* phif,
+                           double* phis, int niter) {
+    if (_gpu == nullptr || !_gpu->available()) return false;
+    // driveMaster is a different scheme (MASTER MM 6.1, a corner-point-balance
+    // solve, not this Picard iteration).  The device arm reproduces the SENM
+    // path only, so it declines rather than silently changing method.
+    if (_mode_master) return false;
+    if (_g.ng() != 2) return false;
+
+    // The pointer/scalar half of reset(), verbatim: everything downstream
+    // (reconstructPinPower, phig, getPhis) reads these.
+    _reigv = reigv;
+    _jnet  = jnet;
+    _phif  = phif;
+    _phis  = phis;
+
+    if (_crdf_on) {
+        for (int lk = 0; lk < _nxyz; lk++) {
+            const auto& model = _xs.models()[_xs.comp(lk)];
+            const int   burn  = _xs.burn(lk);
+            for (int g = 0; g < _ng; g++)
+                _crdf[static_cast<size_t>(lk) * _ng + g] = model.CornerToSurfaceDFRatio(g, burn);
+        }
+    }
+
+    const size_t nng = static_cast<size_t>(_nxyz) * _ng;
+    if (_xsdf_stage.size() != nng) _xsdf_stage.resize(nng);
+    for (int g = 0; g < _ng; ++g)
+        for (int lk = 0; lk < _nxyz; ++lk)
+            _xsdf_stage[static_cast<size_t>(g) * _nxyz + lk] = _xs.xsdf(g, lk);
+
+    if (_isfuel_stage.size() != static_cast<size_t>(_nxyz)) {
+        _isfuel_stage.assign(static_cast<size_t>(_nxyz), 0);
+        for (int lk = 0; lk < _nxyz; ++lk)
+            _isfuel_stage[static_cast<size_t>(lk)] = _g.IsFuel(lk) ? 1u : 0u;
+    }
+
+    ppr::GeomView geom;
+    geom.ng      = _ng;
+    geom.nxyz    = _nxyz;
+    geom.nxy     = _g.nxy();
+    geom.nsurf   = _g.nsurf();
+    geom.hmesh   = &_g.hmesh(XDIR, 0);
+    geom.lktosfc = &_g.lktosfc(LEFT, XDIR, 0);
+    geom.neibrb  = &_g.neibrb(WEST, 0);
+    geom.is_fuel = _isfuel_stage.data();
+
+    ppr::StepView step;
+    step.reigv = _reigv;
+    step.phif  = _phif;
+    step.phis  = _phis;
+    step.jnet  = _jnet;
+    step.xsdf  = _xsdf_stage.data();
+    step.xsrf  = _xs.xsrfData();
+    step.xsnf  = _xs.xsnfData();
+    step.xssm  = _xs.xssmData();
+    step.chif  = _xs.chifData();
+    step.crdf  = _crdf.data();
+    step.phic  = _phic;
+    step.p     = _p;
+    step.a     = _a;
+    step.c     = _c;
+    step.q     = _q;
+    step.l     = _l;
+    step.bt    = _bt;
+
+    int iters = 0;
+    return _gpu->resetAndDrive(geom, step, niter, &iters);
 }
 
 void PPR::buildQuadratureTable() {
@@ -567,6 +642,8 @@ void PPR::drive(int niter) {
         const double err_sw = RelativeChange(currentCornerFlux.sw, previousCornerFlux.sw);
         const double err_ne = RelativeChange(currentCornerFlux.ne, previousCornerFlux.ne);
         const double err_se = RelativeChange(currentCornerFlux.se, previousCornerFlux.se);
+
+        ++_host_iters;
 
         if (err_nw < kCornerFluxTolerance && err_sw < kCornerFluxTolerance && err_ne < kCornerFluxTolerance && err_se < kCornerFluxTolerance) {
             break;
