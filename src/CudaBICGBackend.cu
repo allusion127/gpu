@@ -257,6 +257,75 @@ bool cmfdScalarFusionEnabled() {
     return enabled;
 }
 
+// ---------------------------------------------------------------------------
+// WP7 stage B -- RASBERY_GPU_CMFD_FUSE, a BITMASK, default 0.
+//
+// Every bit below merges two ADJACENT graph nodes into one kernel.  The
+// reference kernels stay exactly where they are and are what mask 0 launches,
+// so the fused path is always measured against a live reference rather than
+// against a memory of one.
+//
+// THE RULE EVERY BIT OBEYS, and the reason each of them is B0 (bit-identical):
+//
+//     same operations, same order, same rounding.
+//
+// Concretely: a fused body is the two reference bodies CONCATENATED, with every
+// expression copied character for character.  That matters for more than
+// readability -- nvcc contracts `x + a * b` into an FMA under the default
+// --fmad=true, so an expression that is retyped rather than copied can change
+// its own rounding even when it is algebraically the same.  Where a fused
+// kernel needs a spelling the reference did not have, it uses the explicit
+// round-to-nearest intrinsics (__fmul_rn / __fadd_rn / __dmul_rn / __ddiv_rn)
+// so the contraction question does not arise; of the four bits below only bit 3
+// carries such an expression, and it inherits __ddiv_rn from its reference.
+//
+// WHAT IS DELIBERATELY NOT HERE, and why (long form in
+// docs/WP7_CMFD_GRAPH_CENSUS_20260831_KO.md Sec 4):
+//
+//   * colored_block_sweep's colour passes -- 23.7% of single-run GPU time and
+//     the largest single item in the Amdahl table.  Sweep k+1 reads x at
+//     NEIGHBOURING nodes, so it depends on sweep k's writes ACROSS THE WHOLE
+//     GRID; the kernel boundary IS that barrier and the colour order IS the
+//     Gauss-Seidel semantics.  There is no "same loop, same i" concatenation
+//     available: a merged kernel would need a device-wide barrier between the
+//     colours (cooperative grid.sync), which is a different and far less local
+//     argument than anything in this bitmask, and it would change the
+//     occupancy the sweep runs at.  NOT FUSABLE, and it stays that way.
+//   * the trailing reduce_dot_stage1 of an iteration, and the prologue one.
+//     Their stage-2 partners (reduce_norm_accumulate_stage2 and
+//     reduce_norm_store_reference_stage2) already carry a SECOND kernel's body
+//     under the scalar-fusion arm, and they gate on `active` where stage 1
+//     gates on `halt` -- the difference between those two guards is exactly
+//     where the over-run telemetry lives.  Folding stage 1 in would collapse
+//     the two guards into one and change what the counters mean.
+//   * the FP32 twins (reduce_dot_stage1_f32 / reduce_dot2_stage1_f32).  The
+//     mixed-precision inner loop is its own opt-in arm; keeping the two gates
+//     independent means neither A/B has to carry the other's variance.
+// ---------------------------------------------------------------------------
+enum CmfdFuseBit : unsigned {
+    kFuseDot      = 1u << 0, ///< reduce_dot_stage1  + reduce_dot_stage2
+    kFuseDot2     = 1u << 1, ///< reduce_dot2_stage1 + reduce_dot2_stage2
+    kFuseWiel     = 1u << 2, ///< cmfd_wiel_stage1   + cmfd_wiel_finalize_chunked
+    kFuseSweepPre = 1u << 3, ///< cmfd_sweep_gate    + cmfd_sweep_patch
+    kFuseAllBits  = kFuseDot | kFuseDot2 | kFuseWiel | kFuseSweepPre
+};
+
+/// Read ONCE, like every other RASBERY_* gate: the mask fixes the captured
+/// graph topology, so it must not be able to change between two outers of the
+/// same run.  Decimal or 0x-prefixed hex; anything unparseable is 0, which is
+/// the reference path.
+unsigned cmfdFuseMask() {
+    static const unsigned mask = [] {
+        const char* v = std::getenv("RASBERY_GPU_CMFD_FUSE");
+        if (v == nullptr) return 0u;
+        char*               end    = nullptr;
+        const unsigned long parsed = std::strtoul(v, &end, 0);
+        if (end == v) return 0u;
+        return static_cast<unsigned>(parsed) & static_cast<unsigned>(kFuseAllBits);
+    }();
+    return mask;
+}
+
 /// Opt-IN counterpart of envFlagDisabled: unset means off.
 bool envFlagEnabled(const char* name) {
     const char* value = std::getenv(name);
@@ -656,6 +725,104 @@ __global__ void reduce_dot_stage2(const int blocks,
     scalars[static_cast<long long>(m) * kScalarCount + slot] = take_sqrt ? sqrt(sum) : sum;
 }
 
+// ---------------------------------------------------------------------------
+// RASBERY_GPU_CMFD_FUSE bit 0 (kFuseDot): reduce_dot_stage1 + reduce_dot_stage2
+// in ONE graph node.
+//
+// ORDER-PRESERVATION NOTE -- why this is bit-identical to the two-node pair.
+//
+//  1. STAGE 1 IS COPIED, NOT REWRITTEN.  The partition (`chunk`, a pure
+//     function of n and gridDim.x), the strided per-thread walk, the shared
+//     array, the fixed binary tree and the `sum += am[i] * bm[i]` expression
+//     are character for character reduce_dot_stage1's.  Same expression, same
+//     translation unit, same flags -- so it contracts to the same FMA and even
+//     the rounding of the multiply-add is the same.
+//  2. STAGE 2 IS COPIED, NOT REWRITTEN.  The fold is still
+//     `for (i = 0; i < blocks; ++i) sum += pm[i]` -- strict ascending index
+//     order over the SAME partial row -- run by ONE thread, and it still ends
+//     in the same `take_sqrt ? sqrt(sum) : sum`.  WHICH block runs it is
+//     irrelevant to the result: the fold reads pm[0..blocks-1], not "its own"
+//     partials, so no operand pairing and no addition order moves.
+//  3. THE BARRIER BETWEEN THEM IS STILL A BARRIER.  In the two-node form the
+//     kernel boundary guaranteed every partial was written before the fold read
+//     it.  Here that guarantee is the retire counter: thread 0 of each block
+//     publishes its partial, issues __threadfence() so the write is visible
+//     device-wide, and only then joins the count.  The fold runs in the block
+//     that draws the LAST ticket, so by construction all gridDim.x partials are
+//     written and fenced before it starts.  The read-back goes through a
+//     volatile pointer so the compiler cannot serve pm[blockIdx.x] out of a
+//     register this block still holds.
+//  4. `blocks` IS gridDim.x.  The two-node form passed the host's `blocks` to
+//     stage 2 and used that same variable as grid.x for stage 1, so reading
+//     gridDim.x here is the identical number by construction.
+//  5. THE GUARDS ARE THE SAME GUARDS, AND THEY CANNOT DISAGREE.  Both reference
+//     kernels open with RASBERY_CMFD_SLOT + HALT_GUARD, and NO kernel runs
+//     between them, so `halt[m]` cannot change across the pair: either both ran
+//     or neither did.  Fused, a halted slot returns before any block touches
+//     the counter, so the fold never runs and the scalar is never written --
+//     which is exactly what stage 2's own HALT_GUARD did.
+//  6. THE COUNTER SELF-REARMS.  atomicInc(retire + m, gridDim.x - 1) wraps the
+//     last ticket back to 0, so the array is 0 on entry to every fused
+//     reduction with no separate memset node.  It is zeroed once at allocation,
+//     and a halted launch leaves it untouched at 0.  ONE array serves every
+//     fused kernel because they are STREAM-ORDERED -- a captured graph replays
+//     a linear chain, so no two of them are ever in flight.
+//
+// Saving: one node per dot().  Two per BiCGSTAB iteration (rho_new and r0.v).
+// ---------------------------------------------------------------------------
+__global__ void reduce_dot_fused(const int n,
+                                 const long long vec_stride,
+                                 const double* __restrict__ a,
+                                 const double* __restrict__ b,
+                                 double* partial,
+                                 double* __restrict__ scalars,
+                                 const int slot,
+                                 const bool take_sqrt,
+                                 unsigned int* __restrict__ retire,
+                                 const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
+    HALT_GUARD(halt + m);
+    __shared__ double shared[kReduceThreads];
+
+    const double* am = a + m * vec_stride;
+    const double* bm = b + m * vec_stride;
+    double*       pm = partial + static_cast<long long>(m) * kMaxReduceBlocks;
+
+    // Fixed, contiguous chunk per block: depends only on (n, gridDim.x).
+    const int chunk = (n + static_cast<int>(gridDim.x) - 1) / static_cast<int>(gridDim.x);
+    const int begin = static_cast<int>(blockIdx.x) * chunk;
+    const int end   = min(begin + chunk, n);
+
+    double sum = 0.0;
+    for (int i = begin + static_cast<int>(threadIdx.x); i < end;
+         i += static_cast<int>(blockDim.x))
+        sum += am[i] * bm[i];
+
+    shared[threadIdx.x] = sum;
+    __syncthreads();
+
+    // Fixed binary tree: identical operand pairing on every launch.
+    for (int stride = kReduceThreads / 2; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride)
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+        __syncthreads();
+    }
+
+    if (threadIdx.x != 0) return;
+    pm[blockIdx.x] = shared[0];
+    __threadfence();
+    if (atomicInc(retire + m, gridDim.x - 1u) != gridDim.x - 1u) return;
+
+    // ---- the former reduce_dot_stage2 node, verbatim ----------------------
+    const volatile double* vpm    = pm;
+    const int              blocks = static_cast<int>(gridDim.x);
+    double                 fold   = 0.0;
+    for (int i = 0; i < blocks; ++i) fold += vpm[i];   // strict index order
+    scalars[static_cast<long long>(m) * kScalarCount + slot] =
+        take_sqrt ? sqrt(fold) : fold;
+}
+
 /// Strict stage-2 fold plus the immediately dependent r20 snapshot.
 /// This removes one scalar graph node without changing the reduction tree or
 /// the liveness/participation guard used by the former two-kernel sequence.
@@ -766,6 +933,92 @@ __global__ void reduce_dot2_stage2(const int blocks,
     }
     scalars[static_cast<long long>(m) * kScalarCount + slot0] = sum0;
     scalars[static_cast<long long>(m) * kScalarCount + slot1] = sum1;
+}
+
+// ---------------------------------------------------------------------------
+// RASBERY_GPU_CMFD_FUSE bit 1 (kFuseDot2): reduce_dot2_stage1 +
+// reduce_dot2_stage2 in ONE graph node.
+//
+// ORDER-PRESERVATION NOTE.  Points 1-6 of reduce_dot_fused apply unchanged and
+// are not repeated; the only difference is that TWO independent reductions ride
+// through the fused kernel exactly as they rode through the pair -- each with
+// its own accumulator, its own shared array, its own partial row and its own
+// strict ascending stage-2 fold.  Nothing is re-associated across the two, and
+// the retire counter is shared because the two reductions retire together (they
+// are the same blocks of the same launch), not because their sums are.
+//
+// Saving: one node per dot2().  One per BiCGSTAB iteration -- the (s.t, t.t)
+// pair.
+// ---------------------------------------------------------------------------
+__global__ void reduce_dot2_fused(const int n,
+                                  const long long vec_stride,
+                                  const double* __restrict__ a0,
+                                  const double* __restrict__ b0,
+                                  const double* __restrict__ a1,
+                                  const double* __restrict__ b1,
+                                  double* partial0,
+                                  double* partial1,
+                                  double* __restrict__ scalars,
+                                  const int slot0,
+                                  const int slot1,
+                                  unsigned int* __restrict__ retire,
+                                  const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
+    HALT_GUARD(halt + m);
+    __shared__ double shared0[kReduceThreads];
+    __shared__ double shared1[kReduceThreads];
+
+    const double* a0m = a0 + m * vec_stride;
+    const double* b0m = b0 + m * vec_stride;
+    const double* a1m = a1 + m * vec_stride;
+    const double* b1m = b1 + m * vec_stride;
+    double*       p0m = partial0 + static_cast<long long>(m) * kMaxReduceBlocks;
+    double*       p1m = partial1 + static_cast<long long>(m) * kMaxReduceBlocks;
+
+    // Identical to reduce_dot2_stage1: depends only on (n, gridDim.x).
+    const int chunk = (n + static_cast<int>(gridDim.x) - 1) / static_cast<int>(gridDim.x);
+    const int begin = static_cast<int>(blockIdx.x) * chunk;
+    const int end   = min(begin + chunk, n);
+
+    double sum0 = 0.0;
+    double sum1 = 0.0;
+    for (int i = begin + static_cast<int>(threadIdx.x); i < end;
+         i += static_cast<int>(blockDim.x)) {
+        sum0 += a0m[i] * b0m[i];
+        sum1 += a1m[i] * b1m[i];
+    }
+
+    shared0[threadIdx.x] = sum0;
+    shared1[threadIdx.x] = sum1;
+    __syncthreads();
+
+    for (int stride = kReduceThreads / 2; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride) {
+            shared0[threadIdx.x] += shared0[threadIdx.x + stride];
+            shared1[threadIdx.x] += shared1[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x != 0) return;
+    p0m[blockIdx.x] = shared0[0];
+    p1m[blockIdx.x] = shared1[0];
+    __threadfence();
+    if (atomicInc(retire + m, gridDim.x - 1u) != gridDim.x - 1u) return;
+
+    // ---- the former reduce_dot2_stage2 node, verbatim ---------------------
+    const volatile double* v0m    = p0m;
+    const volatile double* v1m    = p1m;
+    const int              blocks = static_cast<int>(gridDim.x);
+    double                 fold0  = 0.0;
+    double                 fold1  = 0.0;
+    for (int i = 0; i < blocks; ++i) {   // strict index order, one per reduction
+        fold0 += v0m[i];
+        fold1 += v1m[i];
+    }
+    scalars[static_cast<long long>(m) * kScalarCount + slot0] = fold0;
+    scalars[static_cast<long long>(m) * kScalarCount + slot1] = fold1;
 }
 
 __global__ void matvec_two_group(const int nxyz,
@@ -2264,6 +2517,111 @@ __global__ void cmfd_wiel_finalize_chunked(const int blocks,
     cmfd_wiel_apply(lane_sum[0], lane_sum[1], lane_sum[2], scalars, sweep_halt, m);
 }
 
+// ---------------------------------------------------------------------------
+// RASBERY_GPU_CMFD_FUSE bit 2 (kFuseWiel): cmfd_wiel_stage1 +
+// cmfd_wiel_finalize_chunked in ONE graph node.
+//
+// ORDER-PRESERVATION NOTE.  The same six-point argument as reduce_dot_fused,
+// with three differences worth naming rather than leaving to the reader:
+//
+//  a. THREE reductions, not one, and they stay three.  Each keeps its own
+//     accumulator, its own shared array, its own partial row and its own
+//     strict ascending fold, exactly as in the pair -- this was never a fused
+//     reduction and it is not one now.
+//  b. THE TAIL IS NOT A ONE-THREAD TAIL.  cmfd_wiel_finalize_chunked folds on
+//     three lanes and then calls cmfd_wiel_apply from lane 0, so the fused
+//     kernel has to let the WHOLE last block through.  `sh_last` is written by
+//     thread 0 and read after a __syncthreads every thread of every block
+//     reaches, so the branch is BLOCK-UNIFORM -- which is the same property the
+//     compaction guard relies on, and the reason a __syncthreads inside the
+//     tail is safe.  The reference ran the tail in a 32-thread block and this
+//     runs it in a kReduceThreads one; only lanes 0..2 do arithmetic in either,
+//     and cmfd_wiel_apply is called by lane 0 in both.
+//  c. THE TAIL WRITES sweep_halt, WHICH EVERY BLOCK READ AT ITS FIRST
+//     INSTRUCTION.  That is not a race: a block reaches the atomicInc only
+//     after it has read sweep_halt, and the tail runs only once every one of
+//     the gridDim.x blocks has incremented.  So every read of sweep_halt in
+//     this launch strictly precedes cmfd_wiel_apply's write of it -- the same
+//     ordering the kernel boundary gave the pair.
+//
+// Saving: one node per CMFD sweep, under the chunked Wielandt fold only.  With
+// RASBERY_GPU_WIEL_FOLD on the serial path there is no stage 1 and this bit is
+// inert.
+// ---------------------------------------------------------------------------
+__global__ void cmfd_wiel_fused(const int nxyz,
+                                const long long vec_stride,
+                                const double* __restrict__ terms_ab,
+                                const double* __restrict__ terms_c,
+                                double* partial, ///< [slot][3][kMaxReduceBlocks]
+                                double* scalars,
+                                std::uint32_t* sweep_halt,
+                                unsigned int* __restrict__ retire,
+                                RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
+    if (sweep_halt[m] != 0u) return;
+    __shared__ double sh_err[kReduceThreads];
+    __shared__ double sh_gd[kReduceThreads];
+    __shared__ double sh_gn[kReduceThreads];
+    __shared__ bool   sh_last;
+    // The finalize tail's three lanes.  Declared up here with the rest so no
+    // __shared__ declaration sits behind a conditional return.
+    __shared__ double lane_sum[3];
+
+    const double* ta = terms_ab + m * vec_stride;
+    const double* tc = terms_c + m * vec_stride;
+    double*       pm = partial + static_cast<long long>(m) * (3 * kMaxReduceBlocks);
+
+    // Fixed, contiguous chunk per block: depends only on (nxyz, gridDim.x).
+    const int chunk = (nxyz + static_cast<int>(gridDim.x) - 1) / static_cast<int>(gridDim.x);
+    const int begin = static_cast<int>(blockIdx.x) * chunk;
+    const int end   = min(begin + chunk, nxyz);
+
+    double s_err = 0.0, s_gd = 0.0, s_gn = 0.0;
+    for (int i = begin + static_cast<int>(threadIdx.x); i < end;
+         i += static_cast<int>(blockDim.x)) {
+        s_err += ta[i];
+        s_gd += ta[nxyz + i];
+        s_gn += tc[i];
+    }
+    sh_err[threadIdx.x] = s_err;
+    sh_gd[threadIdx.x]  = s_gd;
+    sh_gn[threadIdx.x]  = s_gn;
+    __syncthreads();
+
+    // Fixed binary tree: identical operand pairing on every launch.
+    for (int stride = kReduceThreads / 2; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride) {
+            sh_err[threadIdx.x] += sh_err[threadIdx.x + stride];
+            sh_gd[threadIdx.x] += sh_gd[threadIdx.x + stride];
+            sh_gn[threadIdx.x] += sh_gn[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        pm[0 * kMaxReduceBlocks + blockIdx.x] = sh_err[0];
+        pm[1 * kMaxReduceBlocks + blockIdx.x] = sh_gd[0];
+        pm[2 * kMaxReduceBlocks + blockIdx.x] = sh_gn[0];
+        __threadfence();
+        sh_last = (atomicInc(retire + m, gridDim.x - 1u) == gridDim.x - 1u);
+    }
+    __syncthreads();
+    if (!sh_last) return;
+
+    // ---- the former cmfd_wiel_finalize_chunked node, verbatim -------------
+    const int              lane   = static_cast<int>(threadIdx.x);
+    const int              blocks = static_cast<int>(gridDim.x);
+    const volatile double* vpm    = pm;
+    if (lane < 3) {
+        const volatile double* values = vpm + lane * kMaxReduceBlocks;
+        double                 sum    = 0.0;
+        for (int i = 0; i < blocks; ++i) sum = sum + values[i]; // strict index order
+        lane_sum[lane] = sum;
+    }
+    __syncthreads();
+    if (lane != 0) return;
+    cmfd_wiel_apply(lane_sum[0], lane_sum[1], lane_sum[2], scalars, sweep_halt, m);
+}
+
 /// diag = udiag - chif*xsnf*reigvs*vol, with the mined fused subtract.
 __global__ void cmfd_updls(const int nxyz,
                            const long long vec_stride,
@@ -2471,6 +2829,127 @@ __global__ void cmfd_sweep_patch(double* scalars, const int m,
             (sm[kEshift] != 0.0) ? __ddiv_rn(1.0, eigv + sm[kEshift]) : 0.0;
     }
     if (probe_residual != nullptr) sm[kErrl2] = *probe_residual;
+}
+
+// ---------------------------------------------------------------------------
+// RASBERY_GPU_CMFD_FUSE bit 3 (kFuseSweepPre): cmfd_sweep_gate +
+// cmfd_sweep_patch in ONE launch.
+//
+// ORDER-PRESERVATION NOTE.  Both references are <<<1, 1>>> one-thread kernels
+// issued back to back in the same window (after issueSweepUploads, before
+// launch_sweeps).  One thread running the gate body and then the patch body IS
+// the stream order of the two nodes it replaces, so "same operations, same
+// order" is immediate.  They also touch DISJOINT memory -- the gate writes
+// sweep_halt[m], the patch writes this slot's scalar block -- so neither can
+// observe the other and the concatenation cannot introduce a read-after-write
+// the pair did not have.  The patch arithmetic is copied verbatim, __ddiv_rn
+// included, so the rounding of the two reciprocals is unchanged.
+//
+// The guards are copied too, and that matters: the reference gate is a no-op
+// when outer_halt is null, and the reference patch is not issued at all when
+// patch_from_probe is false.  Passing null probe pointers reproduces the second
+// exactly, and enqueueSweepPreamble declines to launch anything when NEITHER is
+// wanted -- which is the only case where the pair enqueued zero nodes.
+//
+// Saving: one LAUNCH per device-outer sweep drive.  These two sit outside the
+// captured graph, so this bit lowers launches_per_outer without changing any
+// graph node count.
+// ---------------------------------------------------------------------------
+__global__ void cmfd_sweep_gate_patch(std::uint32_t* sweep_halt,
+                                      const std::uint32_t* __restrict__ outer_halt,
+                                      const int outer_slot, const int m,
+                                      double* scalars,
+                                      const double* __restrict__ probe_eigv,
+                                      const double* __restrict__ probe_residual) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    // ---- cmfd_sweep_gate, verbatim ----------------------------------------
+    if (outer_halt != nullptr && outer_halt[outer_slot] != 0u) sweep_halt[m] = 1u;
+    // ---- cmfd_sweep_patch, verbatim ---------------------------------------
+    // NOT halt-gated in the reference either, so the concatenation does not
+    // acquire a guard the pair lacked (exactness invariant 7).
+    double* sm = scalars + static_cast<long long>(m) * kScalarCount;
+    if (probe_eigv != nullptr) {
+        const double eigv = *probe_eigv;
+        sm[kEigv]         = eigv;
+        sm[kReigv]        = __ddiv_rn(1.0, eigv);
+        sm[kReigvs] =
+            (sm[kEshift] != 0.0) ? __ddiv_rn(1.0, eigv + sm[kEshift]) : 0.0;
+    }
+    if (probe_residual != nullptr) sm[kErrl2] = *probe_residual;
+}
+
+/// WP7 stage B: the CMFD GRAPH NODE CENSUS, measured rather than counted by hand.
+///
+/// Emitted once per successful cudaGraphInstantiate on either CMFD graph, so a
+/// FUSE=0 run and a FUSE=<bits> run of the same deck print directly comparable
+/// lines and the node reduction is a fact instead of an estimate.  Graph
+/// instantiations are rare by construction (a bounded bucket ladder, and
+/// graph_reinstantiations is 0 on a normal run), so this is a handful of lines
+/// per run, not a per-iteration log.
+///
+/// TRAJECTORY-NEUTRAL BY CONSTRUCTION.  cudaGraphGetNodes and
+/// cudaGraphNodeGetType are host-side queries on an already-built cudaGraph_t:
+/// nothing is enqueued, nothing is synchronised, no device memory is read and
+/// the graph is not modified.  A query failure is swallowed (the error is
+/// cleared) rather than turned into a solver failure.
+///
+/// FIELD MEANINGS (docs/WP7_CMFD_GRAPH_CENSUS_20260831_KO.md Sec 2):
+///   nodes                total nodes in the instantiated graph.
+///   sweeps               CMFD sweeps the capture carries (1 for the outer graph,
+///                        which IS one sweep's inner solve).
+///   nodes_per_sweep      "sweep": (nodes - 1) / sweeps -- the assemble node is
+///                        once per LAUNCH, not per sweep.  "outer": nodes.
+///   launches_per_outer   what one CMFD outer costs in dispatches.  One sweep
+///                        carries exactly one outer, so for both graphs this is
+///                        nodes_per_sweep.  It is the number stage B lowers.
+static void reportCmfdGraphCensus(const char* tag, cudaGraph_t graph, int sweeps,
+                                  int iterations_per_outer, unsigned fuse_mask) {
+    if (graph == nullptr) return;
+    size_t count = 0;
+    if (cudaGraphGetNodes(graph, nullptr, &count) != cudaSuccess || count == 0) {
+        cudaGetLastError();
+        return;
+    }
+    std::vector<cudaGraphNode_t> nodes(count);
+    if (cudaGraphGetNodes(graph, nodes.data(), &count) != cudaSuccess) {
+        cudaGetLastError();
+        return;
+    }
+    unsigned long long kernels = 0, memcpies = 0, memsets = 0, other = 0;
+    for (size_t i = 0; i < count; ++i) {
+        cudaGraphNodeType type{};
+        if (cudaGraphNodeGetType(nodes[i], &type) != cudaSuccess) {
+            cudaGetLastError();
+            ++other;
+        } else if (type == cudaGraphNodeTypeKernel) {
+            ++kernels;
+        } else if (type == cudaGraphNodeTypeMemcpy) {
+            ++memcpies;
+        } else if (type == cudaGraphNodeTypeMemset) {
+            ++memsets;
+        } else {
+            ++other;
+        }
+    }
+    // The sweep graph opens with ONE cmfd_assemble_operator_2g per launch; the
+    // outer graph has no such prologue and is itself the per-sweep unit.
+    const unsigned long long per =
+        sweeps > 0 ? static_cast<unsigned long long>(count - 1) /
+                         static_cast<unsigned long long>(sweeps)
+                   : static_cast<unsigned long long>(count);
+    std::ostringstream line;
+    line << "[RASBERY][CMFD][GRAPH] {\"graph\":\"" << tag << "\""
+         << ",\"nodes\":" << count
+         << ",\"sweeps\":" << (sweeps > 0 ? sweeps : 1)
+         << ",\"iterations_per_outer\":" << iterations_per_outer
+         << ",\"nodes_per_sweep\":" << per
+         << ",\"kernel_nodes\":" << kernels
+         << ",\"memcpy_nodes\":" << memcpies
+         << ",\"memset_nodes\":" << memsets
+         << ",\"other_nodes\":" << other
+         << ",\"launches_per_outer\":" << per
+         << ",\"fuse_mask\":" << fuse_mask << "}";
+    std::cout << line.str() << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -2728,6 +3207,11 @@ public:
                 if (requested > 0) iter_batch_request = requested;
             }
             scalar_fusion = cmfdScalarFusionEnabled();
+            fuse_mask      = cmfdFuseMask();
+            fuse_dot       = (fuse_mask & kFuseDot) != 0u;
+            fuse_dot2      = (fuse_mask & kFuseDot2) != 0u;
+            fuse_wiel      = (fuse_mask & kFuseWiel) != 0u;
+            fuse_sweep_pre = (fuse_mask & kFuseSweepPre) != 0u;
             fp32_inner    = cmfdFp32InnerEnabled();
             telemetry.fp32_active = fp32_inner ? 1u : 0u;
             status += " (block=" + std::to_string(block_size) +
@@ -2738,6 +3222,7 @@ public:
                                               : std::string("auto")) +
                       ", assembly=" + (cmfdAssemblyEnabled() ? "on" : "off") +
                       ", scalar fusion=" + (scalar_fusion ? "on" : "off") +
+                      ", fuse=" + std::to_string(fuse_mask) +
                       // The [PHYSICS_MODE] receipt for the inner-solve precision.
                       // fp64 = the historical all-double path; mixed = FP32 inner
                       // BiCGSTAB under an FP64 outer correction.
@@ -2802,6 +3287,12 @@ public:
             // flipping RASBERY_GPU_WIEL_FOLD never changes the arena's shape.
             allocate(reinterpret_cast<void**>(&wiel_partials),
                      S * 3u * static_cast<size_t>(kMaxReduceBlocks) * sizeof(double));
+            // WP7 stage B.  Allocated and zeroed whatever RASBERY_GPU_CMFD_FUSE
+            // says, so the arena's footprint is mask-independent; `slots`
+            // uint32s.  The zero here is the ONLY one it ever needs -- see the
+            // self-rearming argument at reduce_dot_fused point 6.
+            allocate(reinterpret_cast<void**>(&fuse_retire), S * sizeof(unsigned int));
+            CUDA_CHECK(cudaMemset(fuse_retire, 0, S * sizeof(unsigned int)));
             allocate(reinterpret_cast<void**>(&scalars), S * kScalarCount * sizeof(double));
             allocate(reinterpret_cast<void**>(&device_flags), S * sizeof(std::uint32_t));
             allocate(reinterpret_cast<void**>(&iter_flags), S * sizeof(std::uint32_t));
@@ -2995,6 +3486,7 @@ public:
         cudaFree(partials);
         cudaFree(partials2);
         cudaFree(wiel_partials);
+        cudaFree(fuse_retire);
         cudaFree(scalars);
         cudaFree(device_flags);
         cudaFree(iter_flags);
@@ -3051,6 +3543,8 @@ public:
         diag = dinv = cc = src = phi = r = r0 = p = v = s = t = y = z = ax = nullptr;
         partials = nullptr;
         partials2 = nullptr;
+        wiel_partials = nullptr;
+        fuse_retire = nullptr;
         scalars = nullptr;
         device_flags = nullptr;
         iter_flags = nullptr;
@@ -3330,6 +3824,18 @@ public:
     /// Bit-reproducible replacement for cublasDdot / cublasDnrm2.
     void dot(const double* a, const double* b, int scalar_slot, bool take_sqrt = false) {
         const int blocks = reduce_blocks_for(n);
+        // FUSE bit 0.  Same partition, same tree, same strict stage-2 fold, one
+        // node instead of two -- see reduce_dot_fused for the six-point
+        // bit-identity argument.  The reference pair below is what mask 0 runs
+        // and it is never deleted.
+        if (fuse_dot) {
+            reduce_dot_fused<<<dim3(static_cast<unsigned>(blocks),
+                                    static_cast<unsigned>(lanes)),
+                               kReduceThreads, 0, stream>>>(
+                n, vec_stride(), a, b, partials, scalars, scalar_slot, take_sqrt,
+                fuse_retire, device_halt, d_slot_map, lanes);
+            return;
+        }
         reduce_dot_stage1<<<dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(lanes)),
                             kReduceThreads, 0, stream>>>(
             n, vec_stride(), a, b, partials, device_halt, d_slot_map, lanes);
@@ -3344,6 +3850,16 @@ public:
     void dot2(const double* a0, const double* b0, int scalar_slot0,
               const double* a1, const double* b1, int scalar_slot1) {
         const int blocks = reduce_blocks_for(n);
+        // FUSE bit 1.  See reduce_dot2_fused: two independent reductions, each
+        // with the partition, tree and strict fold it had in the pair.
+        if (fuse_dot2) {
+            reduce_dot2_fused<<<dim3(static_cast<unsigned>(blocks),
+                                     static_cast<unsigned>(lanes)),
+                                kReduceThreads, 0, stream>>>(
+                n, vec_stride(), a0, b0, a1, b1, partials, partials2, scalars,
+                scalar_slot0, scalar_slot1, fuse_retire, device_halt, d_slot_map, lanes);
+            return;
+        }
         reduce_dot2_stage1<<<dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(lanes)),
                              kReduceThreads, 0, stream>>>(
             n, vec_stride(), a0, b0, a1, b1, partials, partials2, device_halt, d_slot_map, lanes);
@@ -3713,6 +4229,10 @@ public:
             outer_graphs.push_back(
                 OuterGraph{graph_exec, nmax, lanes, precisionTag(), graph_src});
             g_cmfd_bucket_graphs.fetch_add(1, std::memory_order_relaxed);
+            // WP7 stage B: the node census, at the one place where a graph is
+            // built.  `sweeps` is 0 because the outer graph IS the per-sweep
+            // unit -- it carries no assemble prologue and no Wielandt tail.
+            reportCmfdGraphCensus("outer", graph_src, 0, iter_batch_used, fuse_mask);
             // The capture itself enqueued nothing: replay it now.
         }
         CUDA_CHECK(rasbery::graphLaunchOrSplice(graph_exec, graph_src, stream));
@@ -3757,13 +4277,26 @@ public:
             if (wielFoldMode() == WielFoldMode::CHUNKED) {
                 const int wiel_blocks = reduce_blocks_for(nxyz);
                 reportWielFold(wiel_blocks);
-                cmfd_wiel_stage1<<<dim3(static_cast<unsigned>(wiel_blocks),
-                                        static_cast<unsigned>(lanes)),
-                                   kReduceThreads, 0, stream>>>(
-                    nxyz, vec_stride(), ax, s, wiel_partials, sweep_halt, d_slot_map,
-                    lanes);
-                cmfd_wiel_finalize_chunked<<<scalar_grid(), 32, 0, stream>>>(
-                    wiel_blocks, wiel_partials, scalars, sweep_halt, d_slot_map, lanes);
+                // FUSE bit 2.  Three reductions in, three reductions out, the
+                // same strict ascending fold and the same cmfd_wiel_apply tail
+                // -- see cmfd_wiel_fused.  Inert under the serial fold, which
+                // has no stage 1 to fuse.
+                if (fuse_wiel) {
+                    cmfd_wiel_fused<<<dim3(static_cast<unsigned>(wiel_blocks),
+                                           static_cast<unsigned>(lanes)),
+                                      kReduceThreads, 0, stream>>>(
+                        nxyz, vec_stride(), ax, s, wiel_partials, scalars, sweep_halt,
+                        fuse_retire, d_slot_map, lanes);
+                } else {
+                    cmfd_wiel_stage1<<<dim3(static_cast<unsigned>(wiel_blocks),
+                                            static_cast<unsigned>(lanes)),
+                                       kReduceThreads, 0, stream>>>(
+                        nxyz, vec_stride(), ax, s, wiel_partials, sweep_halt,
+                        d_slot_map, lanes);
+                    cmfd_wiel_finalize_chunked<<<scalar_grid(), 32, 0, stream>>>(
+                        wiel_blocks, wiel_partials, scalars, sweep_halt, d_slot_map,
+                        lanes);
+                }
             } else {
                 reportWielFold(0);
                 cmfd_wiel_finalize<<<scalar_grid(), 32, 0, stream>>>(
@@ -3889,6 +4422,11 @@ public:
             sweep_graph = SweepGraphCapacity{nmax, depth, precisionTag(), lanes};
             sweep_graphs.push_back(SweepGraph{sweep_graph_exec, sweep_graph, sweep_graph_src});
             g_cmfd_bucket_graphs.fetch_add(1, std::memory_order_relaxed);
+            // WP7 stage B: the node census.  `depth` sweeps ride in this
+            // capture, and exactly one cmfd_assemble_operator_2g node sits in
+            // front of them.
+            reportCmfdGraphCensus("sweep", sweep_graph_src, depth, iter_batch_used,
+                                  fuse_mask);
         }
         CUDA_CHECK(rasbery::graphLaunchOrSplice(sweep_graph_exec, sweep_graph_src, stream));
         ++telemetry.graph_launches;
@@ -3924,6 +4462,29 @@ public:
         if (!p.patch_from_probe) return;
         cmfd_sweep_patch<<<1, 1, 0, stream>>>(scalars, m, p.eigv, p.residual);
         CUDA_CHECK(cudaGetLastError());
+    }
+
+    /// The gate and the patch, in that order -- as two launches (the reference)
+    /// or as one (FUSE bit 3).
+    ///
+    /// The one-launch form reproduces the reference's ISSUE decisions as well as
+    /// its arithmetic: the gate is a no-op when `outer_halt` is null, the patch
+    /// is not issued at all when `patch_from_probe` is false (null probe
+    /// pointers say the same thing inside the kernel), and when NEITHER is
+    /// wanted the pair enqueued nothing, so neither does this.
+    void enqueueSweepPreamble(int m, const std::uint32_t* outer_halt, int outer_slot,
+                              const CudaBatchArena::CmfdSweepProbeSink& p) {
+        if (fuse_sweep_pre) {
+            if (outer_halt == nullptr && !p.patch_from_probe) return;
+            cmfd_sweep_gate_patch<<<1, 1, 0, stream>>>(
+                sweep_halt, outer_halt, outer_slot, m, scalars,
+                p.patch_from_probe ? p.eigv : nullptr,
+                p.patch_from_probe ? p.residual : nullptr);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+        enqueueSweepGate(m, outer_halt, outer_slot);
+        enqueueSweepPatch(m, p);
     }
 
     /// H2D for one sweep batch.  chif/vol mirror away their (rare/never)
@@ -4415,6 +4976,14 @@ public:
     double*        partials2 = nullptr;
     /// [slot][3][kMaxReduceBlocks] partials for the opt-in chunked Wielandt fold.
     double*        wiel_partials = nullptr;
+    /// WP7 stage B: per-slot retire counter for the FUSE bitmask's fused
+    /// reductions.  Zeroed once at allocation and SELF-REARMING thereafter
+    /// (atomicInc wraps the last ticket back to 0), so it costs no memset node
+    /// and a halted launch leaves it at 0.  One array serves every fused kernel
+    /// because those kernels are stream-ordered and never overlap.  Allocated
+    /// whatever the mask, so flipping RASBERY_GPU_CMFD_FUSE never changes the
+    /// arena's shape.
+    unsigned int*  fuse_retire = nullptr;
     double*        scalars = nullptr;
     std::uint32_t* device_flags = nullptr;
     std::uint32_t* iter_flags = nullptr;
@@ -4456,6 +5025,14 @@ public:
     std::uint32_t* host_assembly_active = nullptr; // pinned, (slots+1) lanes
     bool          use_graph = true;
     bool          scalar_fusion = true;
+    /// WP7 stage B: RASBERY_GPU_CMFD_FUSE, latched once at construction so the
+    /// captured topology cannot change between two outers of the same run.  The
+    /// four booleans are the mask, unpacked at the enqueue sites.
+    unsigned      fuse_mask      = 0u;
+    bool          fuse_dot       = false;
+    bool          fuse_dot2      = false;
+    bool          fuse_wiel      = false;
+    bool          fuse_sweep_pre = false;
     /// RASBERY_GPU_ITER_BATCH: requested iterations per graph launch.  0 =
     /// unset = follow the algorithmic budget (today's behaviour, and the only
     /// setting for which the capture depth is exactly `1 + nmax`).
@@ -5169,11 +5746,11 @@ bool CudaBatchArena::enqueueSweeps(int m, double* out_phi, const CmfdSweepIO& io
     const int nmax   = sl.nmax;
     const int unroll = sl.sweep_unroll;
     a.core.issueSweepUploads(&m, 1, unroll);
-    a.core.enqueueSweepGate(m, probe.halt, probe.halt_slot);
-    // Rev.7.1 Task 10 part 3: AFTER the gate, so the two orderings this launch
-    // depends on are both `between the upload and the graph`, and the patch
-    // reads the kEshift the upload has just landed.
-    a.core.enqueueSweepPatch(m, probe);
+    // Rev.7.1 Task 10 part 3: the patch goes AFTER the gate, so the two
+    // orderings this launch depends on are both `between the upload and the
+    // graph`, and the patch reads the kEshift the upload has just landed.  WP7
+    // stage B bit 3 may serve both from one launch; the order is the same.
+    a.core.enqueueSweepPreamble(m, probe.halt, probe.halt_slot, probe);
     a.core.launch_sweeps(nmax, unroll);
     ++a.enqueue_launches; // one slot, therefore width one -- see the field's note
     // The verdict BEFORE the downloads: it reads the scalar block the graph just

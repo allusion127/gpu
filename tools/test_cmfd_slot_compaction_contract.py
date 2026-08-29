@@ -93,7 +93,12 @@ FULL_WIDTH_KERNELS = ("initialize_solver_state", "finalize_status")
 # have every thread write the same scalars.
 # Rev.7.1 Task 10 part 3 adds the third, cmfd_sweep_patch, on exactly the same
 # footing: <<<1, 1>>>, a slot the caller named, and a thread-0/block-0 filter.
-EXPLICIT_SLOT_KERNELS = ("cmfd_sweep_gate", "cmfd_sweep_verdict", "cmfd_sweep_patch")
+# WP7 stage B adds the fourth, cmfd_sweep_gate_patch, which IS the gate and the
+# patch concatenated in one thread (RASBERY_GPU_CMFD_FUSE bit 3) -- same launch
+# geometry, same caller-named slot, same filter, so it inherits the exemption
+# for the same reason and not a new one.
+EXPLICIT_SLOT_KERNELS = ("cmfd_sweep_gate", "cmfd_sweep_verdict", "cmfd_sweep_patch",
+                         "cmfd_sweep_gate_patch")
 
 # WP3 Sec 8: the CMFD OUTER family.  Same question as CudaBICGBackend.cu -- does
 # every kernel that indexes by slot go through a logical->physical map -- asked
