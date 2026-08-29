@@ -3943,8 +3943,18 @@ public:
     /// the graph and masking one of them -- doubling the node count, which is
     /// the cost this whole campaign is trying to remove.  Dropping the cached
     /// graphs is what makes the switch take effect; the next launch re-captures
-    /// the FP64 topology.  Called from drain(), i.e. with the stream already
-    /// synchronised, so destroying the executables here is safe.
+    /// the FP64 topology.
+    ///
+    /// Rev.7.1 Task 18 CHANGED WHAT MAKES THAT SAFE, not whether it is.  The
+    /// old reason was "called from drain(), i.e. with the stream already
+    /// synchronised" -- true while the rendezvous elected one launcher that
+    /// drained its own batch before absorbing it, and no longer true now that
+    /// absorb() is also reached from the stream-ordered path, where another
+    /// deck's launch of one of these executables may still be in flight on the
+    /// arena stream.  The reason it is still safe is cudaGraphExecDestroy's own
+    /// contract: a graph that is executing is destroyed when it finishes, not
+    /// under the launch.  What DOES need the claim is the cache itself, and
+    /// every caller of this function holds it.
     void latchFp32Off() {
         if (fp32_latched_off) return;
         fp32_latched_off = true;

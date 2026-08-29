@@ -1848,6 +1848,13 @@ runner가 프로세스 전체를 대표했기 때문이다. 그 구현을 슬롯
    → 배치에서 segment는 **자기 스트림**을 쓰고 따라서 **동기식 sweep hook**(Task 9 쌍, budget 1)을
    잡는다. 둘은 한 쌍이며 분리할 수 없다.
 
+**[Task 18 정정] 둘 다 해소됐고, 두 번째 제약의 진단은 절반만 맞았다.** 제약 1은 §Task 18a에서
+arena가 binding을 이행하게 하여 제거됐다. 제약 2에서 참인 것은 **첫 절뿐**이다 — arena 스트림이
+capture 중이라는 사실. "따라서 동기식 hook, 따라서 budget 1"은 arena의 성질이 아니라
+`enqueueSweeps`의 성질이었다(스트림 claim 없음 + fleet mask를 arena당 버퍼 하나에 stage).
+§Task 18b가 그 셋을 고쳐 배치도 budget 8을 쓴다. 아래 §11.3 B0의 `batch 708/708`은 이제
+**세그먼트가 실제로 도는 배치**에 대해 물어야 하는 게이트다.
+
 **geometry_mismatch 사다리는 지금 도달 불가능하고, 그래도 남긴다.** `rasberyBatchArena`가
 BICGSolver 생성자에서 두 번째 geometry를 던지므로(`batch mode requires every instance to
 share one geometry`) 혼합 배치는 stand-up에 닿기 전에 죽는다. 측정: kngr3 + i-SMR CY01,
@@ -1863,12 +1870,118 @@ bridge 복귀 + outer당 동기화가 그 값이다.
 
 **남은 일(진짜 Task 18).**
 
-- [ ] batched nodal arena가 canonical ownership을 이행하게 한다 → bridge 제거, `canonicalNodalIsHonoured()` 삭제.
-- [ ] CMFD sweep을 슬롯당 스트림(또는 capture-safe 제출 경로)로 바꿔 배치에서도 budget 8을 열어준다.
+- [x] batched nodal arena가 canonical ownership을 이행하게 한다 → bridge 제거, `canonicalNodalIsHonoured()` 삭제. — **[완료]** §Task 18a
+- [x] CMFD sweep을 슬롯당 스트림(또는 capture-safe 제출 경로)로 바꿔 배치에서도 budget 8을 열어준다. — **[완료]** §Task 18b
 - [ ] scheduler refill — 한 슬롯이 비면 다음 덱을 넣는 곳. Task 18-lite는 슬롯을 열었을 뿐 채우지 않는다.
 - [ ] M64 메모리 — kngr_238 mesh에서 per-slot 235 MB면 64슬롯은 15 GB다. 사이즈가 안 맞으면 arena가
       거부하고 사다리가 `batch_mode`를 그대로 말한다(이제는 상수가 아니라 사실이다). 부분 폭
       수용(K < M 슬롯만 서비스)은 의도적으로 미구현 — 불균일한 배치는 조정자가 결정할 일이다.
+
+### Task 18a: batched nodal arena가 canonical binding을 이행한다 — **[완료]**
+
+**결함의 모양.** `adoptCanonical`은 segment의 jnet/flux/phis를 view 테이블에 받았고 **커널은
+그것을 읽고 썼다.** 그런데 `launchBatch`는 drive마다 `Geometry::Jnet`과 `Geometry::Phif`를
+**arena 자신의 dense 블록**(`_base.jnet + s*_cnt_sg`)에 올렸고, 다운로드도 그 손대지 않은
+블록에서 호스트로 되가져왔다. 즉 adoption이 **두 번 무시**됐다 — 업로드는 아무 커널도 보지
+않는 곳으로 갔고, 다운로드는 stale 복사본을 실어왔다. binding을 믿고 `Geometry::Jnet` 채우기를
+멈춘 segment는 한 outer 뒤진 배열 위에서 돌았다(kngr3 statepoint 1: 800.33 ppm / 290 outer 대
+호스트 770.15 / 263).
+
+**수정.** 주소를 **view 테이블에서** 가져오고(legacy 슬롯은 dense 포인터 그대로 = byte-동일,
+adopted 슬롯은 커널이 쓰는 그 버퍼), 두 방향 모두 `gpu::canonicalElidesUpload` /
+`canonicalElidesDownload`를 참가자가 **stage한** ownership으로 묻는다. stage인 이유: launcher는
+M개 instance thread 중 하나이고 나머지 참가자를 대신해 판단하므로, 다른 thread의 backend를
+들여다보면 안 된다.
+
+**같이 닫아야 했던 창 두 개.**
+
+1. `_canon`은 `Slot` 바깥에 산다(view 테이블이 물리 슬롯으로 색인되므로). 그래서
+   `acquireSlot`의 `sl = Slot{}`이 거기에 닿지 않았고, 새 tenant가 죽은 덱의 physics arena
+   포인터를 물려받을 수 있었다 — 유한하고 그럴듯한 값으로 다른 덱의 jnet을 읽고 쓰는 최악의
+   형태. acquire/release 양쪽에서 지운다.
+2. segment는 **첫 drive 전에** arm하는데 arena 슬롯은 그 **안에서** lazy하게 잡힌다. arm 시점의
+   `nodal_slot`은 −1이므로 `adoptCanonicalBuffers`의 arena 전달이 no-op이었고, statepoint 1
+   전체가 미adopt 상태로 돌았다. 실측: 4덱 배치가 224 dataset 차이 → `acquireSlot` 직후
+   adoption 재생으로 0.
+
+**수신증.** 로컬 4덱 배치: `jnet_bridge_bytes` 슬롯당 565 MB → **0**,
+`canonical_nodal_outers` 0 → 전 outer, `[NODAL][CANON] elided_upload_bytes` 0 → 1.58 GB /
+download 2.41 GB. kngr_238 단일 arm X ON b8: elided upload 1.83 GB / download 2.80 GB.
+
+### Task 18b: sweep이 자기 스트림에 claim을 걸어 배치도 budget 8을 쓴다 — **[완료]**
+
+Task 18-lite는 배치의 budget 1을 arena의 성질로 읽었다 — "arena 스트림이 capture 중이므로
+배치는 자기 스트림을 쓰고, 따라서 동기식 sweep hook을 쓰고, 따라서 budget 1이며, 셋은 한
+쌍이고 분리할 수 없다." **첫 절만 참이다.** 나머지는 `enqueueSweeps`의 성질이었다: 그 경로는
+스트림에 아무 claim도 걸지 않았고 fleet mask를 arena당 버퍼 하나에 stage했으므로, 두 번째
+인스턴스가 살아 있는 순간 `inUseCount() > 1`로 거부할 수밖에 없었다.
+
+배치가 stream-ordered sweep을 쓰려면 세 가지가 참이어야 했다.
+
+| 무엇이 | 왜 | 어디에 |
+| --- | --- | --- |
+| **capture가 배타적**이어야 | capture는 그 스트림에 들어오는 모든 제출을 삼킨다 | `Impl::stream_mutex` — enqueue 경로와 rendezvous launcher의 unlocked 구간이 공유. `syncSweepStream`도 잡는다(다른 thread가 capture 중인 스트림은 **동기화 자체가 불법** — `operation not permitted when stream is capturing`, 그리고 오염된 capture가 나머지 3덱을 각자 자리에서 죽인다. 실측 0.97초에 4덱) |
+| **host staging이 launch당 분리**되어야 | `h_slot_map` / `host_active` / `host_assembly_active` / `host_sweep_halt`는 in-flight `cudaMemcpyAsync`의 page-locked SOURCE다 | 슬롯당 lane 1개 + rendezvous lane 1개 = `(slots+1) × slots`. **device mask는 일부러 그대로** — 모든 제출이 한 스트림을 지나므로 두 launch는 스트림이 순서를 지어 준다 |
+| **두 스트림이 join**되어야 | M개 segment는 arena 스트림을 공유할 수 없다(서로의 커널을 capture한다) | `enqueueSweeps(..., caller_stream)` + 슬롯당 event 쌍. `in`은 sweep이 psi를 읽기 전, `out`은 segment가 flux/scalar를 읽기 전. **wait를 걸기 전에 record**하므로 join은 비순환이다 — arena 스트림의 wait는 언제나 "그보다 앞선 arena 스트림 항목에만 의존하는" segment 작업으로만 풀린다 |
+
+단일 덱은 arena 스트림을 그대로 bind하므로 join을 건너뛰고 **Task 10 경로와 byte-동일**하다.
+Driver.h의 arm은 이제 **스트림에 대한 결정만** 한다: solo는 arena의 것을, 배치는 자기 것을,
+둘 다 `finish_cmfd_sweep`을 받고 둘 다 `sweep_synchronizes = false`다.
+
+**수신증.** 로컬 4덱 배치 b8: `segment_launches` 1,624 / `device_outers` 2,818(이전에는 같았다),
+`segment_budget` 8, `budget_exits` 24, `jnet_bridge_bytes` 0.
+
+**bit 게이트 (로컬 WSL, sm_61).**
+
+| 게이트 | 결과 |
+| --- | --- |
+| 4덱 배치 OFF vs ON b8 | 0/84 × 4덱 |
+| 4덱 배치 ON b8, 5회 run-to-run | 0/84 × 4덱 × 5 |
+| 4덱 배치 ON b8 vs 단일 ON b8 | 0/84 × 4덱 |
+| 4덱 배치 OFF vs cad0c0f 배치 OFF (feature-off 동일성) | 0/84 × 4덱 |
+| **8덱 배치**(d0..d3 + 복제 e0..e3, `--batch-mode 8`) OFF vs ON b8 · ON ×2 · 8슬롯 전부 vs 단일 ON | 0/84 × 8덱, 전 슬롯 세그먼트 가동 |
+| 단일 ON b8 vs cad0c0f 단일 ON b8 | 0/84 × 4덱 |
+| kngr_238 단일 arm X(S2+XSRECON/FLATXS) OFF vs ON b8 · ON ×2 · feature-off vs cad0c0f | **0/500** × 3 |
+| kngr_238 단일 arm P(S2) 같은 3조합 | **0/500** × 3 |
+| kngr3 / i-SMR CY01 / CY02 OFF vs ON b8 · ON ×2 · vs cad0c0f ON | 0/84, 0/71, 0/71 |
+| ctest | 12/12 |
+
+**8덱이 4덱보다 강한 게이트다.** claim이 지키는 것은 "한 스트림에 두 launcher"이고, 그것을
+가장 세게 미는 것은 폭이다. 8개 Driver가 한 arena 스트림에서 capture·launch·drain을 겹쳐도
+전 슬롯이 세그먼트를 끝까지 물고, 복제 덱 e_i는 원본 d_i와 bit 동일하다.
+
+**아직 budget 8이 8배 세그먼트가 아니다.** 4덱에서 `device_outers/segment_launches`는 1.7이고
+kngr_238 단일에서 3.7이다(12,017 / 3,211). 나머지는 escape가 가져간다 — kngr_238 arm X에서
+`flux_converged` 2,370 · `negative_flux` 263 · `budget_exits` 572. 이것은 Task 18의 결함이 아니라
+budget 8이 이 덱들에서 실제로 뽑는 값이며, 단일 경로가 Task 10 이래 보여 온 것과 같은 비율이다.
+
+**처리량은 아직 로컬 잡음 안이다.** 4덱 배치 3회 교차: OFF 14.09/11.60/11.50 s, ON b8
+12.15/15.03/11.95 s — 중앙값 11.60 vs 12.15. 8덱 OFF 20.24 vs ON 20.41 s. 무회귀이되 이득도
+아니다. 로컬 box는 GTX 1080 Ti이고 4덱 덱들은 12초짜리라 host/I-O가 지배한다 — 배치 처리량
+판정은 238에서 M64로 해야 한다.
+
+**단일 kngr_238은 회귀가 없고 ON이 조금 빠르다** (arm X, 3회 교차, box 유휴):
+
+| | OFF | ON b8 |
+| --- | --- | --- |
+| 이 트리 | 64.49 / 63.59 / 63.92 s | 60.07 / 62.40 / 62.96 s |
+| cad0c0f OFF | 64.16 / 61.49 s | — |
+
+feature-off 구간이 겹치므로 OFF 경로 회귀 신호는 없다(이 경로에서 바뀐 것은 staging lane의
+포인터 덧셈 하나와 rendezvous launcher의 뮤텍스 하나뿐이며, 후자는 배치에서만 경합한다).
+arm P는 OFF 62.4 / 63.1 → ON b8 60.9 / 57.9 s.
+
+**남은 진짜 Task 18.** refill(빈 슬롯에 다음 덱을 넣는 자리)과 M64 메모리는 그대로 남는다.
+238 M64 재판정 명령(arm X + OUTER b8 + chunked + `RASBERY_GPU_XE=1`):
+
+```bash
+RASBERY_GPU=1 RASBERY_GPU_CMFD_SWEEP=1 RASBERY_GPU_CMFD_RESIDENT_SINGLE=1 RASBERY_GPU_NODAL=1 RASBERY_GPU_NODAL_FULL=1 RASBERY_GPU_XSRECON=1 RASBERY_GPU_FLATXS=1 RASBERY_GPU_WIEL_FOLD=chunked RASBERY_GPU_XE=1 RASBERY_GPU_OUTER=1 RASBERY_GPU_OUTER_SEGMENT_MAX=8 python tools/run_single_gpu_batch.py --batch-width 64 --gpu 0 --   ./RASBERY --rasi <64 decks> --raso <64 outputs> --batch-mode 64
+```
+
+판정 기준: 708 골든 **708/708**, 그리고 `[OUTER_GPU][SLOT]` 64행 전부에서
+`segment_launches < device_outers`(= budget이 실제로 8) · `jnet_bridge_bytes: 0` ·
+`refusals: {}`. 슬롯 하나라도 `no_runner` / `batch_mode`를 말하면 그것이 M64 메모리 한계이며,
+per-slot 235 MB × 64 ≈ 15 GB가 그 자리다.
 
 ## Task 19: GPU Output Packing and CPU Writer-Only I/O
 
