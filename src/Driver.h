@@ -2,6 +2,7 @@
 #include "BICGCMFD.h"
 #include "BatchLightResult.h"
 #include "CudaOuterGraph.h"
+#include "EvaluatorContext.h"
 #include "IO.h"
 #include "Nodal.h"
 #include "OuterTrace.h"
@@ -96,7 +97,27 @@ enum Phase : int {
     PH_NODAL,
     PH_CUSPING,
     PH_UPDDHAT,
-    PH_COUNT
+    // --- statepoint FLOOR phases (outside the outer body) -------------------
+    // The regression of GPU_RASBERY_GA_EVALUATOR_PLAN Sec 2.2 splits a
+    // statepoint into `c + d x outer`.  The seven phases above are `d` -- the
+    // outer body, and the OUTER][PHASE] receipt already sums to it.  `c` was
+    // only ever a residual: 0.474 s of host work per statepoint that the plan
+    // attributes to PPR / depletion / FlatXS / T-H / result packing from
+    // reading the code, with no instrument behind the split.  These buckets are
+    // that instrument.  They are deliberately NOT emitted inside `phase_wall`
+    // -- tools/scheduler_trace_replay.py derives its per-statepoint boundary
+    // work as `wall - sum(phase_wall)`, and folding the floor into that object
+    // would silently move a number that model is calibrated on.  They get their
+    // own `floor_wall` object instead, and the residual stays readable as
+    // `wall - sum(phase_wall) - sum(floor_wall)`.
+    PH_PPR_RESET = PH_UPDDHAT + 1, ///< PPR::reset (buckling, corner flux, fitting, leakage, source)
+    PH_PPR_DRIVE,                  ///< PPR::drive(100) corner-balance iteration
+    PH_PPR_RECON,                  ///< PPR::reconstructPinPower (+ normalisation, Fq/FdH)
+    PH_DEPL_PRED,                  ///< XSSet::PredictorStep (CRAM Bateman, BOS)
+    PH_DEPL_CORR,                  ///< XSSet::CorrectorStep (CRAM Bateman, EOS)
+    PH_RESULT_ADD,                 ///< IO::AddResult (result packing), the head of io_wall
+    PH_COUNT,
+    PH_FLOOR_FIRST = PH_PPR_RESET,
 };
 
 inline const char* phaseName(int phase) {
@@ -108,6 +129,12 @@ inline const char* phaseName(int phase) {
         case PH_NODAL:   return "nodal";
         case PH_CUSPING: return "cusping";
         case PH_UPDDHAT: return "upddhat";
+        case PH_PPR_RESET:  return "ppr_reset";
+        case PH_PPR_DRIVE:  return "ppr_drive";
+        case PH_PPR_RECON:  return "ppr_recon";
+        case PH_DEPL_PRED:  return "depl_predictor";
+        case PH_DEPL_CORR:  return "depl_corrector";
+        case PH_RESULT_ADD: return "result_add";
         default:         break;
     }
     return "unknown";
@@ -3846,11 +3873,17 @@ public:
         const bool pin_off = (_result_mode == ResultMode::PinOff);
 
         // 1. Build solver objects and read input deck
-        Geometry  geometry;
-        Scheduler scheduler;
-        XSSet     cross_sections(geometry);
-
-        IO input_output(geometry, cross_sections, scheduler);
+        //
+        // The four objects that ARE the case, in one named lifetime.  They were
+        // four stack locals here; CaseContext is the same four, in the same
+        // order, with the boundary that `--evaluator` has to respect written
+        // down beside them (EvaluatorContext.h).  The references below keep the
+        // rest of this function reading exactly as it did.
+        CaseContext case_state;
+        Geometry&   geometry       = case_state.geometry;
+        Scheduler&  scheduler      = case_state.scheduler;
+        XSSet&      cross_sections = case_state.cross_sections;
+        IO&         input_output   = case_state.input_output;
         // Deck + XSLIB parse, split out of Init+IO so the Amdahl model's T_fixed
         // can be separated from the XSLIB-cache track (plan Rev.4 Sec 14).
         const auto library_start = std::chrono::steady_clock::now();
@@ -4039,10 +4072,16 @@ public:
                         SolveLoop(ctx, eigv, schedule, total_outer, total_th, keep_search, prime_xe);
                         cross_sections.NormalizeFluxSign();
                     }
-                    cross_sections.PredictorStep(sub_dt, thermal_power, schedule.xenon_transient);
+                    {
+                        outer_timing::Scope pred(sptelem::PH_DEPL_PRED);
+                        cross_sections.PredictorStep(sub_dt, thermal_power, schedule.xenon_transient);
+                    }
                     SolveLoop(ctx, eigv, schedule, total_outer, total_th, keep_search, prime_xe);
                     cross_sections.NormalizeFluxSign();
-                    cross_sections.CorrectorStep(sub_dt, thermal_power, schedule.xenon_transient);
+                    {
+                        outer_timing::Scope corr(sptelem::PH_DEPL_CORR);
+                        cross_sections.CorrectorStep(sub_dt, thermal_power, schedule.xenon_transient);
+                    }
                 }
             }
 
@@ -4080,7 +4119,10 @@ public:
             }
 
             // PPR
+            {
+            outer_timing::Scope ppr_reset_scope(sptelem::PH_PPR_RESET);
             pin_power_reconstruction.reset(1.0 / eigv, geometry.Jnet(), geometry.Phif(), geometry.Phis());
+            }
             // Corner-balance iteration cap.  The loop exits early on its own
             // corner-flux tolerance; measured on KNGR CY1 it needs ~50 rounds,
             // and the historical cap of 5 shipped an unconverged reconstruction
@@ -4093,11 +4135,17 @@ public:
                 const int   v = e ? std::atoi(e) : 100;
                 return v > 0 ? v : 100;
             }();
-            pin_power_reconstruction.drive(ppr_iters);
+            {
+                outer_timing::Scope ppr_drive_scope(sptelem::PH_PPR_DRIVE);
+                pin_power_reconstruction.drive(ppr_iters);
+            }
             // MASTER reports pin-volume-averaged reconstructed power.  A pin-centre
             // sample biases Fq high once intra-node curvature grows during burnup,
             // so use the precomputed 3x3 Gauss-Legendre pin-area integration.
-            pin_power_reconstruction.reconstructPinPower(true, schedule.print_opt.pin_flux);
+            {
+                outer_timing::Scope ppr_recon_scope(sptelem::PH_PPR_RECON);
+                pin_power_reconstruction.reconstructPinPower(true, schedule.print_opt.pin_flux);
+            }
 
             // Output
             const int step_number = step_index + 1;
@@ -4116,7 +4164,10 @@ public:
             sp_traj.step(step_number, total_outer, total_th, efpd, eigv, geometry.bppm(0));
 
             const auto io_start = std::chrono::steady_clock::now();
-            input_output.AddResult(geometry, eigv, step_index, step_number, efpd);
+            {
+                outer_timing::Scope add(sptelem::PH_RESULT_ADD);
+                input_output.AddResult(geometry, eigv, step_index, step_number, efpd);
+            }
 
             if (!light_result && schedule.print_opt.save) {
                 input_output.SaveRestart(RestartPath(input_output, step_number),
@@ -4187,7 +4238,10 @@ public:
                     "\"d2h_bytes_delta\":{},\"d2h_calls_delta\":{},\"counters_shared\":{},"
                     "\"wall\":{:.6f},\"io_wall\":{:.6f},\"phase_wall\":{{\"updpsi\":{:.6f},"
                     "\"setls\":{:.6f},\"drive\":{:.6f},\"updjnet\":{:.6f},\"nodal\":{:.6f},"
-                    "\"cusping\":{:.6f},\"upddhat\":{:.6f}}}}}\n",
+                    "\"cusping\":{:.6f},\"upddhat\":{:.6f}}},\"floor_wall\":{{"
+                    "\"ppr_reset\":{:.6f},\"ppr_drive\":{:.6f},\"ppr_recon\":{:.6f},"
+                    "\"depl_predictor\":{:.6f},\"depl_corrector\":{:.6f},"
+                    "\"result_add\":{:.6f}}}}}\n",
                     sp_job_id, sp_slot, step_number, efpd, total_outer, c.outers(),
                     c.outers_by_cause[sptelem::CAUSE_INITIAL], xeModeName(),
                     c.xe_updates, c.xe_interim_updates, c.xe_cascades, xe_per_cascade,
@@ -4205,7 +4259,10 @@ public:
                     c.wall, c.io_wall, c.phase[sptelem::PH_UPDPSI],
                     c.phase[sptelem::PH_SETLS], c.phase[sptelem::PH_DRIVE],
                     c.phase[sptelem::PH_UPDJNET], c.phase[sptelem::PH_NODAL],
-                    c.phase[sptelem::PH_CUSPING], c.phase[sptelem::PH_UPDDHAT]));
+                    c.phase[sptelem::PH_CUSPING], c.phase[sptelem::PH_UPDDHAT],
+                    c.phase[sptelem::PH_PPR_RESET], c.phase[sptelem::PH_PPR_DRIVE],
+                    c.phase[sptelem::PH_PPR_RECON], c.phase[sptelem::PH_DEPL_PRED],
+                    c.phase[sptelem::PH_DEPL_CORR], c.phase[sptelem::PH_RESULT_ADD]));
                 sp_run.accumulate(c);
             }
 
@@ -4283,7 +4340,10 @@ public:
                 "\"solve_wall\":{:.6f},\"io_wall\":{:.6f},\"total_seconds\":{:.6f},"
                 "\"phase_wall\":{{\"updpsi\":{:.6f},\"setls\":{:.6f},\"drive\":{:.6f},"
                 "\"updjnet\":{:.6f},\"nodal\":{:.6f},\"cusping\":{:.6f},"
-                "\"upddhat\":{:.6f}}}}}\n",
+                "\"upddhat\":{:.6f}}},\"floor_wall\":{{"
+                "\"ppr_reset\":{:.6f},\"ppr_drive\":{:.6f},\"ppr_recon\":{:.6f},"
+                "\"depl_predictor\":{:.6f},\"depl_corrector\":{:.6f},"
+                "\"result_add\":{:.6f}}}}}\n",
                 sp_job_id, sp_slot, static_cast<int>(scheduler.schedule().size()),
                 c.outers_driver, c.outers(), c.outers_by_cause[sptelem::CAUSE_INITIAL],
                 xeModeName(), c.xe_updates, c.xe_interim_updates, c.xe_cascades,
@@ -4304,7 +4364,10 @@ public:
                 c.phase[sptelem::PH_UPDPSI], c.phase[sptelem::PH_SETLS],
                 c.phase[sptelem::PH_DRIVE], c.phase[sptelem::PH_UPDJNET],
                 c.phase[sptelem::PH_NODAL], c.phase[sptelem::PH_CUSPING],
-                c.phase[sptelem::PH_UPDDHAT]));
+                c.phase[sptelem::PH_UPDDHAT],
+                c.phase[sptelem::PH_PPR_RESET], c.phase[sptelem::PH_PPR_DRIVE],
+                c.phase[sptelem::PH_PPR_RECON], c.phase[sptelem::PH_DEPL_PRED],
+                c.phase[sptelem::PH_DEPL_CORR], c.phase[sptelem::PH_RESULT_ADD]));
             // The summary is the last line this deck emits, so flush here: an
             // abnormal exit then loses at most the lines of the decks still
             // running, never a finished deck's telemetry.

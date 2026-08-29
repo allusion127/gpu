@@ -12,11 +12,13 @@
 #include "plog/Log.h"
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <string>
@@ -95,6 +97,40 @@ bool rasberySetEnvIfNeeded(const char* key, const char* value, bool overwrite = 
 
     rasberySetEnv(key, value, true);
     return true;
+}
+
+/// The process cost ledger (GA evaluator plan Sec 2.2, T_process ~= 2.0 s/case).
+///
+/// WHAT IT DECOMPOSES.  `wall - TOTAL DRIVER TIME` was the only number for
+/// everything a case pays outside Drive(), and it is a subtraction of two
+/// measurements taken by different observers.  This splits it into the parts a
+/// persistent evaluator would each amortise differently:
+///
+///   exec_s        the OpenMP re-exec: a second process image, loader and all.
+///                 Null when the environment was already stamped, which is what
+///                 a launcher that exports OMP_* itself achieves TODAY.
+///   pre_drive_s   argv/manifest parsing, the receipts, host-pinning setup.
+///   drive_s       every Driver::Drive in this process, wall to wall.
+///   post_drive_s  writer drain, arena teardown, CUDA teardown, the receipts.
+///
+/// What is left over against /usr/bin/time is the first image's loader and the
+/// static destructors after main returns -- deliberately not guessed at here.
+void rasberyPrintProcessLedger(std::ostream& out, double exec_seconds,
+                               double pre_drive_seconds, double drive_seconds,
+                               double post_drive_seconds, int jobs) {
+    out << "[RASBERY][PROCESS] {\"jobs\":" << jobs << ",\"reexec\":"
+        << (exec_seconds >= 0.0 ? "true" : "false") << ",\"exec_s\":";
+    if (exec_seconds >= 0.0)
+        out << std::fixed << std::setprecision(3) << exec_seconds;
+    else
+        out << "null";
+    out << std::fixed << std::setprecision(3)
+        << ",\"pre_drive_s\":" << pre_drive_seconds
+        << ",\"drive_s\":" << drive_seconds
+        << ",\"post_drive_s\":" << post_drive_seconds
+        << ",\"in_main_s\":" << (pre_drive_seconds + drive_seconds + post_drive_seconds)
+        << "}" << std::endl;
+    out.unsetf(std::ios::floatfield);
 }
 
 /// One word for what a whole run was asked to write: the common mode, or
@@ -251,8 +287,20 @@ void rasberyPrepareOpenMPStartup(char* argv[]) {
     changed |= rasberySetEnvIfNeeded("OMP_PLACES", "cores", true);
     rasberySetEnv("RASBERY_OMP_ENV_READY", "1", true);
 
-    if (changed)
+    if (changed) {
+        // Stamp the monotonic clock across the exec.  The re-exec is a SECOND
+        // process image -- loader, CUDA runtime init, libgomp -- and it is a
+        // per-CASE cost today because every case is a process.  Nothing could
+        // see it before: Driver::Drive starts after it, and `wall - drive` is a
+        // subtraction that lumps it with teardown (GA evaluator plan Sec 2.2's
+        // T_process = 2.0 s).  The environment survives execvp, which is what
+        // makes this measurable at all.
+        rasberySetEnv(
+            "RASBERY_STARTUP_STAMP_NS",
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()).c_str(),
+            true);
         execvp(argv[0], argv);
+    }
 #else
     rasberySetEnv("OMP_WAIT_POLICY", "PASSIVE");
     rasberySetEnv("GOMP_SPINCOUNT", "0");
@@ -268,6 +316,28 @@ int main(int argc, char* argv[]) {
     namespace fs = std::filesystem;
 
     rasberyPrepareOpenMPStartup(argv);
+    // Process cost ledger (GA evaluator plan Sec 2.2, Task C).  A persistent
+    // evaluator amortises everything measured here over the whole population;
+    // today every case pays all of it.
+    const auto process_start = std::chrono::steady_clock::now();
+    double     exec_seconds  = -1.0;
+    if (const char* stamp = std::getenv("RASBERY_STARTUP_STAMP_NS")) {
+        try {
+            const long long then = std::stoll(stamp);
+            exec_seconds =
+                static_cast<double>(process_start.time_since_epoch().count() - then) / 1.0e9;
+        } catch (const std::exception&) {
+            exec_seconds = -1.0; // an inherited stamp from another run; report nothing
+        }
+    }
+    const auto since_start = [&process_start](
+                                 const std::chrono::steady_clock::time_point& t) {
+        return std::chrono::duration<double>(t - process_start).count();
+    };
+    // Set by whichever branch runs the decks; the receipt reads both.
+    double pre_drive_seconds = 0.0;
+    auto   drive_end         = process_start;
+
     // Capture the taskset/cpuset capacity before the first OpenMP API call.
     // With OMP_PROC_BIND=TRUE libgomp later narrows the main thread to one
     // place, so querying sched_getaffinity inside the batch branch is too late.
@@ -327,8 +397,10 @@ int main(int argc, char* argv[]) {
                       << "      pin-off  result HDF5 + restarts, no pin output\n"
                       << "      light    one JSONL line per statepoint, no HDF5\n"
                       << "    It mirrors RASBERY_BATCH_LIGHT_RESULT=1 (which is --result\n"
-                      << "    light) and overrides it.  light and pin-off are screening\n"
-                      << "    modes: light still needs RASBERY_ALLOW_SCREENING=1.\n"
+                      << "    light) and overrides it.  light is a screening mode and still\n"
+                      << "    needs RASBERY_ALLOW_SCREENING=1; pin-off is not gated -- it\n"
+                      << "    still writes the result HDF5, and a deck can already say the\n"
+                      << "    same thing per step with 'pin-wise information': false.\n"
                       << "  - A --jobs manifest line may carry a THIRD field, that job's own\n"
                       << "    result mode, which overrides --result for that job alone --\n"
                       << "    how one wave runs a light population beside full elites.\n";
@@ -714,6 +786,7 @@ int main(int argc, char* argv[]) {
         // sat empty at the end.  Without it "the tail went away" is a claim
         // about a stopwatch.
         rasbery::refill::ledger().begin(jobs, batch_width, host_threads);
+        pre_drive_seconds = since_start(std::chrono::steady_clock::now());
 
 #ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic, 1) num_threads(host_threads)
@@ -749,6 +822,7 @@ int main(int argc, char* argv[]) {
             }
             rasbery::refill::ledger().jobFinished(i);
         }
+        drive_end = std::chrono::steady_clock::now();
         rasbery::refill::ledger().end();
 
         // Same rule as the CUDA teardown below: every Driver has joined, so the
@@ -836,10 +910,11 @@ int main(int argc, char* argv[]) {
         // once per deck (XsLibrary.h).  loads == 1 with hits == jobs - 1 is the
         // shape the batch is supposed to have.
         rasbery::PrintXsLibraryCacheReceipt(std::cout);
-        // Read beside [HDF5][LOCK]: what that lock used to hold was this parse,
-        // once per deck (XsLibrary.h).  loads == 1 with hits == jobs - 1 is the
-        // shape the batch is supposed to have.
-        rasbery::PrintXsLibraryCacheReceipt(std::cout);
+        rasberyPrintProcessLedger(std::cout, exec_seconds, pre_drive_seconds,
+                                  since_start(drive_end) - pre_drive_seconds,
+                                  since_start(std::chrono::steady_clock::now()) -
+                                      since_start(drive_end),
+                                  static_cast<int>(rasbery_inputs.size()));
         // Final writer counters.  Read together with [HDF5][LOCK] above, but
         // note the ACQUISITION count does not move: inline already took the
         // guard once per write function.  What the thread path changes is who
@@ -861,6 +936,7 @@ int main(int argc, char* argv[]) {
     // Same tag in both branches, deliberately: one parser rule.
     if (!rasbery_inputs.empty()) rasbery::iowriter::reportConfig(std::cout);
 
+    pre_drive_seconds = since_start(std::chrono::steady_clock::now());
     for (std::size_t i = 0; i < rasbery_inputs.size(); ++i) {
         const fs::path rasbery_input_path  = rasbery_inputs[i];
         const fs::path rasbery_output_path = rasbery_outputs[i];
@@ -920,6 +996,7 @@ int main(int argc, char* argv[]) {
                   << ",\"dot_partitions\":" << rasbery::rasberyGpuXeDotPartitions()
                   << "}" << std::endl;
     }
+    drive_end = std::chrono::steady_clock::now();
     if (rasbery::rasberyGpuNodalEnabled()) {
         std::cout << "[RASBERY][NODAL][GPU] {\"drives_solved\":"
                   << rasbery::rasberyGpuNodalDrives() << "}" << std::endl;
@@ -939,7 +1016,11 @@ int main(int argc, char* argv[]) {
               << static_cast<double>(hdf5_stats.wait_nanoseconds) / 1.0e6
               << "}" << std::endl;
     rasbery::PrintXsLibraryCacheReceipt(std::cout);
-    rasbery::PrintXsLibraryCacheReceipt(std::cout);
+    rasberyPrintProcessLedger(std::cout, exec_seconds, pre_drive_seconds,
+                              since_start(drive_end) - pre_drive_seconds,
+                              since_start(std::chrono::steady_clock::now()) -
+                                  since_start(drive_end),
+                              static_cast<int>(rasbery_inputs.size()));
     rasbery::iowriter::reportSummary(std::cout);
     return exit_code;
 }

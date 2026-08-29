@@ -528,11 +528,33 @@ void XSSet::LoadTHTables() {
 #else
     const auto base = std::filesystem::path("include") / "Database";
 #endif
-    _mod_cp_table  = milk::Table::ParseFromCSV(base / "mod_cp.csv");
-    _mod_rho_table = milk::Table::ParseFromCSV(base / "mod_rho.csv");
-    _mod_h_table   = milk::Table::ParseFromCSV(base / "mod_h.csv");
-    _mod_t_table   = milk::Table::ParseFromCSV(base / "mod_t.csv");
-    _tf_table      = milk::Table::ParseFromCSV(base / "tf.csv");
+    // Five CSV parses that depend on the BUILD, not on the deck -- the same
+    // shape of per-case waste the XSLIB cache removed one level up, and the
+    // same fix: parse once per process, copy the parsed tables per Driver.
+    //
+    // COPIED, NOT SHARED, deliberately.  milk::Table is small (four property
+    // curves and a fuel-temperature table, kilobytes), the copy is measured in
+    // microseconds, and XSSet::GetCpmod and friends are called from inside the
+    // T/H sweep -- a shared_ptr indirection there buys nothing and a shared
+    // mutable table would be the bug the XSLIB cache had to design around.
+    struct ThTables {
+        milk::Table cp, rho, h, t, tf;
+    };
+    static const ThTables tables = [&base] {
+        ThTables loaded;
+        loaded.cp  = milk::Table::ParseFromCSV(base / "mod_cp.csv");
+        loaded.rho = milk::Table::ParseFromCSV(base / "mod_rho.csv");
+        loaded.h   = milk::Table::ParseFromCSV(base / "mod_h.csv");
+        loaded.t   = milk::Table::ParseFromCSV(base / "mod_t.csv");
+        loaded.tf  = milk::Table::ParseFromCSV(base / "tf.csv");
+        return loaded;
+    }();
+
+    _mod_cp_table  = tables.cp;
+    _mod_rho_table = tables.rho;
+    _mod_h_table   = tables.h;
+    _mod_t_table   = tables.t;
+    _tf_table      = tables.tf;
 }
 
 void DepletionWorkspace::ensure(size_t n) {

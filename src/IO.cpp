@@ -4,12 +4,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include "CompatFormat.h"
 #include <fstream>
 #include <initializer_list>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -561,6 +563,16 @@ void IO::ReadInput(const std::string& filepath) {
     //
     // XSSet::Initialize needs none: Importer::LoadHDF takes its own guard, and
     // a cache hit never reaches it.
+    //
+    // Sec 2.2's `T_percase` (1.1 s) had no breakdown either -- Init+IO was one
+    // number covering deck parse, geometry build, library acquire, the
+    // nxyz-sized allocations and OpenResult.  These five stamps are the
+    // breakdown, printed once per deck as [RASBERY][READINPUT].
+    const auto t_enter = std::chrono::steady_clock::now();
+    auto       t_deck  = t_enter;
+    auto       t_geom  = t_enter;
+    auto       t_xs    = t_enter;
+
     // 1. Resolve the input directory and load the JSON deck.
     {
         std::filesystem::path input_path(filepath);
@@ -754,7 +766,9 @@ void IO::ReadInput(const std::string& filepath) {
     // 3. Initialize Geometry, XS, and optional rod maps from the parsed input.
     _gin = geometry_input;
 
+    t_deck = std::chrono::steady_clock::now();
     _g.Initialize(geometry_input);
+    t_geom = std::chrono::steady_clock::now();
 
     if (_xs_path.empty()) {
         std::filesystem::path in(filepath);
@@ -762,6 +776,7 @@ void IO::ReadInput(const std::string& filepath) {
     }
 
     _xs.Initialize(_xs_path);
+    t_xs = std::chrono::steady_clock::now();
     if (config.contains("axial_rod_division")) {
         _xs.SetAxialRodDivision(config["axial_rod_division"].get<int>());
     } else if (config.contains("rod cusping")) {
@@ -989,6 +1004,24 @@ void IO::ReadInput(const std::string& filepath) {
         }
 
         PLOG_INFO << "Restart: burnup, isotope densities and flux loaded from " << _restart_path;
+    }
+
+    // The Init+IO breakdown (GA evaluator plan Sec 2.2 Task C).  `deck_s`
+    // includes the JSON parse and the schedule/geometry parse; `geometry_s` is
+    // Geometry::Initialize; `xs_s` is XSSet::Initialize, whose library half is
+    // the cached parse and whose other half is the nxyz-sized allocations;
+    // `rest_s` is rod maps, shuffle and the restart restore.  One line per
+    // deck, beside [TIMING] Init+IO, so a batch shows all M of them.
+    {
+        const auto to_s = [](auto a, auto b) {
+            return std::chrono::duration<double>(b - a).count();
+        };
+        const auto t_exit = std::chrono::steady_clock::now();
+        std::cout << std::format(
+            "[RASBERY][READINPUT] {{\"deck_s\":{:.3f},\"geometry_s\":{:.3f},"
+            "\"xs_s\":{:.3f},\"rest_s\":{:.3f},\"total_s\":{:.3f}}}\n",
+            to_s(t_enter, t_deck), to_s(t_deck, t_geom), to_s(t_geom, t_xs),
+            to_s(t_xs, t_exit), to_s(t_enter, t_exit));
     }
 }
 

@@ -19,6 +19,13 @@ Receipts consumed (all optional; missing ones become blank cells):
   ``[RASBERY][TRAJECTORY]``           Driver.h:4305  outers, statepoints, digest
   ``[RASBERY][CUDA][BATCH_OCCUPANCY]`` CudaBICGBackend.cu:5525  mean_width
   ``[RASBERY][REFILL]``               BatchRefill.h  tail_idle_s, slot_busy
+  ``[RASBERY][XSLIB_CACHE]``          XSSet.cpp      loads, hits, bytes,
+                                      lock_wait_ms -- the host library parse
+  ``[RASBERY][PROCESS]``              main.cpp       exec_s, pre_drive_s,
+                                      drive_s, post_drive_s: the decomposition
+                                      of what `wall - drive` used to lump
+  ``[RASBERY][READINPUT]``            IO.cpp         deck_s, geometry_s, xs_s,
+                                      rest_s: the decomposition of Init+IO
 
 The process wall is NOT a receipt -- the Driver cannot observe its own startup
 or teardown.  Pass it with ``--wall-dir DIR``: for a log ``NAME.log`` the tool
@@ -158,6 +165,38 @@ def profile_log(log: Path, wall_dir: Path | None) -> dict:
         rec["hdf5_acquires"] = lock.get("acquires")
         rec["hdf5_wait_ms"] = lock.get("wait_ms")
 
+    xslib = first(receipts(text, "[RASBERY][XSLIB_CACHE]"))
+    for src, dst in (("loads", "xslib_loads"), ("hits", "xslib_hits"),
+                     ("bytes", "xslib_bytes"), ("lock_wait_ms", "xslib_lock_wait_ms")):
+        if src in xslib:
+            rec[dst] = xslib[src]
+
+    proc = first(receipts(text, "[RASBERY][PROCESS]"))
+    for src, dst in (("exec_s", "process_exec_s"), ("pre_drive_s", "process_pre_drive_s"),
+                     ("drive_s", "process_drive_s"), ("post_drive_s", "process_post_drive_s"),
+                     ("in_main_s", "process_in_main_s")):
+        if src in proc:
+            rec[dst] = proc[src]
+
+    # The Init+IO staircase, as ONE number.  Eight workers that queue behind one
+    # 34 MB parse report a rising Init+IO with a constant slope (4.108 .. 14.506
+    # s, ~1.49 s/case before the host XSLIB cache).  `init_ramp_seconds` is the
+    # spread and `init_ramp_slope` is that spread per case: both go to ~0 when
+    # the parse stops being per-case, and neither can be read off a mean.
+    if len(inits) > 1:
+        rec["init_ramp_seconds"] = max(inits) - min(inits)
+        rec["init_ramp_slope"] = rec["init_ramp_seconds"] / (len(inits) - 1)
+        rec["init_seconds_sum"] = sum(inits)
+
+    readin = receipts(text, "[RASBERY][READINPUT]")
+    if readin:
+        for key in ("deck_s", "geometry_s", "xs_s", "rest_s", "total_s"):
+            values = [r[key] for r in readin if key in r]
+            if values:
+                rec["readinput_" + key] = sum(values) / len(values)
+                if len(values) > 1:
+                    rec["readinput_" + key + "_max"] = max(values)
+
     occ = receipts(text, "[RASBERY][CUDA][BATCH_OCCUPANCY]")
     if occ:
         widest = max(occ, key=lambda o: o.get("launches", 0))
@@ -236,6 +275,8 @@ COLUMNS = [
     ("outers_per_statepoint", "out/sp", "{:.1f}", 7),
     ("ms_per_outer", "ms/outer", "{:.2f}", 9),
     ("mean_width", "width", "{:.2f}", 7),
+    ("init_ramp_slope", "ramp/case", "{:.2f}", 9),
+    ("xslib_loads", "xsloads", "{:d}", 7),
     ("digest", "digest", "{}", 17),
 ]
 
@@ -267,7 +308,11 @@ def render(rows: list[dict], stream=sys.stdout) -> None:
                 f"{row.get('driver_seconds_max', 0):.1f} s  "
                 f"init/case {row.get('init_seconds_min') or 0:5.2f}–"
                 f"{row.get('init_seconds_max') or 0:.2f} s  "
-                f"hdf5_lock_wait {row.get('hdf5_wait_ms', 0) / 1000.0:8.1f} s\n")
+                f"hdf5_lock_wait {row.get('hdf5_wait_ms', 0) / 1000.0:8.1f} s  "
+                f"init_ramp {row.get('init_ramp_seconds') or 0:5.2f} s "
+                f"({row.get('init_ramp_slope') or 0:.2f} s/case)  "
+                f"xslib loads {row.get('xslib_loads', '-')}"
+                f"/hits {row.get('xslib_hits', '-')}\n")
             continue
         if "amortisable_fraction" not in row:
             continue
@@ -276,6 +321,22 @@ def render(rows: list[dict], stream=sys.stdout) -> None:
             f"({100 * row['amortisable_fraction']:5.1f} %)   "
             f"physics {100 * row.get('physics_fraction', float('nan')):5.1f} %   "
             f"output {100 * row.get('output_fraction', float('nan')):5.1f} %\n")
+        if row.get("process_in_main_s") is not None:
+            stream.write(
+                f"{row['name']:>16}  process  exec "
+                f"{row.get('process_exec_s') if row.get('process_exec_s') is not None else float('nan'):.2f} s  "
+                f"pre_drive {row.get('process_pre_drive_s', float('nan')):.2f} s  "
+                f"drive {row.get('process_drive_s', float('nan')):.2f} s  "
+                f"post_drive {row.get('process_post_drive_s', float('nan')):.2f} s  "
+                f"unaccounted "
+                f"{(row.get('wall_seconds') or float('nan')) - row['process_in_main_s'] - (row.get('process_exec_s') or 0.0):.2f} s\n")
+        if row.get("readinput_total_s") is not None:
+            stream.write(
+                f"{row['name']:>16}  readinput  deck {row.get('readinput_deck_s', float('nan')):.2f} s  "
+                f"geometry {row.get('readinput_geometry_s', float('nan')):.2f} s  "
+                f"xs {row.get('readinput_xs_s', float('nan')):.2f} s  "
+                f"rest {row.get('readinput_rest_s', float('nan')):.2f} s  "
+                f"total {row['readinput_total_s']:.2f} s\n")
 
 
 def main(argv: list[str]) -> int:
