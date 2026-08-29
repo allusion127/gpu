@@ -5,6 +5,8 @@
 #include "BatchRefill.h"
 #include "CudaXsReconBackend.h"
 #include "Driver.h"
+#include "GpuFullContract.h"
+#include "RunContract.h"
 #include "XSTiming.h"
 #include "plog/Appenders/ConsoleAppender.h"
 #include "plog/Formatters/TxtFormatter.h"
@@ -397,10 +399,23 @@ int main(int argc, char* argv[]) {
                       << "      pin-off  result HDF5 + restarts, no pin output\n"
                       << "      light    one JSONL line per statepoint, no HDF5\n"
                       << "    It mirrors RASBERY_BATCH_LIGHT_RESULT=1 (which is --result\n"
-                      << "    light) and overrides it.  light is a screening mode and still\n"
-                      << "    needs RASBERY_ALLOW_SCREENING=1; pin-off is not gated -- it\n"
-                      << "    still writes the result HDF5, and a deck can already say the\n"
-                      << "    same thing per step with 'pin-wise information': false.\n"
+                      << "    light) and overrides it.  NONE of the three is gated: an\n"
+                      << "    output mode is not a fidelity, so a light run is\n"
+                      << "    acceptance-eligible and reports policy=strict (see\n"
+                      << "    RASBERY_PHYSICS_FIDELITY below).  What IS gated is the\n"
+                      << "    approximation: RASBERY_GA_FEEDBACK_PASSES>0 needs\n"
+                      << "    RASBERY_ALLOW_SCREENING=1 and additionally requires light.\n"
+                      << "  - RASBERY_PHYSICS_FIDELITY=strict|A2|L3coarse|feedback_limited\n"
+                      << "    DECLARES the compute fidelity when the environment cannot\n"
+                      << "    show it -- an L3 coarse deck is a reduced burnup grid and\n"
+                      << "    sets no variable.  A declaration can only make the effective\n"
+                      << "    policy COARSER; strict and A2 are detected from\n"
+                      << "    RASBERY_GA_FEEDBACK_PASSES and RASBERY_STAGED_*_TOL.\n"
+                      << "  - RASBERY_GPU_FULL=1 (alias RASBERY_GPU_STRICT=1) makes every\n"
+                      << "    GPU arm fail CLOSED: a decline or CUDA failure that would\n"
+                      << "    silently run the CPU body fails that CASE instead, naming the\n"
+                      << "    site.  Default off; [RASBERY][GPU_FULL] reports the counts\n"
+                      << "    either way.\n"
                       << "  - A --jobs manifest line may carry a THIRD field, that job's own\n"
                       << "    result mode, which overrides --result for that job alone --\n"
                       << "    how one wave runs a light population beside full elites.\n";
@@ -520,28 +535,59 @@ int main(int argc, char* argv[]) {
                                                   : rasbery::ExecutionMode::Single);
 
     // -----------------------------------------------------------------------
-    // Exact-only hard contract (plan Rev.4 Sec 2).
+    // Exact-only hard contract (plan Rev.4 Sec 2), as WP1 rewrote it
+    // (BOTTLENECK plan Sec 6.2, priority P0).
     //
-    // The campaign accepts full-exact results and nothing else, so the two
-    // approximations that exist in this binary -- the GA feedback-pass limit
-    // and the light (scalar-only, no HDF5) result writer -- must be impossible
-    // to enable BY ACCIDENT.  A warning would not do it: an inherited
-    // environment variable from a screening job is exactly how a screening run
-    // ends up in an acceptance table, and nothing downstream would know.  So
-    // this refuses to start, and RASBERY_ALLOW_SCREENING=1 is the only way to
-    // get a screening run -- never silently, and the receipt below records
-    // which one this was for the benchmark parser.
+    // The campaign accepts full-exact results and nothing else, so an
+    // approximation must be impossible to enable BY ACCIDENT.  A warning would
+    // not do it: an inherited environment variable from a screening job is
+    // exactly how a screening run ends up in an acceptance table, and nothing
+    // downstream would know.  So this refuses to start, and
+    // RASBERY_ALLOW_SCREENING=1 is the only way to get a screening run.
+    //
+    // WHAT WP1 CHANGED, AND WHY.  This used to read
+    //
+    //     const bool screening = (ga_feedback_passes > 0) || light_result;
+    //
+    // which made `--result light` -- a switch that changes only what LEAVES the
+    // process -- declare the SOLVE approximate.  It is not: full, pin-off and
+    // light run the same solve, the same PPR and the same feedback loops, and
+    // the campaign measured all three to one trajectory digest
+    // (814201df0583e1d2).  The cost was paid in both directions: a strict run
+    // that wrote scalars was voided by the acceptance audit, and the harness
+    // worked around that by EXPECTING the screening receipt for a light chunk,
+    // so a receipt claiming screening was accepted for a run that was not.
+    //
+    // Screening is now a property of the FIDELITY alone (src/RunContract.h):
+    // coarse statepoints or a GA feedback-pass limit.  What the case writes is
+    // reported beside it and is never a reason to void a run.
     // -----------------------------------------------------------------------
     const int  ga_feedback_passes = rasbery::BatchLightResult::FeedbackPasses();
-    // ANY light job makes the run a screening run.  Reading only the
-    // environment would let `--result light` walk straight past the guard the
-    // environment variable is guarded by -- the flag is a second door to the
-    // same room, so it gets the same lock.
+    // Still computed, because `full_hdf5` is still a fact about the run and the
+    // feedback-pass limit is still coupled to the light writer below.  It is no
+    // longer an input to `screening`.
     const bool any_light =
         std::any_of(rasbery_result_modes.begin(), rasbery_result_modes.end(),
                     [](rasbery::ResultMode m) { return m == rasbery::ResultMode::Light; });
     const bool light_result       = rasbery::BatchLightResult::Enabled() || any_light;
-    const bool screening          = (ga_feedback_passes > 0) || light_result;
+
+    // A declaration this build cannot parse is a declaration that silently did
+    // not happen -- and the case it exists for, an L3 coarse DECK, is the one
+    // fidelity nothing else can detect.  Refuse rather than report `strict`.
+    if (rasbery::declaredPhysicsFidelityIsUnknown()) {
+        std::cerr << "[RASBERY][EXACT_ONLY][FAIL] RASBERY_PHYSICS_FIDELITY=\""
+                  << rasbery::declaredPhysicsFidelityText()
+                  << "\" is not a fidelity this build knows. Use one of: ";
+        for (int i = 0; i < 4; ++i)
+            std::cerr << (i ? " | " : "") << rasbery::kFidelityTraits[i].policy;
+        std::cerr << " (or the plan spellings: ";
+        for (int i = 0; i < 4; ++i)
+            std::cerr << (i ? " | " : "") << rasbery::kFidelityTraits[i].physics_fidelity;
+        std::cerr << ")." << std::endl;
+        return 2;
+    }
+    const rasbery::PhysicsFidelity fidelity = rasbery::effectivePhysicsFidelity();
+    const bool screening          = rasbery::fidelityIsScreening(fidelity);
     const bool allow_screening    = [] {
         const char* value = std::getenv("RASBERY_ALLOW_SCREENING");
         if (value == nullptr || *value == '\0') return false;
@@ -552,15 +598,21 @@ int main(int argc, char* argv[]) {
 
     if (screening && !allow_screening) {
         std::cerr << "[RASBERY][EXACT_ONLY][FAIL] this build runs full-exact physics only.\n"
+                  << "  policy=" << rasbery::physicsPolicyName(fidelity)
+                  << " (required: strict)\n"
                   << "  RASBERY_GA_FEEDBACK_PASSES=" << ga_feedback_passes
                   << " (required: 0 or unset)\n"
-                  << "  light result requested=" << (light_result ? "1" : "0")
-                  << " (RASBERY_BATCH_LIGHT_RESULT or --result light / a manifest's third "
-                     "field; required: none of them; full HDF5 output is part of the "
-                     "contract)\n"
-                  << "  Unset them to run exact, or set RASBERY_ALLOW_SCREENING=1 to run a "
-                     "screening job on purpose. Screening results are never acceptance "
-                     "results."
+                  << "  RASBERY_PHYSICS_FIDELITY="
+                  << (rasbery::declaredPhysicsFidelityText() != nullptr
+                          ? rasbery::declaredPhysicsFidelityText()
+                          : "<unset>")
+                  << " (a declaration can only make the run COARSER)\n"
+                  << "  NOTE: --result light / RASBERY_BATCH_LIGHT_RESULT is an OUTPUT "
+                     "mode and is NOT why this refused; the same solve and the same "
+                     "trajectory digest come out of full, pin-off and light.\n"
+                  << "  Unset the approximations to run exact, or set "
+                     "RASBERY_ALLOW_SCREENING=1 to run a screening job on purpose. "
+                     "Screening results are never acceptance results."
                   << std::endl;
         return 2;
     }
@@ -576,8 +628,21 @@ int main(int argc, char* argv[]) {
     // Machine-readable physics-mode receipt, emitted by EVERY run before any
     // deck starts (Sec 2.2).  The benchmark parser voids a run whose receipt is
     // missing or whose fields disagree with full-exact.
+    //
+    // `physics_mode` KEEPS ITS LEGACY VOCABULARY.  Every stored 238 arm --
+    // strict and A2 alike -- was measured against the string
+    // "full_exact_nodal", and the harness audits that string, so repointing
+    // this field at the new policy words would void every manifest on disk.
+    // The one new value is coarse10's, which no stored arm can carry because
+    // the binary could not report a coarse deck before WP1.  The FIDELITY lives
+    // in `policy`/`physics_fidelity` below, which is what a WP1-aware audit
+    // (tools/exact_audit.py) reads.
+    const char* const legacy_physics_mode =
+        (fidelity == rasbery::PhysicsFidelity::FeedbackLimited) ? "ga_screen_feedback_limited"
+        : (fidelity == rasbery::PhysicsFidelity::Coarse10State) ? "ga_screen_coarse10"
+                                                                : "full_exact_nodal";
     std::cout << "[RASBERY][PHYSICS_MODE] {\"physics_mode\":\""
-              << (screening ? "ga_screen_feedback_limited" : "full_exact_nodal")
+              << legacy_physics_mode
               << "\",\"screening\":" << (screening ? "true" : "false")
               << ",\"feedback_pass_limit\":" << ga_feedback_passes
               << ",\"full_hdf5\":" << (light_result ? "false" : "true")
@@ -599,12 +664,38 @@ int main(int argc, char* argv[]) {
               // "mixed" is a legitimate value -- one wave, light population,
               // full elites -- and is why this is not a boolean.
               << ",\"result_mode\":\"" << rasberyResultModeSummary(rasbery_result_modes)
-              << "\"}" << std::endl;
+              << "\""
+              // ---- WP1 (BOTTLENECK plan Sec 6.2): THE FIDELITY AXIS --------
+              // The three fields above this line describe what the run WRITES.
+              // The four below describe how it SOLVES, and they are the ones an
+              // acceptance audit keys on (tools/exact_audit.py).  They are
+              // additive: `physics_mode`, `screening`, `feedback_pass_limit`
+              // and `full_hdf5` keep the vocabulary every stored 238 arm was
+              // measured with, so no existing manifest is invalidated -- what
+              // changed is that `physics_mode`/`screening` no longer flip
+              // because a job wrote scalars.
+              << ",\"physics_fidelity\":\"" << rasbery::physicsFidelityName(fidelity)
+              << "\",\"policy\":\"" << rasbery::physicsPolicyName(fidelity)
+              << "\",\"acceptance_eligible\":"
+              << (rasbery::fidelityIsAcceptanceEligible(fidelity) ? "true" : "false")
+              << ",\"requires_exact_rerun\":"
+              << (rasbery::fidelityRequiresExactRerun(fidelity) ? "true" : "false")
+              // Raw, so a declaration that changed nothing is still visible: it
+              // can only ever make the effective fidelity COARSER.
+              << ",\"fidelity_declared\":"
+              << (rasbery::declaredPhysicsFidelityText() != nullptr
+                      ? "\"" + std::string(rasbery::declaredPhysicsFidelityText()) + "\""
+                      : std::string("null"))
+              // ---- WP1 (plan Sec 6.3): was the fail-closed gate on? --------
+              << ",\"gpu_full\":"
+              << (rasbery::gpufull::required() ? "true" : "false")
+              << "}" << std::endl;
 
     if (screening) {
-        std::cout << "[RASBERY][GA][SCREEN] {\"physics_mode\":"
-                     "\"ga_screen_feedback_limited\",\"feedback_passes\":"
-                  << ga_feedback_passes
+        std::cout << "[RASBERY][GA][SCREEN] {\"physics_mode\":\""
+                  << legacy_physics_mode << "\",\"policy\":\""
+                  << rasbery::physicsPolicyName(fidelity)
+                  << "\",\"feedback_passes\":" << ga_feedback_passes
                   << ",\"requires_exact_rerun\":true}" << std::endl;
     }
 
@@ -857,6 +948,13 @@ int main(int argc, char* argv[]) {
         std::cout << "[RASBERY][BATCH_HOST][PIN] {";
         rasbery::rasberyAppendHostPinReceiptFields(std::cout);
         std::cout << "}" << std::endl;
+        // WP1 (plan Sec 6.3).  Printed WHETHER OR NOT the gate is on, and in
+        // both branches with one tag, for the same reason [BATCH_HOST][PIN] is:
+        // "the arm was on and never engaged" must not look like "the arm was
+        // off".  contract_pass is the whole receipt in one boolean.
+        std::cout << "[RASBERY][GPU_FULL] {";
+        rasbery::gpufull::appendReceiptFields(std::cout);
+        std::cout << "}" << std::endl;
         // Rev.7.1 Task 20.  Printed HERE, after the arena has been released, so
         // the tenancy counters it carries are final: releaseSlot runs in the
         // Driver destructors (all joined) and the arena teardown above is the
@@ -979,6 +1077,11 @@ int main(int argc, char* argv[]) {
     rasbery::rasberyDrainPinnedRegistry();
     std::cout << "[RASBERY][BATCH_HOST][PIN] {";
     rasbery::rasberyAppendHostPinReceiptFields(std::cout);
+    std::cout << "}" << std::endl;
+    // Same tag in both branches, deliberately: one parser rule.  See the batch
+    // arm above for why it is unconditional.
+    std::cout << "[RASBERY][GPU_FULL] {";
+    rasbery::gpufull::appendReceiptFields(std::cout);
     std::cout << "}" << std::endl;
 
     if (rasbery::rasberyGpuXsReconEnabled())

@@ -3,6 +3,7 @@
 #include "BatchLightResult.h"
 #include "CudaOuterGraph.h"
 #include "EvaluatorContext.h"
+#include "GpuFullContract.h"
 #include "IO.h"
 #include "Nodal.h"
 #include "OuterTrace.h"
@@ -1217,6 +1218,15 @@ private:
         // and dhat mirrors this outer issued.  They are the same stream for a
         // single deck and different ones in a batch, and draining a stream
         // twice is free.
+        // WP1 (plan Sec 6.3).  COUNT-ONLY, and this is the one site allowed to
+        // be: it runs INSIDE a live device outer segment, and a throw here would
+        // unwind past the segment's stream -- and, on the WHILE arm, past an
+        // open graph capture -- with nothing written to clean either up.  So the
+        // blocking host drive still happens and `contract_pass` goes false; the
+        // segment's own [OUTER_GPU] refusal ladder says why on the NEXT outer,
+        // where the seam CAN refuse.  tools/test_gpu_full_fail_closed.py holds
+        // the allowlist this entry is on.
+        RASBERY_GPU_FULL_COUNT(Outer);
         h.ctx->cmfd_solver.syncSweepStream();
         gpu::rasberySyncSegmentStream(stream);
         h.ctx->cmfd_solver.drive(*h.eigv, h.ctx->geometry.PhifMutable(), *h.residual);
@@ -1962,8 +1972,14 @@ private:
         // The decision is hoisted out of the loop, so nothing below would ever
         // record it; say it once here or the receipt cannot tell "off" from "on
         // and refused every time".
-        if (gpu_outer_enabled && !gpu_outer_armed)
+        if (gpu_outer_enabled && !gpu_outer_armed) {
             gpu::noteOuterSegmentRefusal(gpu_outer_why);
+            // WP1 (plan Sec 6.3).  The segment never armed, so this whole loop
+            // is the host outer body.  `gpu_outer_enabled` is the arm's own
+            // predicate, so a FeatureOff run never reaches here.
+            RASBERY_GPU_FULL_GUARD(Outer, "Driver: outer segment pre-arm",
+                                   gpu::outerRefusalName(gpu_outer_why));
+        }
 
         for (int i = 0; i < max_iter; ++i) {
             if (gpu_outer_armed) {
@@ -2019,6 +2035,14 @@ private:
                         // rule is `prev_inner = eigv`, so use that.
                         prev_inner      = eigv;
                         gpu_outer_armed = false;
+                        // WP1 (plan Sec 6.3).  The device reached a non-finite
+                        // iterate and handed the rest of the re-convergence
+                        // back; under the gate that is a case failure, not a
+                        // quiet change of executor.
+                        RASBERY_GPU_FULL_GUARD(
+                            Outer, "Driver::ReconvergeFlux",
+                            "the device segment escaped with a non-finite iterate; "
+                            "the host outer takes the rest of the re-convergence");
                     }
                     continue;
                 }
@@ -2032,6 +2056,12 @@ private:
                 // a refusal count per outer for the rest of the re-convergence
                 // and still run the host body every time.
                 gpu_outer_armed = false;
+                // WP1 (plan Sec 6.3).  A launch or hook failure inside an armed
+                // segment; the refusal is already counted in [OUTER_GPU], but
+                // nothing made it fatal.
+                RASBERY_GPU_FULL_GUARD(Outer, "Driver::ReconvergeFlux",
+                                       "runSegment refused or failed to launch; the "
+                                       "host outer body takes over");
             }
             ctx.cmfd_solver.updpsi(ctx.geometry.Phif());
             ctx.cmfd_solver.setls(eigv);
@@ -3079,8 +3109,14 @@ private:
                                              gpu_outer_claim.admitted)
                               : gpu::OuterSegmentRefusal::FeatureOff;
         bool gpu_outer_armed = (gpu_outer_why == gpu::OuterSegmentRefusal::None);
-        if (gpu_outer_enabled && !gpu_outer_armed)
+        if (gpu_outer_enabled && !gpu_outer_armed) {
             gpu::noteOuterSegmentRefusal(gpu_outer_why);
+            // WP1 (plan Sec 6.3).  The segment never armed, so this whole loop
+            // is the host outer body.  `gpu_outer_enabled` is the arm's own
+            // predicate, so a FeatureOff run never reaches here.
+            RASBERY_GPU_FULL_GUARD(Outer, "Driver: outer segment pre-arm",
+                                   gpu::outerRefusalName(gpu_outer_why));
+        }
 
         for (int iout = 0; iout < max_iter; ++iout) {
             // HOW MANY OUTERS THIS PASS OF THE LOOP ACTUALLY RAN.
@@ -3197,6 +3233,10 @@ private:
                     // decided once above the loop, so this recurs; stop paying
                     // for it and let the host body below be the whole outer.
                     gpu_outer_armed = false;
+                    // WP1 (plan Sec 6.3), same seam as ReconvergeFlux's.
+                    RASBERY_GPU_FULL_GUARD(Outer, "Driver::SolveLoop",
+                                           "runSegment refused or failed to launch; the "
+                                           "host outer body takes over");
                 }
             }
 
@@ -4171,8 +4211,18 @@ public:
                     1.0 / eigv, geometry.Jnet(), geometry.Phif(),
                     geometry.Phis(), ppr_iters);
             }
+            // WP1 (plan Sec 6.3).  THE PPR FAIL-OPEN SEAM.  Every reason
+            // resetAndDriveGpu can decline -- arm off, no CUDA, ng != 2,
+            // RASBERY_PPR_MODE=master, a CUDA failure -- lands below, and the
+            // two host calls there are the CPU pin-power reconstruction.  The
+            // guard is conditioned on the arm so an unset RASBERY_GPU_PPR
+            // promises nothing.
             if (!ppr_on_device) {
                 ++ppr_host_statepoints;
+                RASBERY_GPU_FULL_GUARD_IF(
+                    rasbery::gpufull::armRequested("RASBERY_GPU_PPR"), Ppr,
+                    "Driver: statepoint PPR",
+                    "the device PPR arm declined; the host reset+drive runs");
                 {
                     outer_timing::Scope ppr_reset_scope(sptelem::PH_PPR_RESET);
                     pin_power_reconstruction.reset(1.0 / eigv, geometry.Jnet(),

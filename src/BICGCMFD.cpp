@@ -1,5 +1,6 @@
 #include "BICGCMFD.h"
 
+#include "GpuFullContract.h"
 #include "HostOuterBodyCounters.h"
 #include "HostPinRegistry.h"
 
@@ -867,6 +868,14 @@ void BICGCMFD::drive(double& eigv, double* flux, double& errl2) {
     // the pristine host loop below takes over.
     if (!cap && canEnqueueDrive()) {
         if (driveDeviceSweeps(eigv, flux, errl2)) return;
+        // WP1 (plan Sec 6.3).  canEnqueueDrive() was true, so the device arm
+        // was armed and ASKED to run; a false from driveDeviceSweeps is a
+        // decline, and the loop below is the CPU.  BackendCounters has carried
+        // a `cmfd_cpu_fallbacks` field since the backend was written and
+        // nothing ever incremented it -- this is the seam it was for.
+        RASBERY_GPU_FULL_GUARD(Cmfd, "BICGCMFD::drive",
+                               "the device sweep loop declined; the host BiCGSTAB "
+                               "outer loop takes the drive");
     }
 
     int negative = 0;

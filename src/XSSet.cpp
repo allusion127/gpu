@@ -1,5 +1,6 @@
 #include "XSSet.h"
 
+#include "GpuFullContract.h"
 #include "Importer.h"
 #include "XSTiming.h"
 #include "XeGpuReceipt.h"
@@ -3085,6 +3086,13 @@ void XSSet::UpdateFlatXS(const XSUpdateOptions& options) {
                 return;
             }
             // Device arm declined: fall through to the reference loop.
+            // WP1 (plan Sec 6.3).  This seam had no counter of any kind: a
+            // FlatXS arm that refused every node looked exactly like an arm
+            // that was never set.
+            RASBERY_GPU_FULL_GUARD_IF(rasberyGpuFlatXsEnabled() && !dump_this, FlatXs,
+                                      "XSSet::UpdateFlatXS",
+                                      "the FlatXS device arm declined; the reference "
+                                      "reconstruction loop runs");
         }
     }
 
@@ -4117,6 +4125,11 @@ double XSSet::UpdateEquilibriumXenon(double power, double relax) {
             return gpu_max;
         }
         tally.host_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        // WP1 (plan Sec 6.3).  The split arm is the one Xe seam that was
+        // already counted; the guard rides on the same line so the two cannot
+        // drift apart.
+        RASBERY_GPU_FULL_GUARD(Xe, "XSSet::UpdateEquilibriumXenon(split)",
+                               "the split device Xe arm declined");
         // any failure falls through to the fused arm, then to the CPU loop
     }
 
@@ -4127,6 +4140,12 @@ double XSSet::UpdateEquilibriumXenon(double power, double relax) {
             return gpu_max;
         }
         // any failure falls through to the unchanged CPU loop
+        // WP1 (plan Sec 6.3).  Unlike the split arm above, this one had NO
+        // tally at all -- the fused RASBERY_GPU_XSRECON arm could decline every
+        // step of every statepoint and no receipt would say so.
+        RASBERY_GPU_FULL_GUARD(Xe, "XSSet::UpdateEquilibriumXenon(fused)",
+                               "the fused device Xe arm declined; the host Xe loop "
+                               "runs");
     }
 
     static const char* dump_path = std::getenv("RASBERY_XSRECON_DUMP");
@@ -4520,6 +4539,13 @@ void XSSet::Deplete(double dt, double power, bool xe_transient) {
         return;
     }
     ++_cram_host_fallbacks;
+    // WP1 (plan Sec 6.3).  Guarded BEFORE the OpenMP region below: an exception
+    // must not have to leave a parallel region to reach main.cpp's per-case
+    // catch.
+    RASBERY_GPU_FULL_GUARD_IF(rasbery::gpufull::armRequested("RASBERY_GPU_CRAM"), Cram,
+                              "XSSet::Deplete",
+                              "the device CRAM predictor declined; the host DepleteNode "
+                              "loop runs");
 
 #pragma omp parallel if (nxyz > OMP_THRESHOLD)
     {
@@ -4662,6 +4688,13 @@ void XSSet::CorrectorStep(double dt, double power, bool xe_transient) {
         CorrectorStepGpu(dt, power, xe_transient, pcDensityAverage,
                          pcXeEquilibriumFix, pcSubsteps);
     if (!corrector_on_device) ++_cram_host_fallbacks;
+    // WP1 (plan Sec 6.3).  Same rule as the predictor's, and before the
+    // corrector's own OpenMP region for the same reason.
+    RASBERY_GPU_FULL_GUARD_IF(!corrector_on_device &&
+                                  rasbery::gpufull::armRequested("RASBERY_GPU_CRAM"),
+                              Cram, "XSSet::PredictorCorrectorStep",
+                              "the device CRAM corrector declined; the host corrector "
+                              "loop runs");
 
     if (!corrector_on_device) {
 #pragma omp parallel if (nxyz > OMP_THRESHOLD)

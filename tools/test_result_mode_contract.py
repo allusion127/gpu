@@ -14,14 +14,20 @@ gets the mode as a constructor argument instead of reading the environment.
 
 THE TWO THINGS THAT WOULD BE SILENT IF BROKEN, and are what this test holds:
 
-  1. THE SCREENING GUARD MUST COVER THE FLAG.  `RASBERY_BATCH_LIGHT_RESULT=1` is
-     refused without RASBERY_ALLOW_SCREENING=1 (plan Rev.4 Sec 2).  A new flag
-     that reaches the same writer past the same guard would be a second door
-     into a room that is locked for a reason.
+  1. THE RESULT MODE MUST NOT REACH THE FIDELITY.  Until WP1 it did:
+     `RASBERY_BATCH_LIGHT_RESULT=1` and `--result light` were both refused
+     without RASBERY_ALLOW_SCREENING=1, because main.cpp folded the output mode
+     into `screening`.  That is now fixed (BOTTLENECK plan Sec 6.2,
+     src/RunContract.h) and the coupling must not come back: `screening` is a
+     function of the FIDELITY, and `full_hdf5` is the one field the writer still
+     decides.  The union `light_result = Enabled() || any_light` survives
+     precisely because `full_hdf5` still has to be true of the whole run --
+     including a job that asked for light through the manifest's third field.
+     tools/test_result_fidelity_contract.py holds the other half.
   2. THE MANIFEST'S THIRD FIELD MUST SURVIVE THE DISPATCHER.  The multi-GPU
      launcher REWRITES chunk manifests.  A third field it silently dropped would
-     turn every promoted elite back into a screening receipt, and the only
-     symptom would be a missing HDF5 nobody looks for until the campaign ends.
+     turn every promoted elite back into a scalar receipt, and the only symptom
+     would be a missing HDF5 nobody looks for until the campaign ends.
 """
 from __future__ import annotations
 
@@ -103,14 +109,24 @@ check('if (option == "--result")' in main or 'option == "--result"' in main,
 check("full|pin-off|light" in main, "--help does not document the three result modes")
 check("--result" in main and "manifest" in main, "--help does not mention the manifest override")
 
-# 1. the screening guard covers the flag
+# 1. the result mode reaches full_hdf5 -- and NOTHING else
 guard_region = main[main.find("Exact-only hard contract"):main.find("[RASBERY][PHYSICS_MODE]")]
 check(len(guard_region) > 200, "could not locate the exact-only guard region in main.cpp")
 check("any_light" in guard_region,
-      "the exact-only guard reads only the environment; --result light would walk past it")
+      "main.cpp reads only the environment for the light result; a job that asked for "
+      "light through the manifest's third field would still be reported full_hdf5:true")
 check(re.search(r"light_result\s*=\s*rasbery::BatchLightResult::Enabled\(\)\s*\|\|\s*any_light",
                 guard_region) is not None,
       "light_result is not the union of the environment and the per-job modes")
+# WP1: and it must NOT reach the screening verdict.  The comment block quotes
+# the old line on purpose, so this scans the code.
+guard_code = re.sub(r"//[^\n]*", "", guard_region)
+check(re.search(r"screening\s*=[^;]*light_result", guard_code) is None,
+      "the result mode is back in the screening verdict: `--result light` would once "
+      "again declare the SOLVE approximate (BOTTLENECK plan Sec 6.2)")
+check("light is a screening mode" not in main,
+      "--help still calls light a screening mode; it is an output mode and a light run "
+      "is acceptance-eligible")
 
 # per-job modes reach both Driver construction sites
 sites = re.findall(r"rasbery::Driver driver\((.*?)\);", main, re.S)

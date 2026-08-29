@@ -1,4 +1,5 @@
 #include "Nodal.h"
+#include "GpuFullContract.h"
 #include "HostOuterBodyCounters.h"
 #include "HostPinRegistry.h"
 #include "NodalConstantKernel.h"
@@ -845,8 +846,19 @@ void Nodal::drive() {
             jnet_snapshot.assign(_jnet, _jnet + static_cast<std::size_t>(_nsurf) * _ng);
         }
     }
-    if (!TryDriveGpu())
+    // WP1 (plan Sec 6.3).  THE NODAL FAIL-OPEN SEAM.  Every reason TryDriveGpu
+    // can refuse -- ng != 2, a fractional rod, an unavailable backend, a CUDA
+    // error inside solveNodal -- lands on the next line and the whole CPU nodal
+    // body runs.  `BackendCounters::nodal_cpu_fallbacks` has been declared and
+    // printed since the arm was written and incremented by nothing.  The guard
+    // is conditioned on the arm's own predicate: a decline with
+    // RASBERY_GPU_NODAL unset promised nothing.
+    if (!TryDriveGpu()) {
+        RASBERY_GPU_FULL_GUARD_IF(rasberyGpuNodalEnabled(), Nodal, "Nodal::drive",
+                                  "the device nodal arm declined; driveBody() runs "
+                                  "the CPU nodal body");
         driveBody();
+    }
 
     // Divergence probe (RASBERY_NODAL_DEBUG_HASH): one FNV line per drive()
     // over jnet+phis; diffing the two arms' streams pinpoints the first call
