@@ -456,6 +456,78 @@ def check_isolation_check(server: str) -> list[str]:
 
 
 # ===========================================================================
+# 8. STAGE 1.5 -- the wave prints what the launchers audit
+# ===========================================================================
+#
+# The dispatcher no longer starts a RASBERY per chunk; it sends a `wave` to a
+# persistent one.  That only stays HONEST if a wave prints the receipts a chunk
+# printed, because the audit those receipts feed
+# (run_single_gpu_batch.check_run_receipts) is the thing that decides whether a
+# throughput number is an acceptance measurement or an anecdote.
+#
+# [RASBERY][BATCH_HOST] is the specific one: the audit reads it to answer "did
+# the multi-instance batch branch actually run, and with the host_threads that
+# were requested".  Without a per-wave copy, EVERY wave a dispatcher sent
+# through an evaluator would be audited as "the batch branch never ran", and the
+# tempting fix -- weakening the audit for this one mode -- is exactly how a mode
+# stops being audited at all.
+BATCH_HOST_FIELDS = ("jobs", "arena_width", "host_threads", "visible_cpus",
+                     "host_pinning", "pin_lease", "legacy_pinning_criterion")
+
+
+def check_batch_host_receipt(server: str) -> list[str]:
+    bad: list[str] = []
+    tag = "[RASBERY][BATCH_HOST] {"
+    start = server.find(tag)
+    if start < 0:
+        return ["EvaluatorServer.h never emits [RASBERY][BATCH_HOST]: every wave a "
+                "dispatcher sends would be audited as a run whose batch branch never "
+                "ran (run_single_gpu_batch.check_run_receipts)"]
+    block = server[start:start + 1200]
+    for field in BATCH_HOST_FIELDS:
+        if f'\\"{field}\\":' not in block:
+            bad.append(f"the per-wave [BATCH_HOST] receipt is missing {field!r}, which "
+                       "main.cpp's batch branch prints; the audit reads the fields, not "
+                       "the tag")
+    # It has to be INSIDE the wave loop, or it is a once-per-process line
+    # pretending to be a per-wave one.
+    wave_start = server.find("[RASBERY][EVALUATOR][WAVE_START]")
+    wave_end = server.find("[RASBERY][EVALUATOR][WAVE] {")
+    if not (0 <= wave_start < start < wave_end):
+        bad.append("the [BATCH_HOST] receipt is not emitted inside runWave between "
+                   "WAVE_START and the wave receipt: a wave-scoped number printed once "
+                   "per process describes the first wave and lies about the rest")
+    return bad
+
+
+# The dispatcher half of the same contract.  It is a source scan and not a run
+# because the run-level checks live in tools/test_multi_gpu_dispatch.py; what is
+# fixed HERE is that the two files still agree about which tag is the sentinel.
+def check_dispatcher_protocol(dispatch: str) -> list[str]:
+    bad: list[str] = []
+    for needle, why in (
+        ("--evaluator-jsonl",
+         "the dispatcher must launch the evaluator mode by its real flag"),
+        ('"op": "wave"',
+         "the dispatcher must speak the `wave` op EvaluatorServer.h implements"),
+        ('{"op":"shutdown"}',
+         "a worker must be shut down explicitly, or the arena is released by process "
+         "death and the teardown receipts never arrive"),
+        ("EVALUATOR_WAVE_RECEIPT",
+         "the wave receipt is the sentinel the dispatcher reads its reply on"),
+        ("EVALUATOR_REFUSED",
+         "a REFUSED wave prints no wave receipt, so it has to be a stop condition "
+         "too or the dispatcher waits forever for a line that is not coming"),
+        ("session.preamble",
+         "[PHYSICS_MODE] is printed once per process; a wave slice audited without "
+         "it reads as a run that declared no fidelity"),
+    ):
+        if needle not in dispatch:
+            bad.append(f"run_multi_gpu_batch.py: {why} (missing {needle!r})")
+    return bad
+
+
+# ===========================================================================
 # RUN
 # ===========================================================================
 failures += check_mode(MAIN)
@@ -465,6 +537,8 @@ failures += check_failure_isolation(SERVER)
 failures += check_receipts(SERVER)
 failures += check_receipt_parity(MAIN)
 failures += check_isolation_check(SERVER)
+failures += check_batch_host_receipt(SERVER)
+failures += check_dispatcher_protocol(read("tools/run_multi_gpu_batch.py"))
 failures += check_process_state()
 
 # The Driver side of the per-case receipt: it must be stamped from the same
@@ -515,6 +589,15 @@ control("check_receipt_parity misses the two shutdown blocks diverging",
 control("check_isolation_check misses a digest comparison replaced by a keff one",
         check_isolation_check,
         SERVER.replace("recheck.digest != receipts[u0].digest", "false"))
+control("check_batch_host_receipt misses a dropped [BATCH_HOST] receipt",
+        check_batch_host_receipt, SERVER.replace("[RASBERY][BATCH_HOST] {", "[X] {"))
+control("check_batch_host_receipt misses a dropped host_threads field",
+        check_batch_host_receipt,
+        SERVER.replace('\\"host_threads\\":" << host_threads',
+                       '\\"threads\\":" << host_threads'))
+control("check_dispatcher_protocol misses a launcher that never shuts a worker down",
+        check_dispatcher_protocol,
+        read("tools/run_multi_gpu_batch.py").replace('{"op":"shutdown"}', "close()"))
 
 # The state scanner's negative control needs a source, not the tree: inject one
 # unclassified mutable static and require the scan to surface it.

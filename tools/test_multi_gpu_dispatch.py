@@ -784,6 +784,245 @@ with tempfile.TemporaryDirectory() as tmp:
           "--set-unset of both staged tolerances leaves a strict child, and the "
           "derivation must read the ENVIRONMENT, not the presence of --strict")
 
+# ===========================================================================
+# WP8 stage 1.5 -- the persistent evaluator, and the ways a worker can die
+# ===========================================================================
+#
+# The dispatcher no longer spawns a RASBERY per claimed chunk; it keeps ONE
+# `--evaluator-jsonl -` per (GPU, K-slot) and feeds it a `wave` per chunk.  Four
+# things can go wrong that could not go wrong before, and each has a check here
+# with a negative control that drives it:
+#
+#   1. the receipts a wave prints are not the receipts the audit reads, so a
+#      whole campaign is audited as "the batch branch never ran";
+#   2. the chunk accounting silently counts waves as processes, so the very
+#      number the mode exists to reduce is the one that cannot be seen;
+#   3. a child DIES mid-wave and the cases it never reported vanish -- no
+#      output, no receipt, no FAIL line, just a manifest longer than the
+#      results;
+#   4. the re-queue retries forever, and one poisoned candidate hangs the
+#      campaign instead of failing it.
+#
+# The child is tools/fake_rasbery_child.py, the SAME fake the tuner contract
+# uses, driven through its FAKE_RASBERY_* knobs.  Nothing here needs a GPU.
+
+FAKE = str((root / "tools" / "fake_rasbery_child.py").resolve())
+
+
+def dispatch(argv: list[str]) -> tuple[int, dict[str, list[dict]], str]:
+    """Run main(); return (rc, receipts by tag, the whole log)."""
+    out = io.StringIO()
+    err = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = mg.main(argv)
+    text = out.getvalue() + err.getvalue()
+    seen: dict[str, list[dict]] = {}
+    for line in out.getvalue().splitlines():
+        if not line.startswith("[RASBERY][MULTI_GPU][") or "] {" not in line:
+            continue
+        tag, payload = line.split("] ", 1)
+        try:
+            seen.setdefault(tag.rsplit("[", 1)[1], []).append(json.loads(payload))
+        except ValueError:
+            pass
+    return rc, seen, text
+
+
+def campaign(work: Path, name: str, decks: list[str], *, extra: list[str],
+             claim: str = "2") -> tuple[int, dict[str, list[dict]], str, Path]:
+    outdir = work / f"out_{name}"
+    outdir.mkdir(parents=True, exist_ok=True)
+    manifest = work / f"jobs_{name}.txt"
+    manifest.write_text(
+        "".join(f'"{d}" "{(outdir / (Path(d).stem + ".h5")).as_posix()}"\n'
+                for d in decks),
+        encoding="utf-8")
+    argv = ["--gpus", "0", "--procs-per-gpu", "1", "--batch-width", "4",
+            "--jobs", str(manifest), "--workdir", str(work / f"run_{name}"),
+            "--pin", "none", "--device-memory-gb", "96", "--claim", claim]
+    rc, seen, text = dispatch(argv + extra + ["--", sys.executable, FAKE])
+    return rc, seen, text, outdir
+
+
+DECKS = [f"d{i}.json" for i in range(6)]
+
+with tempfile.TemporaryDirectory() as tmp:
+    work = Path(tmp)
+
+    # --- 1.  the happy path: ONE image, three waves ------------------------
+    #
+    # `--claim 2` over six jobs is three chunks.  In the old shape that was
+    # three RASBERY images and three `outside_drive` payments (1.75-4.92 s
+    # each, GA evaluator plan Sec 2.3); here it must be ONE.  That inequality
+    # -- images < waves -- IS the work package, and it has to be readable off a
+    # receipt or nobody can tell whether it happened.
+    rc, seen, text, outdir = campaign(work, "happy", DECKS, extra=[])
+    proc = (seen.get("PROC") or [{}])[0]
+    total = (seen.get("TOTAL") or [{}])[0]
+    check(rc == 0, f"the evaluator campaign must finish clean (rc={rc})\n{text[-1200:]}")
+    check(proc.get("evaluator") is True,
+          "[PROC].evaluator must say which shape ran; a throughput number whose "
+          "worker shape is unknown belongs in neither column")
+    check(proc.get("waves") == 3,
+          f"three claimed chunks must be three WAVES: waves={proc.get('waves')}")
+    check(proc.get("processes") == 1,
+          f"three waves must cost ONE process image: processes={proc.get('processes')}. "
+          "If this ever equals `waves` the dispatcher went back to spawning per chunk "
+          "and the whole work package is undone while every other number stays right")
+    check(total.get("images") == 1 and total.get("waves") == 3,
+          f"[TOTAL] must report images and waves apart: {total.get('images')!r} / "
+          f"{total.get('waves')!r}")
+    check(total.get("worker_shape") == "evaluator",
+          f"[TOTAL].worker_shape={total.get('worker_shape')!r}")
+    check((total.get("evaluator_totals") or {}).get("xslib_loads") == 1,
+          f"the library must be parsed ONCE for the whole worker, not once per wave: "
+          f"xslib_loads={(total.get('evaluator_totals') or {}).get('xslib_loads')!r}. "
+          "This is the field plan WP8 names as the witness that the process-lifetime "
+          "half was not torn down between waves")
+    check(sorted(q.name for q in outdir.glob("*.h5")) ==
+          [f"d{i}.h5" for i in range(6)],
+          "every job must have produced its output")
+    check(not proc.get("fatal_waves") and not proc.get("failed_cases"),
+          f"a clean campaign must report no fatal wave and no failed case: "
+          f"{proc.get('fatal_waves')!r} {proc.get('failed_cases')!r}")
+
+    # NEGATIVE CONTROL for the same check: --no-evaluator is the old shape, and
+    # there images == waves.  If that stops being true the two arms have stopped
+    # being different and check 1 above is passing vacuously.
+    rc, seen, text, outdir = campaign(work, "chunked", DECKS, extra=["--no-evaluator"])
+    proc = (seen.get("PROC") or [{}])[0]
+    total = (seen.get("TOTAL") or [{}])[0]
+    check(rc == 0, f"the chunked control must finish clean (rc={rc})\n{text[-1200:]}")
+    check(proc.get("evaluator") is False and total.get("worker_shape") == "chunked",
+          "--no-evaluator must be recorded as the shape that ran")
+    check(proc.get("processes") == 3 and proc.get("waves") == 3,
+          f"negative control: in the chunked shape every wave IS an image "
+          f"({proc.get('processes')} vs {proc.get('waves')}) -- if these differ the "
+          "control is not measuring the old shape")
+    check(sorted(q.name for q in outdir.glob("*.h5")) == [f"d{i}.h5" for i in range(6)],
+          "the chunked control must produce the same outputs")
+
+    # --- 2.  one case fails; the PROCESS survives --------------------------
+    #
+    # This is the isolation EvaluatorServer::runOneCase already provides, seen
+    # from the dispatcher: `d3` reports `failed`, nothing is re-queued, no
+    # restart happens, and the other five still produce outputs.  The campaign
+    # still fails -- a generation that quietly lost a candidate is not a
+    # generation -- but it fails by NAME.
+    rc, seen, text, outdir = campaign(
+        work, "casefail", DECKS, extra=["--set", "FAKE_RASBERY_FAIL=d3"])
+    proc = (seen.get("PROC") or [{}])[0]
+    check(rc != 0, "a failed case must fail the campaign")
+    check(proc.get("restarts") == 0 and proc.get("processes") == 1,
+          f"a CASE failure must not replace the worker: restarts="
+          f"{proc.get('restarts')!r} processes={proc.get('processes')!r}. Restarting on "
+          "a case that merely threw would pay a process stand-up for every bad "
+          "candidate a GA generates")
+    check(proc.get("failed_cases") == ["d3.json"],
+          f"the failed case must be named: {proc.get('failed_cases')!r}")
+    check(not proc.get("fatal_waves"),
+          "a case failure is not a fatal wave; conflating them makes the FATAL "
+          "receipt useless for finding the deaths it is for")
+    survived = sorted(q.name for q in outdir.glob("*.h5"))
+    check(survived == [f"d{i}.h5" for i in range(6) if i != 3],
+          f"every OTHER case must still have produced its output: {survived}")
+
+    # --- 3.  the worker DIES mid-wave: restart, re-queue once, finish ------
+    #
+    # The poison kills the child at `d2` on the FIRST image only (the marker
+    # file spends it), so this drives the whole path: the wave dies after d0/d1
+    # have printed receipts, the dispatcher notices EOF, names the cases nobody
+    # accounted for, starts a fresh child and re-runs exactly those.
+    marker = work / "poison.marker"
+    rc, seen, text, outdir = campaign(
+        work, "fatal", DECKS, claim="all",
+        extra=["--set", "FAKE_RASBERY_POISON=d2",
+               "--set", f"FAKE_RASBERY_POISON_MARKER={marker}"])
+    proc = (seen.get("PROC") or [{}])[0]
+    total = (seen.get("TOTAL") or [{}])[0]
+    fatal = proc.get("fatal_waves") or []
+    check(rc != 0, "a worker that died must fail the campaign, however well it recovered")
+    check(len(fatal) == 1, f"exactly one fatal wave must be recorded: {fatal!r}")
+    if fatal:
+        check(fatal[0].get("completed") == 2,
+              f"the cases that printed a receipt before the death are ACCOUNTED FOR: "
+              f"completed={fatal[0].get('completed')!r} (expected d0, d1)")
+        check(fatal[0].get("unfinished") == ["d2.json", "d3.json", "d4.json", "d5.json"],
+              f"the cases nobody accounted for must be named, in order: "
+              f"{fatal[0].get('unfinished')!r}. A death that is reported as a count "
+              "and not as a list leaves the operator diffing a manifest against a "
+              "directory")
+        check(fatal[0].get("requeued") is True,
+              "the remainder of a dead wave must be re-queued once")
+    check(proc.get("restarts") == 1 and proc.get("processes") == 2,
+          f"the dead worker must be REPLACED, exactly once here: restarts="
+          f"{proc.get('restarts')!r} processes={proc.get('processes')!r}")
+    check(sorted(q.name for q in outdir.glob("*.h5")) == [f"d{i}.h5" for i in range(6)],
+          "after the restart and the re-queue every case must have run: the point of "
+          "re-queueing is that a dead process costs a wave, not a generation")
+    check(total.get("evaluator_restarts") == 1 and total.get("fatal_waves") == 1,
+          f"the campaign receipt must carry the deaths: {total.get('evaluator_restarts')!r} "
+          f"{total.get('fatal_waves')!r}")
+
+    # --- 4.  NEGATIVE CONTROL: it dies again on the retry ------------------
+    #
+    # No marker, so the poison is permanent.  The re-queue is spent, and the
+    # rule is that the still-unaccounted cases are REPORTED FAILED BY NAME and
+    # the dispatcher stops.  A retry loop with no bound would turn one poisoned
+    # candidate into a hung campaign, which is worse than a failed one.
+    rc, seen, text, outdir = campaign(
+        work, "poison", DECKS, claim="all",
+        extra=["--set", "FAKE_RASBERY_POISON=d2"])
+    proc = (seen.get("PROC") or [{}])[0]
+    check(rc != 0, "a chunk that kills two children must fail the campaign")
+    check(len(proc.get("fatal_waves") or []) == 2,
+          f"two deaths, two FATAL records: {proc.get('fatal_waves')!r}")
+    check(proc.get("failed_cases") == ["d2.json", "d3.json", "d4.json", "d5.json"],
+          f"once the re-queue is spent every case still unaccounted for must be "
+          f"reported failed BY NAME: {proc.get('failed_cases')!r}")
+    check("never evaluated" in text and "[MULTI_GPU][FAIL]" in text,
+          "the failure must reach the operator as a [FAIL] line, not only as a "
+          "receipt field: a campaign that lost four candidates has to say so where "
+          "an operator is looking")
+    check(proc.get("restarts") <= 2,
+          f"the retry is ONCE, not until it works: restarts={proc.get('restarts')!r}")
+    survived = sorted(q.name for q in outdir.glob("*.h5"))
+    check(survived == ["d0.h5", "d1.h5"],
+          f"only the cases that ran before the first death may have outputs: {survived}")
+
+    # --- 5.  NEGATIVE CONTROL: no restart budget ---------------------------
+    #
+    # `--evaluator-max-restarts 0` is the arm that says "do not replace a dead
+    # worker".  The dispatcher must then STOP CLAIMING rather than keep sending
+    # waves into a closed pipe: what is left in the queue is better stolen by a
+    # worker that still has a process.
+    rc, seen, text, outdir = campaign(
+        work, "norestart", DECKS, claim="2",
+        extra=["--set", "FAKE_RASBERY_POISON=d2", "--evaluator-max-restarts", "0"])
+    proc = (seen.get("PROC") or [{}])[0]
+    check(rc != 0, "a death with no restart budget must fail the campaign")
+    check(proc.get("restarts") == 0 and proc.get("processes") == 1,
+          f"--evaluator-max-restarts 0 must start no replacement: restarts="
+          f"{proc.get('restarts')!r} processes={proc.get('processes')!r}")
+    check(proc.get("waves") == 2,
+          f"the worker must stop claiming after the death it cannot recover from "
+          f"(waves={proc.get('waves')!r} of the three chunks the queue holds)")
+
+    # --- 6.  a child that never becomes usable -----------------------------
+    #
+    # Not the same failure as a death mid-wave: nothing ran, so nothing is
+    # accounted for, and the message has to point at the log rather than at a
+    # case.
+    rc, seen, text, outdir = campaign(
+        work, "noready", DECKS, extra=["--set", "FAKE_RASBERY_NO_READY=1"])
+    proc = (seen.get("PROC") or [{}])[0]
+    check(rc != 0, "an evaluator that never reached [READY] must fail the campaign")
+    check("never reached [READY]" in text,
+          "the refusal must say the child never became usable, and where its log is")
+    check(not list(outdir.glob("*.h5")),
+          "a child that never started must have produced nothing")
+
+
 if failures:
     raise SystemExit("multi-gpu dispatch: FAIL\n  " + "\n  ".join(failures))
 print("multi-gpu dispatch: PASS")

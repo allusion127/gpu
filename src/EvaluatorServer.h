@@ -706,6 +706,33 @@ private:
              << "\",\"process_reused\":" << (_summary.generations > 0 ? "true" : "false")
              << "}" << std::endl;
 
+        // THE SAME [BATCH_HOST] RECEIPT THE BATCH BRANCH PRINTS (main.cpp:1118),
+        // with the same fields and the same meaning -- printed PER WAVE, because
+        // a wave is what the batch branch calls a process.
+        //
+        // WHY IT IS HERE AND NOT ONLY IN WAVE_START.  The launchers' post-run
+        // audit (run_single_gpu_batch.check_run_receipts) reads exactly this tag
+        // to answer "did the multi-instance batch branch actually run, and with
+        // the host_threads that were asked for".  Without it, every wave a
+        // dispatcher sends through an evaluator would be audited as "the batch
+        // branch never ran", and the honest fix is not to weaken the audit for
+        // one mode -- it is for this mode to print the receipt the audit is
+        // about.  `legacy_pinning_criterion` follows main.cpp's rule verbatim:
+        // workers are recycled onto later decks whenever there are fewer of them
+        // than decks.
+        {
+            const bool host_pinning = rasberyHostPinningMode() != HostPinningMode::Off;
+            _out << "[RASBERY][BATCH_HOST] {\"jobs\":" << njobs
+                 << ",\"arena_width\":" << width
+                 << ",\"host_threads\":" << host_threads
+                 << ",\"visible_cpus\":" << _options.visible_cpus
+                 << ",\"host_pinning\":" << (host_pinning ? "true" : "false")
+                 << ",\"pin_lease\":true"
+                 << ",\"legacy_pinning_criterion\":"
+                 << (host_threads >= njobs ? "true" : "false")
+                 << ",\"wave_id\":" << wave.wave_id << "}" << std::endl;
+        }
+
         const auto wave_start = std::chrono::steady_clock::now();
         refill::ledger().begin(njobs, width, host_threads);
 

@@ -448,54 +448,16 @@ with tempfile.TemporaryDirectory() as tmp:
 # printed, the result file was saved, and no MPS daemon was started.  Which K
 # won is NOT asserted: on a shared host that would be a flake dressed as a
 # contract.
-FAKE_CHILD = '''
-import json, os, shlex, sys
-from pathlib import Path
-argv = sys.argv[1:]
-manifest = Path(argv[argv.index("--jobs") + 1])
-width = int(argv[argv.index("--batch-mode") + 1])
-jobs = [shlex.split(l) for l in manifest.read_text().splitlines() if l.strip()]
-n = len(jobs)
-host = int(os.environ.get("RASBERY_BATCH_HOST_THREADS", width))
-for fields in jobs:
-    out = Path(fields[1])
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text("fake")
-# The receipt is DERIVED from this child's own environment, exactly the way
-# src/RunContract.h derives it -- so the end-to-end run is a real parity check
-# between what the harness declares and what a binary reading the same
-# environment would print.  A fake that always said `strict` would hide the
-# defect: DEFAULT_ENV is the A2 arm.
-def mult(name):
-    try:
-        m = float(os.environ.get(name, "1"))
-    except ValueError:
-        m = 1.0
-    return m if m >= 1.0 else 1.0
-if int(os.environ.get("RASBERY_GA_FEEDBACK_PASSES") or 0) > 0:
-    policy, fidelity = "feedback_limited", "feedback_limited"
-elif mult("RASBERY_STAGED_FLUX_TOL") > 1.0 or mult("RASBERY_STAGED_XE_TOL") > 1.0:
-    policy, fidelity = "A2", "staged_a2"
-else:
-    policy, fidelity = "strict", "full_exact"
-print('[RASBERY][IO_WRITER] {"mode":"thread","mode_source":"default","queue_limit":8}')
-print("[RASBERY][PHYSICS_MODE] " + json.dumps({
-    "physics_mode": "full_exact_nodal", "screening": False, "feedback_pass_limit": 0,
-    "full_hdf5": True, "physics_fidelity": fidelity, "policy": policy,
-    "acceptance_eligible": policy == "strict", "requires_exact_rerun": False,
-    "result_mode": "full", "fidelity_declared": None, "gpu_full": False}))
-print("[RASBERY][BATCH_HOST] " + json.dumps({"host_threads": min(host, width, n)}))
-print("[RASBERY][CUDA][BATCH_OCCUPANCY] " + json.dumps(
-    {"launches": 10, "instance_solves": 10 * min(n, width), "slots": width}))
-print("[RASBERY][REFILL] " + json.dumps(
-    {"refills": 0, "tail_idle_s": 0.25, "duplicates": 0, "stale_tenants": 0,
-     "double_releases": 0, "slot_busy_fraction": 0.9}))
-'''
+# THE FAKE IS SHARED WITH tools/test_multi_gpu_dispatch.py (WP8 stage 1.5).
+# It speaks BOTH child shapes -- `--jobs` chunks and `--evaluator-jsonl` waves --
+# off one body of receipt-printing code, because the claim the dispatcher makes
+# is that the two are audited identically.  Two fakes that drifted would let one
+# mode pass against receipts the other never prints.
+FAKE_CHILD_PATH = str((root / "tools" / "fake_rasbery_child.py").resolve())
 
 with tempfile.TemporaryDirectory() as tmp:
     work = Path(tmp)
-    child = work / "fake_rasbery.py"
-    child.write_text(FAKE_CHILD, encoding="utf-8")
+    child = Path(FAKE_CHILD_PATH)
     outdir = work / "prod"
     outdir.mkdir()
     manifest = work / "jobs.txt"
@@ -604,8 +566,7 @@ with tempfile.TemporaryDirectory() as tmp:
 # strict over the A2 environment (must fail, loudly).
 with tempfile.TemporaryDirectory() as tmp:
     work = Path(tmp)
-    child = work / "fake_rasbery.py"
-    child.write_text(FAKE_CHILD, encoding="utf-8")
+    child = Path(FAKE_CHILD_PATH)
     import contextlib  # noqa: E402
     import io  # noqa: E402
 
@@ -686,6 +647,82 @@ check("mps.stop()" in source and source.count("finally:") >= 2,
       "the production wave's")
 check('"[RASBERY][MULTI_GPU][TUNE]' in source or "MULTI_GPU][TUNE]" in source,
       "the tuner must print a [MULTI_GPU][TUNE] receipt")
+
+# ===========================================================================
+# 13.  The calibration runs through EVALUATORS when the campaign will (WP8 1.5)
+# ===========================================================================
+#
+# A K measured against per-chunk process images is not a measurement of a
+# campaign that will not pay them.  The per-process fixed cost is exactly what
+# the K split multiplies -- 2.56 GB of VRAM and 1.75-4.92 s of `outside_drive`
+# EACH -- so a candidate that pays it once per worker sits at a different knee
+# from one that pays it once per chunk.  If the tuner ever calibrates in one
+# shape and runs in the other, its answer is about a configuration nobody ran.
+check("evaluator=args.evaluator" in source,
+      "the calibration waves must inherit the campaign's --evaluator/--no-evaluator "
+      "shape, or the K is chosen from waves of a different shape than the campaign")
+check(source.count("evaluator=args.evaluator") >= 2,
+      "BOTH the calibration wave and the production wave must pass the shape through: "
+      f"found {source.count('evaluator=args.evaluator')} site(s)")
+
+
+# ===========================================================================
+# 14.  End-to-end calibration in BOTH worker shapes
+# ===========================================================================
+#
+# Same fake, same jobs, same invariants -- and the receipt has to say which
+# shape it measured.  What is NOT asserted is that one shape is faster: with a
+# millisecond-long fake child that would be a flake, and the real number is a
+# 238 number (docs/WP8_EVALUATOR_STAGE2 Sec 4).
+for shape, extra in (("evaluator", []), ("chunked", ["--no-evaluator"])):
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        outdir = work / "prod"
+        outdir.mkdir()
+        jobs_file = work / "jobs.txt"
+        jobs_file.write_text(
+            "".join(f'"d{i}.json" "{(outdir / f"case{i}.h5").as_posix()}"\n'
+                    for i in range(6)),
+            encoding="utf-8")
+        import contextlib  # noqa: E402
+        import io  # noqa: E402
+
+        buffer = io.StringIO()
+        errors = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(errors):
+            rc = mg.main(["--gpus", "0", "--procs-per-gpu", "auto", "--total-width", "4",
+                          "--tune-candidates", "1,2", "--tune-jobs", "2",
+                          "--tune-budget-s", "120", "--jobs", str(jobs_file),
+                          "--workdir", str(work / "run"), "--pin", "none",
+                          "--device-memory-gb", "96", "--claim", "auto"]
+                         + extra + ["--", sys.executable, FAKE_CHILD_PATH])
+        out = buffer.getvalue() + errors.getvalue()
+        check(rc == 0, f"the {shape} calibration must finish (rc={rc})\n{out[-1500:]}")
+        totals = [json.loads(line.split("] ", 1)[1]) for line in out.splitlines()
+                  if line.startswith("[RASBERY][MULTI_GPU][TOTAL] ")]
+        check(len(totals) == 1, f"{shape}: one [TOTAL] receipt, got {len(totals)}")
+        if totals:
+            check(totals[0].get("worker_shape") == shape,
+                  f"[TOTAL].worker_shape must name the shape that was measured: "
+                  f"{totals[0].get('worker_shape')!r} for {shape}")
+            check(totals[0]["jobs"] == 6,
+                  f"{shape}: the campaign must still run every manifest job "
+                  f"({totals[0]['jobs']} of 6)")
+            if shape == "evaluator":
+                check(totals[0]["images"] <= totals[0]["waves"],
+                      "the evaluator must not start more images than it sent waves: "
+                      f"images={totals[0]['images']} waves={totals[0]['waves']}")
+                check((totals[0].get("evaluator_totals") or {}).get("xslib_loads"),
+                      "the campaign must report the fleet's xslib_loads: it is the "
+                      "field WP8 is judged on and it must not grow with the case count")
+            else:
+                check(totals[0]["images"] == totals[0]["waves"],
+                      "in --no-evaluator every wave IS a process image, and the "
+                      "receipt has to show that: "
+                      f"images={totals[0]['images']} waves={totals[0]['waves']}")
+        produced = sorted(q.name for q in outdir.glob("*.h5"))
+        check(produced == [f"case{i}.h5" for i in range(6)],
+              f"{shape}: every production output must exist, got {produced}")
 
 if failures:
     raise SystemExit("fleet tuner: FAIL\n  " + "\n  ".join(failures))

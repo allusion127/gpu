@@ -871,6 +871,285 @@ def auto_claim_size(*, index: int, processes: int, jobs: int, remaining: int,
     return max(1, min(halved, share))
 
 
+# ---------------------------------------------------------------------------
+# The persistent evaluator (WP8 stage 1.5)
+# ---------------------------------------------------------------------------
+#
+# WHAT CHANGES.  Nothing about what a case computes, and nothing about how the
+# queue is claimed.  What changes is WHAT A WORKER IS: it was a SEQUENCE of
+# RASBERY processes, one per claimed chunk; it becomes ONE long-lived
+# `RASBERY --evaluator-jsonl -` that is fed each chunk as a `wave` request on
+# stdin.  docs/WP8_EVALUATOR_STAGE1 Sec 0.1 is explicit about the size of that
+# lever and about what it is NOT: `outside_drive` (the process image, the
+# loader, CUDA context creation and CUDA teardown) is 1.75-4.92 s and is paid
+# ONCE PER PROCESS, so a worker that ran C chunks paid it C times and now pays
+# it once.  Per case it is 0 %.  The whole value is in how many process
+# boundaries a campaign crosses, and that count is what this converts from
+# "chunks" to "workers".
+#
+# WHY IT IS THE DEFAULT.  The chunked path pays a cost that buys nothing: the
+# arena stand-up, the graph capture and the 34 MB library parse are identical
+# across the chunks of ONE worker, and the process boundary between them exists
+# only because the launcher had no way to say "another wave, same process".
+# `--no-evaluator` keeps the old shape as a NAMED arm -- it is the wall control
+# the WP8 gate is measured against, and it is the fallback for a build with no
+# evaluator mode.
+#
+# WHAT IS STILL A PROCESS PROPERTY, AND THEREFORE NOW A WORKER PROPERTY.  The
+# fidelity ([RASBERY][PHYSICS_MODE], resolved once from the environment before
+# the first request), the arena WIDTH (one allocation, latched by the first
+# wave), the I/O writer mode and the host-pinning decision.  A campaign that
+# wanted two fidelities would need two evaluators, not two waves -- which is why
+# `--strict` and the declared-fidelity audit are unchanged here: they were
+# always per-process statements, and a worker is now a process.
+
+EVALUATOR_READY = re.compile(r"\[RASBERY\]\[EVALUATOR\]\[READY\]\s*(\{.*\})")
+EVALUATOR_WAVE_RECEIPT = re.compile(r"\[RASBERY\]\[EVALUATOR\]\[WAVE\]\s*(\{.*\})")
+EVALUATOR_CASE_RECEIPT = re.compile(r"\[RASBERY\]\[EVALUATOR\]\[CASE\]\s*(\{.*\})")
+EVALUATOR_REFUSED = re.compile(r"\[RASBERY\]\[EVALUATOR\]\[REFUSED\]\s*(\{.*\})")
+# `[EVALUATOR] {` with WHITESPACE after the tag -- the once-per-process receipt.
+# The wave/case/refused tags are each followed by `[`, so this cannot match one.
+EVALUATOR_PROCESS = re.compile(r"\[RASBERY\]\[EVALUATOR\]\s+(\{.*\})")
+
+
+def _json_or_none(text: str) -> dict | None:
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+@dataclass
+class WaveOutcome:
+    """One `wave` request and everything the evaluator said about it."""
+
+    text: str = ""
+    cases: list[dict] = field(default_factory=list)
+    receipt: dict | None = None
+    refused: list[dict] = field(default_factory=list)
+    #: False means the child did not survive the wave.  The cases it never
+    #: reported are the ones nobody can account for, and they are exactly what
+    #: gets re-queued once.
+    alive: bool = True
+    returncode: int | None = None
+
+
+class EvaluatorSession:
+    """One long-lived RASBERY evaluator, and its restarts.
+
+    The session owns the pipe protocol and NOTHING about the queue: it is handed
+    a manifest path and a wave id and returns what the evaluator said.  That
+    split is deliberate -- the chunk accounting, the receipt audit and the
+    re-queue decision stay in run_worker, where the chunked path already put
+    them, so both modes are audited by the same code and their numbers are
+    comparable.
+    """
+
+    def __init__(self, *, command: Sequence[str], env: dict[str, str], cwd: str | None,
+                 log_path: Path, max_restarts: int = 3) -> None:
+        self._command = list(command)
+        self._env = dict(env)
+        self._cwd = cwd
+        self.log_path = log_path
+        self.max_restarts = max(0, int(max_restarts))
+        self._proc: subprocess.Popen | None = None
+        self._sink = open(log_path, "w", encoding="utf-8", newline="\n")  # noqa: SIM115
+        #: Everything the CURRENT child printed before it was ready for work --
+        #: [PHYSICS_MODE], [IO_WRITER], [GPU_FULL] and friends.  The per-wave
+        #: audit needs it: those receipts are printed ONCE PER PROCESS, so a
+        #: wave slice on its own would read as a run that declared no fidelity.
+        self.preamble = ""
+        self.epilogue = ""
+        self.starts = 0
+        self.restarts = 0
+        self.returncode: int | None = None
+        self.process_receipts: list[dict] = []
+        self.ready_receipts: list[dict] = []
+
+    # -- lifecycle ---------------------------------------------------------
+    @property
+    def alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def start(self) -> bool:
+        """Stand a child up and read it to its [READY] line.  False if it died."""
+        self._note("start", {"command": list(self._command), "attempt": self.starts + 1})
+        try:
+            self._proc = subprocess.Popen(  # noqa: S603
+                self._command, env=self._env, cwd=self._cwd,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, bufsize=1,
+            )
+        except OSError as exc:
+            self._proc = None
+            self.returncode = 127
+            self._note("start_failed", {"error": str(exc)})
+            return False
+        self.starts += 1
+        text, died = self._pump(lambda line: EVALUATOR_READY.search(line) is not None)
+        self.preamble = text
+        for match in EVALUATOR_READY.finditer(text):
+            receipt = _json_or_none(match.group(1))
+            if receipt is not None:
+                self.ready_receipts.append(receipt)
+        if died:
+            self._reap()
+            return False
+        return True
+
+    def restart(self) -> bool:
+        """Replace a dead child.  False when the restart budget is spent."""
+        self._reap()
+        if self.restarts >= self.max_restarts:
+            self._note("restart_refused", {"restarts": self.restarts,
+                                           "max_restarts": self.max_restarts})
+            return False
+        self.restarts += 1
+        return self.start()
+
+    def close(self) -> str:
+        """Shut the child down and read its teardown receipts to EOF.
+
+        The teardown receipts are the ONLY place [CUDA][BATCH_OCCUPANCY] and the
+        process-lifetime counters appear in this mode -- the arena is released
+        once, at shutdown, which is the whole point of the mode -- so a session
+        that was not closed has no width_fill and no xslib_loads to report.
+        """
+        if self.alive:
+            self._send('{"op":"shutdown"}')
+            try:
+                if self._proc is not None and self._proc.stdin is not None:
+                    self._proc.stdin.close()
+            except OSError:
+                pass
+            text, _died = self._pump(lambda _line: False)
+            self.epilogue += text
+            for match in EVALUATOR_PROCESS.finditer(text):
+                receipt = _json_or_none(match.group(1))
+                if receipt is not None:
+                    self.process_receipts.append(receipt)
+        self._reap()
+        try:
+            self._sink.close()
+        except OSError:
+            pass
+        return self.epilogue
+
+    # -- one wave ----------------------------------------------------------
+    def wave(self, *, wave_id: int, manifest: str,
+             result_mode: str | None = None) -> WaveOutcome:
+        out = WaveOutcome()
+        if not self.alive:
+            out.alive = False
+            out.returncode = self.returncode
+            return out
+        request: dict[str, object] = {"op": "wave", "wave_id": wave_id,
+                                      "jobs_manifest": manifest}
+        if result_mode:
+            request["result_mode"] = result_mode
+        if not self._send(json.dumps(request, separators=(",", ":"))):
+            out.text, _ = self._pump(lambda _line: False)
+            self._reap()
+            out.alive = False
+            out.returncode = self.returncode
+            return out
+
+        def done(line: str) -> bool:
+            match = EVALUATOR_WAVE_RECEIPT.search(line)
+            if match is not None:
+                receipt = _json_or_none(match.group(1))
+                # An unparseable receipt stops the read instead of hanging: a
+                # dispatcher that waits forever for a line it cannot recognise
+                # is worse than one that fails the chunk it could not read.
+                return receipt is None or receipt.get("wave_id") == wave_id
+            # A REFUSED wave never produces a WAVE receipt (EvaluatorServer.h
+            # returns before running one), so it is a stop condition too.
+            return EVALUATOR_REFUSED.search(line) is not None
+
+        text, died = self._pump(done)
+        out.text = text
+        for match in EVALUATOR_CASE_RECEIPT.finditer(text):
+            case = _json_or_none(match.group(1))
+            if case is not None and not case.get("isolation_check"):
+                out.cases.append(case)
+        for match in EVALUATOR_WAVE_RECEIPT.finditer(text):
+            receipt = _json_or_none(match.group(1))
+            if receipt is not None:
+                out.receipt = receipt
+        for match in EVALUATOR_REFUSED.finditer(text):
+            refused = _json_or_none(match.group(1))
+            out.refused.append(refused if refused is not None else {"what": match.group(1)})
+        if died:
+            self._reap()
+            out.alive = False
+            out.returncode = self.returncode
+        return out
+
+    # -- plumbing ----------------------------------------------------------
+    def _send(self, line: str) -> bool:
+        self._note("request", {"line": line})
+        try:
+            if self._proc is None or self._proc.stdin is None:
+                return False
+            self._proc.stdin.write(line + "\n")
+            self._proc.stdin.flush()
+        except (OSError, ValueError):
+            return False
+        return True
+
+    def _pump(self, done) -> tuple[str, bool]:
+        """Read child stdout until *done(line)* or EOF.  Returns (text, died).
+
+        EOF IS THE DEATH SIGNAL and it needs no timeout: the child's stdout is
+        this dispatcher's pipe, so a child that exits -- cleanly, by signal, or
+        by a CUDA abort -- closes it, and readline returns "".
+        """
+        chunks: list[str] = []
+        if self._proc is None or self._proc.stdout is None:
+            return "", True
+        while True:
+            line = self._proc.stdout.readline()
+            if line == "":
+                return "".join(chunks), True
+            chunks.append(line)
+            try:
+                self._sink.write(line)
+                self._sink.flush()
+            except OSError:
+                pass
+            if done(line):
+                return "".join(chunks), False
+
+    def _note(self, what: str, payload: dict) -> None:
+        """A dispatcher-side annotation in the worker log, tagged so it can
+        never be mistaken for one of the executable's own receipts."""
+        try:
+            self._sink.write("[RASBERY][MULTI_GPU][EVALUATOR][" + what.upper() + "] "
+                             + json.dumps(payload, separators=(",", ":"), default=str) + "\n")
+            self._sink.flush()
+        except OSError:
+            pass
+
+    def _reap(self) -> None:
+        proc = self._proc
+        self._proc = None
+        if proc is None:
+            return
+        for stream in (proc.stdin, proc.stdout):
+            try:
+                if stream is not None:
+                    stream.close()
+            except OSError:
+                pass
+        try:
+            self.returncode = proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:  # pragma: no cover - a wedged child
+            proc.kill()
+            self.returncode = proc.wait()
+        self._note("exit", {"returncode": self.returncode})
+
+
 @dataclass
 class WorkerResult:
     gpu: str
@@ -897,6 +1176,24 @@ class WorkerResult:
     # be labelled with the fidelity its cases were measured at.
     declared_fidelity: str = "strict"
     case_fidelity: list[dict] = field(default_factory=list)
+    # WP8 stage 1.5.  `processes` counts RASBERY IMAGES; `waves` counts claimed
+    # chunks.  In the chunked mode they are equal BY CONSTRUCTION, and that
+    # equality is exactly the cost the evaluator removes -- so they have to be
+    # counted apart, or the receipt cannot show the removal.
+    evaluator: bool = False
+    waves: int = 0
+    restarts: int = 0
+    #: The [RASBERY][EVALUATOR] process receipt(s) this worker's children
+    #: printed at shutdown: xslib_loads, cohort_builds/cohort_hits, the slot
+    #: tenancy counters, stop_reason.
+    evaluator_receipts: list[dict] = field(default_factory=list)
+    #: One entry per wave whose child DIED.  Names the cases nobody accounted
+    #: for, so a lost candidate is a line in a receipt instead of a silent gap
+    #: between the manifest and the outputs.
+    fatal_waves: list[dict] = field(default_factory=list)
+    #: Decks whose [EVALUATOR][CASE] receipt said `failed`, plus the ones no
+    #: receipt ever mentioned once the single re-queue was spent.
+    failed_cases: list[str] = field(default_factory=list)
 
     @property
     def fidelities(self) -> dict[str, int]:
@@ -945,6 +1242,147 @@ class WorkerResult:
     def cases_per_hour(self) -> float:
         return 3600.0 * self.jobs / self.wall_s if self.wall_s > 0 else 0.0
 
+    @property
+    def evaluator_totals(self) -> dict:
+        """The process receipts folded into one dict; {} in chunked mode.
+
+        SUMMED, not merged: a worker that was restarted has more than one
+        process receipt, and two images that each loaded the library really did
+        load it twice -- which is the whole point of watching `xslib_loads`.
+        `stop_reason` keeps the LAST child's word, because that is the one that
+        says how the worker ended.
+        """
+        if not self.evaluator_receipts:
+            return {}
+        summed = ("cases", "ok", "failed", "refused", "generations", "xslib_loads",
+                  "xslib_hits", "geometry_builds", "cohort_builds", "cohort_hits",
+                  "arena_releases", "arena_standups", "slot_admissions",
+                  "slot_duplicates", "slot_stale_tenants", "slot_double_releases",
+                  "isolation_checks", "isolation_mismatches")
+        out: dict = {}
+        for key in summed:
+            values = [r.get(key) for r in self.evaluator_receipts
+                      if isinstance(r.get(key), int)]
+            if values:
+                out[key] = sum(values)
+        out["images"] = len(self.evaluator_receipts)
+        out["stop_reason"] = self.evaluator_receipts[-1].get("stop_reason")
+        return out
+
+
+def _run_wave_chunk(
+    *,
+    session: EvaluatorSession,
+    result: WorkerResult,
+    chunk: Sequence[tuple[str, str, str]],
+    chunk_index: int,
+    manifest_arg: str,
+    workdir: Path,
+    stem: str,
+    gpu: str,
+    proc: int,
+) -> tuple[str, list[str]]:
+    """Send one claimed chunk to the persistent evaluator.  (text, problems).
+
+    FAILURE ISOLATION HAS TWO LAYERS AND THEY ARE NOT THE SAME LAYER.
+
+      * One case throwing is already isolated INSIDE the evaluator
+        (EvaluatorServer::runOneCase catches and reports), and arrives here as a
+        `[EVALUATOR][CASE]` line with `"status":"failed"`.  The process keeps
+        answering and this function does nothing special.
+      * The process DYING is the layer that only the dispatcher can handle: a
+        CUDA abort, an OOM kill, a fail-closed refusal that escaped.  Then the
+        cases that already printed a receipt are accounted for and the rest are
+        NOT, and neither the evaluator nor the queue knows which is which.
+
+    So the rule is: whatever printed a receipt is done; the remainder is
+    re-queued ONCE onto a fresh child, and if that dies too every case still
+    unaccounted for is REPORTED FAILED BY NAME.  Once, and not until it works:
+    a chunk that kills two children in a row is a chunk with a poisoned case in
+    it, and retrying it forever turns one bad candidate into a hung campaign.
+    """
+    problems: list[str] = []
+    texts: list[str] = []
+    pending = list(chunk)
+    manifest = manifest_arg
+    attempt = 0
+    while pending:
+        attempt += 1
+        # Unique per worker AND per attempt: the wave id is the sentinel this
+        # dispatcher reads its own reply on, so a repeated id after a restart
+        # would let a stale receipt end the wrong wait.
+        wave_id = chunk_index * 100 + attempt
+        outcome = session.wave(wave_id=wave_id, manifest=manifest)
+        texts.append(outcome.text)
+
+        done_keys: set[str] = set()
+        for case in outcome.cases:
+            done_keys.add(path_key(str(case.get("output", ""))))
+            if case.get("status") != "ok":
+                result.failed_cases.append(str(case.get("deck") or case.get("output")))
+        for refusal in outcome.refused:
+            problems.append(
+                "gpu%s p%d chunk%d: the evaluator REFUSED a wave: %s"
+                % (gpu, proc, chunk_index, refusal.get("what"))
+            )
+        unfinished = [job for job in pending if path_key(job[1]) not in done_keys]
+
+        if outcome.alive:
+            if unfinished:
+                # The child lived and still said nothing about these: a refused
+                # wave, or a receipt this dispatcher could not parse.  Either
+                # way they are not results.
+                problems.append(
+                    "gpu%s p%d chunk%d: the wave finished but %d case(s) got no "
+                    "[EVALUATOR][CASE] receipt: %s"
+                    % (gpu, proc, chunk_index, len(unfinished),
+                       ", ".join(job[0] for job in unfinished[:8]))
+                )
+                result.failed_cases.extend(job[0] for job in unfinished)
+            return "".join(texts), problems
+
+        record = {
+            "gpu": gpu, "proc": proc, "chunk": chunk_index, "attempt": attempt,
+            "wave_id": wave_id, "returncode": outcome.returncode,
+            "completed": len(done_keys),
+            "unfinished": [job[0] for job in unfinished],
+            "requeued": bool(unfinished) and attempt == 1,
+            "restarts": session.restarts,
+        }
+        result.fatal_waves.append(record)
+        print("[RASBERY][MULTI_GPU][EVALUATOR][FATAL] "
+              + json.dumps(record, separators=(",", ":")))
+        if result.returncode == 0:
+            result.returncode = outcome.returncode or 1
+
+        restarted = session.restart()
+        if not unfinished:
+            return "".join(texts), problems
+        if attempt >= 2 or not restarted:
+            problems.append(
+                "gpu%s p%d chunk%d: %d case(s) were never evaluated -- the worker died "
+                "%s and its %s: %s"
+                % (gpu, proc, chunk_index, len(unfinished),
+                   "twice" if attempt >= 2 else "and could not be restarted",
+                   "one re-queue is spent" if attempt >= 2 else "restart budget is spent",
+                   ", ".join(job[0] for job in unfinished[:8]))
+            )
+            result.failed_cases.extend(job[0] for job in unfinished)
+            return "".join(texts), problems
+
+        pending = unfinished
+        retry = workdir / f"{stem}.chunk{chunk_index:04d}.retry.txt"
+        retry.write_text(
+            "".join(
+                f'"{i}" "{o}"' + (f" {m}" if m else "") + "\n"
+                for i, o, m in pending
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+        manifest = str(retry.resolve())
+    return "".join(texts), problems
+
 
 def run_worker(
     *,
@@ -967,6 +1405,8 @@ def run_worker(
     declared_fidelity: str = "strict",
     unset: Sequence[str] = (),
     deadline: float | None = None,
+    evaluator: bool = True,
+    evaluator_max_restarts: int = 3,
 ) -> WorkerResult:
     """One process SEQUENCE: claim, run, repeat, on device *gpu* as slot *proc*.
 
@@ -975,6 +1415,14 @@ def run_worker(
     chunks and the cases/hour it reports is over work that actually finished.
     Killing a child mid-chunk would leave a half-written output and a claim that
     nobody completed, which is a worse thing to own than a slightly long wave.
+
+    *evaluator* (WP8 stage 1.5, the default) makes that sequence ONE process: a
+    persistent `--evaluator-jsonl -` child fed each claimed chunk as a `wave`
+    request.  EVERYTHING AFTER THE CHILD PRINTS ITS RECEIPTS IS UNCHANGED -- the
+    same audit, the same [PHYSICS_MODE] check, the same refill parsing -- because
+    the evaluator prints per wave the receipts the batch branch prints per
+    process.  What changes is the count of process images, which is the only
+    thing this lever touches (docs/WP8_EVALUATOR_STAGE1 Sec 0.1).
     """
     cpus = budget.cpu_sets[index] if budget.cpu_sets else []
     result = WorkerResult(
@@ -998,6 +1446,20 @@ def run_worker(
     # processes on one device, a name keyed only by the GPU would have two
     # workers overwrite each other's chunk manifest between write and exec.
     stem = f"gpu{gpu}.p{proc}"
+    env = launch_env(result.env, unset)
+    result.evaluator = bool(evaluator) and not dry_run
+    # Stood up LAZILY, at the first non-empty claim.  A worker with nothing to
+    # claim must start no process at all: at K > jobs that is the difference
+    # between "a worker that idled" and "a worker that measured its own startup
+    # and reported 0 cases/hour", which is the defect auto_claim_size() exists
+    # to prevent one layer up.
+    session: EvaluatorSession | None = None
+    evaluator_command = (
+        pin_prefix(budget, index)
+        + list(executable)
+        + ["--evaluator-jsonl", "-", "--batch-mode", str(batch_width)]
+        + (["--result", result_mode] if result_mode else [])
+    )
 
     while True:
         if deadline is not None and time.monotonic() >= deadline:
@@ -1040,8 +1502,6 @@ def run_worker(
             newline="\n",
         )
 
-        env = launch_env(result.env, unset)
-
         command = (
             pin_prefix(budget, index)
             + list(executable)
@@ -1056,25 +1516,65 @@ def run_worker(
         command[command.index("--jobs") + 1] = manifest_arg
 
         if dry_run:
+            shown = (evaluator_command + ["<<", f"wave:{manifest_arg}"]
+                     if evaluator else command)
             print(
                 f"[RASBERY][MULTI_GPU][DRY] gpu={gpu} proc={proc} jobs={end - start} "
-                + " ".join(command)
+                + " ".join(shown)
             )
             result.processes += 1
+            result.waves += 1
             result.jobs += end - start
             continue
 
-        with open(log, "w", encoding="utf-8") as sink:
-            child = subprocess.run(  # noqa: S603
-                command, env=env, cwd=str(cwd) if cwd else None,
-                stdout=sink, stderr=subprocess.STDOUT, check=False,
+        # `audit_text` is what check_run_receipts sees; `text` is what the
+        # per-wave counters are read from.  They differ in ONE mode and for one
+        # reason: [PHYSICS_MODE] and the other declaration receipts are printed
+        # ONCE PER PROCESS, before the first request, so a wave slice on its own
+        # would be audited as a run that declared no fidelity at all.  Fidelity
+        # is a process property (docs/WP8_EVALUATOR_STAGE1 Sec 8.3); the audit
+        # has to read it where the process states it.
+        if evaluator:
+            if session is None:
+                session = EvaluatorSession(
+                    command=evaluator_command, env=env,
+                    cwd=str(cwd) if cwd else None,
+                    log_path=workdir / f"{stem}.evaluator.log",
+                    max_restarts=evaluator_max_restarts,
+                )
+                if not session.start():
+                    result.problems.append(
+                        "gpu%s p%d: the evaluator never reached [READY] (rc=%r); see %s"
+                        % (gpu, proc, session.returncode, session.log_path)
+                    )
+                    if result.returncode == 0:
+                        result.returncode = session.returncode or 1
+                    result.jobs += end - start
+                    result.failed_cases.extend(job[0] for job in jobs[start:end])
+                    break
+            text, wave_problems = _run_wave_chunk(
+                session=session, result=result, chunk=jobs[start:end],
+                chunk_index=chunk_index, manifest_arg=manifest_arg,
+                workdir=workdir, stem=stem, gpu=gpu, proc=proc,
             )
-        text = log.read_text(encoding="utf-8", errors="replace")
+            result.problems.extend(wave_problems)
+            result.processes = session.starts
+            result.restarts = session.restarts
+            audit_text = session.preamble + text
+        else:
+            with open(log, "w", encoding="utf-8") as sink:
+                child = subprocess.run(  # noqa: S603
+                    command, env=env, cwd=str(cwd) if cwd else None,
+                    stdout=sink, stderr=subprocess.STDOUT, check=False,
+                )
+            text = log.read_text(encoding="utf-8", errors="replace")
+            result.processes += 1
+            if child.returncode != 0 and result.returncode == 0:
+                result.returncode = child.returncode
+            audit_text = text
 
-        result.processes += 1
+        result.waves += 1
         result.jobs += end - start
-        if child.returncode != 0 and result.returncode == 0:
-            result.returncode = child.returncode
         result.fail_lines += len(FAIL_LINE.findall(text))
         # Same audit the single-GPU harness applies: a run whose physics-mode
         # receipt is not full-exact, or that fell back off a captured graph, is
@@ -1095,7 +1595,8 @@ def run_worker(
             declared_fidelity=declared_fidelity,
         )
         result.problems.extend(
-            f"gpu{gpu} p{proc} chunk{chunk_index}: {p}" for p in check_run_receipts(text, plan)
+            f"gpu{gpu} p{proc} chunk{chunk_index}: {p}"
+            for p in check_run_receipts(audit_text, plan)
         )
         # Per case, in the sense the receipt allows: [PHYSICS_MODE] is printed
         # once per process before any deck starts, so a chunk is the finest
@@ -1104,8 +1605,14 @@ def run_worker(
         result.case_fidelity.append({
             "chunk": chunk_index,
             "jobs": end - start,
-            "policy": receipt_policy(text),
+            # In evaluator mode this reads the PROCESS's declaration, which is
+            # the finest grain that exists there too -- one evaluator cannot mix
+            # strict and A2 (EvaluatorServer.h refuses a wave that asks for a
+            # fidelity the process did not resolve), so a wave inherits its
+            # worker's word and the label stays true per case.
+            "policy": receipt_policy(audit_text),
             "result_mode": plan.result_mode,
+            "scope": "process" if evaluator else "chunk",
         })
         for match in REFILL_RECEIPT.finditer(text):
             try:
@@ -1122,6 +1629,42 @@ def run_worker(
 
         if claim == "all":
             break
+        if evaluator and session is not None and not session.alive:
+            # Dead and out of restarts: stop claiming.  What is left in the
+            # queue is better stolen by a worker that still has a process than
+            # claimed by one that would fail it.
+            break
+
+    # THE TEARDOWN RECEIPTS ARE ONLY HERE.  The arena is released once, at
+    # shutdown -- that IS the mode -- so [CUDA][BATCH_OCCUPANCY], the tenancy
+    # counters, [XSLIB_CACHE] and the [EVALUATOR] process receipt arrive after
+    # the last wave and nowhere else.  A session that was not closed reports no
+    # width_fill, which would silently read as "the arena never gathered".
+    if session is not None:
+        epilogue = session.close()
+        result.processes = session.starts
+        result.restarts = session.restarts
+        result.evaluator_receipts = list(session.process_receipts)
+        if session.returncode not in (0, None) and result.returncode == 0:
+            result.returncode = session.returncode
+        result.fail_lines += len(FAIL_LINE.findall(epilogue))
+        for match in REFILL_RECEIPT.finditer(epilogue):
+            try:
+                result.refill_receipts.append(json.loads(match.group(1)))
+            except ValueError:
+                result.problems.append(
+                    f"gpu{gpu} p{proc}: unparseable REFILL receipt at shutdown")
+        for match in OCCUPANCY_RECEIPT.finditer(epilogue):
+            try:
+                result.occupancy_receipts.append(json.loads(match.group(1)))
+            except ValueError:
+                pass
+        if result.failed_cases:
+            result.problems.append(
+                "gpu%s p%d: %d case(s) did not produce a result: %s"
+                % (gpu, proc, len(result.failed_cases),
+                   ", ".join(result.failed_cases[:8]))
+            )
 
     result.wall_s = time.monotonic() - started
     return result
@@ -1497,6 +2040,14 @@ def _measure_candidate(
             pin_omp=args.pin_omp, dry_run=args.dry_run,
             declared_fidelity=declared_fidelity, unset=unset,
             deadline=time.monotonic() + max(1.0, float(args.tune_budget_s)),
+            # THE CALIBRATION RUNS THROUGH EVALUATORS TOO when the campaign will.
+            # A K measured against per-chunk process images is not a measurement
+            # of the campaign that will not pay them: the per-process fixed cost
+            # is what the split multiplies (VRAM_GB_PER_EXTRA_PROCESS above), and
+            # a candidate that pays it once per worker sits at a different knee
+            # from one that pays it once per chunk.
+            evaluator=args.evaluator,
+            evaluator_max_restarts=args.evaluator_max_restarts,
         )
         if len(workers) == 1:
             gpu, proc, index = workers[0]
@@ -1863,6 +2414,30 @@ def parser() -> argparse.ArgumentParser:
         "predicting happens at arena stand-up, after the queue has been claimed",
     )
 
+    ev = p.add_argument_group(
+        "persistent evaluator (WP8 stage 1.5)",
+        "A worker is ONE long-lived `RASBERY --evaluator-jsonl -` fed a `wave` per "
+        "claimed chunk, instead of one RASBERY process per chunk. Nothing about the "
+        "physics, the queue or the audit changes -- only how many process images a "
+        "campaign pays for. Measured cost of an image: 1.75-4.92 s of `outside_drive` "
+        "(docs/WP8_EVALUATOR_STAGE1 Sec 0.1).",
+    )
+    ev.add_argument(
+        "--no-evaluator", dest="evaluator", action="store_false",
+        help="run the OLD shape: one `--jobs` process per claimed chunk. This is the "
+        "wall control the evaluator is measured against, and the fallback for a "
+        "build with no --evaluator-jsonl mode",
+    )
+    ev.add_argument(
+        "--evaluator-max-restarts", type=int, default=3, metavar="N",
+        help="how many times a worker's evaluator may be replaced after it DIES "
+        "(a CUDA abort, an OOM kill). The cases of the dead wave that already "
+        "printed a receipt are kept; the rest are re-queued ONCE onto the fresh "
+        "child and, if that dies too, reported failed BY NAME. 0 disables "
+        "replacement: the worker stops claiming and the queue is left to the others",
+    )
+    p.set_defaults(evaluator=True)
+
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("command", nargs=argparse.REMAINDER, help="RASBERY executable, preceded by --")
     return p
@@ -1929,6 +2504,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     if args.mps_optional and not args.mps:
         print("error: --mps-optional means nothing without --mps", file=sys.stderr)
+        return 2
+    if args.evaluator_max_restarts < 0:
+        print("error: --evaluator-max-restarts must be >= 0", file=sys.stderr)
         return 2
 
     gpus = [g.strip() for g in args.gpus.split(",") if g.strip()]
@@ -2126,6 +2704,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "procs_policy": ("tuned" if tune_receipt else "explicit"),
                 "pin": budget.pin,
                 "pin_omp": bool(args.pin_omp),
+                # WP8 stage 1.5.  `worker_shape` is the one word that says how
+                # many process images this campaign will pay for: `evaluator`
+                # is one per worker, `chunked` is one per claimed chunk.
+                "worker_shape": "evaluator" if args.evaluator else "chunked",
+                "evaluator_max_restarts": args.evaluator_max_restarts,
                 # The word every chunk's receipt will be audited against, and
                 # the label this campaign's throughput row has to carry.
                 "declared_fidelity": declared_fidelity,
@@ -2250,6 +2833,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             workdir=workdir, cwd=cwd, overrides=overrides, extra_env=extra_env,
             pin_omp=args.pin_omp, dry_run=args.dry_run,
             declared_fidelity=declared_fidelity, unset=unset,
+            evaluator=args.evaluator,
+            evaluator_max_restarts=args.evaluator_max_restarts,
         )
         if len(workers) == 1:
             # One process: run it inline so the operator sees the failure
@@ -2293,6 +2878,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "proc": r.proc,
                     "cpus": r.cpus,
                     "processes": r.processes,
+                    # WP8 stage 1.5: images vs chunks.  In `--no-evaluator` these
+                    # two are equal; the gap between them IS what the mode bought.
+                    "waves": r.waves,
+                    "evaluator": r.evaluator,
+                    "restarts": r.restarts,
+                    "evaluator_totals": r.evaluator_totals,
+                    "fatal_waves": r.fatal_waves,
+                    "failed_cases": r.failed_cases,
                     "jobs": r.jobs,
                     "wall_s": round(r.wall_s, 3),
                     "cases_per_hour": round(r.cases_per_hour, 1),
@@ -2362,6 +2955,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"tenancy audit: duplicates={duplicates} stale_tenants={stale} (both must be 0)"
         )
 
+    # The WP8 acceptance counters, aggregated for the same reason the tenancy
+    # ones are: the gate is "across the campaign", not "in the receipt somebody
+    # happened to read".  `xslib_loads` must track the number of distinct
+    # library CONTENTS the fleet saw and NOT the case count; `cohort_builds` is
+    # stage 2's equivalent for geometry.
+    evaluator_totals: dict[str, int] = {}
+    for r in results:
+        for key, value in r.evaluator_totals.items():
+            if isinstance(value, int):
+                evaluator_totals[key] = evaluator_totals.get(key, 0) + value
+    for key in ("slot_duplicates", "slot_stale_tenants", "slot_double_releases",
+                "isolation_mismatches"):
+        if evaluator_totals.get(key):
+            problems.append(
+                f"evaluator audit: {key}={evaluator_totals[key]} (must be 0)")
+
     all_widths = [r.mean_width for r in results if r.mean_width > 0]
     all_fills = [r.width_fill for r in results if r.width_fill > 0]
     # One count for the whole campaign, so the row this run becomes in a table
@@ -2379,6 +2988,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "gpus": len(gpus),
                 "procs_per_gpu": budget.procs_per_gpu,
                 "processes": len(workers),
+                # Images actually started, against waves actually sent.  With
+                # `--no-evaluator` they are equal and the ratio is 1; with the
+                # evaluator the ratio is the number of process stand-ups this
+                # campaign did NOT pay for, which is the whole WP8 lever.
+                "images": sum(r.processes for r in results),
+                "waves": sum(r.waves for r in results),
+                "worker_shape": "evaluator" if args.evaluator else "chunked",
+                "evaluator_restarts": sum(r.restarts for r in results),
+                "fatal_waves": sum(len(r.fatal_waves) for r in results),
+                "failed_cases": sum(len(r.failed_cases) for r in results),
                 "batch_width": args.batch_width,
                 "jobs": total_jobs,
                 "wall_s": round(wall, 3),
@@ -2396,6 +3015,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "mps_thread_percent": mps.thread_percent if mps_active else None,
                 "duplicates": duplicates,
                 "stale_tenants": stale,
+                "evaluator_totals": evaluator_totals,
                 # The tuner's footprint, kept OUT of `jobs`: the calibration
                 # re-ran a subset of the manifest out of band, so counting it
                 # here would make the campaign's throughput a function of how
