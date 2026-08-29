@@ -123,25 +123,75 @@ if adopt and re.search(r"cudaFree|cudaMalloc", adopt):
     problems.append("adoptCanonicalBuffers: must not allocate or free -- it borrows")
 
 # --- 3. the graph key --------------------------------------------------------
-for key in ("g_key_canon_jnet", "g_key_canon_flux", "g_key_canon_phis",
-            "g_key_materialize"):
-    want(CU_CODE, key, "CudaXsReconBackend.cu",
-         "the borrowed pointers and the materialize mask are baked into the nodal "
-         "capture, so they must be part of its key")
-key_ok = CU_CODE[CU_CODE.find("const bool key_ok"):]
-key_ok = key_ok[:key_ok.find(";")]
-for key in ("g_key_canon_jnet", "g_key_canon_flux", "g_key_canon_phis",
-            "g_key_materialize"):
-    if key not in key_ok:
-        problems.append(f"the nodal graph key_ok test does not compare {key}; a stale "
-                        "capture would move the wrong bytes, or none")
-# Changing either must drop the graph at the moment of the decision.
-for fn, what in (("adoptCanonicalBuffers", "the borrowed pointers"),
-                 ("setMaterializeMask", "the materialize mask")):
-    body = CU_CODE[CU_CODE.find("XsReconBackend::" + fn):][:1200]
-    if "dropNodalGraph" not in body:
-        problems.append(f"{fn}: must drop the captured nodal graph -- {what} are part of "
-                        "its topology")
+#
+# THE KEY IS A STRUCT NOW, AND THE MASK IS AN INDEX RATHER THAN A REASON TO
+# DESTROY.  This section used to read four `g_key_*` globals and a `const bool
+# key_ok` conjunction, and to require that BOTH adoptCanonicalBuffers and
+# setMaterializeMask dropped the captured graph.  Task 10 part 4 §6 replaced the
+# single remembered key with NodalGraphKey + a small keyed cache, because the
+# materialize mask alternates between two values at every device-outer segment
+# boundary: enforcing it by destruction meant re-capturing twice per segment --
+# 3,282 captures on kngr_238, each one draining the backend's stream inside a
+# window nothing counted.
+#
+# THE SAFETY ARGUMENT DID NOT CHANGE, and that is why the rules below are the
+# same rules re-aimed rather than weaker ones.  It was never "the key matched";
+# it was "this graph was captured under exactly these conditions".  A LOOKUP
+# establishes that; an equality test against one remembered key only
+# approximated it.  So what has to be pinned is that every condition is a FIELD
+# and that operator== compares it -- a field that exists and is not compared is
+# the stale capture this section is about.
+KEY_STRUCT = CU_CODE[CU_CODE.find("struct NodalGraphKey"):]
+KEY_STRUCT = KEY_STRUCT[:KEY_STRUCT.find("struct NodalGraph ")] if KEY_STRUCT else ""
+if not KEY_STRUCT:
+    problems.append("CudaXsReconBackend.cu: no NodalGraphKey; the nodal capture has no key "
+                    "and a graph captured under one set of conditions can replay under "
+                    "another")
+# THE DECLARATIONS AND THE COMPARISON ARE READ SEPARATELY, because a struct that
+# still MENTIONS a field in its operator== reads as "has the field" to a scan of
+# the whole block -- which is how "delete the declaration" passed this rule's own
+# negative control once.
+KEY_EQ = KEY_STRUCT[KEY_STRUCT.find("bool operator=="):] if KEY_STRUCT else ""
+KEY_FIELDS = KEY_STRUCT[:KEY_STRUCT.find("bool operator==")] if KEY_STRUCT else ""
+for field, why in (
+        ("canon_jnet", "the borrowed jnet is baked into the capture"),
+        ("canon_flux", "the borrowed flux is baked into the capture"),
+        ("canon_phis", "the borrowed phis is baked into the capture"),
+        ("materialize", "the mask decides which download NODES exist in the capture"),
+        ("halt", "the halt gate is a kernel ARGUMENT; a graph captured ungated cannot be "
+                 "replayed gated"),
+        ("halt_slot", "the gated slot is an argument too")):
+    if not re.search(r"\b%s\s*=" % re.escape(field), KEY_FIELDS):
+        problems.append(f"NodalGraphKey has no {field} field -- {why}")
+    elif not re.search(r"\b%s\s*==" % re.escape(field), KEY_EQ):
+        problems.append(f"NodalGraphKey::operator== does not compare {field} -- {why}, and "
+                        "a field nobody compares is a field that is not in the key")
+# And every one of them has to be FILLED at the lookup, or the cache answers with
+# whatever the default was.
+for field in ("canon_jnet", "canon_flux", "canon_phis", "materialize", "halt", "halt_slot"):
+    # WITH A WORD BOUNDARY, because `want.halt` is a prefix of `want.halt_slot`
+    # -- a substring test says the halt is filled as long as the SLOT is, which
+    # is the pair this rule exists to keep together.
+    if not re.search(r"want\.%s\b" % re.escape(field), CU_CODE):
+        problems.append(f"CudaXsReconBackend.cu: the drive does not set want.{field} before "
+                        "the cache lookup, so the key it searches with is a default")
+
+# adoptCanonicalBuffers STILL DESTROYS, and setMaterializeMask still must not.
+# The asymmetry is the point: an adoption changes which BUFFERS every entry in
+# the cache points at, so no entry survives it; a mask change selects among
+# entries that are all still valid.
+adopt_body = CU_CODE[CU_CODE.find("XsReconBackend::adoptCanonicalBuffers"):][:1200]
+if "dropNodalGraph" not in adopt_body:
+    problems.append("adoptCanonicalBuffers: must drop the captured nodal graphs -- an "
+                    "adoption re-points buffers that EVERY cache entry has baked, so none "
+                    "of them survives it")
+mask_body = CU_CODE[CU_CODE.find("XsReconBackend::setMaterializeMask"):][:1400]
+if "dropNodalGraph" in mask_body:
+    problems.append("setMaterializeMask: drops the captured nodal graph.  The mask "
+                    "alternates twice per device-outer segment, so that is a re-capture "
+                    "and a host drain per segment (3,282 on kngr_238); it is a "
+                    "NodalGraphKey field instead, and the lookup is what makes a drive "
+                    "under this mask select a graph captured under it")
 
 # --- 4. ownership-based elision ----------------------------------------------
 want(CANON_CODE, "last_writer != CanonicalOwner::Host", "GpuCanonicalState.h",

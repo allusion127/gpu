@@ -1232,11 +1232,28 @@ def check_deferred_observation_moved_its_writers(problems: list[str]) -> None:
             "the nodal slot guard does not test NodalView::halt, so the halt reaches "
             "no kernel"
         )
-    if "d.g_key_halt" not in xsrecon:
-        problems.append(
-            "the halt pointer is a kernel ARGUMENT and is not in the nodal graph key.  "
-            "A graph captured ungated cannot be replayed gated"
-        )
+    # THE HALT IS A KERNEL ARGUMENT, SO IT IS A KEY -- and since Task 10 part 4
+    # §6 the key is a struct with a cache behind it rather than one remembered
+    # `d.g_key_halt` global.  Both halves are checked, because a field that
+    # exists and is never compared is a field that is not in the key: a graph
+    # captured ungated would then be selected for a gated drive, and every
+    # kernel of the outer would run past a latched exit.
+    _key = xsrecon[xsrecon.find("struct NodalGraphKey"):]
+    _key = _key[: _key.find("struct NodalGraph ")] if _key else ""
+    # The DECLARATIONS and the COMPARISON read apart, and the fill read with a
+    # word boundary: `halt` is a prefix of `halt_slot`, so every substring test
+    # here would be satisfied by the other half of the pair.
+    _decls = _key[: _key.find("bool operator==")] if _key else ""
+    _eq = _key[_key.find("bool operator=="):] if _key else ""
+    for _field in ("halt", "halt_slot"):
+        if (not re.search(r"\b%s\s*=" % _field, _decls)
+                or not re.search(r"\b%s\b" % _field, _eq)
+                or not re.search(r"want\.%s\b" % _field, xsrecon)):
+            problems.append(
+                "the halt pointer is a kernel ARGUMENT and is not carried, compared and "
+                "filled in the nodal graph key (NodalGraphKey::%s).  A graph captured "
+                "ungated cannot be replayed gated" % _field
+            )
     if "bool XSSet::RodCuspingQuiescent" not in xsset:
         problems.append(
             "there is no XSSet::RodCuspingQuiescent.  Cusping cannot be gated by a "
