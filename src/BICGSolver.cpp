@@ -370,9 +370,10 @@ bool BICGSolver::driveSweepsCuda(double* phi, CudaBatchArena::CmfdSweepIO& io) {
 }
 
 bool BICGSolver::enqueueSweepsCuda(double* phi, const CudaBatchArena::CmfdSweepIO& io,
-                                   const CudaBatchArena::CmfdSweepProbeSink& probe) {
+                                   const CudaBatchArena::CmfdSweepProbeSink& probe,
+                                   void* caller_stream) {
     if (_arena == nullptr || _batch_slot < 0 || !_arena->available()) return false;
-    return _arena->enqueueSweeps(_batch_slot, phi, io, probe);
+    return _arena->enqueueSweeps(_batch_slot, phi, io, probe, caller_stream);
 }
 
 bool BICGSolver::finishSweepsCuda(CudaBatchArena::CmfdSweepIO& io) {

@@ -963,7 +963,7 @@ private:
     // census and the Rayleigh latch are already in device memory when the graph
     // ends, and the convergence kernel reads them from device memory, so the
     // host was only ever carrying them from one device buffer to another.
-    static bool outerSweepEnqueueHook(void* raw, gpu::OuterSegmentStream, int slot,
+    static bool outerSweepEnqueueHook(void* raw, gpu::OuterSegmentStream stream, int slot,
                                       unsigned int) {
         OuterHookCtx& h = *static_cast<OuterHookCtx*>(raw);
         const gpu::CudaOuterSegment::ProbeAddresses a =
@@ -986,8 +986,15 @@ private:
         // because a refused enqueue has no finish half.
         h.ctx->cmfd_solver.setOuterSegmentResident(true);
         h.ctx->cmfd_solver.setls(*h.eigv);
+        // Rev.7.1 Task 18: THE RUNNER'S STREAM IS AN ARGUMENT NOW.  When the
+        // segment bound the arena's own stream (one deck) the drive sees the
+        // same handle it would have used and nothing is joined -- byte for byte
+        // the Task 10 path.  In `--batch-mode` the segment keeps a private
+        // stream, because a graph capture swallows every enqueue on the stream
+        // it is open on and M segments on one stream capture each other; the
+        // drive then joins the two with an event pair instead.
         if (h.ctx->cmfd_solver.enqueueDrive(*h.eigv, h.ctx->geometry.PhifMutable(), *h.residual,
-                                            sink)) {
+                                            sink, stream)) {
             h.enqueued = true;
             return true;
         }
@@ -997,7 +1004,14 @@ private:
         // stream-ordered work in flight (updpsi and the psi mirror the host loop
         // is about to read), and a blocking drive would read those arrays while
         // the copies were still filling them.
+        // TWO STREAMS TO SETTLE, NOT ONE.  The blocking drive is about to read
+        // and write host arrays that both streams have async copies in flight
+        // into -- the arena's for the sweep staging, the runner's for the psi
+        // and dhat mirrors this outer issued.  They are the same stream for a
+        // single deck and different ones in a batch, and draining a stream
+        // twice is free.
         h.ctx->cmfd_solver.syncSweepStream();
+        gpu::rasberySyncSegmentStream(stream);
         h.ctx->cmfd_solver.drive(*h.eigv, h.ctx->geometry.PhifMutable(), *h.residual);
         h.ctx->cmfd_solver.setOuterSegmentResident(false);
         // The blocking drive resolved the retry and the Rayleigh hand-back
@@ -1307,48 +1321,56 @@ private:
         // per outer, inside the enqueue hook.
         //
         // ============================================================
-        // A BATCH KEEPS ITS OWN STREAM, AND THEREFORE ITS OWN SWEEP HOOK
+        // A BATCH KEEPS ITS OWN STREAM AND STILL GETS THE STREAM-ORDERED SWEEP
         // ============================================================
         //
-        // Rev.7.1 Task 18-lite.  THE ARENA STREAM IS UNDER GRAPH CAPTURE, and a
-        // batch has other threads doing the capturing.  CudaBatchArena captures
-        // the CMFD sweep on `core.stream` -- ONE stream for every slot -- and a
-        // capture swallows everything enqueued on that stream by anybody.  With
-        // M Drivers, worker A's segment enqueues updpsi while worker B is
-        // capturing, and both die:
+        // Rev.7.1 Task 18-lite found the constraint; Task 18 removes half of it.
+        //
+        // THE ARENA STREAM IS UNDER GRAPH CAPTURE, and a batch has other threads
+        // doing the capturing.  CudaBatchArena captures the CMFD sweep on
+        // `core.stream` -- ONE stream for every slot -- and a capture swallows
+        // everything enqueued on that stream by anybody.  With M Drivers,
+        // worker A's segment enqueued updpsi while worker B was capturing, and
+        // both died:
         //
         //   [RASBERY][FAIL] cudaMemcpyAsync(d_slot_map, ...): operation failed
         //   due to a previous error during capture
         //
         // -- measured on the 4-deck local batch, four failed decks in 1.2 s.
         //
-        // So sharing the stream is a SINGLE-RUN optimisation, not a general one.
-        // Task 10 adopted it to order the segment's kernels against the sweep
-        // without an event pair, and it still does that wherever exactly one
-        // instance is live.  A batch takes the other arrangement Task 9 already
-        // had: the runner's own private stream, and a sweep hook that BLOCKS.
-        // The two go together and neither is optional --
+        // So SHARING the stream stays a single-run arrangement.  What Task
+        // 18-lite concluded from that -- "and therefore a batch takes the
+        // blocking sweep hook, and therefore a budget of one" -- was a property
+        // of the enqueue path, not of the batch: `enqueueSweeps` refused more
+        // than one live instance because it took no claim on the stream and
+        // staged the fleet masks into one buffer per arena.
         //
-        //   * the private stream means nothing orders the segment's kernels
-        //     against the sweep's except the host, so the sweep hook has to be
-        //     the one that returns having finished (`sweep_synchronizes`), which
-        //     also forces the honest budget of one;
-        //   * the body drains the private stream before every sweep on that arm
-        //     (`!stream_sweep || host_reader_next`), so the psi the drive reads
-        //     and the dhat it assembles from have both landed.
+        // Both are fixed where they live (CudaBICGBackend.cu): the enqueue path
+        // takes the arena's `stream_mutex` for the duration of its enqueue, so
+        // two decks' launches never interleave on the host and the capture is
+        // exclusive; the fleet masks got one staging lane per slot, so a second
+        // launcher's host writes cannot reach the first one's in-flight DMA;
+        // and a caller on a DIFFERENT stream is joined to the arena's by an
+        // event pair, which is what orders a segment's updpsi against the sweep
+        // that reads its psi without either of them owning the other's stream.
         //
-        // What a batch therefore gets is exactly Task 9's segment, per deck:
-        // updpsi, updjnet and upddhat on the device, and the 416 KiB/outer dhat
-        // H2D gone -- one outer at a time instead of eight.
+        // So the arm is now about the STREAM only.  One deck binds the arena
+        // stream and pays nothing; a batch keeps its private stream and pays
+        // two events an outer.  Both get `finish_cmfd_sweep`, both leave
+        // `sweep_synchronizes` false, and both therefore run the segment at its
+        // configured budget.
         //
         // useStream(nullptr) IS NOT REDUNDANT.  The runner is process-lived and
         // arms many times; a previous arm may have pointed it at an arena
         // stream, and this restores its own.
         const bool solo = rasberyBatchWidth() <= 1;
-        const bool stream_sweep =
-            solo && ctx.cmfd_solver.sweepStream() != nullptr &&
+        const bool have_sweep_stream = ctx.cmfd_solver.sweepStream() != nullptr;
+        // Only the SOLO arm adopts the arena stream as the segment's own.
+        const bool shared_stream =
+            solo && have_sweep_stream &&
             gpu::rasberyOuterSegment(slot).useStream(ctx.cmfd_solver.sweepStream());
-        if (!stream_sweep) gpu::rasberyOuterSegment(slot).useStream(nullptr);
+        if (!shared_stream) gpu::rasberyOuterSegment(slot).useStream(nullptr);
+        const bool stream_sweep = have_sweep_stream;
 
         gpu::OuterSegmentHooks hooks;
         hooks.enqueue_cmfd_sweep =

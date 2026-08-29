@@ -2620,14 +2620,39 @@ public:
                      S * sizeof(std::uint32_t));
             CUDA_CHECK(cudaMemset(sweep_halt, 0, S * sizeof(std::uint32_t)));
             CUDA_CHECK(cudaMemset(device_assembly_active, 0, S * sizeof(std::uint32_t)));
-            host_assembly_active.assign(S, 0u);
             CUDA_CHECK(cudaMemset(device_halt, 0, S * sizeof(std::uint32_t)));
             CUDA_CHECK(cudaMemset(device_active, 0, S * sizeof(std::uint32_t)));
             CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&host_status),
                                       S * sizeof(DeviceSolveStatus)));
+            // ---- Rev.7.1 Task 18: ONE STAGING LANE PER SLOT, PLUS ONE -----
+            //
+            // These four are the FLEET-WIDE masks, and every one of them is the
+            // page-locked SOURCE of a cudaMemcpyAsync.  With one copy of each
+            // there could only ever be one launch in flight: a second launcher
+            // rewriting the mask while the first one's DMA was still reading it
+            // is the hazard the sweep_halt snapshot buffer below already
+            // documents, and it is why the stream-ordered enqueue path refused
+            // batch mode outright.
+            //
+            // The device buffers do not need this and deliberately do not get
+            // it: everything reaches the device through ONE stream, so the
+            // uploads of two launches are strictly ordered and cannot overlap.
+            // It is only the HOST side that has no such ordering, because the
+            // host runs ahead of the stream.  Lane `slots` belongs to the
+            // rendezvous launcher (one at a time, by the `launching` claim);
+            // lane m belongs to slot m's own stream-ordered enqueue, which is
+            // the only path that can have several launches outstanding.
+            //
+            // slots+1 lanes of slots words each: 65 x 64 x 4 bytes at the widest
+            // configuration this tree supports.
+            const std::size_t SL = (S + 1) * S;
+            stage_lane           = slots;
             CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&host_active),
-                                      S * sizeof(std::uint32_t)));
-            std::memset(host_active, 0, S * sizeof(std::uint32_t));
+                                      SL * sizeof(std::uint32_t)));
+            std::memset(host_active, 0, SL * sizeof(std::uint32_t));
+            CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&host_assembly_active),
+                                      SL * sizeof(std::uint32_t)));
+            std::memset(host_assembly_active, 0, SL * sizeof(std::uint32_t));
             // SNAPSHOT BUFFER for the sweep mask.  issueSweepUploads used to
             // build the participation mask in host_active, upload it, and then
             // INVERT THAT SAME BUFFER IN PLACE for the sweep_halt upload -- a
@@ -2637,8 +2662,8 @@ public:
             // bytes after the inversion has already landed.  One buffer per
             // upload is the fix; see issueSweepUploads.
             CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&host_sweep_halt),
-                                      S * sizeof(std::uint32_t)));
-            std::memset(host_sweep_halt, 0, S * sizeof(std::uint32_t));
+                                      SL * sizeof(std::uint32_t)));
+            std::memset(host_sweep_halt, 0, SL * sizeof(std::uint32_t));
 
             // The lane -> slot map.  Allocated once at the FULL fleet width
             // whatever a launch's bucket turns out to be, so d_slot_map is a
@@ -2647,9 +2672,10 @@ public:
             // enqueue, a test) behaves exactly as the pre-compaction code did.
             allocate(reinterpret_cast<void**>(&d_slot_map), S * sizeof(int));
             CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&h_slot_map),
-                                      S * sizeof(int)));
-            for (std::size_t i = 0; i < S; ++i) h_slot_map[i] = static_cast<int>(i);
-            CUDA_CHECK(cudaMemcpy(d_slot_map, h_slot_map, S * sizeof(int),
+                                      SL * sizeof(int)));
+            for (std::size_t i = 0; i < SL; ++i)
+                h_slot_map[i] = static_cast<int>(i % S);
+            CUDA_CHECK(cudaMemcpy(d_slot_map, stageSlotMap(), S * sizeof(int),
                                   cudaMemcpyHostToDevice));
             lanes = slots;
 
@@ -2746,6 +2772,8 @@ public:
         host_active = nullptr;
         if (host_sweep_halt != nullptr) cudaFreeHost(host_sweep_halt);
         host_sweep_halt = nullptr;
+        if (host_assembly_active != nullptr) cudaFreeHost(host_assembly_active);
+        host_assembly_active = nullptr;
         neighbors = nullptr;
         colors = nullptr;
         assembly_node_surface = nullptr;
@@ -2927,18 +2955,19 @@ public:
     /// existed and be masked in the same place (the halt guard), or the two
     /// paths stop being the same program.
     void buildSlotMap(const int* active_slots, int count) {
+        int* const map = stageSlotMap();
         if (!compact) {
             lanes = slots;
-            for (int i = 0; i < slots; ++i) h_slot_map[i] = i;
+            for (int i = 0; i < slots; ++i) map[i] = i;
         } else {
             lanes = cmfdBucketFor(count, slots);
-            for (int i = 0; i < slots; ++i) h_slot_map[i] = -1;
-            for (int i = 0; i < count && i < lanes; ++i) h_slot_map[i] = active_slots[i];
+            for (int i = 0; i < slots; ++i) map[i] = -1;
+            for (int i = 0; i < count && i < lanes; ++i) map[i] = active_slots[i];
         }
         // Always the FULL fleet width, never `lanes`: a stale entry from a
         // wider previous launch must never be reachable by a later, deeper
         // graph replay.
-        CUDA_CHECK(cudaMemcpyAsync(d_slot_map, h_slot_map,
+        CUDA_CHECK(cudaMemcpyAsync(d_slot_map, map,
                                    static_cast<size_t>(slots) * sizeof(int),
                                    cudaMemcpyHostToDevice, stream));
         g_cmfd_logical_drives.fetch_add(static_cast<unsigned long long>(count),
@@ -2954,10 +2983,11 @@ public:
     /// H2D for the participating slots, plus the participation mask itself.
     void issueUploads(const int* active_slots, int count) {
         buildSlotMap(active_slots, count);
-        std::memset(host_active, 0, static_cast<size_t>(slots) * sizeof(std::uint32_t));
-        for (int i = 0; i < count; ++i) host_active[active_slots[i]] = 1u;
+        std::uint32_t* const active = stageActive();
+        std::memset(active, 0, static_cast<size_t>(slots) * sizeof(std::uint32_t));
+        for (int i = 0; i < count; ++i) active[active_slots[i]] = 1u;
         CUDA_CHECK(cudaMemcpyAsync(device_active,
-                                   host_active,
+                                   active,
                                    static_cast<size_t>(slots) * sizeof(std::uint32_t),
                                    cudaMemcpyHostToDevice,
                                    stream));
@@ -3558,12 +3588,15 @@ public:
             sl.sweep_in[kSweepSlotBudget - kSweepFirst] = static_cast<double>(slot_budget);
             sl.sweep_in[kSweepSlots - kSweepFirst]      = 0.0;
         }
-        std::memset(host_active, 0, static_cast<size_t>(slots) * sizeof(std::uint32_t));
-        std::fill(host_assembly_active.begin(), host_assembly_active.end(), 0u);
+        std::uint32_t* const active   = stageActive();
+        std::uint32_t* const assembly = stageAssemblyActive();
+        std::uint32_t* const halt     = stageSweepHalt();
+        std::memset(active, 0, static_cast<size_t>(slots) * sizeof(std::uint32_t));
+        std::memset(assembly, 0, static_cast<size_t>(slots) * sizeof(std::uint32_t));
         for (int i = 0; i < count; ++i) {
             const int m = active_slots[i];
-            host_active[m] = 1u;
-            host_assembly_active[static_cast<size_t>(m)] =
+            active[m]   = 1u;
+            assembly[static_cast<size_t>(m)] =
                 slot[static_cast<size_t>(m)].device_assembly ? 1u : 0u;
         }
         // participants: sweep_halt = 0; everyone else: 1 (masks their slots
@@ -3593,15 +3626,15 @@ public:
         // it (slots uint32s, once per launch); an event or a sync here would
         // cost the pipeline this path exists to keep full.
         // tools/test_cmfd_async_h2d_snapshot_contract.py pins it.
-        for (int m = 0; m < slots; ++m) host_sweep_halt[m] = host_active[m] ? 0u : 1u;
+        for (int m = 0; m < slots; ++m) halt[m] = active[m] ? 0u : 1u;
 
-        CUDA_CHECK(cudaMemcpyAsync(device_active, host_active,
+        CUDA_CHECK(cudaMemcpyAsync(device_active, active,
                                    static_cast<size_t>(slots) * sizeof(std::uint32_t),
                                    cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(device_assembly_active, host_assembly_active.data(),
+        CUDA_CHECK(cudaMemcpyAsync(device_assembly_active, assembly,
                                    static_cast<size_t>(slots) * sizeof(std::uint32_t),
                                    cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(sweep_halt, host_sweep_halt,
+        CUDA_CHECK(cudaMemcpyAsync(sweep_halt, halt,
                                    static_cast<size_t>(slots) * sizeof(std::uint32_t),
                                    cudaMemcpyHostToDevice, stream));
 
@@ -3987,14 +4020,33 @@ public:
     std::uint32_t* device_counters = nullptr;
     DeviceSolveStatus* device_status = nullptr;
     DeviceSolveStatus* host_status = nullptr;
+    /// Rev.7.1 Task 18: (slots+1) x slots, one staging LANE per slot plus one
+    /// for the rendezvous launcher.  See the allocation for why the host side
+    /// needs lanes and the device side does not.
     std::uint32_t*     host_active = nullptr;
     /// Staging for the sweep_halt H2D.  Separate from host_active on purpose:
     /// both are page-locked and both are memcpyAsync SOURCES in the same
     /// launcher window, so neither may be rewritten to serve the other.
     std::uint32_t*     host_sweep_halt = nullptr;
+    /// Which lane the launch being staged writes into.  Set by the caller
+    /// under `stream_mutex` and read by buildSlotMap / issueUploads /
+    /// issueSweepUploads; `slots` is the rendezvous lane.
+    int                stage_lane = 0;
+    [[nodiscard]] std::uint32_t* stageActive() const {
+        return host_active + static_cast<std::size_t>(stage_lane) * slots;
+    }
+    [[nodiscard]] std::uint32_t* stageSweepHalt() const {
+        return host_sweep_halt + static_cast<std::size_t>(stage_lane) * slots;
+    }
+    [[nodiscard]] std::uint32_t* stageAssemblyActive() const {
+        return host_assembly_active + static_cast<std::size_t>(stage_lane) * slots;
+    }
+    [[nodiscard]] int* stageSlotMap() const {
+        return h_slot_map + static_cast<std::size_t>(stage_lane) * slots;
+    }
     BackendCounters telemetry{};
     std::vector<Slot> slot;
-    std::vector<std::uint32_t> host_assembly_active;
+    std::uint32_t* host_assembly_active = nullptr; // pinned, (slots+1) lanes
     bool          use_graph = true;
     bool          scalar_fusion = true;
     /// RASBERY_GPU_ITER_BATCH: requested iterations per graph launch.  0 =
@@ -4177,6 +4229,17 @@ public:
         }
     }
 
+    ~Impl() {
+        // The arena outlives every deck, so this only runs at process teardown;
+        // it is here so the pair is owned by the object that created it rather
+        // than leaked on the strength of that.
+        for (cudaEvent_t e : seg_ev_in)
+            if (e != nullptr) cudaEventDestroy(e);
+        for (cudaEvent_t e : seg_ev_out)
+            if (e != nullptr) cudaEventDestroy(e);
+        cudaGetLastError();
+    }
+
     BatchCore core;
 
     // ---------------------------------------------------------------------
@@ -4204,6 +4267,30 @@ public:
     // its keep once more of the step is device-resident.
     // ---------------------------------------------------------------------
     std::mutex              mutex;
+    // ---------------------------------------------------------------------
+    // Rev.7.1 Task 18: THE STREAM CLAIM
+    // ---------------------------------------------------------------------
+    //
+    // `mutex` above guards the RENDEZVOUS -- the pending lists, the launcher
+    // election, the occupancy counters -- and it is deliberately DROPPED across
+    // the device work so the next batch can fill up underneath it.  That left
+    // one thing unguarded: the arena's single stream and the state that is only
+    // meaningful while somebody is enqueueing on it (the staging lanes, `lanes`,
+    // the graph caches, the capture itself).  Under the rendezvous that was
+    // safe by construction, because `launching` elects exactly one thread.
+    //
+    // The stream-ordered sweep has no election -- that is its whole point, and
+    // it is why it refused batch mode.  A capture swallows everything a stream
+    // receives while it is open, so worker A enqueueing its sweep while worker
+    // B captured one killed four decks in 1.2 s with `operation failed due to a
+    // previous error during capture`.
+    //
+    // So the two paths now share ONE claim on the stream, held only for the
+    // ENQUEUE.  Two launches never interleave on the host; on the device they
+    // are serialised by the stream itself, which is what makes the per-slot
+    // device masks unnecessary.  Never taken while `mutex` is held (the
+    // rendezvous drops its lock first), so the two cannot deadlock.
+    std::mutex              stream_mutex;
     std::condition_variable cv;
     // Two rendezvous domains sharing one launcher election: kind 0 is the
     // plain per-sweep solve, kind 1 the device-resident multi-sweep launch
@@ -4231,6 +4318,18 @@ public:
     unsigned long long      wait_events = 0;
     double                  idle_wait_us_total = 0.0;
     std::vector<char>       taken;
+    /// Rev.7.1 Task 18: the cross-stream handover for a segment that does NOT
+    /// share the arena stream.  One pair per slot, created on first use under
+    /// `stream_mutex` and destroyed with the arena.
+    ///
+    /// A SINGLE deck (the resident-single case) still binds the arena stream
+    /// itself and gets neither event: same stream, same order, and the enqueue
+    /// path is byte-identical to what it was.  A BATCH cannot do that -- M
+    /// segments on one stream would capture each other's kernels -- so each
+    /// keeps its own stream and the two are joined here instead: `in` says the
+    /// segment's updpsi has landed before the sweep reads psi, `out` says the
+    /// sweep's flux and scalars have landed before the segment reads them.
+    std::vector<cudaEvent_t> seg_ev_in, seg_ev_out;
     unsigned long long      launches       = 0;
     unsigned long long      batched_solves = 0;
     std::vector<unsigned long long> width_histogram;
@@ -4420,19 +4519,68 @@ void* CudaBatchArena::sweepStream() const {
 }
 
 bool CudaBatchArena::enqueueSweeps(int m, double* out_phi, const CmfdSweepIO& io,
-                                   const CmfdSweepProbeSink& probe) {
+                                   const CmfdSweepProbeSink& probe, void* caller_stream) {
     Impl& a = *_impl;
     if (!a.core.available || out_phi == nullptr) return false;
     if (m < 0 || m >= a.core.slots) return false;
-    // ONE PARTICIPANT, AND THAT IS THE WHOLE PRECONDITION.  solveCommon has a
-    // rendezvous because a batch has several arrivals to align; this path has
-    // none to align and takes no lock, so a second in-flight instance would be a
-    // second launcher on one stream -- the failure the `launching` claim exists
-    // to prevent.  The device outer segment refuses batch mode already
-    // (OuterSegmentEligibility::batch_width); this refuses it again, here, where
-    // the stream is.
-    if (a.inUseCount() > 1) return false;
 
+    // ---- Rev.7.1 Task 18: ONE PARTICIPANT, AND NOW ANY NUMBER OF THEM ------
+    //
+    // WHAT THIS USED TO REFUSE AND WHY.  `if (a.inUseCount() > 1) return false;`
+    // -- because this path takes no lock and the arena has ONE stream, so a
+    // second in-flight instance would be a second launcher on it, which is
+    // exactly the failure the rendezvous `launching` claim exists to prevent.
+    // The device outer segment therefore ran in batch mode with the BLOCKING
+    // sweep hook, which forces `sweep_synchronizes` and a segment budget of one.
+    //
+    // WHAT REPLACED IT.  `stream_mutex` is the claim this path was missing.  It
+    // is held for the ENQUEUE only -- no drain, no rendezvous, no linger -- so
+    // two decks' sweeps never interleave on the host, and on the device they are
+    // ordered by the stream they share.  Everything a launch stages into is
+    // either per-slot already (the physics arrays, the scalar block) or now has
+    // one staging lane per slot (the fleet masks and the slot map), so the
+    // second launcher's host writes cannot reach the first one's in-flight DMA.
+    //
+    // THE STAGE IS INSIDE THE CLAIM, and it has to be: stageSweeps writes
+    // slot m's own scalar block, but issueSweepUploads reads `stage_lane`,
+    // `lanes` and the graph caches, all of which the claim guards.
+    std::lock_guard<std::mutex> stream_claim(a.stream_mutex);
+
+    // ---- join the caller's stream to the arena's ---------------------------
+    //
+    // Skipped entirely when they are the same stream, which is the single-deck
+    // arrangement Task 10 chose and this leaves untouched.
+    cudaStream_t caller = static_cast<cudaStream_t>(caller_stream);
+    const bool   join   = caller != nullptr && caller != a.core.stream;
+    if (join) {
+        if (a.seg_ev_in.empty()) {
+            a.seg_ev_in.assign(static_cast<size_t>(a.core.slots), nullptr);
+            a.seg_ev_out.assign(static_cast<size_t>(a.core.slots), nullptr);
+        }
+        cudaEvent_t& ein  = a.seg_ev_in[static_cast<size_t>(m)];
+        cudaEvent_t& eout = a.seg_ev_out[static_cast<size_t>(m)];
+        if (ein == nullptr &&
+            cudaEventCreateWithFlags(&ein, cudaEventDisableTiming) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        if (eout == nullptr &&
+            cudaEventCreateWithFlags(&eout, cudaEventDisableTiming) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        // RECORDED BEFORE THE WAIT IS ENQUEUED, which is what makes the join
+        // acyclic: the event describes work the caller has ALREADY submitted, so
+        // the arena stream's wait can only ever be satisfied by segment work
+        // that itself depends on strictly earlier arena-stream entries.
+        if (cudaEventRecord(ein, caller) != cudaSuccess ||
+            cudaStreamWaitEvent(a.core.stream, ein, 0) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+    }
+
+    a.core.stage_lane = m; // this slot's own staging lane
     stageSweeps(m, io);
     auto& sl   = a.core.slot[static_cast<size_t>(m)];
     sl.out_phi = out_phi;
@@ -4449,11 +4597,32 @@ bool CudaBatchArena::enqueueSweeps(int m, double* out_phi, const CmfdSweepIO& io
     a.core.enqueueSweepVerdict(m, probe);
     a.core.issueFluxDownloads(&m, 1);
     a.core.issueSweepDownloads(&m, 1);
+    if (join &&
+        (cudaEventRecord(a.seg_ev_out[static_cast<size_t>(m)], a.core.stream) != cudaSuccess ||
+         cudaStreamWaitEvent(caller, a.seg_ev_out[static_cast<size_t>(m)], 0) != cudaSuccess)) {
+        // The launch is already in flight and its results are correct; only the
+        // ORDERING against the caller's stream failed.  Refusing here would let
+        // the caller run a blocking drive over buffers this launch is writing,
+        // so the honest recovery is to make the ordering by hand.
+        cudaGetLastError();
+        if (cudaStreamSynchronize(a.core.stream) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+    }
     return true;
 }
 
 bool CudaBatchArena::finishSweeps(int m, CmfdSweepIO& io) {
     Impl& a = *_impl;
+    // THE OBSERVATION TOUCHES ARENA-WIDE STATE, so it takes the same claim the
+    // enqueue does: absorb() folds into the shared telemetry and can latch the
+    // FP32 fallback (which destroys the graph caches another deck may be about
+    // to launch from), and the exceptional download below enqueues on the arena
+    // stream and synchronises it.  No device wait is held across the claim on
+    // the normal path -- the caller has already synchronised its own stream,
+    // which the enqueue joined to the arena's.
+    std::lock_guard<std::mutex> stream_claim(a.stream_mutex);
     a.core.absorb(&m, 1);
     readSweepObservation(m, io);
     // The Rayleigh hand-back is the one launch whose host branch reads psi and
@@ -4468,6 +4637,21 @@ bool CudaBatchArena::finishSweeps(int m, CmfdSweepIO& io) {
 
 void CudaBatchArena::syncSweepStream() {
     if (!_impl->core.available) return;
+    // Rev.7.1 Task 18: UNDER THE STREAM CLAIM, and this is not bookkeeping.
+    //
+    // A stream that another thread has open for capture may not be
+    // synchronised at all -- `operation not permitted when stream is capturing`
+    // -- and once that error is raised the capture is poisoned, so the next
+    // three decks die on `operation failed due to a previous error during
+    // capture` from wherever they happened to be.  Measured on the 4-deck local
+    // batch, four decks dead in 0.97 s, with the drain named as the first
+    // failure and the other three as its fallout.
+    //
+    // This drain is a HOST-side wait, so holding the claim across it does stall
+    // the other decks' enqueues -- for exactly as long as the arena stream was
+    // going to take anyway, on the path where the caller is about to run a
+    // blocking host CMFD drive.
+    std::lock_guard<std::mutex> stream_claim(_impl->stream_mutex);
     CUDA_CHECK(cudaStreamSynchronize(_impl->core.stream));
     CUDA_CHECK(cudaGetLastError());
 }
@@ -4626,6 +4810,11 @@ void CudaBatchArena::solveCommon(int m, double* out_phi, int kind) {
         // which the next batch fills up.
         lock.unlock();
         if (!failed && !participants.empty()) {
+            // The rendezvous claim (`launching`) keeps other RENDEZVOUS
+            // launchers out; the stream claim keeps the stream-ordered enqueue
+            // path out, which has no election of its own.
+            std::lock_guard<std::mutex> stream_claim(a.stream_mutex);
+            a.core.stage_lane = a.core.slots; // the rendezvous lane
             try {
                 if (kind == 0) {
                     a.core.issueUploads(participants.data(),

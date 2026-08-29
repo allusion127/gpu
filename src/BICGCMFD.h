@@ -204,8 +204,11 @@ public:
     /// and nothing is observed; @p probe names the device addresses the sweep
     /// verdict kernel publishes into.  False = nothing was enqueued and the
     /// caller must take the blocking drive().
+    /// @p caller_stream is the stream the caller's own work rides; see
+    /// CudaBatchArena::enqueueSweeps for what passing a different one buys.
     bool enqueueDrive(double& eigv, double* flux, double& errl2,
-                      const CudaBatchArena::CmfdSweepProbeSink& probe);
+                      const CudaBatchArena::CmfdSweepProbeSink& probe,
+                      void* caller_stream = nullptr);
 
     /// Finish the drive enqueueDrive started.  THE CALLER MUST HAVE
     /// SYNCHRONISED sweepStream().  Sets @p host_continued when the drive was

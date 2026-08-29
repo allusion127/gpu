@@ -241,4 +241,6 @@ bool rasberyBindOuterResidency(const OuterSegmentResidency&) { return false; }
 
 bool rasberyPublishOuterProbe(int, double, double, bool, bool) { return false; }
 
+bool rasberySyncSegmentStream(OuterSegmentStream) { return true; }
+
 } // namespace rasbery::gpu

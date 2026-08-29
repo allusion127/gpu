@@ -1433,6 +1433,17 @@ bool rasberyBindOuterResidency(const OuterSegmentResidency& residency);
 bool rasberyPublishOuterProbe(int slot, double eigv, double residual, bool negative_flux,
                               bool rayleigh);
 
+/// Drain one of the runner's own streams, for a hook that is about to make a
+/// HOST call over buffers the runner has async copies in flight into.
+///
+/// Rev.7.1 Task 18.  Before it, a segment in the stream-ordered arm shared the
+/// arena's stream, so BICGCMFD::syncSweepStream() drained the only stream there
+/// was.  In `--batch-mode` the segment keeps a PRIVATE stream and the arena's is
+/// joined to it by events, so a hook falling back to the blocking drive has two
+/// streams to settle and the second one is the runner's.  Returns false when the
+/// drain failed; a null stream is a no-op and true.
+bool rasberySyncSegmentStream(OuterSegmentStream stream);
+
 /// The five integers that decide an arena LAYOUT, and nothing else.
 ///
 /// Rev.7.1 Task 18-lite.  The arena is one allocation whose slot block is

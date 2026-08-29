@@ -624,7 +624,8 @@ bool BICGCMFD::canEnqueueDrive() const {
 }
 
 bool BICGCMFD::enqueueDrive(double& eigv, double* flux, double& errl2,
-                            const CudaBatchArena::CmfdSweepProbeSink& probe) {
+                            const CudaBatchArena::CmfdSweepProbeSink& probe,
+                            void* caller_stream) {
     _enqueued = EnqueuedDrive{};
     // ASKED BEFORE ANYTHING IS CONSUMED.  A refusal here must leave the solver
     // exactly as setls() left it, because the caller's fallback is the blocking
@@ -651,7 +652,7 @@ bool BICGCMFD::enqueueDrive(double& eigv, double* flux, double& errl2,
     stageSweepIO(io, p, eigv, reigv, reigvs, errl2, 0, 0, /*psi_dirty=*/true);
     io.device_assembly = use_device_assembly;
 
-    if (!_ls->enqueueSweepsCuda(flux, io, probe)) {
+    if (!_ls->enqueueSweepsCuda(flux, io, probe, caller_stream)) {
         // Nothing was enqueued.  Rebuild the host operator before the caller
         // falls back, for the same fail-closed reason driveDeviceSweeps does.
         if (use_device_assembly) assembleHostLinearSystem(eigv);

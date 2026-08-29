@@ -400,8 +400,18 @@ public:
     ///
     /// Returns false without enqueueing anything when the arena cannot serve a
     /// single-participant launch, in which case the caller must take solveSweeps.
+    ///
+    /// Rev.7.1 Task 18: @p caller_stream is the stream the CALLER's own work is
+    /// on.  Pass sweepStream() (or nullptr) when the caller has bound the arena
+    /// stream itself -- the single-deck arrangement -- and the two are already
+    /// ordered by construction.  Pass a DIFFERENT stream and the launch is
+    /// joined to it by an event pair, which is what lets M device outer segments
+    /// keep M private streams and still share this one arena: a capture
+    /// swallows every enqueue on the stream it is open on, so M segments cannot
+    /// share the arena stream, and without the join nothing would order a
+    /// segment's updpsi against the sweep that reads its psi.
     bool enqueueSweeps(int slot, double* phi, const CmfdSweepIO& io,
-                       const CmfdSweepProbeSink& probe);
+                       const CmfdSweepProbeSink& probe, void* caller_stream = nullptr);
 
     /// Copy the sweep outputs of the last enqueueSweeps into @p io.
     ///

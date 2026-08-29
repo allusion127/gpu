@@ -147,8 +147,10 @@ public:
     /// which case the caller must take driveSweepsCuda.  On true, nothing has
     /// been observed yet: the caller synchronises sweepStream() when it is ready
     /// and calls finishSweepsCuda() to read the outcome.
+    /// @p caller_stream: see CudaBatchArena::enqueueSweeps.
     bool enqueueSweepsCuda(double* phi, const CudaBatchArena::CmfdSweepIO& io,
-                           const CudaBatchArena::CmfdSweepProbeSink& probe);
+                           const CudaBatchArena::CmfdSweepProbeSink& probe,
+                           void* caller_stream);
 
     /// The post-synchronise half of enqueueSweepsCuda.  False = non-finite flux.
     bool finishSweepsCuda(CudaBatchArena::CmfdSweepIO& io);

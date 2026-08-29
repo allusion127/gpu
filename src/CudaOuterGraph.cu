@@ -959,6 +959,16 @@ bool rasberyPublishOuterProbe(int slot, double eigv, double residual, bool negat
                                                   rayleigh);
 }
 
+bool rasberySyncSegmentStream(OuterSegmentStream stream) {
+    if (stream == nullptr) return true;
+    const cudaError_t rc = cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
+    if (rc != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+
 void CudaOuterSegment::bind(const OuterSegmentBinding& binding) {
     _impl->binding = binding;
     // A binding is usable only when it can ADDRESS the CMFD bodies' slot views
