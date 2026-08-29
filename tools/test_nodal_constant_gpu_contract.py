@@ -167,11 +167,21 @@ if KERNEL_CODE.find("kNcDiagDI") > KERNEL_CODE.find("kNcDiagD,"):
                     "arena packs diagDI first (SlotRegion::NodalConst)")
 
 # --- 5. --fmad=false on the CUDA TUs -----------------------------------------
+# 2c04a6e moved the literal --fmad=false behind RASBERY_BITEXACT_CUDA_OPTS so that
+# RASBERY_PTXAS_VERBOSE could APPEND to it.  What this contract needs is the
+# RESOLVED option list, not the spelling, so expand the variable instead of
+# grepping for the literal -- and expand a missing definition to "", so deleting
+# the set() still fails here.
+_bitexact = re.search(r'set\(RASBERY_BITEXACT_CUDA_OPTS\s+"([^"]*)"\s*\)', CMAKE_TEXT)
+_BITEXACT_OPTS = _bitexact.group(1) if _bitexact else ""
 for cu in ("test/nodal_constant_device_replay.cu", "test/nodal_constant_exp_probe.cu"):
-    block = CMAKE_TEXT[CMAKE_TEXT.find(cu):] if cu in CMAKE_TEXT else ""
-    if not block:
+    opts = re.search(r'set_source_files_properties\(\s*"\$\{CMAKE_CURRENT_SOURCE_DIR\}/'
+                     + re.escape(cu) + r'"\s*\n\s*PROPERTIES COMPILE_OPTIONS "([^"]*)"',
+                     CMAKE_TEXT)
+    if cu not in CMAKE_TEXT:
         problems.append(f"CMakeLists.txt: does not build {cu}")
-    elif "--fmad=false" not in block[:2000]:
+    elif opts is None or "--fmad=false" not in opts.group(1).replace(
+            "${RASBERY_BITEXACT_CUDA_OPTS}", _BITEXACT_OPTS):
         problems.append(f"CMakeLists.txt: {cu} is not compiled with --fmad=false; nvcc "
                         "would then contract on its own schedule and the deviation would "
                         "no longer be confined to exp")

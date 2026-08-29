@@ -276,11 +276,31 @@ for name, src in (("rasbery_cmfd_outer_form_probe", "test/cmfd_outer_form_probe.
         problems.append(f"CMakeLists.txt: does not build {name} ({src})")
 if "src/CmfdOuterReference.cpp" not in CMAKE_TEXT:
     problems.append("CMakeLists.txt: the reference TU is not linked into the gates")
-block = CMAKE_TEXT[CMAKE_TEXT.find("test/cmfd_outer_device_replay.cu"):] \
-    if "test/cmfd_outer_device_replay.cu" in CMAKE_TEXT else ""
-if block and "--fmad=false" not in block[:2500]:
-    problems.append("CMakeLists.txt: cmfd_outer_device_replay.cu is not compiled with "
-                    "--fmad=false; Class B0 is unreachable without it")
+# 2c04a6e moved the literal --fmad=false behind RASBERY_BITEXACT_CUDA_OPTS so that
+# RASBERY_PTXAS_VERBOSE could APPEND to it.  What this contract needs is the
+# RESOLVED option list, not the spelling, so expand the variable instead of
+# grepping for the literal -- and expand a missing definition to "", so deleting
+# the set() still fails here.
+def bitexact_opts(cmake: str) -> str:
+    m = re.search(r'set\(RASBERY_BITEXACT_CUDA_OPTS\s+"([^"]*)"\s*\)', cmake)
+    return m.group(1) if m else ""
+
+
+def compile_options_for(cmake: str, source: str):
+    """The COMPILE_OPTIONS actually applied to `source`, variables expanded."""
+    m = re.search(r'set_source_files_properties\(\s*"\$\{CMAKE_CURRENT_SOURCE_DIR\}/'
+                  + re.escape(source) + r'"\s*\n\s*PROPERTIES COMPILE_OPTIONS "([^"]*)"',
+                  cmake)
+    if m is None:
+        return None
+    return m.group(1).replace("${RASBERY_BITEXACT_CUDA_OPTS}", bitexact_opts(cmake))
+
+
+if "test/cmfd_outer_device_replay.cu" in CMAKE_TEXT:
+    _opts = compile_options_for(CMAKE_TEXT, "test/cmfd_outer_device_replay.cu")
+    if _opts is None or "--fmad=false" not in _opts:
+        problems.append("CMakeLists.txt: cmfd_outer_device_replay.cu is not compiled with "
+                        "--fmad=false; Class B0 is unreachable without it")
 
 # --- repo hygiene: the 238 gate flagged an add_executable with no source -----
 if "test/nodal_mine_device.cu" in CMAKE_TEXT and \

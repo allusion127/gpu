@@ -174,8 +174,16 @@ forbid(PPR_H_CODE, "static std::unique_ptr<PprBackend>", "PPR.h",
 
 # --- 4. --fmad=false on the TU ------------------------------------------------
 
-if not re.search(r"CudaPprBackend\.cu\"\s*\n\s*PROPERTIES COMPILE_OPTIONS \"--fmad=false\"",
-                 CMAKE_TEXT):
+# 2c04a6e moved the literal --fmad=false behind RASBERY_BITEXACT_CUDA_OPTS so that
+# RASBERY_PTXAS_VERBOSE could APPEND to it.  What this contract needs is the
+# RESOLVED option list, not the spelling, so expand the variable instead of
+# grepping for the literal -- and expand a missing definition to "", so deleting
+# the set() still fails here.
+_bitexact = re.search(r'set\(RASBERY_BITEXACT_CUDA_OPTS\s+"([^"]*)"\s*\)', CMAKE_TEXT)
+_ppr_opts = re.search(r'CudaPprBackend\.cu"\s*\n\s*PROPERTIES COMPILE_OPTIONS "([^"]*)"',
+                      CMAKE_TEXT)
+if _ppr_opts is None or "--fmad=false" not in _ppr_opts.group(1).replace(
+        "${RASBERY_BITEXACT_CUDA_OPTS}", _bitexact.group(1) if _bitexact else ""):
     problems.append("CMakeLists.txt: src/CudaPprBackend.cu must carry --fmad=false -- "
                     "without it the deviation is nvcc's scheduling, not exp")
 

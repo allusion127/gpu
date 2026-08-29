@@ -1374,8 +1374,18 @@ remove_block = remove_block[:remove_block.find(")")]
 if "src/CudaOuterGraphStub.cpp" not in remove_block:
     problems.append("CMakeLists.txt: CudaOuterGraphStub.cpp is not removed from the sources "
                     "in a CUDA build, so both arms would define the same symbols")
-block = CMAKE_TEXT[CMAKE_TEXT.find("src/CudaOuterGraph.cu"):]
-if block and "--fmad=false" not in block[:1200]:
+# 2c04a6e moved the literal --fmad=false behind RASBERY_BITEXACT_CUDA_OPTS so that
+# RASBERY_PTXAS_VERBOSE could APPEND to it.  What this contract needs is the
+# RESOLVED option list, not the spelling, so expand the variable instead of
+# grepping for the literal -- and expand a missing definition to "", so deleting
+# the set() still fails here.
+_bitexact = re.search(r'set\(RASBERY_BITEXACT_CUDA_OPTS\s+"([^"]*)"\s*\)', CMAKE_TEXT)
+_graph_opts = re.search(
+    r'set_source_files_properties\(\s*"\$\{CMAKE_CURRENT_SOURCE_DIR\}/'
+    r'src/CudaOuterGraph\.cu"\s*\n\s*PROPERTIES COMPILE_OPTIONS "([^"]*)"', CMAKE_TEXT)
+_graph_opts = "" if _graph_opts is None else _graph_opts.group(1).replace(
+    "${RASBERY_BITEXACT_CUDA_OPTS}", _bitexact.group(1) if _bitexact else "")
+if "--fmad=false" not in _graph_opts:
     problems.append("CMakeLists.txt: CudaOuterGraph.cu is not compiled with --fmad=false.  It "
                     "composes the Task 4/5 phase kernels, whose contract is bit-identical "
                     "reproduction of the host loops; Class B0 is unreachable without it")

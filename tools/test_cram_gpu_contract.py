@@ -158,6 +158,10 @@ def r_no_process_state(src: dict[str, str]) -> None:
 
 
 def r_fmad(src: dict[str, str]) -> None:
+    # 2c04a6e moved the literal --fmad=false behind RASBERY_BITEXACT_CUDA_OPTS so
+    # RASBERY_PTXAS_VERBOSE could APPEND to it.  What the contract needs is the
+    # RESOLVED option list, not the spelling, so expand the variable -- and expand
+    # a missing definition to "", so deleting the set() still fails this rule.
     cm = src["cmake"]
     m = re.search(
         r"set_source_files_properties\(\s*\"\$\{CMAKE_CURRENT_SOURCE_DIR\}/src/"
@@ -165,7 +169,10 @@ def r_fmad(src: dict[str, str]) -> None:
         cm, re.S)
     assert m, ("CudaCramBackend.cu has no set_source_files_properties entry -- nvcc would "
                "be free to contract the Gauss-Seidel sweep's multiply-adds")
-    assert "--fmad=false" in m.group(1), \
+    var = re.search(r"set\(RASBERY_BITEXACT_CUDA_OPTS\s+\"([^\"]*)\"\s*\)", cm)
+    opts = m.group(1).replace("${RASBERY_BITEXACT_CUDA_OPTS}",
+                              var.group(1) if var else "")
+    assert "--fmad=false" in opts, \
         "CudaCramBackend.cu must be compiled with --fmad=false"
 
 
@@ -312,10 +319,12 @@ RULES = [
       'throw std::runtime_error("ng != 2");')),
     ("no-process-state", r_no_process_state, "cu",
      ("unsigned long long bos_token = 0;", "static unsigned long long bos_token = 0;")),
+    # The control now breaks the option list at its DEFINITION rather than at the
+    # use site: since 2c04a6e the use site names a variable, so emptying the
+    # variable is exactly the way this contract can be lost silently.
     ("fmad-false", r_fmad, "cmake",
-     ('set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/CudaCramBackend.cu"\n'
-      '            PROPERTIES COMPILE_OPTIONS "--fmad=false")',
-      "# removed")),
+     ('set(RASBERY_BITEXACT_CUDA_OPTS "--fmad=false")',
+      'set(RASBERY_BITEXACT_CUDA_OPTS "")')),
     ("class-n1", r_class_is_n1, "hdr",
      ("CLASS N1, NOT B0", "CLASS B0")),
     ("pole-set", r_pole_set, "cu",
