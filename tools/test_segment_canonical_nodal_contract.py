@@ -303,33 +303,68 @@ want(NODAL_H_CODE, "void setCanonicalNodalSegmentMode(bool in_segment, bool devi
      "CudaXsReconBackend.h", "the declaration must carry both halves in one call, so the "
      "ownership and the materialize mask cannot be set to disagreeing values")
 
-# The batch rendezvous must be byte-identical: nothing in NodalArena may consult
-# the segment mode.
-ARENA = between(NODAL_CU_CODE, "class NodalArena {", "std::mutex  g_nodal_arena_mutex;")
-if "setCanonicalNodalSegmentMode" in ARENA or "canonical_nodal" in ARENA:
-    problems.append("CudaXsReconBackend.cu: the batch arena must not consult the segment "
-                    "mode -- it takes an adopted set into its view table and then uploads "
-                    "and downloads around every drive regardless, so a mode it half-honoured "
-                    "would be worse than one it ignores")
-
-# ...AND THE SEGMENT MUST NOT ADOPT WHERE THAT IS TRUE.
+# ---------------------------------------------------------------------------
+# Rev.7.1 Task 18: THE BATCHED ARENA HONOURS THE BINDING, SO THE BRIDGE IS GONE
+# ---------------------------------------------------------------------------
 #
-# Rev.7.1 Task 18-lite retired `the segment refuses batch mode outright`, which
-# is what used to make the line above safe on its own.  The property that
-# replaced it is narrower and has to be checked where it now lives: the segment
-# only takes the canonical binding when the drive that consumes it HONOURS the
-# ownership, and the batched nodal arena does not.  Without this the segment
-# drops its jnet bridge and the arena uploads a one-outer-stale Geometry::Jnet
-# over the jnet updjnet just wrote -- kngr3 statepoint 1 at 800.33 ppm in 290
-# outers against the host's 770.15 in 263.
-want(DRIVER_CODE, "XsReconBackend::canonicalNodalIsHonoured()", "Driver.h",
-     "the arm must ask whether the nodal drive will honour an adopted set before it "
-     "adopts one; the batched nodal arena does not, and the segment drops its jnet bridge "
-     "on the strength of the binding")
-want(NODAL_CU_CODE, "bool XsReconBackend::canonicalNodalIsHonoured()",
+# Task 18-lite pinned the opposite property here -- "the arena must not consult
+# the segment mode", plus a `canonicalNodalIsHonoured()` term in Driver.h that
+# kept the jnet bridge for the whole run whenever the arena was engaged.  That
+# was a description of a defect, not an invariant: the arena took an adopted set
+# into its view table and then uploaded Geometry::Jnet into its OWN dense block
+# on every drive, so adoption was accepted and ignored twice -- the uploads went
+# where no kernel looked and the downloads carried that untouched block home.
+#
+# The arena now addresses jnet/flux/phis through the per-slot view table and
+# consults the same elision predicate the per-instance arm has used since Task 7.
+# What has to be pinned is therefore the fix, in four places.
+ARENA = between(NODAL_CU_CODE, "class NodalArena {", "std::mutex  g_nodal_arena_mutex;")
+for needle, why in (
+        ("canonicalElidesUpload",
+         "the arena's per-slot uploads must consult the ownership, or an adopted "
+         "slot's Geometry::Jnet lands on top of the jnet updjnet just wrote"),
+        ("canonicalElidesDownload",
+         "and its downloads must consult the materialize mask, or the two D2Hs the "
+         "binding removes come back one outer stale over the segment's own mirror"),
+        ("const ndl::NodalView&            v     = _h_views[s];",
+         "the transfer ADDRESS must come from the view table -- the same table the "
+         "kernels read -- and not from the arena's dense rebase"),
+        ("_canon[static_cast<std::size_t>(m)] = gpu::CanonicalSlotBuffers{};",
+         "a slot handover must drop the borrowed pointers: _canon lives outside "
+         "Slot, so `sl = Slot{}` does not reach it and the next tenant would read "
+         "and write a dead deck's physics arena"),
+):
+    if needle not in ARENA:
+        problems.append("CudaXsReconBackend.cu NodalArena: missing `%s` -- %s" % (needle, why))
+
+# The adoption has to be REPLAYED when the slot is acquired.  The segment arms
+# before the first drive and the slot is taken lazily inside it, so the forward
+# in adoptCanonicalBuffers is a no-op at arm time; without the replay the whole
+# first statepoint runs unadopted.
+want(NODAL_CU_CODE, "arena->adoptCanonical(d.nodal_slot, d.canonical.buffers);",
      "CudaXsReconBackend.cu",
-     "the honour question has to be answered by the file that knows which nodal path a run "
-     "takes, not guessed from the batch width at the call site")
+     "the adoption must be replayed at acquireSlot, or statepoint 1 runs with an "
+     "unadopted arena slot while the segment has already dropped its bridge")
+
+# And the ownership must MOVE after a batch drive, exactly as it does after the
+# per-instance one -- otherwise the arena honours the binding for one outer and
+# uploads the host arrays back on the next.
+BATCH_ARM = between(NODAL_CU_CODE, "if (d.nodal_slot >= 0) {",
+                    "g_nodal_batch_fallbacks.fetch_add")
+for region in ("Jnet", "Phis"):
+    if ("gpu::CanonicalRegion::%s" % region) not in BATCH_ARM:
+        problems.append("CudaXsReconBackend.cu: the batch arm must hand %s to "
+                        "CanonicalOwner::Nodal after a successful arena drive" % region)
+
+# THE BRIDGE TERM IS GONE FROM THE ARM.  Its presence is now the bug: it would
+# keep 2 x nsurf*ng doubles an outer on a path that no longer needs them.
+if "canonicalNodalIsHonoured" in DRIVER_CODE:
+    problems.append("Driver.h: canonicalNodalIsHonoured() is retired (Task 18) -- the "
+                    "batched arena honours the binding, so the arm must not gate the "
+                    "adoption on which nodal path the run takes")
+if "canonicalNodalIsHonoured" in NODAL_H_CODE or "canonicalNodalIsHonoured" in NODAL_STUB_CODE:
+    problems.append("XsReconBackend: canonicalNodalIsHonoured() must be removed from the "
+                    "header and the stub as well as the definition")
 
 # The refusal still exists by name -- it means `wider than the arena` now.
 want(OUTER_H_CODE, "BatchMode", "CudaOuterGraph.h",

@@ -623,6 +623,16 @@ public:
             // flags would elide uploads the new one needs.
             sl              = Slot{};
             sl.in_use       = true;
+            // Rev.7.1 Task 18: AND NOT THE PREVIOUS TENANT'S CANONICAL BINDING
+            // EITHER.  _canon lives outside Slot because the view table is
+            // indexed by physical slot, so the `sl = Slot{}` above does not
+            // reach it -- and a borrowed pointer into a dead deck's physics
+            // arena is the worst thing this slot could be left holding: the
+            // kernels would read and write another deck's jnet, every value
+            // finite and plausible.  The new tenant re-adopts below, in
+            // solveNodal, at the moment it learns which slot it got.
+            _canon[static_cast<std::size_t>(m)] = gpu::CanonicalSlotBuffers{};
+            _views_dirty                        = true;
             return m;
         }
         return -1;
@@ -644,6 +654,10 @@ public:
             for (int i = 0; i < 6; ++i) sl.pin_bulk[i] = nullptr;
             for (int i = 0; i < 9; ++i) sl.pin_const[i] = nullptr;
             sl.pin_chif = nullptr;
+            // The borrowed canonical pointers belong to the departing tenant's
+            // physics arena; nothing here may keep them (see acquireSlot).
+            _canon[static_cast<std::size_t>(m)] = gpu::CanonicalSlotBuffers{};
+            _views_dirty                        = true;
         }
         // A lingering launcher may still be waiting for this slot to show up.
         // It never will, and inUseCount() has just dropped, so wake it.
@@ -656,7 +670,8 @@ public:
     /// No `state_generation`: see the xs upload in launchBatch for why the
     /// arena cannot use it as a residency key.
     bool drive(int m, const ndl::NodalView& host, unsigned long long const_gen,
-               unsigned long long ref_gen) {
+               unsigned long long ref_gen, const gpu::CanonicalSlotState& canon,
+               std::uint32_t materialize) {
         if (!_available) return false;
 
         // ---- stage.  No CUDA call here: every instance thread runs this
@@ -664,6 +679,19 @@ public:
         // stream (CudaBatchArena::stageSlot has the same contract).
         {
             Slot& sl     = _slot[static_cast<std::size_t>(m)];
+            // Rev.7.1 Task 18: THE OWNERSHIP IS STAGED, NOT READ AT LAUNCH.
+            //
+            // The launcher is one of the M instance threads and it decides the
+            // elisions for every participant, so it would otherwise be reading
+            // another thread's XsReconBackend::Impl while that thread sits in
+            // the rendezvous.  Copying the two words each participant needs --
+            // the three canonical owners and the materialize mask -- under the
+            // same "no CUDA call here" staging contract keeps the launcher's
+            // reads inside the arena.
+            for (int r = 0; r < gpu::kCanonicalNodalRegionCount; ++r)
+                sl.canon_owner[r] =
+                    canon.ownerOf(gpu::kCanonicalNodalRegions[r]);
+            sl.canon_materialize = materialize;
             sl.h_jnet    = host.jnet;
             sl.h_flux    = host.flux;
             sl.h_phis    = host.phis;
@@ -809,6 +837,25 @@ private:
         const void* pin_bulk[6]  = {}; // jnet, phis, flux, xsrf, xsnf, xssm
         const void* pin_const[9] = {};
         const void* pin_chif     = nullptr;
+        // Rev.7.1 Task 18: the canonical ownership this drive was staged with,
+        // in kCanonicalNodalRegions order (flux, jnet, phis).  Host for every
+        // region until a segment says otherwise, which is what makes a legacy
+        // slot's transfers byte-identical to the pre-Task-18 ones.
+        gpu::CanonicalOwner canon_owner[gpu::kCanonicalNodalRegionCount] = {
+            gpu::CanonicalOwner::Host, gpu::CanonicalOwner::Host,
+            gpu::CanonicalOwner::Host};
+        std::uint32_t canon_materialize =
+            gpu::canonicalBit(gpu::CanonicalRegion::Jnet) |
+            gpu::canonicalBit(gpu::CanonicalRegion::Phis);
+
+        /// The staged owner of one nodal region.  A region outside
+        /// kCanonicalNodalRegions is not shared with this arena at all, so Host
+        /// -- the answer that transfers -- is the only safe reply.
+        [[nodiscard]] gpu::CanonicalOwner ownerOf(gpu::CanonicalRegion r) const {
+            for (int i = 0; i < gpu::kCanonicalNodalRegionCount; ++i)
+                if (gpu::kCanonicalNodalRegions[i] == r) return canon_owner[i];
+            return gpu::CanonicalOwner::Host;
+        }
     };
 
     [[nodiscard]] int inUseCount() const {
@@ -1293,11 +1340,52 @@ private:
             sl.pushed_xsrf = _mirror_xs && push_xsrf;
             sl.pushed_xsnf = _mirror_xs && push_xsnf;
             sl.pushed_xssm = _mirror_xs && push_xssm;
-            if (!memcpyAsyncOrFail(_base.jnet + s * _cnt_sg, sl.h_jnet, sgb,
-                                   cudaMemcpyHostToDevice, "nodal arena jnet H2D") ||
-                !memcpyAsyncOrFail(const_cast<double*>(_base.flux) + s * _cnt_ng1, sl.h_flux, ng1b,
-                                   cudaMemcpyHostToDevice, "nodal arena flux H2D"))
+            // ---- Rev.7.1 Task 18: THE ARENA HONOURS THE CANONICAL BINDING ---
+            //
+            // WHAT IT USED TO DO AND WHY THAT WAS WRONG.  adoptCanonical put the
+            // segment's jnet/flux/phis into the view table -- so the KERNELS
+            // read and wrote them -- and then these two lines uploaded
+            // Geometry::Jnet and Geometry::Phif into the ARENA'S OWN dense
+            // block, which the kernels no longer touched, while the downloads
+            // below read that same untouched block back over the caller's host
+            // arrays.  Adoption was therefore accepted and ignored twice: the
+            // uploads went nowhere and the downloads carried a stale copy home.
+            // The segment, seeing the binding live, had stopped filling
+            // Geometry::Jnet, so a batch that dropped its bridge converged
+            // somewhere else entirely (kngr3 statepoint 1: 800.33 ppm in 290
+            // outers against 770.15 in 263).  Task 18-lite worked around it by
+            // asking a static `is it honoured` predicate and keeping the bridge; this is
+            // the fix that makes the question unnecessary.
+            //
+            // THE ADDRESS COMES FROM THE VIEW TABLE, WHICH IS THE ONLY PLACE
+            // THAT KNOWS.  `v` is what refreshViews() built for this slot a few
+            // lines up -- the arena's dense pointers for a legacy slot, the
+            // borrowed canonical ones for an adopted slot -- so a legacy slot
+            // gets byte-identical transfers to the pre-Task-18 code and an
+            // adopted slot transfers to and from the buffer the kernel uses.
+            //
+            // THE ELISION IS THE SAME PREDICATE THE PER-INSTANCE ARM USES,
+            // consulted with the ownership this slot STAGED (see drive()): a
+            // canonical region whose last writer was a device side needs no
+            // upload, and one no host consumer has asked for needs no download.
+            const ndl::NodalView&            v     = _h_views[s];
+            const gpu::CanonicalSlotBuffers& canon = _canon[s];
+            if (gpu::canonicalElidesUpload(canon, gpu::CanonicalRegion::Jnet,
+                                           sl.ownerOf(gpu::CanonicalRegion::Jnet),
+                                           gpu::CanonicalOwner::Nodal)) {
+                g_canon_up_bytes.fetch_add(sgb, std::memory_order_relaxed);
+            } else if (!memcpyAsyncOrFail(v.jnet, sl.h_jnet, sgb, cudaMemcpyHostToDevice,
+                                          "nodal arena jnet H2D")) {
                 return drained();
+            }
+            if (gpu::canonicalElidesUpload(canon, gpu::CanonicalRegion::Flux,
+                                           sl.ownerOf(gpu::CanonicalRegion::Flux),
+                                           gpu::CanonicalOwner::Nodal)) {
+                g_canon_up_bytes.fetch_add(ng1b, std::memory_order_relaxed);
+            } else if (!memcpyAsyncOrFail(const_cast<double*>(v.flux), sl.h_flux, ng1b,
+                                          cudaMemcpyHostToDevice, "nodal arena flux H2D")) {
+                return drained();
+            }
         }
         // One copy of the whole reigv array: 8 bytes a slot, and it keeps the
         // per-drive eigenvalue out of the kernel arguments the graph baked.
@@ -1320,14 +1408,32 @@ private:
         if (lerr != cudaSuccess) { fail("nodal arena launch", lerr); return drained(); }
 
         // ---- the mined minimal download set, per participant ---------------
+        //
+        // Rev.7.1 Task 18: read from the VIEW, and only when a host consumer has
+        // asked.  Inside a device outer segment nothing on the host reads
+        // Geometry::Jnet or Geometry::Phis between two outers -- the segment
+        // mirrors both itself at its exit -- so an adopted slot's two D2Hs
+        // disappear along with the two H2Ds above.  A legacy slot's mask has
+        // both bits set and its transfers are unchanged.
         for (int m : part) {
             Slot&             sl = _slot[static_cast<std::size_t>(m)];
             const std::size_t s  = static_cast<std::size_t>(m);
-            if (!memcpyAsyncOrFail(sl.h_jnet, _base.jnet + s * _cnt_sg, sgb,
-                                   cudaMemcpyDeviceToHost, "nodal arena jnet D2H") ||
-                !memcpyAsyncOrFail(sl.h_phis, _base.phis + s * _cnt_sg, sgb,
-                                   cudaMemcpyDeviceToHost, "nodal arena phis D2H"))
+            const ndl::NodalView&            v     = _h_views[s];
+            const gpu::CanonicalSlotBuffers& canon = _canon[s];
+            if (gpu::canonicalElidesDownload(canon, gpu::CanonicalRegion::Jnet,
+                                             sl.canon_materialize)) {
+                g_canon_down_bytes.fetch_add(sgb, std::memory_order_relaxed);
+            } else if (!memcpyAsyncOrFail(sl.h_jnet, v.jnet, sgb, cudaMemcpyDeviceToHost,
+                                          "nodal arena jnet D2H")) {
                 return drained();
+            }
+            if (gpu::canonicalElidesDownload(canon, gpu::CanonicalRegion::Phis,
+                                             sl.canon_materialize)) {
+                g_canon_down_bytes.fetch_add(sgb, std::memory_order_relaxed);
+            } else if (!memcpyAsyncOrFail(sl.h_phis, v.phis, sgb, cudaMemcpyDeviceToHost,
+                                          "nodal arena phis D2H")) {
+                return drained();
+            }
         }
 
         const cudaError_t src = cudaStreamSynchronize(_stream);
@@ -2678,11 +2784,37 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
                     g_nodal_batch_refused.fetch_add(1, std::memory_order_relaxed);
                     std::cerr << "[RASBERY][WARN][nodal] batch arena refused a slot "
                                  "(geometry mismatch or width exhausted) -- per-instance arm\n";
+                } else if (d.canonical.buffers.shared()) {
+                    // Rev.7.1 Task 18: THE ADOPTION HAS TO BE REPLAYED HERE, and
+                    // getting this wrong is what a batch looks like when it is
+                    // one outer stale.  adoptCanonicalBuffers forwards to the
+                    // arena, but the segment arms BEFORE the first drive and the
+                    // slot is acquired lazily INSIDE it -- so at arm time
+                    // nodal_slot is -1 and the forward is a no-op.  Statepoint 1
+                    // then ran with an unadopted arena slot: the kernels wrote
+                    // the arena's own dense jnet while the segment, believing
+                    // the binding, had stopped filling Geometry::Jnet.
+                    //
+                    // Replaying it at the moment the slot is learned costs one
+                    // view-table rebuild per tenancy and closes the window.
+                    arena->adoptCanonical(d.nodal_slot, d.canonical.buffers);
                 }
             }
             if (d.nodal_slot >= 0) {
-                if (arena->drive(d.nodal_slot, host, const_generation, ref_generation))
+                if (arena->drive(d.nodal_slot, host, const_generation, ref_generation,
+                                 d.canonical, d.canonical_materialize)) {
+                    // Rev.7.1 Task 18: the batch drive just wrote jnet and phis
+                    // on the device, exactly as the per-instance FULL path does
+                    // at the bottom of this function -- so the ownership moves
+                    // here too, or the NEXT drive would upload the host arrays
+                    // back over them and the arena would honour the binding for
+                    // one outer only.
+                    d.canonical.setOwner(gpu::CanonicalRegion::Jnet,
+                                         gpu::CanonicalOwner::Nodal);
+                    d.canonical.setOwner(gpu::CanonicalRegion::Phis,
+                                         gpu::CanonicalOwner::Nodal);
                     return true; // jnet/phis are home; counters bumped in the arena
+                }
                 g_nodal_batch_fallbacks.fetch_add(1, std::memory_order_relaxed);
             }
         }
@@ -3348,15 +3480,6 @@ void XsReconBackend::adoptCanonicalBuffers(const gpu::CanonicalSlotBuffers& buff
 
 gpu::CanonicalSlotBuffers XsReconBackend::canonicalBuffers() const {
     return _impl->canonical.buffers;
-}
-
-bool XsReconBackend::canonicalNodalIsHonoured() {
-    // nodalArenaWanted() and not `is there an arena object yet`: the slot is
-    // acquired lazily on the FIRST drive, so a question asked at arm time would
-    // answer `per-instance` for a run whose second outer joins the batch.  The
-    // predicate is cached and process-wide, which is the granularity the arena
-    // itself has.
-    return !nodalArenaWanted();
 }
 
 void XsReconBackend::setMaterializeMask(std::uint32_t mask) {

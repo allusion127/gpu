@@ -240,29 +240,15 @@ public:
     /// What this backend is currently borrowing (all-null in legacy mode).
     [[nodiscard]] gpu::CanonicalSlotBuffers canonicalBuffers() const;
 
-    /// Will the drive that consumes an adopted set HONOUR its ownership?
+    /// Rev.7.1 Task 18 RETIRED THE `IS IT HONOURED` PREDICATE.
     ///
-    /// Rev.7.1 Task 18-lite.  Adoption alone is not enough for the device outer
-    /// segment: the segment drops its jnet bridge on the strength of the
-    /// binding -- it stops bringing the device jnet down into Geometry::Jnet --
-    /// so the drive that follows MUST read the adopted buffer rather than
-    /// re-uploading the host array into it.
-    ///
-    /// The per-instance nodal path does exactly that; the BATCHED nodal arena
-    /// does not.  It takes the adoption into its view table (adoptCanonical) and
-    /// then uploads and downloads around every drive regardless of the
-    /// canonical ownership -- `[RASBERY][NODAL][CANON]` reads
-    /// `elided_upload_bytes: 0` in that mode against 212 MB elided on the
-    /// per-instance path.  MEASURED, kngr3 at width 2 and width 4 alike: the
-    /// segment dropped the bridge, the arena uploaded the stale host Jnet over
-    /// the jnet updjnet had just written, and statepoint 1 came out at 800.33
-    /// ppm and 290 outers against the host's 770.15 and 263.
-    ///
-    /// So the segment asks HERE instead of assuming, and keeps its bridge when
-    /// the answer is no -- which costs 2 x nsurf*ng doubles an outer and is
-    /// exact.  A process-wide, cached answer: the batched arena is engaged for
-    /// the whole run or not at all (nodalArenaWanted()).
-    [[nodiscard]] static bool canonicalNodalIsHonoured();
+    /// It answered `does the drive that consumes an adopted set actually read
+    /// it, or does it upload over it` -- and the only reason the question
+    /// existed is that the BATCHED nodal arena did the latter.  The arena now
+    /// addresses jnet/flux/phis through its view table and consults the same
+    /// elision predicate the per-instance arm does (CudaXsReconBackend.cu,
+    /// launchBatch), so both arms honour the binding and the device outer
+    /// segment can drop its jnet bridge on every arm rather than only the one.
 
     /// THE OBSERVATION API (Rev.7 Sec 3.3).  With the routine downloads elided,
     /// the host Geometry arrays no longer track the device -- so a host consumer

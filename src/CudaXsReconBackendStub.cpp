@@ -84,7 +84,6 @@ void XsReconBackend::adoptCanonicalBuffers(const gpu::CanonicalSlotBuffers&) {}
 /// No device, no batched nodal arena, nothing to dishonour.  True keeps the
 /// caller's branch the same shape in both builds; the adoption it guards can
 /// never happen here anyway, because the set is always empty.
-bool XsReconBackend::canonicalNodalIsHonoured() { return true; }
 
 gpu::CanonicalSlotBuffers XsReconBackend::canonicalBuffers() const {
     return gpu::CanonicalSlotBuffers{};

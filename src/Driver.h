@@ -1411,16 +1411,24 @@ private:
         // drive runs.
         //
         // AND THE DRIVE HAS TO HONOUR THE BINDING, NOT JUST TAKE IT.  Rev.7.1
-        // Task 18-lite: the batched nodal arena accepts an adopted set into its
-        // view table and then uploads Geometry::Jnet over it on every drive.
-        // The segment, seeing the binding live, stops filling Geometry::Jnet --
-        // so the arena uploads an array that is one outer stale, and the deck
-        // converges somewhere else (kngr3 statepoint 1: 800.33 ppm in 290 outers
-        // against 770.15 in 263).  Asking XsReconBackend which nodal path this
-        // run uses keeps the bridge exactly where the binding would be a lie.
+        // Task 18-lite found that the BATCHED nodal arena accepted an adopted
+        // set into its view table and then uploaded Geometry::Jnet over it on
+        // every drive.  The segment, seeing the binding live, stops filling
+        // Geometry::Jnet -- so the arena uploaded an array one outer stale and
+        // the deck converged somewhere else (kngr3 statepoint 1: 800.33 ppm in
+        // 290 outers against 770.15 in 263).  The workaround was a third term
+        // here -- a static predicate that answered `will the drive that
+        // consumes an adopted set honour it` -- which kept the bridge for the
+        // whole run whenever the arena was engaged.
+        //
+        // Rev.7.1 Task 18 RETIRED THAT PREDICATE BY FIXING THE ARENA.  launchBatch
+        // now addresses jnet/flux/phis through the per-slot view table and
+        // consults gpu::canonicalElidesUpload/Download with the ownership each
+        // slot staged, which is the same predicate the per-instance arm has
+        // used since Task 7.  Both arms honour the binding, so the question has
+        // one answer and does not need asking.
         const bool nodal_on_device =
-            rasberyGpuNodalEnabled() && rasberyGpuNodalFullEnabled() &&
-            XsReconBackend::canonicalNodalIsHonoured();
+            rasberyGpuNodalEnabled() && rasberyGpuNodalFullEnabled();
         bool canonical_nodal = false;
         if (nodal_on_device) {
             const gpu::CanonicalSlotBuffers set =
