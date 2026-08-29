@@ -1,0 +1,61 @@
+{
+  "schema_version": 3,
+  "frozen": false,
+  "frozen_utc": "TBD_V3_FREEZE",
+  "supersedes": "validation_thresholds_v2.json",
+  "status": "SKELETON. Filled by the validation runner from the v3 freeze run on 238 (docs/V3_FREEZE_20260829_KO.md s6).",
+  "frozen_field_note": "MACHINE-CHECKABLE GUARD. Any consumer of this file must refuse it while \"frozen\" is false.",
+  "derivation": "The thresholds are UNCHANGED from v2 and v1. They were never noise-derived - they are engineering floors (plan Rev.4 s3.4) - so a new baseline trajectory does not move them, and v3 does not move them either. What v3 changes is the TRAJECTORY they are measured against, and this time by four components rather than one: the device outer segment (B0, bit-identical, in the baseline because it is free), the chunked Wielandt fold and the device Xe Anderson algebra (N1, both re-associate a reduction), and the A2 staged tolerance (N1, changes what the loop converges to on the way to converging to the production tolerance). Each was gated on its own before it reached this file. v3 is where they are measured together, once, and become the reference. THE THING TO WATCH is that none of the four is a code default: every one is reached through the environment, and a run with an empty arm env is a v2 run and must be gated against v2. That is why v3_run_identity below is stricter than v2's was - a v3 baseline has to prove its arm, and it can now do so from one receipt.",
+  "gate_a_vs_rasbery_baseline": {
+    "keff_pcm": 1.0,
+    "cbc_ppm": 1.0,
+    "final_cmfd_residual": "<= existing production tolerance (unchanged deck epsilons)",
+    "final_nonlinear_residual": "<= existing production tolerance",
+    "ao_abs": 0.005,
+    "fq_rel": 0.002,
+    "fr_rel": 0.002,
+    "node_power_rel_rms": 0.001,
+    "node_power_rel_max": 0.005,
+    "pin_power_rel_rms": 0.001,
+    "pin_power_rel_max": 0.005,
+    "xe_sm_inventory_rel": 1e-05,
+    "isotope_inventory_rel": 1e-05,
+    "burnup_rel": 1e-06,
+    "convergence_status": "no state may regress from converged to unconverged",
+    "all_statepoints": "finite and converged",
+    "reference_note": "A candidate carrying the v3 arm env is compared against the v3 baseline. A candidate with an empty arm env is compared against v2. Comparing across the two is a category error: the difference would be the adopted arm, not the change under test - the same mistake v2's note warned about for Anderson.",
+    "screening_note": "The v3 arm's Gate A delta against v2 is EXPECTED to be non-zero and is not by itself a verdict: three of the four components are N1. tools/gate_a_compare.py reports the size of the move; Gate B decides whether the move was toward MASTER or away from it."
+  },
+  "gate_a_master_nondegradation": {
+    "delta_RMS_pctpt": 0.02,
+    "delta_max_pctpt": 0.10,
+    "reference": "MASTER_pin_RMS(candidate) <= MASTER_pin_RMS(baseline) + delta_RMS; same for max. Baseline BOC pin RMS/max for v3: TBD_V3_FREEZE (v2: 0.238 pct / 0.80 pct; the 2026-08-29 A2 candidate measured 0.238 pct / 0.80 pct, i.e. no degradation)."
+  },
+  "gate_b_master_envelope": {
+    "reactivity_pcm": 2.0,
+    "cbc_ppm": 15.0,
+    "pin_rms_pct": 0.30,
+    "burnup_points": "BOC + mid-burnup + EOC pin distributions required",
+    "note": "Unchanged envelope, and it is the envelope that decides v3. The 2026-08-29 candidate entered it at 1.847 pcm / 15.334 ppm / AO 0.012, i.e. with MORE reactivity margin than the v2 baseline's 1.905 pcm. cbc_ppm at 15.334 is above the 15.0 floor and was inside the v2-referenced envelope of 15.309 by measurement rather than by threshold; the freeze must state which of the two it is being judged against and record the number either way."
+  },
+  "phase4_anderson": {
+    "axial_trust_ao_abs": 0.02,
+    "acceptance_rate_band_pp": 10.0,
+    "note": "abs(AO_candidate - AO_picard) <= axial_trust per plan s10.4. In v3 Anderson runs on the DEVICE (RASBERY_GPU_XE=1), which re-associates the six inner products; the acceptance-rate band is therefore a real gate again and not just a health check - a rate outside +-10 pp of v2's 95.0 pct means the algorithm changed, not the trajectory. The [RASBERY][XE_GPU] receipt carries proposed/accepted/rejected/reset_edges and host_fallbacks; host_fallbacks > 0 voids a v3 baseline run."
+  },
+  "instrumentation_neutrality": {
+    "gate": "tools/test_telemetry_neutrality.py --compare OFF.log TELEMETRY.log",
+    "requirement": "identical `env` and identical `digest` in the two [RASBERY][TRAJECTORY] receipts, with `telemetry` differing",
+    "void_if": "the two receipts disagree on `env` - that pair is an environment difference and says nothing about the instrumentation",
+    "note": "Wall time and I/O contention DO move with the telemetry and are expected to; that is why the telemetry run is separate from the timing repeats. The iteration must not move."
+  },
+  "v3_run_identity": {
+    "trajectory_receipt_required": "[RASBERY][TRAJECTORY] with env exactly: RASBERY_GPU=1, RASBERY_GPU_CMFD_SWEEP=1, RASBERY_GPU_CMFD_RESIDENT_SINGLE=1, RASBERY_GPU_NODAL=1, RASBERY_GPU_NODAL_FULL=1, RASBERY_GPU_XSRECON=1, RASBERY_GPU_FLATXS=1, RASBERY_GPU_OUTER=1, RASBERY_GPU_OUTER_SEGMENT_MAX=8, RASBERY_GPU_WIEL_FOLD=chunked, RASBERY_GPU_XE=1, RASBERY_STAGED_FLUX_TOL=50, RASBERY_STAGED_XE_TOL=1000, RASBERY_STAGED_LOOSE_SETTLE=1; RASBERY_XE_ANDERSON and RASBERY_XE_MODE null",
+    "single_deck_receipt_required": "[RASBERY][PHYSICS_MODE] exec_mode=\"single\", xe_anderson=true, xe_anderson_source=\"default\"",
+    "io_writer_receipt_required": "[RASBERY][IO_WRITER] mode=\"thread\", mode_source=\"default\"; [RASBERY][IO_WRITER][SUMMARY] failures=0, skipped=0",
+    "wiel_fold_receipt_required": "[RASBERY][CMFD][WIEL_FOLD] mode=\"chunked\", source=\"env\"",
+    "xe_gpu_receipt_required": "[RASBERY][XE_GPU] host_fallbacks=0",
+    "outer_gpu_receipt_required": "[RASBERY][OUTER_GPU] present with refusals empty",
+    "void_if": "any required receipt is missing, or the trajectory receipt's env does not match the arm above. An env-overridden run is an experiment, never a baseline - and in v3 the arm IS an env override, so the receipt is the only thing that separates the two."
+  }
+}

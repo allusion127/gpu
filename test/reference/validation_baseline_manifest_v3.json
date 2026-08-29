@@ -1,0 +1,111 @@
+{
+  "schema_version": 3,
+  "frozen": false,
+  "frozen_utc": "TBD_V3_FREEZE",
+  "supersedes": "validation_baseline_manifest_v2.json",
+  "status": "SKELETON. Every TBD_V3_FREEZE below is filled by the validation runner from the v3 freeze run on 238 (protocol in docs/V3_FREEZE_20260829_KO.md s6). Nothing here is authoritative until \"frozen\" is true.",
+  "frozen_field_note": "MACHINE-CHECKABLE GUARD. Any consumer of this file must refuse it while \"frozen\" is false - a template read as authoritative would gate a campaign on TBD_V3_FREEZE placeholders. The fill-in flips it to true in the same commit that replaces the last placeholder.",
+  "why_v3": "v2 froze the trajectory of a single-deck run whose only non-default component was Anderson Xe on the HOST. v3 freezes the production arm the Rev.7.1 campaign actually reaches: the outer body on the device (B0), the Wielandt fold chunked and the Xe Anderson algebra on the device (N1), and the A2 staged tolerance (N1). Three of those four are trajectory-changing by construction and each was gated separately; v3 is the point at which they are measured together, once, and the result becomes the reference every later Gate A is taken against.",
+  "baseline_commit_sha": "TBD_V3_FREEZE",
+  "branch": "codex/exact-throughput-campaign",
+  "compiler": "TBD_V3_FREEZE (238 toolchain; record the exact g++ path and version)",
+  "cuda_compiler": "TBD_V3_FREEZE (238 nvcc version and path)",
+  "release_flags": "TBD_V3_FREEZE (verify RASBERY_CUDA_ARCHITECTURES=120 through compile_commands.json, and the per-TU --fmad=false on CudaXsReconBackend.cu, exactly as v2 did)",
+  "gpu": {
+    "model": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "uuid": "TBD_V3_FREEZE",
+    "driver": "TBD_V3_FREEZE",
+    "cuda_runtime": "TBD_V3_FREEZE",
+    "host": "238 GPU0"
+  },
+  "benchmark_input": {
+    "deck": "kngr_238.json (APR1400/KNGR CY1 PSAR, 35-state natural EOC, quarter core 8451 nodes NG=2)",
+    "input_sha256": "ac6a28bae361dcd072abb742c1610bd05c03337b7a8a114cee488550231b51c7",
+    "env": "RASBERY_PPR_MODE=master RASBERY_PC_MODE=decart RASBERY_GPU=1 RASBERY_GPU_CMFD_SWEEP=1 RASBERY_GPU_CMFD_RESIDENT_SINGLE=1 RASBERY_GPU_NODAL=1 RASBERY_GPU_NODAL_FULL=1 RASBERY_GPU_XSRECON=1 RASBERY_GPU_FLATXS=1 RASBERY_GPU_OUTER=1 RASBERY_GPU_OUTER_SEGMENT_MAX=8 RASBERY_GPU_WIEL_FOLD=chunked RASBERY_GPU_XE=1 RASBERY_STAGED_FLUX_TOL=50 RASBERY_STAGED_XE_TOL=1000 RASBERY_STAGED_LOOSE_SETTLE=1 RASBERY_OMP_THREADS=12",
+    "env_note": "UNLIKE v2, the v3 baseline env is long, because v3 IS an arm. RASBERY_XE_ANDERSON stays DELIBERATELY ABSENT (single-deck default ON, and a baseline must exercise the default). RASBERY_STATEPOINT_TELEMETRY stays absent from the timing repeats. The [RASBERY][TRAJECTORY] receipt now records the raw value of every knob above, so a baseline run's arm is provable from its own log instead of from the shell history of whoever ran it."
+  },
+  "arm_components": {
+    "note": "One row per component of the v3 arm, with the gate class it was carried under and the single env that turns it off. Rollback is per row and needs no rebuild.",
+    "device_outer_segment": {
+      "env": "RASBERY_GPU_OUTER=1 RASBERY_GPU_OUTER_SEGMENT_MAX=8",
+      "gate_class": "B0",
+      "claim": "bit-identical to the host outer body; feature-off byte identity against the pre-feature binary is the gate, not Gate A/B",
+      "evidence": "TBD_V3_FREEZE (238 feature-off h5diff, datasets 0/N)"
+    },
+    "wielandt_fold_chunked": {
+      "env": "RASBERY_GPU_WIEL_FOLD=chunked",
+      "gate_class": "N1",
+      "claim": "a fixed partition of the fold range associates the additions differently from the serial reduction; the mode is opt-in and the [RASBERY][CMFD][WIEL_FOLD] receipt records mode and provenance",
+      "evidence": "TBD_V3_FREEZE (Gate A vs v2 baseline, Gate B vs MASTER)"
+    },
+    "gpu_xe_anderson": {
+      "env": "RASBERY_GPU_XE=1",
+      "gate_class": "N1",
+      "claim": "the six Anderson inner products move from a serial fold to k_xe_dot_reduce's fixed partition; the algebra, window, four safeguards and reset edges are the host arm's bit for bit (tools/test_xe_gpu_contract.py)",
+      "extra_gate": "Anderson acceptance rate within +-10 pp of the v2 measurement (95.0 pct); [RASBERY][XE_GPU] receipt required",
+      "evidence": "TBD_V3_FREEZE"
+    },
+    "a2_staged_tolerance": {
+      "env": "RASBERY_STAGED_FLUX_TOL=50 RASBERY_STAGED_XE_TOL=1000 RASBERY_STAGED_LOOSE_SETTLE=1",
+      "gate_class": "N1 (A2 workstream)",
+      "claim": "the solve converges to a multiplied tolerance while the statepoint is still moving; agreement at the loose tolerance is never an exit, only the trigger for a polish pass at production tolerance (tools/test_staged_tolerance.py pins the invariant)",
+      "extra_gate": "staged_relapses reported; a relapse count comparable to the search-trial count means the multiplier is too aggressive",
+      "evidence": "TBD_V3_FREEZE"
+    },
+    "resident_single_s2": {
+      "env": "RASBERY_GPU_CMFD_RESIDENT_SINGLE=1",
+      "gate_class": "B0",
+      "claim": "single-deck CMFD residency; bit-identical, measured 55.2 -> 48.7 s at 644/644 datasets identical",
+      "evidence": "docs (W2 Task 4-7 receipt), re-confirmed at v3 freeze: TBD_V3_FREEZE"
+    }
+  },
+  "adopted_defaults": {
+    "unchanged_from_v2": "io_writer=thread, xe_anderson single=ON / batch=OFF. v3 changes NO code default; every component above is reached through the environment and unset returns the v2 trajectory.",
+    "receipt_fields": "[RASBERY][PHYSICS_MODE], [RASBERY][IO_WRITER], [RASBERY][CMFD][WIEL_FOLD], [RASBERY][XE_GPU], [RASBERY][OUTER_GPU], and [RASBERY][TRAJECTORY] (new in v3, printed on every run)"
+  },
+  "golden_outputs": {
+    "single_deck_h5_sha256": "TBD_V3_FREEZE",
+    "trajectory_digest": "TBD_V3_FREEZE",
+    "trajectory_digest_note": "The [RASBERY][TRAJECTORY] receipt's `digest` field for the frozen run. A candidate claiming to reproduce the v3 baseline must print this digest; a candidate that does not is a different trajectory whatever its h5 says about the datasets it happened to compare.",
+    "repeats": "TBD_V3_FREEZE (>= 3 hot, warm-up excluded)",
+    "repeat_walls_s": "TBD_V3_FREEZE",
+    "determinism": "TBD_V3_FREEZE (h5diff -r across repeats; never cmp)",
+    "dataset_count": "TBD_V3_FREEZE",
+    "dataset_count_note": "v2 recorded 500 datasets; the local 1080 Ti tree writes 644 for the same deck. The freeze run must record what 238 actually compares and, if it is not 500, say in one line which commit added the datasets - a gate quoted as 0/500 against a file holding 644 is a gate that skipped 144 of them.",
+    "outers_total": "TBD_V3_FREEZE (base arm 10,483 -> v3 arm 3,114 measured 2026-08-29, to be re-measured at freeze)"
+  },
+  "instrumentation_neutrality": {
+    "claim": "RASBERY_STATEPOINT_TELEMETRY changes wall time and I/O contention only. It must not change the iteration.",
+    "gate": "tools/test_telemetry_neutrality.py --compare OFF.log TELEMETRY.log on the frozen arm: same env, same digest, telemetry differing",
+    "local_result_20260829": "PASS on 1080 Ti for the base arm (12,017 outers) and the v3 arm (4,602 outers), plus 644/644 h5 datasets identical in both pairs",
+    "result_238": "TBD_V3_FREEZE",
+    "history": "The v2 manifest's anderson_health_at_freeze note says telemetry 'perturbs I/O contention' and must be run separately from the timing repeats. That remains true and is a WALL statement. The 238 A2 observation of 3,114 vs 4,393 outers was an ITERATION statement, which this gate exists to settle."
+  },
+  "master_comparison_data_version": "kngr_mas_sum.txt + mas_ppi_{boc,0060..0420} (MASTER 4.0 KNGQ01, campaign 2026-08-22..24); comparator tools/compare_master_rasbery.py",
+  "master_agreement_at_freeze": {
+    "reactivity_pcm": "TBD_V3_FREEZE (2026-08-29 candidate measurement: 1.847)",
+    "cbc_ppm": "TBD_V3_FREEZE (candidate: 15.334)",
+    "ao_abs": "TBD_V3_FREEZE (candidate: 0.012)",
+    "boc_pin_rms_pct": "TBD_V3_FREEZE (candidate: 0.238)",
+    "boc_pin_max_pct": "TBD_V3_FREEZE (candidate: 0.80)",
+    "envelope_note": "The candidate numbers in parentheses are the 2026-08-29 A2 measurement and are all inside the v2 envelope (2.0 pcm / 15.309 ppm / 0.013 / 0.238 pct / 0.80 pct). They are recorded here as the expected value of the freeze run, not as the freeze."
+  },
+  "anderson_health_at_freeze": {
+    "aa_proposed": "TBD_V3_FREEZE",
+    "aa_accepted": "TBD_V3_FREEZE",
+    "aa_rejected": "TBD_V3_FREEZE",
+    "aa_history_resets": "TBD_V3_FREEZE",
+    "acceptance_rate_pct": "TBD_V3_FREEZE (v2: 95.01; the N1 gate is +-10 pp)",
+    "source": "[RASBERY][SPTELEM][SUMMARY] and [RASBERY][XE_GPU] counters; requires RASBERY_STATEPOINT_TELEMETRY=1, which must be run SEPARATELY from the timing repeats (telemetry perturbs I/O contention, not the iteration - see instrumentation_neutrality)"
+  },
+  "throughput_baselines": {
+    "single_deck_wall_s": "TBD_V3_FREEZE (2026-08-29 candidate: 16.3 s against MASTER 27.2 s = 1.67x)",
+    "master_single_deck_wall_s": 27.2,
+    "m64_exact_cases_per_hour": "TBD_V3_FREEZE (batch adoption is NOT part of this freeze; see docs/V3_FREEZE_20260829_KO.md s5)",
+    "master_w16_cases_per_hour": 217.0
+  },
+  "threshold_file": "validation_thresholds_v3.json",
+  "threshold_file_sha256": "TBD_V3_FREEZE",
+  "threshold_file_note": "sha256 of the frozen threshold file recorded in the campaign report at each gate evaluation",
+  "v2_retention": "validation_thresholds_v2.json and validation_baseline_manifest_v2.json are kept UNTOUCHED as history. v2 remains the correct Gate A reference for any single-deck run whose arm env is empty, which is every run that does not opt in to the components above."
+}
