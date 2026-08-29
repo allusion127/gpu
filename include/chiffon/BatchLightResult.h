@@ -189,6 +189,7 @@ public:
     static void Write(const std::string& input,
                       const std::string& xs_path,
                       const std::string& case_key,
+                      const std::string& warm_state_path,
                       int step,
                       int substep,
                       double efpd,
@@ -225,6 +226,13 @@ public:
         // rather than as an empty string that a cache might index on.
         receipt["case_key"] = case_key.empty() ? nlohmann::ordered_json(nullptr)
                                                : nlohmann::ordered_json(case_key);
+        // WP10.2.  Where this case's BOC warm state was written, so a GA can
+        // seed the next generation from the light result it already reads --
+        // without grepping a log for [RASBERY][WARMSTART].  Null when the case
+        // was not asked to save one, which is the default.
+        receipt["warm_state"] = warm_state_path.empty()
+                                    ? nlohmann::ordered_json(nullptr)
+                                    : nlohmann::ordered_json(warm_state_path);
         receipt["cycle"] = CycleId();
         receipt["input_path"] = input;
         receipt["xs_path"] = xs_path;

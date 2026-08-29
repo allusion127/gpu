@@ -10,6 +10,7 @@
 #include "OuterTrace.h"
 #include "PPR.h"
 #include "Scheduler.h"
+#include "WarmState.h"
 #include "XSTiming.h"
 #include "XeGpuReceipt.h"
 #include "XeKernel.h"
@@ -982,6 +983,9 @@ private:
     /// --batch-mode wave may carry light screening cases and full elite cases
     /// side by side (see ResultMode in BatchLightResult.h).
     ResultMode  _result_mode = ResultMode::Full;
+    /// WP10.2 warm start.  Empty means off, on both halves.
+    std::string _warm_start_from;
+    std::string _warm_state_out;
     /// The trajectory fold of the last Drive(), for a caller that cannot grep
     /// stdout (WP8's --evaluator).  Written once, at the same place the
     /// trajectory receipt is printed; never read by the solver.
@@ -4196,9 +4200,39 @@ private:
     /// cause is the expensive one: two runs with different physics sharing one
     /// cache entry.  Values are RAW and unparsed, for the same reason the
     /// trajectory receipt reports them raw.
-    static casekey::Provenance caseKeyProvenance(const IO& input_output) {
+    /// A string that is safe inside a receipt's JSON.  Paths reach the
+    /// warm-start receipt, and a Windows path is full of backslashes: a receipt
+    /// that emitted them raw would be a receipt no parser could read, which is
+    /// the same as no receipt.
+    static std::string jsonString(const std::string& text) {
+        std::string out;
+        out.reserve(text.size());
+        for (const char c : text) {
+            switch (c) {
+                case '"':  out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\n': out += "\\n";  break;
+                case '\r': out += "\\r";  break;
+                case '\t': out += "\\t";  break;
+                default:
+                    if (static_cast<unsigned char>(c) < 0x20) out += ' ';
+                    else out += c;
+            }
+        }
+        return out;
+    }
+
+    static casekey::Provenance caseKeyProvenance(const IO& input_output,
+                                                 const std::string& warm_provenance) {
         casekey::Provenance p;
         p.deck_digest = input_output.deck_key_digest();
+        // WP10.2.  A warm start is N1 -- it can select a root where the
+        // Xe<->flux map has more than one -- so a warm-started answer is not
+        // interchangeable with a cold one and must not share its cache entry.
+        // The token is the parent state's CONTENT digest, and it is empty
+        // whenever the warm start was refused, because a refused warm start
+        // produced a cold run and should key like one.
+        p.warm_start = warm_provenance;
         const PhysicsFidelity fidelity = effectivePhysicsFidelity();
         p.fidelity = physicsFidelityName(fidelity);
         p.policy   = physicsPolicyName(fidelity);
@@ -4231,6 +4265,18 @@ public:
         : _input(input),
           _result_output(result_output),
           _result_mode(result_mode) {
+    }
+
+    /// WP10.2.  `from` seeds this case's BOC flux, boron and k_eff from a
+    /// parent's saved warm state; `save_to` writes this case's own BOC state
+    /// there for a child.  Either may be empty, and with both empty nothing in
+    /// the warm-start path runs at all -- feature-off is byte identity.
+    ///
+    /// PER DRIVER, not per process, and for the same reason ResultMode is: one
+    /// wave carries many candidates, and each has its own parent.
+    void setWarmStart(std::string from, std::string save_to) {
+        _warm_start_from = std::move(from);
+        _warm_state_out  = std::move(save_to);
     }
 
     /// What the last Drive() folded.  Valid only after Drive() returns.
@@ -4367,6 +4413,70 @@ public:
         if (!is_restart_run)
             cross_sections.ResetFluxAndCurrents(1.0);
 
+        // ===================================================================
+        // WP10.2 -- the warm start, applied HERE and nowhere else.
+        // ===================================================================
+        //
+        // AFTER ResetFluxAndCurrents, because that is what writes the cold
+        // guess this replaces; BEFORE the first SolveLoop, because the bucket
+        // it aims at (`initial`) is that solve.  A restart run is left alone:
+        // it already carries a converged flux for THIS core, which is a better
+        // seed than any sibling's and is an input rather than a guess.
+        //
+        // EVERY REFUSAL DEGRADES TO A COLD START.  A missing file, a foreign
+        // magic, a version bump, a geometry that does not match -- each returns
+        // a reason, the flux keeps the cold guess, and the receipt says which.
+        // A warm start that cannot be honoured must never become a wrong one.
+        std::string      warm_provenance;
+        std::string      warm_status      = "off";
+        std::string      warm_reason;
+        std::string      warm_save_status = _warm_state_out.empty() ? "off" : "pending";
+        std::string      warm_save_reason;
+        bool             warm_saved       = false;
+        long long        warm_initial_outers = 0;
+        warmstate::State warm{};
+        if (!_warm_start_from.empty()) {
+            warm_status = "cold_fallback";
+            warmstate::State parent{};
+            warm_reason = warmstate::load(_warm_start_from, parent);
+            if (warm_reason.empty()) {
+                warmstate::State here{};
+                here.ng   = static_cast<std::uint32_t>(geometry.ng());
+                here.nxyz = static_cast<std::uint32_t>(geometry.nxyz());
+                here.nx   = static_cast<std::uint32_t>(geometry.nx());
+                here.ny   = static_cast<std::uint32_t>(geometry.ny());
+                here.nz   = static_cast<std::uint32_t>(geometry.nz());
+                if (!parent.shapeMatches(here)) {
+                    warm_reason = std::format(
+                        "geometry mismatch: parent ng={} nxyz={} ({}x{}x{}) vs "
+                        "this case ng={} nxyz={} ({}x{}x{})",
+                        parent.ng, parent.nxyz, parent.nx, parent.ny, parent.nz,
+                        here.ng, here.nxyz, here.nx, here.ny, here.nz);
+                } else if (!std::isfinite(parent.keff) || parent.keff <= 0.1 ||
+                           parent.keff >= 3.0 || !std::isfinite(parent.boron) ||
+                           parent.boron < 0.0) {
+                    // A non-physical seed is worse than no seed: it would send
+                    // the first search trial somewhere the secant has to walk
+                    // back from.  Sec 10.2 asks for exactly this refusal.
+                    warm_reason = std::format("implausible seed: keff={} boron={}",
+                                              parent.keff, parent.boron);
+                } else {
+                    std::copy(parent.flux.begin(), parent.flux.end(),
+                              geometry.PhifMutable());
+                    // The boron seed reaches the search through the same door
+                    // the deck's does: StartCriticalSearch reads bppm(0).
+                    cross_sections.SetBoron(parent.boron);
+                    eigv        = parent.keff;
+                    warm_status = "applied";
+                    warm        = parent;
+                }
+            }
+            // CONTENT, not path: two runs can name one path and mean different
+            // files, and the case key has to tell them apart.
+            warm_provenance = warmstate::digest(_warm_start_from);
+            if (warm_status != "applied") warm_provenance.clear();
+        }
+
         if (is_restart_run)
             std::cout << std::format("  [RESTART] Continuing from '{}'\n", input_output.restart_path());
         else if (is_shuffle_run)
@@ -4404,17 +4514,18 @@ public:
         // which is cached per process (Sha256FileCached), so a 64-case batch
         // pays the 34 MB read once and every later case reads the cache.  The
         // deck digest itself was already folded during the parse.
-        const std::string case_key = casekey::keyOf(caseKeyProvenance(input_output));
-        _case_receipt.case_key     = case_key;
+        const std::string case_key =
+            casekey::keyOf(caseKeyProvenance(input_output, warm_provenance));
+        _case_receipt.case_key = case_key;
         std::cout << std::format(
             "  [RASBERY][CASE] {{\"schema_version\":1,\"case_key\":\"{}\",\"key_schema\":\"{}\","
             "\"core_op\":\"{}\",\"deck_digest\":\"{}\",\"fidelity\":\"{}\",\"policy\":\"{}\","
-            "\"result_mode\":\"{}\"}}\n",
+            "\"result_mode\":\"{}\",\"warm_start\":\"{}\"}}\n",
             case_key, casekey::kSchema, input_output.deck_key_core_op(),
             input_output.deck_key_digest(),
             physicsFidelityName(effectivePhysicsFidelity()),
             physicsPolicyName(effectivePhysicsFidelity()),
-            ResultModeName(_result_mode));
+            ResultModeName(_result_mode), warm_status);
 
         // Receipt keys (plan Rev.4 Sec 8.1).  result_stem() is empty until
         // OpenResult(), and light-result runs never call it, so fall back to the
@@ -4625,6 +4736,40 @@ public:
             // is allowed to differ between two runs of the same arm.
             sp_traj.step(step_number, total_outer, total_th, efpd, eigv, geometry.bppm(0));
 
+            // WP10.2 receipts.  `initial` is the bucket the warm start aims at
+            // (GA evaluator plan Sec 2.2: 347 of 4,609 outers), so it is tallied
+            // UNCONDITIONALLY -- one add per statepoint -- rather than only
+            // under RASBERY_STATEPOINT_TELEMETRY.  A lever whose before/after
+            // can only be read on a telemetry run is a lever that cannot be
+            // measured on the wall-timing run it is supposed to shorten.
+            warm_initial_outers += ctx.telemetry.outers_by_cause[sptelem::CAUSE_INITIAL];
+
+            // The BOC state, for a child.  FIRST STATEPOINT ONLY: every later
+            // one already starts from the previous statepoint's converged flux,
+            // which is the best warm start there is, so 34 more files would
+            // seed nothing.  Written after the statepoint publishes, so what is
+            // saved is what the receipt reported.
+            if (!_warm_state_out.empty() && !warm_saved) {
+                warm_saved = true;
+                warmstate::State out{};
+                out.ng   = static_cast<std::uint32_t>(geometry.ng());
+                out.nxyz = static_cast<std::uint32_t>(geometry.nxyz());
+                out.nx   = static_cast<std::uint32_t>(geometry.nx());
+                out.ny   = static_cast<std::uint32_t>(geometry.ny());
+                out.nz   = static_cast<std::uint32_t>(geometry.nz());
+                out.keff  = eigv;
+                out.boron = geometry.bppm(0);
+                out.efpd  = efpd;
+                out.flux.assign(geometry.Phif(),
+                                geometry.Phif() +
+                                    static_cast<std::size_t>(out.ng) * out.nxyz);
+                const std::filesystem::path save_path(_warm_state_out);
+                if (save_path.has_parent_path())
+                    std::filesystem::create_directories(save_path.parent_path());
+                warm_save_reason = warmstate::save(_warm_state_out, out);
+                warm_save_status = warm_save_reason.empty() ? "saved" : "save_failed";
+            }
+
             const auto io_start = std::chrono::steady_clock::now();
             {
                 outer_timing::Scope add(sptelem::PH_RESULT_ADD);
@@ -4644,6 +4789,7 @@ public:
                 outer_timing::Scope write_scope(sptelem::PH_RESULT_WRITE);
                 if (light_result) {
                     BatchLightResult::Write(_input, input_output.xs_path(), case_key,
+                                            warm_saved ? _warm_state_out : std::string(),
                                             schedule.step, schedule.substep,
                                             schedule.efpd, schedule.bu_avg,
                                             schedule.eigv, schedule.ppm,
@@ -4841,6 +4987,31 @@ public:
                     static_cast<double>(c.micxH2dBytes()) / (1024.0 * 1024.0),
                     c.bosReuses(), c.wallMs(), c.status());
             }
+        }
+
+        // WP10.2 receipt.  Printed ONLY when a warm start was asked for or
+        // saved: with both halves off nothing here runs and the log is the log
+        // of a build without this feature, which is what "feature-off identity"
+        // has to mean for a receipt as well as for a result.
+        //
+        // `initial_outers` is the number the A/B is decided on -- run the same
+        // deck cold and warm and compare it, then compare `outers` and wall.
+        // `keff_seed` / `boron_seed` are what the parent handed over, so a run
+        // that converged somewhere else can be asked whether the seed was the
+        // reason.
+        if (warm_status != "off" || warm_save_status != "off") {
+            std::cout << std::format(
+                "  [RASBERY][WARMSTART] {{\"schema_version\":1,\"slot\":{},"
+                "\"load\":\"{}\",\"load_path\":\"{}\",\"save\":\"{}\","
+                "\"save_path\":\"{}\",\"gate\":\"N1\",\"initial_outers\":{},"
+                "\"outers\":{},\"statepoints\":{},\"keff_seed\":{:.8f},"
+                "\"boron_seed\":{:.4f},\"efpd_seed\":{:.4f},\"provenance\":\"{}\","
+                "\"reason\":\"{}\"}}\n",
+                cmfd_solver.batchSlot(), warm_status, jsonString(_warm_start_from),
+                warm_save_status, jsonString(_warm_state_out), warm_initial_outers,
+                sp_traj.outers, sp_traj.statepoints, warm.keff, warm.boron, warm.efpd,
+                warm_provenance,
+                jsonString(warm_reason.empty() ? warm_save_reason : warm_reason));
         }
 
         const double total_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - driver_start).count();

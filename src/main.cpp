@@ -48,6 +48,25 @@ namespace {
 
 constexpr int RASBERY_OMP_THREADS = 8;
 
+/// WP10.2.  Where a job's warm state goes.
+///
+/// The DERIVED default keys off the job's OUTPUT path, deliberately, and it is
+/// the same rule Driver::RestartPath already uses: `--raso` is the one string
+/// main() and the launcher both guarantee is unique per deck, so deriving from
+/// it is what makes "distinct outputs implies distinct warm-state namespace"
+/// true.  An explicit path is honoured as given -- and refused for a multi-job
+/// run below, because N decks writing one file is N-1 lost states and one
+/// arbitrary winner.
+std::string WarmStatePath(bool enabled, const std::string& explicit_path,
+                          const std::string& output) {
+    if (!enabled) return {};
+    if (!explicit_path.empty()) return explicit_path;
+    const std::filesystem::path out(output);
+    const std::string           stem = out.stem().string();
+    return (out.parent_path() / ((stem.empty() ? std::string("result") : stem) + ".warm"))
+        .string();
+}
+
 /// Live process affinity capacity straight from the kernel, or 0 when the
 /// platform/query cannot answer.  Only trustworthy while nothing has bound the
 /// calling thread yet -- see rasberyVisibleCpuThreads() below.
@@ -386,6 +405,12 @@ int main(int argc, char* argv[]) {
     std::string evaluator_request_path    = "-"; ///< "-" is stdin
     double      evaluator_idle_timeout    = -1.0;
     bool        evaluator_isolation_check = false;
+    // WP10.2 warm start.  Empty means off; `--save-warm-state` with no path
+    // derives one per job from that job's output, so a batch cannot have two
+    // decks writing one warm-state file.
+    std::string warm_start_from;
+    std::string warm_state_out;
+    bool        save_warm_state = false;
 
     int argi = 1;
     while (argi < argc) {
@@ -419,6 +444,30 @@ int main(int argc, char* argv[]) {
         if (option == "--evaluator-isolation-check") {
             evaluator_isolation_check = true;
             ++argi;
+            continue;
+        }
+
+        // WP10.2.  Handled HERE, before the generic value-consuming loop,
+        // because --save-warm-state takes an OPTIONAL path (default: derived
+        // from the job's own output namespace) and that loop rejects any option
+        // not followed by a value.
+        if (option == "--warm-start-from") {
+            ++argi;
+            if (argi >= argc || std::string(argv[argi]).rfind("--", 0) == 0) {
+                std::cerr << "Missing value after option: " << option << std::endl;
+                return 1;
+            }
+            warm_start_from = argv[argi];
+            ++argi;
+            continue;
+        }
+        if (option == "--save-warm-state") {
+            save_warm_state = true;
+            ++argi;
+            if (argi < argc && std::string(argv[argi]).rfind("--", 0) != 0) {
+                warm_state_out = argv[argi];
+                ++argi;
+            }
             continue;
         }
 
@@ -484,7 +533,24 @@ int main(int argc, char* argv[]) {
                       << "    which the controller may append to; stdin stops at EOF.\n"
                       << "  - --evaluator-isolation-check re-runs each wave's FIRST deck once\n"
                       << "    more at the END of that wave and compares the two digests --\n"
-                      << "    the A -> ... -> A cross-case leak test, run in production.\n";
+                      << "    the A -> ... -> A cross-case leak test, run in production.\n"
+                      << "  - --warm-start-from FILE seeds this case's BOC flux, critical\n"
+                      << "    boron and k_eff from a parent case's saved warm state, which\n"
+                      << "    shortens the `initial` outer bucket (7.5 % of a case).  It is\n"
+                      << "    GATE N1: a different starting point may select a different\n"
+                      << "    root, so the digest MAY move and the gate is keff/CBC/Fq/FdH\n"
+                      << "    inside the acceptance thresholds -- not digest equality.  Any\n"
+                      << "    refusal (missing file, wrong geometry, implausible seed)\n"
+                      << "    degrades to a COLD start and says so in [RASBERY][WARMSTART].\n"
+                      << "    Unset, nothing in that path runs.\n"
+                      << "  - --save-warm-state [FILE] writes this case's BOC state for a\n"
+                      << "    child to warm-start from.  With no FILE the path is derived\n"
+                      << "    per job from its --raso (<dir>/<stem>.warm), so a batch cannot\n"
+                      << "    have two decks writing one file.  It is independent of\n"
+                      << "    --result: light writes no restart, and this is the channel\n"
+                      << "    that replaces it for seeding.\n"
+                      << "    Evaluator requests take the same two as \"warm_start_from\"\n"
+                      << "    and \"save_warm_state\" per case.\n";
             return 0;
         }
 
@@ -584,6 +650,18 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
         }
+    }
+
+    // WP10.2, and the SAME namespace rule one line down: an explicit
+    // --save-warm-state path with more than one deck is N decks writing one
+    // file -- N-1 lost states and an arbitrary winner.  Refused by name rather
+    // than silently, because the run would otherwise look like it worked and
+    // the child would warm-start from the wrong parent.
+    if (save_warm_state && !warm_state_out.empty() && rasbery_outputs.size() > 1) {
+        std::cerr << "--save-warm-state with an explicit path takes exactly one deck ("
+                  << rasbery_outputs.size() << " given). Drop the path and each job "
+                     "derives its own from its --raso." << std::endl;
+        return 1;
     }
 
     // -----------------------------------------------------------------------
@@ -1110,6 +1188,10 @@ int main(int argc, char* argv[]) {
                     rasbery::Driver driver(rasbery_inputs[static_cast<std::size_t>(i)],
                                            rasbery_outputs[static_cast<std::size_t>(i)],
                                            rasbery_result_modes[static_cast<std::size_t>(i)]);
+                    driver.setWarmStart(
+                        warm_start_from,
+                        WarmStatePath(save_warm_state, warm_state_out,
+                                      rasbery_outputs[static_cast<std::size_t>(i)]));
                     job_status[static_cast<std::size_t>(i)] = driver.Drive();
                 }
             } catch (const std::exception& error) {
@@ -1261,6 +1343,9 @@ int main(int argc, char* argv[]) {
         try {
             rasbery::Driver driver(rasbery_input_path.string(), rasbery_output_path.string(),
                                    rasbery_result_modes[i]);
+            driver.setWarmStart(warm_start_from,
+                                WarmStatePath(save_warm_state, warm_state_out,
+                                              rasbery_output_path.string()));
             driver_exit_code = driver.Drive();
         } catch (const std::exception& error) {
             driver_exit_code = 1;

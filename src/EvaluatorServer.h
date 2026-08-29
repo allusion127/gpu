@@ -107,6 +107,14 @@ struct CaseRequest {
     std::string key;                  ///< opaque candidate key, echoed back
     ResultMode  result_mode = ResultMode::Full;
     std::string fidelity;             ///< declared, VALIDATED, never applied
+    /// WP10.2.  `warm_start_from` seeds this case's BOC flux/boron/keff from a
+    /// parent's saved state; `save_warm_state` writes this case's own for a
+    /// child.  Both empty is the default and runs nothing.  This is the field
+    /// a generation-to-generation warm start travels on: the controller names
+    /// the parent it chose, and the evaluator refuses -- to a COLD start, in
+    /// the receipt -- anything it cannot honour.
+    std::string warm_start_from;
+    std::string save_warm_state;
 };
 
 /// One generation.
@@ -354,6 +362,23 @@ inline bool parseCase(const nlohmann::json& object, ResultMode default_mode, Cas
             return false;
         }
     }
+    // WP10.2.  Both are plain strings and both default to empty (= off); a
+    // non-string is refused by name rather than coerced, because a warm start
+    // the client thought it asked for and did not get is a silent A/B.
+    if (object.contains("warm_start_from")) {
+        if (!object["warm_start_from"].is_string()) {
+            error = R"("warm_start_from" must be a string)";
+            return false;
+        }
+        out.warm_start_from = object["warm_start_from"].get<std::string>();
+    }
+    if (object.contains("save_warm_state")) {
+        if (!object["save_warm_state"].is_string()) {
+            error = R"("save_warm_state" must be a string)";
+            return false;
+        }
+        out.save_warm_state = object["save_warm_state"].get<std::string>();
+    }
     if (object.contains("key")) {
         if (!object["key"].is_string()) {
             error = R"("key" must be a string)";
@@ -402,6 +427,8 @@ struct WaveJobs {
     std::vector<std::string> outputs;
     std::vector<ResultMode>  modes;
     std::vector<std::string> keys;
+    std::vector<std::string> warm_from;
+    std::vector<std::string> warm_save;
 };
 
 class Server {
@@ -606,14 +633,20 @@ private:
                 return;
             }
             jobs.keys.assign(jobs.inputs.size(), std::string());
+            jobs.warm_from.assign(jobs.inputs.size(), std::string());
+            jobs.warm_save.assign(jobs.inputs.size(), std::string());
         }
         for (const CaseRequest& c : wave.cases) {
             jobs.inputs.push_back(c.deck);
             jobs.outputs.push_back(c.output);
             jobs.modes.push_back(c.result_mode);
             jobs.keys.push_back(c.key);
+            jobs.warm_from.push_back(c.warm_start_from);
+            jobs.warm_save.push_back(c.save_warm_state);
         }
         jobs.keys.resize(jobs.inputs.size());
+        jobs.warm_from.resize(jobs.inputs.size());
+        jobs.warm_save.resize(jobs.inputs.size());
         if (jobs.inputs.empty()) {
             refuse("a wave with no jobs (neither \"jobs_manifest\" nor preceding "
                    "\"op\":\"case\" lines)",
@@ -697,6 +730,8 @@ private:
             runOneCase(jobs.inputs[static_cast<std::size_t>(i)],
                        jobs.outputs[static_cast<std::size_t>(i)],
                        jobs.modes[static_cast<std::size_t>(i)],
+                       jobs.warm_from[static_cast<std::size_t>(i)],
+                       jobs.warm_save[static_cast<std::size_t>(i)],
                        status[static_cast<std::size_t>(i)],
                        failure[static_cast<std::size_t>(i)],
                        receipts[static_cast<std::size_t>(i)],
@@ -747,7 +782,12 @@ private:
             Driver::CaseReceipt  recheck;
             double               recheck_seconds  = 0.0;
             double               recheck_teardown = 0.0;
-            runOneCase(jobs.inputs[u0], recheck_output, jobs.modes[u0], recheck_status,
+            // The isolation recheck is a REPEAT of the first deck, and it must
+            // repeat the same case: the same warm start in, and NO warm state
+            // out -- writing one would overwrite the parent state the wave's own
+            // first case just produced.
+            runOneCase(jobs.inputs[u0], recheck_output, jobs.modes[u0], jobs.warm_from[u0],
+                       std::string(), recheck_status,
                        recheck_error, recheck, recheck_seconds, recheck_teardown);
             ++_summary.isolation_checks;
             if (njobs < 2) ++_summary.isolation_adjacent;
@@ -812,6 +852,7 @@ private:
     /// batch branch scopes it before jobFinished(): the number this mode has to
     /// keep small is the refill latency, and teardown IS that latency.
     static void runOneCase(const std::string& deck, const std::string& output, ResultMode mode,
+                           const std::string& warm_from, const std::string& warm_save,
                            int& status, std::string& failure, Driver::CaseReceipt& receipt,
                            double& seconds, double& teardown_ms) {
         const auto started = std::chrono::steady_clock::now();
@@ -824,6 +865,7 @@ private:
         try {
             {
                 Driver driver(deck, output, mode);
+                driver.setWarmStart(warm_from, warm_save);
                 status  = driver.Drive();
                 drove   = std::chrono::steady_clock::now();
                 receipt = driver.caseReceipt();
