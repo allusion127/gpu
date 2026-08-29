@@ -191,6 +191,33 @@ def source_contract() -> None:
     if sha_h.count("0x428a2f98u") != 1:
         fail("Sha256.h does not carry exactly one K table")
 
+    # 9. THE LIBRARY DIGEST MUST BE ABLE TO EXPIRE.  One hash transform, two
+    #    caching policies: BatchLightResult::Sha256FileCached memoises by PATH
+    #    ALONE and never expires, which was harmless when a process was one
+    #    deck and is not now that the evaluator worker (WP8.1.5) is a process
+    #    that outlives a library rebuild -- it would keep stamping the digest
+    #    of a file that is no longer there.  The key bytes are the same either
+    #    way while the file is unchanged; what differs is whether "unchanged"
+    #    is ever re-checked.  XsLibraryContentDigest memoises by
+    #    (path, size, mtime) and is the digest the library cache itself keys on.
+    i = DRIVER_H.find("casekey::Provenance caseKeyProvenance(")
+    if i < 0:
+        fail("Driver.h no longer has caseKeyProvenance; the case key's provenance "
+             "must be assembled in exactly one place")
+    else:
+        body = DRIVER_H[i:DRIVER_H.find("\n    }", i)]
+        # Comments stripped: this function's comment says WHY it is not
+        # Sha256FileCached, and a rule that read the reason as the offence
+        # would forbid the tree from explaining itself.
+        code = re.sub(r"//[^\n]*", "", body)
+        if "XsLibraryContentDigest(" not in code:
+            fail("caseKeyProvenance does not take xslib_digest from "
+                 "XsLibraryContentDigest ((path, size, mtime)-memoised); a digest "
+                 "memoised by path alone cannot notice a library rebuild")
+        if "Sha256FileCached" in code:
+            fail("caseKeyProvenance still reaches for Sha256FileCached, which "
+                 "memoises by path alone and never expires")
+
 
 # ---------------------------------------------------------------------------
 # BEHAVIOUR HALF

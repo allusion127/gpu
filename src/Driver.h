@@ -14,6 +14,7 @@
 #include "XSTiming.h"
 #include "XeGpuReceipt.h"
 #include "XeKernel.h"
+#include "XsLibrary.h"
 
 #include <algorithm>
 #include <atomic>
@@ -4269,9 +4270,20 @@ private:
         p.policy   = physicsPolicyName(fidelity);
         // The library's CONTENT, not its path: two decks naming the same file
         // through different mount points are the same case, and two files at
-        // one path across a library update are not.  Cached per process.
+        // one path across a library update are not.
+        //
+        // XsLibraryContentDigest, NOT BatchLightResult::Sha256FileCached.  Both
+        // stream the same bytes through the same Sha256, so the key bytes are
+        // identical while the file is; they differ only in WHEN they stop
+        // looking.  Sha256FileCached memoises by PATH ALONE and never expires,
+        // and the evaluator server (WP8.1.5) is now a process that outlives a
+        // library rebuild -- it would have gone on serving the digest of a file
+        // that is no longer there, and stamped a stale key onto answers computed
+        // from the new one.  XsLibraryContentDigest memoises by
+        // (path, size, mtime) and is the SAME digest the library cache keys on,
+        // so the case key and the cache it addresses cannot disagree.
         if (!input_output.xs_path().empty())
-            p.xslib_digest = BatchLightResult::Sha256FileCached(input_output.xs_path());
+            p.xslib_digest = XsLibraryContentDigest(input_output.xs_path());
         for (const char* name : trajectory::kArmEnv) {
             const char* value = std::getenv(name);
             p.env.emplace_back(name, value != nullptr ? std::string(value) : std::string());
@@ -4542,7 +4554,8 @@ public:
         // has to be able to answer without having been asked in advance.
         //
         // COST.  One SHA-256 of a ~1 kB payload, plus the XS library digest --
-        // which is cached per process (Sha256FileCached), so a 64-case batch
+        // which is memoised per process by (path, size, mtime)
+        // (XsLibraryContentDigest), so a 64-case batch
         // pays the 34 MB read once and every later case reads the cache.  The
         // deck digest itself was already folded during the parse.
         const std::string case_key =
