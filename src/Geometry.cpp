@@ -13,7 +13,6 @@ Geometry::Geometry() {
     _nxe          = nullptr;
     _nys          = nullptr;
     _nye          = nullptr;
-    _comps        = nullptr;
     _neib         = nullptr;
     _hmesh        = nullptr;
     _lktosfc      = nullptr;
@@ -88,7 +87,6 @@ Geometry::~Geometry() {
     delete[] _nxe;
     delete[] _nys;
     delete[] _nye;
-    delete[] _comps;
     delete[] _neib;
     delete[] _hmesh;
     delete[] _lktosfc;
@@ -347,7 +345,6 @@ void Geometry::Initialize(const GeometryInput& in) {
     double hx = in.hx / _ndivxy;
     double hy = in.hy / _ndivxy;
 
-    _comps   = new int[_nxyz];
     _neib    = new int[NEWSBT * _nxyz];
     _hmesh   = new double[NDIRMAX * _nxyz];
     _lktosfc = new int[NEWSBT * _nxyz];

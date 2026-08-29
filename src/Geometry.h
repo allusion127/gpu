@@ -165,8 +165,15 @@ private:
     int  _symang; // symmetry angle (90 / 360)
     bool _symdiv; // center assembly divided
 
-    // Composition / form-function
-    int*  _comps;   // composition index per node [nxyz]
+    // Composition / form-function.
+    //
+    // There is no `_comps` here.  It was `new int[_nxyz]` -- uninitialised --
+    // and NOTHING ever wrote it or read it: the composition index the solver
+    // uses is XSSet::_comp (XSSet.h:587), a std::size_t array on a different
+    // object.  It survived only because Geometry's constructor nulls, allocates
+    // and deletes it like a real member, and because the GPU arena catalogued
+    // it as a region (GpuPhysicsArenaLayout.h) and so published a device pointer
+    // to nxyz ints no import had ever filled.
     int   _ncomp;   // number of compositions
     bool* _is_fuel; // fuel flag per node [nxyz]
 
@@ -372,12 +379,6 @@ public:
 
     /// @brief Assembly rotation array for a given assembly
     inline int* larot(int la) { return &_larot[la * _ndivxy2]; }
-
-    /// @brief Composition index per node
-    inline int& comp(int lk) { return _comps[lk]; }
-
-    /// @brief Composition index array
-    inline int* comps() { return _comps; }
 
     /// @brief Whether a 3D node is fuel
     [[nodiscard]] inline bool IsFuel(int lk) const { return _is_fuel[lk]; }

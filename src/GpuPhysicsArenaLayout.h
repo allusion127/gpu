@@ -145,6 +145,17 @@ inline constexpr ArenaDims arenaDims(int nxyz, int nsurf, int nxy, int n_fuel, i
 
 /// Immutable shared geometry (Sec 3.3): ONE copy for the whole cohort, placed
 /// below the slot base so no slot stride can reach it.
+///
+/// There is deliberately NO `Comps` region, for the same reason LibraryRegion
+/// has no `knot_offsets`.  `Geometry::_comps` was allocated (`new int[_nxyz]`,
+/// so uninitialised) and then never written by anything, and never read either:
+/// the composition index the solver actually uses is `XSSet::_comp`
+/// (XSSet.h:587), a different array of a different type.  A region for it
+/// reserved nxyz*4 bytes of VRAM and, worse, made `DeviceGeometryView::comps`
+/// a NON-NULL pointer into arena bytes no import had ever touched -- a field
+/// that reads as available and dereferences to whatever the arena last held.
+/// If a kernel ever needs the composition map, the region to add is XSSet's,
+/// with an importGeometryAsync that actually fills it.
 enum class GeometryRegion : int {
     Hmesh = 0,
     Hz,
@@ -160,7 +171,6 @@ enum class GeometryRegion : int {
     Lktosfc,
     Ltola,
     Ltolc,
-    Comps,
     FuelNodes,
     IsFuel,
     Count
@@ -418,7 +428,6 @@ inline constexpr std::size_t arenaGeometryElements(GeometryRegion r, const Arena
         case GeometryRegion::Lktosfc:   return nxyz * kDevNdirMax * kDevLr;
         case GeometryRegion::Ltola:     return nxy;
         case GeometryRegion::Ltolc:     return nxy * kDevNews;
-        case GeometryRegion::Comps:     return nxyz;
         case GeometryRegion::FuelNodes: return static_cast<std::size_t>(d.n_fuel);
         case GeometryRegion::IsFuel:    return nxyz;
         case GeometryRegion::Count:     break;

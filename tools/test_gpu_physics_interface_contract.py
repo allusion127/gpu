@@ -395,6 +395,27 @@ for backed in ("lib_flux", "lib_chix"):
 need("LibraryRegion::LibFlux" in LAYOUT and "LibraryRegion::LibChix" in LAYOUT,
      "lib_flux / lib_chix have no arena region behind them")
 
+# The same rule for the GEOMETRY view, where it had actually been broken.
+# `DeviceGeometryView::comps` had an arena region (GeometryRegion::Comps, nxyz
+# ints of VRAM per cohort) whose only host backing was Geometry::_comps --
+# `new int[nxyz]`, so uninitialised, and written by NOTHING.  Nothing read it on
+# the host either: the composition index the solver uses is XSSet::_comp
+# (XSSet.h), a std::size_t array on a different object.  So a kernel that
+# believed the name would have read whatever the arena last held, and the
+# pointer was non-null, which is the way this kind of hole survives review.
+LAYOUT_CODE = strip_comments(LAYOUT)
+GEOMETRY_CODE = strip_comments((SRC / "Geometry.h").read_text(encoding="utf-8-sig"))
+geometry_view = struct_body("DeviceGeometryView", TYPES_CODE)
+need("comps" not in geometry_view,
+     "DeviceGeometryView declares `comps` again; no host array fills it "
+     "(Geometry::_comps was allocated and never written)")
+need("Comps" not in LAYOUT_CODE,
+     "the arena catalogues a Comps geometry region again; nothing imports into it, "
+     "so the view would publish uninitialised device memory")
+need("_comps" not in GEOMETRY_CODE,
+     "Geometry::_comps is back -- an uninitialised [nxyz] array no code writes or "
+     "reads; XSSet::_comp is the composition map")
+
 # The BOS microscopic snapshot is FOUR slots, not eleven (Sec 6.18).
 need("kBosMicroXtCount = 4" in TYPES_CODE,
      "GpuPhysicsTypes.h does not pin the BOS microscopic snapshot at 4 slots")

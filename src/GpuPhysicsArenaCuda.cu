@@ -334,7 +334,6 @@ DeviceGeometryView GpuPhysicsArena::geometryView() const {
     v.lktosfc = atOrNull<int>(b, go(GeometryRegion::Lktosfc));
     v.ltola   = atOrNull<int>(b, go(GeometryRegion::Ltola));
     v.ltolc   = atOrNull<int>(b, go(GeometryRegion::Ltolc));
-    v.comps   = atOrNull<int>(b, go(GeometryRegion::Comps));
     v.fuel_nodes = atOrNull<int>(b, go(GeometryRegion::FuelNodes));
     v.is_fuel    = atOrNull<int>(b, go(GeometryRegion::IsFuel));
 

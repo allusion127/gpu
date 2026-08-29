@@ -169,7 +169,6 @@ struct DeviceGeometryView {
     const int* lktosfc; ///< [(l*NDIRMAX + dir)*LR + side]
     const int* ltola;   ///< [nxy]
     const int* ltolc;   ///< [NEWS*nxy]
-    const int* comps;   ///< [nxyz]
 
     const int* fuel_nodes; ///< [n_fuel], built once at setup
     const int* is_fuel;    ///< [nxyz], 0/1 (int, not bool: bool has no device ABI guarantee)
