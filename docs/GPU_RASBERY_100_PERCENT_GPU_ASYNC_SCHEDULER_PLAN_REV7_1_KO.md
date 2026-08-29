@@ -2113,6 +2113,141 @@ W3의 device-side outer가 가려는 방향이며 이 절의 범위가 아니다
 따라 암묵적 device 동기화를 하고, 다른 스레드가 `core.stream`에 열어 둔 capture는 그걸로 무효화
 된다. 발생 시점(각 덱의 첫 sweep 준비 구간)과 정확히 겹친다. `stream_mutex` 아래로 넣거나 첫
 launch 전에 전부 끝내는 것이 후보 처방이며, **자체 게이트가 필요한 별도 작업**이다.
+**[Task 18d에서 종결. 용의자 지목은 절반만 맞았다 — 아래를 보라.]**
+
+### Task 18d: capture 창은 프로세스의 모든 할당과 배타적이다 — **[완료]**
+
+**증상(§18c "별건 결함"의 그것).** 4acff55, 로컬 1080 Ti, `--batch-mode` + `RASBERY_GPU_OUTER=1
+SEGMENT_MAX=8`. 사전 측정한 사망률은 문서에 적힌 것보다 높다:
+
+| | 사망 / 20회 | 죽을 때의 wall |
+| --- | --- | --- |
+| M=8 | **4 / 20 (20 %)** | 1.68–1.83 s |
+| M=16 | **3 / 20 (15 %)** | 3.86–4.33 s |
+
+**진단 1 — 첫 실패는 capture 창 *안*에서 났고, 나머지 일곱은 그 뒤처리였다.**
+
+죽은 실행의 `[RASBERY][FAIL]`을 순서대로 읽으면 한 줄로 갈린다.
+
+```text
+d0.json  cudaMemcpyAsync(host_status, device_status, …): operation failed due to a previous error during capture
+d1..e3   cudaMemcpyAsync(d_slot_map, map, …):           operation failed due to a previous error during capture
+```
+
+첫 줄의 `cudaMemcpyAsync(host_status, …)`는 `enqueue_outer`의 상태 D2H, 즉 **capture 창 안에서
+기록되는 노드**다(`CudaBICGBackend.cu`). 그러니 사건은 "누군가 capture를 무효화했다" 하나이고,
+나머지 일곱 덱은 그 이후 `core.stream`을 만진 죄밖에 없다.
+
+**진단 2 — 무효화의 범인은 `pinHost`가 아니라 `cudaDeviceSynchronize`다.**
+
+`[RASBERY][CAPTURE]` 수신증(스레드 서수 · 스트림 · 그 순간 열려 있는 capture 수)과
+`RASBERY_GPU_CAPTURE_STALL_US`(capture 창을 인위로 넓히는 진단 노브)를 붙여 8덱 배치를 5회
+돌렸다. 창을 200 ms로 벌리면 4 / 5가 죽는다 — 그리고 **죽은 실행과 산 실행을 가르는 것은 창
+안에 들어온 API의 종류 하나뿐이다.**
+
+| run | 창 안의 `cudaHostRegister` | 창 안의 `cudaDeviceSynchronize` | 결과 |
+| --- | --- | --- | --- |
+| 1 | 73 | **0** | **생존** |
+| 2 | 248 | 2 | 사망 |
+| 3 | 65 | 1 | 사망 |
+| 4 | 57 | 1 | 사망 |
+| 5 | 57 | 1 | 사망 |
+
+**동시 `cudaHostRegister` 73건은 capture를 죽이지 못한다. `cudaDeviceSynchronize` 1건은 매번
+죽인다.** 그 한 건은 `CudaOuterGraph.cu`의 `CudaOuterSegment::bindResidency` — 슬롯 뷰를
+패치하는 `k_cmfd_bind_resident` 뒤의 device-wide drain이고, **모든 덱의 arming 경로에** 있다.
+§18c가 지목한 `BICGCMFD.cpp`의 최초 1회 `pinHost`는 *공범*이다: 그것이 늦은 덱의 스레드를
+정확히 그 시각에 device API 위에 올려놓아 창이 겹칠 확률을 만든다. 방아쇠는 아니다.
+
+capture는 네 곳(CMFD outer · CMFD sweep · nodal bucket · nodal instance) 모두
+`cudaStreamCaptureModeThreadLocal`로 열려 있었고, 그것이 이 결함이
+조용했던 이유다 — ThreadLocal은 **캡처하는 스레드만** 막는다. 형제 스레드는 막지 않고, 그
+스레드의 device 동기화가 남의 capture를 대신 무효화한다.
+
+**진단 3 — 한 덱의 사고가 배치의 사망이 된 이유는 두 줄이다.**
+
+```cpp
+rc = cudaStreamBeginCapture(stream, …);
+if (rc == cudaSuccess) { enqueue_outer(nmax); rc = cudaStreamEndCapture(stream, &graph); }
+```
+
+`enqueue_outer`는 `CUDA_CHECK`한다 — 즉 **던진다**. 던지면 `cudaStreamEndCapture`를 건너뛰고,
+arena 스트림은 프로세스가 끝날 때까지 capture 모드에 남는다. 그 뒤 그 스트림에 닿는 모든 것이
+900/901이 된다. §18c가 관측한 `cudaStreamSynchronize(_impl->core.stream): operation not
+permitted when stream is capturing`이 바로 그 잔해다.
+
+**처방 — 규칙 하나와 가드 하나.**
+
+1. **`src/GpuCaptureArbiter.h` (신설, 헤더 전용 · CUDA 비의존).** capture 창은 프로세스의 모든
+   할당 · 등록 · device-wide 동기화와 **배타적**이다. shared_mutex를 뒤집어 쓴다: 드문 쪽
+   (capture)이 writer, 흔한 쪽(할당)이 reader. 재진입 두 경우(창 안의 할당 · 할당 안의 창)는
+   스레드 로컬 깊이로 판정해 **잠그지 않는다** — 그래서 교착이 구조적으로 불가능하다.
+   `RASBERY_GPU_CAPTURE_ARBITER=0`은 계수와 추적은 남기고 직렬화만 끈다(위 A/B가 그것이다).
+2. **`ScopedStreamCapture` (CudaBICGBackend.cu).** 소멸자가 창을 닫는다. 그리고 창 안의 enqueue를
+   `try`로 감싸 예외를 **기존의 직접 enqueue fallback으로 강등**한다 — capture 중 제출된 작업은
+   기록될 뿐 실행되지 않는다는, 이 코드가 이미 의존하던 CUDA 의미론 덕분에 이중 적용이 아니다.
+   강제 레이스 실행에서 `captures_unwound: 1`이 매번 찍혔다: 가드가 없었다면 그 스트림은 그대로
+   죽어 있었을 것이다.
+3. 할당 쪽은 pin 훅(두 TU 모두) · arena stand-up/teardown · XsRecon의 lazy 할당
+   (`RASBERY_CUDA_TRY_ALLOC`) · outer segment stand-up/bind/teardown · physics arena
+   reserve/release에 `AllocWindow`를 연다. **`bindResidency`의 device-wide drain은 남긴다** —
+   그것은 뷰 패치를 *모든* 스트림에 보이게 하는 장벽이고, 좁히는 것은 별건의 위험이다. 지금은
+   그 장벽이 남의 capture 밖에서만 일어난다.
+
+**신설 수신증** `[RASBERY][CUDA][CAPTURE_ARBITER]` (BATCH_OCCUPANCY 옆):
+`capture_windows` · `alloc_overlapped`(capture가 열린 동안 시도된 할당 — 직렬화 *전에* 센다) ·
+`alloc_blocked` / `alloc_wait_us`(실제로 기다린 것) · `alloc_in_capture`(계약 위반) ·
+`captures_unwound`(가드가 대신 닫은 창).
+
+**인과 A/B (같은 바이너리, 8덱, capture 창 200 ms 강제).**
+
+| | 사망 | `alloc_overlapped` | `captures_unwound` |
+| --- | --- | --- | --- |
+| `CAPTURE_ARBITER=0` | **4 / 5** | 73–288 | 1 (사망마다) |
+| `CAPTURE_ARBITER=1` | **0 / 5** | 2–6 | 0 |
+
+**게이트 (로컬 WSL, sm_61, 최종 바이너리).**
+
+| 게이트 | 결과 |
+| --- | --- |
+| 8덱 배치 × 20 (ON b8) | **사망 0 / 20** (사전 4 / 20) |
+| 16덱 배치 × 20 (ON b8) | **사망 0 / 20** (사전 3 / 20) |
+| 8덱 배치 OFF vs ON b8 | 0/100 × 8덱 |
+| 8덱 배치 ON b8 × 2 | 0/100 × 8덱 |
+| 8덱 배치 ON b8 vs 단일 ON b8(덱별) | 0/100 × 8덱 |
+| 8덱 배치 OFF vs 4acff55 OFF (feature-off 동일성) | 0/100 × 8덱 |
+| kngr_238 단일 arm P(S2) OFF vs ON b8 | **0/644** |
+| kngr_238 단일 OFF vs 4acff55 OFF (feature-off 동일성) | **0/644** |
+| kngr_238 `[TRAJECTORY] digest` (위 3 실행) | `78e58de0db8b4484` · `outers 12017` 전부 동일 |
+| ctest | 12/12 |
+| contracts | 기존 9종 PASS + 신설 `tools/test_gpu_capture_arbiter_contract.py` PASS |
+
+**폭과 wall — 이 수정이 사지 않은 것.**
+
+| | 4acff55 | 수정 |
+| --- | --- | --- |
+| `mean_width` (M=8 ON, 실행별) | 1.59 (§18c) | 1.568 – 1.591 |
+| `mean_width` 평균 (M=16 ON, 20회) | 2.289 | **2.487** (기준의 사망 실행이 폭 1.0으로 들어간다) |
+| wall M=16 중앙값 (base/fix **교차** 20회, 조용한 기계) | **30.68 s** | **30.73 s** (+0.15 %) |
+| `CAPTURE_ARBITER` (M=8 ON, 18 s 실행 전체) | — | `alloc_wait_us` 110–282 · `alloc_blocked` 0–1 · `alloc_in_capture` 0 · `captures_unwound` 0 |
+
+`alloc_wait_us`가 답이다: 한 실행 전체에서 할당이 capture를 기다린 시간의 합이 **0.1–0.3 ms**다.
+capture는 실행당 세 번뿐이고 할당은 stand-up과 teardown에 몰려 있으니, 두 집합은 원래 거의 만나지
+않는다. 만나는 그 드문 순간이 배치를 죽이던 것이고, 그 순간의 값이 이 수치다.
+
+**238 M64 기대치.** 이 절은 처리량을 바꾸지 않는다. 캠페인 전체에서 요구하는 것은 하나:
+**harness의 실행별 `rc`와 `FAIL` 계수가 0으로 유지되는 것** — 즉 `run_single_gpu_batch.py`가
+64덱 실행에서 `rc=0`, `[RASBERY][FAIL]` 0줄, 그리고 `[CUDA][CAPTURE_ARBITER]`의
+`alloc_in_capture: 0` · `captures_unwound: 0`을 보고하는 것. 로컬에서 사망률이 M과 함께 붙어
+있었으므로(M=8 20 %, M=16 15 %) M64에서는 **캠페인당 0회**가 판정선이다. 한 번이라도 나오면
+`alloc_overlapped`와 `[RASBERY][CAPTURE]` 추적(`RASBERY_GPU_CAPTURE_TRACE=1`)이 어느 API가
+창 안에 들어왔는지 이름으로 말한다.
+
+**남은 일.** `bindResidency`의 device-wide drain은 스트림 범위로 좁힐 수 있다(패치 커널을
+`_impl->stream`에 올리고 그 스트림만 동기화). 그러면 방아쇠 자체가 사라진다. 다만 그 drain은
+현재 뷰 패치를 *모든* 스트림에 보이게 하는 장벽이고, 좁히는 것은 별도의 게이트가 필요한 변경이라
+이 절에서는 하지 않았다.
+
 
 ## Task 19: GPU Output Packing and CPU Writer-Only I/O
 
