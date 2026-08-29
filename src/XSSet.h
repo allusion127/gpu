@@ -1,4 +1,5 @@
 #pragma once
+#include "CudaCramBackend.h"
 #include "CudaXsReconBackend.h"
 #include "FlatXsKernel.h"
 // For xsrecon::NISO and xsrecon::BatchView: the device Xe entry points
@@ -137,6 +138,36 @@ private:
     std::vector<int>                _fuel_nodes;      // built once; geometry-fixed
     unsigned long long              _micx_generation = 1;
     bool                            _xsrecon_pinned  = false;
+
+    // CRAM depletion device backend (RASBERY_GPU_CRAM, default off).  GA
+    // evaluator plan Task 16.  Created on first use like _xsrecon_backend, and
+    // owned here for the same reason: one XSSet, one Driver, one batch slot.
+    //
+    // UNLIKE THE PPR ARM, THIS ONE MOVES THE TRAJECTORY.  Its output is the
+    // isotope inventory the next statepoint's XS reconstruction reads, so
+    // RASBERY_GPU_CRAM is listed in trajectory::kArmEnv (Driver.h) and an A/B
+    // that changes it is an arm change, not a timing change.
+    std::unique_ptr<CramBackend> _cram_backend;
+    /// Predictor/corrector calls that ran on the host because the device
+    /// declined or failed.  With the arm off this is every one of them.
+    unsigned long long _cram_host_fallbacks = 0;
+    /// Token published by the last successful device predictor; the corrector
+    /// presents it so a mid-statepoint fallback cannot pair a device corrector
+    /// with a host predictor's BOS state.  0 = no device predictor yet.
+    unsigned long long _cram_bos_token = 0;
+    /// Node-invariant burnup-key normalisation, built once (geometry- and
+    /// composition-fixed) with the host's own expression so the device reads a
+    /// number the host would have produced, not a re-derivation of it.
+    std::vector<double> _cram_dfac;
+    std::vector<double> _cram_vol;
+    unsigned long long  _cram_lib_generation = 0;
+
+    /// True and the views filled when the device arm can run this deck at all.
+    bool PrepareCramLib(cram::LibView& lib);
+    bool DepleteGpu(double dt, double power, bool xe_transient);
+    bool CorrectorStepGpu(double dt, double power, bool xe_transient,
+                          bool density_average, bool xe_equilibrium_fix,
+                          int substeps);
 
     // Advances whenever HOST code writes _xs or _iden outside the device
     // backends' own downloads (CPU reference loops, cusping blends, depletion,
@@ -643,6 +674,23 @@ public:
         if (!_xsrecon_backend)
             _xsrecon_backend = std::make_unique<XsReconBackend>();
         return _xsrecon_backend.get();
+    }
+
+    /// Task 16 device depletion backend, created on first use.  Never null, so
+    /// the receipt in Driver.h can read its counters without asking whether the
+    /// arm was ever reached.
+    CramBackend& cram() {
+        if (!_cram_backend) _cram_backend = std::make_unique<CramBackend>();
+        return *_cram_backend;
+    }
+    [[nodiscard]] const CramBackend& cram() const {
+        const_cast<XSSet*>(this)->cram();
+        return *_cram_backend;
+    }
+    /// Predictor/corrector halves that ran on the host.  The receipt's
+    /// `host_fallbacks`; non-zero with the arm on means the device declined.
+    [[nodiscard]] unsigned long long cramHostFallbacks() const {
+        return _cram_host_fallbacks;
     }
     [[nodiscard]] unsigned long long hoststateGeneration() const {
         return _hoststate_generation;

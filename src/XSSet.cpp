@@ -53,6 +53,14 @@ constexpr double BORON_DENSITY_FACTOR       = 5.5707678E-8;
 constexpr int    OMP_THRESHOLD              = 64;
 constexpr bool   USE_AVERAGE_DMOD_FOR_BORON = false;
 constexpr int    CRAM_ORDER                 = 8;
+// The device depletion arm (Task 16) transcribes ONE pole set.  A change here
+// must break the build, not leave CudaCramBackend.cu quietly running the old one.
+static_assert(CRAM_ORDER == cram::kOrder,
+              "CRAM order drifted from CudaCramBackend.h's kOrder");
+// cram::PredictorView / CorrectorView carry the eleven scalar-XS pointers as a
+// fixed-size array; the fill loops below index it with N_XS_SCALAR.
+static_assert(N_XS_SCALAR == 11,
+              "N_XS_SCALAR drifted from cram::PredictorView::mic's extent");
 
 // Stored scalar XS types: all but the derived XSDF/XSRF (rebuilt from transport/scatter).
 constexpr int ACTIVE_XT[] = {XSTF, XSAF, XSFF, XSNF, XSKF, XSSF, FYLD, XS2N, XS3N};
@@ -4502,6 +4510,17 @@ void XSSet::Deplete(double dt, double power, bool xe_transient) {
 
     const double norm_factor = NormFactor(power);
 
+    // GA evaluator plan Task 16.  RASBERY_GPU_CRAM=1 runs the whole node loop on
+    // the device; anything else -- arm off, no CUDA, ng != 2, no depletion data,
+    // a CUDA failure, or ANY node that hit milk.h's two throw conditions --
+    // returns false having written nothing, and the host loop below runs exactly
+    // as it did before.
+    if (DepleteGpu(dt, power, xe_transient)) {
+        ++_hoststate_generation; // depletion rewrites _iden
+        return;
+    }
+    ++_cram_host_fallbacks;
+
 #pragma omp parallel if (nxyz > OMP_THRESHOLD)
     {
         static thread_local DepletionWorkspace  ws_tls;
@@ -4636,6 +4655,15 @@ void XSSet::CorrectorStep(double dt, double power, bool xe_transient) {
     const size_t        condensed_size = niso * N_XS_SCALAR;
     const size_t        nxyz_size      = static_cast<size_t>(nxyz);
 
+    // GA evaluator plan Task 16.  Same fail-open contract as the predictor's,
+    // plus one extra decline: a corrector whose BOS micro-XS snapshot on the
+    // device did not come from THIS statepoint's device predictor.
+    const bool corrector_on_device =
+        CorrectorStepGpu(dt, power, xe_transient, pcDensityAverage,
+                         pcXeEquilibriumFix, pcSubsteps);
+    if (!corrector_on_device) ++_cram_host_fallbacks;
+
+    if (!corrector_on_device) {
 #pragma omp parallel if (nxyz > OMP_THRESHOLD)
     {
         static thread_local DepletionWorkspace  ws_tls;
@@ -4804,12 +4832,154 @@ void XSSet::CorrectorStep(double dt, double power, bool xe_transient) {
             }
         }
     }
+    } // !corrector_on_device
 
-    // Rebuild XS on the corrected EOS composition and burnup.
+    // Rebuild XS on the corrected EOS composition and burnup.  The device arm
+    // stops at _iden/_burn: rod materials, branch coefficients and the flat-XS
+    // rebuild are the same host calls on both paths.
     _fine_rod_thermal_fluence = _fine_rod_thermal_fluence_bos;
     DepleteRodMaterials(dt, power, true);
     PrecomputeBranchCoefficients();
     UpdateFlatXS();
+}
+
+// --- Task 16: the CRAM depletion device arm --------------------------------
+//
+// Three functions, and every one of them can say no.  The rule is the PPR arm's
+// rule: a `false` return means NOTHING has been written, so the host loop that
+// follows is the loop that always ran.  The difference from PPR is downstream,
+// not here -- these densities are the next statepoint's input, which is why
+// RASBERY_GPU_CRAM sits in trajectory::kArmEnv.
+
+bool XSSet::PrepareCramLib(cram::LibView& lib) {
+    using namespace Isotope;
+
+    const int nxyz = _g.nxyz();
+    if (nxyz <= 0) return false;
+    // depDecay/depTrans are the process-wide Chiffon parse.  A deck without
+    // them has no depletion at all; a deck whose registry is not the canonical
+    // 39 is not the registry the device pattern was mined from.
+    if (depDecay.rows() != niso || depDecay.cols() != niso ||
+        depTrans.rows() != niso || depTrans.cols() != niso)
+        return false;
+
+    if (_cram_dfac.size() != static_cast<size_t>(nxyz)) {
+        _cram_dfac.resize(static_cast<size_t>(nxyz));
+        _cram_vol.resize(static_cast<size_t>(nxyz));
+        for (int l = 0; l < nxyz; ++l) {
+            _cram_vol[static_cast<size_t>(l)] = _g.vol(l);
+            // EXACTLY the host expression from CorrectorStep, evaluated here so
+            // the device reads a number the host produced rather than a
+            // re-derivation of it in a different association.
+            _cram_dfac[static_cast<size_t>(l)] =
+                8.64e7 * (_g.vol(l) / _lib->lib_model_volu[_comp[l]]) *
+                _lib->lib_model_hmas[_comp[l]];
+        }
+        ++_cram_lib_generation;
+    }
+
+    lib.generation = _cram_lib_generation;
+    lib.niso       = static_cast<int>(niso);
+    lib.nxs        = N_XS_SCALAR;
+    lib.first      = static_cast<int>(iI135);
+    lib.ac_first   = static_cast<int>(iAcFirst);
+    lib.ac_last    = static_cast<int>(iAcLast);
+    lib.i135       = static_cast<int>(iI135);
+    lib.xe135      = static_cast<int>(iXe135);
+    lib.xe135m     = static_cast<int>(iXe135m);
+    lib.u234       = static_cast<int>(iU234);
+    lib.u235       = static_cast<int>(iU235);
+    lib.u238       = static_cast<int>(iU238);
+    lib.np237      = static_cast<int>(iNp237);
+    lib.dep_decay  = depDecay.data();
+    lib.dep_trans  = depTrans.data();
+    lib.dfac       = _cram_dfac.data();
+    lib.vol        = _cram_vol.data();
+    return true;
+}
+
+bool XSSet::DepleteGpu(double dt, double power, bool xe_transient) {
+    CramBackend& g = cram();
+    if (!g.available()) return false;
+    // DepleteNode's own first line: with no depletion data the host body is a
+    // no-op, and a device arm that "succeeded" on it would skip a no-op while
+    // pretending it ran.
+    if (depDecay.size() == 0) return false;
+
+    cram::LibView lib;
+    if (!PrepareCramLib(lib)) return false;
+
+    cram::PredictorView v;
+    v.ng              = _g.ng();
+    v.nxyz            = _g.nxyz();
+    v.dt              = dt;
+    v.norm_factor     = NormFactor(power);
+    v.xe_transient    = xe_transient ? 1 : 0;
+    v.micx_generation = _micx_generation;
+    v.phif            = _g.Phif();
+    v.iden            = _iden.data();
+    // The same eleven pointers, in the same order, DepleteNode builds.  The
+    // backend uploads only the four slots the transition matrix and the Xe
+    // equilibrium actually read; the list stays complete so a future reader of
+    // a fifth slot is a compile-time edit here, not a silent wrong answer.
+    const double* mic_ptrs[N_XS_SCALAR] = {
+        _micx.xstf.data(), _micx.xsdf.data(), _micx.xsaf.data(), _micx.xsff.data(),
+        _micx.xsnf.data(), _micx.xskf.data(), _micx.xssf.data(), _micx.xsrf.data(),
+        _micx.fyld.data(), _micx.xs2n.data(), _micx.xs3n.data()};
+    for (size_t xt = 0; xt < N_XS_SCALAR; ++xt) v.mic[xt] = mic_ptrs[xt];
+
+    // Retire the previous statepoint's token BEFORE the call: a predictor that
+    // declines must not leave a token this statepoint's corrector can match.
+    _cram_bos_token          = 0;
+    unsigned long long token = 0;
+    if (!g.predictor(lib, v, &token)) return false;
+    _cram_bos_token = token;
+    return true;
+}
+
+bool XSSet::CorrectorStepGpu(double dt, double power, bool xe_transient,
+                             bool density_average, bool xe_equilibrium_fix,
+                             int substeps) {
+    // The Isotalo substep chain is a second device path nobody has measured.
+    // Declining is the cheap, honest answer; see CudaCramBackend.h.
+    if (substeps != 1) return false;
+    CramBackend& g = cram();
+    if (!g.available()) return false;
+    if (depDecay.size() == 0) return false;
+    if (_cram_bos_token == 0) return false; // this statepoint's predictor was host-side
+
+    cram::LibView lib;
+    if (!PrepareCramLib(lib)) return false;
+
+    cram::CorrectorView v;
+    v.ng                 = _g.ng();
+    v.nxyz               = _g.nxyz();
+    v.dt                 = dt;
+    v.bos_norm           = NormFactor(power, _xs_bos, _flux_bos.data());
+    v.eos_norm           = NormFactor(power);
+    v.xe_transient       = xe_transient ? 1 : 0;
+    v.density_average    = density_average ? 1 : 0;
+    v.xe_equilibrium_fix = xe_equilibrium_fix ? 1 : 0;
+    v.micx_generation    = _micx_generation;
+    v.bos_token          = _cram_bos_token;
+    v.flux_bos           = _flux_bos.data();
+    v.flux_eos           = _g.Phif();
+    v.xskf_bos           = _xs_bos.xskf.data();
+    v.xskf_eos           = _xs.xskf.data();
+    v.iden_bos           = _iden_bos.data();
+    v.iden               = _iden.data();
+    v.burn_bos           = _burn_bos.data();
+    v.burn               = _burn.data();
+
+    const double* mic_ptrs[N_XS_SCALAR] = {
+        _micx.xstf.data(), _micx.xsdf.data(), _micx.xsaf.data(), _micx.xsff.data(),
+        _micx.xsnf.data(), _micx.xskf.data(), _micx.xssf.data(), _micx.xsrf.data(),
+        _micx.fyld.data(), _micx.xs2n.data(), _micx.xs3n.data()};
+    for (size_t xt = 0; xt < N_XS_SCALAR; ++xt) v.mic[xt] = mic_ptrs[xt];
+
+    if (!g.corrector(lib, v)) return false;
+    _cram_bos_token = 0; // one corrector consumes one predictor's snapshot
+    return true;
 }
 
 // Rod insertion

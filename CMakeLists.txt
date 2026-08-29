@@ -42,6 +42,7 @@ if (RASBERY_ENABLE_CUDA)
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaOuterGraphStub.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/GpuPhysicsBackendStub.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaPprBackendStub.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaCramBackendStub.cpp"
     )
     list(APPEND RASBERY_SOURCES
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaBICGBackend.cu"
@@ -51,6 +52,7 @@ if (RASBERY_ENABLE_CUDA)
             "${CMAKE_CURRENT_SOURCE_DIR}/src/GpuPhaseScheduler.cu"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/GpuPhysicsBackendCuda.cu"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaPprBackend.cu"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaCramBackend.cu"
     )
     # Task 9 composes the Task 4/5 phase kernels, whose contract is bit-identical
     # reproduction of the host loops: nvcc must not contract a*b+c into an fma
@@ -69,6 +71,13 @@ if (RASBERY_ENABLE_CUDA)
     # mercy of nvcc's scheduler instead of at the one place the gate documents
     # (the device libm's exp, and the corner-sum chunking).
     set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/CudaPprBackend.cu"
+            PROPERTIES COMPILE_OPTIONS "--fmad=false")
+    # GA evaluator plan Task 16 (GPU CRAM depletion).  Same reason again, and it
+    # bites harder here than anywhere else in the tree: the Gauss-Seidel sweep is
+    # `sum -= vals[i] * x[cols[i]]` repeated up to 64 times per pole, so a single
+    # contracted multiply-add would compound across 256 sweeps before the result
+    # is compared, and the depletion output feeds the NEXT statepoint.
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/CudaCramBackend.cu"
             PROPERTIES COMPILE_OPTIONS "--fmad=false")
 endif ()
 

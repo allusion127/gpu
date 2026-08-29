@@ -392,6 +392,14 @@ namespace trajectory {
 /// is deliberately absent: it is the thing under test, and it rides in its own
 /// field so an arm comparison can hold every OTHER knob equal.
 ///
+/// RASBERY_GPU_CRAM is deliberately PRESENT, and it is the counterexample that
+/// makes the PPR rule below mean something.  The device depletion arm (Task 16)
+/// writes the isotope inventory the NEXT statepoint reconstructs its cross
+/// sections from, so the knob moves keff, the critical boron and the axial
+/// offset of every statepoint after the first.  It belongs in the list on the
+/// list's own terms; tools/test_cram_gpu_contract.py asserts the presence, the
+/// way test_ppr_gpu_contract.py asserts the absence.
+///
 /// RASBERY_GPU_PPR is deliberately absent for a DIFFERENT reason, and the
 /// difference is the whole point of the arm.  Pin-power reconstruction is
 /// strictly downstream of the iteration: it runs after the statepoint's final
@@ -412,6 +420,7 @@ inline constexpr const char* kArmEnv[] = {
     "RASBERY_GPU_NODAL_FULL",
     "RASBERY_GPU_XSRECON",
     "RASBERY_GPU_FLATXS",
+    "RASBERY_GPU_CRAM",
     "RASBERY_GPU_XE",
     "RASBERY_GPU_XE_DOT_PARTITIONS",
     "RASBERY_GPU_OUTER",
@@ -4361,6 +4370,38 @@ public:
                     cmfd_solver.batchSlot(), g.statepoints(), g.deviceOrdinal(),
                     ppr_host_statepoints, g.iterations(),
                     pin_power_reconstruction.hostIterations(), g.wallMs(), g.status());
+            }
+        }
+
+        // GA evaluator plan Task 16 receipt.  Printed when the arm is on (or ran
+        // at all), and under RASBERY_STATEPOINT_TELEMETRY so an A/B has a line
+        // from both sides.  The three numbers that decide whether the arm ran
+        // are `statepoints` (device predictor calls), `host_fallbacks` (every
+        // predictor or corrector half that ran on the CPU) and `gs_iters_mean`
+        // -- the mean Gauss-Seidel sweep count per (node, pole), which is the
+        // observable that says the device solved the SAME iteration the host
+        // does rather than a differently-converged one.
+        {
+            const CramBackend& c = cross_sections.cram();
+            if (c.available() || c.predictorCalls() > 0 || c.correctorCalls() > 0 ||
+                sp_telem) {
+                const double gs_mean =
+                    (c.gsSolves() > 0)
+                        ? static_cast<double>(c.gsIterations()) /
+                              static_cast<double>(c.gsSolves())
+                        : 0.0;
+                std::cout << std::format(
+                    "  [RASBERY][CRAM_GPU] {{\"schema_version\":1,\"slot\":{},"
+                    "\"statepoints\":{},\"predictor_calls\":{},"
+                    "\"corrector_calls\":{},\"nodes\":{},\"device\":{},"
+                    "\"host_fallbacks\":{},\"gs_iters_mean\":{:.3f},"
+                    "\"gs_solves\":{},\"micx_h2d_mb\":{:.1f},"
+                    "\"bos_reuse\":{},\"wall_ms\":{:.3f},\"status\":\"{}\"}}\n",
+                    cmfd_solver.batchSlot(), c.predictorCalls(), c.predictorCalls(),
+                    c.correctorCalls(), c.nodesSolved(), c.deviceOrdinal(),
+                    cross_sections.cramHostFallbacks(), gs_mean, c.gsSolves(),
+                    static_cast<double>(c.micxH2dBytes()) / (1024.0 * 1024.0),
+                    c.bosReuses(), c.wallMs(), c.status());
             }
         }
 

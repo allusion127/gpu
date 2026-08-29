@@ -40,8 +40,17 @@ SHIM = r'''
 // Auto-generated CUDA shim for host-side syntax checking.  Not a build artefact
 // and never compiled into RASBERY.
 #pragma once
+#include <cmath>
 #include <cstddef>
 #include <cstring>
+
+// The host <cmath> supplies logb/scalbn/hypot/copysign/isfinite/isnan/isinf,
+// which the device libm also provides; the rewrite therefore type-checks the
+// same call shapes nvcc will see.
+using std::copysign;
+using std::hypot;
+using std::logb;
+using std::scalbn;
 
 using cudaError_t = int;
 enum : int { cudaSuccess = 0 };
@@ -62,8 +71,18 @@ inline cudaError_t cudaFreeHost(void*) { return cudaSuccess; }
 inline cudaError_t cudaMemcpy(void*, const void*, std::size_t, cudaMemcpyKind) { return cudaSuccess; }
 inline cudaError_t cudaMemcpyAsync(void*, const void*, std::size_t, cudaMemcpyKind, cudaStream_t) { return cudaSuccess; }
 inline cudaError_t cudaStreamCreateWithFlags(cudaStream_t*, unsigned) { return cudaSuccess; }
+inline cudaError_t cudaStreamCreate(cudaStream_t*) { return cudaSuccess; }
 inline cudaError_t cudaStreamDestroy(cudaStream_t) { return cudaSuccess; }
 inline cudaError_t cudaStreamSynchronize(cudaStream_t) { return cudaSuccess; }
+inline cudaError_t cudaGetDevice(int* d) { *d = 0; return cudaSuccess; }
+inline cudaError_t cudaSetDevice(int) { return cudaSuccess; }
+
+struct CUevent_st;
+using cudaEvent_t = CUevent_st*;
+inline cudaError_t cudaEventCreate(cudaEvent_t*) { return cudaSuccess; }
+inline cudaError_t cudaEventDestroy(cudaEvent_t) { return cudaSuccess; }
+inline cudaError_t cudaEventRecord(cudaEvent_t, cudaStream_t) { return cudaSuccess; }
+inline cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t, cudaEvent_t) { *ms = 0.0f; return cudaSuccess; }
 
 // Built-in variables.  Values are irrelevant to a syntax check; the shape is not.
 struct RasberyDim3 { unsigned x = 0, y = 0, z = 0; };
@@ -82,8 +101,23 @@ inline unsigned long long atomicAdd(unsigned long long* address, unsigned long l
     *address += val;
     return old;
 }
+inline unsigned long long atomicOr(unsigned long long* address, unsigned long long val) {
+    unsigned long long old = *address;
+    *address |= val;
+    return old;
+}
+inline unsigned int atomicOr(unsigned int* address, unsigned int val) {
+    unsigned int old = *address;
+    *address |= val;
+    return old;
+}
 inline long long __double_as_longlong(double x) {
     long long r;
+    std::memcpy(&r, &x, sizeof r);
+    return r;
+}
+inline double __longlong_as_double(long long x) {
+    double r;
     std::memcpy(&r, &x, sizeof r);
     return r;
 }
@@ -95,7 +129,9 @@ inline cudaError_t cudaMemsetAsync(void*, int, std::size_t, cudaStream_t) { retu
 # closing `>>>`, which cannot appear inside a launch configuration.
 LAUNCH = re.compile(r"<<<.*?>>>", re.DOTALL)
 
-QUALIFIERS = re.compile(r"\b(__global__|__device__|__host__|__forceinline__|__restrict__)\b")
+QUALIFIERS = re.compile(
+    r"\b(__global__|__device__|__host__|__forceinline__|__restrict__"
+    r"|__constant__|__shared__)\b")
 
 
 def rewrite(text: str) -> str:
