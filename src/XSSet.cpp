@@ -2,12 +2,14 @@
 
 #include "GpuFullContract.h"
 #include "Importer.h"
+#include "Sha256.h"
 #include "XSTiming.h"
 #include "XeGpuReceipt.h"
 #include "XeKernel.h"
 #include "XsReconKernel.h"
 
 #include <cstdint>
+#include <fstream>
 #include <cstdio>
 #include <cstring>
 #include <atomic>
@@ -615,6 +617,11 @@ std::shared_ptr<const XsLibrary> BuildXsLibrary(const std::string& xs_path, int 
         ec.clear();
         const auto stamp = std::filesystem::last_write_time(std::filesystem::path(xs_path), ec);
         lib.mtime        = ec ? 0 : static_cast<std::int64_t>(stamp.time_since_epoch().count());
+        // The digest is memoised by (path, size, mtime), and AcquireXsLibrary
+        // has already asked for it to build the key -- so recording it on the
+        // parse costs a vector scan and makes the value carry the provenance of
+        // the BYTES, not just the name of the file they were meant to be in.
+        lib.content_digest = XsLibraryContentDigest(xs_path);
     }
 
     // 1. Parse.  LoadHDF takes its own Chiffon::Hdf5Guard and publishes the
@@ -826,6 +833,7 @@ struct XsLibraryCacheEntry {
     std::string                      path;
     std::uint64_t                    file_size = 0;
     std::int64_t                     mtime     = 0;
+    std::string                      digest;   ///< sha256 of the file's bytes
     int                              ng        = 0;
     std::shared_ptr<const XsLibrary> value;
     bool                             building = false; ///< one worker is parsing this key
@@ -854,12 +862,105 @@ std::atomic<std::uint64_t> g_xslib_loads{0};
 std::atomic<std::uint64_t> g_xslib_hits{0};
 std::atomic<std::uint64_t> g_xslib_waits{0};
 std::atomic<std::uint64_t> g_xslib_lock_wait_ns{0};
+std::atomic<std::uint64_t> g_xslib_digest_computes{0};
 
 struct XsLibraryKeyFields {
     std::string   path;
     std::uint64_t file_size = 0;
     std::int64_t  mtime     = 0;
+    std::string   digest;
 };
+
+/// `always` re-reads the file on every acquisition; `cached` (the default)
+/// memoises by (path, size, mtime); `off` returns an empty digest and leaves
+/// the key as it was before WP8 stage 2.
+///
+/// `off` exists for one reason: it is the A/B control for the hardening, and a
+/// change to a CACHE KEY that cannot be turned off cannot be shown to be free.
+enum class XsLibraryDigestPolicy { Off, Cached, Always };
+
+XsLibraryDigestPolicy XsLibraryDigestMode() {
+    static const XsLibraryDigestPolicy mode = [] {
+        const char* v = std::getenv("RASBERY_XSLIB_DIGEST");
+        const std::string value = (v && *v) ? std::string(v) : std::string("cached");
+        if (value == "0" || value == "off") return XsLibraryDigestPolicy::Off;
+        if (value == "always") return XsLibraryDigestPolicy::Always;
+        return XsLibraryDigestPolicy::Cached;
+    }();
+    return mode;
+}
+
+const char* XsLibraryDigestModeName() {
+    switch (XsLibraryDigestMode()) {
+        case XsLibraryDigestPolicy::Off:    return "off";
+        case XsLibraryDigestPolicy::Always: return "always";
+        default:                            return "cached";
+    }
+}
+
+struct XsLibraryDigestEntry {
+    std::string   path;
+    std::uint64_t file_size = 0;
+    std::int64_t  mtime     = 0;
+    std::string   digest;
+};
+
+std::mutex& XsLibraryDigestMutex() {
+    static std::mutex m;
+    return m;
+}
+
+std::vector<XsLibraryDigestEntry>& XsLibraryDigestEntries() {
+    static std::vector<XsLibraryDigestEntry> entries;
+    return entries;
+}
+
+/// Stream the file through the SAME transform CaseKey uses (Sha256.h).
+///
+/// Not BatchLightResult::Sha256FileCached: that one memoises by PATH ALONE and
+/// never expires, so in a process that outlives a library rebuild it would hand
+/// back the digest of a file that is no longer there -- which is precisely the
+/// staleness this key change exists to remove.  The transform is shared; the
+/// caching policy is not, because the two callers have different lifetimes.
+std::string XsLibraryDigestOf(const std::string& xs_path) {
+    std::ifstream input(xs_path, std::ios::binary);
+    if (!input) return {};
+    Sha256                      sha;
+    std::array<char, 64 * 1024> buffer{};
+    while (input) {
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto got = input.gcount();
+        if (got <= 0) break;
+        sha.update(buffer.data(), static_cast<std::size_t>(got));
+    }
+    g_xslib_digest_computes.fetch_add(1, std::memory_order_relaxed);
+    return sha.hex();
+}
+
+std::string XsLibraryDigestCached(const std::string& canonical, std::uint64_t size,
+                                  std::int64_t mtime, const std::string& xs_path) {
+    const XsLibraryDigestPolicy mode = XsLibraryDigestMode();
+    if (mode == XsLibraryDigestPolicy::Off) return {};
+    if (mode == XsLibraryDigestPolicy::Always) return XsLibraryDigestOf(xs_path);
+    {
+        std::lock_guard<std::mutex> guard(XsLibraryDigestMutex());
+        for (const auto& e : XsLibraryDigestEntries())
+            if (e.file_size == size && e.mtime == mtime && e.path == canonical)
+                return e.digest;
+    }
+    // Deliberately NOT under the mutex: two workers arriving cold on the same
+    // library both read it once, which costs one extra 34 MB read and never
+    // makes a hit wait behind a read.  The cache below is single-flighted where
+    // it matters -- on the PARSE -- and this is only the key for it.
+    const std::string digest = XsLibraryDigestOf(xs_path);
+    std::lock_guard<std::mutex> guard(XsLibraryDigestMutex());
+    for (const auto& e : XsLibraryDigestEntries())
+        if (e.file_size == size && e.mtime == mtime && e.path == canonical)
+            return e.digest;
+    XsLibraryDigestEntries().push_back(
+        XsLibraryDigestEntry{canonical, size, mtime, digest});
+    return digest;
+}
 
 XsLibraryKeyFields XsLibraryKeyOf(const std::string& xs_path) {
     XsLibraryKeyFields key;
@@ -872,6 +973,7 @@ XsLibraryKeyFields XsLibraryKeyOf(const std::string& xs_path) {
     ec.clear();
     const auto stamp = std::filesystem::last_write_time(std::filesystem::path(xs_path), ec);
     key.mtime        = ec ? 0 : static_cast<std::int64_t>(stamp.time_since_epoch().count());
+    key.digest       = XsLibraryDigestCached(key.path, key.file_size, key.mtime, xs_path);
     return key;
 }
 
@@ -890,10 +992,13 @@ std::shared_ptr<const XsLibrary> AcquireXsLibrary(const std::string& xs_path, in
         return BuildXsLibrary(xs_path, ng);
 
     const XsLibraryKeyFields key = XsLibraryKeyOf(xs_path);
+    // The digest is compared FIRST because it is the field that discriminates:
+    // a replaced library keeps its path, usually keeps its size and can keep
+    // its mtime, and only its content is guaranteed to have changed.
     const auto               find = [&key, ng]() -> XsLibraryCacheEntry* {
         for (auto& e : XsLibraryCacheEntries())
-            if (e.ng == ng && e.file_size == key.file_size && e.mtime == key.mtime &&
-                e.path == key.path)
+            if (e.ng == ng && e.digest == key.digest && e.file_size == key.file_size &&
+                e.mtime == key.mtime && e.path == key.path)
                 return &e;
         return nullptr;
     };
@@ -920,7 +1025,8 @@ std::shared_ptr<const XsLibrary> AcquireXsLibrary(const std::string& xs_path, in
         XsLibraryCacheEntry* entry = find();
         if (entry == nullptr) {
             XsLibraryCacheEntries().push_back(
-                XsLibraryCacheEntry{key.path, key.file_size, key.mtime, ng, nullptr, true});
+                XsLibraryCacheEntry{key.path, key.file_size, key.mtime, key.digest, ng,
+                                    nullptr, true});
             break; // this thread builds it
         }
         if (entry->value != nullptr) {
@@ -960,7 +1066,8 @@ std::shared_ptr<const XsLibrary> AcquireXsLibrary(const std::string& xs_path, in
         lock.lock();
         auto& entries = XsLibraryCacheEntries();
         for (auto it = entries.begin(); it != entries.end(); ++it)
-            if (it->ng == ng && it->file_size == key.file_size && it->mtime == key.mtime &&
+            if (it->ng == ng && it->digest == key.digest &&
+                it->file_size == key.file_size && it->mtime == key.mtime &&
                 it->path == key.path && it->value == nullptr) {
                 entries.erase(it);
                 break;
@@ -981,12 +1088,17 @@ std::shared_ptr<const XsLibrary> AcquireXsLibrary(const std::string& xs_path, in
     return built;
 }
 
+std::string XsLibraryContentDigest(const std::string& xs_path) {
+    return XsLibraryKeyOf(xs_path).digest;
+}
+
 XsLibraryCacheStats XsLibraryCacheSnapshot() {
     XsLibraryCacheStats s;
     s.loads        = g_xslib_loads.load(std::memory_order_relaxed);
     s.hits         = g_xslib_hits.load(std::memory_order_relaxed);
     s.waits        = g_xslib_waits.load(std::memory_order_relaxed);
     s.lock_wait_ms = g_xslib_lock_wait_ns.load(std::memory_order_relaxed) / 1000000ULL;
+    s.digest_computes = g_xslib_digest_computes.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> guard(XsLibraryCacheMutex());
     s.entries = XsLibraryCacheEntries().size();
     for (const auto& e : XsLibraryCacheEntries())
@@ -1000,6 +1112,11 @@ void PrintXsLibraryCacheReceipt(std::ostream& out) {
         << ",\"waits\":" << s.waits
         << ",\"entries\":" << s.entries << ",\"bytes\":" << s.bytes
         << ",\"lock_wait_ms\":" << s.lock_wait_ms
+        // WP8 stage 2.  `digest_computes` must equal the number of distinct
+        // (path, size, mtime) triples this process saw -- ONE for a normal
+        // campaign -- and must not grow with the case count.
+        << ",\"digest_computes\":" << s.digest_computes
+        << ",\"digest_policy\":\"" << XsLibraryDigestModeName() << "\""
         << ",\"enabled\":" << (XsLibraryCacheDisabled() ? "false" : "true") << "}\n";
 }
 

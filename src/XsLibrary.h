@@ -41,6 +41,30 @@
 // cache now finds the same bytes at the same address and matches on the first
 // try.
 //
+// THE CACHE KEY IS A CONTENT KEY (WP8 stage 2).  It used to be
+// (canonical path, size, mtime, ng).  In a one-shot process that is fine: the
+// library cannot be replaced between the first deck and the last, because the
+// whole process is shorter than the operation that would replace it.  A
+// long-lived evaluator breaks that assumption -- it can outlive a library
+// rebuild -- and the failure mode is silent and total: every case after the
+// swap reuses the OLD parse, produces perfectly self-consistent numbers, and
+// nothing in any receipt says which library they came from.
+//
+// So the key now carries a SHA-256 of the file's bytes, and every parse
+// records it in `content_digest`.  The same digest is what casekey::Provenance
+// calls `xslib_digest` (src/CaseKey.h) and the same transform computes it
+// (Sha256.h), because two hashes of one file is how a cache key ends up
+// disagreeing with the receipt that named it.
+//
+// WHAT IS STILL OPEN, AND IT IS NAMED HERE RATHER THAN PAPERED OVER.  The
+// digest itself is memoised by (path, size, mtime) so a wave of M cases reads
+// the 34 MB once instead of M times.  A replacement that keeps the same size
+// AND lands inside the filesystem's mtime resolution therefore still returns
+// the stale digest.  That hole is strictly smaller than the one it replaces --
+// it now needs the size to match too -- and `RASBERY_XSLIB_DIGEST=always`
+// closes it completely at the cost of one file read per acquisition, for the
+// campaigns that actually rewrite libraries underneath a running fleet.
+//
 // THE ONE MUTABLE ALIAS THAT HAD TO GO.  XSSet::fmap()/gmap() returned
 // `double&` into `_models[...]`, and PPR took `auto&` (which selected the
 // non-const `GetDepletionPoint` and `_refr_dpts[0]`, an inserting lookup).
@@ -103,6 +127,10 @@ struct XsLibrary {
     std::string   path;         ///< canonical path the parse came from
     std::uint64_t file_size = 0;
     std::int64_t  mtime      = 0; ///< filesystem clock ticks, as reported by last_write_time
+    /// SHA-256 of the library file's bytes -- the part of the key that survives
+    /// a same-size, same-mtime replacement.  Empty only when the file could not
+    /// be read at all, which is a different fact from "the digest is zero".
+    std::string   content_digest;
     int           ng         = 0; ///< energy groups the flatten was laid out for
     size_t        niso       = 0; ///< isotope registry size at parse time
     size_t        bytes      = 0; ///< approximate resident footprint of this parse
@@ -154,7 +182,20 @@ struct XsLibraryCacheStats {
     /// it belongs beside [HDF5][LOCK].wait_ms, which is what it replaced.
     std::uint64_t lock_wait_ms  = 0;
     std::uint64_t entries       = 0;
+    /// Times a file was actually read to compute its content digest.  THE
+    /// WITNESS for the key hardening: it must track the number of distinct
+    /// (path, size, mtime) triples the process saw and must NOT grow with the
+    /// case count -- if it does, the memoisation is not working and every case
+    /// is paying a 34 MB read for a key.
+    std::uint64_t digest_computes = 0;
 };
+
+/// Content digest of one library file, memoised by (path, size, mtime).
+///
+/// Exposed because the cohort key needs the same digest the cache key uses:
+/// a cohort whose library provenance came from a second hash of the same file
+/// is a cohort that can disagree with its own cache.
+std::string XsLibraryContentDigest(const std::string& xs_path);
 
 /// Parse + flatten one library file.  Pure function of (xs_path, ng); enters HDF5.
 std::shared_ptr<const XsLibrary> BuildXsLibrary(const std::string& xs_path, int ng);

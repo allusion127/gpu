@@ -69,6 +69,7 @@
 // table, which is the failure mode WP1's exact-only contract exists for.
 
 #include "BatchRefill.h"
+#include "CohortContext.h"
 #include "CudaXsReconBackend.h"
 #include "Driver.h"
 #include "HostPinRegistry.h"
@@ -558,8 +559,9 @@ public:
     /// The WP8 process receipt.  Printed by main.cpp after the shared teardown
     /// receipts, so `xslib_loads`/`xslib_hits` are final.
     void reportProcess(std::ostream& out) const {
-        const XsLibraryCacheStats xslib = XsLibraryCacheSnapshot();
-        const auto&               ten   = refill::tenancy();
+        const XsLibraryCacheStats xslib  = XsLibraryCacheSnapshot();
+        const cohort::Stats       cohorts = cohort::snapshot();
+        const auto&               ten    = refill::tenancy();
         out << "[RASBERY][EVALUATOR] {\"cases\":" << _summary.cases
             << ",\"ok\":" << _summary.ok
             << ",\"failed\":" << _summary.failed
@@ -583,9 +585,25 @@ public:
             << ",\"slot_double_releases\":" << ten.double_releases.load()
             << ",\"xslib_loads\":" << xslib.loads
             << ",\"xslib_hits\":" << xslib.hits
+            << ",\"xslib_digest_computes\":" << xslib.digest_computes
             << ",\"library_loads\":" << xslib.loads
-            // One CaseContext per case, by construction: stage 1 does not reuse
-            // geometry.  Stage 2 is where this stops equalling `cases`.
+            // WP8 stage 2 -- THE MIDDLE LIFETIME, and the two numbers that say
+            // whether it exists.  `cohort_builds` must equal the number of
+            // distinct (geometry, library) pairs this process saw and must NOT
+            // grow with the case count: a GA generation of M candidates over
+            // one core is builds=1, hits=M-1.  If it is ever builds=M the
+            // cohort key has started covering something a candidate changes,
+            // and the middle lifetime is gone again without a word from any
+            // other number in this receipt.
+            << ",\"cohort_builds\":" << cohorts.builds
+            << ",\"cohort_hits\":" << cohorts.hits
+            << ",\"cohorts\":" << cohorts.cohorts
+            << ",\"ppr_quadrature_builds\":" << cohorts.quadrature_builds
+            // One CaseContext per case, by construction: the Geometry object
+            // itself is still per case (CohortContext.h says exactly why), so
+            // this still equals `cases` and is NOT the same claim as
+            // `cohort_builds`.  Reporting both is what keeps the difference
+            // legible instead of letting one number stand for two facts.
             << ",\"geometry_builds\":" << _summary.cases
             << ",\"pin_live_ranges_between_waves\":"
             << _summary.pin_live_ranges_between_waves

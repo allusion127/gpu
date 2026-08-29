@@ -13,6 +13,7 @@
 #include <filesystem>
 
 #include "pch.h"
+#include "CohortContext.h"
 #include "Geometry.h"
 #include "XSSet.h"
 #include "Scheduler.h"
@@ -42,6 +43,14 @@ private:
     // only ever hashed.
     std::string _deck_key_digest;   ///< sha256 of casekey::deckPayload(config)
     std::string _deck_key_core_op;  ///< which symmetry op canonicalised the LP
+
+    // WP8 stage 2: which COHORT this case belongs to -- the middle lifetime.
+    // Acquired where GeometryInput is final (after the shuffle resolver and the
+    // restart fallback have both had their say) and before XSSet::Initialize,
+    // so a case is attached to its cohort before anything that could consume
+    // the cohort's state runs.  The shared_ptr keeps the Context alive for the
+    // life of the process, which is what it is for.
+    std::shared_ptr<const cohort::Context> _cohort;
 
     struct ShuffleSpec {
         int target_row, target_col;
@@ -125,6 +134,9 @@ public:
     /// WP10.1.  Empty until ReadInput() has run.
     const std::string& deck_key_digest() const { return _deck_key_digest; }
     const std::string& deck_key_core_op() const { return _deck_key_core_op; }
+    /// WP8 stage 2.  Null until ReadInput() has run.
+    const std::shared_ptr<const cohort::Context>& cohort_context() const { return _cohort; }
+    std::string cohort_key() const { return _cohort ? _cohort->key : std::string(); }
     const std::string& restart_path() const { return _restart_path; }
     bool has_restart() const { return !_restart_path.empty(); }
     double restart_efpd() const { return _restart_efpd; }

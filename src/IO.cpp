@@ -1,7 +1,9 @@
 #include "IO.h"
 
 #include "CaseKey.h"
+#include "CohortContext.h"
 #include "Model.h"
+#include "XsLibrary.h"
 
 #include <algorithm>
 #include <cctype>
@@ -785,6 +787,24 @@ void IO::ReadInput(const std::string& filepath) {
         std::filesystem::path in(filepath);
         _xs_path = (in.parent_path() / "results.h5").string();
     }
+
+    // WP8 stage 2: attach this case to its COHORT.
+    //
+    // HERE, and not earlier, because the cohort key is a function of
+    // `geometry_input` AS BUILT -- after the shuffle resolver rewrote `core` in
+    // place and after a missing geometry block was recovered from a restart --
+    // and of the cross-section library's CONTENT, which needs `_xs_path`
+    // resolved.  Earlier would key on something Geometry was not built from;
+    // later would be after XSSet::Initialize, which is the first thing that
+    // could want cohort state.
+    //
+    // The library digest is memoised by (path, size, mtime) inside XsLibrary,
+    // and XSSet::Initialize on the next line asks for the same value, so this
+    // costs one file read for the whole process and a vector scan per case.
+    _cohort = cohort::acquire(cohort::Descriptor{
+        Sha256::hexOf(cohort::geometryPayload(geometry_input)),
+        XsLibraryContentDigest(_xs_path),
+        geometry_input.ng, geometry_input.ndivxy, geometry_input.npins});
 
     _xs.Initialize(_xs_path);
     t_xs = std::chrono::steady_clock::now();

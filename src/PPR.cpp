@@ -1,4 +1,7 @@
 #include "PPR.h"
+
+#include "CohortContext.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
@@ -133,15 +136,20 @@ bool PPR::resetAndDriveGpu(const double reigv, double* jnet, const double* phif,
     return _gpu->resetAndDrive(geom, step, niter, &iters);
 }
 
-void PPR::buildQuadratureTable() {
-    const int               ndiv      = _g.ndivxy();
-    const int               npins     = _g.npins();
+// WP8 stage 2.  Was `PPR::buildQuadratureTable()`, a member that filled a
+// per-object vector.  It is now a free function of the only two things it ever
+// read, so the result can be built once per process and shared by every case of
+// the cohort.  THE ARITHMETIC IS UNCHANGED, line for line: the gate for the
+// whole work package is that the trajectory digest does not move, and a
+// reordered floating-point expression would move it.
+PinQuadTable rasbery::buildPinQuadratureTable(int ndiv, int npins) {
+    PinQuadTable            table;
     const double            inv_npins = 1.0 / npins;
     const double            inv_ndiv  = 1.0 / ndiv;
     static constexpr double xi3[3]    = {-0.7745966692414834, 0.0, 0.7745966692414834};
     static constexpr double wi3[3]    = {0.5555555555555556, 0.8888888888888888, 0.5555555555555556};
 
-    _pin_quad_table.resize(npins * npins);
+    table.resize(npins * npins);
 
     for (int py = 0; py < npins; ++py) {
         const double y0    = py * inv_npins;
@@ -155,7 +163,7 @@ void PPR::buildQuadratureTable() {
             const int    di_lo = std::min(static_cast<int>(x0 * ndiv), ndiv - 1);
             const int    di_hi = std::min(static_cast<int>(x1 * ndiv - 1e-12), ndiv - 1);
 
-            auto& info = _pin_quad_table[py * npins + px];
+            auto& info = table[py * npins + px];
             info.overlaps.clear();
 
             for (int dj = dj_lo; dj <= dj_hi; ++dj) {
@@ -207,7 +215,11 @@ void PPR::buildQuadratureTable() {
             }
         }
     }
-    _quad_table_built = true;
+    return table;
+}
+
+void PPR::acquireQuadratureTable() {
+    _pin_quad_table = cohort::acquirePinQuadrature(_g.ndivxy(), _g.npins());
 }
 
 /// @brief Build 3×3 neighbor stencil and reflection flags from neibrb.
@@ -842,8 +854,10 @@ double PPR::jnetY(int lk, int g, double x, double y, bool xrev, bool yrev) {
 }
 
 void PPR::reconstructPinPower(bool use_quadrature, bool reconstruct_flux) {
-    // Build quadrature table once (geometry-dependent, never changes)
-    if (use_quadrature && !_quad_table_built) buildQuadratureTable();
+    // Take the cohort's quadrature table once (geometry-dependent, never
+    // changes).  Lazily, exactly as before: a run that never reconstructs a pin
+    // power still does not pay for the table.
+    if (use_quadrature && !_pin_quad_table) acquireQuadratureTable();
 
     const int ng    = _ng;
     const int nxy   = _g.nxy();
@@ -973,7 +987,7 @@ void PPR::reconstructPinPower(bool use_quadrature, bool reconstruct_flux) {
                         }
                     } else {
                         // === QUADRATURE MODE: 3x3 Gauss-Legendre integration ===
-                        const auto& pin_info = _pin_quad_table[pin_idx];
+                        const auto& pin_info = (*_pin_quad_table)[pin_idx];
 
                         for (const auto& ovl : pin_info.overlaps) {
                             const int li = ovl.dj * ndiv + ovl.di;

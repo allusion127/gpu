@@ -1037,6 +1037,10 @@ int main(int argc, char* argv[]) {
         // number of distinct library CONTENTS this process saw, and must not
         // grow with the case count or the wave count.
         rasbery::PrintXsLibraryCacheReceipt(std::cout);
+        // WP8 stage 2's equivalent for geometry.  Printed in both branches, and
+        // beside the XSLIB receipt on purpose: the two answer the same shape of
+        // question about the two halves of what a cohort is.
+        rasbery::cohort::printReceipt(std::cout);
         rasberyPrintProcessLedger(std::cout, exec_seconds, pre_drive_seconds,
                                   since_start(drive_end) - pre_drive_seconds,
                                   since_start(std::chrono::steady_clock::now()) -
@@ -1298,6 +1302,9 @@ int main(int argc, char* argv[]) {
         // once per deck (XsLibrary.h).  loads == 1 with hits == jobs - 1 is the
         // shape the batch is supposed to have.
         rasbery::PrintXsLibraryCacheReceipt(std::cout);
+        // WP8 stage 2, same shape of claim for geometry: a batch of M decks
+        // over one core is builds=1, hits=M-1.
+        rasbery::cohort::printReceipt(std::cout);
         rasberyPrintProcessLedger(std::cout, exec_seconds, pre_drive_seconds,
                                   since_start(drive_end) - pre_drive_seconds,
                                   since_start(std::chrono::steady_clock::now()) -
@@ -1412,6 +1419,9 @@ int main(int argc, char* argv[]) {
               << static_cast<double>(hdf5_stats.wait_nanoseconds) / 1.0e6
               << "}" << std::endl;
     rasbery::PrintXsLibraryCacheReceipt(std::cout);
+    // A single case is builds=1, hits=0.  Printed here too so the three
+    // branches' teardown receipts stay one set and not three.
+    rasbery::cohort::printReceipt(std::cout);
     rasberyPrintProcessLedger(std::cout, exec_seconds, pre_drive_seconds,
                               since_start(drive_end) - pre_drive_seconds,
                               since_start(std::chrono::steady_clock::now()) -

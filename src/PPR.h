@@ -2,6 +2,7 @@
 
 #include "CudaPprBackend.h"
 #include "Geometry.h"
+#include "PprQuadrature.h"
 #include "XSSet.h"
 #include "pch.h"
 #include <cmath>
@@ -46,22 +47,9 @@
 
 namespace rasbery {
 
-// Pre-computed quadrature point data for pin power reconstruction
-struct QuadPoint {
-    double xq, yq;  // local [-1,1] coords within sub-node
-    double leg[15]; // Lx[i]*Ly[j] products (upper-triangular ordering)
-    double wt;      // wi3[qi] * wi3[qj]
-};
-
-struct PinOverlap {
-    int       di, dj;     // sub-node indices within assembly
-    double    dx_h, dy_h; // half-widths for jacobian
-    QuadPoint qpts[9];    // 3x3 Gauss-Legendre points
-};
-
-struct PinQuadInfo {
-    std::vector<PinOverlap> overlaps;
-};
+// QuadPoint / PinOverlap / PinQuadInfo moved to PprQuadrature.h (WP8 stage 2)
+// so CohortContext.h can hold the table without dragging Geometry, XSSet and
+// the CUDA backend header in behind it.
 
 class PPR {
 private:
@@ -88,9 +76,14 @@ private:
     double* _l;    // -> g.PprL()   axial leakage expansion
     double* _bt;   // -> g.PprBt()  transverse buckling
 
-    // Pre-computed quadrature table (built once, indexed by pin)
-    std::vector<PinQuadInfo> _pin_quad_table;
-    bool                     _quad_table_built = false;
+    // The pre-computed quadrature table, indexed by pin.
+    //
+    // WP8 stage 2: BORROWED, not owned.  It is a pure function of
+    // (ndivxy, npins) -- see PprQuadrature.h -- so it belongs to the cohort and
+    // not to this PPR object.  It used to be a per-object `vector`, which meant
+    // a 64-case wave built 64 bit-identical copies of it, one per Driver.  The
+    // null pointer is the "not built yet" flag the old `bool` was.
+    std::shared_ptr<const PinQuadTable> _pin_quad_table;
 
     // Corner-DF consistency ratio sdfa/pdfa per (node, group), refreshed in
     // reset().  The corner-balance phic is a heterogeneous corner-flux estimate;
@@ -146,7 +139,8 @@ private:
         return sgn * jn * h / (2.0 * D);
     }
 
-    void buildQuadratureTable();
+    /// Take this cohort's table (building it if the process has not yet).
+    void acquireQuadratureTable();
 
     /// @brief Fused update: Particular + Homogeneous + ProjectFlux in single pass
     void updateFused(int lk, int g);
