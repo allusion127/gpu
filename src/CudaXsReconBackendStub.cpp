@@ -52,6 +52,14 @@ bool XsReconBackend::xeCommit(const xsrecon::BatchView&, int, double, bool,
     return false;
 }
 
+// WP7-C.  The transaction declines here for the same reason the six above do:
+// a call site must never need an #ifdef.
+bool XsReconBackend::xeTransaction(const xsrecon::BatchView&, unsigned long long,
+                                   unsigned long long, const XeTxnRequest&,
+                                   xe::XeTxnControl*) {
+    return false;
+}
+
 unsigned long long XsReconBackend::xeEvaluations() { return 0; }
 
 unsigned long long XsReconBackend::xeCommits() { return 0; }
@@ -109,6 +117,8 @@ bool rasberyGpuFlatXsEnabled() { return false; }
 bool rasberyGpuNodalEnabled() { return false; }
 
 bool rasberyGpuXeEnabled() { return false; }
+
+bool rasberyGpuXeTxnEnabled() { return false; }
 
 int rasberyGpuXeDotPartitions() { return 0; }
 

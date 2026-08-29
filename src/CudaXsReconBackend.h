@@ -41,6 +41,7 @@ struct BatchView;
 
 namespace xe {
 struct XeTriple;
+struct XeTxnControl;
 }
 
 namespace flatxs {
@@ -166,6 +167,39 @@ public:
     /// Receipts (process-wide, all instances): fuel-node evaluations and
     /// commits the device actually ran.  Zero means the arm never fired,
     /// whatever the flag said -- the G0 validity check.
+    // --- WP7 stage C: the whole step as ONE device transaction -------------
+    //
+    // Everything the host decides between the evaluate and the commit, decided
+    // on the device instead: a step becomes evaluate -> history -> dots ->
+    // solve/accept -> commit with ONE host synchronisation, the drain's, which
+    // the caller was paying for anyway.  The six entry points above stay and
+    // are what RASBERY_GPU_XE_TXN=0 runs, so the bit-identity gate compares
+    // against live code rather than a memory of it.
+    //
+    // The request carries what the host still owns and the device cannot know:
+    // the window bookkeeping (Driver.h's XeAndersonState is host state), and
+    // the three constants Driver.h declares.  Passing the constants rather than
+    // redeclaring them is the point -- a second spelling of
+    // XE_ANDERSON_MIN_GRAM is a second opinion waiting to drift.
+    struct XeTxnRequest {
+        int    hist_col    = -1;   ///< window column to record; -1 records none
+        bool   hist_rotate = false;///< drop the oldest column before recording
+        int    ncol        = 0;    ///< window width AFTER the record; 0 = unarmed
+        double eq_tol      = 0.0;  ///< Driver.h XE_EQUILIBRIUM_TOLERANCE
+        double min_gram    = 0.0;  ///< Driver.h XE_ANDERSON_MIN_GRAM
+        double max_step    = 0.0;  ///< the trust region, as a multiple of picard
+        double relax       = 1.0;  ///< the damping a REJECTED step commits with
+    };
+
+    /// Run one Xe step as a single device transaction.  Returns false having
+    /// written nothing observable, in which case the caller must run the
+    /// round-tripping arm; on true `*out` carries the step's outcome, residual
+    /// and reason, and the host arrays are authoritative again.
+    bool xeTransaction(const xsrecon::BatchView& host,
+                       unsigned long long micx_generation,
+                       unsigned long long state_generation, const XeTxnRequest& req,
+                       xe::XeTxnControl* out);
+
     static unsigned long long xeEvaluations();
     static unsigned long long xeCommits();
 
@@ -432,6 +466,11 @@ unsigned long long rasberyGpuFlatXsNodes();
 /// (evaluate / Anderson algebra / commit on the device).  Stub builds return
 /// false.  DEFAULT OFF until the Gate A/B receipts adopt it.
 bool rasberyGpuXeEnabled();
+
+/// RASBERY_GPU_XE_TXN, read once per process: WP7 stage C's single-transaction
+/// Xe step.  Default OFF; the arm it changes is the RASBERY_GPU_XE one, and it
+/// claims to change it bit for bit.
+bool rasberyGpuXeTxnEnabled();
 
 /// The fixed partition count the device inner product is cut into
 /// (RASBERY_GPU_XE_DOT_PARTITIONS, default xe::XE_DOT_PARTITIONS_DEFAULT).

@@ -4077,6 +4077,35 @@ bool XSSet::XeGpuCommitCandidate(double power) {
                                       _hoststate_generation);
 }
 
+bool XSSet::XeGpuTransaction(double power, const XsReconBackend::XeTxnRequest& req,
+                             xe::XeTxnControl& out) {
+    // The same two refusals XeGpuEvaluate makes, for the same reasons: with no
+    // depletion data depTrans has no rows and the kernel's dep_i135/dep_xe135
+    // would be built out of nothing, and at zero power UpdateEquilibriumXenon
+    // returns 0.0 without doing anything.
+    if (depDecay.size() == 0 || power <= 0.0)
+        return false;
+    std::array<double, xsrecon::NISO> dep_i135{}, dep_xe135{};
+    xsrecon::BatchView                v{};
+    if (!PrepareXeDeviceCall(power, 1.0, v, dep_i135, dep_xe135))
+        return false;
+    // BOTH phase scopes, because the transaction does both halves' work: the
+    // map evaluation and the reconstruction.  Charging only one would move the
+    // phase ledger under an A/B whose whole point is that the two arms do the
+    // same work.
+    xsphase::Scope eqxe_scope(xsphase::tallies().eqxe,
+                              static_cast<std::uint64_t>(v.n_fuel));
+    xsphase::Scope recon_scope(xsphase::tallies().eqxe_recon,
+                               static_cast<std::uint64_t>(v.n_fuel));
+    // The transaction ALWAYS commits -- the candidate if it survived, the
+    // Picard image the fallback would have committed if it did not -- so the
+    // macro-XS write is announced unconditionally, exactly as the two commit
+    // entry points announce theirs.
+    noteMacroXsWrite();
+    return _xsrecon_backend->xeTransaction(v, _micx_generation, _hoststate_generation,
+                                           req, &out);
+}
+
 bool XSSet::XeGpuCommitPicard(double power, double relax) {
     std::array<double, xsrecon::NISO> dep_i135{}, dep_xe135{};
     xsrecon::BatchView                v{};

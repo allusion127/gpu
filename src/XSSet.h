@@ -507,6 +507,14 @@ public:
     /// fused loop skips, exactly like UpdateEquilibriumXenon.
     bool XeGpuCommitPicard(double power, double relax);
 
+    /// WP7 stage C.  The SEVEN calls above, as one -- evaluate, history, dots,
+    /// solve, candidate, gate and commit, with the three decisions between them
+    /// taken on the device and one host observation at the end.  The seven stay
+    /// because RASBERY_GPU_XE_TXN=0 still runs them and the bit-identity gate
+    /// compares this against them.
+    bool XeGpuTransaction(double power, const XsReconBackend::XeTxnRequest& req,
+                          xe::XeTxnControl& out);
+
     /// Evaluate + commit, i.e. the whole of UpdateEquilibriumXenon through the
     /// split kernels.  This is the B0 (bit-gated) half of Task 13.
     bool TryUpdateEquilibriumXenonGpuSplit(double power, double relax,

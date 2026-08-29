@@ -62,6 +62,26 @@ struct XeGpuTally {
     /// match the host's count exactly: a missed edge leaves the OLD map's
     /// difference columns alive and fits its curvature onto the new one.
     std::atomic<unsigned long long> reset_edges{0};
+    // --- WP7 stage C: the per-step sync census, MEASURED -------------------
+    //
+    // The doc's before/after table is not a model.  These three are counted at
+    // the places they happen -- xeSync() at every cudaStreamSynchronize on the
+    // Xe stream, countXeD2H() at every device->host transfer the Xe path makes,
+    // and xe_device_steps once per committed step, which is the only event that
+    // happens exactly once per step on both arms.  Their ratio is the census,
+    // and it is read off the same run that claims it.
+    std::atomic<unsigned long long> xe_device_steps{0};
+    /// Of those, the ones taken as ONE device transaction (RASBERY_GPU_XE_TXN).
+    std::atomic<unsigned long long> txn_steps{0};
+    /// Transactions that ended in a committed Anderson candidate; the rest
+    /// committed the damped Picard image the fallback would have committed.
+    std::atomic<unsigned long long> txn_accepted{0};
+    /// A transaction the device refused before touching anything, so the
+    /// round-tripping arm ran the step instead.  Non-zero means the census
+    /// below is a mixture and the A/B is not measuring what it says.
+    std::atomic<unsigned long long> txn_declined{0};
+    std::atomic<unsigned long long> host_syncs{0};
+    std::atomic<unsigned long long> d2h_bytes{0};
 };
 
 /// One tally per process, and the only global in the arm.
@@ -94,6 +114,22 @@ inline void appendXeGpuReceiptFields(std::ostream& os) {
        << ",\"anderson_proposed\":" << proposed << ",\"anderson_accepted\":" << accepted
        << ",\"anderson_accept_rate\":" << rate
        << ",\"reset_edges\":" << t.reset_edges.load(std::memory_order_relaxed);
+
+    // WP7-C.  Per-step means per COMMITTED STEP; with none taken the ratios are
+    // undefined and -1 says so, for the same reason anderson_accept_rate does.
+    const unsigned long long steps = t.xe_device_steps.load(std::memory_order_relaxed);
+    const unsigned long long syncs = t.host_syncs.load(std::memory_order_relaxed);
+    const unsigned long long d2h   = t.d2h_bytes.load(std::memory_order_relaxed);
+    const double             sps =
+        (steps > 0) ? static_cast<double>(syncs) / static_cast<double>(steps) : -1.0;
+    const double bps =
+        (steps > 0) ? static_cast<double>(d2h) / static_cast<double>(steps) : -1.0;
+    os << ",\"xe_device_steps\":" << steps
+       << ",\"txn_steps\":" << t.txn_steps.load(std::memory_order_relaxed)
+       << ",\"txn_accepted\":" << t.txn_accepted.load(std::memory_order_relaxed)
+       << ",\"txn_declined\":" << t.txn_declined.load(std::memory_order_relaxed)
+       << ",\"host_syncs\":" << syncs << ",\"host_syncs_per_step\":" << sps
+       << ",\"d2h_bytes\":" << d2h << ",\"d2h_bytes_per_step\":" << bps;
 }
 
 } // namespace rasbery::xe

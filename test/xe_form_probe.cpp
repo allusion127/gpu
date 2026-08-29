@@ -97,10 +97,18 @@ int main(int argc, char** argv) {
         int         bit;
         int         states;
     };
-    const Site sites[4] = {{"dot first product", xe::XE_DOT_FIRST_BIT, 3},
+    // WP7-C added the last four: the normal equations moved onto the device, so
+    // the four multiply-adds inside them became sites too.  They are listed here
+    // for the same reason the first four are -- a site nobody probes is a site
+    // that mines as whatever the seed happened to say.
+    const Site sites[8] = {{"dot first product", xe::XE_DOT_FIRST_BIT, 3},
                            {"dot third product", xe::XE_DOT_THIRD_BIT, 2},
                            {"candidate, 1 column", xe::XE_CAND1_BIT, 2},
-                           {"candidate, 2 columns", xe::XE_CAND2_BIT, 2}};
+                           {"candidate, 2 columns", xe::XE_CAND2_BIT, 2},
+                           {"gram determinant", xe::XE_TXN_DET_BIT, 3},
+                           {"gamma[0] numerator", xe::XE_TXN_G0_BIT, 3},
+                           {"gamma[1] numerator", xe::XE_TXN_G1_BIT, 3},
+                           {"projection", xe::XE_TXN_PROJ_BIT, 3}};
     int decisive = 0;
     for (const Site& s : sites) {
         const unsigned long long field = (s.states == 2) ? 1ull : 3ull;

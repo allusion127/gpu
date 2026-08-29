@@ -101,7 +101,35 @@ constexpr int XE_DOT_FIRST_BIT = 0; ///< 2 bits, 3 states
 constexpr int XE_DOT_THIRD_BIT = 2; ///< 1 bit
 constexpr int XE_CAND1_BIT     = 3; ///< 1 bit, the one-column window
 constexpr int XE_CAND2_BIT     = 4; ///< 1 bit, the two-column window
-constexpr int XE_BIT_COUNT     = 5;
+
+// WP7 stage C (RASBERY_GPU_XE_TXN).  FOUR MORE SITES, AND THEY ARE NEW ONLY IN
+// WHERE THEY RUN.  The transaction moves Driver.h's normal equations onto the
+// device so a step needs no host observation between the dots and the commit.
+// The arithmetic is not allowed to move with them: TXN=1 must reproduce TXN=1's
+// own predecessor -- the current RASBERY_GPU_XE arm -- bit for bit, and that
+// arm computes these four expressions with g++ at -O3, where -ffp-contract=fast
+// may fuse either product of each into the add.  The device TU is built
+// --fmad=false, so nothing fuses there unless it is written as an fma; which
+// one to write is a property of the BUILD MACHINE and therefore mined, exactly
+// like the dot's and the candidate's sites.
+//
+// The four host expressions, from TryAndersonXeStepGpu:
+//
+//     det      = a * c - b * b;
+//     gamma[0] = (c * p - b * q) / det;
+//     gamma[1] = (a * q - b * p) / det;
+//     proj     = gamma[0] * p + gamma[1] * q;
+//
+// Each is one add with two multiplies feeding it, so each has three states --
+// neither product fused, the first fused, the second fused -- and takes two
+// bits.  What is NOT a site: `XE_ANDERSON_MIN_GRAM * a * c` and
+// `max_step * picard` are multiply chains with no add; `p / a` is a division;
+// `gg - proj` and the one-column `gamma[j] * p` have one multiply or none.
+constexpr int XE_TXN_DET_BIT   = 5;  ///< 2 bits, 3 states: a*c - b*b
+constexpr int XE_TXN_G0_BIT    = 7;  ///< 2 bits, 3 states: c*p - b*q
+constexpr int XE_TXN_G1_BIT    = 9;  ///< 2 bits, 3 states: a*q - b*p
+constexpr int XE_TXN_PROJ_BIT  = 11; ///< 2 bits, 3 states: g0*p + g1*q
+constexpr int XE_BIT_COUNT     = 13;
 
 /// States of the first dot site.
 constexpr unsigned XE_DOT_FIRST_NONE = 0u; ///< both products rounded, plain add
@@ -120,7 +148,21 @@ constexpr unsigned XE_DOT_FIRST_P2   = 2u; ///< fma(a2,b2, mul(a1,b1))
 /// the add), the dot's third product is fused, the one-column candidate is
 /// fused and the two-column one is not.  All four sites were measured decisive
 /// on this host by test/xe_form_probe.cpp -- none of them is a coin toss.
+/// WP7-C adds bits 5..12 and they are ZERO here, which is not a measurement --
+/// it is the absence of one.  Nothing was ever measured for those four sites on
+/// the authoring host because the authoring host has no nvcc, so the shipped
+/// record says "unfused" and the MINING is what the run actually uses.  The
+/// [RASBERY][FORMS] receipt is where a host that disagrees with this record
+/// announces itself, and on the first 238 build it is expected to.
 constexpr unsigned long long XE_FORMS_DEFAULT = 0xdull;
+
+/// States of a two-product site.  ONE ENCODING FOR ALL FOUR of the WP7-C sites,
+/// so a reader checks the meaning once: 0 is both products separately rounded,
+/// 1 fuses the FIRST product into the add, 2 fuses the SECOND.  Deliberately
+/// the same numbering XE_DOT_FIRST_* uses.
+constexpr unsigned XE_SITE_NONE = 0u;
+constexpr unsigned XE_SITE_P1   = 1u;
+constexpr unsigned XE_SITE_P2   = 2u;
 
 /// The number of contiguous partitions the device inner product is cut into.
 /// FIXED -- it depends on no launch parameter, no occupancy, no device -- which
@@ -413,6 +455,7 @@ RASBERY_XE_HD inline double xeDotFold(const double* partials, int parts) {
 /// host reads them.  Pair `slot` -> (left triple id, right triple id) is a
 /// table rather than a switch so the device kernel and the host harness cannot
 /// disagree about which product landed in which slot.
+
 enum XeDotSlot {
     XE_DOT_GG = 0, ///< <g,g>
     XE_DOT_A  = 1, ///< <dg0,dg0>
@@ -422,5 +465,276 @@ enum XeDotSlot {
     XE_DOT_Q  = 5, ///< <dg1,g>
     XE_DOT_COUNT = 6
 };
+
+// ---------------------------------------------------------------------------
+// WP7 stage C -- the Xe device transaction
+// ---------------------------------------------------------------------------
+//
+// WHAT MOVES, AND WHAT DOES NOT.  Today an Anderson Xe step is five device
+// launches with FOUR host stream synchronisations threaded between them,
+// because the host owns three decisions: is the step armed, did the 2x2 solve
+// condition, did the candidate pass the safeguards.  Each decision reads a
+// handful of doubles the device just computed, so each costs a full round trip.
+// The arithmetic of those decisions is EIGHT DOUBLES WIDE.  It is not on the
+// host because it is expensive; it is on the host because that is where it was
+// written.
+//
+// So it moves, unchanged, into one single-thread kernel, and the ONLY thing
+// that changes about a step is that nobody observes it in the middle.  The
+// dots are consumed in the same slot order, the safeguards fire in the same
+// sequence with the same constants, the same candidate is committed.  That is
+// why WP7-C is a B0 claim against the current device arm and not an N1 one --
+// the N1 line was crossed by the fixed partition, once, and it stays crossed
+// exactly where it was.
+//
+// THE REJECTED STEP IS COMMITTED HERE TOO, and that is the part that has to be
+// argued rather than asserted.  Today a refusal returns false and the caller
+// runs UpdateEquilibriumXenon, which -- on this arm -- re-evaluates the map at
+// a state nothing has written and commits x + relax*(F - x).  The transaction
+// instead commits the F IT ALREADY HOLDS, from the same evaluation, with the
+// same blend.  Those are the same bits: the map is a deterministic kernel over
+// unchanged operands, so the second evaluation could only ever return the
+// first's answer.  What it saves is that second evaluation -- one full
+// 39-isotope condensation over every fuel node, on every rejected step.
+//
+// AND relax IS 1.0 ON THIS PATH, always.  Driver.h arms the Anderson attempt
+// with `xe_anderson && xe_relax == 1.0 && flux_converged`, and the fallback it
+// guards uses that same xe_relax.  The transaction therefore commits F itself
+// (xeBlendOrdinal's undamped arm) rather than a blend, and the contract test
+// asserts the guard that makes this true is still in the caller.
+
+/// Why a step ended, in the order the safeguards are tested.  Downloaded once
+/// per step so the host telemetry counts exactly what it counted before.
+enum XeTxnReason {
+    XE_TXN_ACCEPTED  = 0, ///< candidate passed every safeguard and was committed
+    XE_TXN_NOT_ARMED = 1, ///< ncol == 0 or the residual is already under tolerance
+    XE_TXN_CONDITION = 2, ///< SAFEGUARD 1/4: neither window width conditioned
+    XE_TXN_RESIDUAL  = 3, ///< SAFEGUARD 2/4: the fit predicts no decrease
+    XE_TXN_PHYSICS   = 4, ///< SAFEGUARD 3/4: a density went negative or non-finite
+    XE_TXN_STEP      = 5  ///< SAFEGUARD 4/4: outside the trust region
+};
+
+/// The whole of one step's host-visible state, device-resident, written by the
+/// two control kernels and read by the commit kernel.  ONE STRUCT AND ONE
+/// DOWNLOAD: the four scalars the host still needs (the residual, the outcome,
+/// the two counter increments) ride back on the transfer the commit's drain was
+/// already paying for, so a transaction step adds no synchronisation of its own.
+///
+/// Plain old data, doubles first: it is cudaMemcpy'd as one block and the host
+/// reads the same struct out of the same header.
+struct XeTxnControl {
+    double gamma[2];    ///< the fit coefficients, read by the candidate kernel
+    double picard;      ///< the raw residual at x_k -- the caller's xe_change
+    double step;        ///< the candidate's trust-region metric
+    double proj;        ///< sum_j gamma_j <dG_j, g_k>
+    double gg;          ///< <g,g>, kept so a rejection is readable in the receipt
+    int    solved;      ///< the fit conditioned; the candidate kernel runs on this
+    int    accept;      ///< 1 = commit XE_T_CAND, 0 = commit XE_T_F
+    int    proposed;    ///< the step got past arming, i.e. it is a real proposal
+    int    reason;      ///< XeTxnReason
+    int    ncol;        ///< the window width this step used
+    int    physics_bad; ///< the candidate kernel's OR-reduction
+    int    pad[2];
+};
+
+/// isfinite() without reaching for a classifier whose host and device spellings
+/// differ, and without `v - v == 0.0`, which a compiler is entitled to fold.
+/// A NaN fails the comparison (every comparison against it is false) and either
+/// infinity exceeds the largest finite double, so this IS std::isfinite.
+RASBERY_XE_HD inline bool xeFinite(double v) {
+    return fabs(v) <= 1.7976931348623157e308;
+}
+
+/// `u*v - w*z` under one mined site.  See XE_SITE_* for the encoding.
+RASBERY_XE_HD inline double xeSiteSub(double u, double v, double w, double z,
+                                      unsigned state) {
+    if (state == XE_SITE_P1) return xsr::xsrFma(u, v, -xsr::xsrMul(w, z));
+    if (state == XE_SITE_P2) return xsr::xsrFma(-w, z, xsr::xsrMul(u, v));
+    return xsr::xsrMul(u, v) - xsr::xsrMul(w, z);
+}
+
+/// `u*v + w*z` under one mined site.
+RASBERY_XE_HD inline double xeSiteAdd(double u, double v, double w, double z,
+                                      unsigned state) {
+    if (state == XE_SITE_P1) return xsr::xsrFma(u, v, xsr::xsrMul(w, z));
+    if (state == XE_SITE_P2) return xsr::xsrFma(w, z, xsr::xsrMul(u, v));
+    return xsr::xsrMul(u, v) + xsr::xsrMul(w, z);
+}
+
+RASBERY_XE_HD inline unsigned xeSiteState(unsigned long long forms, int bit) {
+    return static_cast<unsigned>((forms >> bit) & 3ull);
+}
+
+/// THE LEAST SQUARES AND SAFEGUARD 1/4 (conditioning), and NOTHING ELSE.
+///
+/// SEPARATE FROM THE CONTROL BODY BECAUSE THE MINING NEEDS IT SEPARATE.  The
+/// four contraction sites live in here, and XeFormMine.h scores them by running
+/// this against XeAndersonReference.cpp's verbatim quotation of the same block
+/// in Driver.h.  A scorer that had to go through xeAndersonSolveControl would
+/// get no gamma at all whenever SAFEGUARD 2/4 rejected -- it writes them only on
+/// the accepting path -- and would then mine a site out of the cases where it
+/// happened not to fire.  Which is a statement about the fixture and not about
+/// the compiler; CmfdOuterFormMiner.cpp names that failure by name.
+///
+/// Returns Driver.h's `solved`.  On false the outputs are untouched.
+RASBERY_XE_HD inline bool xeAndersonFit(const double* dots, int ncol, double min_gram,
+                                        unsigned long long forms, double* gamma0_out,
+                                        double* gamma1_out, double* proj_out) {
+    const double gg = dots[XE_DOT_GG];
+    if (ncol == XE_DEPTH) {
+        const double a   = dots[XE_DOT_A];
+        const double b   = dots[XE_DOT_B];
+        const double c   = dots[XE_DOT_C];
+        const double p   = dots[XE_DOT_P];
+        const double q   = dots[XE_DOT_Q];
+        const double det = xeSiteSub(a, c, b, b, xeSiteState(forms, XE_TXN_DET_BIT));
+        if (a > 0.0 && c > 0.0 && xeFinite(det) && xeFinite(p) && xeFinite(q) &&
+            det > min_gram * a * c) {
+            const double g0 =
+                xeSiteSub(c, p, b, q, xeSiteState(forms, XE_TXN_G0_BIT)) / det;
+            const double g1 =
+                xeSiteSub(a, q, b, p, xeSiteState(forms, XE_TXN_G1_BIT)) / det;
+            *gamma0_out = g0;
+            *gamma1_out = g1;
+            *proj_out   = xeSiteAdd(g0, p, g1, q, xeSiteState(forms, XE_TXN_PROJ_BIT));
+            return true;
+        }
+    }
+    // The newest column.  At ncol == 2 that is dg[1] -- slots C and Q -- and at
+    // ncol == 1 it is dg[0], which is slots A and P.
+    const int    j = ncol - 1;
+    const double a = (j == 1) ? dots[XE_DOT_C] : dots[XE_DOT_A];
+    const double p = (j == 1) ? dots[XE_DOT_Q] : dots[XE_DOT_P];
+    if (a > 0.0 && xeFinite(a) && xeFinite(p) && a > min_gram * gg) {
+        const double gj = p / a;
+        *gamma0_out     = (j == 1) ? 0.0 : gj;
+        *gamma1_out     = (j == 1) ? gj : 0.0;
+        // ONE multiply, no add: no site here, and none is mined for it.
+        *proj_out       = xsr::xsrMul(gj, p);
+        return true;
+    }
+    return false;
+}
+
+/// THE NORMAL EQUATIONS AND SAFEGUARDS 1/4 AND 2/4, in Driver.h's order.
+///
+/// Reads `dots` in XeDotSlot order and nothing else; `eq_tol` and `min_gram`
+/// are PARAMETERS rather than constants of this header on purpose -- Driver.h
+/// owns XE_EQUILIBRIUM_TOLERANCE and XE_ANDERSON_MIN_GRAM, and a second
+/// declaration of either is a second opinion waiting to drift.
+///
+/// Writes `ctl` completely: on every exit path every field it owns is assigned,
+/// because the commit kernel reads them whatever happened.
+RASBERY_XE_HD inline void xeAndersonSolveControl(const double* dots, int ncol,
+                                                 double picard, double eq_tol,
+                                                 double min_gram,
+                                                 unsigned long long forms,
+                                                 XeTxnControl* ctl) {
+    ctl->gamma[0]    = 0.0;
+    ctl->gamma[1]    = 0.0;
+    ctl->picard      = picard;
+    ctl->step        = 0.0;
+    ctl->proj        = 0.0;
+    ctl->gg          = dots[XE_DOT_GG];
+    ctl->solved      = 0;
+    ctl->accept      = 0;
+    ctl->proposed    = 0;
+    ctl->ncol        = ncol;
+    ctl->physics_bad = 0;
+
+    // 3. Arming -- NOT a rejection, so neither counter moves.
+    if (ncol == 0 || picard < eq_tol) {
+        ctl->reason = XE_TXN_NOT_ARMED;
+        return;
+    }
+    ctl->proposed = 1;
+
+    const double gg     = dots[XE_DOT_GG];
+    double       proj   = 0.0;
+    double       gamma0 = 0.0, gamma1 = 0.0;
+    const bool   solved =
+        xeAndersonFit(dots, ncol, min_gram, forms, &gamma0, &gamma1, &proj);
+    if (!solved) {
+        ctl->reason = XE_TXN_CONDITION;
+        return;
+    }
+
+    // SAFEGUARD 2/4: the fit must predict a residual DECREASE.
+    const double pred2 = gg - proj;
+    if (!(xeFinite(pred2) && pred2 >= 0.0 && pred2 < gg)) {
+        ctl->proj   = proj;
+        ctl->reason = XE_TXN_RESIDUAL;
+        return;
+    }
+
+    ctl->gamma[0] = gamma0;
+    ctl->gamma[1] = gamma1;
+    ctl->proj     = proj;
+    ctl->solved   = 1;
+    ctl->reason   = XE_TXN_ACCEPTED; // provisional; the gate below can overturn it
+}
+
+/// SAFEGUARDS 3/4 AND 4/4, after the candidate kernel's two reductions.  Split
+/// from the solve for the one reason a split is ever justified here: the
+/// candidate's grid-wide OR and MAX are not readable until its grid retires,
+/// and a kernel boundary is the only barrier that says so.
+RASBERY_XE_HD inline void xeAndersonGateControl(int physics_bad, double step,
+                                                double max_step, XeTxnControl* ctl) {
+    ctl->physics_bad = physics_bad;
+    ctl->step        = step;
+    if (!ctl->solved) return; // the reason is already recorded
+    if (physics_bad) {
+        ctl->accept = 0;
+        ctl->reason = XE_TXN_PHYSICS;
+        return;
+    }
+    // SAFEGUARD 4/4: written as !(<=) so a NaN rejects.
+    if (!(step <= max_step * ctl->picard)) {
+        ctl->accept = 0;
+        ctl->reason = XE_TXN_STEP;
+        return;
+    }
+    ctl->accept = 1;
+    ctl->reason = XE_TXN_ACCEPTED;
+}
+
+/// THE FUSED HISTORY MAINTENANCE (WP7-C step b).  One thread per fuel ordinal
+/// performs, IN THIS ORDER, what fourteen device-to-device copies and two kXeSub
+/// launches performed before:
+///
+///     rotate   df[0] <- df[1], dg[0] <- dg[1]        (only at a full window)
+///     record   df[col] <- F - F_prev, dg[col] <- G - G_prev
+///     save     F_prev <- F, G_prev <- G
+///
+/// ORDER-PRESERVATION NOTE.  Every one of these is ELEMENTWISE at a single
+/// ordinal: no reduction, no neighbour, no accumulation.  Ordinal k's outputs
+/// are a function of ordinal k's inputs alone, so no thread can observe another
+/// thread's write and the grid may retire in any order.  What the fusion HAS to
+/// preserve is the sequence WITHIN one ordinal -- the record must read F_prev
+/// before the save overwrites it, and the rotate must read df[1] before the
+/// record overwrites it -- and it does, by reading all six operands into
+/// registers first.  No arithmetic changes: the two subtractions are
+/// xeSubOrdinal's own, unrounded and unfused, and the copies are copies.
+RASBERY_XE_HD inline void xeHistoryOrdinal(const double* f, const double* f_prev,
+                                           const double* g, const double* g_prev,
+                                           double* df0, double* df1, double* dg0,
+                                           double* dg1, double* f_prev_out,
+                                           double* g_prev_out, int k, int col,
+                                           int rotate) {
+    const double fv = f[k], fp = f_prev[k], gv = g[k], gp = g_prev[k];
+    if (rotate) {
+        df0[k] = df1[k];
+        dg0[k] = dg1[k];
+    }
+    double* dfc = (col == 0) ? df0 : df1;
+    double* dgc = (col == 0) ? dg0 : dg1;
+    if (col >= 0) {
+        dfc[k] = fv - fp;
+        dgc[k] = gv - gp;
+    }
+    f_prev_out[k] = fv;
+    g_prev_out[k] = gv;
+}
+
 
 } // namespace rasbery::xe

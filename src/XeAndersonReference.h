@@ -42,6 +42,17 @@ struct Fixture {
     std::vector<double> f_i, f_x, f_m; ///< F(x_k), the candidate's base point
     std::vector<double> d_i, d_x, d_m; ///< dF columns, [j*n + k], j = 0..1
     double              gamma[2]       = {0.0, 0.0};
+    /// WP7-C.  Gram matrices and right-hand sides for the normal equations,
+    /// six doubles per case, [6*case + slot] in XeDotSlot order.  A SEPARATE
+    /// FIXTURE FROM THE VECTORS ABOVE because what it has to discriminate is
+    /// different: the four sites in the 2x2 solve are only evaluated when the
+    /// two-column branch is TAKEN, so every case here is deliberately
+    /// well-conditioned.  A fixture of near-singular Gram matrices would fall
+    /// to the one-column secant every time, which has no site, and would mine
+    /// three of the four as don't-cares -- a statement about the fixture and
+    /// not about the compiler.
+    std::vector<double> alg;
+    int                 alg_cases = 0;
 };
 
 /// Deterministic; the same fixture on every host and every run.
@@ -54,5 +65,17 @@ double refDot(const Fixture& f, int i0, int i1);
 /// f.n.
 void refCandidate(const Fixture& f, int ncol, std::vector<double>& ci,
                   std::vector<double>& cx, std::vector<double>& cm);
+
+/// WP7-C.  TryAndersonXeStepGpu's normal equations, quoted verbatim: the two
+/// coefficients, the projection, the determinant, and the `solved` flag the
+/// conditioning test sets.  `det_out` is an output only so the mining can score
+/// that site directly instead of through two divisions; the production arm
+/// materialises det anyway, because it divides by it twice.
+///
+/// `min_gram` is a parameter for the same reason the shipped body takes one:
+/// Driver.h owns XE_ANDERSON_MIN_GRAM and a second spelling here would be a
+/// second opinion.
+bool refAlgebra(const Fixture& f, int idx, int ncol, double min_gram, double gamma_out[2],
+                double* proj_out, double* det_out);
 
 } // namespace xeref

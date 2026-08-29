@@ -198,8 +198,13 @@ def source_contract():
     if TELEM_ENV in arm:
         fail(f"{TELEM_ENV} is in kArmEnv; it must stay in its own field so an "
              "arm comparison can hold every other knob equal")
+    # RASBERY_GPU_XE_TXN (WP7-C) claims to move NOTHING -- it is a B0 change
+    # against the RASBERY_GPU_XE arm.  It is listed anyway, and that is the
+    # point: a knob whose whole content is "this does not move the trajectory"
+    # is exactly the knob an A/B has to be able to prove was held equal.
     for knob in ("RASBERY_STAGED_FLUX_TOL", "RASBERY_STAGED_XE_TOL",
                  "RASBERY_STAGED_LOOSE_SETTLE", "RASBERY_GPU_XE",
+                 "RASBERY_GPU_XE_TXN",
                  "RASBERY_GPU_OUTER", "RASBERY_XE_ANDERSON"):
         if knob not in arm:
             fail(f"{knob} moves a trajectory but is not in the arm receipt")

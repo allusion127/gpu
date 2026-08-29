@@ -508,6 +508,7 @@ inline constexpr const char* kArmEnv[] = {
     "RASBERY_GPU_CRAM",
     "RASBERY_GPU_XE",
     "RASBERY_GPU_XE_DOT_PARTITIONS",
+    "RASBERY_GPU_XE_TXN",
     "RASBERY_GPU_OUTER",
     "RASBERY_GPU_OUTER_SEGMENT_MAX",
     "RASBERY_GPU_OUTER_BATCH_STREAM_SWEEP",
@@ -2409,6 +2410,113 @@ private:
                 reason, cols, picard, value);
     }
 
+    /// WP7 stage C -- the same step as ONE DEVICE TRANSACTION
+    /// (RASBERY_GPU_XE_TXN, default off).
+    ///
+    /// ---------------------------------------------------------------------
+    /// WHAT IT RETURNS, AND WHY THAT IS NOT WHAT ITS SIBLING RETURNS
+    /// ---------------------------------------------------------------------
+    ///
+    /// TryAndersonXeStepGpu returns false to mean "I wrote nothing, run the
+    /// Picard step yourself".  The transaction cannot say that: it has already
+    /// committed by the time anyone on the host knows whether the candidate
+    /// passed, and on a rejection it commits THE IMAGE THE PICARD FALLBACK
+    /// WOULD HAVE COMMITTED -- the F it already holds, undamped, with the
+    /// zero-flux skip.  So `true` here means "a step was taken", accepted or
+    /// not, and the caller must not take another.
+    ///
+    /// That is the same commit, bit for bit, and the argument is short: the
+    /// fallback's UpdateEquilibriumXenon re-evaluates the map at a state
+    /// NOTHING HAS WRITTEN since this evaluation, through the same kernel, so
+    /// it can only reproduce the same F; and relax is 1.0 on this path because
+    /// SolveLoop arms the attempt with `xe_relax == 1.0` and hands the fallback
+    /// that same xe_relax.  The backend refuses any other relax rather than
+    /// assume it.
+    ///
+    /// `false` means the transaction DECLINED -- an unavailable arm, a deck the
+    /// history block was not sized for, zero power -- having written nothing,
+    /// and the round-tripping arm below runs the step instead.  That path is
+    /// counted (`txn_declined`) because a run where it fires is a run whose
+    /// census is a mixture of two arms.
+    ///
+    /// EVERY COUNTER IS THE ONE THE OTHER PAIR OF ARMS CHARGES.  On a rejected
+    /// step, TXN=0 charges aa_proposed here and xe_updates/device_updates in
+    /// UpdateEquilibriumXenon; there is one call here instead of two, so both
+    /// are charged from the downloaded reason.  A receipt that changed under a
+    /// flag claiming bit-identity would be the first thing to disbelieve.
+    static bool TryAndersonXeStepGpuTxn(SolverContext& ctx, XeAndersonState& aa,
+                                        double power, double max_step,
+                                        double& xe_change) {
+        XSSet& xs = ctx.cross_sections;
+        if (xs.fuel_nodes().empty())
+            return false;
+
+        // The window bookkeeping the device cannot do: aa is HOST state, and
+        // these three numbers are exactly what steps 2 and 3 of the sibling
+        // compute before it knows anything about this step's outcome.
+        XsReconBackend::XeTxnRequest req;
+        int                          ncol_after = aa.ncol;
+        if (aa.have_prev) {
+            if (aa.ncol == XE_ANDERSON_DEPTH) {
+                req.hist_rotate = true;
+                --ncol_after; // the oldest column falls out of the window
+            }
+            req.hist_col = ncol_after;
+            ++ncol_after;
+        }
+        req.ncol     = ncol_after;
+        req.eq_tol   = XE_EQUILIBRIUM_TOLERANCE;
+        req.min_gram = XE_ANDERSON_MIN_GRAM;
+        req.max_step = max_step;
+        req.relax    = 1.0; // see the header: SolveLoop guarantees it
+
+        xe::XeTxnControl out{};
+        if (!xs.XeGpuTransaction(power, req, out)) {
+            xe::xeGpuTally().txn_declined.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
+        aa.ncol      = ncol_after;
+        aa.have_prev = true;
+        xe_change    = out.picard;
+
+        // The step happened on the device however it ended, so the split arm's
+        // sum-to-whole triple is charged once, here, instead of once in
+        // UpdateEquilibriumXenon.
+        xe::XeGpuTally& tally = xe::xeGpuTally();
+        tally.xe_updates.fetch_add(1, std::memory_order_relaxed);
+        tally.device_updates.fetch_add(1, std::memory_order_relaxed);
+
+        if (out.reason == xe::XE_TXN_NOT_ARMED)
+            return true; // arming is not a rejection: neither counter moves
+
+        ++ctx.telemetry.xe_aa_proposed;
+        tally.aa_proposed.fetch_add(1, std::memory_order_relaxed);
+
+        if (out.reason == xe::XE_TXN_ACCEPTED) {
+            ++ctx.telemetry.xe_aa_accepted;
+            tally.aa_accepted.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+
+        // The same four reasons, with the same reported value, as the sibling's
+        // four RejectXeAnderson call sites.
+        const char*  reason = "condition";
+        double       value  = out.gg;
+        if (out.reason == xe::XE_TXN_RESIDUAL) {
+            reason = "residual";
+            value  = out.gg - out.proj;
+        } else if (out.reason == xe::XE_TXN_PHYSICS) {
+            reason = "physics";
+            value  = out.step;
+        } else if (out.reason == xe::XE_TXN_STEP) {
+            reason = "step";
+            value  = out.step;
+        }
+        RejectXeAnderson(ctx, reason, out.ncol, out.picard, value);
+        return true;
+    }
+
     /// The DEVICE arm of the safeguarded Anderson step (RASBERY_GPU_XE,
     /// Rev.7.1 Task 13).
     ///
@@ -2452,6 +2560,14 @@ private:
     /// of it.  That is the same trade the host arm's own comment defends.
     static bool TryAndersonXeStepGpu(SolverContext& ctx, XeAndersonState& aa,
                                      double power, double max_step, double& xe_change) {
+        // WP7-C.  ONE LINE, AT THE TOP, and the body below is untouched -- the
+        // same shape Task 13's own dispatch takes.  With the flag unset this is
+        // a load of a cached bool and the round-tripping arm runs exactly as it
+        // always has, which is what makes the flag's A/B an A/B.
+        static const bool txn = rasberyGpuXeTxnEnabled();
+        if (txn && TryAndersonXeStepGpuTxn(ctx, aa, power, max_step, xe_change))
+            return true;
+
         XSSet& xs = ctx.cross_sections;
 
         // 1. Evaluate the map without applying it (plan Sec 10.1) -- x, F(x)

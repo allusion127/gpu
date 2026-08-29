@@ -8,6 +8,7 @@
 #include "GpuGraphSplice.h"
 #include "NodalKernel.h"
 #include "XeFormMask.h"
+#include "XeGpuReceipt.h"
 #include "XeKernel.h"
 #include "XsReconKernel.h"
 
@@ -126,6 +127,10 @@ __global__ void kernelXsRecon(xsr::BatchView v, unsigned long long* max_bits,
 }
 
 namespace xek = rasbery::xe;
+
+/// One preloaded dot layout: 2*XE_DOT_COUNT pair ids followed by XE_DOT_COUNT
+/// destination slots, which is what kXeDotStage1/2 read.
+constexpr int XE_TXN_LAYOUT_INTS = 3 * xek::XE_DOT_COUNT;
 
 // ---------------------------------------------------------------------------
 // Rev.7.1 Task 13 -- the split Xe arm's three kernels
@@ -279,6 +284,138 @@ __global__ void kXeCommit(xsr::BatchView v, const double* hist, int triple, doub
         vi                         = t.i135[k];
         vx                         = t.xe135[k];
         vm                         = t.xe135m[k];
+    }
+    xek::xeCommitOrdinal(v, k, vi, vx, vm);
+    atomicAdd(solved, 1ULL);
+}
+
+// ---------------------------------------------------------------------------
+// WP7 stage C -- the Xe device transaction (RASBERY_GPU_XE_TXN, default off)
+// ---------------------------------------------------------------------------
+//
+// The five kernels above stay exactly as they are and are what TXN=0 launches,
+// so the B0 replay compares against LIVE CODE and not a memory of it -- the same
+// rule WP7-B's fusion bits follow.  What is added here is the same work with
+// the three host decisions moved inside.
+
+/// FUSED HISTORY MAINTENANCE.  Replaces, in one launch, what was two kXeSub
+/// launches and twelve device-to-device copies: xeRotateHistory (6 copies),
+/// xeRecordColumn (2 kernels) and xeSaveEvaluation (6 copies).
+///
+/// ORDER-PRESERVATION NOTE (WP7-B's rule, applied here).  Every operation is
+/// ELEMENTWISE at one fuel ordinal and one row: no reduction, no neighbour, no
+/// accumulation, so ordinal k's outputs depend on ordinal k's inputs alone and
+/// the grid may retire in any order whatever.  The sequence that DOES matter is
+/// the one inside a single ordinal -- the record must read F_prev before the
+/// save overwrites it, and the rotate must read df[1] before the record
+/// overwrites it -- and xeHistoryOrdinal loads all four operands into registers
+/// before it stores anything.  No arithmetic is added, removed or reassociated:
+/// two unfused subtractions and four copies, which is what the twelve
+/// cudaMemcpyAsync and two kXeSub did.
+__global__ void kXeHistory(double* hist, int n_fuel, int col, int rotate) {
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= n_fuel) return;
+    for (int row = 0; row < 3; ++row) {
+        xek::xeHistoryOrdinal(
+            xeRow(hist, row, xek::XE_T_F, n_fuel),
+            xeRow(hist, row, xek::XE_T_F_PREV, n_fuel),
+            xeRow(hist, row, xek::XE_T_G, n_fuel),
+            xeRow(hist, row, xek::XE_T_G_PREV, n_fuel),
+            const_cast<double*>(xeRow(hist, row, xek::XE_T_DF0, n_fuel)),
+            const_cast<double*>(xeRow(hist, row, xek::XE_T_DF1, n_fuel)),
+            const_cast<double*>(xeRow(hist, row, xek::XE_T_DG0, n_fuel)),
+            const_cast<double*>(xeRow(hist, row, xek::XE_T_DG1, n_fuel)),
+            const_cast<double*>(xeRow(hist, row, xek::XE_T_F_PREV, n_fuel)),
+            const_cast<double*>(xeRow(hist, row, xek::XE_T_G_PREV, n_fuel)), k, col,
+            rotate);
+    }
+}
+
+/// ONE THREAD, AND THAT IS THE POINT.  Eight doubles of arithmetic that used to
+/// cost a stream synchronisation now cost a launch.  It consumes `dots` in
+/// XeDotSlot order -- the same order kXeDotStage2 wrote them and the same order
+/// the host read them -- and the constants arrive as arguments because Driver.h
+/// owns them.
+///
+/// It also clears the candidate kernel's two reduction cells, which is what
+/// removes the two cudaMemsetAsync nodes the host arm needed there.
+__global__ void kXeAndersonSolve(const double* dots, int ncol,
+                                 const unsigned long long* picard_bits, double eq_tol,
+                                 double min_gram, unsigned long long forms,
+                                 xek::XeTxnControl* ctl, int* physics_bad,
+                                 unsigned long long* step_bits) {
+    double picard = __longlong_as_double(static_cast<long long>(*picard_bits));
+    xek::xeAndersonSolveControl(dots, ncol, picard, eq_tol, min_gram, forms, ctl);
+    *physics_bad = 0;
+    *step_bits   = 0ull;
+}
+
+/// kXeCandidate with gamma read from device memory and the launch predicated on
+/// the fit having conditioned.  The body is xeCandidateOrdinal, unchanged: a
+/// candidate built here is bit-for-bit the candidate TXN=0 builds, because the
+/// gammas it is built from are bit-for-bit the same gammas.
+__global__ void kXeCandidateTxn(double* hist, int n_fuel, const xek::XeTxnControl* ctl,
+                                unsigned long long forms, int* physics_bad,
+                                unsigned long long* step_bits) {
+    if (!ctl->solved) return;
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= n_fuel) return;
+
+    const double gamma[2] = {ctl->gamma[0], ctl->gamma[1]};
+    int          bad      = 0;
+    double       step     = 0.0;
+    xek::xeCandidateOrdinal(xeTripleConstAt(hist, xek::XE_T_F, n_fuel),
+                            xeTripleConstAt(hist, xek::XE_T_X, n_fuel),
+                            xeRow(hist, 0, xek::XE_T_DF0, n_fuel),
+                            xeRow(hist, 1, xek::XE_T_DF0, n_fuel),
+                            xeRow(hist, 2, xek::XE_T_DF0, n_fuel), ctl->ncol, gamma,
+                            xeTripleAt(hist, xek::XE_T_CAND, n_fuel), k, n_fuel, forms,
+                            &bad, &step);
+    if (bad) atomicOr(physics_bad, 1);
+    atomicMax(step_bits, static_cast<unsigned long long>(__double_as_longlong(step)));
+}
+
+/// SAFEGUARDS 3/4 and 4/4, one thread, after the candidate grid has retired.
+/// A separate kernel and not a prologue inside kXeCommitTxn because a grid-wide
+/// OR and MAX are not readable until the grid that wrote them is done, and the
+/// kernel boundary is the only thing that says so.
+__global__ void kXeAndersonGate(xek::XeTxnControl* ctl, const int* physics_bad,
+                                const unsigned long long* step_bits, double max_step) {
+    const double step =
+        __longlong_as_double(static_cast<long long>(*step_bits));
+    xek::xeAndersonGateControl(*physics_bad, step, max_step, ctl);
+}
+
+/// kXeCommit with `triple` and `picard_skip` read from the control block rather
+/// than passed from the host.
+///
+///   accept == 1   commit XE_T_CAND over EVERY fuel node, exactly as the host
+///                 arm's accepted commit does (CommitXenon's contract).
+///   accept == 0   commit x + relax*(F - x) and SKIP the zero-flux nodes,
+///                 exactly as the Picard fallback does
+///                 (UpdateEquilibriumXenon's `continue`).
+///
+/// relax is 1.0 on this path and the host asserts it; the parameter is here so
+/// the kernel does not silently bake an invariant it does not own.
+__global__ void kXeCommitTxn(xsr::BatchView v, const double* hist,
+                             const xek::XeTxnControl* ctl, double relax,
+                             const unsigned char* processed,
+                             unsigned long long* solved) {
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= v.n_fuel) return;
+    const int accept = ctl->accept;
+    if (!accept && processed[k] == 0u) return;
+
+    double vi = 0.0, vx = 0.0, vm = 0.0;
+    if (accept) {
+        const xek::XeTripleConst c = xeTripleConstAt(hist, xek::XE_T_CAND, v.n_fuel);
+        vi                         = c.i135[k];
+        vx                         = c.xe135[k];
+        vm                         = c.xe135m[k];
+    } else {
+        xek::xeBlendOrdinal(xeTripleConstAt(hist, xek::XE_T_F, v.n_fuel),
+                            xeTripleConstAt(hist, xek::XE_T_X, v.n_fuel), relax, k, &vi,
+                            &vx, &vm);
     }
     xek::xeCommitOrdinal(v, k, vi, vx, vm);
     atomicAdd(solved, 1ULL);
@@ -2062,9 +2199,15 @@ struct XsReconBackend::Impl {
     double*             xe_dots      = nullptr; // [XE_DOT_COUNT]
     int*                xe_pairs     = nullptr; // [2*XE_DOT_COUNT] then [XE_DOT_COUNT]
     int*                xe_flags     = nullptr; // [1] physics_bad
-    unsigned long long* xe_bits      = nullptr; // [0] max/step bits, [1] nodes
+    unsigned long long* xe_bits      = nullptr; // [0] max/step, [1] step/nodes, [2] txn nodes
     int                 xe_parts     = 0;       // the FIXED partition count
     int                 xe_hist_fuel = 0;       // n_fuel the block was sized for
+    // WP7-C.  The step's decision block, DEVICE-RESIDENT and PER-Impl -- which
+    // is per XSSet, per Driver, per deck.  A file-scope one would be the batch
+    // bug this tree already paid for once, with M decks writing one another's
+    // acceptance.
+    xek::XeTxnControl*  xe_ctl       = nullptr;
+    xek::XeTxnControl   xe_ctl_host{}; // the single per-step download's landing pad
 
     // Offsets into dev_block, in doubles.
     std::size_t off_mic[xsr::NXS] = {};
@@ -2172,6 +2315,7 @@ struct XsReconBackend::Impl {
         if (xe_pairs) { cudaFree(xe_pairs); xe_pairs = nullptr; }
         if (xe_flags) { cudaFree(xe_flags); xe_flags = nullptr; }
         if (xe_bits) { cudaFree(xe_bits); xe_bits = nullptr; }
+        if (xe_ctl) { cudaFree(xe_ctl); xe_ctl = nullptr; }
         xe_hist_fuel = 0;
         xe_parts     = 0;
     }
@@ -2202,14 +2346,30 @@ struct XsReconBackend::Impl {
         RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&xe_dots),
                                           xek::XE_DOT_COUNT * sizeof(double)),
                                status);
+        // 3*XE_DOT_COUNT for the legacy arm's per-call upload, then TWO more
+        // fixed layouts -- one per window width -- that the transaction uploads
+        // ONCE here instead of twice per step.  Separate storage on purpose: the
+        // legacy arm still writes its own region every call, and a shared one
+        // would make the transaction's tables depend on who ran last.
         RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&xe_pairs),
-                                          3 * xek::XE_DOT_COUNT * sizeof(int)),
+                                          (3 * xek::XE_DOT_COUNT +
+                                           2 * XE_TXN_LAYOUT_INTS) * sizeof(int)),
                                status);
         RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&xe_flags), sizeof(int)),
                                status);
+        // THREE, not two.  The transaction needs its own commit counter: slot 0
+        // still carries the residual the control kernel reads and slot 1 the
+        // candidate's trust-region max, and both are live when the commit runs.
         RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&xe_bits),
-                                          2 * sizeof(unsigned long long)),
+                                          3 * sizeof(unsigned long long)),
                                status);
+        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&xe_ctl),
+                                          sizeof(xek::XeTxnControl)),
+                               status);
+        // Only the transaction reads them, and only the transaction should pay
+        // the one-time synchronisation the upload needs -- so with TXN off the
+        // round-tripping arm's allocation path is byte-for-byte what it was.
+        if (rasberyGpuXeTxnEnabled() && !uploadXeTxnLayouts()) return false;
         // The history is READ before it is written on exactly one path: a
         // window column the arm never recorded.  The host guards that with
         // ncol, and so does this arm -- but a NaN sitting in an unwritten
@@ -2318,6 +2478,56 @@ struct XsReconBackend::Impl {
     }
 
     /// The xs + Xe-chain-iden download every committing path owes the host.
+    /// Every stream synchronisation the Xe path takes, counted where it is
+    /// taken.  The WP7-C census is a RECEIPT and not a paragraph: `host_syncs`
+    /// divided by `xe_device_steps` is the number the doc's before/after table
+    /// quotes, measured by the run that quotes it.
+    cudaError_t xeSync() {
+        xe::xeGpuTally().host_syncs.fetch_add(1, std::memory_order_relaxed);
+        return cudaStreamSynchronize(stream);
+    }
+
+    static void countXeD2H(std::size_t bytes) {
+        xe::xeGpuTally().d2h_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+
+    /// The two fixed dot layouts, uploaded once per allocation.  WHICH PRODUCTS
+    /// THE HOST ACTUALLY READS is decided exactly as XsReconBackend::xeDots
+    /// decides it -- and the two must stay the same decision, so the table is
+    /// built by the same `add` sequence, spelled once here and read from there.
+    bool uploadXeTxnLayouts() {
+        int host[2 * XE_TXN_LAYOUT_INTS] = {};
+        for (int ncol = 1; ncol <= xek::XE_DEPTH; ++ncol) {
+            int* pairs  = host + (ncol - 1) * XE_TXN_LAYOUT_INTS;
+            int* slots  = pairs + 2 * xek::XE_DOT_COUNT;
+            int  npairs = 0;
+            auto add    = [&](int slot, int left, int right) {
+                pairs[2 * npairs]     = left;
+                pairs[2 * npairs + 1] = right;
+                slots[npairs]         = slot;
+                ++npairs;
+            };
+            add(xek::XE_DOT_GG, xek::XE_T_G, xek::XE_T_G);
+            add(xek::XE_DOT_A, xek::XE_T_DG0, xek::XE_T_DG0);
+            add(xek::XE_DOT_P, xek::XE_T_DG0, xek::XE_T_G);
+            if (ncol == xek::XE_DEPTH) {
+                add(xek::XE_DOT_B, xek::XE_T_DG0, xek::XE_T_DG1);
+                add(xek::XE_DOT_C, xek::XE_T_DG1, xek::XE_T_DG1);
+                add(xek::XE_DOT_Q, xek::XE_T_DG1, xek::XE_T_G);
+            }
+        }
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(xe_pairs + 3 * xek::XE_DOT_COUNT, host,
+                                         sizeof(host), cudaMemcpyHostToDevice, stream),
+                         status);
+        // The layouts are read by kernels this call does not order against, so
+        // the upload is completed here rather than left in flight.  Once per
+        // allocation, never per step.
+        RASBERY_CUDA_TRY(cudaStreamSynchronize(stream), status);
+        return true;
+    }
+
+    static int xeTxnPairCount(int ncol) { return (ncol == xek::XE_DEPTH) ? 6 : 3; }
+
     bool drainXeCommit(const xsr::BatchView& host) {
         const std::size_t nx  = static_cast<std::size_t>(nxyz);
         const std::size_t lmp = static_cast<std::size_t>(xsr::NG) * nx;
@@ -2325,8 +2535,12 @@ struct XsReconBackend::Impl {
         for (int xt = 0; xt < xsr::NXS; ++xt)
             if (!download(host.xs[xt], off_xs[xt], lmp)) return false;
         if (!download(host.xs_ssm, off_xs_ssm, ssm)) return false;
-        return download(host.iden + static_cast<std::size_t>(xsr::I135) * nx,
-                        off_iden + static_cast<std::size_t>(xsr::I135) * nx, 3 * nx);
+        if (!download(host.iden + static_cast<std::size_t>(xsr::I135) * nx,
+                      off_iden + static_cast<std::size_t>(xsr::I135) * nx, 3 * nx))
+            return false;
+        countXeD2H((static_cast<std::size_t>(xsr::NXS) * lmp + ssm + 3 * nx) *
+                   sizeof(double));
+        return true;
     }
 
     bool upload(const double* src, std::size_t off, std::size_t count) {
@@ -2470,7 +2684,8 @@ bool XsReconBackend::xeEvaluate(const xsr::BatchView& host,
     RASBERY_CUDA_TRY(cudaMemcpyAsync(&bits, d.xe_bits, sizeof(bits),
                                      cudaMemcpyDeviceToHost, d.stream),
                      d.status);
-    RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
+    Impl::countXeD2H(sizeof(bits));
+    RASBERY_CUDA_TRY(d.xeSync(), d.status);
 
     double picard;
     static_assert(sizeof(picard) == sizeof(bits), "bit width");
@@ -2598,7 +2813,8 @@ bool XsReconBackend::xeDots(int ncol, double* out_six) {
                                      xek::XE_DOT_COUNT * sizeof(double),
                                      cudaMemcpyDeviceToHost, d.stream),
                      d.status);
-    RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
+    Impl::countXeD2H(xek::XE_DOT_COUNT * sizeof(double));
+    RASBERY_CUDA_TRY(d.xeSync(), d.status);
     return true;
 }
 
@@ -2627,7 +2843,8 @@ bool XsReconBackend::xeCandidate(const double* gamma, int ncol, double* step_out
     RASBERY_CUDA_TRY(cudaMemcpyAsync(&bits, d.xe_bits, sizeof(bits),
                                      cudaMemcpyDeviceToHost, d.stream),
                      d.status);
-    RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
+    Impl::countXeD2H(sizeof(bad) + sizeof(bits));
+    RASBERY_CUDA_TRY(d.xeSync(), d.status);
 
     double step;
     std::memcpy(&step, &bits, sizeof(step));
@@ -2674,7 +2891,9 @@ bool XsReconBackend::xeCommit(const xsr::BatchView& host, int triple, double rel
     RASBERY_CUDA_TRY(cudaMemcpyAsync(&solved, d.xe_bits + 1, sizeof(solved),
                                      cudaMemcpyDeviceToHost, d.stream),
                      d.status);
-    RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
+    Impl::countXeD2H(sizeof(solved));
+    RASBERY_CUDA_TRY(d.xeSync(), d.status);
+    xe::xeGpuTally().xe_device_steps.fetch_add(1, std::memory_order_relaxed);
 
     // Same contract solve() has: the downloads just made the host arrays equal
     // to the device copy, so the caller must NOT bump its host-state generation
@@ -2682,6 +2901,185 @@ bool XsReconBackend::xeCommit(const xsr::BatchView& host, int triple, double rel
     d.resident_state_generation = state_generation;
 
     g_xe_commits.fetch_add(solved, std::memory_order_relaxed);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// WP7 stage C -- one Xe step as one device transaction
+// ---------------------------------------------------------------------------
+//
+// THE CENSUS THIS REPLACES.  A step on the round-tripping arm is
+//
+//     xeEvaluate  -> kernel, D2H 8 B,  SYNC        (is it armed?)
+//     rotate/record/save -> 12 D2D copies + 2 kernels
+//     xeDots      -> 2 H2D, kernel, kernel, D2H 48 B, SYNC   (did it condition?)
+//     xeCandidate -> 2 memset, kernel, D2H 12 B, SYNC        (did it pass?)
+//     xeCommit    -> kernel, drain D2H, D2H 8 B, SYNC
+//
+// -- four synchronisations, three of them paying for a decision that is eight
+// doubles wide.  This is the same work with those three decisions inside:
+//
+//     kXeEvaluate -> kXeHistory -> kXeDotStage1/2 -> kXeAndersonSolve
+//                 -> kXeCandidateTxn -> kXeAndersonGate -> kXeCommitTxn
+//     -> drain D2H + one XeTxnControl, ONE SYNC
+//
+// The remaining sync is the drain's, and it is not the transaction's to remove:
+// the host arrays are authoritative for everything downstream of an Xe step on
+// this tree, so `_xs` and the three `_iden` rows have to be back before the
+// caller reads them.  Plan Sec WP7-C makes that conditional on device residency
+// -- "state arrays가 device resident이면 중간 D2H를 생략한다" -- and residency
+// is not this work package.  What IS removed is every sync that was not paying
+// for a materialisation.
+//
+// FAILS OPEN, LIKE THE SIX ENTRY POINTS ABOVE, and it fails open EARLY: every
+// refusal below happens before a kernel that writes host-visible state has been
+// launched, so the caller can run the round-tripping arm on an untouched
+// solver.  A refusal after the commit kernel would not be recoverable, and
+// there is none.
+bool XsReconBackend::xeTransaction(const xsr::BatchView& host,
+                                   unsigned long long micx_generation,
+                                   unsigned long long state_generation,
+                                   const XeTxnRequest& req, xe::XeTxnControl* out) {
+    Impl& d = *_impl;
+    if (!d.available || host.n_fuel <= 0 || host.nxyz <= 0) return false;
+    if (req.ncol < 0 || req.ncol > xek::XE_DEPTH) return false;
+    if (req.hist_col >= xek::XE_DEPTH) return false;
+    // relax is 1.0 on the Anderson path by construction (Driver.h arms the
+    // attempt with `xe_relax == 1.0`).  Refusing anything else is not
+    // defensiveness: the rejected branch commits the damped Picard image, and
+    // if the caller ever damps here the two arms would commit different images
+    // and the B0 claim would be silently false.
+    if (!(req.relax == 1.0)) return false;
+    if (!d.ensure(host.nxyz, host.n_fuel)) {
+        d.available = false;
+        return false;
+    }
+    if (!d.xeEnsure()) {
+        d.available = false;
+        return false;
+    }
+    if (d.xe_ctl == nullptr) return false;
+
+    xsr::BatchView v{};
+    if (!d.stage(host, micx_generation, state_generation, true, v)) return false;
+
+    const unsigned long long forms = xe::xeFormMask();
+
+    // 1. Evaluate.  x, F(x), g into the device history; the residual reduces
+    //    through the same exact atomicMax it always did.
+    RASBERY_CUDA_TRY(cudaMemsetAsync(d.xe_bits, 0, 3 * sizeof(unsigned long long),
+                                     d.stream),
+                     d.status);
+    {
+        const int block = 128;
+        const int grid  = (host.n_fuel + block - 1) / block;
+        kXeEvaluate<<<grid, block, 0, d.stream>>>(v, d.xe_hist, d.xe_processed,
+                                                  d.xe_bits);
+        RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
+    }
+    g_xe_evaluations.fetch_add(static_cast<unsigned long long>(host.n_fuel),
+                               std::memory_order_relaxed);
+
+    // 2. History: rotate, record, save -- one launch, the same numbers.
+    {
+        const int block = 256;
+        const int grid  = (d.xe_hist_fuel + block - 1) / block;
+        kXeHistory<<<grid, block, 0, d.stream>>>(d.xe_hist, d.xe_hist_fuel,
+                                                 req.hist_col, req.hist_rotate ? 1 : 0);
+        RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
+    }
+
+    // 3. The six inner products, fixed partition, unchanged.  The layouts were
+    //    uploaded once at xeEnsure; nothing about them is per step.
+    const int ncol   = (req.ncol < 1) ? 1 : req.ncol;
+    const int npairs = Impl::xeTxnPairCount(ncol);
+    const int* layout = d.xe_pairs + 3 * xek::XE_DOT_COUNT +
+                        (ncol - 1) * XE_TXN_LAYOUT_INTS;
+    RASBERY_CUDA_TRY(cudaMemsetAsync(d.xe_dots, 0, xek::XE_DOT_COUNT * sizeof(double),
+                                     d.stream),
+                     d.status);
+    {
+        const int block1 = 128;
+        const int total  = npairs * d.xe_parts;
+        kXeDotStage1<<<(total + block1 - 1) / block1, block1, 0, d.stream>>>(
+            d.xe_hist, d.xe_hist_fuel, d.xe_parts, npairs, layout, d.xe_partials, forms);
+        RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
+        kXeDotStage2<<<1, xek::XE_DOT_COUNT, 0, d.stream>>>(
+            d.xe_parts, npairs, d.xe_partials, layout + 2 * xek::XE_DOT_COUNT,
+            d.xe_dots);
+        RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
+    }
+
+    // 4. The decision the host used to make, one thread, same order.
+    //    `req.ncol` and NOT the clamped `ncol`: a zero window is the arming
+    //    test's business, and the clamp above exists only so the dot layout
+    //    index is in range.
+    kXeAndersonSolve<<<1, 1, 0, d.stream>>>(d.xe_dots, req.ncol, d.xe_bits, req.eq_tol,
+                                            req.min_gram, forms, d.xe_ctl, d.xe_flags,
+                                            d.xe_bits + 1);
+    RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
+
+    // 5. The candidate, plus SAFEGUARD 3/4 and the trust-region metric.
+    {
+        const int block = 256;
+        const int grid  = (d.xe_hist_fuel + block - 1) / block;
+        kXeCandidateTxn<<<grid, block, 0, d.stream>>>(d.xe_hist, d.xe_hist_fuel,
+                                                      d.xe_ctl, forms, d.xe_flags,
+                                                      d.xe_bits + 1);
+        RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
+    }
+    kXeAndersonGate<<<1, 1, 0, d.stream>>>(d.xe_ctl, d.xe_flags, d.xe_bits + 1,
+                                           req.max_step);
+    RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
+
+    // 6. Commit -- the candidate if it survived, the Picard image if it did
+    //    not.  The kernel reads which from the control block; the host does not
+    //    learn which until the download below, and does not need to.
+    {
+        const int block = 128;
+        const int grid  = (host.n_fuel + block - 1) / block;
+        kXeCommitTxn<<<grid, block, 0, d.stream>>>(v, d.xe_hist, d.xe_ctl, req.relax,
+                                                   d.xe_processed, d.xe_bits + 2);
+        RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
+    }
+
+    // 7. THE ONE HOST OBSERVATION.  The drain the caller needs anyway, and the
+    //    control block riding on the same transfer, cleared by the same sync.
+    //
+    //    THE FAIL-OPEN PROMISE ENDS HERE, AND THAT HAS TO BE SAID OUT LOUD.
+    //    Every refusal above happens before a kernel that writes host-visible
+    //    state; a failure below is a CUDA error AFTER the commit kernel, so the
+    //    device inventory has already moved and letting the round-tripping arm
+    //    take the step again would commit it TWICE.  The instance is retired
+    //    instead: `available = false` makes every later device call decline, so
+    //    the run continues on the host loop, which is the only arm that cannot
+    //    double-commit.  (xeCommit has carried the same exposure since it
+    //    shipped, and did not say so.)
+    unsigned long long solved = 0;
+    if (!d.drainXeCommit(host) ||
+        cudaMemcpyAsync(&d.xe_ctl_host, d.xe_ctl, sizeof(xek::XeTxnControl),
+                        cudaMemcpyDeviceToHost, d.stream) != cudaSuccess ||
+        cudaMemcpyAsync(&solved, d.xe_bits + 2, sizeof(solved), cudaMemcpyDeviceToHost,
+                        d.stream) != cudaSuccess ||
+        d.xeSync() != cudaSuccess) {
+        d.status    = "xeTransaction: download failed after the commit kernel";
+        d.available = false;
+        return false;
+    }
+    Impl::countXeD2H(sizeof(xek::XeTxnControl) + sizeof(solved));
+
+    // Same contract xeCommit keeps: the downloads made the host arrays equal to
+    // the device copy, so the caller must NOT bump its host-state generation.
+    d.resident_state_generation = state_generation;
+    *out                        = d.xe_ctl_host;
+
+    g_xe_commits.fetch_add(solved, std::memory_order_relaxed);
+    {
+        xe::XeGpuTally& tally = xe::xeGpuTally();
+        tally.xe_device_steps.fetch_add(1, std::memory_order_relaxed);
+        tally.txn_steps.fetch_add(1, std::memory_order_relaxed);
+        if (out->accept) tally.txn_accepted.fetch_add(1, std::memory_order_relaxed);
+    }
     return true;
 }
 
@@ -3964,6 +4362,14 @@ bool rasberyGpuNodalEnabled() {
 
 bool rasberyGpuXeEnabled() {
     static const bool on = envFlagEnabled("RASBERY_GPU_XE");
+    return on;
+}
+
+bool rasberyGpuXeTxnEnabled() {
+    // WP7-C.  envFlagEnabled, i.e. ABSENT MEANS OFF.  The transaction is a
+    // performance change with a bit-identity claim attached, and a default-on
+    // performance change is a claim nobody was asked to check.
+    static const bool on = envFlagEnabled("RASBERY_GPU_XE_TXN");
     return on;
 }
 

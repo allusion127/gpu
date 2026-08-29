@@ -44,6 +44,12 @@ inline std::uint64_t bits(double d) {
 /// so what is scored is what ships.
 constexpr int SCORE_SLICES = 16;
 
+/// Driver.h's XE_ANDERSON_MIN_GRAM, and the ONE place this file spells it.
+/// Not #included from Driver.h because that header pulls in the whole solver;
+/// tools/test_xe_txn_contract.py compares the two literals and fails when they
+/// part company, which is the same guard XE_EQUILIBRIUM_TOLERANCE gets.
+constexpr double XE_MIN_GRAM = 1.0e-8;
+
 inline xe::XeTripleConst leftOf(const xeref::Fixture& f) {
     xe::XeTripleConst t;
     t.i135   = f.a_i.data();
@@ -110,6 +116,34 @@ inline long scoreMask(const xeref::Fixture& f, unsigned long long mask) {
             if (bits(gm[u]) != bits(rm[u])) ++bad;
         }
     }
+
+    // WP7-C.  The normal equations, both window widths.  The one-column branch
+    // has no site of its own, but it is scored anyway for the reason the
+    // candidate loop's two widths are: it is what the fallback runs, and a mask
+    // that broke it would otherwise mine clean.
+    //
+    // THE FLOOR IS THE PRODUCTION ONE.  1e-8 is Driver.h's
+    // XE_ANDERSON_MIN_GRAM, and mining against a different floor would score a
+    // conditioning test the run never makes.
+    for (int ncol = 1; ncol <= xe::XE_DEPTH; ++ncol) {
+        for (int ci = 0; ci < f.alg_cases; ++ci) {
+            double       rg[2] = {0.0, 0.0}, rproj = 0.0, rdet = 0.0;
+            const bool   rsolved =
+                xeref::refAlgebra(f, ci, ncol, XE_MIN_GRAM, rg, &rproj, &rdet);
+            double       g0 = 0.0, g1 = 0.0, proj = 0.0;
+            const double* dots = f.alg.data() + static_cast<std::size_t>(6 * ci);
+            const bool   solved =
+                xe::xeAndersonFit(dots, ncol, XE_MIN_GRAM, mask, &g0, &g1, &proj);
+            if (solved != rsolved) {
+                ++bad;
+                continue;
+            }
+            if (!solved) continue;
+            if (bits(g0) != bits(rg[0])) ++bad;
+            if (bits(g1) != bits(rg[1])) ++bad;
+            if (bits(proj) != bits(rproj)) ++bad;
+        }
+    }
     return bad;
 }
 
@@ -122,14 +156,18 @@ inline unsigned long long mineForms(const xeref::Fixture& f, unsigned long long 
         int bit;
         int states;
     };
-    const Site sites[4] = {{xe::XE_DOT_FIRST_BIT, 3},
+    const Site sites[8] = {{xe::XE_DOT_FIRST_BIT, 3},
                            {xe::XE_DOT_THIRD_BIT, 2},
                            {xe::XE_CAND1_BIT, 2},
-                           {xe::XE_CAND2_BIT, 2}};
+                           {xe::XE_CAND2_BIT, 2},
+                           {xe::XE_TXN_DET_BIT, 3},
+                           {xe::XE_TXN_G0_BIT, 3},
+                           {xe::XE_TXN_G1_BIT, 3},
+                           {xe::XE_TXN_PROJ_BIT, 3}};
 
     unsigned long long best       = seed;
     long               best_score = scoreMask(f, best);
-    for (int pass = 0; pass < 6 && best_score > 0; ++pass) {
+    for (int pass = 0; pass < 10 && best_score > 0; ++pass) {
         const long before = best_score;
         for (const Site& s : sites)
             for (int state = 0; state < s.states; ++state) {
