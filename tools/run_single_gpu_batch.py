@@ -40,6 +40,28 @@ EXACT_PHYSICS_MODE = {
     "feedback_pass_limit": 0,
     "full_hdf5": True,
 }
+# `--result light` is an OUTPUT-shape switch, not a fidelity one: the same
+# physics runs and the same trajectory digest comes out (GA plan Sec 2.4), but
+# main.cpp classifies a light job as a screening run because it writes no
+# result HDF5, so the receipt reads `screening:true` /
+# `physics_mode:ga_screen_feedback_limited` / `full_hdf5:false`.  Auditing a
+# light run against EXACT_PHYSICS_MODE therefore fails every light arm on a
+# field that says nothing about the physics.
+#
+# What must NOT be relaxed is `feedback_pass_limit`: that is the GA feedback
+# APPROXIMATION, and it is the one field here that changes the answer.  A light
+# run with a nonzero feedback limit is still not an acceptance measurement.
+SCREENING_PHYSICS_MODE = {
+    "physics_mode": "ga_screen_feedback_limited",
+    "screening": True,
+    "feedback_pass_limit": 0,
+    "full_hdf5": False,
+}
+
+
+def expected_physics_mode(result_mode: str | None) -> dict:
+    """The PHYSICS_MODE receipt a chunk in *result_mode* is required to print."""
+    return SCREENING_PHYSICS_MODE if result_mode == "light" else EXACT_PHYSICS_MODE
 
 
 DEFAULT_ENV = {
@@ -71,6 +93,10 @@ class LaunchPlan:
     host_workers: int
     worker_policy: str
     gpu: str
+    # The EFFECTIVE result mode of this launch: "light" if any job in it writes
+    # scalar-only output, else "full"/"pin-off".  It selects which PHYSICS_MODE
+    # receipt the audit demands; see expected_physics_mode().
+    result_mode: str = "full"
 
 
 def visible_cpu_threads() -> int:
@@ -186,12 +212,15 @@ def validate_deck_paths(command: Sequence[str]) -> list[str]:
     return rasi
 
 
-def check_physics_mode(output: str) -> list[str]:
+def check_physics_mode(output: str, expected: dict | None = None) -> list[str]:
     """Exact-only audit (plan Rev.4 Sec 2.2).
 
-    A run whose physics-mode receipt is missing, unparseable, or not full-exact
-    is not an acceptance measurement, however good its throughput looked.
+    A run whose physics-mode receipt is missing, unparseable, or not the mode it
+    was launched in is not an acceptance measurement, however good its
+    throughput looked.  *expected* defaults to full-exact; a light (scalar-only)
+    launch passes SCREENING_PHYSICS_MODE instead.
     """
+    expected_mode = EXACT_PHYSICS_MODE if expected is None else expected
     problems = []
     receipt = None
     for match in PHYSICS_MODE_RECEIPT.finditer(output):
@@ -210,7 +239,7 @@ def check_physics_mode(output: str) -> list[str]:
                 "measurement"
             )
         return problems
-    for key, expected in EXACT_PHYSICS_MODE.items():
+    for key, expected in expected_mode.items():
         if key not in receipt:
             problems.append("[RASBERY][PHYSICS_MODE] is missing %r" % key)
         elif receipt[key] != expected:
@@ -223,7 +252,7 @@ def check_physics_mode(output: str) -> list[str]:
 
 def check_run_receipts(output: str, plan: "LaunchPlan") -> list[str]:
     """Post-run receipt audit: did the run have the shape that was asked for?"""
-    problems = check_physics_mode(output)
+    problems = check_physics_mode(output, expected_physics_mode(plan.result_mode))
 
     receipt = None
     for match in BATCH_HOST_RECEIPT.finditer(output):
@@ -306,6 +335,10 @@ def build_plan(args: argparse.Namespace, command: list[str]) -> tuple[LaunchPlan
         host_workers=workers,
         worker_policy=policy,
         gpu=str(args.gpu),
+        # A --result on the command line wins over --result here only because
+        # build_plan appended ours when there was none; either way the audit
+        # has to expect the receipt the executable will actually print.
+        result_mode=(values_after(command, "--result") or ["full"])[0],
     )
     return plan, command, env
 
