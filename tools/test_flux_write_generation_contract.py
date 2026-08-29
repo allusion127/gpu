@@ -88,8 +88,13 @@ EXPECTED = {
     # finishDrive's per-SEGMENT twin and writes Geometry::Phif for the same
     # reason -- the Rayleigh hand-back on an abandoned drive moves the flux on
     # the host.  Handing it PhifMutable() is what declares that.
-    "Driver.h": 7,    # drive x2 in the loops, drive x2 + enqueueDrive + finishDrive
-                      # + finishDeferredDrives in the hooks
+    # WP10.2 adds the eighth: the warm start copies a parent case's BOC flux
+    # into Geometry before the first solve.  It is a host flux WRITE like every
+    # other entry here -- the device must not keep serving the cold guess it
+    # uploaded -- so it goes through the same door, and the generation bump is
+    # what says so.  It runs only when --warm-start-from names a file.
+    "Driver.h": 8,    # drive x2 in the loops, drive x2 + enqueueDrive + finishDrive
+                      # + finishDeferredDrives in the hooks, + the warm-start seed
 }
 for name, want in EXPECTED.items():
     # comments mention the door by name; only CALLS count

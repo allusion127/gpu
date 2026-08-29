@@ -171,50 +171,6 @@ struct Schedule {
     double search_bracket_hi_residual       = 0.0;
 
     // Termination bookkeeping for the critical search (published to the result file).
-    // -----------------------------------------------------------------------
-    // WP9-D: the critical search's convergence history.  TELEMETRY ONLY.
-    // -----------------------------------------------------------------------
-    //
-    // WHY IT IS HERE AND NOT IN THE DRIVER.  The GA evaluator plan's outer
-    // census charges 707 outers -- 15.3 % of a case -- to the boron search,
-    // spread over 137 committed trials, and says the cost is CANDIDATE
-    // DEPENDENT: the worse a loading pattern is in reactivity, the more trials
-    // it buys.  Before anything is done about that, the 238 runner has to be
-    // able to say how many outers a statepoint's search actually costs and WHY
-    // the proposals were what they were -- a bootstrap probe, a carried slope, a
-    // secant, or a bisection inside a bracket are four different stories about
-    // the same trial count.  The classification can only be made where `method`
-    // is decided, which is here.
-    //
-    // COST AND NEUTRALITY.  Plain integer members of an object that already
-    // exists per statepoint, incremented once per PROPOSAL (137 per run).
-    // Nothing here is read by the solver: no branch, no tolerance and no
-    // proposal depends on any of these fields, which is what makes the receipt
-    // trajectory-neutral rather than merely cheap.
-    long long search_n_proposals  = 0;  ///< ProposeNextSearchPoint calls
-    long long search_n_refused    = 0;  ///< proposals that returned no next point
-    long long search_n_secant     = 0;  ///< two-sample secant steps
-    long long search_n_carry      = 0;  ///< first steps taken on a CARRIED slope
-    long long search_n_probe      = 0;  ///< bootstrap/probe steps (no slope yet)
-    long long search_n_bisect     = 0;  ///< bisections inside a sign-change bracket
-    double    search_first_x      = 0.0; ///< the initial guess this statepoint started from
-    double    search_last_dx      = 0.0; ///< |x_new - x_old| of the LAST committed step
-
-    /// Re-armed per statepoint by the Driver.  Deliberately NOT cleared by
-    /// ResetSearchState(): that runs at every SolveLoop entry, and a statepoint
-    /// with substeps enters SolveLoop several times -- clearing there would
-    /// report the last substep's search as the statepoint's.
-    void ResetSearchTelemetry() {
-        search_n_proposals = 0;
-        search_n_refused   = 0;
-        search_n_secant    = 0;
-        search_n_carry     = 0;
-        search_n_probe     = 0;
-        search_n_bisect    = 0;
-        search_first_x     = 0.0;
-        search_last_dx     = 0.0;
-    }
-
     int    search_exit_status = static_cast<int>(SearchExit::NONE);
     double search_exit_dk     = 0.0; // |k_eff - target| actually accepted
     double search_exit_tol    = 0.0; // tolerance that dk was judged against
@@ -265,6 +221,55 @@ struct Schedule {
     std::vector<double> ax_tful;
     std::vector<double> ax_tmod;
     std::vector<double> ax_dmod;
+
+    // 7. WP9-D: the critical search's convergence history.  TELEMETRY ONLY.
+    //
+    // ON THE OUTPUT SIDE OF THE LINE, and that placement is the point.  The
+    // block above `// OUTPUT parameters` is the search's STATE, and
+    // tools/test_gpu_physics_interface_contract.py requires every field of it
+    // to have a DeviceSearchState counterpart, because the device solver
+    // mirrors all of it.  These are not state: nothing reads them, least of
+    // all the device.  They are what the search DID.
+    //
+    // WHY IT IS HERE AND NOT IN THE DRIVER.  The GA evaluator plan's outer
+    // census charges 707 outers -- 15.3 % of a case -- to the boron search,
+    // spread over 137 committed trials, and says the cost is CANDIDATE
+    // DEPENDENT: the worse a loading pattern is in reactivity, the more trials
+    // it buys.  Before anything is done about that, the 238 runner has to be
+    // able to say how many outers a statepoint's search actually costs and WHY
+    // the proposals were what they were -- a bootstrap probe, a carried slope, a
+    // secant, or a bisection inside a bracket are four different stories about
+    // the same trial count.  The classification can only be made where `method`
+    // is decided, which is here.
+    //
+    // COST AND NEUTRALITY.  Plain integer members of an object that already
+    // exists per statepoint, incremented once per PROPOSAL (137 per run).
+    // Nothing here is read by the solver: no branch, no tolerance and no
+    // proposal depends on any of these fields, which is what makes the receipt
+    // trajectory-neutral rather than merely cheap.
+    long long search_n_proposals  = 0;  ///< ProposeNextSearchPoint calls
+    long long search_n_refused    = 0;  ///< proposals that returned no next point
+    long long search_n_secant     = 0;  ///< two-sample secant steps
+    long long search_n_carry      = 0;  ///< first steps taken on a CARRIED slope
+    long long search_n_probe      = 0;  ///< bootstrap/probe steps (no slope yet)
+    long long search_n_bisect     = 0;  ///< bisections inside a sign-change bracket
+    double    search_first_x      = 0.0; ///< the initial guess this statepoint started from
+    double    search_last_dx      = 0.0; ///< |x_new - x_old| of the LAST committed step
+
+    /// Re-armed per statepoint by the Driver.  Deliberately NOT cleared by
+    /// ResetSearchState(): that runs at every SolveLoop entry, and a statepoint
+    /// with substeps enters SolveLoop several times -- clearing there would
+    /// report the last substep's search as the statepoint's.
+    void ResetSearchTelemetry() {
+        search_n_proposals = 0;
+        search_n_refused   = 0;
+        search_n_secant    = 0;
+        search_n_carry     = 0;
+        search_n_probe     = 0;
+        search_n_bisect    = 0;
+        search_first_x     = 0.0;
+        search_last_dx     = 0.0;
+    }
 
     [[nodiscard]] bool hasCriticalSearch() const {
         return searchType == SearchType::BORON || searchType == SearchType::RODCRIT;

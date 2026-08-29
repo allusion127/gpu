@@ -6,25 +6,29 @@ prints, and tools/case_key.py, which a GA controller uses to decide NOT to run
 the solver.  Two implementations of one key is how a cache starts serving the
 wrong answer, so this holds them to one definition.
 
-THREE HALVES, because only two of them can run here.
+FOUR HALVES, and how far each one gets.
 
-SOURCE HALF (default).  The parts that must be identical are compared as
-source: the arm-environment list and its ORDER, the fidelity table, the payload
-field order, and the canonical token grammar.  There is no C++ compiler on the
-authoring host, so these are static cross-checks -- but they are the checks that
-actually catch drift, because drift happens when someone adds a knob to one list.
+SOURCE (always).  The parts that must be identical are compared as source: the
+arm-environment list and its ORDER, the fidelity table, the payload field order,
+the canonical token grammar, and the legal symmetry orbit.  These are the checks
+that catch DRIFT, because drift happens when someone adds a knob to one list.
 
-BEHAVIOUR HALF (default).  The python implementation is exercised on fixtures
-for the properties the key is FOR: symmetric-equivalent loading patterns hash
-equal; a genuinely different pattern does not; a half core is not folded; and
-every provenance field is load-bearing (change it, and the key changes).  Each
-one is a negative control as much as a check.
+BEHAVIOUR (always).  The python implementation is exercised on fixtures for the
+properties the key is FOR: symmetric-equivalent loading patterns hash equal; a
+genuinely different pattern does not; a half core is not folded; and every
+provenance field is load-bearing (change it, and the key changes) while the
+telemetry flag is not.  Each one is a negative control as much as a check.
 
-LIVE HALF (`--compare RUN.log DECK.json`).  The one comparison that closes the
-loop between the two implementations, and it needs a real run: the binary prints
-`[RASBERY][CASE]` with the key it used, and this asserts tools/case_key.py
-computes the same 64 hex digits from the same deck under the same environment.
-That is a 238 gate, listed in the WP9/WP10 runbook.
+COMPILED (when a C++ compiler is present; SKIPPED, and said so, otherwise).  The
+half that actually closes the loop between the two implementations without
+needing a GPU: src/CaseKey.h is compiled into a small harness and its canonical
+deck payload is compared BYTE FOR BYTE against tools/case_key.py's, on decks
+seeded with every float spelling the two languages could disagree about.  It
+also runs three FIPS 180-4 SHA-256 vectors.
+
+LIVE (`--compare RUN.log DECK.json`).  What is left after the compiled half: the
+provenance the payload takes from the ENVIRONMENT and the cross-section library,
+which only a real run has.  A 238 gate, listed in the WP9/WP10 runbook.
 
 USAGE
     tools/test_case_key_contract.py
@@ -37,6 +41,8 @@ import json
 import os
 import py_compile
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -315,6 +321,168 @@ def behaviour_contract() -> None:
 
 
 # ---------------------------------------------------------------------------
+# COMPILED HALF -- the one that actually closes the loop, when a compiler is here
+#
+# The source half holds the two implementations to the same FIELD SET.  What it
+# cannot check is the thing most likely to differ: how each language SPELLS a
+# value.  `{:.17g}` versus `%.17g`, the exponent's digit count, integer versus
+# float typing, object key order.  So when a C++ compiler is available,
+# src/CaseKey.h is compiled into a small harness and its canonical deck payload
+# is compared to tools/case_key.py's, BYTE FOR BYTE, on the same decks.
+#
+# Only `deckPayload` is compared, deliberately: it is the half that walks
+# arbitrary JSON and formats floats.  `payloadOf` above it is concatenation of
+# fields the source half already compares one by one.
+#
+# The harness also runs three FIPS 180-4 SHA-256 vectors, because the transform
+# moved between headers in this change and "it still compiles" is not the same
+# claim as "it still hashes".
+#
+# No compiler is not a failure -- it is a SKIP, reported as one, because the
+# authoring host for this campaign often has none and a test that failed there
+# would be turned off.
+# ---------------------------------------------------------------------------
+HARNESS_CPP = r'''
+#include "CaseKey.h"
+#include "Sha256.h"
+
+#include <fstream>
+#include <iostream>
+#include <string>
+
+int main(int argc, char** argv) {
+    struct Vector { const char* in; const char* want; };
+    const Vector vectors[] = {
+        {"", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+        {"abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},
+        {"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+         "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"},
+    };
+    for (const Vector& v : vectors) {
+        if (rasbery::Sha256::hexOf(v.in) != v.want) {
+            std::cerr << "sha256 vector mismatch for \"" << v.in << "\"\n";
+            return 1;
+        }
+    }
+    if (argc < 3) { std::cerr << "usage: harness <deck.json> <out.bin>\n"; return 2; }
+    std::ifstream in(argv[1]);
+    if (!in) { std::cerr << "cannot open " << argv[1] << "\n"; return 2; }
+    nlohmann::ordered_json config;
+    in >> config;
+    std::string core_op;
+    const std::string payload = rasbery::casekey::deckPayload(config, &core_op);
+    std::ofstream out(argv[2], std::ios::binary);
+    out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+    std::cout << core_op << "\n";
+    return 0;
+}
+'''
+
+# Values chosen to exercise every spelling the two languages could disagree on:
+# an integer, a plain decimal, a tiny exponent, a huge one, a negative, a value
+# with no exact binary representation, a bool and a null.
+FLOAT_TRAPS = {
+    "traps": {"int": 7, "one": 1.0, "tenth": 0.1, "tiny": 1.0e-6, "tinier": 2.5e-17,
+              "huge": 1.0e+21, "neg": -3.25e-4, "third": 1.0 / 3.0,
+              "yes": True, "no": False, "nothing": None,
+              "list": [1, 2.0, "three", None]},
+}
+
+
+def deck_with_floats(core, symang):
+    return deck(core, symang=symang, extra=dict(FLOAT_TRAPS))
+
+
+def find_compiler():
+    """MSVC's vcvars64.bat, or a g++/clang++ on PATH, or None."""
+    if os.name == "nt":
+        program_files = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        vswhere = Path(program_files) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+        if vswhere.is_file():
+            done = subprocess.run(
+                [str(vswhere), "-latest", "-products", "*", "-requires",
+                 "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                 "-property", "installationPath"],
+                capture_output=True, universal_newlines=True)
+            root = done.stdout.strip().splitlines()
+            if done.returncode == 0 and root:
+                bat = Path(root[0]) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+                if bat.is_file():
+                    return str(bat)
+    for name in ("g++", "clang++"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def compiled_contract() -> bool:
+    """True when the compiled half actually ran."""
+    compiler = find_compiler()
+    if compiler is None:
+        return False
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        cpp = tmp / "case_key_harness.cpp"
+        cpp.write_text(HARNESS_CPP, encoding="utf-8")
+        exe = tmp / ("case_key_harness.exe" if os.name == "nt" else "case_key_harness")
+        includes = [ROOT / "src", ROOT / "include", ROOT / "include" / "chiffon"]
+        try:
+            if compiler.lower().endswith("vcvars64.bat"):
+                # QUOTED include paths: this repository's own path contains an
+                # `&`, which cmd would otherwise read as a command separator.
+                script = tmp / "build_case_key_harness.bat"
+                script.write_text(
+                    "@echo off\r\n"
+                    + 'call "%s" >nul\r\n' % compiler
+                    + 'cd /d "%s"\r\n' % tmp
+                    + 'cl /nologo /std:c++20 /EHsc /D_CRT_SECURE_NO_WARNINGS "%s" %s /Fe:"%s"\r\n'
+                      % (cpp, " ".join('/I "%s"' % d for d in includes), exe),
+                    encoding="utf-8")
+                subprocess.run(["cmd", "/c", str(script)], check=True, cwd=str(tmp),
+                               capture_output=True, universal_newlines=True)
+            else:
+                subprocess.run(
+                    [compiler, "-std=c++20", "-O0", str(cpp), "-o", str(exe)]
+                    + [arg for d in includes for arg in ("-I", str(d))],
+                    check=True, capture_output=True, universal_newlines=True)
+        except subprocess.CalledProcessError as failure:
+            fail("the case-key harness does not compile:\n"
+                 + (failure.stdout or "") + (failure.stderr or ""))
+            return True
+
+        payloads = {}
+        for name, core, symang in (("base", QUARTER, 90), ("transpose", QUARTER_T, 90),
+                                   ("half", QUARTER, 180)):
+            path = write(tmp, f"{name}.json", deck_with_floats(core, symang))
+            out = tmp / f"{name}.bin"
+            done = subprocess.run([str(exe), str(path), str(out)],
+                                  capture_output=True, universal_newlines=True)
+            if done.returncode != 0:
+                fail(f"the compiled case-key harness failed on {name}: "
+                     f"{done.stdout}{done.stderr}")
+                return True
+            payloads[name] = out.read_bytes()
+            py_text, py_op = case_key.deck_payload(json.loads(path.read_text()))
+            py_bytes = py_text.encode("utf-8")
+            if done.stdout.strip() != py_op:
+                fail(f"{name}: C++ core_op {done.stdout.strip()!r} != python {py_op!r}")
+            if payloads[name] != py_bytes:
+                where = next((i for i, (a, b) in enumerate(zip(payloads[name], py_bytes))
+                              if a != b), min(len(payloads[name]), len(py_bytes)))
+                fail(f"{name}: the canonical deck payloads differ at byte {where}\n"
+                     f"  C++    {payloads[name][max(0, where - 70):where + 70]!r}\n"
+                     f"  python {py_bytes[max(0, where - 70):where + 70]!r}")
+        # And the property, proved on the COMPILED side rather than inferred
+        # from the python one.
+        if payloads["base"] != payloads["transpose"]:
+            fail("C++ does not fold a quarter map and its transpose to one payload")
+        if payloads["base"] == payloads["half"]:
+            fail("C++ folded a 180-degree map; only 90 and 360 have an argued orbit")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # LIVE HALF
 # ---------------------------------------------------------------------------
 def compare(log: Path, deck_path: Path) -> int:
@@ -352,13 +520,17 @@ def main(argv: list[str]) -> int:
 
     source_contract()
     behaviour_contract()
+    compiled = compiled_contract()
     py_compile.compile(str(ROOT / "tools" / "case_key.py"), doraise=True)
     py_compile.compile(str(Path(__file__).resolve()), doraise=True)
     if FAILED:
         for message in FAILED:
             print(f"case key contract: FAIL: {message}")
         return 1
-    print("case key contract: PASS")
+    print("case key contract: PASS"
+          + (" (source + behaviour + compiled byte-for-byte)" if compiled
+             else " (source + behaviour; NO C++ COMPILER -- the byte-for-byte "
+                  "half did not run)"))
     return 0
 
 

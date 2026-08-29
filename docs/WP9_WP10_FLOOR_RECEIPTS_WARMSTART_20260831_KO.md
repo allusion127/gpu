@@ -7,7 +7,7 @@
 | 대상 계획 | `GPU_RASBERY_BOTTLENECK_PARALLEL_ACCELERATION_IMPLEMENTATION_PLAN_20260830_KO.md` WP9 단계 A·C·D, WP10.1, WP10.2 |
 | 참조 실측 | `GPU_RASBERY_GA_EVALUATOR_PLAN_20260831_KO.md` §2.2(비용 모델), §3.2(위상 귀속), §5.1(LP = `core` 블록), §5.4(warm-start), §6.5(게이트 등급) |
 | 커밋 | `5883023`(WP9-A) · `95481bc`(WP10.1) · `031ccbe`(WP10.2) · `3df4ea7`(WP9-D) |
-| 로컬에서 한 것 | 소스 계약과 순수 파이썬 계약뿐. **이 호스트에는 C++ 컴파일러가 없다** — 성능 수치는 하나도 없고, 있어서도 안 된다 |
+| 로컬에서 한 것 | 소스 계약, 파이썬 계약, 그리고 **헤더 전용 TU의 MSVC 컴파일·실행**(`tools/test_case_key_contract.py`의 compiled half). 전체 빌드는 CUDA/HDF5 때문에 238에서만 된다 — **성능 수치는 하나도 없고, 있어서도 안 된다** |
 | 238에서만 가능한 것 | §6 전부 |
 
 ---
@@ -64,7 +64,7 @@ GA evaluator 계획 §2.2는 상태점을 `c + d × outer`로 회귀하고 `c = 
 | 버킷을 두 가산 객체에 동시에 넣기 | 이중 계상 |
 | `phase_wall`을 7개 이상으로 키우기 | replay 모델의 캘리브레이션 이동 |
 | 명명된 호출부의 Scope 제거 | 아무것도 안 재는 버킷 |
-| `std::format` placeholder/인자 수 불일치 | **이 호스트에 컴파일러가 없어서 리뷰로도 컴파일로도 못 잡는 유일한 결함** |
+| `std::format` placeholder/인자 수 불일치 | **전체 빌드가 로컬에서 안 되므로 리뷰로도 컴파일로도 못 잡는 결함** |
 
 마지막 것은 실제로 값어치를 했다: 두 수신증 모두 placeholder 63/63, 66/66(WP9-D 이후
 77/77, 74/74)로 재계수된다.
@@ -160,7 +160,18 @@ T-H/rod/허용오차), 실효 `PhysicsFidelity`와 policy 이름, `trajectory::k
 핀맵처럼 캐시가 **줄 수 없는** 것은 키의 miss가 아니라 산출물의 miss이고, 요청자가 그 모드로
 재실행을 요청한다.
 
-### 3.4 두 구현이 한 정의를 갖게 하는 법
+### 3.4 두 구현이 한 정의를 갖게 하는 법 — 그리고 그것이 이미 증명되었다는 것
+
+**로컬에서 증명되었다.** `tools/test_case_key_contract.py`의 compiled half가 MSVC로
+`src/CaseKey.h`를 헤더 전용 TU로 컴파일해 `deckPayload`를 돌리고, 같은 덱에 대한
+`tools/case_key.py`의 출력과 **바이트 단위로** 비교한다. fixture 덱에는 두 언어가 어긋날
+수 있는 모든 철자를 심어 두었다(정수, `1.0`, `0.1`, `1e-6`, `2.5e-17`, `1e21`, 음수,
+`1/3`, bool, null, 혼합 배열). 실제 `kngr_238.json`에 대해서도 확인했다:
+3,604바이트 동일, `deck_digest = fd8714d6…`.
+
+음성 대조군: 파이썬 쪽 float 정밀도를 `%.17g` → `%.16g`로 한 자리만 바꾸면 624번째
+바이트에서 실패한다. 즉 §6.6이 최대 위험으로 적었던 항목은 **이미 닫혔고**, 238에 남은
+것은 payload의 나머지 절반(환경·라이브러리 digest·fidelity) 뿐이다.
 
 JSON 텍스트가 아니라 **토큰 스트림**이다. 키 순서·공백·부동소수 표기가 직렬화기마다
 다르기 때문이다. 값마다 철자가 정확히 하나이고, float는 `%.17g` — C++ `std::format`과
@@ -248,13 +259,16 @@ light JSONL이 `warm_state`를 싣는다. GA가 로그를 grep 하지 않고 이
 ```bash
 python3 tools/test_statepoint_telemetry.py      # WP9-A + WP9-D, 음성 대조군 7
 python3 tools/test_telemetry_neutrality.py      # 소스 절반
-python3 tools/test_case_key_contract.py         # WP10.1, 소스 + 거동
+python3 tools/test_case_key_contract.py         # WP10.1, 소스 + 거동 + **컴파일 바이트 비교**
 python3 tools/test_warm_start_contract.py       # WP10.2, 음성 대조군 5
 python3 tools/case_cost_profile.py <log>        # 새 분해 인쇄
 ```
 
-**로컬에서 확인할 수 없는 것**: 컴파일, `std::format("{:.17g}")`이 Python `%.17g`와
-바이트 동일한지(§6.3이 그 게이트다), 어떤 성능 수치든.
+**로컬에서 확인한 것**: `src/CaseKey.h` + `include/chiffon/Sha256.h`가 컴파일되고,
+SHA-256이 FIPS 벡터와 맞고, `deckPayload`가 Python과 바이트 동일하다(§3.4).
+
+**로컬에서 확인할 수 없는 것**: 전체 빌드(CUDA/HDF5), 키의 환경·라이브러리 절반,
+어떤 성능 수치든.
 
 ---
 
@@ -328,7 +342,9 @@ median/p10/p90을 기록한다. WP9-A/WP9-D는 **계기 추가**이므로 이 ar
 
 ### 6.3 WP10.1 — case key의 라이브 게이트
 
-**두 구현이 같은 64 hex를 내는지가 이 WP의 유일한 진짜 게이트다.**
+**남은 절반만이 게이트다.** 덱 payload의 바이트 동일성은 §3.4에서 이미 컴파일해서
+증명했으므로, 여기서 새로 검증되는 것은 payload의 나머지 — 환경 knob 문자열, 단면
+라이브러리 내용 digest, 실효 fidelity — 와 그것들이 실제 실행에서 같은 값을 갖는지다.
 
 ```bash
 python3 tools/test_case_key_contract.py --compare $O/off.log kngr_238.json
@@ -443,7 +459,7 @@ RASBERY_OMP_THREADS=1 RASBERY_BATCH_RECEIPT_JSONL=$O/g1.jsonl \
 | 지점 | 증상 | 대응 |
 |---|---|---|
 | 컴파일 | 로컬에 컴파일러가 없다 | 첫 관문. `std::format("{:.17g}")`은 libstdc++/fmt 양쪽에서 지원되지만 확인 필요 |
-| `{:.17g}` vs `%.17g` | §6.3 `--compare`가 `deck_digest` 불일치로 FAIL | 지수 표기(`1e-06` vs `1e-6`) 가능성. 발견되면 payload의 float 규칙을 양쪽에서 명시 포맷으로 고정 |
+| ~~`{:.17g}` vs `%.17g`~~ | ~~`deck_digest` 불일치~~ | **종결.** §3.4의 compiled half가 MSVC에서 바이트 동일을 증명했다(`1e-06` 형태 포함). 238에서 다른 컴파일러(GCC/libstdc++)를 쓰므로 §6.3 `--compare`가 그 툴체인에서의 확인을 계속한다 |
 | warm state 바이트 순서 | 다른 머신의 `.warm`을 읽으면 무의미한 값 | 설계상 host-local. 기하 검사와 seed 타당성 검사가 대부분 잡지만, **캠페인 안에서만 쓸 것** |
 | `nested_wall.flatxs` 오버헤드 | telemetry ON 실행에서 `UpdateFlatXS`가 매우 자주 호출되면 clock read가 보인다 | 6.1의 중립성 비교와 6.2의 <1 % 규칙이 이것을 잡는다. 문제가 되면 `LB_FLATXS`만 별도 게이트 |
 
