@@ -1,0 +1,365 @@
+#pragma once
+
+// WP5 stage B -- the CTA-per-node arm of the flat-XS node update.
+//
+// DEVICE ONLY.  This header uses __shared__ and __syncthreads(), so it is
+// included from .cu translation units and nothing else.  Those TUs build with
+// --fmad=false, exactly like the thread-per-node arm, and the contraction
+// policy object is literally the SAME type (fxs::StaticForms over the SAME
+// FLATXS_FORMS mask) -- there is one definition of every fused/unfused choice
+// in the tree and both arms call it.
+//
+// -------------------------------------------------------------------------
+// WHY THIS ARM EXISTS
+// -------------------------------------------------------------------------
+// kernelFlatXs runs ONE THREAD PER NODE, and flatxsSolveNode's workspace is a
+// per-thread local array set:
+//
+//     bl   [N_ACTIVE*NG  =   18 doubles]      144 B
+//     bls  [NLSM         =    4 doubles]       32 B
+//     bm   [N_ACTIVE*NMIC=  702 doubles]    5,616 B
+//     bms  [NMSM         =  156 doubles]    1,248 B
+//     iden [NISO         =   39 doubles]      312 B
+//     active_xt[9] ints                        36 B
+//                                          --------
+//                                          7,388 B / thread   (~7.2 KiB)
+//
+// No GPU has 7 KiB of registers per thread, so ptxas puts that in LOCAL
+// memory -- per-thread global-backed storage.  Stage A of WP5 measures how
+// much of it actually spills and what the achieved occupancy is
+// (tools/flatxs_resource_report.py); this kernel is the answer IF stage A
+// shows the local traffic the static count predicts.
+//
+// The fix is to make the workspace a per-CTA object instead of a per-thread
+// one: 919 doubles = 7,352 B of __shared__ per BLOCK rather than per thread.
+// At 128 threads/CTA that is 57 B/thread of workspace instead of 7,388.
+//
+// -------------------------------------------------------------------------
+// WHY IT IS BIT-IDENTICAL (the B0 argument -- read this before touching it)
+// -------------------------------------------------------------------------
+// The claim is NOT "the same math in a different order rounds the same".  It
+// is the stronger and checkable claim: **every floating-point operation of
+// flatxsSolveNode is executed here, on the same operands, in the same
+// per-value order.  Only the identity of the thread executing it changes.**
+// That holds because of exactly two structural properties, and both of them
+// are asserted by tools/test_flatxs_cta_contract.py:
+//
+// (P1) FIXED LANE OWNERSHIP OVER AN ELEMENT ORDINAL SPACE.
+//      Every workspace element has a flat ordinal q, and every phase of this
+//      kernel walks its ordinal space with the SAME grid-stride form
+//
+//          for (int q = tid; q < N; q += T)
+//
+//      so the thread that gathers element q is the thread that applies every
+//      delta to element q and the thread that scatters element q.  Element
+//      q's accumulation chain therefore lives entirely inside one thread and
+//      is never split, reassociated, or re-ordered.  The reference's chain
+//      for element q is
+//
+//          bx[q] = ref[q];
+//          for s in stream order:  bx[q] = ma(ACC, scale_s, horner_s(q), bx[q])
+//
+//      and that is exactly the sequence this kernel executes for q.  Changing
+//      T (the block size) changes WHICH thread owns q and changes NOTHING
+//      about q's chain -- which is why the block size is a tunable and not a
+//      numerics knob.
+//
+// (P2) THE ISOTOPE FOLD IS NEVER PARALLELISED.
+//      The macro-XS rebuild is
+//
+//          val = bl[t*NG+ig];
+//          for (iso = 0; iso < NISO; ++iso)          // ASCENDING, SEQUENTIAL
+//              val = ma(F_MACRO_SCAL, mt[iso*NG+ig], iden[iso], val);
+//
+//      a 39-long dependent FMA chain.  fma(a,b,c) is a SINGLE-ROUNDING
+//      operation, so this chain is not associative in any sense -- a tree
+//      reduction over iso does not merely re-round, it computes different
+//      products (it would have to sum a*b terms that the reference never
+//      materialises at all).  So there is NO parallel reduction here and no
+//      atomicAdd.  Instead the PARALLELISM IS OVER THE CHAINS: there are
+//      N_ACTIVE*NG = 18 independent scalar chains and NLSM = 4 independent
+//      scatter chains, each one owned whole by a single lane, each one folded
+//      left-to-right iso = 0..NISO-1.  No lane ever folds part of another
+//      lane's chain, so no "fixed-order tree" is needed -- and none is used.
+//      Same rule as XsReconKernel.h's determinism contract, same reason.
+//
+//      The XSRF pass (rf += xs_ssm[...] over ige) is likewise a per-ig
+//      sequential chain owned by one lane; NG = 2, it is not worth splitting
+//      and splitting it would be wrong for the same reason.
+//
+// (P3) UNIFORM CONTROL FLOW IS RECOMPUTED, NOT BROADCAST.
+//      did/x/scale, the DeltaMeta, the mode-1 interval search, xloc and base
+//      are computed REDUNDANTLY BY EVERY LANE from the same global bytes.
+//      They are integer work plus one exact subtraction (xloc = x - knot), so
+//      every lane gets bit-identical values; broadcasting them through shared
+//      memory would need a __syncthreads() per stream entry and buy nothing.
+//      This is the one place this kernel deliberately departs from the WP5
+//      plan's pseudo-code, which syncs once per delta: with (P1) there is no
+//      cross-lane dependency inside the stream loop at all, so the loop runs
+//      with ZERO barriers regardless of how long the stream is.
+//
+// The only barriers in the kernel are the three that publish one phase's
+// writes to lanes that did not perform them:
+//   * after the light-isotope refresh (all lanes read sh_iden),
+//   * after the workspace is final          (all lanes read sh_bl/sh_bm/...),
+//   * after the macro pass                  (the XSDF/XSRF pass re-reads
+//     xs[XSTF]/xs[XSAF]/xs_ssm from GLOBAL, exactly like the reference does,
+//     and __syncthreads() is what makes another lane's global store visible).
+//
+// FMA NOTE.  Nothing in this file writes `a * b + c`.  Every multiply-add
+// goes through pol.ma(<bit>, ...) with the same FormBit the reference uses at
+// that site, and the TU is compiled --fmad=false so nvcc cannot fuse the
+// unfused arms on its own.  If a site here were spelled with a different bit
+// than the reference spells it, the replay gate
+// (test/flatxs_device_replay.cu --cta) fails loudly instead of drifting.
+//
+// -------------------------------------------------------------------------
+// WHAT IS *NOT* CLAIMED
+// -------------------------------------------------------------------------
+// Nothing about speed.  Stage A decides whether local traffic is the real
+// bottleneck and the 238 runbook in docs/WP5_FLATXS_CTA_20260831_KO.md
+// decides whether this arm is adopted.  The flag defaults OFF.
+
+#include "FlatXsKernel.h"
+
+#include <cuda_runtime.h>
+
+#if !defined(__CUDACC__)
+    #error "FlatXsCtaKernel.cuh is device-only; include it from a .cu TU"
+#endif
+
+namespace rasbery::flatxs {
+
+/// Shared workspace: the exact same five arrays flatxsSolveNode declares as
+/// thread locals, sized from the SAME constants (N_ACTIVE/NG/NLSM/NMIC/NMSM/
+/// NISO from FlatXsKernel.h and XsReconKernel.h).  Nothing here is a
+/// hand-copied magic number -- if the isotope registry or the group count
+/// moves, this struct moves with it, and the contract test refuses any
+/// literal size.
+struct CtaWorkspace {
+    double bl[N_ACTIVE * NG];   ///< lmpx scalars   [t*NG + ig]
+    double bls[NLSM];           ///< lmpx scatter   [igs*NG + ige]
+    double bm[N_ACTIVE * NMIC]; ///< micx scalars   [t*NMIC + iso*NG + ig]
+    double bms[NMSM];           ///< micx scatter   [iso*NG*NG + igs*NG + ige]
+    double iden[NISO];          ///< node densities after RefreshLightIsotopes
+};
+
+/// Ordinal-space extents.  These name the loop bounds used by (P1) so the
+/// gather / apply / scatter phases cannot drift apart.
+constexpr int Q_LMP = N_ACTIVE * NG;   // 18
+constexpr int Q_LSM = NLSM;            // 4
+constexpr int Q_MIC = N_ACTIVE * NMIC; // 702
+constexpr int Q_MSM = NMSM;            // 156
+
+/// One CTA, one unrodded node.  `T` is blockDim.x as a compile-time constant
+/// so the strides fold; it is a PERFORMANCE parameter only (see P1).
+template <int T, class POL>
+__device__ inline void flatxsSolveNodeCta(const FlatXsView& v, int i,
+                                          const POL& pol, CtaWorkspace& w) {
+    const int nxyz = v.nxyz;
+    const int l    = v.nodes[i];
+    const int tid  = static_cast<int>(threadIdx.x);
+
+    // --- 1. Gather the reference state (plain copies, no arithmetic) -------
+    // Same ordinal mapping as every later phase: q -> lane q % T.
+    for (int q = tid; q < Q_LMP; q += T) {
+        const int t  = q / NG;
+        const int ig = q - t * NG;
+        w.bl[q]      = v.ref_lmp[t][ig * nxyz + l];
+    }
+    for (int q = tid; q < Q_LSM; q += T) w.bls[q] = v.ref_lsm[q * nxyz + l];
+    for (int q = tid; q < Q_MIC; q += T) {
+        const int t = q / NMIC;
+        const int e = q - t * NMIC;
+        w.bm[q]     = v.ref_mic[t][e * nxyz + l];
+    }
+    for (int q = tid; q < Q_MSM; q += T) w.bms[q] = v.ref_msm[q * nxyz + l];
+
+    // NO BARRIER HERE, AND THAT IS DELIBERATE: by (P1) the lane that wrote
+    // element q is the lane that reads it below.  A barrier would be free
+    // insurance against a bug that (P1) makes impossible and that the contract
+    // test checks for.
+
+    // --- 2. Apply the resolved delta stream in the caller's order ----------
+    const int s0 = v.node_off[i];
+    const int s1 = s0 + v.node_cnt[i];
+    for (int s = s0; s < s1; ++s) {
+        const int    did   = v.stream_did[s];
+        const double x     = v.stream_x[s];
+        const double scale = v.stream_scale[s];
+        // Same defensive guard as the reference; uniform across the block, so
+        // it costs no divergence.
+        if (did < 0 || scale == 0.0) continue;
+
+        // (P3): every lane recomputes this, nobody broadcasts it.
+        const DeltaMeta dm   = v.deltas[did];
+        int             base = dm.coeff_base;
+        int             nord = dm.nord;
+        double          xloc = x;
+        if (dm.mode == 1) {
+            const int nintervals = dm.nord / dm.ncoeff;
+            int       interval   = nintervals - 1;
+            for (int k = 0; k < nintervals - 1; ++k) {
+                if (x < v.knots[dm.knot_offset + k + 1]) {
+                    interval = k;
+                    break;
+                }
+            }
+            xloc = x - v.knots[dm.knot_offset + interval];
+            base += interval * dm.ncoeff;
+            nord = dm.ncoeff;
+        }
+
+        // lmpx scalars.  Reference: for t, for e -> Horner down p, then
+        // dst[e] = ma(F_ACC_LMP, scale, val, dst[e]).  Here the (t,e) pair is
+        // the ordinal q and the chain is identical.
+        for (int q = tid; q < Q_LMP; q += T) {
+            const int     t     = q / NG;
+            const int     e     = q - t * NG;
+            const double* cdata = v.coeff_lmp[t];
+            double        val   = cdata[(base + nord - 1) * NG + e];
+            for (int p = nord - 2; p >= 0; --p)
+                val = pol.ma(F_HORNER_LMP, val, xloc, cdata[(base + p) * NG + e]);
+            w.bl[q] = pol.ma(F_ACC_LMP, scale, val, w.bl[q]);
+        }
+        // lmpx scatter.
+        for (int q = tid; q < Q_LSM; q += T) {
+            double val = v.coeff_lsm[(base + nord - 1) * NLSM + q];
+            for (int p = nord - 2; p >= 0; --p)
+                val = pol.ma(F_HORNER_LSM, val, xloc,
+                             v.coeff_lsm[(base + p) * NLSM + q]);
+            w.bls[q] = pol.ma(F_ACC_LSM, scale, val, w.bls[q]);
+        }
+
+        if (!v.has_coeff_micx) continue;
+        // micx scalars.
+        for (int q = tid; q < Q_MIC; q += T) {
+            const int     t     = q / NMIC;
+            const int     e     = q - t * NMIC;
+            const double* cdata = v.coeff_mic[t];
+            double        val   = cdata[(base + nord - 1) * NMIC + e];
+            for (int p = nord - 2; p >= 0; --p)
+                val = pol.ma(F_HORNER_MIC, val, xloc, cdata[(base + p) * NMIC + e]);
+            w.bm[q] = pol.ma(F_ACC_MIC, scale, val, w.bm[q]);
+        }
+        // micx scatter.
+        for (int q = tid; q < Q_MSM; q += T) {
+            double val = v.coeff_msm[(base + nord - 1) * NMSM + q];
+            for (int p = nord - 2; p >= 0; --p)
+                val = pol.ma(F_HORNER_MSM, val, xloc,
+                             v.coeff_msm[(base + p) * NMSM + q]);
+            w.bms[q] = pol.ma(F_ACC_MSM, scale, val, w.bms[q]);
+        }
+    }
+
+    // --- 3. Densities + RefreshLightIsotopes ------------------------------
+    // Rows IH1/IB10/IO16 (0/1/2, contiguous by registry design) are the ONLY
+    // rows the refresh rewrites, so lanes load rows 3.. from memory and lane 0
+    // computes rows 0..2.  Splitting it this way means no lane ever reads a
+    // row another lane is about to overwrite, so one barrier suffices.
+    for (int iso = tid; iso < NISO; iso += T)
+        if (iso > IO16) w.iden[iso] = v.iden[iso * nxyz + l];
+    if (tid == 0) {
+        const double nH2O       = v.dmod[l] * v.wvfr[l] * WATER_NUMBER_DENSITY;
+        const double boron_dmod = fxsBoronDmod(v, l);
+        w.iden[IH1]             = 2.0 * nH2O;
+        w.iden[IO16]            = nH2O;
+        w.iden[IB10] = boron_dmod * v.wvfr[l] * v.bppm[l] * BORON_DENSITY_FACTOR;
+        v.iden[IH1 * nxyz + l]  = w.iden[IH1];
+        v.iden[IB10 * nxyz + l] = w.iden[IB10];
+        v.iden[IO16 * nxyz + l] = w.iden[IO16];
+    }
+
+    // --- 4. Scatter the workspace back to the SoA arrays (plain copies) ----
+    // Still lane-owned (P1), so this needs no barrier of its own.
+    for (int q = tid; q < Q_LMP; q += T) {
+        const int t             = q / NG;
+        const int ig            = q - t * NG;
+        v.lmp[t][ig * nxyz + l] = w.bl[q];
+    }
+    for (int q = tid; q < Q_LSM; q += T) v.lsm[q * nxyz + l] = w.bls[q];
+    for (int q = tid; q < Q_MIC; q += T) {
+        const int t            = q / NMIC;
+        const int e            = q - t * NMIC;
+        v.mic[t][e * nxyz + l] = w.bm[q];
+    }
+    for (int q = tid; q < Q_MSM; q += T) v.msm[q * nxyz + l] = w.bms[q];
+
+    // Publish the workspace and sh_iden: from here on lanes read elements they
+    // did not write.
+    __syncthreads();
+
+    // --- 5. Rebuild this node's macroscopic XS ----------------------------
+    // (P2): one lane per output chain, isotope fold strictly ascending.
+    const int active_xt[N_ACTIVE] = {
+        xsrecon::T_XSTF, xsrecon::T_XSAF, xsrecon::T_XSFF,
+        xsrecon::T_XSNF, xsrecon::T_XSKF, xsrecon::T_XSSF,
+        xsrecon::T_FYLD, xsrecon::T_XS2N, xsrecon::T_XS3N};
+    for (int q = tid; q < Q_LMP; q += T) {
+        const int     t  = q / NG;
+        const int     ig = q - t * NG;
+        const double* mt = w.bm + t * NMIC;
+        double        val = w.bl[q];
+        for (int iso = 0; iso < NISO; ++iso)
+            val = pol.ma(F_MACRO_SCAL, mt[iso * NG + ig], w.iden[iso], val);
+        v.xs[active_xt[t]][ig * nxyz + l] = val;
+    }
+    for (int q = tid; q < Q_LSM; q += T) {
+        // q == igs*NG + ige, and bms is [iso*NLSM + q] -- same expression the
+        // reference writes as bms[iso*NLSM + igs*NG + ige].
+        double val = w.bls[q];
+        for (int iso = 0; iso < NISO; ++iso)
+            val = pol.ma(F_MACRO_SSM, w.bms[iso * NLSM + q], w.iden[iso], val);
+        v.xs_ssm[q * nxyz + l] = val;
+    }
+
+    // The XSDF/XSRF pass re-reads xs[XSTF]/xs[XSAF]/xs_ssm from GLOBAL, exactly
+    // as the reference does, and those stores came from other lanes.
+    __syncthreads();
+
+    for (int ig = tid; ig < NG; ig += T) {
+        const double tr = v.xs[xsrecon::T_XSTF][ig * nxyz + l];
+        v.xs[xsrecon::T_XSDF][ig * nxyz + l] =
+            (tr > 1.0e-30) ? 0.333333333333333 / tr : 0.0;
+
+        double rf = v.xs[xsrecon::T_XSAF][ig * nxyz + l];
+        for (int ige = 0; ige < NG; ++ige)
+            rf += v.xs_ssm[(ig * NG + ige) * nxyz + l];
+        v.xs[xsrecon::T_XSRF][ig * nxyz + l] = rf;
+    }
+}
+
+/// One CTA per node.  Static __shared__ (7,352 B/CTA): no dynamic shared-mem
+/// opt-in is needed and the occupancy is legible from the launch bounds.
+template <int T>
+__global__ void __launch_bounds__(T) kernelFlatXsCta(FlatXsView v) {
+    __shared__ CtaWorkspace w;
+    const int i = static_cast<int>(blockIdx.x);
+    // Block-uniform, so the whole CTA leaves together and no lane can be
+    // stranded at a barrier the others already passed.
+    if (i >= v.n_nodes) return;
+    flatxsSolveNodeCta<T>(v, i, StaticForms{}, w);
+}
+
+/// Block sizes the arm accepts.  The list is a PERFORMANCE ladder, not a
+/// numerics one (P1): every entry produces the same bytes.  Anything else the
+/// caller asks for is clamped to CTA_THREADS_DEFAULT.
+constexpr int CTA_THREADS_DEFAULT = 128;
+
+/// Launch helper: the one place the block-size ladder is spelled, so the
+/// production backend and the replay gate cannot pick different ladders.
+inline void flatxsCtaLaunch(const FlatXsView& v, int threads, cudaStream_t stream) {
+    const int grid = v.n_nodes;
+    if (grid <= 0) return;
+    switch (threads) {
+        case 64:  kernelFlatXsCta<64><<<grid, 64, 0, stream>>>(v); break;
+        case 256: kernelFlatXsCta<256><<<grid, 256, 0, stream>>>(v); break;
+        case 128:
+        default:
+            kernelFlatXsCta<CTA_THREADS_DEFAULT>
+                <<<grid, CTA_THREADS_DEFAULT, 0, stream>>>(v);
+            break;
+    }
+}
+
+} // namespace rasbery::flatxs

@@ -3,12 +3,22 @@
 // capture and score elementwise ULP against the captured CPU outputs.
 //
 //   CUDA_VISIBLE_DEVICES=<uuid> ./flatxs_device_replay <capture-base>
+//   CUDA_VISIBLE_DEVICES=<uuid> ./flatxs_device_replay <capture-base> --cta [T]
+//   CUDA_VISIBLE_DEVICES=<uuid> ./flatxs_device_replay <capture-base> --one <i> [n]
 //
 // PASS (exit 0) means every element of every array the kernel writes is
 // bit-identical to what the production gcc loop wrote.  This is the same
 // verdict the host replay gives; running both separates "the body is wrong"
 // from "nvcc rounds differently".
+//
+// --cta [T] adds WP5 stage B's CTA-per-node arm on its OWN copies of every
+// mutable array and reports two extra verdicts: CTA vs the reference kernel
+// (the B0 claim -- exactly 0 mismatches required, at every block size on the
+// ladder) and CTA vs the capture.  T defaults to flatxs::CTA_THREADS_DEFAULT;
+// run it at 64, 128 and 256, because a block size that changed the bytes would
+// mean the lane-ownership invariant (P1 in FlatXsCtaKernel.cuh) is broken.
 
+#include "../src/FlatXsCtaKernel.cuh"
 #include "../src/FlatXsKernel.h"
 
 #include <cuda_runtime.h>
@@ -88,7 +98,9 @@ std::uint64_t ulpDiff(double a, double b) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <capture-base>\n", argv[0]);
+        std::fprintf(stderr,
+                     "usage: %s <capture-base> [--cta [T] | --one <i> [n]]\n",
+                     argv[0]);
         return 2;
     }
     const std::string base = argv[1];
@@ -174,6 +186,10 @@ int main(int argc, char** argv) {
     // an optionally truncated stream -- bisects the first diverging entry.
     const bool one_mode = argc > 3 && std::string(argv[2]) == "--one";
     const int  one_idx  = one_mode ? std::atoi(argv[3]) : -1;
+    // --cta [T]: run WP5's CTA-per-node arm alongside the reference kernel.
+    const bool cta_mode = argc > 2 && std::string(argv[2]) == "--cta";
+    const int  cta_threads =
+        (cta_mode && argc > 3) ? std::atoi(argv[3]) : fxs::CTA_THREADS_DEFAULT;
     if (one_mode && argc > 4) {
         const int maxd = std::atoi(argv[4]);
         if (cnt[static_cast<std::size_t>(one_idx)] > maxd)
@@ -304,14 +320,47 @@ int main(int argc, char** argv) {
     TRY(cudaGetLastError());
     TRY(cudaDeviceSynchronize());
 
+    // --- WP5 stage C: the CTA arm, on its OWN copies of every mutable array.
+    //
+    // The point of a separate copy set is that the two arms must not be able
+    // to help each other: `c` shares only the immutable library/reference
+    // tables and the per-node inputs, and every array either kernel WRITES is
+    // re-uploaded from the same captured pre-state.  So a three-way verdict is
+    // possible from one run --
+    //   (1) CTA vs REFERENCE KERNEL, per node, element for element -- the B0
+    //       claim of FlatXsCtaKernel.cuh, and the one this file exists for;
+    //   (2) CTA vs the captured gcc OUTPUT -- the same 0-ULP bar the
+    //       thread-per-node arm already clears.
+    // (1) is the sharper test: it fails on a lane-ownership or barrier bug
+    // even on a deck where (2) happens to be insensitive.
+    fxs::FlatXsView c = v;
+    if (cta_mode) {
+        for (int t = 0; t < fxs::N_ACTIVE; ++t) {
+            c.lmp[t] = up(lmpx[t]);
+            c.mic[t] = up(micx[t]);
+        }
+        c.lsm = up(lsm);
+        c.msm = up(msmx);
+        for (int xt = 0; xt < xsr::NXS; ++xt) c.xs[xt] = up(xsa[xt]);
+        c.xs_ssm = up(xs_ssm);
+        c.iden   = up(iden);
+        fxs::flatxsCtaLaunch(c, cta_threads, nullptr);
+        TRY(cudaGetLastError());
+        TRY(cudaDeviceSynchronize());
+    }
+
     auto pull = [&](const double* dv, std::vector<double>& hv_, std::size_t n) {
         hv_.resize(n);
         return cudaMemcpy(hv_.data(), dv, n * sizeof(double),
                           cudaMemcpyDeviceToHost) == cudaSuccess;
     };
-    std::uint64_t bad = 0, worst = 0;
+    std::uint64_t bad = 0, worst = 0;      // arm-vs-capture
+    std::uint64_t cta_bad = 0, cta_worst = 0; // CTA-vs-capture
+    std::uint64_t ab_bad = 0;              // CTA-vs-reference-kernel (must be 0)
     auto score = [&](const std::vector<double>& got,
-                     const std::vector<double>& want, const char* tag) {
+                     const std::vector<double>& want, const char* tag,
+                     std::uint64_t& bad_out, std::uint64_t& worst_out,
+                     const char* what) {
         std::uint64_t abad = 0, aworst = 0;
         int           first_l = -1, first_r = -1;
         for (std::size_t i = 0; i < nodes.size(); ++i) {
@@ -326,41 +375,57 @@ int main(int argc, char** argv) {
             }
         }
         if (abad) {
-            std::printf("  %-8s mismatches=%-10" PRIu64 " worst_ulp=%" PRIu64
+            std::printf("  [%s] %-8s mismatches=%-10" PRIu64 " worst_ulp=%" PRIu64
                         " first(l=%d,row=%d) got=%.17g want=%.17g\n",
-                        tag, abad, aworst, first_l, first_r,
+                        what, tag, abad, aworst, first_l, first_r,
                         got[static_cast<std::size_t>(first_r) * nx + first_l],
                         want[static_cast<std::size_t>(first_r) * nx + first_l]);
         }
-        bad += abad;
-        if (aworst > worst) worst = aworst;
+        bad_out += abad;
+        if (aworst > worst_out) worst_out = aworst;
     };
-    std::vector<double> h;
+    std::vector<double> h, hc;
     char tag[32];
+    // One walk over every array either kernel writes.  `ref` is the reference
+    // kernel's device pointer, `cta` the CTA arm's, `want` the capture.
+    auto arm = [&](const double* ref_dv, const double* cta_dv,
+                   const std::vector<double>& want, std::size_t n,
+                   const char* tag_) -> bool {
+        if (!pull(ref_dv, h, n)) return false;
+        score(h, want, tag_, bad, worst, "ref-vs-capture");
+        if (!cta_mode) return true;
+        if (!pull(cta_dv, hc, n)) return false;
+        std::uint64_t sink = 0;
+        score(hc, h, tag_, ab_bad, sink, "cta-vs-ref");
+        score(hc, want, tag_, cta_bad, cta_worst, "cta-vs-capture");
+        return true;
+    };
     for (int t = 0; t < fxs::N_ACTIVE; ++t) {
-        if (!pull(v.lmp[t], h, lmp)) return 3;
         std::snprintf(tag, sizeof tag, "lmp%d", t);
-        score(h, out_lmp[t], tag);
-        if (!pull(v.mic[t], h, mic)) return 3;
+        if (!arm(v.lmp[t], c.lmp[t], out_lmp[t], lmp, tag)) return 3;
         std::snprintf(tag, sizeof tag, "mic%d", t);
-        score(h, out_mic[t], tag);
+        if (!arm(v.mic[t], c.mic[t], out_mic[t], mic, tag)) return 3;
     }
-    if (!pull(v.lsm, h, ssm)) return 3;
-    score(h, out_lsm, "lsm");
-    if (!pull(v.msm, h, msm)) return 3;
-    score(h, out_msm, "msm");
+    if (!arm(v.lsm, c.lsm, out_lsm, ssm, "lsm")) return 3;
+    if (!arm(v.msm, c.msm, out_msm, msm, "msm")) return 3;
     for (int xt = 0; xt < xsr::NXS; ++xt) {
-        if (!pull(v.xs[xt], h, lmp)) return 3;
         std::snprintf(tag, sizeof tag, "xs%d", xt);
-        score(h, out_xs[xt], tag);
+        if (!arm(v.xs[xt], c.xs[xt], out_xs[xt], lmp, tag)) return 3;
     }
-    if (!pull(v.xs_ssm, h, ssm)) return 3;
-    score(h, out_xs_ssm, "xs_ssm");
-    if (!pull(v.iden, h, 3 * nx)) return 3;
-    score(h, out_iden3, "iden3");
+    if (!arm(v.xs_ssm, c.xs_ssm, out_xs_ssm, ssm, "xs_ssm")) return 3;
+    if (!arm(v.iden, c.iden, out_iden3, 3 * nx, "iden3")) return 3;
 
     std::printf("[flatxs_device_replay] nodes=%" PRId64 " mismatches=%" PRIu64
                 " worst_ulp=%" PRIu64 " -> %s\n",
                 n_nodes, bad, worst, bad == 0 ? "PASS" : "FAIL");
+    if (cta_mode) {
+        std::printf("[flatxs_device_replay --cta threads=%d] "
+                    "cta_vs_ref_mismatches=%" PRIu64 "  "
+                    "cta_vs_capture_mismatches=%" PRIu64 " worst_ulp=%" PRIu64
+                    " -> %s\n",
+                    cta_threads, ab_bad, cta_bad, cta_worst,
+                    (ab_bad == 0 && cta_bad == 0) ? "PASS" : "FAIL");
+        return (bad == 0 && ab_bad == 0 && cta_bad == 0) ? 0 : 1;
+    }
     return bad == 0 ? 0 : 1;
 }

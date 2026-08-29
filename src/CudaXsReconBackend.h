@@ -456,6 +456,19 @@ bool rasberyGpuXsReconEnabled();
 /// RASBERY_GPU_FLATXS, read once per process.  Stub builds return false.
 bool rasberyGpuFlatXsEnabled();
 
+/// RASBERY_GPU_FLATXS_CTA, read once per process: WP5 stage B's CTA-per-node
+/// flat-XS kernel.  Default OFF; the arm it changes is the
+/// RASBERY_GPU_FLATXS one, and it claims to change it BIT FOR BIT -- the
+/// argument is written at the top of src/FlatXsCtaKernel.cuh and gated by
+/// test/flatxs_device_replay.cu --cta.  Stub builds return false.
+bool rasberyGpuFlatXsCtaEnabled();
+
+/// Threads per CTA for that arm (RASBERY_GPU_FLATXS_CTA_THREADS; 64/128/256,
+/// anything else clamps to flatxs::CTA_THREADS_DEFAULT).  PERFORMANCE ONLY:
+/// every value on the ladder produces the same bytes, because each workspace
+/// element's accumulation chain lives inside one lane whatever the block size.
+int rasberyGpuFlatXsCtaThreads();
+
 /// Receipt accessor mirroring XsReconBackend::nodesSolved for main.cpp.
 unsigned long long rasberyGpuXsReconNodes();
 

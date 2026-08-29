@@ -5,6 +5,14 @@ project(RASBERY LANGUAGES C CXX)
 
 option(RASBERY_ENABLE_OPENMP "Enable OpenMP support when available." ON)
 option(RASBERY_ENABLE_CUDA "Enable the CUDA BiCGSTAB/CMFD backend." OFF)
+# WP5 stage A.  ptxas -v prints registers/thread, stack frame and spill
+# stores/loads per kernel at COMPILE time -- the cheapest half of the
+# resource proof, and the half that needs no device.  OFF by default because
+# it is pure build noise for everyone not measuring; tools/flatxs_resource_report.py
+# parses the log it produces.  It is appended to, never replaces, the
+# --fmad=false the bit-identity contract depends on.
+option(RASBERY_PTXAS_VERBOSE
+        "Append --ptxas-options=-v to the bit-exact CUDA TUs (WP5 stage A)." OFF)
 set(RASBERY_CUDA_ARCHITECTURES "80;86;89;100;120" CACHE STRING
         "CUDA architectures to build the CMFD backend for (e.g. 61 for GTX 10xx).")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -12,6 +20,16 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 if (RASBERY_ENABLE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
+endif ()
+
+# The compile options every bit-exact CUDA TU carries.  --fmad=false is a
+# CONTRACT, not a tuning flag: the kernels in those TUs claim to reproduce a
+# host loop bit for bit, and letting nvcc fuse a*b+c where g++ did not would
+# make that claim depend on two schedulers agreeing.  RASBERY_PTXAS_VERBOSE
+# only ADDS to the list, so the contract cannot be switched off by measuring.
+set(RASBERY_BITEXACT_CUDA_OPTS "--fmad=false")
+if (RASBERY_PTXAS_VERBOSE)
+    list(APPEND RASBERY_BITEXACT_CUDA_OPTS "--ptxas-options=-v")
 endif ()
 
 # Dependencies
@@ -59,26 +77,26 @@ if (RASBERY_ENABLE_CUDA)
     # where the host compiler did not.  Same reason, same flag, same scope as
     # CudaXsReconBackend.cu above.
     set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/CudaOuterGraph.cu"
-            PROPERTIES COMPILE_OPTIONS "--fmad=false")
+            PROPERTIES COMPILE_OPTIONS "${RASBERY_BITEXACT_CUDA_OPTS}")
     # The xsrecon kernel's contract is bit-identical reproduction of the host
     # loop; nvcc must not contract a*b+c into fma where the host compiler did
     # not.  Scoped to this one file so the CMFD backend keeps its flags.
     set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/CudaXsReconBackend.cu"
-            PROPERTIES COMPILE_OPTIONS "--fmad=false")
+            PROPERTIES COMPILE_OPTIONS "${RASBERY_BITEXACT_CUDA_OPTS}")
     # GA evaluator plan Task 10 (GPU PPR).  The kernels are a transcription of
     # PPR.cpp's node bodies in the host's statement order; contracting a*b+c
     # into an fma where the host did not would put the arm's deviation at the
     # mercy of nvcc's scheduler instead of at the one place the gate documents
     # (the device libm's exp, and the corner-sum chunking).
     set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/CudaPprBackend.cu"
-            PROPERTIES COMPILE_OPTIONS "--fmad=false")
+            PROPERTIES COMPILE_OPTIONS "${RASBERY_BITEXACT_CUDA_OPTS}")
     # GA evaluator plan Task 16 (GPU CRAM depletion).  Same reason again, and it
     # bites harder here than anywhere else in the tree: the Gauss-Seidel sweep is
     # `sum -= vals[i] * x[cols[i]]` repeated up to 64 times per pole, so a single
     # contracted multiply-add would compound across 256 sweeps before the result
     # is compared, and the depletion output feeds the NEXT statepoint.
     set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/CudaCramBackend.cu"
-            PROPERTIES COMPILE_OPTIONS "--fmad=false")
+            PROPERTIES COMPILE_OPTIONS "${RASBERY_BITEXACT_CUDA_OPTS}")
 endif ()
 
 add_executable(RASBERY ${RASBERY_SOURCES})
@@ -358,7 +376,7 @@ if (RASBERY_ENABLE_TESTS)
                 CUDA_SEPARABLE_COMPILATION ON)
         set_source_files_properties(
                 "${CMAKE_CURRENT_SOURCE_DIR}/test/flatxs_device_replay.cu"
-                PROPERTIES COMPILE_OPTIONS "--fmad=false")
+                PROPERTIES COMPILE_OPTIONS "${RASBERY_BITEXACT_CUDA_OPTS}")
     endif ()
 
     if (RASBERY_ENABLE_CUDA)
@@ -375,7 +393,7 @@ if (RASBERY_ENABLE_TESTS)
                 CUDA_SEPARABLE_COMPILATION ON)
         set_source_files_properties(
                 "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_device_replay.cu"
-                PROPERTIES COMPILE_OPTIONS "--fmad=false")
+                PROPERTIES COMPILE_OPTIONS "${RASBERY_BITEXACT_CUDA_OPTS}")
 
         # The nodal contraction miner is the tool that produced the mask in
         # NodalKernel.h, but the .cu itself was never committed -- test/ is
@@ -398,7 +416,7 @@ if (RASBERY_ENABLE_TESTS)
                     CUDA_SEPARABLE_COMPILATION ON)
             set_source_files_properties(
                     "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_mine_device.cu"
-                    PROPERTIES COMPILE_OPTIONS "--fmad=false")
+                    PROPERTIES COMPILE_OPTIONS "${RASBERY_BITEXACT_CUDA_OPTS}")
         else ()
             message(WARNING
                     "test/nodal_mine_device.cu is absent, so rasbery_nodal_mine_device is "
@@ -424,7 +442,7 @@ if (RASBERY_ENABLE_TESTS)
                 CUDA_SEPARABLE_COMPILATION ON)
         set_source_files_properties(
                 "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_constant_exp_probe.cu"
-                PROPERTIES COMPILE_OPTIONS "--fmad=false")
+                PROPERTIES COMPILE_OPTIONS "${RASBERY_BITEXACT_CUDA_OPTS}")
 
         add_test(NAME nodal_constant_exp_probe
                 COMMAND rasbery_nodal_constant_exp_probe 1000000)
@@ -445,7 +463,7 @@ if (RASBERY_ENABLE_TESTS)
                 CUDA_SEPARABLE_COMPILATION ON)
         set_source_files_properties(
                 "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_constant_device_replay.cu"
-                PROPERTIES COMPILE_OPTIONS "--fmad=false")
+                PROPERTIES COMPILE_OPTIONS "${RASBERY_BITEXACT_CUDA_OPTS}")
 
         # Device arm of the Task 5 gate.  The Sec 6.12 counter reduction -- warp
         # reduce, one atomic per block, atomicMax over the ratio's bit pattern --
@@ -475,7 +493,7 @@ if (RASBERY_ENABLE_TESTS)
         endif ()
         set_source_files_properties(
                 "${CMAKE_CURRENT_SOURCE_DIR}/test/cmfd_outer_device_replay.cu"
-                PROPERTIES COMPILE_OPTIONS "--fmad=false")
+                PROPERTIES COMPILE_OPTIONS "${RASBERY_BITEXACT_CUDA_OPTS}")
 
         add_test(NAME cmfd_outer_device_replay
                 COMMAND rasbery_cmfd_outer_device_replay 4096)

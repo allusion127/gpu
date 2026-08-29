@@ -114,6 +114,13 @@ bool rasberyGpuXsReconEnabled() { return false; }
 
 bool rasberyGpuFlatXsEnabled() { return false; }
 
+bool rasberyGpuFlatXsCtaEnabled() { return false; }
+
+// The ladder's default, not 0: a caller that logs the value must not be told
+// the arm would launch an empty block.  With the CUDA-less build there is no
+// arm at all, and rasberyGpuFlatXsCtaEnabled() already says so.
+int rasberyGpuFlatXsCtaThreads() { return 128; }
+
 bool rasberyGpuNodalEnabled() { return false; }
 
 bool rasberyGpuXeEnabled() { return false; }

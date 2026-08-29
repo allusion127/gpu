@@ -2,6 +2,7 @@
 
 #include "BatchRefill.h"
 #include "CudaTransferMirror.h"
+#include "FlatXsCtaKernel.cuh"
 #include "FlatXsKernel.h"
 #include "GpuCanonicalState.h"
 #include "GpuCaptureArbiter.h"
@@ -3325,9 +3326,20 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     v.node_cnt     = d.dev_cnt;
     v.nodes        = d.dev_nodes;
 
-    const int block = 128;
-    const int grid  = (host.n_nodes + block - 1) / block;
-    kernelFlatXs<<<grid, block, 0, d.stream>>>(v);
+    // WP5 stage B.  ONE dispatch point, ONE flag, read once into a cached
+    // bool: the reference arm below is the code the CTA arm is scored against,
+    // so it must still be reachable and still be the default.  The two arms
+    // write the same bytes (FlatXsCtaKernel.cuh, the B0 argument at the top),
+    // so nothing downstream of this line -- the downloads, the residency
+    // bookkeeping, the counters -- knows or needs to know which one ran.
+    static const bool cta = rasberyGpuFlatXsCtaEnabled();
+    if (cta) {
+        fxs::flatxsCtaLaunch(v, rasberyGpuFlatXsCtaThreads(), d.stream);
+    } else {
+        const int block = 128;
+        const int grid  = (host.n_nodes + block - 1) / block;
+        kernelFlatXs<<<grid, block, 0, d.stream>>>(v);
+    }
     RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
 
     // --- results the host needs back --------------------------------------
@@ -4353,6 +4365,32 @@ bool rasberyGpuXsReconEnabled() {
 bool rasberyGpuFlatXsEnabled() {
     static const bool on = envFlagEnabled("RASBERY_GPU_FLATXS");
     return on;
+}
+
+bool rasberyGpuFlatXsCtaEnabled() {
+    // WP5 stage B.  envFlagEnabled, i.e. ABSENT MEANS OFF -- same rule and
+    // same reason as RASBERY_GPU_XE_TXN: this is a performance change carrying
+    // a bit-identity claim, and a default-on performance change is a claim
+    // nobody was asked to check.  The thread-per-node kernelFlatXs stays the
+    // mask-0 reference and stays the default until the 238 runbook in
+    // docs/WP5_FLATXS_CTA_20260831_KO.md says otherwise.
+    static const bool on = envFlagEnabled("RASBERY_GPU_FLATXS_CTA");
+    return on;
+}
+
+int rasberyGpuFlatXsCtaThreads() {
+    // Read once, clamped once, to the ladder flatxsCtaLaunch spells.  The
+    // block size is a PERFORMANCE parameter only: by (P1) in
+    // FlatXsCtaKernel.cuh every entry of the ladder produces the same bytes,
+    // so a bad value must be clamped, never fail the run.
+    static const int threads = [] {
+        const char* v = std::getenv("RASBERY_GPU_FLATXS_CTA_THREADS");
+        if (v == nullptr) return fxs::CTA_THREADS_DEFAULT;
+        const int n = std::atoi(v);
+        if (n == 64 || n == 128 || n == 256) return n;
+        return fxs::CTA_THREADS_DEFAULT;
+    }();
+    return threads;
 }
 
 bool rasberyGpuNodalEnabled() {
