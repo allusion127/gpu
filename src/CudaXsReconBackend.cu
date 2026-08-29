@@ -309,6 +309,19 @@ std::atomic<unsigned long long> g_canon_up_bytes{0};
 std::atomic<unsigned long long> g_canon_down_bytes{0};
 std::atomic<unsigned long long> g_nodal_graph_launches{0};
 std::atomic<unsigned long long> g_nodal_graph_fallbacks{0};
+/// Rev.7.1 Task 10 part 4: how many times the drive had to CAPTURE, as opposed
+/// to launch what it had captured before.
+///
+/// COUNTED BECAUSE IT WAS INVISIBLE.  Every re-capture costs a
+/// cudaStreamSynchronize on the backend's own stream (the drain that has to
+/// leave an idle stream for cudaStreamBeginCapture), a capture, and an
+/// instantiate -- and NONE of that lands in the segment's
+/// `in_body_host_syncs`, which counts the runner's own drains.  A host-free
+/// segment can therefore read `in_body_host_syncs: 0` and still rendezvous once
+/// per segment inside the nodal backend.  `graph_launches - graph_captures` is
+/// the number the caching is about; on a run where the key is stable it should
+/// be `launches - 1`.
+std::atomic<unsigned long long> g_nodal_graph_captures{0};
 std::atomic<unsigned long long> g_nodal_d2h_bytes{0}; // per drive, last shape seen
 /// Rev.7.1 W3 item 2: drives whose terminal drain became an event on the
 /// segment's stream instead of a host block.  A deferral that never happened is
@@ -1686,6 +1699,8 @@ struct NodalReceipt {
                   << (nodalFuseMatEvenEnabled() ? 1 : 0)
                   << ",\"graph_launches\":"
                   << g_nodal_graph_launches.load(std::memory_order_relaxed)
+                  << ",\"graph_captures\":"
+                  << g_nodal_graph_captures.load(std::memory_order_relaxed)
                   << ",\"graph_fallbacks\":"
                   << g_nodal_graph_fallbacks.load(std::memory_order_relaxed)
                   << ",\"d2h_bytes_per_drive\":"
@@ -1860,13 +1875,9 @@ struct XsReconBackend::Impl {
     /// replayed gated.  It settles once per run, so it costs one instantiation.
     const void*     nodal_halt      = nullptr;
     int             nodal_halt_slot = 0;
-    // Everything else the capture baked in.  Any change invalidates it.
-    const void*     g_key_ndev = nullptr;
-    const void*     g_key_dblk = nullptr;
-    const void*     g_key_jnet = nullptr;
-    const void*     g_key_phis = nullptr;
-    const void*     g_key_flux = nullptr;
-    int             g_key_nxyz = 0, g_key_nsurf = 0, g_key_chif_empty = -1;
+    // Everything the capture baked in.  Any change invalidates the graph FOR
+    // THAT KEY -- which, since Rev.7.1 Task 10 part 4, is not the same thing as
+    // invalidating the graph.  See NodalGraphKey below.
 
     // --- Rev.7.1 Task 7: canonical CMFD-Nodal device state ------------------
     //
@@ -1925,26 +1936,108 @@ struct XsReconBackend::Impl {
     // all.  A graph captured under one and replayed under the other would move
     // the wrong bytes, or none, so they are part of the key rather than assumed
     // constant.
-    const void*   g_key_canon_jnet = nullptr;
-    const void*   g_key_canon_flux = nullptr;
-    const void*   g_key_canon_phis = nullptr;
-    std::uint32_t g_key_materialize = 0xFFFFFFFFu;
-    int           g_key_canon_owner_jnet = -1;
-    int           g_key_canon_owner_flux = -1;
-    /// Rev.7.1 Task 10 part 3: the halt gate is a kernel argument, so it is a key.
-    const void*   g_key_halt      = reinterpret_cast<const void*>(~static_cast<std::uintptr_t>(0));
-    int           g_key_halt_slot = -1;
+    /// Everything a captured nodal drive baked in, in one comparable object.
+    ///
+    /// It used to be sixteen `g_key_*` scalars beside ONE graph, and the pair
+    /// behaved as "the graph, plus what it was for": a key that no longer
+    /// matched meant the graph was destroyed.  For fifteen of these that is
+    /// right -- they move when the geometry or the bound buffers move, and the
+    /// old graph is then worthless.
+    ///
+    /// `materialize` is the sixteenth and it does not behave like the others.
+    /// It takes exactly two values -- 0 inside a device outer segment, where
+    /// nobody is looking and both downloads are elided, and `Jnet|Phis` outside
+    /// it, where a host reader is about to touch both -- and it ALTERNATES,
+    /// twice per segment, for the whole run.  With one slot that is a destroy
+    /// and a re-capture at every segment boundary, and a re-capture is not free:
+    /// it drains the backend's stream (a host rendezvous that no receipt counts,
+    /// least of all the segment's own `in_body_host_syncs`), captures, and
+    /// instantiates.  Measured on kngr_238 before this change: 3,282 captures
+    /// against 3,214 segments and 12,041 launches -- one hidden rendezvous per
+    /// segment, on the arm whose entire claim is that the host never looks.
+    ///
+    /// So the key stops being a validity test on one graph and becomes what it
+    /// always described: an INDEX.  Two alternating values now cost two entries
+    /// instead of two captures per segment, and the safety argument is
+    /// unchanged, because it was never "the key matched" -- it was "this graph
+    /// was captured under exactly these conditions", which is what a lookup
+    /// establishes and an equality test only approximated.
+    struct NodalGraphKey {
+        const void*   ndev = nullptr;
+        const void*   dblk = nullptr;
+        const void*   jnet = nullptr;
+        const void*   phis = nullptr;
+        const void*   flux = nullptr;
+        int           nxyz = 0;
+        int           nsurf = 0;
+        int           chif_empty = -1;
+        const void*   canon_jnet = nullptr;
+        const void*   canon_flux = nullptr;
+        const void*   canon_phis = nullptr;
+        std::uint32_t materialize = 0xFFFFFFFFu;
+        int           owner_jnet = -1;
+        int           owner_flux = -1;
+        /// Rev.7.1 Task 10 part 3: the halt gate is a kernel argument, so it is
+        /// a key.
+        const void*   halt = reinterpret_cast<const void*>(~static_cast<std::uintptr_t>(0));
+        int           halt_slot = -1;
 
+        /// Written out rather than defaulted: this TU compiles as C++17 (no
+        /// `= default` for operator==), and every field here is one a captured
+        /// graph would silently move the wrong bytes without.
+        bool operator==(const NodalGraphKey& o) const {
+            return ndev == o.ndev && dblk == o.dblk && jnet == o.jnet &&
+                   phis == o.phis && flux == o.flux && nxyz == o.nxyz &&
+                   nsurf == o.nsurf && chif_empty == o.chif_empty &&
+                   canon_jnet == o.canon_jnet && canon_flux == o.canon_flux &&
+                   canon_phis == o.canon_phis && materialize == o.materialize &&
+                   owner_jnet == o.owner_jnet && owner_flux == o.owner_flux &&
+                   halt == o.halt && halt_slot == o.halt_slot;
+        }
+    };
+
+    struct NodalGraph {
+        cudaGraphExec_t exec = nullptr;
+        cudaGraph_t     src  = nullptr;  ///< kept so the drive can be spliced
+        NodalGraphKey   key;
+    };
+
+    /// SMALL BY CONSTRUCTION, AND CAPPED ANYWAY.  In a run whose geometry does
+    /// not move, the only key field that changes is `materialize`, so the cache
+    /// holds two entries.  The cap exists for the case that assumption is wrong:
+    /// an unbounded cache of graphs nobody will ask for again is a leak with a
+    /// polite name, and the fallback -- throw the lot away and start over -- is
+    /// exactly the behaviour this replaced, so it cannot be worse than before.
+    static constexpr std::size_t kNodalGraphCacheMax = 8;
+    std::vector<NodalGraph> nodal_graphs;
+
+    /// Point `nodal_graph` / `nodal_graph_src` at the entry captured under
+    /// `want`, or at nothing.
+    bool selectNodalGraph(const NodalGraphKey& want) {
+        for (const NodalGraph& e : nodal_graphs)
+            if (e.key == want) {
+                nodal_graph     = e.exec;
+                nodal_graph_src = e.src;
+                return true;
+            }
+        nodal_graph     = nullptr;
+        nodal_graph_src = nullptr;
+        return false;
+    }
+
+    /// EVERY entry, not the selected one.
+    ///
+    /// All four callers are topology changes that invalidate the whole cache --
+    /// ndev/dev_block reallocated, the canonical buffers re-adopted -- so
+    /// "destroy the current graph" was only ever right because there was one.
     void dropNodalGraph() {
-        if (nodal_graph != nullptr) {
-            cudaGraphExecDestroy(nodal_graph);
-            nodal_graph = nullptr;
+        for (const NodalGraph& e : nodal_graphs) {
+            if (e.exec != nullptr) cudaGraphExecDestroy(e.exec);
+            if (e.src != nullptr) cudaGraphDestroy(e.src);
         }
-        if (nodal_graph_src != nullptr) {
-            cudaGraphDestroy(nodal_graph_src);
-            nodal_graph_src = nullptr;
-        }
-        g_key_ndev = nullptr;
+        nodal_graphs.clear();
+        nodal_graph     = nullptr;
+        nodal_graph_src = nullptr;
     }
 
     // --- batch arena (multi-instance nodal) -------------------------------
@@ -2007,11 +2100,10 @@ struct XsReconBackend::Impl {
         if (dev_sdid) cudaFree(dev_sdid);
         if (dev_sx) cudaFree(dev_sx);
         if (dev_sscale) cudaFree(dev_sscale);
-        if (nodal_graph) cudaGraphExecDestroy(nodal_graph);
-        // The exec's twin (Rev.7.1 Task 10): the capture keeps the source graph
-        // so the drive can be spliced into a captured outer body, and this is the
-        // other place that has to know it exists.
-        if (nodal_graph_src) cudaGraphDestroy(nodal_graph_src);
+        // THE CACHE, NOT THE SELECTION.  `nodal_graph` / `nodal_graph_src` are
+        // aliases into nodal_graphs since Rev.7.1 Task 10 part 4, so destroying
+        // them here would free one entry twice and leak the rest.
+        dropNodalGraph();
         if (nodal_h_reigv) cudaFreeHost(nodal_h_reigv);
         // W3 item 2: one event per backend, created lazily on the first
         // deferred drain.  Destroyed beside the other lazily-created nodal
@@ -3290,27 +3382,30 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     // there to prevent.  All four are constant in the steady state (ownership
     // settles on the device side, and nobody materialises mid-segment), so this
     // costs one instantiation at the mode change and none after.
-    const bool key_ok = d.nodal_graph != nullptr &&
-                        d.g_key_ndev == d.ndev_dbl &&
-                        d.g_key_dblk == d.dev_block &&
-                        d.g_key_jnet == host.jnet &&
-                        d.g_key_phis == host.phis &&
-                        d.g_key_flux == host.flux &&
-                        d.g_key_nxyz == host.nxyz &&
-                        d.g_key_nsurf == host.nsurf &&
-                        d.g_key_chif_empty == host.chif_empty &&
-                        d.g_key_canon_jnet == canon.jnet &&
-                        d.g_key_canon_flux == canon.flux &&
-                        d.g_key_canon_phis == canon.phis &&
-                        d.g_key_materialize == d.canonical_materialize &&
-                        d.g_key_canon_owner_jnet ==
-                            static_cast<int>(d.canonical.ownerOf(gpu::CanonicalRegion::Jnet)) &&
-                        d.g_key_canon_owner_flux ==
-                            static_cast<int>(d.canonical.ownerOf(gpu::CanonicalRegion::Flux)) &&
-                        d.g_key_halt == d.nodal_halt &&
-                        d.g_key_halt_slot == d.nodal_halt_slot;
-    if (d.nodal_graph != nullptr && !key_ok)
-        d.dropNodalGraph();
+    // Rev.7.1 Task 10 part 4: A LOOKUP, NOT AN EQUALITY TEST AND A DESTROY.
+    //
+    // The key is built here and asked for; a miss leaves the selection empty and
+    // the capture below fills it, and -- the whole point -- it leaves the OTHER
+    // entries alone.  The alternating materialize mask therefore costs two
+    // entries for the run instead of two captures per segment.
+    XsReconBackend::Impl::NodalGraphKey want;
+    want.ndev        = d.ndev_dbl;
+    want.dblk        = d.dev_block;
+    want.jnet        = host.jnet;
+    want.phis        = host.phis;
+    want.flux        = host.flux;
+    want.nxyz        = host.nxyz;
+    want.nsurf       = host.nsurf;
+    want.chif_empty  = host.chif_empty;
+    want.canon_jnet  = canon.jnet;
+    want.canon_flux  = canon.flux;
+    want.canon_phis  = canon.phis;
+    want.materialize = d.canonical_materialize;
+    want.owner_jnet  = static_cast<int>(d.canonical.ownerOf(gpu::CanonicalRegion::Jnet));
+    want.owner_flux  = static_cast<int>(d.canonical.ownerOf(gpu::CanonicalRegion::Flux));
+    want.halt        = d.nodal_halt;
+    want.halt_slot   = d.nodal_halt_slot;
+    d.selectNodalGraph(want);
 
     // Failing out of a half-enqueued drive must not leave a D2H in flight:
     // TryDriveGpu answers false and the CPU body then writes the very same
@@ -3373,6 +3468,12 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         // Capture once, then replay for the rest of the run.  The conditional
         // uploads above are already queued on this stream; drain them so the
         // capture starts on an idle stream (once per run, so free).
+        //
+        // Rev.7.1 Task 10 part 4: "ONCE PER RUN, SO FREE" IS THE CLAIM THIS
+        // COUNTER EXISTS TO CHECK.  The drain is a host rendezvous on the
+        // backend's stream and it is not in the segment's in_body_host_syncs,
+        // so if the graph key moves the cost is real and nothing reports it.
+        g_nodal_graph_captures.fetch_add(1, std::memory_order_relaxed);
         RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
         cudaGraph_t graph  = nullptr;
         bool        enq_ok = true;
@@ -3409,24 +3510,24 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
             g_nodal_graph_fallbacks.fetch_add(1, std::memory_order_relaxed);
             ok = enqueue_full();
         } else {
-            d.g_key_ndev       = d.ndev_dbl;
-            d.g_key_dblk       = d.dev_block;
-            d.g_key_jnet       = host.jnet;
-            d.g_key_phis       = host.phis;
-            d.g_key_flux       = host.flux;
-            d.g_key_nxyz       = host.nxyz;
-            d.g_key_nsurf      = host.nsurf;
-            d.g_key_chif_empty = host.chif_empty;
-            d.g_key_canon_jnet = canon.jnet;
-            d.g_key_canon_flux = canon.flux;
-            d.g_key_canon_phis = canon.phis;
-            d.g_key_materialize = d.canonical_materialize;
-            d.g_key_canon_owner_jnet =
-                static_cast<int>(d.canonical.ownerOf(gpu::CanonicalRegion::Jnet));
-            d.g_key_canon_owner_flux =
-                static_cast<int>(d.canonical.ownerOf(gpu::CanonicalRegion::Flux));
-            d.g_key_halt      = d.nodal_halt;
-            d.g_key_halt_slot = d.nodal_halt_slot;
+            // INTO THE CACHE UNDER THE KEY IT WAS ASKED FOR.  `want` was built
+            // before the capture and nothing between here and there can have
+            // moved it -- the capture reads those values, it does not set them
+            // -- so this is the graph for exactly these conditions.
+            //
+            // The cap is a leak guard, not a policy: if the key space turns out
+            // to be bigger than the two values `materialize` alternates between,
+            // throwing the cache away is precisely what this code did before,
+            // so the degenerate case cannot be worse than the status quo.
+            if (d.nodal_graphs.size() >= XsReconBackend::Impl::kNodalGraphCacheMax) {
+                cudaGraphExec_t keep_exec = d.nodal_graph;
+                cudaGraph_t     keep_src  = d.nodal_graph_src;
+                d.dropNodalGraph();
+                d.nodal_graph     = keep_exec;
+                d.nodal_graph_src = keep_src;
+            }
+            d.nodal_graphs.push_back(
+                XsReconBackend::Impl::NodalGraph{d.nodal_graph, d.nodal_graph_src, want});
             const cudaError_t lrc =
                 rasbery::graphLaunchOrSplice(d.nodal_graph, d.nodal_graph_src, d.stream);
             if (lrc != cudaSuccess) {
@@ -3644,11 +3745,18 @@ gpu::CanonicalSlotBuffers XsReconBackend::canonicalBuffers() const {
 
 void XsReconBackend::setMaterializeMask(std::uint32_t mask) {
     Impl& d = *_impl;
-    // Also a topology change: the mask decides which download NODES exist in the
-    // capture.  Without the drop, a graph captured while nobody was looking
-    // would replay with the downloads still missing and the consumer would read
-    // a stale Geometry array -- the exact failure this API exists to prevent.
-    if (d.canonical_materialize != mask) d.dropNodalGraph();
+    // THE MASK DECIDES WHICH DOWNLOAD NODES EXIST IN THE CAPTURE, so a graph
+    // captured while nobody was looking must never replay when a consumer is:
+    // that is a stale Geometry array, the exact failure this API exists to
+    // prevent.  It used to be enforced by DESTROYING the graph here.
+    //
+    // Rev.7.1 Task 10 part 4: it is enforced by the key instead, and the graph
+    // stays.  `materialize` is a field of NodalGraphKey, so a drive under this
+    // mask can only ever select a graph captured under this mask -- the same
+    // guarantee, from a lookup rather than from the absence of an alternative.
+    // What that buys is the re-capture this line used to force at every segment
+    // boundary: 3,282 of them on kngr_238, each one draining the backend's
+    // stream.  See NodalGraphKey.
     d.canonical_materialize = mask;
 }
 
@@ -3748,11 +3856,10 @@ bool XsReconBackend::waitOnSegmentEvent(void* event) {
 
 void XsReconBackend::setNodalHaltGate(const void* halt, int slot) {
     // NO EXPLICIT GRAPH DROP HERE, and that is not an omission: the pair is in
-    // the key solveNodal tests on its next call (`d.g_key_halt`), so the drop
-    // happens where every other key change's drop happens.  Doing it here as
-    // well would destroy a graph exec while the previous drive may still be in
-    // flight on d.stream -- the whole point of the deferred drain is that the
-    // host does not wait for it.
+    // NodalGraphKey, so the next drive simply selects a different entry (or
+    // captures one).  Dropping here would destroy a graph exec while the
+    // previous drive may still be in flight on d.stream -- the whole point of
+    // the deferred drain is that the host does not wait for it.
     _impl->nodal_halt      = halt;
     _impl->nodal_halt_slot = slot;
 }

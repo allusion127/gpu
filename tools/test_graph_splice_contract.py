@@ -156,8 +156,11 @@ for path, code, exec_name in ((BICG, BICG_CODE, "sweep_graph_exec"),
 DESTROY_PAIRS = (
     (BICG, BICG_CODE, "destroyGraphCaches",
      ("cudaGraphExecDestroy(e.exec)", "cudaGraphDestroy(e.src)")),
+    # Task 10 part 4 turned the nodal side's single slot into a keyed cache, so
+    # the pair to destroy is every ENTRY's -- and `nodal_graph` /
+    # `nodal_graph_src` became non-owning aliases into it.
     (NODAL, NODAL_CODE, "dropNodalGraph",
-     ("cudaGraphExecDestroy(nodal_graph)", "cudaGraphDestroy(nodal_graph_src)")),
+     ("cudaGraphExecDestroy(e.exec)", "cudaGraphDestroy(e.src)", "nodal_graphs.clear()")),
 )
 for path, code, func, needles in DESTROY_PAIRS:
     # The DEFINITION, not the first mention: both of these are called from above
@@ -173,11 +176,40 @@ for path, code, func, needles in DESTROY_PAIRS:
                 f"{path.name}: {func} does not {needle} -- the exec and its source graph "
                 "must come down together")
 
-# The nodal release path is the second place that has to know the twin exists.
-if NODAL_CODE.count("cudaGraphDestroy(nodal_graph_src)") < 2:
+# THE SELECTION IS AN ALIAS, SO NOBODY MAY DESTROY IT.
+#
+# Since the nodal side became a keyed cache, `nodal_graph` and `nodal_graph_src`
+# point INTO nodal_graphs.  A destroy through either one frees an entry the
+# vector still holds -- a double free at release, and a live cache entry pointing
+# at a dead exec until then.  dropNodalGraph is the only owner; the backend's
+# release path has to call it rather than reach past it.
+for spelling in ("cudaGraphExecDestroy(nodal_graph)", "cudaGraphDestroy(nodal_graph_src)"):
+    if spelling.replace(" ", "") in NODAL_CODE.replace(" ", ""):
+        problems.append(
+            f"CudaXsReconBackend.cu: {spelling} -- that handle is a non-owning alias into "
+            "nodal_graphs; destroy through dropNodalGraph()")
+if "dropNodalGraph();" not in NODAL_CODE:
+    problems.append("CudaXsReconBackend.cu: nothing calls dropNodalGraph()")
+
+# The cache is capped: an unbounded one is a leak with a polite name.
+if "kNodalGraphCacheMax" not in NODAL_CODE:
+    problems.append("CudaXsReconBackend.cu: the nodal graph cache has no cap")
+
+# materialize must be a KEY field, not a reason to destroy.  This is the whole
+# point of part 4's second half: the mask alternates twice per segment, and
+# destroying on it cost a hidden host rendezvous per segment.
+mask_fn = re.search(r"void\s+XsReconBackend::setMaterializeMask[^{]*\{", NODAL_CODE)
+mask_body = NODAL_CODE[mask_fn.end():mask_fn.end() + 400] if mask_fn else ""
+if not mask_fn:
+    problems.append("CudaXsReconBackend.cu: no setMaterializeMask definition")
+elif "dropNodalGraph" in mask_body:
     problems.append(
-        "CudaXsReconBackend.cu: nodal_graph_src is destroyed in fewer than two places -- "
-        "dropNodalGraph and the backend release both own it")
+        "CudaXsReconBackend.cu: setMaterializeMask drops the nodal graph -- the mask "
+        "alternates twice per device outer segment, so that is a re-capture (and a host "
+        "drain nothing counts) per segment; it belongs in NodalGraphKey instead")
+if "materialize" not in NODAL_CODE[NODAL_CODE.find("struct NodalGraphKey"):
+                                   NODAL_CODE.find("struct NodalGraphKey") + 1600]:
+    problems.append("CudaXsReconBackend.cu: NodalGraphKey does not carry the materialize mask")
 
 # ---------------------------------------------------------------------------
 # 4. a run that never captures pays nothing, and the flag is raise-only

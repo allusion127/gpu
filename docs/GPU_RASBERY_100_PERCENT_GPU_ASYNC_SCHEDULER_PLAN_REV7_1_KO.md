@@ -1614,9 +1614,23 @@ device_launch_in_body    미측정  로컬에서 refusal이 아니라 HANG (opt-
 
 `src/GpuGraphSplice.h`의 `graphLaunchOrSplice`가 두 자리를 모두 덮는다(capture 중이면 `cudaGraphAddChildGraphNode`, 아니면 원래의 launch). 입장료는 두 캐시가 소스 `cudaGraph_t`를 exec와 **쌍으로** 보존하는 것이다. capture를 한 번도 하지 않는 런은 프로세스 전역 플래그 뒤에서 아무 비용도 내지 않는다.
 
-**WHILE은 아직 서지 않았고**, 코드가 드러낸 전제 셋이 남아 있다(같은 문서 §3): (a) sweep 스테이징 블록 `Slot::sweep_in`/`sweep_out`이 **pageable**이라 memcpy node가 되지 못한다, (b) `g_key_materialize`가 세그먼트마다 nodal graph를 drop시켜 child graph 객체가 세그먼트를 넘어 살지 못한다(오늘도 세그먼트당 재인스턴스화 2회를 내고 있다), (c) sweep 캐시 miss가 nested capture다 — 세그먼트의 **outer 0을 eager로 돌리고 body는 outer 1을 캡처**하면 (c)는 warm-up으로 닫히고, 그것이 `cmfd_sweep_patch`가 첫 outer를 patch하지 않는다는 part 3의 사실과도 맞물린다.
+**WHILE은 아직 서지 않았고**, 코드가 드러낸 전제 셋이 남아 있었다(같은 문서 §3): (a) sweep 스테이징 블록 `Slot::sweep_in`/`sweep_out`이 **pageable**이라 memcpy node가 되지 못한다, (b) `g_key_materialize`가 세그먼트마다 nodal graph를 drop시켜 child graph 객체가 세그먼트를 넘어 살지 못한다, (c) sweep 캐시 miss가 nested capture다 — 세그먼트의 **outer 0을 eager로 돌리고 body는 outer 1을 캡처**하면 (c)는 warm-up으로 닫히고, 그것이 `cmfd_sweep_patch`가 첫 outer를 patch하지 않는다는 part 3의 사실과도 맞물린다.
 
 조건은 device state에 이미 있다 — `seg.exit == 0 && seg.outer_in_segment < seg.budget` — 이므로 **budget은 capture key에 들어가지 않는다.**
+
+- [x] **Step 11 (신설, 2026-08-31): (b)를 닫았다 — nodal graph를 키로 캐시한다.** 상세는 같은 문서 §6.
+
+세어 보니 (b)는 성능 각주가 아니었다. nodal 수신증에 `graph_captures`가 없었고, 재캡처는 `cudaStreamBeginCapture`가 idle 스트림을 요구하므로 앞에 `cudaStreamSynchronize(d.stream)`를 달고 있으며 — **그것은 세그먼트의 `in_body_host_syncs`에 들어가지 않는다.** host-free 세그먼트가 `in_body_host_syncs: 0`을 보고하면서 nodal 백엔드 안에서 세그먼트당 한 번 호스트와 만나고 있었다.
+
+```text
+kngr3   b8   graph_captures 379   (segment_launches 375)   -> 4
+kngr_238 b8  graph_captures 3282  (segment_launches 3214)  -> 4
+kngr_238 OFF graph_captures                                -> 2   (세그먼트가 없으면 왕복도 없다)
+```
+
+고침은 `g_key_*` 16개를 `NodalGraphKey` 하나로 묶고 단일 슬롯을 `std::vector<NodalGraph>`(상한 8)로 만든 것이다. `setMaterializeMask`는 더 이상 drop하지 않고, `solveNodal`은 동등성 검사 대신 **조회**를 한다. 안전 논증은 그대로다 — 근거는 "키가 일치했다"가 아니라 "이 그래프는 정확히 이 조건에서 캡처되었다"였고, 조회가 그것을 확립한다. `dropNodalGraph()`는 이제 모든 항목을 파괴하고, `nodal_graph`/`nodal_graph_src`는 캐시로의 비소유 별칭이라 그것을 통한 파괴는 계약이 금지한다.
+
+게이트: kngr_238 열 비교 + kngr3/CY01/CY02 열여덟 + batch 셋 = **전부 0**, digest 12개 run 전부 `78e58de0db8b4484`, 세그먼트 수신증 여섯 개 불변, ctest 12/12, `tools/test_graph_splice_contract.py`에 규칙 넷 신설(각각 음성 대조 통과).
 
 ## Task 11: GPU Rod Cusping and Fractional-Rod Nodal Path
 

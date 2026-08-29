@@ -1,6 +1,7 @@
 # Task 10 part 4: conditional WHILE — 그 구멍은 하나가 아니었다
 
 브랜치 `codex/exact-throughput-campaign`, 기준 `fe35621`
+커밋 `72e55a7`(splice, §1-§5) + `<이 문서>`(nodal graph 캐시, §6)
 측정 하드웨어: 로컬 WSL, GTX 1080 Ti(sm_61) 1장, nvcc 12.6 / gcc 13.3, driver 560.94
 새 파일: `tools/probe_while_body_capture.cu`, `src/GpuGraphSplice.h`,
 `tools/test_graph_splice_contract.py`
@@ -29,8 +30,10 @@ nodal drive(`CudaXsReconBackend.cu:3365`)와 **CMFD sweep**(`CudaBICGBackend.cu:
 :3798`)이 모두 한 번 캡처해 두고 남은 런 내내 replay하는 graph를 launch한다.
 sweep 쪽은 §5의 조사에 들어 있지 않았다.
 
-이 커밋이 한 일은 **두 구멍을 함께 메운 것**이고, WHILE 자체는 아직 서지 않았다.
-서지 못하게 하는 것이 무엇인지도 이제 추측이 아니라 목록이다(§3).
+첫 커밋이 한 일은 **두 구멍을 함께 메운 것**이고(§2), 두 번째가 그 다음에 온 전제 하나를
+닫았다(§6 — 세그먼트마다 죽던 nodal graph, 그리고 그것이 데리고 있던, 아무도 세지 않던
+host rendezvous). WHILE 자체는 아직 서지 않았고, 서지 못하게 하는 것이 무엇인지는 이제
+추측이 아니라 목록이다(§3).
 
 ---
 
@@ -85,7 +88,7 @@ RC=124면 sm_120에서도 같은 hang이라는 것이 답이다.
 
 ---
 
-## 2. 이 커밋이 한 것 — `graphLaunchOrSplice`
+## 2. 첫 커밋이 한 것 — `graphLaunchOrSplice`
 
 `src/GpuGraphSplice.h` 하나와, 그것을 쓰는 두 자리다.
 
@@ -171,7 +174,7 @@ eager로 스테이징한 블록을 outer 1..N-1이 그대로 쓰게 되고, 세�
 값(eigv/reigv/reigvs/errl2)은 이미 `cmfd_sweep_patch`가 device probe에서 덮어쓴다.
 part 3이 patch 커널을 만든 이유가 여기서 두 번째로 값을 한다.
 
-### (b) nodal graph가 세그먼트마다 죽는다
+### (b) nodal graph가 세그먼트마다 죽는다 — **§6에서 고쳤다**
 
 `g_key_materialize`(`CudaXsReconBackend.cu:3301`)는 그래프 키다. 그리고
 `setCanonicalNodalSegmentMode(true)`가 mask를 0으로, 세그먼트 exit이 `Jnet|Phis`로 되돌린다
@@ -191,10 +194,12 @@ WHILE에게 이것은 성능이 아니라 **수명** 문제다: child graph node
 2. **`cudaGraphExecUpdate`로 갱신한다.** topology가 같으면 싸다. conditional node를 가진
    exec에 대해 합법인지는 **아직 측정되지 않았다** — 다음 스파이크의 첫 줄이다.
 3. **materialize mask를 drop 사유에서 빼고 캐시 키로 만든다.** mask는 두 값(0과 `Jnet|Phis`)
-   밖에 갖지 않으므로 항목 두 개짜리 캐시다. 세그먼트당 재인스턴스화 2회가 **오늘 당장**
-   사라지므로, WHILE과 무관하게 값이 있고 따로 게이트할 수 있다.
+   밖에 갖지 않으므로 항목 두 개짜리 캐시다. 세그먼트당 재캡처가 **오늘 당장** 사라지므로,
+   WHILE과 무관하게 값이 있고 따로 게이트할 수 있다.
 
-3번이 옳아 보이고, 1번은 게이트가 막는다.
+3번이 옳았고 1번은 게이트가 막는다. **§6이 3번이다** — 그리고 세어 보니 비용은 여기서
+적은 것보다 컸다: 재캡처마다 `cudaStreamSynchronize`가 딸려 있었고, 그것은 어떤
+수신증에도 들어 있지 않았다.
 
 ### (c) 캐시 미스가 nested capture다
 
@@ -256,7 +261,7 @@ overrun은 존재하지 않는다. `hostfree_enqueued − hostfree_outers`가 �
 
 ---
 
-## 5. 게이트 (이 커밋)
+## 5. 게이트 (첫 커밋)
 
 이 커밋의 런타임 경로는 `g_graph_capture_possible`가 내려가 있는 동안
 `cudaGraphLaunch(exec, stream)` 한 줄로 접히므로 동일성은 **구성상** 참이다. 표는 그것을
@@ -316,7 +321,7 @@ kngr3 hostfree_segments 370, hostfree_refusals{"sweep_wont_enqueue":5}
 batch segment_launches 722 == device_outers 722 == host_outer_observations 722
 ```
 
-### 5.4 나머지
+### 5.4 계약
 
 | 항목 | 결과 |
 |---|---|
@@ -355,15 +360,98 @@ no-regression의 근거는 따라서 wall이 아니라 **구조**다: `g_graph_c
 
 ---
 
-## 6. 다음
+## 6. 그리고 (b)를 먼저 고쳤다 — 세그먼트마다 죽던 nodal graph
+
+§3(b)는 "captured nodal graph가 세그먼트마다 두 번 파괴되고 다시 캡처된다"를 **추론**으로
+적었다. 세어 보니 추론이 아니었다. 두 번째 커밋(`72e55a7` 다음)이 그것을 센 뒤 고쳤다.
+
+### 6.1 세는 것이 먼저였다 — `graph_captures`
+
+nodal 수신증에는 `graph_launches`는 있고 **capture 횟수는 없었다**. 그런데 재캡처는
+공짜가 아니다: `cudaStreamBeginCapture`가 idle 스트림을 요구하므로 그 앞에
+`cudaStreamSynchronize(d.stream)`가 있고, 그것은 **host rendezvous**다. 그리고 그것은
+세그먼트의 `in_body_host_syncs`에 **들어가지 않는다** — 그 카운터는 runner 자신의 drain만
+센다.
+
+즉 host-free 세그먼트가 `in_body_host_syncs: 0`을 보고하면서 nodal 백엔드 안에서
+세그먼트당 한 번 호스트와 만나고 있었다. 재어 보면:
+
+| 덱 | drives | `graph_captures` (이전) | segment_launches |
+|---|---|---|---|
+| kngr3 b8 | 662 | **379** | 375 |
+| kngr_238 b8 | 12,041 | **3,282** | 3,214 |
+
+세그먼트당 정확히 하나다.
+
+### 6.2 원인은 키가 아니라 **키가 하나뿐이었다**는 것
+
+`g_key_materialize`는 그래프 키로서 **옳다** — mask가 어떤 download NODE가 존재하는지를
+정하므로, 아무도 보지 않을 때 캡처한 그래프를 누군가 볼 때 replay하면 stale한 Geometry
+배열이다. 문제는 그 키가 **하나의 그래프에 대한 유효성 검사**였다는 점이다. mask는 두 값
+사이를 세그먼트마다 왕복하므로, 유효성 검사는 매번 파괴를 뜻했다.
+
+고침은 키를 **인덱스**로 만드는 것이다. `NodalGraphKey`(16개 필드, C++17이라
+`operator==`는 손으로 쓴다)와 `std::vector<NodalGraph> nodal_graphs`가 생기고,
+`solveNodal`은 동등성 검사 대신 **조회**를 한다. `setMaterializeMask`는 더 이상
+`dropNodalGraph`를 부르지 않는다.
+
+**안전 논증은 바뀌지 않았다.** 근거는 한 번도 "키가 일치했다"가 아니었다 — "이 그래프는
+정확히 이 조건에서 캡처되었다"였고, 그것은 조회가 **확립**하는 것이고 동등성 검사는
+근사할 뿐이었다. 키 필드 16개는 글자 그대로 옮겼다.
+
+`dropNodalGraph()`는 이제 **모든** 항목을 파괴한다. 네 호출자 전부 topology 변경이라
+캐시 전체가 무효이므로, "현재 그래프를 파괴한다"는 하나뿐이었기 때문에만 옳았다. 그리고
+`nodal_graph`/`nodal_graph_src`는 캐시로의 **비소유 별칭**이 되었으므로 그것을 통해
+파괴하면 double free다 — 계약이 그 철자를 금지한다(§6.4).
+
+캐시에는 상한 8이 있다. 키 공간이 두 값보다 크다면 캐시를 통째로 버리는데, 그것이 바로
+이 코드가 **이전에 하던 일**이므로 퇴화 경우가 현상보다 나빠질 수 없다.
+
+### 6.3 결과
+
+| 덱 / arm | `graph_captures` 이전 → 이후 | `graph_launches` |
+|---|---|---|
+| kngr3 b8 | 379 → **4** | 662 |
+| kngr_238 b8 | 3,282 → **4** | 12,041 |
+| kngr_238 b8 FULL | — → **4** | 25,659 |
+| kngr_238 b1 / b16 | — → **3 / 4** | 12,020 / 12,065 |
+| kngr_238 OFF | — → **2** | 12,017 |
+
+OFF가 2인 것이 이 변경의 형태를 확인해 준다: 세그먼트가 없으면 mask가 왕복하지 않고,
+따라서 고칠 것도 없었다.
+
+**wall은 이 세션에서 여전히 말할 수 없다** — §5.5와 같은 이유로, 같은 상자에서 `b_on8`
+96.1 s와 `n_on8a` 60.3 s가 나오지만 `b_off` 74.0 / `n_off` 77.7도 같이 나온다. 없앤 것은
+세그먼트당 host rendezvous 하나와 instantiate 하나이고, **그것이 얼마인지는 238이 말해야
+한다.**
+
+### 6.4 게이트 (두 번째 커밋)
+
+§5.1의 열 비교, §5.3의 세 덱 열여덟 비교, batch 세 비교 — **전부 0**.
+`[TRAJECTORY]` digest는 12개 run 전부 `78e58de0db8b4484` / outers 12017.
+세그먼트 수신증 여섯 개(§5.2)는 **숫자 하나 다르지 않다**. ctest 12/12.
+
+계약에 규칙 넷이 붙었고 각각 음성 대조를 통과한다:
+
+* `nodal_graph` / `nodal_graph_src`를 통한 파괴 금지(별칭이므로 double free),
+* `dropNodalGraph`는 `e.exec`/`e.src`를 돌며 `nodal_graphs.clear()`,
+* `setMaterializeMask`는 그래프를 drop하지 않는다 — 되돌리면 FAIL,
+* `NodalGraphKey`는 materialize mask를 담는다, 캐시에는 상한이 있다.
+
+---
+
+## 7. 다음
 
 순서가 정해져 있고, 각 단계가 자기 게이트를 가진다.
 
-1. **(a)** sweep 스테이징 블록을 pinned로. hot path의 pageable async copy 제거.
+1. ~~**(b3)** materialize mask를 drop 사유에서 캐시 키로.~~ **완료** — §6.
+2. **(a)** sweep 스테이징 블록(`Slot::sweep_in`/`sweep_out`)을 pinned로. hot path의
+   pageable async copy 제거이자 WHILE의 전제.
    게이트: kngr_238 OFF/ON b8 S2+X bit-identical, ctest.
-2. **(b3)** materialize mask를 drop 사유에서 캐시 키로. 세그먼트당 nodal 재인스턴스화
-   2회 제거. 게이트: 같음 + `nodal graph_reinstantiations` 감소 수신증.
 3. **`cudaGraphExecUpdate` + conditional node** 합법성 스파이크 (한 줄, 위 probe에 추가).
+   §6이 (b)를 닫았으므로 child graph 객체는 이제 세그먼트를 넘어 살고, 이 질문은
+   "body를 세그먼트마다 다시 만들어야 하는가"에서 "만들지 않아도 되는가"로 약해졌다 —
+   그래도 물어야 한다.
 4. **WHILE** — §4. 게이트: part 3의 표 전부 + `hostfree_enqueued − hostfree_outers → 0`,
    `graph_instantiations` warm-up 후 0, batch 거부 수신증.
 
