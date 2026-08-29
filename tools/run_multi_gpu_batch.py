@@ -972,6 +972,17 @@ class EvaluatorSession:
     def alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
+    @property
+    def pid(self) -> int | None:
+        """The live child's pid, for a caller that has to sample its RSS.
+
+        WP11's soak reads /proc/<pid>/status between generations, and a leak is
+        a slope over a session that RESTARTS: each restart is a new pid, so the
+        caller has to re-read this rather than cache it, which is why it is a
+        property and not a constructor argument.
+        """
+        return self._proc.pid if self._proc is not None else None
+
     def start(self) -> bool:
         """Stand a child up and read it to its [READY] line.  False if it died."""
         self._note("start", {"command": list(self._command), "attempt": self.starts + 1})
@@ -1037,17 +1048,44 @@ class EvaluatorSession:
         return self.epilogue
 
     # -- one wave ----------------------------------------------------------
-    def wave(self, *, wave_id: int, manifest: str,
-             result_mode: str | None = None) -> WaveOutcome:
+    def wave(self, *, wave_id: int, manifest: str | None = None,
+             result_mode: str | None = None,
+             cases: Sequence[dict] | None = None,
+             fidelity: dict | None = None) -> WaveOutcome:
+        """One wave: a manifest, a list of inline case requests, or both.
+
+        WHY INLINE CASES EXIST HERE.  A manifest line is a deck, an output and a
+        result mode -- it cannot carry a warm-start parent, a per-case fidelity
+        or a promotion link, and after WP10.3 those are exactly what a mixed
+        wave is made of.  The dispatcher's own chunked path still sends
+        manifests (it is auditing throughput, not fidelity) and WP11's soak
+        sends inline cases, off ONE session class, so the two are audited by the
+        same code and their numbers stay comparable.
+        """
         out = WaveOutcome()
         if not self.alive:
             out.alive = False
             out.returncode = self.returncode
             return out
-        request: dict[str, object] = {"op": "wave", "wave_id": wave_id,
-                                      "jobs_manifest": manifest}
+        # The evaluator collects `op:case` lines and runs them when the wave
+        # line arrives, so the cases go FIRST and a failure to write one aborts
+        # before the wave is asked for -- a half-sent generation must not run.
+        for case in cases or ():
+            payload = dict(case)
+            payload.setdefault("op", "case")
+            if not self._send(json.dumps(payload, separators=(",", ":"))):
+                out.text, _ = self._pump(lambda _line: False)
+                self._reap()
+                out.alive = False
+                out.returncode = self.returncode
+                return out
+        request: dict[str, object] = {"op": "wave", "wave_id": wave_id}
+        if manifest:
+            request["jobs_manifest"] = manifest
         if result_mode:
             request["result_mode"] = result_mode
+        if fidelity:
+            request.update(fidelity)
         if not self._send(json.dumps(request, separators=(",", ":"))):
             out.text, _ = self._pump(lambda _line: False)
             self._reap()
