@@ -36,6 +36,13 @@ private:
     int _primary_restart_cycle = 1;
     double _restart_efpd = 0.0;
 
+    // WP10.1: the DECK half of the canonical case key, folded where the parsed
+    // deck is live and carried as two short strings.  Keeping the whole parsed
+    // deck alive instead would cost a copy per batch slot for a value that is
+    // only ever hashed.
+    std::string _deck_key_digest;   ///< sha256 of casekey::deckPayload(config)
+    std::string _deck_key_core_op;  ///< which symmetry op canonicalised the LP
+
     struct ShuffleSpec {
         int target_row, target_col;
         int source_row, source_col;
@@ -115,6 +122,9 @@ public:
     }
 
     const std::string& xs_path() const { return _xs_path; }
+    /// WP10.1.  Empty until ReadInput() has run.
+    const std::string& deck_key_digest() const { return _deck_key_digest; }
+    const std::string& deck_key_core_op() const { return _deck_key_core_op; }
     const std::string& restart_path() const { return _restart_path; }
     bool has_restart() const { return !_restart_path.empty(); }
     double restart_efpd() const { return _restart_efpd; }

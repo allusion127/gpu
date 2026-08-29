@@ -1,6 +1,7 @@
 #pragma once
 #include "BICGCMFD.h"
 #include "BatchLightResult.h"
+#include "CaseKey.h"
 #include "CudaOuterGraph.h"
 #include "EvaluatorContext.h"
 #include "GpuFullContract.h"
@@ -968,6 +969,10 @@ public:
         long long          th_updates  = 0;
         int                slot        = -1;
         bool               complete    = false;
+        /// WP10.1: the canonical duplicate key of the case that was just run.
+        /// Carried in the receipt as well as printed, so `--evaluator` can hand
+        /// it back to the controller without anyone grepping stdout.
+        std::string        case_key;
     };
 
 private:
@@ -4182,6 +4187,33 @@ private:
     /// IO::OpenResult already uses for `<stem>_pinpower.csv`.
     /// RASBERY_RESTART_AT_INPUT=1 restores the legacy location for anything
     /// that reads restarts back by their old path.
+    /// WP10.1: everything the canonical case key needs beyond the deck.
+    ///
+    /// THE ENVIRONMENT LIST IS trajectory::kArmEnv, AND THAT IS THE POINT.  It
+    /// is already the campaign's answer to "which knobs can move an iteration",
+    /// maintained by the trajectory receipt and pinned by its contracts.  A
+    /// second list here would be a second answer, and the failure it would
+    /// cause is the expensive one: two runs with different physics sharing one
+    /// cache entry.  Values are RAW and unparsed, for the same reason the
+    /// trajectory receipt reports them raw.
+    static casekey::Provenance caseKeyProvenance(const IO& input_output) {
+        casekey::Provenance p;
+        p.deck_digest = input_output.deck_key_digest();
+        const PhysicsFidelity fidelity = effectivePhysicsFidelity();
+        p.fidelity = physicsFidelityName(fidelity);
+        p.policy   = physicsPolicyName(fidelity);
+        // The library's CONTENT, not its path: two decks naming the same file
+        // through different mount points are the same case, and two files at
+        // one path across a library update are not.  Cached per process.
+        if (!input_output.xs_path().empty())
+            p.xslib_digest = BatchLightResult::Sha256FileCached(input_output.xs_path());
+        for (const char* name : trajectory::kArmEnv) {
+            const char* value = std::getenv(name);
+            p.env.emplace_back(name, value != nullptr ? std::string(value) : std::string());
+        }
+        return p;
+    }
+
     static std::string RestartPath(const IO& input_output, int step_number) {
         const char* at_input = std::getenv("RASBERY_RESTART_AT_INPUT");
         const bool  legacy =
@@ -4353,6 +4385,36 @@ public:
 
         const double init_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - driver_start).count();
         std::cout << std::format("  [TIMING] Init+IO={:.3f} s\n", init_seconds);
+
+        // ===================================================================
+        // WP10.1 -- the canonical duplicate key, and the receipt that names it.
+        // ===================================================================
+        //
+        // HERE, because this is the first point where all four halves exist:
+        // the deck digest (IO folded it at parse time, with the loading pattern
+        // canonicalised under the core's symmetry), the effective fidelity, the
+        // arm environment, and the cross-section library's CONTENT digest.
+        //
+        // UNCONDITIONAL, like the trajectory receipt and for the same reason: a
+        // key that only some runs computed is a key no cache could trust, and
+        // "was this case the one that produced that answer" is a question a run
+        // has to be able to answer without having been asked in advance.
+        //
+        // COST.  One SHA-256 of a ~1 kB payload, plus the XS library digest --
+        // which is cached per process (Sha256FileCached), so a 64-case batch
+        // pays the 34 MB read once and every later case reads the cache.  The
+        // deck digest itself was already folded during the parse.
+        const std::string case_key = casekey::keyOf(caseKeyProvenance(input_output));
+        _case_receipt.case_key     = case_key;
+        std::cout << std::format(
+            "  [RASBERY][CASE] {{\"schema_version\":1,\"case_key\":\"{}\",\"key_schema\":\"{}\","
+            "\"core_op\":\"{}\",\"deck_digest\":\"{}\",\"fidelity\":\"{}\",\"policy\":\"{}\","
+            "\"result_mode\":\"{}\"}}\n",
+            case_key, casekey::kSchema, input_output.deck_key_core_op(),
+            input_output.deck_key_digest(),
+            physicsFidelityName(effectivePhysicsFidelity()),
+            physicsPolicyName(effectivePhysicsFidelity()),
+            ResultModeName(_result_mode));
 
         // Receipt keys (plan Rev.4 Sec 8.1).  result_stem() is empty until
         // OpenResult(), and light-result runs never call it, so fall back to the
@@ -4581,7 +4643,7 @@ public:
                 // mode pays, this is what the chosen output mode costs on top.
                 outer_timing::Scope write_scope(sptelem::PH_RESULT_WRITE);
                 if (light_result) {
-                    BatchLightResult::Write(_input, input_output.xs_path(),
+                    BatchLightResult::Write(_input, input_output.xs_path(), case_key,
                                             schedule.step, schedule.substep,
                                             schedule.efpd, schedule.bu_avg,
                                             schedule.eigv, schedule.ppm,

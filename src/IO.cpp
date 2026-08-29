@@ -1,5 +1,6 @@
 #include "IO.h"
 
+#include "CaseKey.h"
 #include "Model.h"
 
 #include <algorithm>
@@ -586,6 +587,16 @@ void IO::ReadInput(const std::string& filepath) {
         throw std::runtime_error("IO::ReadInput: cannot open input file: " + filepath);
     nlohmann::ordered_json config;
     input_stream >> config;
+
+    // WP10.1: fold the DECK half of the canonical case key HERE, and nowhere
+    // else, because this is the only place the parsed deck exists.  Two
+    // loading patterns related by a symmetry operation of the core fold to one
+    // digest; everything else in the deck goes in verbatim.  Cost is one walk
+    // of a deck-sized JSON tree, once per case, next to the parse that produced
+    // it -- and it is unconditional, because a key that only some runs computed
+    // is a key no cache could trust.
+    _deck_key_digest =
+        Sha256::hexOf(casekey::deckPayload(config, &_deck_key_core_op));
 
     _xs_path.clear();
     _restart_path.clear();

@@ -850,6 +850,17 @@ private:
         std::ostringstream line;
         line << "[RASBERY][EVALUATOR][CASE] {\"wave_id\":" << wave_id << ",\"case\":" << index
              << ",\"key\":" << (key.empty() ? std::string("null") : detail::quoted(key))
+             // WP10.1.  `key` above is the CLIENT's opaque label, echoed back so
+             // a controller can match a reply to the request it sent.
+             // `case_key` is the SOLVER's canonical duplicate key of what was
+             // actually computed -- the loading pattern folded onto its symmetry
+             // orbit, the fidelity, the arm environment and the library digest.
+             // They are different questions and a cache must not use the first
+             // for the second: two labels can name one case, and one label can
+             // name two after a deck edit.
+             << ",\"case_key\":"
+             << (receipt.case_key.empty() ? std::string("null")
+                                          : detail::quoted(receipt.case_key))
              << ",\"deck\":" << detail::quoted(deck)
              << ",\"output\":" << detail::quoted(output)
              << ",\"result_mode\":\"" << ResultModeName(mode)
