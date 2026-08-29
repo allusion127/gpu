@@ -4,7 +4,10 @@
 대상: GA evaluator 계획 §5.5 / §6.2 Task 7
 변경 파일: `tools/run_multi_gpu_batch.py`, `tools/run_single_gpu_batch.py`,
 `tools/test_multi_gpu_dispatch.py`, `tools/test_harness_env_parity.py`,
+`tools/test_fleet_tuner.py`(WP4 튜너 계약),
 `test/reference/batch_reference_env_238.json` — **`src/`는 한 줄도 건드리지 않는다.**
+갱신 2026-09-01: §4.8에 238 실측 행렬 8 arm, §4.9에 WP4 튜너(`--procs-per-gpu auto`).
+§2.5의 VRAM 모델은 §4.8-5가 반증했고 두 항으로 고쳤다.
 로컬 실측: WSL, GTX 1080 Ti(sm_61) 1장, nvcc 12.6, 24 코어, `~/bfdecks` d0..d3 + e0..e3
 238 인용치: nsys osrt(`pthread_cond_wait` 72.6 %, `pthread_mutex_lock` 17.6 %),
 `mean_width` **14.5/64 = 22.7 %**, SM 62 %, GPU 메모리 처리량 7 %,
@@ -181,6 +184,11 @@ solver_threads = W                              → RASBERY_OMP_THREADS
 
 ### 2.5 메모리 가드 (`[MULTI_GPU][VRAM]`)
 
+> **§4.8-5가 이 절의 모델을 반증했다.** 슬롯 항은 예고대로 K에 대해 평평했지만,
+> **프로세스마다 2.56 GB의 고정비**(CUDA 컨텍스트·모듈·라이브러리 핸들·할당자 풀)가
+> 있고 아무도 청구하지 않고 있었다. 가드는 이제 두 항이다:
+> `K×W×per_slot + (K−1)×extra_process_gb`. 아래 문단은 첫 항의 설명으로 읽을 것.
+
 아레나는 프로세스 시작 시 **선언 폭으로 한 번** 사이징되고 런 내내 잡고 있다. 따라서
 K개 프로세스 × 폭 W는 한 디바이스에서 K×W 슬롯이다.
 
@@ -338,6 +346,8 @@ A·B와 A′·B′ 사이의 절대 wall 차이는 전부 호스트 경합이다
    크다** — 같은 A arm이 48.24 s와 76.15 s로 나왔다. 그래서 c/h 배수는 1.25×–1.69×로
    갈렸고 `width_fill` 배수는 1.35×–1.39×로 붙었다.
 4. 1080 Ti는 MPS 없이 time-sliced다. 238에서 MPS를 켜면 **이 배수의 상한이 달라진다.**
+   → **§4.8이 그것을 실측했다: 1.92배 달라진다**(8×M8이 457 → 878 c/h). 그리고 방향도
+   달라진다 — MPS 없는 K=8은 이득이 아니라 **손실**이다.
 
 **보고해야 할 것은 배수가 아니라 `width_fill`과 `cases_per_hour`의 쌍이다.**
 
@@ -644,6 +654,169 @@ dispatcher 대조  --gpus 0 --procs-per-gpu 1 --batch-width 64       → 115.6 c
 
 ---
 
+### 4.8 238 실측 행렬 — 결과 (2026-09-01)
+
+RTX PRO 6000 96 GB, 24코어 호스트, 64잡, `DEFAULT_ENV` 생산 arm, `--result light`.
+`--claim auto`이므로 워커마다 정확히 폭 하나, 리필도 스틸도 없다(§4.3).
+
+| arm | MPS | `cases_per_hour` | control 대비 | `width_fill` | VRAM | rc |
+|---|---|---:|---:|---:|---:|---:|
+| 원시 `--batch-mode 64` (하네스 없음) | — | **582** | 1.007× | — | 12.3 GB | 0 |
+| **1×M64 (dispatcher control)** | 없음 | **578** | 1.000× | 0.28 | 12.3 GB | 0 |
+| 2×M32 | 없음 | 648 | 1.121× | | 14.9 GB | 0 |
+| 4×M16 | 없음 | 579 | 1.002× | | 20.0 GB | 0 |
+| 8×M8 | 없음 | 457 | **0.791×** | | 30.2 GB | 0 |
+| 2×M32 | 있음 | 810 | 1.401× | | 14.9 GB | 0 |
+| 4×M16 | 있음 | 864 | 1.495× | | 20.0 GB | 0 |
+| **8×M8** | **있음** | **878** | **1.519×** | **0.41** | 30.2 GB | 0 |
+
+MPS arm은 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE = 100/K`(50 / 25 / 12). 모든 arm에서
+`rc=0`, `fail_lines=0`, `duplicates=0`, `stale_tenants=0`, arm 사이 daemon 잔존 없음.
+
+**1) 게이트 8을 통과했다 — 그러므로 아래 배수는 데이터다.** dispatcher control
+578 c/h는 원시 라인 582의 −0.7 %로, §4.5가 요구한 ±5 % 안이다. §4.7의 5.0배 결함은
+재발하지 않았다. **이 줄이 맞지 않았다면 나머지 일곱 줄은 전부 버려야 했다.**
+
+**2) 킬 기준 통과.** 2×M32(MPS 없음) = **1.121×** ≥ 1.05×. L5 트랙은 산다.
+
+**3) MPS는 “가속제”가 아니라, K가 커지면 전제다.** §0은 MPS를 “correctness
+메커니즘이 아니라 서로 다른 context kernel의 동시 실행을 돕는 선택 옵션”이라고 적었다.
+정확성에 대해서는 옳고, **처리량에 대해서는 절반만 옳다**:
+
+```text
+K=2 :  648 (no MPS)  →  810 (MPS)      둘 다 이득
+K=4 :  579 (no MPS)  →  864 (MPS)      MPS 없이는 본전
+K=8 :  457 (no MPS)  →  878 (MPS)      MPS 없이는 손실 0.79×
+```
+
+시분할에서는 K가 커질수록 **디바이스에서 돌려주는 것이 호스트에서 얻은 것을 넘어선다.**
+같은 arm이 MPS 유무로 1.92배 갈린다. → **MPS 없는 K≥4는 재지 말 것.** 그 숫자는
+L5에 대한 정보가 아니라 시분할에 대한 정보다.
+
+**4) `width_fill` 0.28 → 0.41 (+46 %).** §0.1이 판정 지표로 지목한 값이 실제로
+그렇게 움직였고, `mean_width`는 예고대로 **작아졌다**. control의 0.28은 이 문서가
+인용해 온 0.227보다 높다(다른 빌드·덱). **판정은 언제나 같은 실행 안의 control
+대비로 한다** — 문서에 적힌 절대값과 비교하지 말 것.
+
+**5) VRAM은 K에 대해 평평하지 않다. §2.5의 모델이 틀렸다.**
+
+```text
+K x W = 64 고정:  12.3   14.9   20.0   30.2 GB   (K = 1, 2, 4, 8)
+추가 프로세스당 증분:   2.60   2.57   2.56 GB     ← 직선
+```
+
+§2.5는 “K×W를 고정하면 메모리도 그대로”라고 적었다. **슬롯 항은 실제로 평평했다** —
+레버가 약속한 그대로다. 아무도 청구하지 않은 것은 **프로세스 자신**이다: CUDA 컨텍스트,
+모듈 이미지, 라이브러리 핸들, 할당자 풀 — 폭의 함수가 아닌 고정비 2.56 GB.
+
+가드를 두 항으로 고쳤다(`--vram-per-extra-process-gb`, 기본 2.56):
+
+```text
+demand(device) = K × W × per_slot_gb  +  (K − 1) × extra_process_gb
+```
+
+옛 모델에서 **16×M4는 “13 GB”였고 실제는 약 51 GB다.** 96 GB 장비에서는 어느 쪽이든
+통과하지만, 그보다 작은 장비에서는 그 차이가 판정 전체이며, 예측되는 실패는
+**큐를 이미 claim한 뒤 아레나 stand-up에서** 일어난다.
+
+**6) 다음 두 arm.** 12×M6 / 16×M4로 무릎을 찾는다(`--total-width 64`이므로 폭은
+올림: 12→6, 16→4). 새 모델의 예측 VRAM은 **42.8 GB / 51.4 GB**로 96 GB 안이다.
+24코어에서 16 프로세스는 프로세스당 1코어이고, 그보다 큰 K는 튜너가 거절한다(§4.9).
+
+---
+
+### 4.9 튜너 — `--procs-per-gpu auto` (WP4)
+
+§4.8의 표는 여덟 번의 수동 실행이다. 무릎이 장비·드라이버·MPS·덱 조합마다 움직이므로
+(같은 K=8이 0.79×이기도 하고 1.52×이기도 하다), 이제 하네스가 **그 자리에서 재고**
+남은 큐를 이긴 K로 돌린다.
+
+```bash
+python3 tools/run_multi_gpu_batch.py \
+    --gpus 0 --procs-per-gpu auto --total-width 64 \
+    --tune-candidates 1,2,4,8,12,16 --tune-jobs 16 --tune-budget-s 600 \
+    --mps --claim auto --result light \
+    --jobs $O/m64.txt --cwd ~/t18decks/kngr --workdir $O/work/auto \
+    --pin taskset -- $B/RASBERY
+```
+
+**폭은 `--total-width`가 정한다.** `W = ceil(T/K)` — `--total-width 64`는
+1×M64, 2×M32, 4×M16, 8×M8, 12×M6, 16×M4다. **올림**이므로 K개 프로세스가 T보다 좁게
+선언하는 일은 없다(12×M5 = 60은 control보다 좁은 선언이고, 그것은 다른 arm이다).
+`--batch-width`는 여전히 **프로세스당** 폭이며, 그 경우 선언 폭이 K에 비례해 커지므로
+큰 후보는 VRAM 가드가 거절한다(하네스가 경고한다).
+
+**캘리브레이션이 하지 않는 네 가지.**
+
+1. **큐를 소비하지 않는다.** 후보마다 **같은** 잡 부분집합을 다시 돌린다 — 다른 잡을
+   주면 폭이 아니라 덱을 비교하는 것이 된다. 그래서 재실행은 `<workdir>/tune/`으로
+   **경로를 바꿔** 나가고, 캠페인은 그 뒤 매니페스트의 모든 잡을 정확히 한 번 돈다.
+   `[TOTAL].jobs`는 매니페스트 잡만 세고, 재실행은 `calibration_jobs`로 따로 적힌다.
+2. **생산 출력을 덮어쓰지 않는다.** 후보별 출력은 `<workdir>/tune/k<K>/out/`이다.
+3. **MPS daemon을 남기지 않는다.** thread percent가 100/K이므로 후보마다 자기 서버가
+   필요하고, 각각 다음 후보가 시작하기 **전에** `finally`에서 내려간다. 남았다면
+   다음 후보의 “MPS 없음”이 조용히 MPS 런이 된다(§5 함정 3).
+4. **캠페인을 다 쓰지 않는다.** `--tune-budget-s`는 워커가 **다음 청크를 claim하기
+   전에** 검사된다. 청크 도중에 자식을 죽이면 반쯤 쓰인 출력과 아무도 완료하지 않은
+   claim이 남는다.
+
+**목적함수와 동률.** 점수는 후보의 `cases_per_hour` **중앙값**(`--tune-repeats`).
+계획 §WP4의 `tail_penalty` / `failure_penalty`에서 두 가지를 의도적으로 바꿨다.
+
+- **실패는 감점이 아니라 실격이다.** `rc≠0`, `[FAIL]` 줄, receipt 감사 실패 중
+  하나라도 있으면 후보는 선택에서 **빠진다**. 안전할 만큼 큰 감점은 실격과 구별되지
+  않고, 감점이라 부를 만큼 작은 감점은 “빠르고 깨진 K”를 이기게 한다.
+- **tail은 감산이 아니라 동률 판정이다.** 점수를 c/h로 두어야 receipt의 숫자가
+  운영자가 582와 비교하는 그 숫자로 남는다. p90 케이스 지연은 이 하네스가 재지 않으므로
+  (실행 파일은 배치 점유율을 내지 케이스 wall을 내지 않는다) 대리값은 REFILL 수신증의
+  `tail_idle_max_s`다.
+
+동률(`--tune-tie-rel`, 기본 2 %)은 **(tail_idle_max_s, host thread 수, VRAM, K)**
+순으로 깬다. §4.8의 MPS 표에서 864와 878은 1.6 % 차이 — **동률 밴드 안**이므로 튜너는
+tail이 낮은 4×M16을 고른다. 그것이 의도다: 무릎 근처의 1.6 %는 다음 실행에서 뒤집히고,
+tail이 낮은 쪽이 wave 경계에서 덜 잃는다. 원시 최대값을 원하면 `--tune-tie-rel 0`.
+
+**후보 K=1은 기본 후보 집합에 들어 있다.** control을 고를 수 없는 튜너는 “여기서는
+레버가 듣지 않는다”를 보고할 수 없고, 계획의 1.05× 킬 기준은 바로 그 보고를 요구한다.
+
+**저장과 재사용.**
+
+```bash
+# 튜닝 결과는 <workdir>/tune/result.json 에 저장된다 (--tune-save 로 지정 가능)
+python3 tools/run_multi_gpu_batch.py --gpus 0 --procs-per-gpu 1 --total-width 64 \
+    --tune-from $O/work/auto/tune/result.json ... -- $B/RASBERY
+```
+
+결과는 **장비 UUID와 드라이버 버전에 keyed**되어 있고, 맞지 않으면 캠페인 시작 전에
+`rc=2`로 거절한다 — 다른 fleet에서 잰 K는 이 fleet의 측정이 아니다. `nvidia-smi`를
+물을 수 없어 키를 확인하지 못한 경우도 거절이다(“모르는 것”은 “같다”가 아니다).
+의도적으로 재사용하려면 `--allow-tune-mismatch`이며, 그때 receipt에 `key_match:false`가
+남는다.
+
+**읽어야 할 줄.**
+
+```text
+[RASBERY][MULTI_GPU][TUNE][CAND]  후보마다 한 줄, 재는 즉시 (진행 상황)
+    {"procs_per_gpu":8,"batch_width":8,"declared_width_per_gpu":64,"jobs":16,
+     "cases_per_hour":878.0,"width_fill":0.41,"tail_idle_max_s":...,
+     "vram_per_device_gb":30.9,"mps":true,"mps_thread_percent":12,
+     "eligible":true,"disqualified":""}
+[RASBERY][MULTI_GPU][TUNE]        하나. candidates / chosen / calibration_s /
+                                  calibration_jobs / key / tie_rel
+[RASBERY][MULTI_GPU][PLAN]        procs_policy:"tuned", width_policy:"total_width",
+                                  writer_policy, host_thread_demand
+[RASBERY][MULTI_GPU][TOTAL]       tuned / tune_source / calibration_jobs
+```
+
+**호스트 예산 receipt가 바뀌었다(WP4).** `writer_threads`는 더 이상 상수 8이 아니다 —
+`src/IoWriter.h`는 writer 스레드를 **하나** 돌리고(`inline` 모드는 0), `--result light`는
+결과 HDF5를 아예 쓰지 않는다. `writer_policy`가 어느 쪽인지 이름으로 말하고,
+캘리브레이션 로그의 `[RASBERY][IO_WRITER]`를 읽었다면 `receipt`라고 적힌다.
+`host_thread_demand`는 **코어 요구량이 아니라 스레드 수**다(레인은 대부분 랑데부에서
+블록되어 있다). 기준 arm의 `host_thread_ratio` ≈ 2.7은 정상이며 경고가 아니다.
+
+---
+
 ## 5. 함정 목록 (runner용)
 
 | # | 함정 | 증상 | 대응 |
@@ -659,6 +832,12 @@ dispatcher 대조  --gpus 0 --procs-per-gpu 1 --batch-width 64       → 115.6 c
 | 9 | `--driver-workers`/`--no-oversubscribe`로 레인을 코어 수까지 낮춤 | `width_fill`이 무너지고 c/h가 5배 떨어진다. 오류는 없다 | `[PLAN].driver_workers`가 폭 W와 같은지, `driver_worker_policy`가 `binary_default_width`인지 확인 |
 | 10 | 물리 키를 export로만 주고 `--set`을 안 씀 | `DEFAULT_ENV`가 이겨서 조용히 다른 arm이 돈다 | A/B는 반드시 `--set KEY=VALUE`로. `[MULTI_GPU][ENV]`로 확인 |
 | 11 | MASTER 대조인데 `RASBERY_PPR_MODE`를 안 줌 | 핀 파워가 SENM 경로로 나온다 | `--set RASBERY_PPR_MODE=master` (더 이상 기본값이 아니다, §4.1) |
+| 12 | **MPS 없이 K≥4를 재고 “무릎”이라고 보고** | 8×M8이 0.79×로 나온다. 오류는 없다 | K가 커지면 MPS는 선택이 아니라 전제다(§4.8-3). MPS 없는 K≥4는 시분할을 재는 것이다 |
+| 13 | VRAM을 옛 한 항 모델로 예산 | 16×M4가 “13 GB”, 실제 약 51 GB. 아레나 stand-up에서 죽는다 — 큐를 claim한 뒤에 | `[VRAM].extra_process_gb`가 두 번째 항이다(§4.8-5) |
+| 14 | `--procs-per-gpu auto --dry-run` | rc=2 | 튜너는 **잰다**. 마른 캘리브레이션은 아무것도 돌지 않은 K를 고른 것이 된다 |
+| 15 | 튜닝 결과를 다른 장비·드라이버에서 재사용 | rc=2 (거절) | 결과는 UUID+드라이버에 keyed다. 의도적이면 `--allow-tune-mismatch`, 그러면 `key_match:false`가 남는다 |
+| 16 | 캘리브레이션 잡을 캠페인 처리량에 섞어 읽음 | 배수가 “튜닝이 얼마나 걸렸나”의 함수가 된다 | `[TOTAL].jobs`는 매니페스트 잡만, 재실행은 `calibration_jobs` |
+| 17 | `--total-width` 없이 튜닝 | 선언 폭이 K에 비례해 커져 큰 후보가 전부 VRAM 거절 | `--total-width 64`. 하네스가 경고는 하지만 막지는 않는다 |
 
 ---
 
@@ -666,8 +845,9 @@ dispatcher 대조  --gpus 0 --procs-per-gpu 1 --batch-width 64       → 115.6 c
 
 | 항목 | 상태 | 왜 지금 아닌가 |
 |---|---|---|
-| **MPS 성능** | 미실측 | 로컬(WSL)에 control daemon이 없다. 거절 경로만 검증했다 |
-| **238의 배수** | 미실측 | 로컬 1.251×는 폭 8/4·짧은 덱의 값이다. §3.3 |
+| **MPS 성능** | **실측 (§4.8)** | 8×M8+MPS = 878 c/h, 같은 arm이 MPS 없이는 457. 1.92배 |
+| **238의 배수** | **실측 (§4.8)** | control 578 대비 **1.519×** (8×M8+MPS). 킬 기준 1.05×는 2×M32가 MPS 없이도 통과(1.121×) |
+| **무릎의 위치** | 부분 실측 | 8까지는 단조 증가(MPS). 12×M6 / 16×M4가 다음이고, 그 뒤로는 24코어에서 프로세스당 1코어 미만이 되어 튜너가 거절한다 |
 | **다중 GPU × K** | 미실측 | 코드 경로는 같다(`processes = G × K`). GPU 1장 전용 정책 때문에 로컬에서 잴 수 없다 |
-| **per-slot VRAM 재측정** | 0.203 GB 고정 | 238 M64 전출력 peak 13 GB에서 나온 값이다. `--result light` arm의 실제 peak은 더 작을 것 — `--vram-per-slot-gb`로 조정 가능하나, 가드는 **보수적인 쪽**이 옳다 |
+| **per-slot VRAM 재측정** | **두 항 모델로 교체 (§4.8-5)** | 슬롯 항 0.203 GB는 그대로(K에 대해 평평한 것이 실측으로 확인되었다). 새로 생긴 것은 프로세스 고정비 2.56 GB — `--vram-per-extra-process-gb`. `--result light`의 실제 peak은 여전히 더 작고, 가드는 **보수적인 쪽**이 옳다 |
 | **`--claim auto`의 K 인식** | 구현됨, 미튜닝 | `max(W, ceil(remaining/(2·G·K)))`. K가 크면 청크가 폭으로 고정되어 스틸이 사실상 사라진다. 128잡 이상에서 다시 볼 것 |

@@ -8,6 +8,7 @@
 | 검토 방법 | 정적 소스 검토만. **이 검토에서 서버 238 실행·빌드·프로파일은 수행하지 않았다.** |
 | 작성 | 2026-08-31 KST |
 | 갱신 | 2026-08-31 KST — R5·F9·F10·F11 종결. `5ccf879`(하네스 감사 전환), `666e123`(죽은 receipt 필드 배선). 여전히 **로컬 빌드 없음**: §7과 §8-7)이 238에서 확인할 것을 적는다. |
+| 갱신 | 2026-09-01 KST — **R2 종결**(소스의 9칸 채택, 파서는 칸 수를 세지 않는다). WP3 계약 하드닝 `79c1880`, WP4 튜너 `6ad1de7`. 238 L5 행렬 실측이 들어왔다(docs/W4_L5 §4.8): control 578 c/h로 원시 582 재현, 8×M8+MPS **878 c/h = 1.519×**. §9에 WP3 가격 평가 runbook을 적었다. 여전히 **로컬 빌드 없음**. |
 
 > 이 문서는 두 가지를 한다. (1) 계획 §4.3/§4.4가 트리에 대해 주장하는 사실을 `file:line`으로 확인하거나 반박한다. (2) WP0–WP11 추적표를 만든다. 추적표는 이후 계속 갱신한다.
 
@@ -125,9 +126,44 @@ WP1 이전 `src/main.cpp`는 `const bool screening = (ga_feedback_passes > 0) ||
 dispatcher가 Driver lane을 호스트 코어 수(24)로 제한했고, 바이너리 자신의 기준 실행은 24코어에서 64 lane을 돌린다. 같은 바이너리에서 **115.6 c/h 대 582 c/h, 5.0×**. 근거: `tools/run_single_gpu_batch.py:15`, `:87-88`, `:206`, `:523-527` (커밋 `7099e54` "fix(harness): make both batch harnesses reproduce the raw 238 reference line"에 포함). 문서 자신이 “세 번의 이전 sweep이 이것을 데이터로 보고했다”고 적고 있다.
 → **결과:** §3.3의 `FlatXS 39.9% / Xe 26.9% / CMFD 19% / Nodal 8.6%`는 **도착 폭이 14.5로 굶던 실행의 커널 지분**이다. 폭이 채워지면 지분은 반드시 이동한다. **WP5가 “FlatXS 최우선”을 확정하기 전에 §3.3을 고친 하네스에서 다시 재야 한다.** 이것을 WP5의 blocking dependency로 추적표에 넣었다.
 
+> **R1 갱신 (2026-09-01).** 하네스 쪽은 끝났다: 238에서 dispatcher control 1×M64가
+> **578 c/h**로 원시 라인 **582**를 −0.7%로 재현했다(docs/W4_L5 §4.8). 5.0배 결함은
+> 재발하지 않는다. 그러나 §3.3의 지분은 **아직 다시 재지 않았다** — 그리고 이제
+> 재야 할 실행이 하나 더 늘었다: `width_fill`이 0.28에서 **0.41**로 오른
+> 8×M8+MPS arm이다. 폭이 두 배 가까이 찬 실행에서 FlatXS 지분이 그대로인지가
+> WP5의 전제이고, 그 측정 없이 “FlatXS 39.9%”를 인용하는 것은 여전히 굶던 실행을
+> 인용하는 것이다.
+
 **R2. WP3 bucket ladder: 계획 7칸, 트리 9칸.**
 계획 §WP3 구현 세부는 “bucket은 `1,2,4,8,16,32,64`로 제한”이라 적었다. 트리는 **`1,2,4,8,16,24,32,48,64` 9칸**이다 — `src/CudaBICGBackend.cu:424`, 히스토그램 배열 크기 9 `:547`, receipt의 `bucket_histogram` 길이 9 `:5638-5644`. 그리고 계약 테스트는 “bucket ladder는 스케줄러의 사다리이지 두 번째 사다리가 아니다”를 명시적으로 붙들고 있다(테스트 docstring 6번).
-→ **결정 필요:** (a) 트리의 9칸을 채택하고 계획 문장을 고친다(권고 — 24/48은 M64의 실제 도착 폭 14.5 부근을 훨씬 잘 덮는다), 또는 (b) 7칸으로 줄이고 스케줄러 사다리도 함께 바꾼다. **파서를 계획대로 7칸으로 쓰면 receipt와 어긋난다.**
+**R2 종결 — 트리의 9칸을 채택하고, 아무 파서도 칸 수를 세지 않는다 (`79c1880`).**
+
+선택지 (a)를 택한다: **소스가 진실이다.** 근거는 두 가지다.
+
+1. 24와 48은 238 M64의 실제 도착 폭 14.5 부근을 덮는 rung이다. 계획의 7칸으로 줄이면
+   14.5는 16 대신 16, 20은 32로 올라가 **WP3이 지금 가격을 매기려는 padding이 늘어난다.**
+   사다리를 짧게 만드는 것은 receipt를 짧게 만들지 padding을 줄이지 않는다.
+2. 사다리는 네 곳에 있고(`src/GpuPhaseScheduler.h:69` `kDispatchBuckets`,
+   `src/CudaBICGBackend.cu:418` `kBuckets`, `src/CudaXsReconBackend.cu:1310` `kBuckets`,
+   `test/cmfd_slot_compaction_replay.cu:127`) 히스토그램 배열 두 개가 그 **길이**에
+   묶여 있다(`CudaBICGBackend.cu:548`, `CudaXsReconBackend.cu:359`). 스케줄러 쪽을 7로
+   바꾸는 것은 커널 코드 변경이고, WP3의 지시는 “커널 코드를 바꾸지 말 것”이다.
+
+**계약으로 고정한 방식이 요점이다 — 9를 적지 않았다.**
+`tools/test_cmfd_slot_compaction_contract.py`의 `scan_ladder()`는 스케줄러의 리스트를
+읽어 나머지 세 복사본과 비교하고, `kDispatchBucketCount`와 두 히스토그램 배열 크기를 그
+**길이**와 비교한다. 9를 상수로 적는 것은 계획이 7을 적은 것과 같은 실수이며,
+`cmfdBucketIndex()`가 `len-1`을 반환할 수 있으므로 짧은 배열은 **범위 밖 atomic 증가**다.
+음성 대조군 두 개가 붙어 있다: `.cu`의 사다리를 계획의 7칸으로 줄이면 FAIL,
+히스토그램만 7로 줄여도 FAIL.
+
+**파서는 관대하되 침묵하지 않는다.** `tools/cmfd_compact_receipt.py`가 사다리를 소스에서
+읽어 receipt의 히스토그램과 zip한다. 길이가 다르면 **mismatch로 보고하고 원본 그대로
+돌려준다** — 잘라 맞추지도, 0으로 채워 맞추지도 않는다. 조용히 맞추는 것이 파서와
+receipt가 한 캠페인 내내 어긋나는 방식이다. `padding_fraction`은 블록 수에서 **다시
+계산**한다(세 숫자가 한 사실이므로 불일치는 반올림이 아니라 발견이다).
+`python3 tools/cmfd_compact_receipt.py <log>`가 WP3 가격표를 인쇄한다.
+
 
 **R3. WP3의 등급이 문서 간에 다르다.**
 새 계획은 CMFD compaction을 **B0**로 적는다(§WP3 정확성 게이트 “B0가 목표다”, §9 표). GA evaluator 계획은 같은 것을 **N1**으로 적는다(`docs/GPU_RASBERY_GA_EVALUATOR_PLAN_20260831_KO.md:28`, `:868`).
@@ -196,9 +232,9 @@ strict와 A2 **둘 다** 지금까지 `full_exact_nodal`을 찍어 왔고 238 �
 | **WP0** | 재현 가능한 baseline + 자동 판정 하네스 | **not-started** | 하네스 담당 | `tools/test_perf_manifest_contract.py`가 mode/fidelity 불일치 arm 비교를 거부 | R4: `run_{single,multi}_gpu_batch.py` env-parity 작업 커밋 |
 | **WP1** | 출력/충실도 분리 + GPU full fail-closed | **done (코드·계약·하네스)** — 바이너리 `9dff6ff`, 하네스 감사 전환 `5ccf879`, 죽은 receipt 필드 `666e123` | 본 작업 | 238에서 §8 runbook **7줄** 통과 + 오버헤드 <1% | ~~R5~~ 종결. **238 빌드만 남았다** |
 | **WP2** | 착지 기능 238 재가격 | **not-started** (단, 판정 근거는 준비됨 — F9/F10 종결로 engagement receipt가 상수를 읽지 않는다) | 하네스 담당 + 본 작업 | 6개 기능 각각 `adopt`/`keep-opt-in`/`reject`. **판정은 `[GPU_FULL].*_fallbacks` + `[BACKEND_COUNTERS].{xs,cmfd,nodal}_cpu_fallbacks` + `[XE_GPU].fused_*`로 한다** | WP0, WP1(모드 일치 비교가 성립해야 함), R4. **잔여 F9: 네 개의 `*_gpu_calls`(`xs`,`nodal`,`th`,`depletion`)는 아직 죽어 있다** — `tools/test_receipt_counters_live.py`의 `KNOWN_DEAD`에 이유와 함께 열거되어 있고, 배선하면 목록이 줄어든다 |
-| **WP3** | CMFD compaction 검증·채택 | **landed-unpriced** (계약 테스트까지 존재, F1–F5) | 본 작업 | M64 mode-matched +5%, padding −30%, ON×3 digest 동일 | WP2, R2(ladder 결정), R4 |
-| **WP4** | 단일 GPU K-process 자동 튜닝 | **landed-unpriced** (launcher만) | 하네스 담당 | K=2가 1×64 대비 ≥1.05× | WP0, R1(하네스 결함 수정), R4 |
-| **WP5** | FlatXS CTA-per-node + XS residency | **not-started** | 본 작업 | 단계 A(ptxas/ncu spill 증명) → 분기 | **R1: 고친 하네스에서 §3.3 재측정**, WP3+WP4 |
+| **WP3** | CMFD compaction 검증·채택 | **landed-unpriced, 계약 하드닝 done** (`79c1880`: 커널 12개의 outer 계열까지 스캔 확대 + 15개 음성 대조군, R2 종결) | 본 작업 | **238 가격 평가만 남았다 — §9 runbook**. M64 mode-matched +5%, padding 유의 감소, ON×2 digest 동일 | WP2, ~~R2~~ 종결, R4. **코드 작업 없음** |
+| **WP4** | 단일 GPU K-process 자동 튜닝 | **priced + tuner landed** (`6ad1de7`) — 238 8-arm 행렬 실측(docs/W4_L5 §4.8), `--procs-per-gpu auto`/`--tune-from` 착지 | 하네스 담당 + 본 작업 | ~~K=2가 1×64 대비 ≥1.05×~~ **통과: 2×M32 = 1.121× (MPS 없음)**. 최고 arm 8×M8+MPS = **878 c/h = 1.519×**. 다음: 12×M6/16×M4로 무릎 확정, 3연속 wave 회귀 없음 | ~~R1~~ 해소(§4.7 결함 재발 없음: control 578 vs 원시 582), R4 |
+| **WP5** | FlatXS CTA-per-node + XS residency | **not-started** | 본 작업 | 단계 A(ptxas/ncu spill 증명) → 분기 | **R1: 재측정은 이제 가능해졌다** — dispatcher control이 원시 라인을 ±5%로 재현했다(578 vs 582). 남은 것은 §3.3 커널 지분을 **폭이 찬 실행에서 다시 재는 것**이고, 그 실행은 8×M8+MPS다(width_fill 0.28→0.41). WP3+WP4 |
 | **WP6** | GPU PPR device loop/reconstruct/canonical | **부분 landed-unpriced** (`c502856` 장치 PPR, 기본 OFF·fail-open) | 본 작업 | 단계 A: `ppr_device_calls == statepoints`, `ppr_host_calls == 0` (GPU full), N1 Gate A/B | WP2(PPR 1차 A/B), WP1(fail-closed로 engagement 증명) |
 | **WP7** | 단일 launch/sync 축소 + Xe transaction | **부분 landed-unpriced** (WHILE 구현·기본 OFF) | 본 작업 | 단계 A: 단일 WHILE ≥5% (교대 5쌍). 필수 receipt에 `refusals{no_residency}` / `refusals{unbound}` 포함 | WP2. ~~F11~~ 종결(`666e123`) |
 | **WP8** | 장수명 GA evaluator | **not-started** | 본 작업 | 단계 1: `--evaluator-jsonl` wave 프로토콜 + A-B-A 동일성 | WP1+WP2 안정화 |
@@ -422,6 +458,161 @@ env -u RASBERY_GPU_CMFD_SWEEP CUDA_VISIBLE_DEVICES=0 \
 > **주의:** 3)의 `[GPU_FULL]`이 0이 아니면 **그것이 결과다.** 그 실행은 A/B의 기준선으로 쓸 수 없고, `site=`가 어느 팔이 조용히 CPU였는지 말한다. 그 경우 WP2의 대상 기능 표에 “그 팔은 238에서 실제로 engage 하지 않는다”를 먼저 기록한다.
 
 > **7)에 대한 주의:** 7b)의 두 숫자(`[BACKEND_COUNTERS].nodal_cpu_fallbacks`와 `[GPU_FULL].nodal_fallbacks`)가 **다르면** F9의 수정이 목적을 잃은 것이다. 두 필드는 같은 원자(`gpufull::detail::counter`)를 읽도록 배선했고, 다르다는 것은 어딘가에서 두 번째 tally가 생겼다는 뜻이다 — F13이 금지한 바로 그 상태.
+
+---
+
+## 9. 238 runbook — WP3 CMFD compaction 가격 평가
+
+WP3에 남은 것은 코드가 아니라 **가격**이다(§1 재분류, §5 표). 아래는 그 측정이다.
+
+전제: §8-0)의 빌드, `docs/W4_L5_MULTIPROC_PER_GPU_20260901_KO.md` §4.1의 환경,
+§4.2의 64잡 매니페스트. **하네스 없이 재지 말 것** — 환경 불일치는 이 캠페인에서 오류도
+FAIL 줄도 남기지 않는 유일한 결함이다(W4_L5 §4.7).
+
+```bash
+export REPO=$HOME/gpu; export B=$HOME/build/rasbery-wp3-sm120
+export O=$HOME/bench/wp3; mkdir -p $O
+export RASBERY_ALLOW_SCREENING=1          # --result light (권한은 운영자의 것)
+cd $REPO
+python3 tools/test_cmfd_slot_compaction_contract.py   # 하드웨어 불필요, 같은 트리에서
+python3 tools/test_cmfd_slot_compaction_contract.py --run   # nvcc replay 포함
+```
+
+> **`RASBERY_GPU_CMFD_COMPACT`는 `kArmEnv`에 없다** (`src/Driver.h:415-443`). 그것은
+> 선언이다: 이 기능은 B0이며 궤적을 움직이지 않는다. 따라서 `[TRAJECTORY]` digest의
+> `env` 필드가 ON/OFF에서 **같고**, digest를 직접 비교할 수 있다. **digest가 움직이면
+> 그 선언이 틀린 것이고, 그 자리에서 N1로 재분류하고 Gate B를 태운다**(R3).
+> 그리고 `DEFAULT_ENV`가 주지 않는 키다 — **반드시 `--set`으로 준다.** export도
+> 상속되기는 하지만(자식은 `os.environ`을 물려받는다) 그때 A/B의 arm은 **셸의 상태**가
+> 되고, 두 arm을 한 루프에서 도는 이 runbook에서 그것은 정확히 W4_L5 §5 함정 10이다.
+> `--set`으로 주면 `[MULTI_GPU][ENV]`와 `[PROC].env`가 **무엇이 실제로 갔는지** 적는다.
+
+### 9.1 상금부터 본다 (GPU 시간 0)
+
+`[RASBERY][CMFD][COMPACT]`는 **ON/OFF 무관하게 인쇄된다**(F4). 그러므로 OFF 실행 하나로
+“고칠 것이 얼마나 있는가”를 먼저 읽는다 — padding이 이미 작다면 나머지 단계는 돌릴
+필요가 없다.
+
+```bash
+python3 tools/run_multi_gpu_batch.py --gpus 0 --procs-per-gpu 1 --batch-width 64 \
+    --claim auto --result light --jobs $O/m64.txt --cwd ~/t18decks/kngr \
+    --workdir $O/w/prize --pin taskset -- $B/RASBERY > $O/prize.out 2>&1
+python3 tools/cmfd_compact_receipt.py $O/w/prize/*.log
+```
+
+기대 출력(사다리는 소스에서 읽는다 — 9칸, R2):
+
+```text
+# bucket ladder from source: [1, 2, 4, 8, 16, 24, 32, 48, 64]
+...: enabled=0 logical_drives=N physical=N padding=N padding_fraction=0.xxxx ...
+    buckets: <=1=.., <=2=.., <=4=.., <=8=.., <=16=.., <=24=.., <=32=.., <=48=.., <=64=..
+```
+
+**판정 규칙:** `padding_fraction`이 0.10 미만이면 WP3의 상한은 10 %이고, 아래 A/B의
+목표(+5 %)는 사실상 도달 불가능하다 — 그 경우 **그 숫자를 적고 WP3을 `reject`로 닫는다.**
+`bucket_histogram`은 어느 rung에 무게가 있는지 말한다: 14.5 부근이면 `<=16`과 `<=24`가
+무거워야 한다. `<=64`가 무겁다면 도착 폭이 이미 차 있다는 뜻이고, 그것도 결과다.
+
+### 9.2 A/B — 1×M64 (control 폭)
+
+교대 5쌍, 워밍업 1회 버림. **arm마다 `--workdir`를 다르게** (W4_L5 §5 함정 5).
+
+```bash
+for i in 1 2 3 4 5; do
+  for v in 0 1; do
+    python3 tools/run_multi_gpu_batch.py --gpus 0 --procs-per-gpu 1 --batch-width 64 \
+        --claim auto --result light --jobs $O/m64.txt --cwd ~/t18decks/kngr \
+        --workdir $O/w/m64_c${v}_${i} --pin taskset \
+        --set RASBERY_GPU_CMFD_COMPACT=$v \
+        -- $B/RASBERY > $O/m64_c${v}_${i}.out 2>&1
+    grep -h "MULTI_GPU\]\[TOTAL\]" $O/m64_c${v}_${i}.out
+  done
+done
+grep -ho '"RASBERY_GPU_CMFD_COMPACT":"[01]"' $O/m64_c*_1.out | sort | uniq -c   # env 확인
+```
+
+### 9.3 A/B — 8×M8 + MPS (폭이 찬 arm)
+
+**이 arm이 WP3의 진짜 시험이다.** W4_L5 §4.8이 `width_fill`을 0.28 → 0.41로 올렸다.
+compaction이 지우는 것은 **선언 폭과 도착 폭의 차이**이므로, 도착 폭이 이미 오른 arm에서
+상금은 **작아져 있어야 한다.** 두 arm의 `padding_fraction`을 나란히 적는 것이 이 WP의
+가장 중요한 한 줄이다 — WP3과 WP4가 같은 비용을 두 방법으로 지우기 때문이다(계획 §3).
+
+```bash
+for i in 1 2 3 4 5; do
+  for v in 0 1; do
+    python3 tools/run_multi_gpu_batch.py --gpus 0 --procs-per-gpu 8 --total-width 64 \
+        --claim auto --result light --mps --jobs $O/m64.txt --cwd ~/t18decks/kngr \
+        --workdir $O/w/m8_c${v}_${i} --pin taskset \
+        --set RASBERY_GPU_CMFD_COMPACT=$v \
+        -- $B/RASBERY > $O/m8_c${v}_${i}.out 2>&1
+    grep -h "MULTI_GPU\]\[TOTAL\]\|MULTI_GPU\]\[MPS\]" $O/m8_c${v}_${i}.out
+  done
+  pgrep -a nvidia-cuda-mps        # arm 사이 잔존 확인. 비어 있어야 한다
+done
+python3 tools/cmfd_compact_receipt.py $O/w/m8_c0_1/*.log $O/w/m8_c1_1/*.log
+```
+
+`[MPS].active:true`가 아닌 arm은 무효다(W4_L5 §4.5).
+
+### 9.4 B0 — OFF는 이전 바이너리와 바이트 동일
+
+compaction OFF는 **완전 항등**이어야 한다(계약 테스트 5번). 그것을 소스가 아니라
+디스크에서 확인한다. `$O/base.h5`는 `3e9e3e5` 빌드의 같은 arm 결과.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 $B/RASBERY --rasi $DATA/kngr_238.json \
+    --raso $O/off.h5 --result full 2>&1 | tee $O/off.log
+h5diff -r $O/base.h5 $O/off.h5 && echo "B0 OK (identity-off)"
+diff <(grep -o '\[RASBERY\]\[TRAJECTORY\].*' $O/base.log) \
+     <(grep -o '\[RASBERY\]\[TRAJECTORY\].*' $O/off.log) && echo "digest OK"
+```
+
+### 9.5 ON×2 digest 동일 — 그리고 ON vs OFF도
+
+```bash
+for i in 1 2; do
+  CUDA_VISIBLE_DEVICES=0 RASBERY_GPU_CMFD_COMPACT=1 $B/RASBERY \
+      --rasi $DATA/kngr_238.json --raso $O/on_$i.h5 --result full \
+      2>&1 | tee $O/on_$i.log | grep -o '\[RASBERY\]\[TRAJECTORY\].*'
+done
+diff <(grep -o '\[RASBERY\]\[TRAJECTORY\].*' $O/on_1.log) \
+     <(grep -o '\[RASBERY\]\[TRAJECTORY\].*' $O/on_2.log) && echo "ON x2 digest OK"
+h5diff -r $O/on_1.h5 $O/on_2.h5 && echo "ON x2 bytes OK"
+# 그리고 B0의 본체: ON 이 OFF 와 같은가
+h5diff -r $O/off.h5  $O/on_1.h5 && echo "B0 OK (ON == OFF)"
+diff <(grep -o '\[RASBERY\]\[TRAJECTORY\].*' $O/off.log) \
+     <(grep -o '\[RASBERY\]\[TRAJECTORY\].*' $O/on_1.log) && echo "B0 digest OK"
+```
+
+> ON×2를 먼저 보는 이유: **ON 경로가 비결정적이면 ON≠OFF는 compaction의 증거가 아니다.**
+> 계획은 ON×3을 적었다. ×2가 통과하고 ×3이 필요해지는 경우는 하나뿐 — ON×2가 갈렸을 때이며,
+> 그때는 개수를 늘리는 것이 아니라 **비결정성을 먼저 보고한다.**
+
+### 9.6 판정표
+
+| 항목 | 어디서 | 채택 기준 |
+|---|---|---|
+| 상금 | §9.1 `padding_fraction` (OFF) | <0.10이면 `reject`. 그 숫자를 적고 닫는다 |
+| 1×M64 처리량 | §9.2 `[TOTAL].cases_per_hour` 중앙값 | ON/OFF ≥ **+5 %** |
+| 8×M8+MPS 처리량 | §9.3 동일 | ON/OFF ≥ +5 %. **여기서 사라지면 WP4가 이미 그 비용을 지운 것이다** |
+| padding 감소 | §9.1/§9.3 두 arm의 `padding_fraction` | ON에서 유의하게 감소 |
+| graph 폭증 없음 | `bucket_graphs` | bucket 수(9)를 넘어 계속 증가하지 않는다 |
+| B0 | §9.4, §9.5 | `h5diff -r` 비고 `[TRAJECTORY]` digest 동일 — OFF vs 이전 바이너리, **그리고 ON vs OFF** |
+| 결정성 | §9.5 | ON×2 digest·바이트 동일 |
+| 감사 | 모든 arm | `rc=0`, `fail_lines=0`, `duplicates/stale_tenants=0` |
+
+digest가 움직이면 **그 자리에서 N1로 기록하고 Gate B를 태운다**(R3). 성능 숫자는
+그 다음이다.
+
+### 9.7 이 runbook이 로컬에서 확인할 수 없는 것
+
+- padding의 실제 크기. 소스는 “세는 자리가 있다”까지만 말한다.
+- ON 경로의 정확성. 계약 테스트는 **정적**이다 — `--run`의 replay는 nvcc가 있어야 하고,
+  비연속 physical slot `{1,4,7,31}` 강제와 tenancy 교체 후 stale map은 계획 §WP3
+  “테스트 우선 절차” 2·4번이며 `test/cmfd_slot_compaction_replay.cu`를 확장해야 한다.
+  **이 트리에는 아직 없다.**
+- bucket graph 인스턴스 수의 실제 추이.
 
 ---
 
