@@ -151,7 +151,12 @@ inline cudaError_t graphLaunchOrSplice(cudaGraphExec_t exec, cudaGraph_t graph,
     cudaGraph_t             cur = nullptr;
     const cudaGraphNode_t*  deps = nullptr;
     std::size_t             ndeps = 0;
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+    const cudaGraphEdgeData* edge_data = nullptr;
+    rc = cudaStreamGetCaptureInfo(stream, &cap, &id, &cur, &deps, &edge_data, &ndeps);
+#else
     rc = cudaStreamGetCaptureInfo(stream, &cap, &id, &cur, &deps, &ndeps);
+#endif
     if (rc != cudaSuccess) return rc;
     if (cur == nullptr) return cudaErrorStreamCaptureUnsupported;
 
@@ -159,8 +164,13 @@ inline cudaError_t graphLaunchOrSplice(cudaGraphExec_t exec, cudaGraph_t graph,
     rc = cudaGraphAddChildGraphNode(&child, cur, deps, ndeps, graph);
     if (rc != cudaSuccess) return rc;
 
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+    return cudaStreamUpdateCaptureDependencies(stream, &child, nullptr, 1,
+                                               cudaStreamSetCaptureDependencies);
+#else
     return cudaStreamUpdateCaptureDependencies(stream, &child, 1,
                                                cudaStreamSetCaptureDependencies);
+#endif
 }
 
 }  // namespace rasbery

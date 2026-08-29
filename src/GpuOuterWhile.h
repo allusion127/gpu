@@ -273,9 +273,16 @@ inline cudaError_t buildOuterWhile(cudaStream_t root_stream, cudaStream_t body_s
     cudaGraph_t             g  = nullptr;
     const cudaGraphNode_t*  deps  = nullptr;
     std::size_t             ndeps = 0;
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+    const cudaGraphEdgeData* edge_data = nullptr;
+#endif
 
     *stage = "GetCaptureInfo(root)";
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+    rc = cudaStreamGetCaptureInfo(root_stream, &st, &id, &g, &deps, &edge_data, &ndeps);
+#else
     rc = cudaStreamGetCaptureInfo(root_stream, &st, &id, &g, &deps, &ndeps);
+#endif
     if (rc != cudaSuccess) return abandon_root(rc);
     if (g == nullptr) return abandon_root(cudaErrorStreamCaptureUnsupported);
 
@@ -293,7 +300,11 @@ inline cudaError_t buildOuterWhile(cudaStream_t root_stream, cudaStream_t body_s
     if (rc != cudaSuccess) return abandon_root(rc);
 
     *stage = "GetCaptureInfo(arm)";
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+    rc = cudaStreamGetCaptureInfo(root_stream, &st, &id, &g, &deps, &edge_data, &ndeps);
+#else
     rc = cudaStreamGetCaptureInfo(root_stream, &st, &id, &g, &deps, &ndeps);
+#endif
     if (rc != cudaSuccess) return abandon_root(rc);
 
     *stage = "AddNode(while)";
@@ -303,8 +314,13 @@ inline cudaError_t buildOuterWhile(cudaStream_t root_stream, cudaStream_t body_s
     if (rc != cudaSuccess) return abandon_root(rc);
 
     *stage = "UpdateCaptureDependencies";
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+    rc = cudaStreamUpdateCaptureDependencies(root_stream, &cond, nullptr, 1,
+                                             cudaStreamSetCaptureDependencies);
+#else
     rc = cudaStreamUpdateCaptureDependencies(root_stream, &cond, 1,
                                              cudaStreamSetCaptureDependencies);
+#endif
     if (rc != cudaSuccess) return abandon_root(rc);
 
     *stage = "BeginCaptureToGraph(body)";
