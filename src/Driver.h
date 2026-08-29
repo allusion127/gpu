@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <filesystem>
 #include "CompatFormat.h"
@@ -324,6 +325,142 @@ inline void report(std::ostream& out) {
     out << "}" << std::endl;
 }
 } // namespace outer_timing
+
+// ---------------------------------------------------------------------------
+// The trajectory receipt -- ALWAYS ON, and that is the whole point.
+// ---------------------------------------------------------------------------
+//
+// WHY THIS EXISTS.  Instrumentation must never move the iteration.  On 238 an
+// A2 candidate was reported at 3,114 outers plain and 4,393 with
+// RASBERY_STATEPOINT_TELEMETRY=1, and there was no way to tell, from the two
+// logs, whether the telemetry had perturbed the solve or whether the two runs
+// had simply been given different environments -- because the only per-run
+// record of "which arm was this" is scattered across receipts that each feature
+// prints only when it is ON, and the per-statepoint line carries a wall time
+// that makes a plain `diff` of two logs useless.
+//
+// So this receipt answers exactly that question, in one line, on every run:
+//
+//   * `digest` is a fold of the per-statepoint (step, outers, T/H steps, and the
+//     BIT PATTERNS of efpd, k_eff and boron) -- i.e. the trajectory, not a
+//     summary of it.  Two runs of the same arm agree on it exactly; a run whose
+//     iteration moved by one outer, or whose k_eff moved in the last bit, does
+//     not.
+//   * `env` is the raw, UNPARSED value of every knob that can move a
+//     trajectory.  Raw on purpose: a receipt that re-derived `staged_flux_mult`
+//     would be a second interpretation of the variable that could drift from
+//     SolveLoop's, and the one thing this must not do is disagree with the
+//     solver about what the run was asked for.  Unset prints as null.
+//   * `telemetry` is reported BESIDE the digest and is deliberately NOT folded
+//     into it, so "telemetry is trajectory-neutral" is a mechanical test:
+//     two runs whose `env` and `digest` agree while `telemetry` differs.
+//
+// COST.  Five integer folds per statepoint (35-51 of them) and one formatted
+// line per run.  There is no gate because a receipt nobody can be sure was
+// enabled is a receipt nobody can quote.
+namespace trajectory {
+
+/// The knobs that can move an iteration, reported raw so the receipt cannot
+/// disagree with the solver's own reading of them.  RASBERY_STATEPOINT_TELEMETRY
+/// is deliberately absent: it is the thing under test, and it rides in its own
+/// field so an arm comparison can hold every OTHER knob equal.
+inline constexpr const char* kArmEnv[] = {
+    "RASBERY_GPU",
+    "RASBERY_GPU_CMFD_SWEEP",
+    "RASBERY_GPU_CMFD_RESIDENT_SINGLE",
+    "RASBERY_GPU_CMFD_FP32",
+    "RASBERY_GPU_NODAL",
+    "RASBERY_GPU_NODAL_FULL",
+    "RASBERY_GPU_XSRECON",
+    "RASBERY_GPU_FLATXS",
+    "RASBERY_GPU_XE",
+    "RASBERY_GPU_XE_DOT_PARTITIONS",
+    "RASBERY_GPU_OUTER",
+    "RASBERY_GPU_OUTER_SEGMENT_MAX",
+    "RASBERY_GPU_WIEL_FOLD",
+    "RASBERY_CMFD_OUTER_FORMS",
+    "RASBERY_XE_FORMS",
+    "RASBERY_XE_MODE",
+    "RASBERY_XE_ANDERSON",
+    "RASBERY_XE_ANDERSON_MAX_STEP",
+    "RASBERY_XE_CASCADE_BUDGET",
+    "RASBERY_XE_INTERIM_L2",
+    "RASBERY_STAGED_FLUX_TOL",
+    "RASBERY_STAGED_XE_TOL",
+    "RASBERY_STAGED_LOOSE_SETTLE",
+    "RASBERY_GA_FEEDBACK_PASSES",
+    "RASBERY_ALLOW_SCREENING",
+};
+
+/// FNV-1a, one 64-bit word at a time.  Chosen because it is eight lines, has no
+/// table, and this is an identity check between two runs of the same binary --
+/// not a cryptographic claim.
+inline void mix(unsigned long long& h, unsigned long long word) {
+    for (int b = 0; b < 8; ++b) {
+        h ^= (word >> (b * 8)) & 0xffull;
+        h *= 1099511628211ull;
+    }
+}
+
+/// The BIT PATTERN of a double.  A digest that folded the printed decimals
+/// would agree across a trajectory change too small to print, which is the one
+/// case it exists to catch.
+inline unsigned long long bits(double v) {
+    unsigned long long u = 0;
+    static_assert(sizeof(u) == sizeof(v), "a double is not eight bytes here");
+    std::memcpy(&u, &v, sizeof(u));
+    return u;
+}
+
+struct Digest {
+    unsigned long long h           = 14695981039346656037ull; ///< FNV-1a offset basis
+    int                statepoints = 0;
+    long long          outers      = 0;
+    long long          th          = 0;
+
+    /// One statepoint, folded at the moment the solver publishes it.
+    void step(int step_number, int outer, int th_steps, double efpd, double eigv,
+              double ppm) {
+        ++statepoints;
+        outers += outer;
+        th     += th_steps;
+        mix(h, static_cast<unsigned long long>(step_number));
+        mix(h, static_cast<unsigned long long>(outer));
+        mix(h, static_cast<unsigned long long>(th_steps));
+        mix(h, bits(efpd));
+        mix(h, bits(eigv));
+        mix(h, bits(ppm));
+    }
+};
+
+/// `"NAME":"value"` for every arm knob, `null` where the variable is unset.
+inline std::string armEnvJson() {
+    std::string out = "{";
+    bool        first = true;
+    for (const char* name : kArmEnv) {
+        const char* v = std::getenv(name);
+        if (!first) out += ",";
+        first = false;
+        out += "\"";
+        out += name;
+        out += "\":";
+        if (v == nullptr) {
+            out += "null";
+        } else {
+            // The values are short flag-like strings; quote them and drop the
+            // two characters that could break the line, rather than pull in a
+            // JSON escaper for a receipt.
+            out += "\"";
+            for (const char* p = v; *p != '\0'; ++p)
+                if (*p != '"' && *p != '\\' && *p != '\n') out += *p;
+            out += "\"";
+        }
+    }
+    out += "}";
+    return out;
+}
+
+} // namespace trajectory
 
 // In-core equilibrium-xenon mode (RASBERY_XE_MODE), resolved once per process.
 //
@@ -3664,6 +3801,10 @@ public:
         std::string sp_job_id;
         int         sp_slot = -1;
         sptelem::Counters sp_run;
+        // The trajectory fold (always on; see the namespace comment).  Declared
+        // beside the telemetry accumulator and armed by nothing: a receipt whose
+        // presence depended on a flag could not answer a question ABOUT flags.
+        trajectory::Digest sp_traj;
         if (sp_telem) {
             sp_job_id = input_output.result_stem();
             if (sp_job_id.empty())
@@ -3793,6 +3934,12 @@ public:
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - step_start).count();
             std::cout << std::format("  NO.={:4d}  EFPD={:10.3f}  K-EFF={:.6f}  PPM={:8.2f}  outer={:3d}  TH={:2d}  t={:5.2f}s\n",
                                      step_number, efpd, eigv, geometry.bppm(0), total_outer, total_th, step_seconds);
+            // The same five numbers the line above prints, folded at full
+            // precision.  HERE and not later because this is where they are the
+            // published values of this statepoint; `step_seconds` is the one
+            // field of that line deliberately left out, being the only one that
+            // is allowed to differ between two runs of the same arm.
+            sp_traj.step(step_number, total_outer, total_th, efpd, eigv, geometry.bppm(0));
 
             const auto io_start = std::chrono::steady_clock::now();
             input_output.AddResult(geometry, eigv, step_index, step_number, efpd);
@@ -3989,6 +4136,20 @@ public:
             // running, never a finished deck's telemetry.
             iowriter::flushLines();
         }
+
+        // The trajectory receipt, unconditionally, as the last line of the run.
+        //
+        // AFTER the telemetry summary and outside its gate, so that the two runs
+        // being compared emit this line in the same place whether the telemetry
+        // is on or off.  `telemetry` is printed and NOT folded into `digest`:
+        // that separation is what makes "instrumentation moved the iteration" a
+        // question two greps can answer.
+        std::cout << std::format(
+            "[RASBERY][TRAJECTORY] {{\"schema_version\":1,\"slot\":{},\"statepoints\":{},"
+            "\"outers\":{},\"th_updates\":{},\"digest\":\"{:016x}\",\"telemetry\":{},"
+            "\"env\":{}}}\n",
+            cmfd_solver.batchSlot(), sp_traj.statepoints, sp_traj.outers, sp_traj.th,
+            sp_traj.h, sp_telem ? 1 : 0, trajectory::armEnvJson());
         return 0;
     }
 };
