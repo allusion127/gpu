@@ -88,6 +88,26 @@ inline void graphCapturePossible() {
     g_graph_capture_possible.store(true, std::memory_order_relaxed);
 }
 
+/// A BACKEND THAT MET A CACHE MISS WITH A CAPTURE ALREADY OPEN ON ITS STREAM.
+///
+/// Both graph caches answer a miss by opening cudaStreamBeginCapture on the
+/// very stream the outer body is being captured on -- a NESTED capture, which
+/// the runtime refuses and which takes the outer capture down with it.  Task 10
+/// part 4's warm-up rule (the segment's outer 0 runs eagerly) is what makes the
+/// caches warm before the body is recorded, so this counter should be zero on
+/// every run; it exists because "should be" is not a measurement.
+///
+/// The backends answer such a miss by ENQUEUEING DIRECTLY instead of capturing.
+/// That is exact -- a graph replay and the enqueue it was captured from are the
+/// same kernels in the same order -- so a non-zero here is a performance and a
+/// contract signal, not a wrong answer.  It is process-wide because both
+/// backends bump it and only the segment receipt prints it.
+inline std::atomic<unsigned long long> g_graph_warmup_misses{0};
+
+inline void graphWarmupMiss() {
+    g_graph_warmup_misses.fetch_add(1, std::memory_order_relaxed);
+}
+
 /// Is this stream recording rather than executing?
 ///
 /// Answered by cudaStreamIsCapturing, which does NOT clear a sticky error and

@@ -50,6 +50,18 @@
 //                           CUDA >= 12.3 escape hatch if (2), (3) and (4) all
 //                           refuse.
 //
+//   (7) exec_update_conditional   Added by part 4 §7 item 3.  May an exec that
+//                           CONTAINS a conditional node be re-pointed with
+//                           cudaGraphExecUpdate?  Two roots of identical
+//                           topology whose bodies splice DIFFERENT child
+//                           graphs; the exec is built from the first, updated
+//                           with the second, and replayed.  `applied` is true
+//                           only when the new child ran and the old one did
+//                           not -- an update that returns success and changes
+//                           nothing is the failure this row separates from a
+//                           refusal.  A `false` here is what makes the WHILE
+//                           key its INSTANTIATION rather than update one exec.
+//
 //   (6) memcpy_in_body      One H2D memcpy node inside the body (the segment's
 //                           fixed {flux} upload), because the conditional-body
 //                           node whitelist is kernel/empty/child/memset/memcpy
@@ -109,7 +121,9 @@ constexpr int kMarkChildGraph  = 1;
 constexpr int kMarkForkJoin    = 2;
 constexpr int kMarkDeviceLaunch= 3;
 constexpr int kMarkMemcpy      = 4;
-constexpr int kMarkSlots       = 5;
+constexpr int kMarkUpdateOld   = 5;   ///< sub-probe (7): the spliced child BEFORE the update
+constexpr int kMarkUpdateNew   = 6;   ///< sub-probe (7): the spliced child AFTER it
+constexpr int kMarkSlots       = 7;
 
 char g_err[16][256];
 int  g_nerr = 0;
@@ -618,6 +632,123 @@ int main() {
         std::fflush(stdout);
     }
 
+    // ---- (7) cudaGraphExecUpdate on an exec that CONTAINS a WHILE ----------
+    //
+    // WHY THIS ROW EXISTS (docs/TASK10_CONDITIONAL_WHILE_20260831_KO.md §3(b)3
+    // and §7 item 3).  The outer body's WHILE is instantiated once per
+    // (deck, shape).  Its body carries CHILD GRAPH NODES -- the CMFD sweep's
+    // graph and the nodal drive's -- and those source graphs are cache entries
+    // that a key change can replace.  If an exec containing a conditional node
+    // can be UPDATED, a replaced child is a cheap re-point of an exec that
+    // already exists.  If it cannot, the only honest answer is to key the
+    // INSTANTIATION as well and cache the execs, which is what the WHILE
+    // implementation does -- so this measurement decides a design, not a
+    // fallback.
+    //
+    // THE TEST IS NOT "did the call return success".  Two roots of identical
+    // topology are built, differing only in WHICH child graph the body splices
+    // -- one marks slot A, the other slot B.  The exec is instantiated from the
+    // first and updated with the second, and then it is REPLAYED: `applied` is
+    // true only when the new child's marks equal the trip count and the old
+    // child's marks are zero.  An update that is accepted and does nothing is
+    // the failure mode this probe exists to distinguish from a refusal.
+    bool eu_api_ok = false, eu_applied = false;
+    int  eu_trips = -1, eu_old_marks = -1, eu_new_marks = -1;
+    cudaError_t eu_err = cudaSuccess;
+    const char* eu_result = "not-asked";
+    {
+        cudaGraph_t child_old = nullptr, child_new = nullptr;
+        cudaError_t brc = buildMarkGraph(kMarkUpdateOld, s, &child_old, nullptr, 0ull);
+        if (brc != cudaSuccess) note("exec_update.child_old", brc);
+        brc = buildMarkGraph(kMarkUpdateNew, s, &child_new, nullptr, 0ull);
+        if (brc != cudaSuccess) note("exec_update.child_new", brc);
+
+        // The same splice sub-probe (3) validated, parameterised by which
+        // source graph gets hung off the body.
+        auto splice = [](cudaGraph_t child) {
+            return [child](cudaStream_t body_stream, cudaGraph_t) -> cudaError_t {
+                cudaStreamCaptureStatus st{};
+                unsigned long long id = 0;
+                cudaGraph_t cur = nullptr;
+                const cudaGraphNode_t* deps = nullptr;
+                size_t nd = 0;
+                cudaError_t r = cudaStreamGetCaptureInfo(body_stream, &st, &id, &cur,
+                                                         &deps, &nd);
+                if (r != cudaSuccess) return r;
+                cudaGraphNode_t node = nullptr;
+                r = cudaGraphAddChildGraphNode(&node, cur, deps, nd, child);
+                if (r != cudaSuccess) return r;
+                return cudaStreamUpdateCaptureDependencies(body_stream, &node, 1,
+                                                           cudaStreamSetCaptureDependencies);
+            };
+        };
+
+        WhileBuild a, b2;
+        const char* stage_a = "";
+        const char* stage_b = "";
+        cudaError_t ra = buildWhile(s, bs, kLimit, &a, splice(child_old), &stage_a);
+        if (ra != cudaSuccess) { eu_err = ra; note("exec_update.build_old", ra); }
+        cudaError_t rb = ra == cudaSuccess
+                             ? buildWhile(s, bs, kLimit, &b2, splice(child_new), &stage_b)
+                             : cudaSuccess;
+        if (ra == cudaSuccess && rb != cudaSuccess) {
+            eu_err = rb;
+            note("exec_update.build_new", rb);
+        }
+        if (ra == cudaSuccess && rb == cudaSuccess) {
+            cudaGraphExecUpdateResultInfo info{};
+            const cudaError_t urc = cudaGraphExecUpdate(a.exec, b2.root, &info);
+            eu_api_ok = urc == cudaSuccess;
+            if (!eu_api_ok) { eu_err = urc; cudaGetLastError(); }
+            switch (info.result) {
+                case cudaGraphExecUpdateSuccess: eu_result = "success"; break;
+                case cudaGraphExecUpdateErrorTopologyChanged:
+                    eu_result = "topology-changed"; break;
+                case cudaGraphExecUpdateErrorNodeTypeChanged:
+                    eu_result = "node-type-changed"; break;
+                case cudaGraphExecUpdateErrorNotSupported:
+                    eu_result = "not-supported"; break;
+                case cudaGraphExecUpdateErrorUnsupportedFunctionChange:
+                    eu_result = "unsupported-function-change"; break;
+                case cudaGraphExecUpdateErrorParametersChanged:
+                    eu_result = "parameters-changed"; break;
+                case cudaGraphExecUpdateErrorAttributesChanged:
+                    eu_result = "attributes-changed"; break;
+                default: eu_result = "error"; break;
+            }
+            if (eu_api_ok) {
+                k_zero<<<1, 1, 0, s>>>(g_counter);
+                cudaMemsetAsync(g_marks + kMarkUpdateOld, 0, sizeof(int), s);
+                cudaMemsetAsync(g_marks + kMarkUpdateNew, 0, sizeof(int), s);
+                cudaError_t r = cudaStreamSynchronize(s);
+                if (r == cudaSuccess) r = cudaGraphLaunch(a.exec, s);
+                if (r == cudaSuccess) r = cudaStreamSynchronize(s);
+                if (r != cudaSuccess) { eu_err = r; note("exec_update.replay", r); }
+                else {
+                    cudaMemcpy(&eu_trips, g_counter, sizeof(int), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(&eu_old_marks, g_marks + kMarkUpdateOld, sizeof(int),
+                               cudaMemcpyDeviceToHost);
+                    cudaMemcpy(&eu_new_marks, g_marks + kMarkUpdateNew, sizeof(int),
+                               cudaMemcpyDeviceToHost);
+                    eu_applied = eu_trips == kLimit && eu_new_marks == kLimit &&
+                                 eu_old_marks == 0;
+                }
+            }
+        }
+        std::printf("{\"probe\":\"while_body_capture\",\"record\":\"exec_update_conditional\","
+                    "\"api_ok\":%s,\"result\":\"%s\",\"applied\":%s,\"err\":\"%s\","
+                    "\"trips\":%d,\"old_marks\":%d,\"new_marks\":%d,\"stage\":[\"%s\",\"%s\"]}\n",
+                    eu_api_ok ? "true" : "false", eu_result,
+                    eu_applied ? "true" : "false",
+                    eu_err == cudaSuccess ? "none" : cudaGetErrorName(eu_err),
+                    eu_trips, eu_old_marks, eu_new_marks, stage_a, stage_b);
+        destroyWhile(&a);
+        destroyWhile(&b2);
+        if (child_old != nullptr) cudaGraphDestroy(child_old);
+        if (child_new != nullptr) cudaGraphDestroy(child_new);
+        std::fflush(stdout);
+    }
+
     for (int i = 0; i < g_nerr; ++i)
         std::printf("{\"probe\":\"while_body_capture\",\"record\":\"error\",\"what\":\"%s\"}\n",
                     g_err[i]);
@@ -628,7 +759,8 @@ int main() {
                 "\"graph_launch_in_capture\":{\"api\":%s,\"recorded\":%s,\"replayed\":%s},"
                 "\"child_graph_node\":%s,\"fork_join_in_body\":%s,"
                 "\"device_launch_in_body\":{\"asked\":%s,\"ok\":%s},"
-                "\"memcpy_in_body\":%s}\n",
+                "\"memcpy_in_body\":%s,"
+                "\"exec_update_conditional\":{\"api\":%s,\"applied\":%s,\"result\":\"%s\"}}\n",
                 CUDART_VERSION, prop.major, prop.minor,
                 while_ok ? "true" : "false",
                 gl_api_ok ? "true" : "false",
@@ -637,7 +769,8 @@ int main() {
                 cg_ok ? "true" : "false",
                 fj_ok ? "true" : "false",
                 dl_asked ? "true" : "false", dl_ok ? "true" : "false",
-                mc_ok ? "true" : "false");
+                mc_ok ? "true" : "false",
+                eu_api_ok ? "true" : "false", eu_applied ? "true" : "false", eu_result);
     std::fflush(stdout);
 
     cudaEventDestroy(ev_out);

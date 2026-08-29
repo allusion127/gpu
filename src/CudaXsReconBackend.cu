@@ -3464,6 +3464,20 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         } else {
             g_nodal_graph_launches.fetch_add(1, std::memory_order_relaxed);
         }
+    } else if (rasbery::graphCaptureActive(d.stream)) {
+        // Rev.7.1 Task 10 part 4: A MISS INSIDE A CAPTURED OUTER BODY.
+        //
+        // d.stream is pulled into the outer body's capture by the handover
+        // event, so the drain and the cudaStreamBeginCapture below would be a
+        // host rendezvous and a NESTED capture on a recording stream -- the
+        // second of which is refused and invalidates the outer capture.  The
+        // direct enqueue is the same kernels the graph would have replayed, so
+        // the body records the right work; what it does not do is populate the
+        // cache, which is the segment's outer 0's job.
+        //
+        // COUNTED rather than silent: graph_warmup_misses is a gate at 0.
+        rasbery::graphWarmupMiss();
+        ok = enqueue_full();
     } else {
         // Capture once, then replay for the rest of the run.  The conditional
         // uploads above are already queued on this stream; drain them so the

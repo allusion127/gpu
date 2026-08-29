@@ -2559,8 +2559,28 @@ public:
         cuda_transfer::ByteExactMirror<double> dtil_mirror;
         MirroredUpload chif_mirror;
         MirroredUpload vol_mirror;
-        double        sweep_in[kSweepCount]  = {};
-        double        sweep_out[kSweepCount] = {};
+        // ---- Rev.7.1 Task 10 part 4 precondition (a): PINNED, NOT INLINE ----
+        //
+        // These two used to be `double[kSweepCount]` VALUE arrays inside the
+        // Slot, which put them in the std::vector<Slot>'s pageable storage --
+        // and both are cudaMemcpyAsync endpoints on the sweep's hot path
+        // (issueSweepUploads' H2D, issueSweepDownloads' D2H, one of each per
+        // outer).  A pageable async copy is not asynchronous: the driver
+        // stages it through its own bounce buffer and the call blocks.  It is
+        // also NOT RECORDABLE -- a cudaMemcpyAsync from pageable memory issued
+        // on a capturing stream is refused and invalidates the capture, which
+        // is what stopped the outer body from being captured at all.
+        //
+        // They now point into BatchCore::host_sweep_scalars, one 2*kSweepCount
+        // lane per slot, cudaMallocHost'd once at stand-up.  Every one of the
+        // 22 use sites reads them exactly as before (an array name was already
+        // a pointer at every one of them); what changed is where the bytes
+        // live.  bindSweepLanes() is the single place that sets them, and
+        // acquireSlot re-runs it after its whole-struct reset -- `Slot{}` sets
+        // both to nullptr, and the reset audit (batchSlotIsReset) tests for
+        // that rather than trusting it.
+        double*       sweep_in               = nullptr;
+        double*       sweep_out              = nullptr;
         int           sweep_unroll           = 0;
     };
 
@@ -2865,6 +2885,22 @@ public:
                                       SL * sizeof(std::uint32_t)));
             std::memset(host_sweep_halt, 0, SL * sizeof(std::uint32_t));
 
+            // Rev.7.1 Task 10 part 4 precondition (a).  The sweep scalar block,
+            // page-locked.  TWO lanes per slot -- in then out, adjacent -- not
+            // one lane per LAUNCH like the masks above: unlike host_active this
+            // block is not rewritten by a second launcher while a first one's
+            // DMA reads it, because a slot has one tenant and a tenant's
+            // launches are ordered by the arena's own stream.  The
+            // per-launcher lanes exist for the FLEET-WIDE masks, which every
+            // launcher writes; this is per-slot state and stays per-slot.
+            CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&host_sweep_scalars),
+                                      static_cast<std::size_t>(S) * 2u *
+                                          static_cast<std::size_t>(kSweepCount) *
+                                          sizeof(double)));
+            std::memset(host_sweep_scalars, 0,
+                        static_cast<std::size_t>(S) * 2u *
+                            static_cast<std::size_t>(kSweepCount) * sizeof(double));
+
             // The lane -> slot map.  Allocated once at the FULL fleet width
             // whatever a launch's bucket turns out to be, so d_slot_map is a
             // fixed address a captured graph can bake, and seeded with the
@@ -2884,6 +2920,7 @@ public:
             CUBLAS_CHECK(cublasSetStream(handle, stream));
             CUBLAS_CHECK(cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_DEVICE));
             slot.resize(static_cast<size_t>(slots));
+            for (int m = 0; m < slots; ++m) bindSweepLanes(m);
             available = true;
         } catch (const std::exception& error) {
             status = error.what();
@@ -2896,6 +2933,26 @@ public:
     void allocate(void** pointer, size_t bytes) {
         rasbery::AllocWindow window("cmfd.arena.malloc");
         CUDA_CHECK(cudaMalloc(pointer, bytes));
+    }
+
+    /// Point slot m's sweep scalar block at its pinned lane and zero it.
+    ///
+    /// THE ONLY WRITER OF THESE TWO POINTERS, and it is called from exactly
+    /// two places: stand-up, and acquireSlot after the whole-struct reset.  A
+    /// third caller would be a slot rebinding under a launch whose DMA reads
+    /// the lane, which is why there is not one.
+    void bindSweepLanes(int m) {
+        if (host_sweep_scalars == nullptr) return;
+        Slot& sl = slot[static_cast<std::size_t>(m)];
+        sl.sweep_in =
+            host_sweep_scalars + static_cast<std::size_t>(m) * 2u *
+                                     static_cast<std::size_t>(kSweepCount);
+        sl.sweep_out = sl.sweep_in + kSweepCount;
+        // The bytes `double sweep_in[kSweepCount] = {}` used to give: the
+        // reset audit reads them, and a stale lane would make a recycled slot
+        // look like the previous tenant's.
+        std::memset(sl.sweep_in, 0, 2u * static_cast<std::size_t>(kSweepCount) *
+                                        sizeof(double));
     }
 
     void release() {
@@ -2978,6 +3035,12 @@ public:
         host_active = nullptr;
         if (host_sweep_halt != nullptr) cudaFreeHost(host_sweep_halt);
         host_sweep_halt = nullptr;
+        // The slots alias this block, so it is freed only after every slot has
+        // stopped pointing at it -- and they are cleared here rather than in
+        // ~Slot, because release() can run while the vector is still alive.
+        for (auto& sl : slot) { sl.sweep_in = nullptr; sl.sweep_out = nullptr; }
+        if (host_sweep_scalars != nullptr) cudaFreeHost(host_sweep_scalars);
+        host_sweep_scalars = nullptr;
         if (host_assembly_active != nullptr) cudaFreeHost(host_assembly_active);
         host_assembly_active = nullptr;
         neighbors = nullptr;
@@ -3572,6 +3635,17 @@ public:
                 if (iter_batch_used >= 2) ++telemetry.batched_graph_launches;
                 return;
             }
+            // Rev.7.1 Task 10 part 4: THE SAME RULE AS launch_sweeps', AND FOR
+            // THE SAME REASON THIS SITE ALREADY GOT THE SPLICE (part 4 §5.4).
+            // The BiCG outer graph is not on the RESIDENT_SINGLE segment path
+            // TODAY -- but "today" is a premise nobody has to break on purpose,
+            // and the failure if it is broken is a nested capture, which is
+            // fatal rather than slow.  The direct enqueue is the same kernels.
+            if (rasbery::graphCaptureActive(stream)) {
+                rasbery::graphWarmupMiss();
+                enqueue_outer(nmax);
+                return;
+            }
             cudaGraph_t graph = nullptr;
             cudaError_t rc    = cudaSuccess;
             {
@@ -3735,6 +3809,26 @@ public:
                                                         stream));
                 ++telemetry.graph_launches;
                 if (iter_batch_used >= 2) ++telemetry.batched_graph_launches;
+                return;
+            }
+            // Rev.7.1 Task 10 part 4: A MISS INSIDE A CAPTURED OUTER BODY IS
+            // ANSWERED WITH THE ENQUEUE, NOT WITH A NESTED CAPTURE.
+            //
+            // `stream` is the segment's, and inside a WHILE body capture it is
+            // recording.  cudaStreamBeginCapture on a stream already capturing
+            // is refused -- and the existing failure path answers a refusal by
+            // destroying the graph caches and setting use_graph=false for the
+            // rest of the RUN, which is a silent performance cliff whose cause
+            // would be four frames away.  The direct enqueue below is the same
+            // kernels in the same order as the replay it stands in for, so the
+            // body records exactly what a warm cache would have spliced.
+            //
+            // COUNTED, because it means the warm-up rule did not hold: the
+            // segment's outer 0 runs eagerly precisely so this cache is warm by
+            // the time outer 1 is captured.  The gate is graph_warmup_misses 0.
+            if (rasbery::graphCaptureActive(stream)) {
+                rasbery::graphWarmupMiss();
+                enqueue_sweeps(nmax, unroll);
                 return;
             }
             // The capacity ratchet, now PER BUCKET: start from the deepest
@@ -4336,6 +4430,10 @@ public:
     /// both are page-locked and both are memcpyAsync SOURCES in the same
     /// launcher window, so neither may be rewritten to serve the other.
     std::uint32_t*     host_sweep_halt = nullptr;
+    /// Rev.7.1 Task 10 part 4 precondition (a): the page-locked home of every
+    /// slot's sweep scalar block, `slots` x 2 x kSweepCount doubles.  See
+    /// Slot::sweep_in and bindSweepLanes().
+    double*            host_sweep_scalars = nullptr;
     /// Which lane the launch being staged writes into.  Set by the caller
     /// under `stream_mutex` and read by buildSlotMap / issueUploads /
     /// issueSweepUploads; `slots` is the rendezvous lane.
@@ -4780,6 +4878,12 @@ public:
         !sl.chif_mirror.valid && !sl.vol_mirror.valid && !sl.xsrf_mirror.valid() &&
         !sl.xssm_mirror.valid() && !sl.xsnf_mirror.valid() && !sl.dtil_mirror.valid();
     if (!pointers_clear || !flags_default || !mirrors_clear) return false;
+    // Rev.7.1 Task 10 part 4 precondition (a).  The scalar block is a pinned
+    // lane now, so "reset" is two facts and not one: the slot points at its
+    // lane (Slot{} nulls it, bindSweepLanes puts it back) and the lane is
+    // zero.  Order matters -- the null test is what stops the loop below from
+    // reading through a pointer the reset just cleared.
+    if (sl.sweep_in == nullptr || sl.sweep_out == nullptr) return false;
     for (int i = 0; i < kSweepCount; ++i)
         if (sl.sweep_in[i] != 0.0 || sl.sweep_out[i] != 0.0) return false;
     return true;
@@ -4821,6 +4925,12 @@ int CudaBatchArena::acquireSlot() {
         // assignment is a no-op -- same reset the NodalArena already does.
         BatchCore::Slot& sl = _impl->core.slot[static_cast<size_t>(m)];
         sl        = BatchCore::Slot{};
+        // ...and the one field the whole-struct reset CANNOT restore, because
+        // its correct value is not a constant: sweep_in/sweep_out point into
+        // the arena's pinned block (Task 10 part 4 precondition (a)), and
+        // Slot{} nulls them.  Re-bound here, before the audit below, which
+        // tests for exactly this.
+        _impl->core.bindSweepLanes(m);
         // Rev.7.1 Task 20 (plan Sec 3.2 "재활용 감사", Sec 8.2).  The reset above
         // is a whole-struct assignment, so it cannot MISS a field -- but it can
         // stop being one.  This checks the post-condition rather than trusting
