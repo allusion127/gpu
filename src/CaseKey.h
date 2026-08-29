@@ -91,23 +91,23 @@ inline void appendValue(std::string& out, const Json& value) {
             out += '~';
             return;
         case nlohmann::json::value_t::boolean:
-            out += value.get<bool>() ? 'T' : 'F';
+            out += value.template get<bool>() ? 'T' : 'F';
             return;
         case nlohmann::json::value_t::number_integer:
             out += 'i';
-            out += std::to_string(value.get<long long>());
+            out += std::to_string(value.template get<long long>());
             return;
         case nlohmann::json::value_t::number_unsigned:
             out += 'i';
-            out += std::to_string(value.get<unsigned long long>());
+            out += std::to_string(value.template get<unsigned long long>());
             return;
         case nlohmann::json::value_t::number_float:
             out += 'd';
             // %.17g, the one float spelling both languages produce identically.
-            out += std::format("{:.17g}", value.get<double>());
+            out += std::format("{:.17g}", value.template get<double>());
             return;
         case nlohmann::json::value_t::string:
-            appendString(out, value.get<std::string>());
+            appendString(out, value.template get<std::string>());
             return;
         case nlohmann::json::value_t::array:
             out += '[';
@@ -256,7 +256,7 @@ inline CoreCanon canonicalCore(const CoreMap& core, int symang, bool /*mirror*/)
 template <class Json>
 inline std::string deckPayload(const Json& config, std::string* core_op = nullptr) {
     const CoreMap core =
-        config.contains("core") ? config.at("core").get<CoreMap>() : CoreMap{};
+        config.contains("core") ? config.at("core").template get<CoreMap>() : CoreMap{};
     int  symang = 0;
     bool mirror = false;
     int  symdiv = 0;

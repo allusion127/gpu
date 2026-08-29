@@ -135,7 +135,11 @@ def source_contract() -> None:
     if '"{:.17g}"' not in CASEKEY_H:
         fail("CaseKey.h no longer spells floats through {:.17g}; python uses %.17g "
              "and the two would drift on the first non-integer deck value")
-    for token in ("out += '~';", "out += value.get<bool>() ? 'T' : 'F';",
+    # `value.template get<bool>()`, not `value.get<bool>()`: `value` has a
+    # DEPENDENT type inside `template <class Json> appendValue`, and GCC 14.3
+    # rejects the undisambiguated spelling that MSVC accepts.  The token asserted
+    # here is the one that compiles on 238; see test_dependent_template_contract.py.
+    for token in ("out += '~';", "out += value.template get<bool>() ? 'T' : 'F';",
                   "std::sort(keys.begin(), keys.end());"):
         if token not in CASEKEY_H:
             fail(f"CaseKey.h lost the canonical token rule {token!r}")
