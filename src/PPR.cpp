@@ -812,12 +812,18 @@ void PPR::reconstructPinPower(bool use_quadrature, bool reconstruct_flux) {
             if (ref_lk < 0) continue;
 
             // Get burn-interpolated form functions from Chiffon model
-            size_t mi    = _xs.comp(ref_lk);
-            auto&  model = _xs.models()[mi];
-            int    burn  = _xs.burn(ref_lk);
+            size_t      mi    = _xs.comp(ref_lk);
+            // CONST, and .at(0): the parsed models are shared by every Driver
+            // in the process (XsLibrary.h).  `auto&` selected the mutating
+            // overloads -- `_refr_dpts[0]` inserts an empty ctype row when the
+            // key is missing -- which is a write into another deck's library.
+            // XSSet::Initialize already refuses any library whose node models
+            // lack ctype 0, so .at(0) cannot be the throwing case here.
+            const auto& model = _xs.models()[mi];
+            int         burn  = _xs.burn(ref_lk);
 
             // Interpolate fmap/gmap between bounding burnup points
-            auto& refrMap = model._refr_dpts[0];
+            const auto& refrMap = model._refr_dpts.at(0);
             auto  hiIt    = refrMap.lower_bound(burn);
             auto  loIt    = hiIt;
 

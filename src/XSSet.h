@@ -7,6 +7,8 @@
 #include "XsReconKernel.h"
 #include "Geometry.h"
 #include "Model.h"
+// XSArraySet, the library-derived flatten, and the process-wide parse cache.
+#include "XsLibrary.h"
 
 #include <array>
 #include <atomic>
@@ -19,19 +21,9 @@
 
 namespace rasbery {
 
-// SoA cross-section array set
-struct XSArraySet {
-    milk::Vector<double> xstf, xsdf, xsaf, xsff, xsnf, xskf, xssf, xsrf;
-    milk::Vector<double> fyld, xs2n, xs3n;
-    milk::Vector<double> xssm;
-
-    void allocate(size_t scalar_size, size_t sm_size);
-    void clear();
-    void fill(double v);
-
-    milk::Vector<double>&       operator[](Chiffon::XSTYPE xt);
-    const milk::Vector<double>& operator[](Chiffon::XSTYPE xt) const;
-};
+// XSArraySet now lives in XsLibrary.h: the library flatten and the node-wise
+// live blocks are the same shape, and the flatten had to move to a header that
+// carries no Geometry.
 
 struct DepletionWorkspace;
 
@@ -77,61 +69,14 @@ private:
 
     void LoadTHTables();
 
-    // Chiffon database
-
-    std::vector<Chiffon::Model> _models;
-
-    static constexpr int BRANCH_BPPM = 0;
-    static constexpr int BRANCH_TFUL = 1;
-    static constexpr int BRANCH_DMOD = 2;
-    static constexpr int NUM_SCALAR_BRANCHES = 3;
-
-    struct DeltaInfo {
-        int nord        = 0;
-        int mode        = 0;
-        int ncoeff      = 0;
-        int coeff_base  = 0;
-        int knot_offset = 0;
-        int knot_count  = 0;
-    };
-
-    struct SpectralHistoryInfo {
-        Chiffon::SpectralTerm term;
-        size_t                delta_base = 0;
-        std::vector<int>      burnups;
-        bool                  rod_scaled = false;
-    };
-
-    bool _lib_has_coeff_micx = false; // any delta has microscopic XS
-
-    std::vector<size_t>                        _refr_base;        // model -> first reference flat id
-    std::vector<size_t>                        _refr_ctyp_stride; // model -> flat ids per reference ctype row
-    std::vector<size_t>                        _refr_burn_stride; // model -> flat id step per reference burn point
-    std::vector<std::vector<int>>              _refr_ctyp;        // model -> ordered reference ctype list
-    std::vector<std::vector<std::vector<int>>> _refr_burn;        // model -> ctype -> burn keys
-
-    std::vector<std::vector<size_t>>                        _brch_base;        // model, branch -> first delta id
-    std::vector<std::vector<size_t>>                        _brch_ctyp_stride; // model, branch -> ids per ctype row
-    std::vector<std::vector<size_t>>                        _brch_burn_stride; // model, branch -> id step per burn point
-    std::vector<std::vector<std::vector<int>>>              _brch_ctyp;        // model, branch -> ctype list
-    std::vector<std::vector<std::vector<std::vector<int>>>> _brch_burn;        // model, branch, ctype -> burn keys
-
-    XSArraySet                         _lib_lmpx;         // library reference lumped XS, indexed by depletion point
-    XSArraySet                         _lib_micx;         // library reference microscopic XS, indexed by depletion point
-    milk::Vector<double>               _lib_iden;         // library reference isotope densities
-    std::vector<double>                _lib_burn;         // library reference burnup in GWd/THM
-    std::vector<double>                _lib_wvfr;         // library reference water volume fraction
-    std::vector<std::array<double, 3>> _lib_ref_branch_x; // reference bppm/tful/dmod coordinates
-    std::vector<double>                _lib_flux;         // library reference average flux [dpt*ng + ig]
-    std::vector<double>                _lib_chix;         // library reference fission spectrum [dpt*ng + ig]
-
-    XSArraySet                                      _lib_coeff_lmpx; // branch delta coefficients for lumped XS
-    XSArraySet                                      _lib_coeff_micx; // branch delta coefficients for microscopic XS
-    std::vector<DeltaInfo>                          _lib_deltas;     // branch delta metadata and coefficient offsets
-    std::vector<double>                             _lib_knots;      // concatenated spline knots for branch deltas
-    std::vector<double>                             _lib_model_volu; // model reference volume for burnup normalization
-    std::vector<double>                             _lib_model_hmas; // model heavy metal mass for burnup normalization
-    std::vector<std::vector<SpectralHistoryInfo>> _lib_spectral_history;
+    // Chiffon database.
+    //
+    // The parse and its flatten are shared, immutable, and owned by the
+    // process-wide cache in XsLibrary.h -- every field that used to live here
+    // as `_models`, `_lib_*`, `_refr_*` or `_brch_*` is now `_lib->...`.  The
+    // pointer is null until Initialize() runs, which is the same window in
+    // which the old members were empty.
+    std::shared_ptr<const XsLibrary> _lib;
 
     // Node-wise data
     std::vector<int>                 _node_refr_lo;    // node -> lower reference depletion point id
@@ -153,7 +98,7 @@ private:
     // far its own U235/Pu239 balance has been driven toward the rodded
     // trajectory. Everything here is inert (partner < 0, weight 0) unless the
     // library carries the twin, so single-library runs are untouched.
-    std::vector<int>                 _lib_history_partner; // model -> partner model index (-1 none)
+    // (the model -> partner map is library data: _lib->lib_history_partner)
     std::vector<double>              _node_hw;             // node -> blend weight in [0,1]
     std::vector<int>                 _node_refr_lo_p;      // node -> partner lower reference id
     std::vector<int>                 _node_refr_hi_p;      // node -> partner upper reference id
@@ -326,14 +271,9 @@ private:
     [[nodiscard]] double NormFactor(double power, const XSArraySet& xs_arr, const double* flux) const;
 
     void               unpackXS(const Chiffon::CrossSection& xs, size_t l, size_t ngrp, size_t nxyz, size_t niso_count);
-    void               FlattenReferenceCrossSection(size_t flat, const Chiffon::DepletionPoint& dpt);
-    void               FlattenDeltaCrossSection(size_t coeff_base, const Chiffon::DeltaCrossSection& dxs);
-    void               FlattenBranchDelta(const Chiffon::BranchDelta& bd, size_t mi, int branch,
-                                          size_t& delta_slot_idx, size_t& coeff_idx, size_t& knot_offset);
-    void               FlattenSpectralHistory(
-        const Chiffon::SpectralHistoryCorrection& correction,
-        SpectralHistoryInfo& info, size_t& delta_slot_idx,
-        size_t& coeff_idx, size_t& knot_offset);
+    // The four Flatten* helpers moved to XSSet.cpp as free functions over
+    // XsLibrary: they never read anything but (models, ng, niso), which is
+    // what made the parse shareable in the first place.
     void               RebuildUsesRodCache();
     [[nodiscard]] bool UsesRodXS(int l) const;
     /// @brief One fitted spectral-history surface to apply.
@@ -664,8 +604,13 @@ public:
     void                 BuildRodProfileMatrix(const std::map<std::string, std::vector<double>>& profiles);
     [[nodiscard]] double rod_max_step() const { return _rod_ncols > 1 ? static_cast<double>(_rod_ncols - 1) : 0.0; }
 
-    std::vector<Chiffon::Model>&                     models() { return _models; }
-    [[nodiscard]] const std::vector<Chiffon::Model>& models() const { return _models; }
+    /// The parsed library models.  CONST ONLY: the parse is shared by every
+    /// Driver in the process (XsLibrary.h), so a mutable handle to it is a
+    /// data race with every other deck that named the same library file.
+    [[nodiscard]] const std::vector<Chiffon::Model>& models() const { return _lib->models; }
+
+    /// The shared parse itself, for callers that need its provenance.
+    [[nodiscard]] const std::shared_ptr<const XsLibrary>& library() const { return _lib; }
 
     // Macroscopic XS accessors
     [[nodiscard]] double xsnf(const int& ig, const int& l) const { return _xs.xsnf[ig * _g.nxyz() + l]; }
@@ -739,8 +684,11 @@ public:
         return _micx.xssm[elem];
     }
 
-    [[nodiscard]] double& fmap(const int& ig, const int& l, const int& pinx, const int& piny);
-    [[nodiscard]] double& gmap(const int& l, const int& pinx, const int& piny);
+    // fmap()/gmap() are gone.  They handed out `double&` into the parsed
+    // models, had no caller anywhere in the tree, and indexed `_fmap` with a
+    // node id against an assembly-sized array -- so they could not have had
+    // one.  A mutable alias into a shared parse is the one thing this cache
+    // cannot allow; PPR reads the same form functions through const models().
 
     // Node-level isotope density helpers
     [[nodiscard]] std::vector<double> getNodeIden(int l) const;

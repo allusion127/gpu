@@ -764,6 +764,10 @@ int main(int argc, char* argv[]) {
                   << hdf5_stats.acquisitions << ",\"wait_ms\":"
                   << static_cast<double>(hdf5_stats.wait_nanoseconds) / 1.0e6
                   << "}" << std::endl;
+        // Read beside [HDF5][LOCK]: what that lock used to hold was this parse,
+        // once per deck (XsLibrary.h).  loads == 1 with hits == jobs - 1 is the
+        // shape the batch is supposed to have.
+        rasbery::PrintXsLibraryCacheReceipt(std::cout);
         // Final writer counters.  Read together with [HDF5][LOCK] above, but
         // note the ACQUISITION count does not move: inline already took the
         // guard once per write function.  What the thread path changes is who
@@ -861,6 +865,7 @@ int main(int argc, char* argv[]) {
               << hdf5_stats.acquisitions << ",\"wait_ms\":"
               << static_cast<double>(hdf5_stats.wait_nanoseconds) / 1.0e6
               << "}" << std::endl;
+    rasbery::PrintXsLibraryCacheReceipt(std::cout);
     rasbery::iowriter::reportSummary(std::cout);
     return exit_code;
 }

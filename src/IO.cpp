@@ -536,10 +536,31 @@ void IO::ParseSchedule(const nlohmann::ordered_json& config) {
 
 // Read one JSON input deck and initialize geometry, XS, and scheduler state.
 void IO::ReadInput(const std::string& filepath) {
-    // This scope covers restart reads, shuffle reads, and XSSet::Initialize()
-    // (which loads the CHIFFON HDF5 library) as one transaction.  The guard is
-    // recursive because helper paths also protect their direct HDF5 entrypoints.
-    Chiffon::Hdf5Guard hdf5_guard;
+    // THE GUARD IS NOT HELD HERE, AND THAT IS THE POINT.
+    //
+    // It used to wrap this whole function -- "restart reads, shuffle reads and
+    // XSSet::Initialize as one transaction".  But the guard exists for one
+    // reason only, that HDF5 1.10.x is not thread-safe (Hdf5Guard.h); nothing
+    // in this function needs a transaction, and the transaction is what turned
+    // eight concurrent workers into a queue.  Under it sat the 34 MB CHIFFON
+    // parse, per deck, per worker: Init+IO 4.108 .. 14.506 s across a width-8
+    // wave, ~1.49 s of slope per case, 63.8 s of lock wait for eight decks
+    // (GA evaluator plan Sec 3.1(a)).
+    //
+    // The parse itself is now shared (XsLibrary.h), so the second worker has
+    // nothing to parse.  What is left here is JSON parsing, the geometry build
+    // and the nxyz-sized allocations -- pure per-deck host work that touches no
+    // HDF5 and has no business being serialised.  So the guard moves DOWN, onto
+    // the four places that actually enter the HDF5 runtime:
+    //
+    //   * the restart EFPD probe below,
+    //   * the shuffle-spec source reads,
+    //   * LoadGeometryFromRestart and ApplyShuffle (both already take their own
+    //     guard -- it is recursive, so a caller's scope nests harmlessly),
+    //   * the trailing restart-state restore.
+    //
+    // XSSet::Initialize needs none: Importer::LoadHDF takes its own guard, and
+    // a cache hit never reaches it.
     // 1. Resolve the input directory and load the JSON deck.
     {
         std::filesystem::path input_path(filepath);
@@ -606,6 +627,7 @@ void IO::ReadInput(const std::string& filepath) {
     }
 
     if (!_restart_files.empty()) {
+        Chiffon::Hdf5Guard hdf5_guard;
         const std::string& efpd_restart_path = _restart_files.rbegin()->second;
         HighFive::File     rfile(efpd_restart_path, HighFive::File::ReadOnly);
         if (rfile.exist("metadata")) {
@@ -666,6 +688,11 @@ void IO::ReadInput(const std::string& filepath) {
         geometry_input.batch = batches;
 
         _shuffle_specs.clear();
+        // One guard over the whole shuffle scan, not one per dataset: the
+        // HighFive::File below is read in two places and its DESTRUCTOR also
+        // enters the HDF5 runtime.  Still far narrower than the function-wide
+        // guard this replaced, and a deck with no shuffle never enters here.
+        Chiffon::Hdf5Guard shuffle_guard;
         for (int row = 0; row < static_cast<int>(geometry_input.core.size()); ++row) {
             for (int col = 0; col < static_cast<int>(geometry_input.core[row].size()); ++col) {
                 ShuffleSpec spec;
@@ -814,6 +841,7 @@ void IO::ReadInput(const std::string& filepath) {
 
     // 4. Restore restart-state fields after the model library is ready.
     if (!_restart_path.empty() && _shuffle_specs.empty()) {
+        Chiffon::Hdf5Guard hdf5_guard;
         const int nxyz = _g.nxyz();
         const int niso = static_cast<int>(Chiffon::Isotope::niso);
 
