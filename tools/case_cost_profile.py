@@ -172,11 +172,11 @@ def profile_log(log: Path, wall_dir: Path | None) -> dict:
     # inside loop_wall/floor_wall buckets, so adding it would double count.
     for obj, prefix in (("phase_wall", "phase_"), ("loop_wall", "loop_"),
                         ("floor_wall", "floor_"), ("nested_wall", "nested_"),
-                        ("floor_transfer", "floortx_")):
+                        ("floor_transfer", "floortx_"), ("search", "srch_")):
         block = sp.get(obj) or {}
         for name, value in block.items():
             rec[prefix + name] = value
-        if block and obj not in ("floor_transfer", "nested_wall"):
+        if block and obj not in ("floor_transfer", "nested_wall", "search"):
             rec[prefix + "sum"] = sum(float(v) for v in block.values())
     if "nested_flatxs" in rec:
         rec["nested_sum"] = float(rec["nested_flatxs"])
@@ -403,6 +403,28 @@ def render(rows: list[dict], stream=sys.stdout) -> None:
                 f"floor {row.get('floor_sum') or 0:6.2f} s  "
                 f"residual {row.get('residual_seconds', float('nan')):6.2f} s  "
                 f"({100 * (row.get('named_fraction') or 0):.1f} % of solve named)\n")
+        # WP9-D.  The search ledger.  `outers/trial` is the number the plan's
+        # trial-reduction options are priced against: a trial is not one outer,
+        # it is a Xe cascade's worth of re-convergence, and the ratio says how
+        # many.  The method split says WHICH lever could apply -- a run that is
+        # mostly `probe` has no slope to carry and wants a seeded bracket; one
+        # that is mostly `bisect` has a bracket that is not narrowing.
+        if row.get("srch_trials") is not None:
+            trials = int(row.get("srch_trials") or 0)
+            outers = float(row.get("search_outers") or 0)
+            stream.write(
+                f"{row['name']:>16}  search     trials {trials:5d}  "
+                f"outers {int(outers):6d}  "
+                f"({outers / max(1, trials):6.1f} outers/trial, "
+                f"{100.0 * outers / max(1.0, float(row.get('outers') or 1)):4.1f} % of run)  "
+                f"proposals {int(row.get('srch_proposals') or 0):5d}  "
+                f"refused {int(row.get('srch_refused') or 0):4d}\n")
+            stream.write(
+                f"{row['name']:>16}  search     method  probe {int(row.get('srch_probe') or 0):5d}"
+                f"  carry {int(row.get('srch_carry_secant') or 0):5d}"
+                f"  secant {int(row.get('srch_secant') or 0):5d}"
+                f"  bisect {int(row.get('srch_bisect') or 0):5d}"
+                f"  iterations {int(row.get('srch_iterations') or 0):5d}\n")
         if row.get("floortx_d2h_bytes") is not None:
             stream.write(
                 f"{row['name']:>16}  boundary   H2D "

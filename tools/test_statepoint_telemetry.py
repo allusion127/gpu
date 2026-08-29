@@ -332,6 +332,110 @@ if drive.count("ctx.telemetry.armFloor(") != 1:
     fail("the floor transfer baseline is armed more than once")
 
 # ---------------------------------------------------------------------------
+# 6d. WP9-D: the critical search's convergence history.
+#
+#     INSTRUMENT ONLY.  The plan's outer census charges 15.3 % of a case to the
+#     boron search over 137 trials, and says the cost is CANDIDATE DEPENDENT.
+#     Before any trial-reduction lever is built, the runner has to be able to
+#     say what those trials were -- a bootstrap probe, a carried slope, a secant
+#     and a bisection inside a collapsing bracket are four different stories
+#     about one trial count, with four different fixes.  What this section
+#     protects is that the story is complete and that telling it does not change
+#     the search.
+# ---------------------------------------------------------------------------
+SCHEDULER = (ROOT / "src" / "Scheduler.h").read_text(encoding="utf-8-sig")
+SEARCH_FIELDS = ("trials", "proposals", "refused", "secant", "carry_secant", "probe",
+                 "bisect", "iterations")
+for name, block in (("per-statepoint", step_block), ("summary", summary_block)):
+    search_obj = json_object(block, "search")
+    for field in SEARCH_FIELDS:
+        if f'"{field}":' not in search_obj:
+            fail(f"{name} search object missing {field!r}")
+# The per-statepoint receipt additionally carries the convergence history that
+# does not SUM over a run, so a run summary deliberately does not repeat it.
+for field in ("exit", "tol", "dk", "x_first", "x_final", "dx_last"):
+    if f'"{field}":' not in json_object(step_block, "search"):
+        fail(f"per-statepoint search object missing {field!r}")
+
+# The classification happens exactly once, where `method` is decided.  Two call
+# sites would be two classifications that can disagree.
+if SCHEDULER.count("TallyProposal(") != 2:  # the definition and its one call
+    fail("Schedule::TallyProposal is not defined once and called once; the search "
+         "classification must have a single site")
+if "const bool proposed = AdvanceSecantSearch(" not in SCHEDULER:
+    fail("ProposeNextSearchPoint no longer folds both search arms into one call, so "
+         "the proposal classification would have to be repeated per arm")
+
+# TRAJECTORY NEUTRALITY, mechanically.  Every WP9-D field may be WRITTEN and
+# may be READ BY A RECEIPT.  None of them may be read by anything that decides
+# what the search does next -- no condition, no arithmetic feeding next_x.
+WP9D_FIELDS = ("search_n_proposals", "search_n_refused", "search_n_secant",
+               "search_n_carry", "search_n_probe", "search_n_bisect",
+               "search_first_x", "search_last_dx")
+CONDITION = re.compile(r"\b(if|while|for|return|assert)\b[^;]*")
+
+
+def split_guard(stripped: str) -> tuple[str, str]:
+    """Split a leading `[else ]if (...)` / `else` off a statement.
+
+    Paren-counted rather than regex-matched, because a condition can contain
+    parentheses of its own (`method.rfind("bisection", 0) == 0`) and a regex
+    that stopped at the first `)` would report the tail of the CONDITION as the
+    statement -- which is how a scan like this quietly starts passing.
+    """
+    text = stripped
+    if text.startswith("else "):
+        text = text[5:].lstrip()
+    elif text == "else":
+        return "", ""
+    if not text.startswith("if ("):
+        return "", text
+    depth, i = 0, text.index("(")
+    for j in range(i, len(text)):
+        if text[j] == "(":
+            depth += 1
+        elif text[j] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[i + 1:j], text[j + 1:].strip()
+    return text, ""
+for line in SCHEDULER.splitlines():
+    body = line.split("//")[0]
+    if not any(f in body for f in WP9D_FIELDS):
+        continue
+    stripped = body.strip()
+    if stripped.startswith(("long long ", "double ")):
+        continue  # the declarations
+    # A leading `if (cond)` is allowed -- the classification reads `method`, the
+    # string the proposal already built -- but the CONDITION may not mention a
+    # counter, because that would be the search reading its own instrument.
+    cond, rest = split_guard(stripped)
+    if any(f in cond for f in WP9D_FIELDS):
+        fail(f"a WP9-D search counter is read by a CONDITION: {stripped!r}")
+        continue
+    rest = rest.strip()
+    if rest.startswith("++") and rest.endswith(";"):
+        continue
+    if re.match(r"^[a-z_0-9]+\s*=\s*[^=].*;$", rest):
+        continue
+    if CONDITION.search(rest) and any(f in rest for f in WP9D_FIELDS):
+        fail(f"a WP9-D search counter reaches control flow: {stripped!r}")
+        continue
+    if any(f in rest for f in WP9D_FIELDS):
+        fail(f"a WP9-D search counter is not a plain write in Scheduler.h: {stripped!r}")
+for field in WP9D_FIELDS:
+    for m in re.finditer(re.escape(field), DRIVER):
+        line = DRIVER[DRIVER.rfind("\n", 0, m.start()) + 1:
+                      DRIVER.find("\n", m.start())]
+        if line.lstrip().startswith("//") or "///" in line:
+            continue
+        if "ResetSearchTelemetry" in line:
+            continue
+        # Every other reader must be inside the receipt's argument list.
+        if "ctx.telemetry.search_" not in line and "schedule.search_" not in line:
+            fail(f"Driver.h reads {field} outside the receipt: {line.strip()!r}")
+
+# ---------------------------------------------------------------------------
 # 6c. Negative control for a defect no reviewer can see and no compiler here can
 #     catch: a receipt whose std::format placeholder count and argument count
 #     have drifted apart.  Both receipts are re-counted from the source.

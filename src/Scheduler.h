@@ -171,6 +171,50 @@ struct Schedule {
     double search_bracket_hi_residual       = 0.0;
 
     // Termination bookkeeping for the critical search (published to the result file).
+    // -----------------------------------------------------------------------
+    // WP9-D: the critical search's convergence history.  TELEMETRY ONLY.
+    // -----------------------------------------------------------------------
+    //
+    // WHY IT IS HERE AND NOT IN THE DRIVER.  The GA evaluator plan's outer
+    // census charges 707 outers -- 15.3 % of a case -- to the boron search,
+    // spread over 137 committed trials, and says the cost is CANDIDATE
+    // DEPENDENT: the worse a loading pattern is in reactivity, the more trials
+    // it buys.  Before anything is done about that, the 238 runner has to be
+    // able to say how many outers a statepoint's search actually costs and WHY
+    // the proposals were what they were -- a bootstrap probe, a carried slope, a
+    // secant, or a bisection inside a bracket are four different stories about
+    // the same trial count.  The classification can only be made where `method`
+    // is decided, which is here.
+    //
+    // COST AND NEUTRALITY.  Plain integer members of an object that already
+    // exists per statepoint, incremented once per PROPOSAL (137 per run).
+    // Nothing here is read by the solver: no branch, no tolerance and no
+    // proposal depends on any of these fields, which is what makes the receipt
+    // trajectory-neutral rather than merely cheap.
+    long long search_n_proposals  = 0;  ///< ProposeNextSearchPoint calls
+    long long search_n_refused    = 0;  ///< proposals that returned no next point
+    long long search_n_secant     = 0;  ///< two-sample secant steps
+    long long search_n_carry      = 0;  ///< first steps taken on a CARRIED slope
+    long long search_n_probe      = 0;  ///< bootstrap/probe steps (no slope yet)
+    long long search_n_bisect     = 0;  ///< bisections inside a sign-change bracket
+    double    search_first_x      = 0.0; ///< the initial guess this statepoint started from
+    double    search_last_dx      = 0.0; ///< |x_new - x_old| of the LAST committed step
+
+    /// Re-armed per statepoint by the Driver.  Deliberately NOT cleared by
+    /// ResetSearchState(): that runs at every SolveLoop entry, and a statepoint
+    /// with substeps enters SolveLoop several times -- clearing there would
+    /// report the last substep's search as the statepoint's.
+    void ResetSearchTelemetry() {
+        search_n_proposals = 0;
+        search_n_refused   = 0;
+        search_n_secant    = 0;
+        search_n_carry     = 0;
+        search_n_probe     = 0;
+        search_n_bisect    = 0;
+        search_first_x     = 0.0;
+        search_last_dx     = 0.0;
+    }
+
     int    search_exit_status = static_cast<int>(SearchExit::NONE);
     double search_exit_dk     = 0.0; // |k_eff - target| actually accepted
     double search_exit_tol    = 0.0; // tolerance that dk was judged against
@@ -334,6 +378,11 @@ struct Schedule {
             search_current_x                 = std::clamp(memory.has_rod_secant ? memory.rod_secant_x : 1.0,
                                           0.0, rod_max_step);
         }
+        // WP9-D: the point the statepoint STARTED from.  Warm start (WP10.2)
+        // and any future bracket seeding both move exactly this number, so an
+        // A/B has to be able to read it rather than infer it from the first
+        // committed trial -- which is already one proposal downstream.
+        search_first_x = search_current_x;
     }
 
     // Drop everything learned about k_eff(x) while keeping the current trial point and the
@@ -530,8 +579,8 @@ struct Schedule {
         rod_bracket_not_found   = false;
         const double k_residual = searchResidual(eigv);
 
+        SecantSearchParams params;
         if (searchType == SearchType::RODCRIT) {
-            SecantSearchParams params;
             params.has_secant        = &memory.has_rod_secant;
             params.secant_dkdx       = &memory.rod_secant_dkdx;
             params.carry_available   = search_seeded_from_previous_step;
@@ -541,21 +590,44 @@ struct Schedule {
             params.enforce_rod_clamp = true;
             params.rod_max_step      = rod_max_step;
             params.use_bracket       = true;
-            return AdvanceSecantSearch(eigv, k_residual, params, next_x, method,
-                                       rod_bracket_not_found);
+        } else {
+            params.has_secant      = &memory.has_boron_secant;
+            params.secant_dkdx     = &memory.boron_secant_dkdx;
+            params.carry_available = memory.has_boron_secant;
+            params.probe           = search_boron_probe;
+            params.probe_method    = "bootstrap";
         }
+        // ONE call site, and the tally below is why the two arms were folded
+        // into one: a classification that had to be repeated per arm is a
+        // classification that can disagree with itself.
+        const bool proposed = AdvanceSecantSearch(eigv, k_residual, params, next_x, method,
+                                                  rod_bracket_not_found);
+        TallyProposal(proposed, method);
+        return proposed;
+    }
 
-        SecantSearchParams params;
-        params.has_secant      = &memory.has_boron_secant;
-        params.secant_dkdx     = &memory.boron_secant_dkdx;
-        params.carry_available = memory.has_boron_secant;
-        params.probe           = search_boron_probe;
-        params.probe_method    = "bootstrap";
-        return AdvanceSecantSearch(eigv, k_residual, params, next_x, method,
-                                   rod_bracket_not_found);
+    /// WP9-D telemetry.  Reads `method` and writes counters nothing else reads.
+    /// `method` is the string the proposal ALREADY built for the trace, so this
+    /// invents no second name for what happened.
+    void TallyProposal(bool proposed, const std::string& method) {
+        ++search_n_proposals;
+        if (!proposed) {
+            ++search_n_refused;
+            return;
+        }
+        if (method == "secant")             ++search_n_secant;
+        else if (method == "carry-secant")  ++search_n_carry;
+        else if (method.rfind("bisection", 0) == 0) ++search_n_bisect;
+        else                                ++search_n_probe;
     }
 
     void CommitSearchPoint(double eigv, double next_x, SearchMemory& memory) {
+        // WP9-D: the size of the step being taken.  At the end of the search
+        // this is the LAST one, i.e. how far the secant still had to move when
+        // it stopped -- the |dppm| the plan's trial-reduction options are judged
+        // against, and a number that says whether the tolerance or the noise
+        // floor ended the search.
+        search_last_dx   = std::abs(next_x - search_current_x);
         search_prev_x    = search_current_x;
         search_prev_eigv = eigv;
         search_has_prev  = true;

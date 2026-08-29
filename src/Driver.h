@@ -245,6 +245,20 @@ struct Counters {
     /// stage is locating a different root than the one being published.
     long long staged_relapses      = 0;
     long long search_trials        = 0;  ///< committed AND applied trial points
+    // WP9-D.  The search's convergence history, copied from the Schedule at the
+    // statepoint boundary (Scheduler.h owns the classification, because `method`
+    // is decided there).  These are how the 238 runner prices what the boron
+    // search costs per statepoint before any trial-reduction option is built:
+    // 137 trials over a run is one number, but 137 trials that are mostly
+    // BOOTSTRAP PROBES and 137 that are mostly bisections inside a collapsing
+    // bracket are two different problems with two different fixes.
+    long long search_proposals     = 0;  ///< proposal attempts, accepted or not
+    long long search_refused       = 0;  ///< attempts that produced no next point
+    long long search_secant        = 0;
+    long long search_carry         = 0;  ///< first steps on a slope CARRIED from before
+    long long search_probe         = 0;  ///< bootstrap steps: no slope was available
+    long long search_bisect        = 0;
+    long long search_iterations    = 0;  ///< Schedule::search_iteration at the close
     long long th_updates           = 0;
     long long flux_limit_retries   = 0;  ///< flux limit-cycle events ([WARN][flux])
     long long th_search_coincident = 0;  ///< outers where T/H and search both fired
@@ -366,6 +380,13 @@ struct Counters {
         xe_aa_history_resets += step.xe_aa_history_resets;
         staged_relapses      += step.staged_relapses;
         search_trials        += step.search_trials;
+        search_proposals     += step.search_proposals;
+        search_refused       += step.search_refused;
+        search_secant        += step.search_secant;
+        search_carry         += step.search_carry;
+        search_probe         += step.search_probe;
+        search_bisect        += step.search_bisect;
+        search_iterations    += step.search_iterations;
         th_updates           += step.th_updates;
         flux_limit_retries   += step.flux_limit_retries;
         th_search_coincident += step.th_search_coincident;
@@ -4559,6 +4580,13 @@ public:
         for (int step_index = 0; step_index < static_cast<int>(scheduler.schedule().size()); ++step_index) {
             auto& schedule = scheduler.schedule(step_index);
             const auto step_start = std::chrono::steady_clock::now();
+            // WP9-D: re-arm the search history HERE, at the statepoint boundary
+            // and not at SolveLoop entry.  A depletion statepoint with substeps
+            // enters SolveLoop several times, and clearing per entry would
+            // report the last substep's search as the whole statepoint's.  The
+            // natural-EOC block re-queues a COPY of a schedule entry, so a
+            // re-queued statepoint would otherwise inherit its parent's tallies.
+            schedule.ResetSearchTelemetry();
 
             schedule.PrepareForStep(cross_sections.CoreHeavyMetalMassKg());
             schedule.ApplyToGeometry(geometry);
@@ -4816,6 +4844,16 @@ public:
                                   now.bulk_d2h_bytes_during_iteration,
                                   now.bulk_d2h_calls_during_iteration);
                 ctx.telemetry.outers_driver = total_outer;
+                // WP9-D: the search history, carried across from the Schedule
+                // that owns it.  At the close, so it is this statepoint's whole
+                // search including every substep's.
+                ctx.telemetry.search_proposals  = schedule.search_n_proposals;
+                ctx.telemetry.search_refused    = schedule.search_n_refused;
+                ctx.telemetry.search_secant     = schedule.search_n_secant;
+                ctx.telemetry.search_carry      = schedule.search_n_carry;
+                ctx.telemetry.search_probe      = schedule.search_n_probe;
+                ctx.telemetry.search_bisect     = schedule.search_n_bisect;
+                ctx.telemetry.search_iterations = schedule.search_iteration;
                 ctx.telemetry.wall          = step_seconds;
                 ctx.telemetry.io_wall       = step_io_seconds;
                 const sptelem::Counters& c  = ctx.telemetry;
@@ -4863,7 +4901,11 @@ public:
                     "\"result_add\":{:.6f},\"result_write\":{:.6f}}},"
                     "\"nested_wall\":{{\"flatxs\":{:.6f},\"flatxs_calls\":{}}},"
                     "\"floor_transfer\":{{\"h2d_bytes\":{},\"h2d_calls\":{},"
-                    "\"d2h_bytes\":{},\"d2h_calls\":{}}}}}\n",
+                    "\"d2h_bytes\":{},\"d2h_calls\":{}}},"
+                    "\"search\":{{\"trials\":{},\"proposals\":{},\"refused\":{},"
+                    "\"secant\":{},\"carry_secant\":{},\"probe\":{},\"bisect\":{},"
+                    "\"iterations\":{},\"exit\":{},\"tol\":{:.3e},\"dk\":{:.6e},"
+                    "\"x_first\":{:.6f},\"x_final\":{:.6f},\"dx_last\":{:.6f}}}}}\n",
                     sp_job_id, sp_slot, step_number, efpd, total_outer, c.outers(),
                     c.outers_by_cause[sptelem::CAUSE_INITIAL], xeModeName(),
                     c.xe_updates, c.xe_interim_updates, c.xe_cascades, xe_per_cascade,
@@ -4890,7 +4932,13 @@ public:
                     c.phase[sptelem::PH_RESULT_WRITE],
                     c.xs_wall[xsphase::LB_FLATXS], c.xs_calls[xsphase::LB_FLATXS],
                     c.floor_h2d_bytes, c.floor_h2d_calls,
-                    c.floor_d2h_bytes, c.floor_d2h_calls));
+                    c.floor_d2h_bytes, c.floor_d2h_calls,
+                    c.search_trials, c.search_proposals, c.search_refused,
+                    c.search_secant, c.search_carry, c.search_probe, c.search_bisect,
+                    c.search_iterations, schedule.search_exit_status,
+                    schedule.search_exit_tol, schedule.search_exit_dk,
+                    schedule.search_first_x, schedule.search_current_x,
+                    schedule.search_last_dx));
                 sp_run.accumulate(c);
             }
 
@@ -5060,7 +5108,10 @@ public:
                 "\"result_add\":{:.6f},\"result_write\":{:.6f}}},"
                 "\"nested_wall\":{{\"flatxs\":{:.6f},\"flatxs_calls\":{}}},"
                 "\"floor_transfer\":{{\"h2d_bytes\":{},\"h2d_calls\":{},"
-                "\"d2h_bytes\":{},\"d2h_calls\":{}}}}}\n",
+                "\"d2h_bytes\":{},\"d2h_calls\":{}}},"
+                "\"search\":{{\"trials\":{},\"proposals\":{},\"refused\":{},"
+                "\"secant\":{},\"carry_secant\":{},\"probe\":{},\"bisect\":{},"
+                "\"iterations\":{}}}}}\n",
                 sp_job_id, sp_slot, static_cast<int>(scheduler.schedule().size()),
                 c.outers_driver, c.outers(), c.outers_by_cause[sptelem::CAUSE_INITIAL],
                 xeModeName(), c.xe_updates, c.xe_interim_updates, c.xe_cascades,
@@ -5090,7 +5141,10 @@ public:
                 c.phase[sptelem::PH_RESULT_WRITE],
                 c.xs_wall[xsphase::LB_FLATXS], c.xs_calls[xsphase::LB_FLATXS],
                 c.floor_h2d_bytes, c.floor_h2d_calls,
-                c.floor_d2h_bytes, c.floor_d2h_calls));
+                c.floor_d2h_bytes, c.floor_d2h_calls,
+                c.search_trials, c.search_proposals, c.search_refused,
+                c.search_secant, c.search_carry, c.search_probe, c.search_bisect,
+                c.search_iterations));
             // The summary is the last line this deck emits, so flush here: an
             // abnormal exit then loses at most the lines of the decks still
             // running, never a finished deck's telemetry.
