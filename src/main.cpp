@@ -3,6 +3,7 @@
 #include "Importer.h"
 
 #include "BatchRefill.h"
+#include "CaseFidelity.h"
 #include "CudaXsReconBackend.h"
 #include "Driver.h"
 #include "EvaluatorServer.h"
@@ -410,6 +411,12 @@ int main(int argc, char* argv[]) {
     // decks writing one warm-state file.
     std::string warm_start_from;
     std::string warm_state_out;
+    /// WP10.3.  `--statepoint-grid full|coarse|three|<GWd/t list>`: the burnup
+    /// grid this run's decks are loaded on, applied inside IO::ReadInput before
+    /// the deck digest (src/StatepointGrid.h).  Run-wide here, because a
+    /// one-shot invocation IS one lane; the per-case form is the evaluator's
+    /// `"statepoint_grid"` request field.  Unset is the deck as written.
+    std::string statepoint_grid;
     bool        save_warm_state = false;
 
     int argi = 1;
@@ -468,6 +475,40 @@ int main(int argc, char* argv[]) {
                 warm_state_out = argv[argi];
                 ++argi;
             }
+            continue;
+        }
+
+        // WP10.3.  Before the generic loop for the same reason the two warm
+        // start options are: the grid is ONE value, not a list, and a list
+        // option would happily swallow the deck paths that follow it.
+        if (option == "--statepoint-grid") {
+            ++argi;
+            if (argi >= argc || std::string(argv[argi]).rfind("--", 0) == 0) {
+                std::cerr << "Missing value after option: " << option << std::endl;
+                return 1;
+            }
+            statepoint_grid = argv[argi];
+            std::vector<double> grid_check;
+            std::string         grid_error;
+            if (!rasbery::spgrid::parseGrid(statepoint_grid, grid_check, grid_error)) {
+                std::cerr << grid_error << std::endl;
+                return 1;
+            }
+            // The measured non-monotonicity, said where an operator can still
+            // change the grid: cost is SUPERLINEAR in the burnup step, and the
+            // 3-statepoint grid measured MORE outers than the 35-statepoint
+            // deck.  A warning, not a refusal -- calibrating a grid is a
+            // legitimate thing to do and this is the number to calibrate
+            // against.
+            if (rasbery::spgrid::largestStep(grid_check) > rasbery::spgrid::kWarnBurnupStepGwd)
+                std::cerr << "[RASBERY][WARN][statepoint_grid] largest burnup step is "
+                          << rasbery::spgrid::largestStep(grid_check) << " GWd/t (> "
+                          << rasbery::spgrid::kWarnBurnupStepGwd
+                          << "). Cost is superlinear in the step: the measured 3-statepoint "
+                             "grid ran 5,104 outers against the 35-statepoint deck's 4,609. "
+                             "Calibrate before believing the wall (tools/make_screening_deck.py)."
+                          << std::endl;
+            ++argi;
             continue;
         }
 
@@ -550,7 +591,15 @@ int main(int argc, char* argv[]) {
                       << "    --result: light writes no restart, and this is the channel\n"
                       << "    that replaces it for seeding.\n"
                       << "    Evaluator requests take the same two as \"warm_start_from\"\n"
-                      << "    and \"save_warm_state\" per case.\n";
+                      << "    and \"save_warm_state\" per case.\n"
+                      << "  - --statepoint-grid full|coarse|three|<GWd/t list> rewrites the\n"
+                      << "    deck's burnup schedule at load (WP10.3).  `coarse` is the\n"
+                      << "    measured 9-point grid (0.5,1,2,4,6,8,10,13,16); a list is\n"
+                      << "    cumulative GWd/t past BOC.  Anything but `full` makes the run\n"
+                      << "    L3coarse -- screening only, never acceptance -- and the deck\n"
+                      << "    digest and case key are taken of the COARSE deck, so a\n"
+                      << "    screening answer can never be served for a full request.\n"
+                      << "    Evaluator requests take it per case as \"statepoint_grid\".\n";
             return 0;
         }
 
@@ -741,7 +790,16 @@ int main(int argc, char* argv[]) {
         std::cerr << ")." << std::endl;
         return 2;
     }
-    const rasbery::PhysicsFidelity fidelity = rasbery::effectivePhysicsFidelity();
+    // WP10.3.  THE RUN'S FIDELITY, and it is no longer the environment's alone:
+    // `--statepoint-grid` is a deck transform, so it is the ONE fidelity input
+    // RunContract.h could never detect and had to be declared through
+    // RASBERY_PHYSICS_FIDELITY.  Now the flag that causes it is the flag that
+    // reports it, and an operator cannot run a coarse deck and forget to say so
+    // -- which was the entire hole in the L3coarse lane.
+    rasbery::CaseFidelity run_fidelity = rasbery::processCaseFidelity();
+    run_fidelity.statepoint_grid =
+        rasbery::spgrid::isFullGrid(statepoint_grid) ? std::string() : statepoint_grid;
+    const rasbery::PhysicsFidelity fidelity = run_fidelity.solved();
     const bool screening          = rasbery::fidelityIsScreening(fidelity);
     const bool allow_screening    = [] {
         const char* value = std::getenv("RASBERY_ALLOW_SCREENING");
@@ -830,6 +888,10 @@ int main(int argc, char* argv[]) {
               // changed is that `physics_mode`/`screening` no longer flip
               // because a job wrote scalars.
               << ",\"physics_fidelity\":\"" << rasbery::physicsFidelityName(fidelity)
+              // WP10.3.  The L3coarse lane's input, named.  `full` on every run
+              // that did not ask for a grid, so an audit can REQUIRE the field
+              // rather than treat its absence as "probably full".
+              << "\",\"statepoint_grid\":\"" << run_fidelity.gridToken()
               << "\",\"policy\":\"" << rasbery::physicsPolicyName(fidelity)
               << "\",\"acceptance_eligible\":"
               << (rasbery::fidelityIsAcceptanceEligible(fidelity) ? "true" : "false")
@@ -1196,6 +1258,7 @@ int main(int argc, char* argv[]) {
                         warm_start_from,
                         WarmStatePath(save_warm_state, warm_state_out,
                                       rasbery_outputs[static_cast<std::size_t>(i)]));
+                    driver.setCaseFidelity(run_fidelity);
                     job_status[static_cast<std::size_t>(i)] = driver.Drive();
                 }
             } catch (const std::exception& error) {
@@ -1353,6 +1416,7 @@ int main(int argc, char* argv[]) {
             driver.setWarmStart(warm_start_from,
                                 WarmStatePath(save_warm_state, warm_state_out,
                                               rasbery_output_path.string()));
+            driver.setCaseFidelity(run_fidelity);
             driver_exit_code = driver.Drive();
         } catch (const std::exception& error) {
             driver_exit_code = 1;

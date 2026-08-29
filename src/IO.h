@@ -143,7 +143,13 @@ public:
     const std::map<int, std::string>& restart_files() const { return _restart_files; }
     bool has_shuffle() const { return !_shuffle_specs.empty(); }
 
-    void ReadInput(const std::string& filepath);
+    /// WP10.3.  `statepoint_grid` is a DECK transform applied between the JSON
+    /// parse and the canonical deck digest: empty (or "full") is the deck as
+    /// written and costs one string compare, anything else rewrites the burnup
+    /// schedule (src/StatepointGrid.h).  It is a parameter and not a member
+    /// because a coarse case and a full case are two cases, and the digest that
+    /// tells them apart has to be taken of the deck that was actually solved.
+    void ReadInput(const std::string& filepath, const std::string& statepoint_grid = "");
     void AddResult(Geometry& g, double keff,
                    int schedule_index, int step_no, double efpd);
 

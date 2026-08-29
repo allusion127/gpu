@@ -52,18 +52,39 @@ SOLVE = region(SRC, "static void SolveLoop(", "\n    /// Where this run's restar
 # multiplier below one would TIGHTEN the loose stage past production, which is
 # not a mode this design has -- the polish pass would then be the looser of the
 # two and the invariant below would be inverted.
+# WP10.3 MOVED THE THREE READS OUT OF SolveLoop.  They were `static const`
+# lambdas here, which is a PER-PROCESS read inside a per-CASE solve: the first
+# case an evaluator ran latched the convergence policy for every case after it.
+# They now live on the case (src/CaseFidelity.h) and arrive on SolverContext, so
+# this section pins two things instead of one -- that the defaults and the clamp
+# still say what they said, wherever they live, and that SolveLoop takes its
+# values FROM THE CASE and has not grown an environment read of its own.
+FIDELITY = (ROOT / "src" / "CaseFidelity.h").read_text(errors="replace")
+CONTRACT = (ROOT / "src" / "RunContract.h").read_text(errors="replace")
+
+# The clamp and the default are RunContract.h's detail::stagedMultiplier, which
+# processCaseFidelity() calls for both knobs.  Same two properties, one copy.
+if "(m >= 1.0) ? m : 1.0" not in CONTRACT:
+    fail("src/RunContract.h's stagedMultiplier does not clamp a below-1 multiplier back "
+         "to 1.0; a multiplier below one would TIGHTEN the loose stage past production "
+         "and invert the whole invariant below")
+if '(value != nullptr) ? std::atof(value) : 1.0' not in CONTRACT:
+    fail("src/RunContract.h's stagedMultiplier does not default to 1.0 (off) when the "
+         "knob is unset")
 for var, env in (("staged_flux_mult", "RASBERY_STAGED_FLUX_TOL"),
                  ("staged_xe_mult", "RASBERY_STAGED_XE_TOL")):
-    blk = region(SOLVE, f"static const double {var} = [] {{", "}();", var)
-    if f'std::getenv("{env}")' not in blk:
-        fail(f"{var} does not read {env}")
-    if "? std::atof(v) : 1.0" not in blk:
-        fail(f"{var} does not default to 1.0 (off) when {env} is unset")
-    if "(m >= 1.0) ? m : 1.0" not in blk:
-        fail(f"{var} does not clamp a below-1 multiplier back to 1.0")
+    if f'detail::stagedMultiplier("{env}")' not in FIDELITY:
+        fail(f"src/CaseFidelity.h's processCaseFidelity() does not read {env} into {var}")
+    if not re.search(rf"{var}\s*=\s*ctx\.fidelity\.{var};", SOLVE):
+        fail(f"SolveLoop does not take {var} from the case; a per-process read inside a "
+             f"per-case solve hands the first case's policy to every case after it")
+if f'std::getenv("RASBERY_STAGED' in SOLVE:
+    fail("SolveLoop reads a staged knob straight from the environment again")
 
-if "const bool staged_tol = staged_flux_mult > 1.0 || staged_xe_mult > 1.0;" not in SOLVE:
-    fail("the feature gate is not `either multiplier is above 1`")
+if "const bool   staged_tol       = ctx.fidelity.staged();" not in SOLVE:
+    fail("the feature gate is not the case's own `either multiplier is above 1`")
+if "return staged_flux_mult > 1.0 || staged_xe_mult > 1.0;" not in FIDELITY:
+    fail("CaseFidelity::staged() is not `either multiplier is above 1`")
 
 # ------------------------------------------------- 2. the default path is off
 # `polishing` starts TRUE when the feature is off, which is what makes every
@@ -152,12 +173,17 @@ if not re.search(r"constexpr double STAGED_SEARCH_MARGIN = [1-9]", SOLVE):
 # staging off `polishing` is true throughout, so the term is identically false
 # and the gate is the original expression -- but only if the flag is ANDed with
 # `!polishing` rather than standing alone.
-gate = region(loop, "static const bool staged_loose_settle = [] {",
+gate = region(loop, "const bool staged_loose_settle = ctx.fidelity.loose_settle;",
               "clean_iters < SEARCH_SETTLE_ITERS) {", "settling gate")
-if 'std::getenv("RASBERY_STAGED_LOOSE_SETTLE")' not in gate:
-    fail("the loose-settle knob does not read RASBERY_STAGED_LOOSE_SETTLE")
-if "if (v == nullptr) return false;" not in gate:
+# The knob's own reading moved to CaseFidelity.h with the other two, verbatim.
+# It is pinned there, and pinned as PER CASE here.
+if 'std::getenv("RASBERY_STAGED_LOOSE_SETTLE")' not in FIDELITY:
+    fail("src/CaseFidelity.h does not read RASBERY_STAGED_LOOSE_SETTLE")
+if "if (value == nullptr) return false;" not in FIDELITY:
     fail("the loose-settle knob does not default to off")
+if 's == "0" || s == "off" || s == "OFF" || s == "false" ||' not in FIDELITY:
+    fail("parseStagedLooseSettle no longer spells the truthiness test the way SolveLoop's "
+         "own lambda did; the receipt and the solver would then read one knob two ways")
 if "!(staged_loose_settle && !polishing) &&" not in gate:
     fail("the loose-settle knob is not gated on the LOOSE stage; it would skip the settling "
          "gate for the published sample too")

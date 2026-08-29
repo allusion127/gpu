@@ -186,9 +186,30 @@ public:
         }
     }
 
+    /// WP10.3.  WHAT THE CASE SOLVED AT, as the case itself resolved it.
+    ///
+    /// The light JSONL line is the ONLY thing a screening case produces -- no
+    /// HDF5, no restart, ~25 kB of scalars -- and a GA reads it directly.  Once
+    /// one evaluator process can answer a screening request and a promoted
+    /// strict request in one wave, "which fidelity produced this number" stops
+    /// being answerable from the process's single [PHYSICS_MODE] line, and a
+    /// scalar with no fidelity beside it is a scalar that can be ranked against
+    /// one measured under a different convergence policy.  So it travels WITH
+    /// the number.  Defaults are the strict/full lane, so a caller that does
+    /// not fill it writes what the pre-WP10.3 receipt meant.
+    struct Fidelity {
+        std::string policy              = "strict";
+        std::string physics_fidelity    = "full_exact";
+        std::string statepoint_grid     = "full";
+        std::string declared;      ///< the request's word, raw; empty prints null
+        std::string promoted_from; ///< the screened case_key this replaces
+        bool        acceptance_eligible = true;
+    };
+
     static void Write(const std::string& input,
                       const std::string& xs_path,
                       const std::string& case_key,
+                      const Fidelity& fidelity,
                       const std::string& warm_state_path,
                       int step,
                       int substep,
@@ -226,6 +247,26 @@ public:
         // rather than as an empty string that a cache might index on.
         receipt["case_key"] = case_key.empty() ? nlohmann::ordered_json(nullptr)
                                                : nlohmann::ordered_json(case_key);
+        // WP10.3.  Five fields, all present on every line whatever the lane,
+        // because a field only the screening lane carried would be a field no
+        // audit could REQUIRE -- and an audit that cannot require a field
+        // cannot tell "this ran strict" from "this ran under a binary that
+        // forgot to say".  tools/exact_audit.py::audit_light_receipts keys on
+        // exactly these.
+        receipt["policy"]              = fidelity.policy;
+        receipt["physics_fidelity"]    = fidelity.physics_fidelity;
+        receipt["statepoint_grid"]     = fidelity.statepoint_grid;
+        receipt["acceptance_eligible"] = fidelity.acceptance_eligible;
+        receipt["fidelity_declared"]   = fidelity.declared.empty()
+                                             ? nlohmann::ordered_json(nullptr)
+                                             : nlohmann::ordered_json(fidelity.declared);
+        // WP10.3 promotion.  The screening case_key this line's case is the
+        // strict re-run OF, so the two rows link without the GA having to
+        // remember which request it sent.  Null on everything that was not
+        // promoted, which is almost everything.
+        receipt["promoted_from"] = fidelity.promoted_from.empty()
+                                       ? nlohmann::ordered_json(nullptr)
+                                       : nlohmann::ordered_json(fidelity.promoted_from);
         // WP10.2.  Where this case's BOC warm state was written, so a GA can
         // seed the next generation from the light result it already reads --
         // without grepping a log for [RASBERY][WARMSTART].  Null when the case

@@ -1,6 +1,7 @@
 #pragma once
 #include "BICGCMFD.h"
 #include "BatchLightResult.h"
+#include "CaseFidelity.h"
 #include "CaseKey.h"
 #include "CudaOuterGraph.h"
 #include "EvaluatorContext.h"
@@ -1006,6 +1007,23 @@ public:
         /// Carried in the receipt as well as printed, so `--evaluator` can hand
         /// it back to the controller without anyone grepping stdout.
         std::string        case_key;
+        /// WP10.3: WHAT THIS CASE SOLVED AT, as the case itself resolved it.
+        ///
+        /// The process-level [PHYSICS_MODE] receipt answers "what was this
+        /// PROCESS configured for", and once fidelity is per case that is no
+        /// longer the same question as "what did THIS case solve at".  A
+        /// mixed-fidelity wave has ONE [PHYSICS_MODE] line and sixty-four
+        /// answers, so the per-case audit (tools/exact_audit.py
+        /// audit_case_fidelity) keys on these, and they are filled even when
+        /// nothing per-case was requested -- a field that only some cases
+        /// carried would be a field no audit could require.
+        std::string        policy;            ///< strict | A2 | L3coarse | ...
+        std::string        physics_fidelity;  ///< the plan Sec 6.2 spelling
+        std::string        statepoint_grid;   ///< "full" unless the deck was coarsened
+        std::string        fidelity_declared; ///< the request's word, raw, or empty
+        /// The screening case_key this one was promoted FROM, or empty.
+        std::string        promoted_from;
+        bool               acceptance_eligible = false;
     };
 
 private:
@@ -1018,6 +1036,11 @@ private:
     /// WP10.2 warm start.  Empty means off, on both halves.
     std::string _warm_start_from;
     std::string _warm_state_out;
+    /// WP10.3.  HOW this case solves, per Driver for the reason ResultMode and
+    /// the warm start are: one wave carries a screening population and a
+    /// promoted elite, and they do not converge the same way.  Defaulted from
+    /// the environment, so an unconfigured Driver is the pre-WP10.3 Driver.
+    CaseFidelity _fidelity = processCaseFidelity();
     /// The trajectory fold of the last Drive(), for a caller that cannot grep
     /// stdout (WP8's --evaluator).  Written once, at the same place the
     /// trajectory receipt is printed; never read by the solver.
@@ -1181,6 +1204,18 @@ private:
         /// One-shot latch for the frozen-Xe startup guard, so the warning is a
         /// property of the run rather than of every statepoint in it.
         bool   xe_frozen_checked = false;
+        /// WP10.3.  HOW THIS CASE SOLVES, as a value the case owns.
+        ///
+        /// SolveLoop is static and takes SolverContext, so this is the carrier
+        /// that already existed: the three staged-tolerance knobs used to be
+        /// function-local statics inside SolveLoop, which latched the FIRST
+        /// case of the process and handed its convergence policy to every later
+        /// one.  In an evaluator that answers a mixed wave, that is sixty-three
+        /// cases running a fidelity nobody asked them for and a receipt for each
+        /// saying otherwise.  Default-constructed it is the process environment
+        /// (processCaseFidelity()), so a Driver nobody configured behaves
+        /// exactly as this tree did before.
+        CaseFidelity fidelity = processCaseFidelity();
     };
 
 
@@ -3156,17 +3191,21 @@ private:
         // step on a CONVERGED flux -- converged to a looser tolerance, but
         // consistently so, which is still a fixed point of a well-defined map --
         // so the Anderson history stays valid and stays engaged.
-        static const double staged_flux_mult = [] {
-            const char*  v = std::getenv("RASBERY_STAGED_FLUX_TOL");
-            const double m = (v != nullptr) ? std::atof(v) : 1.0;
-            return (m >= 1.0) ? m : 1.0;   // a multiplier below 1 would TIGHTEN
-        }();
-        static const double staged_xe_mult = [] {
-            const char*  v = std::getenv("RASBERY_STAGED_XE_TOL");
-            const double m = (v != nullptr) ? std::atof(v) : 1.0;
-            return (m >= 1.0) ? m : 1.0;
-        }();
-        const bool staged_tol = staged_flux_mult > 1.0 || staged_xe_mult > 1.0;
+        //
+        // WP10.3: PER CASE, NOT PER PROCESS.  These two were `static const`
+        // lambdas reading RASBERY_STAGED_FLUX_TOL / _XE_TOL, so the first case
+        // a process ran latched the convergence policy for every case after it.
+        // The evaluator (EvaluatorServer.h) answers waves whose cases may
+        // legitimately differ -- a screening population beside a promoted elite
+        // -- and there the latch is not a cache, it is sixty-three cases running
+        // a policy nobody asked them for under receipts that claim otherwise.
+        // ctx.fidelity is default-constructed FROM THE ENVIRONMENT
+        // (processCaseFidelity()), so a Driver nobody configured reads exactly
+        // the same two numbers this code read before, once per process, from a
+        // static that is now one level up.
+        const double staged_flux_mult = ctx.fidelity.staged_flux_mult;
+        const double staged_xe_mult   = ctx.fidelity.staged_xe_mult;
+        const bool   staged_tol       = ctx.fidelity.staged();
         // THE SEARCH SAMPLE'S OWN FLOOR.  A secant search reading k_eff off a
         // flux converged no better than its own tolerance samples noise, and the
         // rod-crit case (rodcrit_search_floor, above) is this code base's
@@ -3923,13 +3962,12 @@ private:
             // than assumed.  It is inert unless staging is on, because with a
             // single stage `polishing` is true throughout and this is the
             // original gate exactly.
-            static const bool staged_loose_settle = [] {
-                const char* v = std::getenv("RASBERY_STAGED_LOOSE_SETTLE");
-                if (v == nullptr) return false;
-                const std::string s(v);
-                return !(s.empty() || s == "0" || s == "off" || s == "OFF" ||
-                         s == "false" || s == "FALSE");
-            }();
+            // WP10.3: per case, for the reason the two multipliers above are.
+            // The truthiness test itself did not move -- it is
+            // parseStagedLooseSettle (CaseFidelity.h), which is this lambda
+            // verbatim, so that the receipt and the solver read the knob the
+            // same way.
+            const bool staged_loose_settle = ctx.fidelity.loose_settle;
             if (has_search && schedule.searchType == SearchType::BORON &&
                 !(staged_loose_settle && !polishing) &&
                 clean_iters < SEARCH_SETTLE_ITERS) {
@@ -4254,8 +4292,57 @@ private:
         return out;
     }
 
+    /// WP10.3.  The staged knobs are no longer environment facts, so the key
+    /// may not read them from the environment.
+    ///
+    /// THE DEFECT THIS AVOIDS, stated plainly: `trajectory::kArmEnv` is walked
+    /// with getenv() below, and once one process can run a strict case and an
+    /// A2 case back to back, both would fold the SAME `RASBERY_STAGED_FLUX_TOL`
+    /// string into their key -- so the promoted strict re-run of a screened
+    /// candidate would collide with the screening result it exists to replace.
+    /// A cache keyed on that would serve the approximation as the acceptance
+    /// answer, which is the one thing WP1's contract exists to prevent, reached
+    /// through a new door.  So the three per-case knobs are spelled from the
+    /// CaseFidelity, in the same `%.17g`-free integer/decimal shape an operator
+    /// would have exported, and everything else still comes from the
+    /// environment because everything else still IS the environment.
+    ///
+    /// AND WHY THE RAW STRING IS KEPT WHENEVER NOTHING WAS OVERRIDDEN.  The
+    /// key has a second implementation (tools/case_key.py), which reads these
+    /// three out of a resolved child environment as RAW TEXT, and
+    /// tools/test_case_key_contract.py holds the two to one fixture.  If this
+    /// side normalised `50.0` to `50` for every run, the two would part company
+    /// on a deck nobody changed.  So: identical to the process default means
+    /// identical bytes -- every key this tree has ever computed is unchanged --
+    /// and only a case that actually asked for something else gets the
+    /// canonical spelling of what it asked for.  A per-case knob has no
+    /// environment string to be raw about; %.17g is the same spelling
+    /// casekey::appendValue gives a double, so the two languages still agree.
+    static std::string armEnvValue(const char* name, const CaseFidelity& fidelity) {
+        const CaseFidelity& base = processCaseFidelity();
+        const char*         raw  = std::getenv(name);
+        const std::string   text = raw != nullptr ? std::string(raw) : std::string();
+        const auto spell = [](double value) { return std::format("{:.17g}", value); };
+        if (std::strcmp(name, "RASBERY_STAGED_FLUX_TOL") == 0) {
+            if (fidelity.staged_flux_mult == base.staged_flux_mult) return text;
+            return fidelity.staged_flux_mult > 1.0 ? spell(fidelity.staged_flux_mult)
+                                                   : std::string();
+        }
+        if (std::strcmp(name, "RASBERY_STAGED_XE_TOL") == 0) {
+            if (fidelity.staged_xe_mult == base.staged_xe_mult) return text;
+            return fidelity.staged_xe_mult > 1.0 ? spell(fidelity.staged_xe_mult)
+                                                 : std::string();
+        }
+        if (std::strcmp(name, "RASBERY_STAGED_LOOSE_SETTLE") == 0) {
+            if (fidelity.loose_settle == base.loose_settle) return text;
+            return fidelity.loose_settle ? std::string("1") : std::string();
+        }
+        return text;
+    }
+
     static casekey::Provenance caseKeyProvenance(const IO& input_output,
-                                                 const std::string& warm_provenance) {
+                                                 const std::string& warm_provenance,
+                                                 const CaseFidelity& fidelity) {
         casekey::Provenance p;
         p.deck_digest = input_output.deck_key_digest();
         // WP10.2.  A warm start is N1 -- it can select a root where the
@@ -4265,9 +4352,11 @@ private:
         // whenever the warm start was refused, because a refused warm start
         // produced a cold run and should key like one.
         p.warm_start = warm_provenance;
-        const PhysicsFidelity fidelity = effectivePhysicsFidelity();
-        p.fidelity = physicsFidelityName(fidelity);
-        p.policy   = physicsPolicyName(fidelity);
+        // WP10.3: the CASE's fidelity, not the process's.  With no per-case
+        // request these are the same two strings effectivePhysicsFidelity()
+        // produced, because CaseFidelity defaults from the same environment.
+        p.fidelity = fidelity.physicsFidelity();
+        p.policy   = fidelity.policy();
         // The library's CONTENT, not its path: two decks naming the same file
         // through different mount points are the same case, and two files at
         // one path across a library update are not.
@@ -4284,10 +4373,8 @@ private:
         // so the case key and the cache it addresses cannot disagree.
         if (!input_output.xs_path().empty())
             p.xslib_digest = XsLibraryContentDigest(input_output.xs_path());
-        for (const char* name : trajectory::kArmEnv) {
-            const char* value = std::getenv(name);
-            p.env.emplace_back(name, value != nullptr ? std::string(value) : std::string());
-        }
+        for (const char* name : trajectory::kArmEnv)
+            p.env.emplace_back(name, armEnvValue(name, fidelity));
         return p;
     }
 
@@ -4321,6 +4408,20 @@ public:
         _warm_start_from = std::move(from);
         _warm_state_out  = std::move(save_to);
     }
+
+    /// WP10.3.  The resolved per-case fidelity -- staged tolerances, the loose
+    /// settle gate and the burnup grid.  Set it BEFORE Drive(): the grid is
+    /// applied inside ReadInput and the tolerances are copied into
+    /// SolverContext at the top of the solve, so a later change would be a
+    /// change the receipt already contradicted.
+    ///
+    /// The caller is expected to have run it through resolveCaseFidelity(),
+    /// which is where the declared-vs-solved equality lives; this setter takes
+    /// a resolved value and does not re-judge it, because two judges would
+    /// eventually disagree and the receipt would then be a coin toss.
+    void setCaseFidelity(CaseFidelity fidelity) { _fidelity = std::move(fidelity); }
+
+    [[nodiscard]] const CaseFidelity& caseFidelity() const { return _fidelity; }
 
     /// What the last Drive() folded.  Valid only after Drive() returns.
     [[nodiscard]] const CaseReceipt& caseReceipt() const { return _case_receipt; }
@@ -4362,7 +4463,13 @@ public:
         // Deck + XSLIB parse, split out of Init+IO so the Amdahl model's T_fixed
         // can be separated from the XSLIB-cache track (plan Rev.4 Sec 14).
         const auto library_start = std::chrono::steady_clock::now();
-        input_output.ReadInput(_input);
+        // WP10.3.  THE BURNUP GRID IS APPLIED HERE AND NOWHERE ELSE, because
+        // ReadInput folds the deck's canonical key digest immediately after the
+        // parse and the coarse deck must be the deck that digest is taken of --
+        // otherwise a ten-statepoint screening answer and a thirty-five
+        // statepoint acceptance answer share a case key.  Empty is the deck as
+        // written, and is one string compare (StatepointGrid.h::isFullGrid).
+        input_output.ReadInput(_input, _fidelity.statepoint_grid);
         if (pin_off) {
             for (auto& entry : scheduler.schedule()) {
                 entry.print_opt.pin_info = false;
@@ -4381,6 +4488,13 @@ public:
         PPR   pin_power_reconstruction(geometry, cross_sections);
 
         SolverContext ctx{geometry, cross_sections, cmfd_solver, nodal_solver, SearchMemory{}};
+        // WP10.3.  ONE copy, here, before any solve: SolveLoop is static and
+        // reads its convergence policy off the context it is handed, so this
+        // assignment is the whole of "this case converges the way this case was
+        // asked to".  It is a struct of two doubles, a bool and three short
+        // strings -- there is no path where copying it per case is measurable
+        // beside a deck parse.
+        ctx.fidelity = _fidelity;
 
         // ===================================================================
         // Rev.7.1 Task 9 link 1: stand the device outer segment up, ONCE.
@@ -4559,17 +4673,33 @@ public:
         // pays the 34 MB read once and every later case reads the cache.  The
         // deck digest itself was already folded during the parse.
         const std::string case_key =
-            casekey::keyOf(caseKeyProvenance(input_output, warm_provenance));
-        _case_receipt.case_key = case_key;
+            casekey::keyOf(caseKeyProvenance(input_output, warm_provenance, _fidelity));
+        _case_receipt.case_key            = case_key;
+        // WP10.3.  The per-case fidelity, carried as a value for the same
+        // reason the digest is: a mixed wave's sixty-four answers interleave on
+        // stdout and the evaluator's per-case receipt has to name its OWN.
+        _case_receipt.policy              = _fidelity.policy();
+        _case_receipt.physics_fidelity    = _fidelity.physicsFidelity();
+        _case_receipt.statepoint_grid     = _fidelity.gridToken();
+        _case_receipt.fidelity_declared   = _fidelity.declared;
+        _case_receipt.promoted_from       = _fidelity.promoted_from;
+        _case_receipt.acceptance_eligible = _fidelity.acceptanceEligible();
         std::cout << std::format(
-            "  [RASBERY][CASE] {{\"schema_version\":1,\"case_key\":\"{}\",\"key_schema\":\"{}\","
+            "  [RASBERY][CASE] {{\"schema_version\":2,\"case_key\":\"{}\",\"key_schema\":\"{}\","
             "\"core_op\":\"{}\",\"deck_digest\":\"{}\",\"fidelity\":\"{}\",\"policy\":\"{}\","
-            "\"result_mode\":\"{}\",\"warm_start\":\"{}\"}}\n",
+            "\"result_mode\":\"{}\",\"warm_start\":\"{}\",\"statepoint_grid\":\"{}\","
+            "\"acceptance_eligible\":{},\"fidelity_declared\":{},\"promoted_from\":{}}}\n",
             case_key, casekey::kSchema, input_output.deck_key_core_op(),
             input_output.deck_key_digest(),
-            physicsFidelityName(effectivePhysicsFidelity()),
-            physicsPolicyName(effectivePhysicsFidelity()),
-            ResultModeName(_result_mode), warm_status);
+            _case_receipt.physics_fidelity, _case_receipt.policy,
+            ResultModeName(_result_mode), warm_status, _case_receipt.statepoint_grid,
+            _case_receipt.acceptance_eligible ? "true" : "false",
+            _fidelity.declared.empty()
+                ? std::string("null")
+                : "\"" + jsonString(_fidelity.declared) + "\"",
+            _fidelity.promoted_from.empty()
+                ? std::string("null")
+                : "\"" + jsonString(_fidelity.promoted_from) + "\"");
 
         // Receipt keys (plan Rev.4 Sec 8.1).  result_stem() is empty until
         // OpenResult(), and light-result runs never call it, so fall back to the
@@ -4839,7 +4969,15 @@ public:
                 // mode pays, this is what the chosen output mode costs on top.
                 outer_timing::Scope write_scope(sptelem::PH_RESULT_WRITE);
                 if (light_result) {
+                    BatchLightResult::Fidelity light_fidelity;
+                    light_fidelity.policy              = _case_receipt.policy;
+                    light_fidelity.physics_fidelity    = _case_receipt.physics_fidelity;
+                    light_fidelity.statepoint_grid     = _case_receipt.statepoint_grid;
+                    light_fidelity.declared            = _case_receipt.fidelity_declared;
+                    light_fidelity.promoted_from       = _case_receipt.promoted_from;
+                    light_fidelity.acceptance_eligible = _case_receipt.acceptance_eligible;
                     BatchLightResult::Write(_input, input_output.xs_path(), case_key,
+                                            light_fidelity,
                                             warm_saved ? _warm_state_out : std::string(),
                                             schedule.step, schedule.substep,
                                             schedule.efpd, schedule.bu_avg,

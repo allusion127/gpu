@@ -23,11 +23,16 @@ FIVE PARTS.
      shutdown -- and the deferred ones are asserted, not assumed.  The arena is
      released exactly once, after the wave loop.
 
-  3. THE REFUSALS.  Two request fields cannot be honoured in stage 1
-     (`batch_width` after the first wave, `fidelity` at all), and a stage-1
-     evaluator that IGNORED either would be the campaign's fastest route from a
-     screening run to an acceptance table.  Both refuse by name, and a refusal
-     moves the exit code.
+  3. THE REFUSALS.  `batch_width` after the first wave cannot be honoured -- the
+     arena is one allocation -- and it refuses by name.  `fidelity` used to be
+     the second such field and WP10.3 made it a hook instead (src/CaseFidelity.h),
+     so what is pinned here is the property the refusal protected: a declared
+     fidelity is RESOLVED against what the case will actually solve at, the
+     resolution reaches the Driver, and a disagreement refuses.  An evaluator
+     that echoed the word without applying it would be the campaign's fastest
+     route from a screening run to an acceptance table -- the same defect the
+     stage-1 refusal existed for, through a wider door.  A refusal moves the
+     exit code.
 
   4. THE RECEIPTS.  Every field the 238 runbook reads, plus the anti-drift rule
      that the evaluator's shutdown block emits every receipt tag the batch
@@ -194,12 +199,26 @@ def check_refusals(server: str) -> list[str]:
         bad.append("a wave asking for a different batch_width is not refused; the arena is "
                    "one allocation sized at the first admission and a second width would "
                    "silently run at the first one's")
-    if "effectivePhysicsFidelity()" not in code or "fidelityAgrees" not in code:
-        bad.append("a request's declared fidelity is not checked against the fidelity this "
-                   "process actually resolved; a stage-1 evaluator that ignored the field "
+    # WP10.3 REPLACED THE FIDELITY REFUSAL WITH A FIDELITY HOOK, and the
+    # property being protected did not change: a request's declared fidelity
+    # must be checked against what the case will ACTUALLY solve at.  Stage 1
+    # satisfied that by refusing every per-case declaration; stage 10.3
+    # satisfies it by resolving one and refusing when the resolution disagrees.
+    # An evaluator that took the word and applied nothing would answer a
+    # screening request with a strict receipt, which is the same defect through
+    # a wider door.
+    if "resolveCaseFidelity(" not in code:
+        bad.append("a request's declared fidelity is never resolved against what the case "
+                   "will solve at; an evaluator that echoed the word without applying it "
                    "would answer a screening request with a strict receipt")
-    if "cannot change fidelity per case" not in server:
-        bad.append("the fidelity refusal does not say why it cannot be honoured")
+    if "driver.setCaseFidelity(fidelity)" not in code:
+        bad.append("the resolved fidelity is not handed to the Driver, so the receipt would "
+                   "claim a convergence policy the solve never ran under")
+    if "\"op\":\"promote\"" not in server and 'R"("op":"promote"' not in server:
+        bad.append("there is no promote op: a screened candidate cannot be re-run at strict "
+                   "with the link back to the screening result that proves it was")
+    if "promoted_from" not in code:
+        bad.append("a promotion is not linked to the screening result it replaces")
     if "unknown op " not in server:
         bad.append("an unrecognised op is not refused by name")
     if "--raso paths must be distinct within a wave" not in server:
@@ -247,10 +266,19 @@ PROCESS_FIELDS = (
     "arena_standups", "arena_releases", "slot_admissions", "slot_duplicates",
     "slot_stale_tenants", "slot_double_releases", "isolation_checks",
     "isolation_mismatches", "stop_reason", "refused", "batch_width",
+    # WP10.3.  A soak that meant to exercise mixed fidelity and reports zero
+    # overrides exercised nothing -- which is how a soak passes for the wrong
+    # reason, so the number has to exist to be asserted on.
+    "fidelity_overrides", "promotions",
 )
 CASE_FIELDS = ("wave_id", "case", "key", "deck", "output", "result_mode", "status",
                "exit_code", "digest", "statepoints", "outers", "slot", "lane", "wall_s",
-               "teardown_ms", "isolation_check", "error")
+               "teardown_ms", "isolation_check", "error",
+               # WP10.3.  The process prints ONE [PHYSICS_MODE] line and a
+               # mixed wave has sixty-four answers, so the per-case audit has
+               # nothing to key on unless the case's own line carries them.
+               "policy", "physics_fidelity", "statepoint_grid",
+               "acceptance_eligible", "fidelity_declared", "promoted_from")
 WAVE_FIELDS = ("wave_id", "jobs", "ok", "failed", "wall_s", "cases_per_hour",
                "process_reused", "xslib_loads", "xslib_hits", "pin_live_ranges")
 
@@ -264,7 +292,12 @@ def check_receipts(server: str) -> list[str]:
         if start < 0:
             bad.append(f"EvaluatorServer.h never emits {tag.strip()}")
             continue
-        block = server[start:start + 4000]
+        # The window has to cover the WHOLE receipt statement, and the process
+        # receipt grew past 4,000 characters when WP10.3 added two counters --
+        # at which point `stop_reason`, the last field, fell off the end and the
+        # check reported a field that was right there.  Sized off the longest
+        # receipt with room, not tuned to make today's source pass.
+        block = server[start:start + 8000]
         for field in fields:
             if f'\\"{field}\\":' not in block:
                 bad.append(f"the {tag.strip()} receipt is missing {field!r}")
@@ -572,8 +605,13 @@ control("check_lifetimes misses the arena being released per wave",
             "iowriter::flushLines();", "rasberyReleaseBatchArena();"))
 control("check_lifetimes misses a dropped pin-lease assertion",
         check_lifetimes, MAIN, SERVER.replace("rasberyHostPinLiveRanges()", "0u"))
-control("check_refusals misses an ignored fidelity field",
-        check_refusals, SERVER.replace("effectivePhysicsFidelity()", "PhysicsFidelity::FullExact"))
+control("check_refusals misses a declared fidelity that is never resolved",
+        check_refusals, SERVER.replace("resolveCaseFidelity(", "ignoreFidelity("))
+control("check_refusals misses a resolved fidelity that never reaches the Driver",
+        check_refusals,
+        SERVER.replace("driver.setCaseFidelity(fidelity)", "/* applied nowhere */"))
+control("check_refusals misses a promotion with no link to what it replaces",
+        check_refusals, SERVER.replace("promoted_from", "note"))
 control("check_refusals misses a lost width latch",
         check_refusals, SERVER.replace("latched batch_width=", "used width "))
 control("check_failure_isolation misses a case that takes the process down",

@@ -121,13 +121,28 @@ check(parse_traits(_mutant) != EXPECTED_TRAITS,
       "it cannot detect the mutation it exists to detect")
 
 # ------------------------------------------------- A2 detection must not drift -
-# Driver.h decides staging with `staged_flux_mult > 1.0 || staged_xe_mult > 1.0`
-# on multipliers clamped at 1.0.  RunContract.h reports it.  Two readings of one
-# knob is exactly how a receipt starts lying, so both are pinned here.
+# WP10.3 COLLAPSED THE TWO READINGS INTO ONE.  Driver.h used to decide staging
+# with its own `staged_flux_mult > 1.0 || staged_xe_mult > 1.0` over two
+# function-local statics, and RunContract.h kept a second copy of that predicate
+# for the receipt; this check existed to notice them parting company.  The
+# predicate now lives once, in CaseFidelity::staged(), and both the solver
+# (`ctx.fidelity.staged()`) and the receipt (`CaseFidelity::solved()`) call it --
+# so what is pinned is that the single copy still says the same thing, and that
+# Driver.h has not grown a second opinion of its own.
 driver = read("src/Driver.h")
-check("const bool staged_tol = staged_flux_mult > 1.0 || staged_xe_mult > 1.0;" in driver,
-      "src/Driver.h: the staged-tolerance predicate moved; src/RunContract.h's copy of it "
-      "(and therefore the `policy` field) is now unverified")
+case_fidelity = read("src/CaseFidelity.h")
+check("return staged_flux_mult > 1.0 || staged_xe_mult > 1.0;" in case_fidelity,
+      "src/CaseFidelity.h: the staged-tolerance predicate moved; the `policy` field and "
+      "the loop's own stage decision are now unverified against each other")
+check("const bool   staged_tol       = ctx.fidelity.staged();" in driver,
+      "src/Driver.h: SolveLoop no longer takes its staged decision from the case's own "
+      "CaseFidelity; a second reading of the knob is exactly how a receipt starts lying")
+check("std::getenv(\"RASBERY_STAGED_FLUX_TOL\")" not in driver
+      and "std::getenv(\"RASBERY_STAGED_XE_TOL\")" not in driver
+      and "std::getenv(\"RASBERY_STAGED_LOOSE_SETTLE\")" not in driver,
+      "src/Driver.h reads a staged knob straight from the environment again: that is a "
+      "per-PROCESS read inside a per-CASE solve, and in a mixed evaluator wave it hands "
+      "the first case's convergence policy to every case after it")
 for knob in ("RASBERY_STAGED_FLUX_TOL", "RASBERY_STAGED_XE_TOL"):
     check(knob in contract,
           f"src/RunContract.h does not read {knob}; an A2 arm would report policy=strict")

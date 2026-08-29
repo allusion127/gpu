@@ -191,7 +191,11 @@ def source_contract() -> None:
         fail("the light JSONL names a warm state that may not have been written")
     if "driver.setWarmStart(warm_from, warm_save);" not in EVAL:
         fail("the evaluator parses the warm-start fields but does not apply them")
-    if "std::string(), recheck_status," not in EVAL:
+    # `save_warm_state` empty on the recheck.  WP10.3 put the case's resolved
+    # fidelity between it and the status out-parameter -- the recheck must run
+    # at the SAME fidelity or its digest has no reason to match -- so the match
+    # is on the empty save argument itself rather than on its neighbour.
+    if not re.search(r"std::string\(\),\s*jobs\.fidelity\[u0\],\s*recheck_status,", EVAL):
         fail("the isolation recheck saves a warm state; it would overwrite the parent "
              "state the wave's own first case just produced")
 

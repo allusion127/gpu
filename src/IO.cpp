@@ -1,6 +1,7 @@
 #include "IO.h"
 
 #include "CaseKey.h"
+#include "StatepointGrid.h"
 #include "CohortContext.h"
 #include "Model.h"
 #include "XsLibrary.h"
@@ -540,7 +541,7 @@ void IO::ParseSchedule(const nlohmann::ordered_json& config) {
 }
 
 // Read one JSON input deck and initialize geometry, XS, and scheduler state.
-void IO::ReadInput(const std::string& filepath) {
+void IO::ReadInput(const std::string& filepath, const std::string& statepoint_grid) {
     // THE GUARD IS NOT HELD HERE, AND THAT IS THE POINT.
     //
     // It used to wrap this whole function -- "restart reads, shuffle reads and
@@ -589,6 +590,27 @@ void IO::ReadInput(const std::string& filepath) {
         throw std::runtime_error("IO::ReadInput: cannot open input file: " + filepath);
     nlohmann::ordered_json config;
     input_stream >> config;
+
+    // WP10.3: THE BURNUP GRID, BEFORE THE DIGEST AND BEFORE ANY CONSUMER.
+    //
+    // This is the L3coarse lane, and it is the one fidelity RunContract.h says
+    // "cannot be detected" -- it is a DECK property, not an environment one.
+    // Applying it here makes it a deck property in the only sense that matters:
+    // the coarse schedule is what the case key is taken of two statements
+    // below, so a ten-statepoint screening answer and a thirty-five-statepoint
+    // acceptance answer of the same candidate cannot land on one key.  Empty is
+    // the deck as written and is one string compare -- feature-off is the old
+    // path, byte for byte.
+    //
+    // A REFUSAL, not a silent pass-through, when the grid cannot be applied: a
+    // deck with no depletion entry run under a screening declaration would be a
+    // full-cost case filed in the screening lane, which is the mirror image of
+    // the defect WP1's contract exists for.
+    if (!rasbery::spgrid::isFullGrid(statepoint_grid)) {
+        std::string grid_error;
+        if (!rasbery::spgrid::applyGridSpec(config, statepoint_grid, grid_error))
+            throw std::runtime_error("IO::ReadInput: " + grid_error);
+    }
 
     // WP10.1: fold the DECK half of the canonical case key HERE, and nowhere
     // else, because this is the only place the parsed deck exists.  Two

@@ -47,28 +47,52 @@
 //                                 Driver, which is the exact defect the lease
 //                                 was introduced to kill.
 //
-// WHAT IS REFUSED RATHER THAN APPROXIMATED.  Two request fields cannot be
-// honoured per case in stage 1, and both fail the case instead of being
-// silently ignored:
+// WHAT IS REFUSED RATHER THAN APPROXIMATED.
 //
 //   `batch_width`  the arena is one allocation sized at the first admission and
 //                  fixed for the process (CudaBICGBackend.cu).  The FIRST wave
 //                  latches the width; a later wave asking for a different one
 //                  is refused by name.  Stage 2's CohortContext is where a
 //                  second shape becomes legal.
-//   `fidelity`     PhysicsFidelity resolves ONCE per process from the
-//                  environment and caches (RunContract.h's function-local
-//                  statics), and the [PHYSICS_MODE] receipt has already been
-//                  printed by the time the first request is read.  A per-case
-//                  fidelity is therefore a claim this process cannot keep, so a
-//                  request that names one that disagrees with the process's
-//                  effective fidelity is refused.  Agreeing is allowed, and is
-//                  how a client asserts what it thinks it is talking to.
+//
+// WHAT WP10.3 TURNED FROM A REFUSAL INTO A HOOK: `fidelity`.
+//
+// Stage 1 refused a per-case fidelity and said why -- PhysicsFidelity resolved
+// once per process from function-local statics, and Driver::SolveLoop read the
+// staged-tolerance knobs into three more of its own, so a request could assert
+// the process's fidelity and never change it.  That reasoning was right about
+// the code and wrong about the physics: NOTHING ABOUT AN ARENA DEPENDS ON A
+// CONVERGENCE TOLERANCE.  What actually bound fidelity to the process was six
+// `static const` reads, and src/CaseFidelity.h is those six reads moved one
+// level out, into a value the case owns:
+//
+//   staged tolerances    per Driver, carried into SolveLoop on SolverContext
+//   loose-settle gate    same
+//   burnup grid          per Driver, applied inside IO::ReadInput BEFORE the
+//                        deck digest, so the coarse lane cannot share a case
+//                        key with the full one (src/StatepointGrid.h)
+//   feedback passes      STILL process-level, and a FLOOR: no request undoes it
+//   RASBERY_PHYSICS_FIDELITY  still process-level, and coarser-only already
+//
+// So a wave may now carry a screening population and a promoted elite, and each
+// case's receipt says which it was.  What has NOT become negotiable is the
+// equality: resolveCaseFidelity() refuses unless what the case will solve is
+// exactly the word it declared -- a case can no more run finer than declared
+// (a strict number filed in the A2 column) than coarser (an approximation
+// walking into an acceptance table).
 //
 // A quiet "close enough" here is how a screening result reaches an acceptance
 // table, which is the failure mode WP1's exact-only contract exists for.
+//
+// THE `promote` OP is the other half.  It re-runs a case_key at strict/full,
+// warm-started from its own screening result when one exists, and STAMPS THE
+// LINK: the strict receipt carries `promoted_from` = the screening case_key.
+// Without that link a promotion is two unrelated rows and "did the elite we
+// shipped actually get re-run" is a question nobody can answer from the
+// receipts alone.
 
 #include "BatchRefill.h"
+#include "CaseFidelity.h"
 #include "CohortContext.h"
 #include "CudaXsReconBackend.h"
 #include "Driver.h"
@@ -107,7 +131,15 @@ struct CaseRequest {
     std::string output;               ///< --raso; the job's output namespace
     std::string key;                  ///< opaque candidate key, echoed back
     ResultMode  result_mode = ResultMode::Full;
-    std::string fidelity;             ///< declared, VALIDATED, never applied
+    /// WP10.3.  Declared AND APPLIED.  `resolved` is what
+    /// resolveCaseFidelity() made of `request` against the process default, and
+    /// it is what the Driver is configured with -- so the word in the receipt
+    /// and the tolerances in the loop have exactly one source.
+    FidelityRequest request_fidelity;
+    CaseFidelity    resolved_fidelity;
+    /// True when this case arrived as `{"op":"promote"}`.  Reported; nothing in
+    /// the solve reads it.
+    bool promoted = false;
     /// WP10.2.  `warm_start_from` seeds this case's BOC flux/boron/keff from a
     /// parent's saved state; `save_warm_state` writes this case's own for a
     /// child.  Both empty is the default and runs nothing.  This is the field
@@ -124,6 +156,11 @@ struct WaveRequest {
     std::string              jobs_manifest;
     int                      batch_width = 0; ///< 0 = the process default
     std::vector<CaseRequest> cases;
+    /// WP10.3.  What a MANIFEST job runs at.  A manifest line names a deck, an
+    /// output and a result mode and nothing else, so its fidelity is the wave's
+    /// declaration resolved once -- and with no declaration that is the process
+    /// default, which is what a manifest wave has always been.
+    CaseFidelity manifest_fidelity = processCaseFidelity();
 };
 
 /// What ended the stream.  Reported in the process receipt: a run that stopped
@@ -241,6 +278,12 @@ struct Summary {
     long long failed       = 0;
     long long generations  = 0;
     long long refused      = 0; ///< requests rejected before a Driver was built
+    /// WP10.3.  Cases whose resolved fidelity was NOT the process default, and
+    /// cases that arrived as `{"op":"promote"}`.  A soak asserts on both: a run
+    /// that meant to exercise mixed fidelity and reports zero overrides
+    /// exercised nothing, which is the way a soak passes for the wrong reason.
+    long long fidelity_overrides   = 0;
+    long long promotions           = 0;
     long long isolation_checks     = 0;
     long long isolation_mismatches = 0;
     long long isolation_adjacent   = 0;
@@ -336,6 +379,11 @@ inline bool parseRequest(const std::string& line, nlohmann::json& object, std::s
     return true;
 }
 
+/// Defined below, beside applyWaveFidelityDefault, because the two are one
+/// rule: what a request may say about fidelity and what a wave may default.
+inline bool parseFidelityFields(const nlohmann::json& object, FidelityRequest& out,
+                                std::string& error);
+
 /// Pull one case out of a `{"op":"case", ...}` object.
 inline bool parseCase(const nlohmann::json& object, ResultMode default_mode, CaseRequest& out,
                       std::string& error) {
@@ -387,35 +435,90 @@ inline bool parseCase(const nlohmann::json& object, ResultMode default_mode, Cas
         }
         out.key = object["key"].get<std::string>();
     }
-    if (object.contains("fidelity")) {
-        if (!object["fidelity"].is_string()) {
-            error = R"("fidelity" must be a string)";
-            return false;
-        }
-        out.fidelity = object["fidelity"].get<std::string>();
-    }
+    if (!parseFidelityFields(object, out.request_fidelity, error)) return false;
     return true;
 }
 
-/// The fidelity gate.  See the header comment: a request may ASSERT the
-/// process's fidelity and may not change it.
-inline bool fidelityAgrees(const std::string& declared, std::string& error) {
-    if (declared.empty()) return true;
-    PhysicsFidelity parsed = PhysicsFidelity::FullExact;
-    if (!parsePhysicsFidelity(declared, parsed)) {
-        error = "\"fidelity\":\"" + declared + "\" is not a fidelity this build knows";
-        return false;
+/// WP10.3.  Pull the fidelity half of a request out of *object*.
+///
+/// Shared by `case`, `promote` and `wave`, because a wave-level declaration is
+/// a DEFAULT for the cases that named nothing and has to mean the same thing
+/// there as it does on a case.  Two parsers would eventually mean two things.
+inline bool parseFidelityFields(const nlohmann::json& object, FidelityRequest& out,
+                                std::string& error) {
+    const auto string_field = [&object, &error](const char* name, std::string& value) {
+        if (!object.contains(name)) return true;
+        if (!object[name].is_string()) {
+            error = std::string("\"") + name + "\" must be a string";
+            return false;
+        }
+        value = object[name].get<std::string>();
+        return true;
+    };
+    // `physics_fidelity` is the plan Sec 6.2 spelling and `fidelity` the
+    // campaign shorthand; both name one field, and parsePhysicsFidelity accepts
+    // either vocabulary, so a controller may use whichever its manifests use.
+    if (!string_field("fidelity", out.fidelity)) return false;
+    if (out.fidelity.empty() && !string_field("physics_fidelity", out.fidelity)) return false;
+    if (object.contains("statepoint_grid")) {
+        if (!object["statepoint_grid"].is_string()) {
+            error = R"("statepoint_grid" must be a string: full | coarse | three | a )"
+                    R"(cumulative GWd/t list such as "0.5,1,2,4,8,16")";
+            return false;
+        }
+        out.statepoint_grid = object["statepoint_grid"].get<std::string>();
+        out.has_grid        = true;
     }
-    const PhysicsFidelity effective = effectivePhysicsFidelity();
-    if (parsed != effective) {
-        error = std::string("\"fidelity\":\"") + declared + "\" but this process resolved " +
-                physicsPolicyName(effective) +
-                " from its environment and cannot change fidelity per case (WP8 stage 1). "
-                "Start a process whose RASBERY_* fidelity environment matches, or drop the "
-                "field.";
-        return false;
+    const auto number_field = [&object, &error](const char* name, bool& has, double& value) {
+        if (!object.contains(name)) return true;
+        if (!object[name].is_number()) {
+            error = std::string("\"") + name + "\" must be a number >= 1.0";
+            return false;
+        }
+        value = object[name].get<double>();
+        has   = true;
+        return true;
+    };
+    if (!number_field("staged_flux_tol", out.has_flux_mult, out.flux_mult)) return false;
+    if (!number_field("staged_xe_tol", out.has_xe_mult, out.xe_mult)) return false;
+    if (object.contains("staged_loose_settle")) {
+        if (!object["staged_loose_settle"].is_boolean()) {
+            error = R"("staged_loose_settle" must be a boolean)";
+            return false;
+        }
+        out.loose_settle     = object["staged_loose_settle"].get<bool>();
+        out.has_loose_settle = true;
     }
+    if (!string_field("promoted_from", out.promoted_from)) return false;
     return true;
+}
+
+/// Fill in a case's unset fidelity fields from the wave's declaration.
+///
+/// A WAVE DECLARATION IS A DEFAULT AND NEVER AN OVERRIDE.  If it overrode, a
+/// mixed wave -- the whole point of WP10.3 -- would be impossible to express:
+/// the wave line arrives AFTER the case lines it collects, so an override would
+/// retroactively restate what sixty-four cases had already declared, and the
+/// case that asked for strict inside a screening generation would silently
+/// become a screening case.  So: a case that named a field keeps it.
+inline void applyWaveFidelityDefault(const FidelityRequest& wave, FidelityRequest& request) {
+    if (request.fidelity.empty()) request.fidelity = wave.fidelity;
+    if (!request.has_grid && wave.has_grid) {
+        request.statepoint_grid = wave.statepoint_grid;
+        request.has_grid        = true;
+    }
+    if (!request.has_flux_mult && wave.has_flux_mult) {
+        request.flux_mult     = wave.flux_mult;
+        request.has_flux_mult = true;
+    }
+    if (!request.has_xe_mult && wave.has_xe_mult) {
+        request.xe_mult     = wave.xe_mult;
+        request.has_xe_mult = true;
+    }
+    if (!request.has_loose_settle && wave.has_loose_settle) {
+        request.loose_settle     = wave.loose_settle;
+        request.has_loose_settle = true;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -430,6 +533,10 @@ struct WaveJobs {
     std::vector<std::string> keys;
     std::vector<std::string> warm_from;
     std::vector<std::string> warm_save;
+    /// WP10.3.  One resolved fidelity per job, parallel to the five above.  A
+    /// manifest-sourced job gets the wave's, an inline case gets its own.
+    std::vector<CaseFidelity> fidelity;
+    std::vector<bool>         promoted;
 };
 
 class Server {
@@ -456,6 +563,15 @@ public:
              << ",\"batch_width\":" << _options.batch_width
              << ",\"result_mode\":\"" << ResultModeName(_options.default_result_mode)
              << "\",\"physics_fidelity\":\"" << physicsFidelityName(effectivePhysicsFidelity())
+             // WP10.3.  The DEFAULT a case inherits, and the floor no case can
+             // climb above -- two different facts that used to be one.  A
+             // client reads `fidelity_per_case` to know this binary will honour
+             // a per-case declaration instead of refusing it; an older
+             // evaluator has no such field, which is the honest answer.
+             << "\",\"fidelity_per_case\":true"
+             << ",\"fidelity_default\":\"" << processCaseFidelity().policy()
+             << "\",\"fidelity_floor\":\"" << physicsPolicyName(processFidelityFloor())
+             << "\",\"statepoint_grid_default\":\"" << processCaseFidelity().gridToken()
              << "\",\"idle_timeout_s\":" << _options.idle_timeout_s
              << ",\"isolation_check\":" << (_options.isolation_check ? "true" : "false")
              << "}" << std::endl;
@@ -478,15 +594,42 @@ public:
                 stop   = true;
                 break;
             }
-            if (op == "case") {
+            if (op == "case" || op == "promote") {
                 CaseRequest request;
-                if (!parseCase(object, _options.default_result_mode, request, error)) {
+                // WP10.3.  A PROMOTION IS A CASE WITH THREE DEFAULTS FLIPPED,
+                // and it is a separate op only so that those defaults are the
+                // ones a promotion must have rather than the ones the process
+                // happens to carry.  `strict`, `full` output and the full
+                // burnup grid are the acceptance lane by definition (plan Sec
+                // 6.2), so an operator who has to spell all three out every
+                // time will eventually not, and the run that forgets is a
+                // screening answer wearing an elite's name.
+                const bool promote = (op == "promote");
+                if (!parseCase(object,
+                               promote ? ResultMode::Full : _options.default_result_mode,
+                               request, error)) {
                     refuse(error, line);
                     continue;
                 }
-                if (!fidelityAgrees(request.fidelity, error)) {
-                    refuse(error, line);
-                    continue;
+                if (promote) {
+                    request.promoted = true;
+                    if (request.request_fidelity.fidelity.empty())
+                        request.request_fidelity.fidelity = "strict";
+                    if (!request.request_fidelity.has_grid) {
+                        request.request_fidelity.statepoint_grid = "full";
+                        request.request_fidelity.has_grid        = true;
+                    }
+                    // The LINK, and the reason the op exists at all.  Without
+                    // it the strict re-run is an unrelated row and nothing in
+                    // the receipts answers "was this elite actually re-run".
+                    if (request.request_fidelity.promoted_from.empty()) {
+                        refuse(R"("op":"promote" needs "promoted_from": the case_key of the )"
+                               R"(screening result this run replaces. A promotion with no )"
+                               R"(link is two unrelated rows, and the audit cannot then tell )"
+                               R"(a promoted elite from a case that merely ran strict.)",
+                               line);
+                        continue;
+                    }
                 }
                 pending.push_back(std::move(request));
                 continue;
@@ -511,12 +654,40 @@ public:
                     }
                     wave.batch_width = object["batch_width"].get<int>();
                 }
-                std::string declared;
-                if (object.contains("physics_fidelity") && object["physics_fidelity"].is_string())
-                    declared = object["physics_fidelity"].get<std::string>();
-                else if (object.contains("fidelity") && object["fidelity"].is_string())
-                    declared = object["fidelity"].get<std::string>();
-                if (!fidelityAgrees(declared, error)) {
+                // WP10.3.  The wave's fidelity is a DEFAULT for the cases that
+                // declared none, resolved per case below.  It is no longer an
+                // assertion about the process, because the process no longer
+                // has one fidelity to assert.
+                FidelityRequest wave_fidelity;
+                if (!parseFidelityFields(object, wave_fidelity, error)) {
+                    refuse(error, line);
+                    pending.clear();
+                    continue;
+                }
+                bool wave_refused = false;
+                for (CaseRequest& c : pending) {
+                    applyWaveFidelityDefault(wave_fidelity, c.request_fidelity);
+                    if (!resolveCaseFidelity(c.request_fidelity, processCaseFidelity(),
+                                             c.resolved_fidelity, error)) {
+                        // ONE case's refusal fails the WAVE, deliberately.  A
+                        // wave is a generation; running sixty-three of its
+                        // sixty-four cases and dropping the one whose fidelity
+                        // could not be honoured is how a GA silently loses a
+                        // candidate and never learns it did.
+                        refuse(error + "  (deck: " + c.deck + ")", line);
+                        wave_refused = true;
+                        break;
+                    }
+                }
+                if (wave_refused) {
+                    pending.clear();
+                    continue;
+                }
+                // The manifest half of the same wave, resolved once: manifest
+                // lines carry no fidelity of their own, so they run at the
+                // wave's.
+                if (!resolveCaseFidelity(wave_fidelity, processCaseFidelity(),
+                                         wave.manifest_fidelity, error)) {
                     refuse(error, line);
                     pending.clear();
                     continue;
@@ -543,8 +714,21 @@ public:
         if (!pending.empty()) {
             WaveRequest tail;
             tail.wave_id = _summary.generations + 1;
+            // The same resolution the `wave` branch does, because these cases
+            // are about to run and an unresolved CaseFidelity is the process
+            // default wearing whatever word the request used.
+            bool tail_refused = false;
+            for (CaseRequest& c : pending) {
+                std::string error;
+                if (!resolveCaseFidelity(c.request_fidelity, processCaseFidelity(),
+                                         c.resolved_fidelity, error)) {
+                    refuse(error + "  (deck: " + c.deck + ")", c.deck);
+                    tail_refused = true;
+                    break;
+                }
+            }
             tail.cases.swap(pending);
-            runWave(tail, _options.default_result_mode);
+            if (!tail_refused) runWave(tail, _options.default_result_mode);
         }
 
         _summary.stop     = reason;
@@ -618,6 +802,8 @@ public:
                                    : *std::max_element(_summary.teardown_ms.begin(),
                                                        _summary.teardown_ms.end()))
             << "}"
+            << ",\"fidelity_overrides\":" << _summary.fidelity_overrides
+            << ",\"promotions\":" << _summary.promotions
             << ",\"isolation_checks\":" << _summary.isolation_checks
             << ",\"isolation_mismatches\":" << _summary.isolation_mismatches
             << ",\"isolation_adjacent\":" << _summary.isolation_adjacent
@@ -653,6 +839,12 @@ private:
             jobs.keys.assign(jobs.inputs.size(), std::string());
             jobs.warm_from.assign(jobs.inputs.size(), std::string());
             jobs.warm_save.assign(jobs.inputs.size(), std::string());
+            // A manifest names decks and output paths and says nothing about
+            // fidelity, so its jobs run at the WAVE's -- which, with no wave
+            // declaration, is the process default and therefore exactly what a
+            // manifest wave did before WP10.3.
+            jobs.fidelity.assign(jobs.inputs.size(), wave.manifest_fidelity);
+            jobs.promoted.assign(jobs.inputs.size(), false);
         }
         for (const CaseRequest& c : wave.cases) {
             jobs.inputs.push_back(c.deck);
@@ -661,10 +853,14 @@ private:
             jobs.keys.push_back(c.key);
             jobs.warm_from.push_back(c.warm_start_from);
             jobs.warm_save.push_back(c.save_warm_state);
+            jobs.fidelity.push_back(c.resolved_fidelity);
+            jobs.promoted.push_back(c.promoted);
         }
         jobs.keys.resize(jobs.inputs.size());
         jobs.warm_from.resize(jobs.inputs.size());
         jobs.warm_save.resize(jobs.inputs.size());
+        jobs.fidelity.resize(jobs.inputs.size(), processCaseFidelity());
+        jobs.promoted.resize(jobs.inputs.size(), false);
         if (jobs.inputs.empty()) {
             refuse("a wave with no jobs (neither \"jobs_manifest\" nor preceding "
                    "\"op\":\"case\" lines)",
@@ -777,6 +973,7 @@ private:
                        jobs.modes[static_cast<std::size_t>(i)],
                        jobs.warm_from[static_cast<std::size_t>(i)],
                        jobs.warm_save[static_cast<std::size_t>(i)],
+                       jobs.fidelity[static_cast<std::size_t>(i)],
                        status[static_cast<std::size_t>(i)],
                        failure[static_cast<std::size_t>(i)],
                        receipts[static_cast<std::size_t>(i)],
@@ -800,6 +997,17 @@ private:
         _summary.cases  += njobs;
         _summary.ok     += ok;
         _summary.failed += failed;
+        {
+            const std::string default_policy = processCaseFidelity().policy();
+            const std::string default_grid   = processCaseFidelity().gridToken();
+            for (int i = 0; i < njobs; ++i) {
+                const auto u = static_cast<std::size_t>(i);
+                if (jobs.fidelity[u].policy() != default_policy ||
+                    jobs.fidelity[u].gridToken() != default_grid)
+                    ++_summary.fidelity_overrides;
+                if (jobs.promoted[u]) ++_summary.promotions;
+            }
+        }
         if (failed > 0 && _exit_code == 0) _exit_code = 1;
 
         // ---------------------------------------------------------------
@@ -831,8 +1039,12 @@ private:
             // repeat the same case: the same warm start in, and NO warm state
             // out -- writing one would overwrite the parent state the wave's own
             // first case just produced.
+            // The SAME fidelity, necessarily: an isolation check that re-ran the
+            // deck under a different convergence policy would compare two
+            // digests that had no reason to agree and would report every wave
+            // as leaking.
             runOneCase(jobs.inputs[u0], recheck_output, jobs.modes[u0], jobs.warm_from[u0],
-                       std::string(), recheck_status,
+                       std::string(), jobs.fidelity[u0], recheck_status,
                        recheck_error, recheck, recheck_seconds, recheck_teardown);
             ++_summary.isolation_checks;
             if (njobs < 2) ++_summary.isolation_adjacent;
@@ -898,6 +1110,7 @@ private:
     /// keep small is the refill latency, and teardown IS that latency.
     static void runOneCase(const std::string& deck, const std::string& output, ResultMode mode,
                            const std::string& warm_from, const std::string& warm_save,
+                           const CaseFidelity& fidelity,
                            int& status, std::string& failure, Driver::CaseReceipt& receipt,
                            double& seconds, double& teardown_ms) {
         const auto started = std::chrono::steady_clock::now();
@@ -911,6 +1124,10 @@ private:
             {
                 Driver driver(deck, output, mode);
                 driver.setWarmStart(warm_from, warm_save);
+                // WP10.3.  BEFORE Drive(), because the burnup grid is applied
+                // inside ReadInput and the tolerances are copied into
+                // SolverContext at the top of the solve.
+                driver.setCaseFidelity(fidelity);
                 status  = driver.Drive();
                 drove   = std::chrono::steady_clock::now();
                 receipt = driver.caseReceipt();
@@ -961,7 +1178,36 @@ private:
         } else {
             line << "null";
         }
-        line << ",\"statepoints\":" << receipt.statepoints
+        // WP10.3.  WHAT THIS CASE SOLVED AT, on the case's own line.
+        //
+        // The process prints ONE [PHYSICS_MODE] receipt and a mixed wave has
+        // sixty-four answers, so the process receipt can no longer stand for
+        // any of them.  These five are what tools/exact_audit.py
+        // audit_case_fidelity checks PER CASE against the per-request
+        // declaration, and they come from Driver::CaseReceipt -- i.e. from the
+        // configuration the Driver was actually built with, not from the
+        // request, so a request that was mis-applied shows up as a mismatch
+        // rather than as an echo of itself.
+        //
+        // A case that never got a receipt (it threw before the fold closed)
+        // prints nulls, not defaults: "this case has no fidelity to report" and
+        // "this case ran strict" must not look the same to an audit.
+        const bool have_fidelity = !receipt.policy.empty();
+        line << ",\"policy\":"
+             << (have_fidelity ? detail::quoted(receipt.policy) : std::string("null"))
+             << ",\"physics_fidelity\":"
+             << (have_fidelity ? detail::quoted(receipt.physics_fidelity) : std::string("null"))
+             << ",\"statepoint_grid\":"
+             << (have_fidelity ? detail::quoted(receipt.statepoint_grid) : std::string("null"))
+             << ",\"acceptance_eligible\":"
+             << (have_fidelity ? (receipt.acceptance_eligible ? "true" : "false") : "null")
+             << ",\"fidelity_declared\":"
+             << (receipt.fidelity_declared.empty() ? std::string("null")
+                                                   : detail::quoted(receipt.fidelity_declared))
+             << ",\"promoted_from\":"
+             << (receipt.promoted_from.empty() ? std::string("null")
+                                               : detail::quoted(receipt.promoted_from))
+             << ",\"statepoints\":" << receipt.statepoints
              << ",\"outers\":" << receipt.outers
              << ",\"th_updates\":" << receipt.th_updates
              << ",\"slot\":" << receipt.slot
