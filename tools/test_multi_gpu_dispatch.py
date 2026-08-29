@@ -161,9 +161,18 @@ check(mg.pin_prefix(none, 0) == [], "pin_prefix: --pin none must add no prefix")
 check(none.driver_workers == 4,
       f"host budget: driver_workers={none.driver_workers} must be capped at the arena width")
 
-# --- the writer budget is the plan's, stated once ---------------------------
+# --- the writer budget is the EXECUTABLE's, not the plan's ------------------
+#
+# WP4 replaced the fixed constant with a model of what src/IoWriter.h actually
+# runs (one thread, or none in `inline` mode, or none when --result light writes
+# no HDF5 at all).  The constant survives only as the last-resort fallback, and
+# the full contract for the replacement is in tools/test_fleet_tuner.py Sec 8.
 check(mg.WRITER_THREADS_PER_PROCESS == 8,
       "the plan Sec 13.3 host budget is writer ~8 threads per process")
+check(mg.plan_writer_threads(result_mode="full")[0] == 1,
+      "the writer budget charged to a process must be the ONE thread IoWriter.h starts, "
+      "not the plan's eight: the difference is subtracted from the per-process core "
+      "share before the solver threads are sized")
 
 # --- the child environment is resolved in ONE place and PRINTED -------------
 #
@@ -303,12 +312,28 @@ check("gpu_wall = max(r.wall_s for r in share)" in source,
 check(abs(mg.VRAM_GB_PER_SLOT - 13.0 / 64.0) < 1e-12,
       "the per-slot cost must stay the measured 238 M64 number (13 GB / 64 slots)")
 
+# THE SLOT TERM IS FLAT IN K; THE PROCESS TERM IS NOT (238 matrix, docs/W4_L5
+# Sec 4.8).  Holding K x W = 64 measured 12.3 / 14.9 / 20.0 / 30.2 GB at
+# K = 1 / 2 / 4 / 8 -- a straight line of 2.56 GB per ADDITIONAL process, which
+# is the CUDA context and its friends, not the arena.  This file used to assert
+# the opposite ("4 x M16 must be charged the same 64 slots as 1 x M64"), and
+# under that model 16 x M4 "needs 13 GB" when it needs about 51.
 fits = mg.plan_vram(gpus=["0"], procs_per_gpu=4, batch_width=16, device_memory_gb=24.0)
-check(fits.per_device_gb == mg.VRAM_GB_PER_SLOT * 64,
-      "4 x M16 must be charged the same 64 slots as 1 x M64: the arenas are sized per "
-      "process, and L5 keeps the aggregate declared width fixed")
+check(abs(fits.per_device_gb - (mg.VRAM_GB_PER_SLOT * 64
+                                + 3 * mg.VRAM_GB_PER_EXTRA_PROCESS)) < 1e-9,
+      f"4 x M16 is the same 64 SLOTS as 1 x M64 plus THREE more processes: "
+      f"{fits.per_device_gb} GB charged, {mg.VRAM_GB_PER_SLOT * 64 + 3 * mg.VRAM_GB_PER_EXTRA_PROCESS} expected")
+check(fits.per_device_gb > mg.VRAM_GB_PER_SLOT * 64,
+      "negative control: a guard that charges K x W slots and nothing else says 16 x M4 "
+      "fits in 13 GB. It needs about 51, and the arm dies at arena stand-up with the "
+      "queue already claimed")
 check([d.verdict for d in fits.devices] == ["fits"],
-      f"13 GB of arenas must fit 24 GB: {fits.receipt()!r}")
+      f"20.7 GB of arenas and contexts must fit 24 GB: {fits.receipt()!r}")
+
+single = mg.plan_vram(gpus=["0"], procs_per_gpu=1, batch_width=64, device_memory_gb=24.0)
+check(abs(single.per_device_gb - mg.VRAM_GB_PER_SLOT * 64) < 1e-9,
+      "K=1 must be charged NO extra-process term: the first process's context is inside "
+      "the measured 13 GB, and charging it twice would refuse the control arm")
 
 over = mg.plan_vram(gpus=["0"], procs_per_gpu=4, batch_width=64, device_memory_gb=24.0)
 check([d.verdict for d in over.devices] == ["over"],
@@ -316,7 +341,7 @@ check([d.verdict for d in over.devices] == ["over"],
 check(over.over and not over.unverified, "an over-budget device must be reported as over")
 
 # Charged PER DEVICE, not per campaign: two GPUs each have their own memory.
-two = mg.plan_vram(gpus=["0", "1"], procs_per_gpu=2, batch_width=32, device_memory_gb=16.0)
+two = mg.plan_vram(gpus=["0", "1"], procs_per_gpu=2, batch_width=32, device_memory_gb=24.0)
 check([d.verdict for d in two.devices] == ["fits", "fits"],
       "the guard must charge each device its own K*W slots; summing across GPUs would "
       "refuse a run that fits on both")

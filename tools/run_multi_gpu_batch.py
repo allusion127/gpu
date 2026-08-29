@@ -94,9 +94,65 @@ FAIL_LINE = re.compile(r"\[RASBERY\]\[FAIL\]")
 # the loader budget is the OpenMP Driver workers plus the per-Driver solver
 # threads, which is what RASBERY_BATCH_HOST_THREADS and RASBERY_OMP_THREADS
 # split between them.
+#
+# WP4 ("개선해야 할 현재 runner 가정"): THE EXECUTABLE DOES NOT HAVE EIGHT WRITER
+# THREADS.  src/IoWriter.h runs exactly ONE (`_worker`, a single std::thread --
+# IoWriter.h:405, :492) in `thread` mode and NONE in `inline` mode, and with
+# `--result light` there is no result HDF5 at all: the scalar JSONL leaves
+# through flushLines(), not through the writer's queue.  Charging 8 was not a
+# harmless over-estimate -- it is SUBTRACTED from the per-process core share
+# before the solver threads are sized (the --no-oversubscribe arm), so on a K=8
+# split of 24 cores the phantom writer was larger than the whole process's
+# share and pinned the solver count to its floor.  The constant stays as the
+# last-resort fallback; plan_writer_threads() derives the real number and
+# writer_threads_from_receipt() replaces it with what the binary printed.
 WRITER_THREADS_PER_PROCESS = 8
 LOADER_THREADS_PER_GPU_MIN = 8
 LOADER_THREADS_PER_GPU_MAX = 16
+
+IO_WRITER_RECEIPT = re.compile(r"\[RASBERY\]\[IO_WRITER\]\s*(\{.*\})")
+
+
+def writer_threads_from_receipt(text: str) -> int | None:
+    """Writer threads the EXECUTABLE reported, or None if it did not say.
+
+    `[RASBERY][IO_WRITER] {"mode":"thread"|"inline",...}` (IoWriter.h:841) is
+    printed before the first deck, so a calibration wave's log already carries
+    it.  `thread` is one writer thread; `inline` is none.  An unknown mode word
+    returns None rather than a guess -- the point of reading the receipt is to
+    stop guessing, and a guess dressed as a reading is worse than no reading.
+    """
+    modes = {"thread": 1, "inline": 0}
+    seen: int | None = None
+    for match in IO_WRITER_RECEIPT.finditer(text):
+        try:
+            mode = json.loads(match.group(1)).get("mode")
+        except ValueError:
+            continue
+        if mode in modes:
+            seen = modes[mode]
+    return seen
+
+
+def plan_writer_threads(
+    *,
+    result_mode: str | None,
+    io_writer_mode: str | None = None,
+    observed: int | None = None,
+) -> tuple[int, str]:
+    """(threads, policy) for ONE process's HDF5 writer pool.
+
+    Precedence: what the executable printed, then RASBERY_IO_WRITER, then the
+    result mode.  The policy word goes into the [PLAN] receipt so a change of
+    default is visible in the log rather than only in the throughput.
+    """
+    if observed is not None and observed >= 0:
+        return observed, "receipt"
+    if (io_writer_mode or "").strip().lower() == "inline":
+        return 0, "io_writer_inline"
+    if (result_mode or "full") == "light":
+        return 0, "light_no_hdf5"
+    return 1, "io_writer_thread"
 
 # ---------------------------------------------------------------------------
 # The memory guard (L5)
@@ -117,6 +173,25 @@ VRAM_GB_M64_FULL_OUTPUT = 13.0
 VRAM_SLOTS_M64 = 64
 VRAM_GB_PER_SLOT = VRAM_GB_M64_FULL_OUTPUT / VRAM_SLOTS_M64  # 0.203 GB
 VRAM_MARGIN_GB = 1.0
+
+# ...AND K PROCESSES OF WIDTH W COST MORE THAN ONE OF WIDTH K*W.  This file used
+# to say they cost the same -- "L5 keeps the aggregate declared width fixed, so
+# the memory stays the same too" -- and the 238 matrix says otherwise:
+#
+#     1 x M64  12.3 GB      2 x M32  14.9 GB      4 x M16  20.0 GB
+#                           8 x M8   30.2 GB
+#
+# The increments are 2.60, 2.57, 2.56 GB per ADDITIONAL process: a straight
+# line, which is what a per-process fixed cost looks like -- the CUDA context,
+# the module images, cuBLAS/cuDNN handles and the allocator's own pool, none of
+# which is a function of the arena width.  The slot term did stay flat, exactly
+# as the lever promised; what nobody charged was the process.
+#
+# It matters because the guard is the tuner's upper bound.  Under the old model
+# 16 x M4 "needs 13.0 GB"; it needs about 50.7, and on anything smaller than a
+# 96 GB device the difference is the whole verdict.  The failure it predicts
+# still happens at arena stand-up, after the queue has been claimed.
+VRAM_GB_PER_EXTRA_PROCESS = 2.56
 
 
 # ---------------------------------------------------------------------------
@@ -266,11 +341,39 @@ class HostBudget:
     cpu_sets: list[list[int]]
     pin: str
     worker_policy: str = "binary_default_width"
+    writer_policy: str = "io_writer_thread"
+    result_mode: str = "full"
 
     @property
     def cpus_per_gpu(self) -> int:
         """The whole device's host share, however many processes carry it."""
         return self.cpus_per_proc * self.procs_per_gpu
+
+    @property
+    def host_threads_per_proc(self) -> int:
+        """Threads one process can have IN EXISTENCE -- not cores it needs.
+
+        The distinction is the whole WP4 host-budget correction.  The OpenMP
+        region that carries the Driver lanes is sized by OMP_NUM_THREADS, and
+        OMP_MAX_ACTIVE_LEVELS=1 makes the inner solver regions serial, so the
+        process's thread count is that one region plus the single writer
+        thread.  Nearly all of those threads are BLOCKED on the GPU rendezvous
+        -- which is exactly why the lanes are not divided by K, and why this
+        number must never be turned back into a core requirement.  It is
+        reported so the operator can see the ratio, and used only as the
+        tuner's third tie-break ("lower CPU usage" in the plan's ordering).
+        """
+        return max(1, self.solver_threads) + self.writer_threads
+
+    @property
+    def host_thread_demand(self) -> int:
+        """The whole host's: every process's, summed."""
+        return self.host_threads_per_proc * self.processes
+
+    @property
+    def host_thread_ratio(self) -> float:
+        """Threads per visible CPU.  The reference arm is ~2.7 and is correct."""
+        return self.host_thread_demand / self.visible_cpus if self.visible_cpus else 0.0
 
 
 def plan_host_budget(
@@ -283,6 +386,9 @@ def plan_host_budget(
     solver_threads: int | None,
     procs_per_gpu: int = 1,
     oversubscribe: bool = True,
+    result_mode: str | None = None,
+    io_writer_mode: str | None = None,
+    writer_threads_observed: int | None = None,
 ) -> HostBudget:
     """Split the host between the RASBERY processes (plan Sec 13.3, Sec 5.5).
 
@@ -316,6 +422,10 @@ def plan_host_budget(
     procs_per_gpu = max(1, procs_per_gpu)
     processes = n_gpus * procs_per_gpu
     cpus_per_proc = max(1, visible_cpus // processes)
+    writer, writer_policy = plan_writer_threads(
+        result_mode=result_mode, io_writer_mode=io_writer_mode,
+        observed=writer_threads_observed,
+    )
     if driver_workers:
         workers, policy = driver_workers, "explicit"
     elif oversubscribe:
@@ -336,8 +446,10 @@ def plan_host_budget(
     else:
         # What is left of this process's share, after the writer pool, is what
         # the per-Driver solver regions may spend.  At least 1: a zero would be
-        # a silently serial solver.
-        spare = max(0, cpus_per_proc - workers - WRITER_THREADS_PER_PROCESS)
+        # a silently serial solver.  The writer term is now the REAL one
+        # (0 or 1, not the plan's 8), which is why this arm no longer collapses
+        # to the floor on a narrow per-process core share.
+        spare = max(0, cpus_per_proc - workers - writer)
         threads = max(1, min(3, 1 + spare // max(1, workers)))
 
     sets: list[list[int]] = []
@@ -353,10 +465,12 @@ def plan_host_budget(
         cpus_per_proc=cpus_per_proc,
         driver_workers=workers,
         solver_threads=threads,
-        writer_threads=WRITER_THREADS_PER_PROCESS,
+        writer_threads=writer,
         cpu_sets=sets,
         pin=pin,
         worker_policy=policy,
+        writer_policy=writer_policy,
+        result_mode=result_mode or "full",
     )
 
 
@@ -391,6 +505,7 @@ class VramPlan:
     batch_width: int
     procs_per_gpu: int
     per_process_gb: float
+    extra_process_gb: float
     per_device_gb: float
     aggregate_gb: float
     devices: list[DeviceVram]
@@ -406,6 +521,7 @@ class VramPlan:
     def receipt(self) -> dict:
         return {
             "per_slot_gb": round(self.per_slot_gb, 4),
+            "extra_process_gb": round(self.extra_process_gb, 3),
             "batch_width": self.batch_width,
             "procs_per_gpu": self.procs_per_gpu,
             "per_process_gb": round(self.per_process_gb, 3),
@@ -463,20 +579,28 @@ def plan_vram(
     batch_width: int,
     per_slot_gb: float = VRAM_GB_PER_SLOT,
     margin_gb: float = VRAM_MARGIN_GB,
+    extra_process_gb: float = VRAM_GB_PER_EXTRA_PROCESS,
     device_memory_gb: float | None = None,
     probe=query_device_memory_gb,
 ) -> VramPlan:
     """What K processes of width W will hold on each listed device.
 
-    A process's arenas are sized for its OWN declared width, so K of them cost
-    K times one -- the point of L5 is that the aggregate declared width stays
-    the same while the rendezvous narrows, and that means the memory stays the
-    same too.  The guard exists for the arm that changes both (`4 x M64` rather
-    than `4 x M16`), which is the easy thing to type and the one that dies at
-    arena stand-up, after the queue has been claimed.
+    TWO TERMS, and the second one is the 238 correction.  A process's arenas are
+    sized for its OWN declared width, so the SLOT term is K x W x per-slot and
+    holding K x W fixed does hold it fixed -- that part of the lever's promise
+    measured true.  But each process also pays a fixed cost that has nothing to
+    do with the width (CUDA context, module images, library handles, allocator
+    pool), and the 238 matrix prices it at 2.56 GB per additional process:
+    12.3 / 14.9 / 20.0 / 30.2 GB at K = 1 / 2 / 4 / 8 with K x W = 64 throughout.
+
+    The guard still exists for the arm that changes both (`4 x M64` rather than
+    `4 x M16`) -- the easy thing to type and the one that dies at arena
+    stand-up, after the queue has been claimed -- but it now also catches the
+    arm that keeps the declared width and adds processes until the contexts
+    alone fill the device.
     """
     per_process = batch_width * per_slot_gb
-    per_device = procs_per_gpu * per_process
+    per_device = procs_per_gpu * per_process + max(0, procs_per_gpu - 1) * extra_process_gb
     devices: list[DeviceVram] = []
     for gpu in gpus:
         total = device_memory_gb if device_memory_gb is not None else probe(gpu)
@@ -497,6 +621,7 @@ def plan_vram(
         batch_width=batch_width,
         procs_per_gpu=procs_per_gpu,
         per_process_gb=per_process,
+        extra_process_gb=extra_process_gb,
         per_device_gb=per_device,
         aggregate_gb=per_device * len(gpus),
         devices=devices,
@@ -745,8 +870,16 @@ def run_worker(
     extra_env: dict[str, str],
     pin_omp: bool,
     dry_run: bool,
+    deadline: float | None = None,
 ) -> WorkerResult:
-    """One process SEQUENCE: claim, run, repeat, on device *gpu* as slot *proc*."""
+    """One process SEQUENCE: claim, run, repeat, on device *gpu* as slot *proc*.
+
+    *deadline* (time.monotonic) bounds a CALIBRATION wave: it is checked before
+    a chunk is claimed, never inside one, so a bounded wave still measures whole
+    chunks and the cases/hour it reports is over work that actually finished.
+    Killing a child mid-chunk would leave a half-written output and a claim that
+    nobody completed, which is a worse thing to own than a slightly long wave.
+    """
     cpus = budget.cpu_sets[index] if budget.cpu_sets else []
     result = WorkerResult(
         gpu=gpu, proc=proc, index=index,
@@ -769,6 +902,8 @@ def run_worker(
     stem = f"gpu{gpu}.p{proc}"
 
     while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
         if claim == "all":
             # Static split: each WORKER takes its equal share once, and that is
             # the whole run.  Chunking it further would only add process
@@ -882,6 +1017,495 @@ def run_worker(
 
 
 # ---------------------------------------------------------------------------
+# The K auto-tuner (WP4)
+# ---------------------------------------------------------------------------
+#
+# WHY A TUNER AND NOT A TABLE.  The 238 matrix (docs/W4_L5 Sec 4.8) says the
+# knee MOVES.  Without MPS the best K on an RTX PRO 6000 is 2 (648 c/h against
+# the 582 raw control) and K=8 is a LOSS (457); with MPS that same K=8 is the
+# best measured arm (878 c/h, width_fill 0.41).  The winning K is a function of
+# the device, the driver, whether MPS is up, the deck mix and the host's core
+# count -- none of which this file can read off a constant.  So it measures, on
+# this host, and then runs the queue at what it measured.
+#
+# WHAT THE CALIBRATION MAY NOT DO.
+#
+#   1. It may not CONSUME the queue.  Every candidate has to see the same jobs
+#      or the comparison is between decks, not between widths.  So calibration
+#      re-runs one fixed subset K times, OUT OF BAND, and the production queue
+#      still holds every job afterwards: `[TOTAL].jobs` counts each manifest job
+#      exactly once and the re-runs are reported separately as
+#      `calibration_jobs`.  (Splitting the queue across candidates instead would
+#      make each candidate a measurement of different decks, and would make the
+#      campaign's own job accounting depend on how long tuning took.)
+#   2. It may not overwrite a production output.  Each candidate's outputs are
+#      redirected under `<workdir>/tune/k<K>/`, so a `--result full` campaign
+#      comes out of calibration with its real outputs untouched.
+#   3. It may not leave an MPS daemon behind.  The thread percentage is 100/K,
+#      so each candidate needs its own server; each is stopped in a finally
+#      before the next starts.  A daemon left up would make the NEXT candidate's
+#      "no MPS" arm silently an MPS run -- the trap docs/W4_L5 Sec 5 #3 names.
+#   4. It may not spend the campaign.  Each candidate is bounded by
+#      --tune-budget-s, checked before a worker claims its next chunk.
+#
+# THE OBJECTIVE, and where it departs from the plan.  The plan's function is
+#
+#     score = median_cases_per_hour - tail_penalty - failure_penalty
+#
+# with ties broken by (p90 case latency, CPU, VRAM, K).  Two deliberate changes:
+#
+#   * A FAILURE IS A DISQUALIFICATION, NOT A PENALTY.  A candidate whose wave
+#     returned nonzero, printed a [FAIL] line, or failed the imported receipt
+#     audit is removed from the choice entirely.  A penalty big enough to be
+#     safe is indistinguishable from exclusion; one small enough to be a penalty
+#     lets a fast-and-broken K win.
+#   * THE TAIL IS A TIE-BREAK, NOT A SUBTRACTION.  `score` stays in cases/hour
+#     so the number in the receipt is the number the operator compares against
+#     the 582 c/h raw line.  p90 case latency is not measured by this harness
+#     (the executable reports per-batch occupancy, not per-case wall), so the
+#     tail proxy is `tail_idle_max_s` from the REFILL receipts: the time the
+#     last worker held the device with an emptying arena.  The substitution is
+#     stated here because it is the one place the tuner is not the plan.
+#
+# Ties are broken by (tail_idle_max_s, host threads, VRAM, K), in that order, and
+# "tie" means within --tune-tie-rel of the best.  Every term is in the receipt,
+# so the choice can be recomputed from the receipt alone.
+TUNE_CANDIDATES = (1, 2, 4, 8, 12, 16)
+TUNE_SCHEMA = 1
+TUNE_TIE_REL = 0.02
+
+
+def width_for_procs(procs: int, *, batch_width: int | None, total_width: int | None) -> int:
+    """The per-process arena width for a K-candidate.
+
+    `--total-width T` is the WP4 arm: the DECLARED width per GPU is held fixed
+    and only the rendezvous narrows, so W = ceil(T/K) -- rounded UP so K
+    processes still declare at least T slots (12 x M6 = 72, not 12 x M5 = 60,
+    which is the arm the 238 runner is actually queuing next).  `--batch-width W`
+    holds the width PER PROCESS instead, which makes the declared width grow
+    with K; the VRAM guard is what keeps that from being typed by accident.
+    """
+    procs = max(1, procs)
+    if total_width:
+        return max(1, -(-int(total_width) // procs))
+    return max(1, int(batch_width or 1))
+
+
+@dataclass
+class TuneCandidate:
+    """One measured -- or refused -- K."""
+
+    procs: int
+    width: int
+    jobs: int = 0
+    wall_s: float = 0.0
+    samples: list[float] = field(default_factory=list)  # cases/hour, one per repeat
+    width_fill: float = 0.0
+    tail_idle_max_s: float = 0.0
+    vram_per_device_gb: float = 0.0
+    cpus_per_proc: int = 0
+    host_thread_demand: int = 0
+    mps: bool = False
+    mps_thread_percent: int | None = None
+    rc: int = 0
+    fail_lines: int = 0
+    problems: list[str] = field(default_factory=list)
+    refused: str = ""  # nonempty: never measured, and why
+
+    @property
+    def cases_per_hour(self) -> float:
+        """The score: the MEDIAN over repeats, so one unlucky wave cannot win."""
+        if not self.samples:
+            return 0.0
+        ordered = sorted(self.samples)
+        mid = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[mid]
+        return 0.5 * (ordered[mid - 1] + ordered[mid])
+
+    @property
+    def eligible(self) -> bool:
+        return (
+            not self.refused
+            and bool(self.samples)
+            and self.rc == 0
+            and self.fail_lines == 0
+            and not self.problems
+        )
+
+    @property
+    def disqualified(self) -> str:
+        if self.refused:
+            return self.refused
+        if not self.samples:
+            return "no measurement"
+        if self.rc != 0:
+            return f"rc={self.rc}"
+        if self.fail_lines:
+            return f"{self.fail_lines} [FAIL] line(s)"
+        if self.problems:
+            return f"{len(self.problems)} receipt problem(s): {self.problems[0]}"
+        return ""
+
+    def receipt(self) -> dict:
+        return {
+            "procs_per_gpu": self.procs,
+            "batch_width": self.width,
+            "declared_width_per_gpu": self.procs * self.width,
+            "jobs": self.jobs,
+            "wall_s": round(self.wall_s, 3),
+            "cases_per_hour": round(self.cases_per_hour, 1),
+            "samples_cases_per_hour": [round(s, 1) for s in self.samples],
+            "width_fill": round(self.width_fill, 4),
+            "tail_idle_max_s": round(self.tail_idle_max_s, 3),
+            "vram_per_device_gb": round(self.vram_per_device_gb, 3),
+            "cpus_per_proc": self.cpus_per_proc,
+            "host_thread_demand": self.host_thread_demand,
+            "mps": self.mps,
+            "mps_thread_percent": self.mps_thread_percent,
+            "rc": self.rc,
+            "fail_lines": self.fail_lines,
+            "problems": len(self.problems),
+            "eligible": self.eligible,
+            "disqualified": self.disqualified,
+        }
+
+
+def candidate_refusal(
+    *,
+    procs: int,
+    width: int,
+    gpus: Sequence[str],
+    visible_cpus: int,
+    vram: VramPlan,
+    allow_overcommit: bool,
+) -> str:
+    """Why this K cannot be MEASURED at all, or "" if it can.
+
+    Two bounds, both the plan's: the VRAM guard (arenas are sized at process
+    start and held for the run, so K x W slots must fit on EVERY listed device)
+    and the host cores (a process that cannot be given a core of its own is not
+    an independent process, it is contention wearing a taskset).
+    """
+    processes = len(gpus) * max(1, procs)
+    if processes > visible_cpus:
+        return (
+            f"host has {visible_cpus} visible CPU(s) for {processes} process(es): each "
+            "process needs at least one core of its own or the split measures contention "
+            "rather than width"
+        )
+    if vram.over and not allow_overcommit:
+        worst = vram.over[0]
+        return (
+            f"device {worst.gpu}: {procs} x width {width} needs {worst.demand_gb:.2f} GB "
+            f"of a {worst.budget_gb or 0.0:.2f} GB budget"
+        )
+    return ""
+
+
+def choose_candidate(
+    candidates: Sequence[TuneCandidate], *, tie_rel: float = TUNE_TIE_REL
+) -> TuneCandidate | None:
+    """The winner, deterministically.
+
+    Best median cases/hour; everything within *tie_rel* of it is a tie, and a
+    tie goes to lower tail idle, then fewer host threads, then lower VRAM, then
+    the smaller K.  Pure and total -- the same list always gives the same
+    answer, which is what lets tools/test_fleet_tuner.py drive it with no GPU.
+    """
+    live = [c for c in candidates if c.eligible]
+    if not live:
+        return None
+    best = max(c.cases_per_hour for c in live)
+    if best <= 0.0:
+        return None
+    floor = best * (1.0 - max(0.0, tie_rel))
+    tied = [c for c in live if c.cases_per_hour >= floor]
+    return min(
+        tied,
+        key=lambda c: (
+            round(c.tail_idle_max_s, 3),
+            c.host_thread_demand,
+            round(c.vram_per_device_gb, 3),
+            c.procs,
+        ),
+    )
+
+
+def tune_key(gpus: Sequence[str]) -> dict:
+    """What a saved tuning result is keyed on (plan: device UUID + driver).
+
+    A tuning result is a measurement of ONE fleet: the same K on a different
+    device, or after a driver change, is a different number.  Unknowable fields
+    come back None with `verified:false` rather than a key that pretends.
+    """
+    key: dict = {"gpus": [str(g) for g in gpus], "uuids": [], "names": [],
+                 "driver": None, "verified": False}
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return key
+    try:
+        done = subprocess.run(  # noqa: S603
+            [exe, "-i", ",".join(str(g) for g in gpus),
+             "--query-gpu=uuid,name,driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return key
+    if done.returncode != 0:
+        return key
+    for line in done.stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3:
+            continue
+        key["uuids"].append(parts[0])
+        key["names"].append(parts[1])
+        key["driver"] = parts[2]
+    key["verified"] = bool(key["uuids"])
+    return key
+
+
+def tune_key_matches(saved: dict, current: dict) -> bool:
+    """Whether a saved result describes THIS fleet.
+
+    Unverified on either side is NOT a match: a result whose device is unknown
+    cannot be shown to describe this one, and the caller refuses rather than
+    spending a campaign at a K that was measured somewhere else.
+    """
+    if not saved or not current:
+        return False
+    if not saved.get("verified") or not current.get("verified"):
+        return False
+    return (saved.get("uuids") == current.get("uuids")
+            and saved.get("driver") == current.get("driver"))
+
+
+def calibration_jobs(
+    jobs: Sequence[tuple[str, str, str]], *, count: int, procs: int, tune_dir: Path
+) -> list[tuple[str, str, str]]:
+    """The SAME head-of-manifest subset for every candidate, redirected.
+
+    Same jobs so the candidates are comparable; redirected outputs so a
+    calibration can never overwrite a production result or share a restart
+    namespace with one.  The index prefix keeps the outputs distinct inside one
+    candidate even when two decks have the same basename.
+    """
+    subset = list(jobs)[: max(1, count)]
+    out: list[tuple[str, str, str]] = []
+    for index, (deck, output, mode) in enumerate(subset):
+        name = f"k{procs:02d}_{index:04d}_{Path(output).name or 'case.h5'}"
+        out.append((deck, str((tune_dir / name).resolve()), mode))
+    return out
+
+
+def _measure_candidate(
+    *,
+    procs: int,
+    width: int,
+    gpus: Sequence[str],
+    jobs: Sequence[tuple[str, str, str]],
+    visible_cpus: int,
+    args,
+    executable: Sequence[str],
+    overrides: dict[str, str],
+    cwd: Path | None,
+    tune_root: Path,
+    repeat: int,
+) -> tuple[TuneCandidate, list[WorkerResult]]:
+    """Run ONE candidate wave and score it.  Never raises for a measurement."""
+    budget = plan_host_budget(
+        gpus=gpus, batch_width=width, visible_cpus=visible_cpus, pin=args.pin,
+        driver_workers=args.driver_workers, solver_threads=args.solver_threads,
+        procs_per_gpu=procs, oversubscribe=not args.no_oversubscribe,
+        result_mode=args.result, io_writer_mode=overrides.get("RASBERY_IO_WRITER"),
+    )
+    vram = plan_vram(
+        gpus=gpus, procs_per_gpu=procs, batch_width=width,
+        per_slot_gb=args.vram_per_slot_gb, margin_gb=args.vram_margin_gb,
+        extra_process_gb=args.vram_per_extra_process_gb,
+        device_memory_gb=args.device_memory_gb,
+    )
+    cand = TuneCandidate(
+        procs=procs, width=width,
+        vram_per_device_gb=vram.per_device_gb,
+        cpus_per_proc=budget.cpus_per_proc,
+        host_thread_demand=budget.host_thread_demand,
+    )
+    cand.refused = candidate_refusal(
+        procs=procs, width=width, gpus=gpus, visible_cpus=visible_cpus, vram=vram,
+        allow_overcommit=args.allow_vram_overcommit,
+    )
+    if cand.refused:
+        return cand, []
+
+    workdir = tune_root / f"k{procs:02d}" / f"r{repeat}"
+    workdir.mkdir(parents=True, exist_ok=True)
+    subset = calibration_jobs(jobs, count=args.tune_jobs, procs=procs,
+                              tune_dir=tune_root / f"k{procs:02d}" / "out")
+    (tune_root / f"k{procs:02d}" / "out").mkdir(parents=True, exist_ok=True)
+
+    mps = MpsSession(workdir=workdir, gpus=gpus,
+                     thread_percent=args.mps_thread_percent, procs_per_gpu=procs)
+    results: list[WorkerResult] = []
+    started = time.monotonic()
+    try:
+        if args.mps:
+            mps.start()
+            if not mps.active and not args.mps_optional:
+                cand.refused = "MPS requested and unavailable: " + mps.reason
+                return cand, []
+        cand.mps = mps.active
+        cand.mps_thread_percent = mps.thread_percent if mps.active else None
+        queue = Queue(workdir / "queue.json", len(subset))
+        workers = [
+            (gpu, proc, gpu_index * procs + proc)
+            for gpu_index, gpu in enumerate(gpus)
+            for proc in range(procs)
+        ]
+        common = dict(
+            queue=queue, jobs=list(subset), budget=budget, batch_width=width,
+            claim=args.claim, result_mode=args.result, executable=list(executable),
+            workdir=workdir, cwd=cwd, overrides=overrides, extra_env=mps.client_env(),
+            pin_omp=args.pin_omp, dry_run=args.dry_run,
+            deadline=time.monotonic() + max(1.0, float(args.tune_budget_s)),
+        )
+        if len(workers) == 1:
+            gpu, proc, index = workers[0]
+            results.append(run_worker(gpu=gpu, proc=proc, index=index, **common))
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=len(workers)) as pool:
+                futures = [
+                    pool.submit(run_worker, gpu=gpu, proc=proc, index=index, **common)
+                    for gpu, proc, index in workers
+                ]
+                results = [f.result() for f in futures]
+    finally:
+        # Before the NEXT candidate, always: a live daemon would make the next
+        # arm's "no MPS" measurement silently an MPS one.
+        mps.stop()
+
+    wall = time.monotonic() - started
+    cand.jobs = sum(r.jobs for r in results)
+    cand.wall_s = wall
+    if wall > 0 and cand.jobs > 0:
+        cand.samples.append(3600.0 * cand.jobs / wall)
+    fills = [r.width_fill for r in results if r.width_fill > 0]
+    cand.width_fill = sum(fills) / len(fills) if fills else 0.0
+    cand.tail_idle_max_s = max((r.tail_idle_s for r in results), default=0.0)
+    cand.rc = next((r.returncode for r in results if r.returncode != 0), 0)
+    cand.fail_lines = sum(r.fail_lines for r in results)
+    cand.problems = [p for r in results for p in r.problems]
+    return cand, results
+
+
+def calibrate(
+    *,
+    gpus: Sequence[str],
+    jobs: Sequence[tuple[str, str, str]],
+    visible_cpus: int,
+    args,
+    executable: Sequence[str],
+    overrides: dict[str, str],
+    cwd: Path | None,
+    workdir: Path,
+) -> tuple[TuneCandidate | None, list[TuneCandidate], float, int | None]:
+    """Measure every candidate K and pick one.
+
+    Returns (chosen, candidates, calibration_s, writer_threads_observed).  The
+    last one is the WP4 host-budget fix in action: the calibration logs carry
+    `[RASBERY][IO_WRITER]`, so the production wave's writer budget can be what
+    the executable said rather than what the plan guessed.
+    """
+    tune_root = workdir / "tune"
+    tune_root.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    measured: list[TuneCandidate] = []
+    observed_writer: int | None = None
+    for procs in sorted({max(1, int(k)) for k in args.tune_candidates}):
+        width = width_for_procs(procs, batch_width=args.batch_width,
+                                total_width=args.total_width)
+        merged: TuneCandidate | None = None
+        for repeat in range(max(1, int(args.tune_repeats))):
+            cand, results = _measure_candidate(
+                procs=procs, width=width, gpus=gpus, jobs=jobs,
+                visible_cpus=visible_cpus, args=args, executable=executable,
+                overrides=overrides, cwd=cwd, tune_root=tune_root, repeat=repeat,
+            )
+            if merged is None:
+                merged = cand
+            else:
+                merged.samples.extend(cand.samples)
+                merged.jobs += cand.jobs
+                merged.wall_s += cand.wall_s
+                merged.tail_idle_max_s = max(merged.tail_idle_max_s, cand.tail_idle_max_s)
+                merged.rc = merged.rc or cand.rc
+                merged.fail_lines += cand.fail_lines
+                merged.problems.extend(cand.problems)
+                merged.refused = merged.refused or cand.refused
+            if observed_writer is None:
+                for log in sorted((tune_root / f"k{procs:02d}").rglob("*.log")):
+                    observed_writer = writer_threads_from_receipt(
+                        log.read_text(encoding="utf-8", errors="replace"))
+                    if observed_writer is not None:
+                        break
+            if cand.refused:
+                break
+        assert merged is not None
+        measured.append(merged)
+        print("[RASBERY][MULTI_GPU][TUNE][CAND] "
+              + json.dumps(merged.receipt(), separators=(",", ":")))
+    chosen = choose_candidate(measured, tie_rel=args.tune_tie_rel)
+    return chosen, measured, time.monotonic() - started, observed_writer
+
+
+def tune_payload(
+    *,
+    chosen: TuneCandidate,
+    candidates: Sequence[TuneCandidate],
+    calibration_s: float,
+    key: dict,
+    tie_rel: float,
+    source: str,
+    calibration_jobs_run: int,
+) -> dict:
+    """The [MULTI_GPU][TUNE] receipt, which is also the --tune-from file."""
+    return {
+        "schema": TUNE_SCHEMA,
+        "source": source,
+        "key": key,
+        "tie_rel": tie_rel,
+        "calibration_s": round(calibration_s, 3),
+        "calibration_jobs": calibration_jobs_run,
+        "candidates": [c.receipt() for c in candidates],
+        "chosen": {
+            "procs_per_gpu": chosen.procs,
+            "batch_width": chosen.width,
+            "declared_width_per_gpu": chosen.procs * chosen.width,
+            "cases_per_hour": round(chosen.cases_per_hour, 1),
+            "width_fill": round(chosen.width_fill, 4),
+            "mps": chosen.mps,
+        },
+    }
+
+
+def load_tune_result(path: Path) -> dict:
+    """Read a saved --tune-from file, refusing a shape it cannot trust."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path}: not a tuning result object")
+    if int(payload.get("schema", -1)) != TUNE_SCHEMA:
+        raise ValueError(
+            f"{path}: tuning result schema {payload.get('schema')!r}, this dispatcher "
+            f"writes {TUNE_SCHEMA}. Re-tune rather than reinterpreting an older shape")
+    chosen = payload.get("chosen") or {}
+    if int(chosen.get("procs_per_gpu", 0)) <= 0 or int(chosen.get("batch_width", 0)) <= 0:
+        raise ValueError(f"{path}: tuning result names no usable (procs_per_gpu, batch_width)")
+    return payload
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -900,14 +1524,23 @@ def parser() -> argparse.ArgumentParser:
         "device is off limits",
     )
     p.add_argument(
-        "--procs-per-gpu", type=int, default=1, metavar="K",
+        "--procs-per-gpu", default="1", metavar="K",
         help="independent RASBERY processes per listed GPU (L5, GA plan Sec 5.5). Each "
         "gets its own arenas, its own rendezvous and its own slice of the host, so "
         "--batch-width is the width PER PROCESS: `--procs-per-gpu 4 --batch-width 16` "
-        "declares the same 64 slots per device as `--batch-width 64` does alone",
+        "declares the same 64 slots per device as `--batch-width 64` does alone. "
+        "`auto` calibrates K on this host first (WP4) -- see the tuner group",
     )
-    p.add_argument("--batch-width", type=int, required=True,
-                   help="CUDA arena width per PROCESS")
+    p.add_argument("--batch-width", type=int,
+                   help="CUDA arena width per PROCESS. Give this or --total-width")
+    p.add_argument(
+        "--total-width", type=int, metavar="T",
+        help="DECLARED width per GPU, split across the processes: the per-process width "
+        "is ceil(T/K). This is the WP4 arm -- the device sees the same declared width "
+        "at every K and only the rendezvous narrows, so `--total-width 64` gives "
+        "1xM64, 2xM32, 4xM16, 8xM8, 12xM6, 16xM4. Rounded UP so K processes never "
+        "declare less than T between them",
+    )
     p.add_argument("--jobs", required=True,
                    help="job manifest: `<input.json> <output.h5> [result-mode]` per line; the "
                         "optional third field overrides --result for that job alone")
@@ -991,11 +1624,65 @@ def parser() -> argparse.ArgumentParser:
         help="CUDA_MPS_ACTIVE_THREAD_PERCENTAGE per child; default 100/K",
     )
 
+    tune = p.add_argument_group(
+        "K auto-tuner (WP4)",
+        "Calibrate --procs-per-gpu on THIS host before the campaign: a few jobs per "
+        "candidate K, the winner runs the queue. The calibration never claims a "
+        "production job and never writes a production output -- it re-runs one fixed "
+        "subset into <workdir>/tune/, so the queue is intact afterwards and "
+        "[TOTAL].jobs still counts each manifest job exactly once.",
+    )
+    tune.add_argument(
+        "--tune", action="store_true",
+        help="calibrate K even if --procs-per-gpu names a number (same as "
+        "`--procs-per-gpu auto`)",
+    )
+    tune.add_argument(
+        "--tune-candidates", default=",".join(str(k) for k in TUNE_CANDIDATES),
+        metavar="K,K,...",
+        help="candidate process counts. K=1 is in the default set on purpose: it is the "
+        "control, and a tuner that cannot choose it cannot decline the lever",
+    )
+    tune.add_argument(
+        "--tune-jobs", type=int, default=16, metavar="N",
+        help="jobs per candidate, the SAME head-of-manifest N for every K. Fewer than K "
+        "would leave processes with nothing to claim and measure startup",
+    )
+    tune.add_argument(
+        "--tune-budget-s", type=float, default=600.0, metavar="S",
+        help="wall bound per candidate wave, checked before a worker claims its next "
+        "chunk (never mid-chunk: a killed child leaves a half-written output)",
+    )
+    tune.add_argument("--tune-repeats", type=int, default=1, metavar="R",
+                      help="waves per candidate; the score is the MEDIAN over them")
+    tune.add_argument("--tune-tie-rel", type=float, default=TUNE_TIE_REL, metavar="F",
+                      help="candidates within this fraction of the best count as tied, and "
+                           "a tie goes to (lower tail idle, lower CPU, lower VRAM, smaller K)")
+    tune.add_argument(
+        "--tune-from", metavar="JSON",
+        help="reuse a previous [MULTI_GPU][TUNE] result instead of calibrating. Refused "
+        "unless its device UUIDs and driver match this host -- a K measured on another "
+        "fleet is not a measurement of this one",
+    )
+    tune.add_argument("--tune-save", metavar="JSON",
+                      help="where to write the tuning result (default <workdir>/tune/result.json)")
+    tune.add_argument(
+        "--allow-tune-mismatch", action="store_true",
+        help="use a --tune-from result whose device key does not match (or cannot be "
+        "verified). The receipt still records key_match:false",
+    )
+
     mem = p.add_argument_group("device memory guard")
     mem.add_argument(
         "--vram-per-slot-gb", type=float, default=VRAM_GB_PER_SLOT,
         help="arena cost of one batch slot; default is the measured 238 M64 full-output "
         "peak (13 GB / 64 slots)",
+    )
+    mem.add_argument(
+        "--vram-per-extra-process-gb", type=float, default=VRAM_GB_PER_EXTRA_PROCESS,
+        help="fixed device cost of each process AFTER the first (CUDA context, modules, "
+        "library handles, allocator pool). Default is the measured 238 slope: 12.3/14.9/"
+        "20.0/30.2 GB at K=1/2/4/8 with K x W = 64 throughout",
     )
     mem.add_argument("--vram-margin-gb", type=float, default=VRAM_MARGIN_GB,
                      help="device memory held back from the arenas")
@@ -1020,11 +1707,53 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not executable:
         print("error: missing RASBERY executable after --", file=sys.stderr)
         return 2
-    if args.batch_width <= 0:
+    if args.batch_width is None and args.total_width is None:
+        print("error: one of --batch-width (width per process) or --total-width "
+              "(declared width per GPU, split across the processes) is required",
+              file=sys.stderr)
+        return 2
+    if args.batch_width is not None and args.batch_width <= 0:
         print("error: --batch-width must be positive", file=sys.stderr)
         return 2
-    if args.procs_per_gpu <= 0:
-        print("error: --procs-per-gpu must be positive", file=sys.stderr)
+    if args.total_width is not None and args.total_width <= 0:
+        print("error: --total-width must be positive", file=sys.stderr)
+        return 2
+
+    # --procs-per-gpu is a COUNT or the word `auto`; --tune is the same request
+    # spelled next to an explicit count, so a matrix script can add one flag.
+    tune_requested = bool(args.tune)
+    procs_per_gpu = 1
+    if isinstance(args.procs_per_gpu, str) and args.procs_per_gpu.strip().lower() == "auto":
+        tune_requested = True
+    else:
+        try:
+            procs_per_gpu = int(args.procs_per_gpu)
+        except (TypeError, ValueError):
+            print("error: --procs-per-gpu must be a positive integer or `auto`",
+                  file=sys.stderr)
+            return 2
+        if procs_per_gpu <= 0:
+            print("error: --procs-per-gpu must be positive", file=sys.stderr)
+            return 2
+    try:
+        tune_candidates = sorted({int(k) for k in str(args.tune_candidates).replace(",", " ").split()})
+    except ValueError:
+        print("error: --tune-candidates must be a comma-separated list of integers",
+              file=sys.stderr)
+        return 2
+    if not tune_candidates or any(k <= 0 for k in tune_candidates):
+        print("error: --tune-candidates must be positive", file=sys.stderr)
+        return 2
+    args.tune_candidates = tune_candidates
+    if args.tune_repeats <= 0:
+        print("error: --tune-repeats must be positive", file=sys.stderr)
+        return 2
+    if args.tune_jobs <= 0:
+        print("error: --tune-jobs must be positive", file=sys.stderr)
+        return 2
+    if args.tune_from and tune_requested:
+        print("error: --tune-from reuses a measurement and `auto`/--tune makes a new "
+              "one; pick one", file=sys.stderr)
         return 2
     if args.mps_thread_percent is not None and not 1 <= args.mps_thread_percent <= 100:
         print("error: --mps-thread-percent must be in [1, 100]", file=sys.stderr)
@@ -1074,15 +1803,107 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: --cwd is not a directory: {cwd}", file=sys.stderr)
         return 2
 
+    # --- WP4: decide K before anything is planned on it ---------------------
+    #
+    # The tuner runs FIRST and out of band.  It has to: K decides the host
+    # split, the VRAM demand and the MPS thread percentage, so a plan printed
+    # before the calibration would be a plan for a K nobody chose.
+    visible_cpus = visible_cpu_threads()
+    writer_observed: int | None = None
+    calibration_jobs_run = 0
+    tune_receipt: dict | None = None
+    if tune_requested or args.tune_from:
+        key = tune_key(gpus)
+        if args.tune_from:
+            try:
+                payload = load_tune_result(Path(args.tune_from))
+            except (OSError, ValueError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            matched = tune_key_matches(payload.get("key") or {}, key)
+            payload["key_match"] = matched
+            payload["source"] = "file"
+            payload["file"] = str(args.tune_from)
+            if not matched and not args.allow_tune_mismatch:
+                print(
+                    "[RASBERY][MULTI_GPU][TUNE] "
+                    + json.dumps(payload, separators=(",", ":")))
+                print(
+                    "[RASBERY][MULTI_GPU][FAIL] --tune-from %s was measured on a "
+                    "different fleet (saved key %r, this host %r) or on a host where the "
+                    "device could not be identified. A K measured somewhere else is not a "
+                    "measurement of this device: re-tune with --procs-per-gpu auto, or "
+                    "pass --allow-tune-mismatch to use it anyway."
+                    % (args.tune_from, (payload.get("key") or {}).get("uuids"),
+                       key.get("uuids")),
+                    file=sys.stderr)
+                return 2
+            procs_per_gpu = int(payload["chosen"]["procs_per_gpu"])
+            args.batch_width = int(payload["chosen"]["batch_width"])
+            tune_receipt = payload
+        else:
+            if args.dry_run:
+                print("error: --procs-per-gpu auto measures; it cannot be dry-run",
+                      file=sys.stderr)
+                return 2
+            if args.total_width is None:
+                print(
+                    "[RASBERY][MULTI_GPU][WARN] tuning with --batch-width holds the width "
+                    "PER PROCESS, so the declared width per GPU grows with K and the VRAM "
+                    "guard will refuse the larger candidates. --total-width is the arm "
+                    "that holds the declared width fixed and narrows only the rendezvous.",
+                    file=sys.stderr)
+            chosen, candidates, calibration_s, writer_observed = calibrate(
+                gpus=gpus, jobs=jobs, visible_cpus=visible_cpus, args=args,
+                executable=executable, overrides=overrides, cwd=cwd, workdir=workdir,
+            )
+            calibration_jobs_run = sum(c.jobs for c in candidates)
+            if chosen is None:
+                for cand in candidates:
+                    print("[RASBERY][MULTI_GPU][TUNE][CAND] "
+                          + json.dumps(cand.receipt(), separators=(",", ":")),
+                          file=sys.stderr)
+                print(
+                    "[RASBERY][MULTI_GPU][FAIL] the calibration produced no usable "
+                    "candidate: every K was refused by the guards or failed its own "
+                    "receipt audit. The campaign is not started, because a K chosen "
+                    "from failed waves is not a measurement.",
+                    file=sys.stderr)
+                return 2
+            procs_per_gpu = chosen.procs
+            args.batch_width = chosen.width
+            tune_receipt = tune_payload(
+                chosen=chosen, candidates=candidates, calibration_s=calibration_s,
+                key=key, tie_rel=args.tune_tie_rel, source="calibration",
+                calibration_jobs_run=calibration_jobs_run,
+            )
+            tune_receipt["key_match"] = True
+            save_to = Path(args.tune_save) if args.tune_save else workdir / "tune" / "result.json"
+            try:
+                save_to.parent.mkdir(parents=True, exist_ok=True)
+                save_to.write_text(json.dumps(tune_receipt, indent=2), encoding="utf-8")
+                tune_receipt["saved"] = str(save_to)
+            except OSError as exc:  # pragma: no cover - a full disk, not a policy
+                print(f"[RASBERY][MULTI_GPU][WARN] could not save the tuning result: {exc}",
+                      file=sys.stderr)
+        print("[RASBERY][MULTI_GPU][TUNE] "
+              + json.dumps(tune_receipt, separators=(",", ":")))
+    elif args.total_width is not None:
+        args.batch_width = width_for_procs(
+            procs_per_gpu, batch_width=args.batch_width, total_width=args.total_width)
+
     budget = plan_host_budget(
         gpus=gpus,
         batch_width=args.batch_width,
-        visible_cpus=visible_cpu_threads(),
+        visible_cpus=visible_cpus,
         pin=args.pin,
         driver_workers=args.driver_workers,
         solver_threads=args.solver_threads,
-        procs_per_gpu=args.procs_per_gpu,
+        procs_per_gpu=procs_per_gpu,
         oversubscribe=not args.no_oversubscribe,
+        result_mode=args.result,
+        io_writer_mode=overrides.get("RASBERY_IO_WRITER"),
+        writer_threads_observed=writer_observed,
     )
     queue = Queue(workdir / "queue.json", len(jobs))
 
@@ -1104,6 +1925,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "driver_worker_policy": budget.worker_policy,
                 "solver_threads": budget.solver_threads,
                 "writer_threads": budget.writer_threads,
+                "writer_policy": budget.writer_policy,
+                "host_threads_per_proc": budget.host_threads_per_proc,
+                "host_thread_demand": budget.host_thread_demand,
+                "host_thread_ratio": round(budget.host_thread_ratio, 3),
+                "width_policy": "total_width" if args.total_width else "batch_width",
+                "procs_policy": ("tuned" if tune_receipt else "explicit"),
                 "pin": budget.pin,
                 "pin_omp": bool(args.pin_omp),
             },
@@ -1118,6 +1945,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         batch_width=args.batch_width,
         per_slot_gb=args.vram_per_slot_gb,
         margin_gb=args.vram_margin_gb,
+        extra_process_gb=args.vram_per_extra_process_gb,
         device_memory_gb=args.device_memory_gb,
     )
     print("[RASBERY][MULTI_GPU][VRAM] " + json.dumps(vram.receipt(), separators=(",", ":")))
@@ -1125,10 +1953,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         for device in vram.over:
             print(
                 "[RASBERY][MULTI_GPU][FAIL] device %s: %d process(es) x width %d x %.3f GB/slot "
-                "= %.2f GB needed, but the device has %.2f GB and the guard holds back "
-                "%.2f GB (%.2f GB usable). Lower --batch-width or --procs-per-gpu, or pass "
-                "--allow-vram-overcommit to find out the hard way at arena stand-up."
+                "plus %d x %.2f GB of per-process fixed cost = %.2f GB needed, but the "
+                "device has %.2f GB and the guard holds back %.2f GB (%.2f GB usable). "
+                "Lower --batch-width or --procs-per-gpu, or pass --allow-vram-overcommit "
+                "to find out the hard way at arena stand-up."
                 % (device.gpu, budget.procs_per_gpu, args.batch_width, vram.per_slot_gb,
+                   max(0, budget.procs_per_gpu - 1), vram.extra_process_gb,
                    device.demand_gb, device.total_gb or 0.0, vram.margin_gb,
                    device.budget_gb or 0.0),
                 file=sys.stderr,
@@ -1349,6 +2179,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "mps_thread_percent": mps.thread_percent if mps_active else None,
                 "duplicates": duplicates,
                 "stale_tenants": stale,
+                # The tuner's footprint, kept OUT of `jobs`: the calibration
+                # re-ran a subset of the manifest out of band, so counting it
+                # here would make the campaign's throughput a function of how
+                # long tuning took.
+                "tuned": bool(tune_receipt),
+                "tune_source": (tune_receipt or {}).get("source"),
+                "calibration_jobs": calibration_jobs_run,
                 "rc": exit_code,
                 "fail_lines": total_fail,
             },
