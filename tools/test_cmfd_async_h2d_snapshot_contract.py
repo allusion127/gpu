@@ -178,18 +178,30 @@ def main() -> int:
     # ---- 2. the shape of the fix -----------------------------------------
     sweep = function_body(code, "issueSweepUploads")
     if sweep:
+        # Rev.7.1 Task 18: the two buffers are now two STAGING LANES of two
+        # page-locked blocks -- `halt` is stageSweepHalt(), `active` is
+        # stageActive() -- because the stream-ordered enqueue path can have
+        # several launches outstanding and one buffer per arena meant one launch
+        # in flight.  The property is unchanged and so is the reason for it: the
+        # halt mask must never be the participation mask rewritten in place.
         if not re.search(
-            r"cudaMemcpyAsync\s*\(\s*sweep_halt\s*,\s*host_sweep_halt\b", sweep
+            r"cudaMemcpyAsync\s*\(\s*sweep_halt\s*,\s*halt\b", sweep
         ):
             problems.append(
                 "issueSweepUploads: the sweep_halt upload must come from its own "
-                "page-locked buffer `host_sweep_halt`, not from a rewritten "
-                "host_active"
+                "page-locked buffer (stageSweepHalt()), not from a rewritten "
+                "participation mask"
             )
-        if re.search(r"host_active\s*\[[^\]]*\]\s*=\s*host_active\s*\[", sweep):
+        if "stageSweepHalt()" not in sweep or "stageActive()" not in sweep:
             problems.append(
-                "issueSweepUploads: host_active is inverted IN PLACE again -- that is "
-                "the exact write-during-DMA this gate exists to stop"
+                "issueSweepUploads: the two masks must come from this launch's own "
+                "staging lanes; sharing one buffer between launches puts the "
+                "write-during-DMA back one launcher over"
+            )
+        if re.search(r"\bactive\s*\[[^\]]*\]\s*=\s*active\s*\[", sweep):
+            problems.append(
+                "issueSweepUploads: the participation mask is inverted IN PLACE again -- "
+                "that is the exact write-during-DMA this gate exists to stop"
             )
 
     if not re.search(

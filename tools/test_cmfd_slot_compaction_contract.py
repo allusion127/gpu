@@ -200,11 +200,20 @@ def main() -> int:
     if "if (!compact) {" not in build:
         problems.append("buildSlotMap has no compaction-off arm")
     off_arm = build[build.find("if (!compact) {"):build.find("} else {")]
-    if "lanes = slots;" not in off_arm or "h_slot_map[i] = i;" not in off_arm:
+    # Rev.7.1 Task 18 moved the map into a per-launch STAGING LANE (`map` is
+    # stageSlotMap(), one lane per slot plus one for the rendezvous), because
+    # the host buffer is a page-locked memcpyAsync source and the stream-ordered
+    # enqueue path can have several launches outstanding.  The identity is what
+    # is being checked, not which buffer holds it.
+    if "lanes = slots;" not in off_arm or "map[i] = i;" not in off_arm:
         problems.append(
             "buildSlotMap: with compaction OFF the map must be the FULL IDENTITY over "
             "physical slots with lanes == slots. Anything narrower changes which blocks "
             "the OFF launch visits and where they are masked.")
+    if "stageSlotMap()" not in build:
+        problems.append(
+            "buildSlotMap writes the shared h_slot_map rather than this launch's staging "
+            "lane; a second launcher would rewrite the first one's in-flight H2D source")
     if "static_cast<size_t>(slots) * sizeof(int)" not in build:
         problems.append(
             "buildSlotMap uploads less than the full fleet width; a stale entry from a "

@@ -20,10 +20,18 @@ The nine checks, and the failure each one is written against:
      that rides the same stream; reading it before the caller's synchronise is
      a use of uninitialised host memory that happens to hold last outer's answer.
 
-  3. enqueueSweeps REFUSES A SECOND PARTICIPANT.  It takes no lock, so two
-     arrivals would be two launchers on one stream -- the exact failure the
-     rendezvous in solveCommon documents ("NaN flux, invalidated graph captures
-     and heap corruption, all of it invisible until batches got wide enough").
+  3. enqueueSweeps SERVES A SECOND PARTICIPANT SAFELY.  Rev.7.1 Task 18-lite
+     had it REFUSE one, because it took no lock and two arrivals were two
+     launchers on one stream -- the exact failure the rendezvous in solveCommon
+     documents ("NaN flux, invalidated graph captures and heap corruption, all
+     of it invisible until batches got wide enough").  That refusal forced the
+     blocking sweep hook in `--batch-mode` and with it a segment budget of one,
+     so Task 18 replaced it with the three things that make it unnecessary: the
+     stream claim (which is what makes the capture exclusive, and which every
+     other entry point touching the stream must take as well), one staging lane
+     per slot for the page-locked fleet masks, and an event pair joining the
+     caller's stream to the arena's.  A refusal that comes BACK is now the
+     failure, because it silently returns the batch to budget 1.
 
   4. drain() IS sync + absorb().  The enqueue arm has to do the same per-slot
      bookkeeping the blocking arm does -- the mirror commits, the non-finite
@@ -101,7 +109,6 @@ def main() -> int:
                         "to the rendezvous path and sweep_synchronizes must go back to true")
     else:
         for banned, why in (
-                ("cudaStreamSynchronize", "a synchronise here IS the per-outer round trip"),
                 ("cudaDeviceSynchronize", "a device-wide wait is a rendezvous with "
                                           "everything else on the device too"),
                 (".drain(", "drain() synchronises; the enqueue path's caller owns when "
@@ -111,10 +118,67 @@ def main() -> int:
                               "holds the PREVIOUS outer's answer until the caller syncs")):
             if banned in enqueue:
                 problems.append(f"CudaBatchArena::enqueueSweeps uses {banned!r} -- {why}")
-        if "inUseCount() > 1" not in enqueue:
-            problems.append("CudaBatchArena::enqueueSweeps does not refuse a second "
-                            "participant.  It takes no lock, so two arrivals are two "
-                            "launchers on one stream -- see solveCommon's `launching` claim")
+        # The one synchronise this path may contain is the RECOVERY for a failed
+        # event join, and only there: the launch is already in flight, so a
+        # refusal would send the caller into a blocking drive over buffers the
+        # launch is writing.  Anywhere else it is the per-outer round trip.
+        if enqueue.count("cudaStreamSynchronize") > 1:
+            problems.append("CudaBatchArena::enqueueSweeps synchronises more than once; the "
+                            "only legal one is the failed-join recovery")
+        if "cudaStreamSynchronize" in enqueue and "cudaStreamWaitEvent" not in enqueue:
+            problems.append("CudaBatchArena::enqueueSweeps synchronises without an event "
+                            "join to recover -- that IS the per-outer round trip")
+        # ---- Rev.7.1 Task 18: the second participant, and what replaced the
+        # refusal ------------------------------------------------------------
+        #
+        # Task 18-lite pinned `inUseCount() > 1` here: the path took no lock, so
+        # two arrivals were two launchers on one stream and a capture swallowed
+        # the other one's enqueues.  That forced the blocking sweep hook in
+        # `--batch-mode` and with it a segment budget of one.
+        #
+        # The refusal is gone and the three things that make its absence safe
+        # are pinned instead.
+        if "inUseCount() > 1" in enqueue:
+            problems.append("CudaBatchArena::enqueueSweeps still refuses a second "
+                            "participant; Task 18 replaced that refusal with the stream "
+                            "claim, and with it in place a batch segment is stuck at "
+                            "budget 1")
+        if "stream_mutex" not in enqueue:
+            problems.append("CudaBatchArena::enqueueSweeps takes no claim on the arena "
+                            "stream.  A capture swallows every enqueue the stream receives "
+                            "while it is open, so without the claim two decks kill each "
+                            "other with `operation failed due to a previous error during "
+                            "capture`")
+        if "stage_lane" not in enqueue:
+            problems.append("CudaBatchArena::enqueueSweeps does not select a staging lane.  "
+                            "The fleet masks are page-locked memcpyAsync SOURCES; a second "
+                            "launcher sharing one buffer rewrites the first one's in-flight "
+                            "DMA")
+        if "cudaStreamWaitEvent" not in enqueue or "cudaEventRecord" not in enqueue:
+            problems.append("CudaBatchArena::enqueueSweeps does not join the caller's "
+                            "stream.  M segments cannot share the arena stream (they would "
+                            "capture each other), so without the event pair nothing orders "
+                            "a segment's updpsi against the sweep that reads its psi")
+
+    # ---- every other entry point that touches the arena stream takes the
+    # claim too.  syncSweepStream is the one that proved it: draining a stream
+    # another thread has open for capture raises `operation not permitted when
+    # stream is capturing`, and the poisoned capture then kills the rest of the
+    # batch from wherever it happens to be.
+    for fn, nxt in (("void CudaBatchArena::syncSweepStream() {",
+                     "void CudaBatchArena::readSweepObservation("),
+                    ("bool CudaBatchArena::finishSweeps(int m, CmfdSweepIO& io) {",
+                     "void CudaBatchArena::syncSweepStream(")):
+        section = body_after(backend, fn, nxt)
+        if section and "stream_mutex" not in section:
+            problems.append(f"{fn.strip()} touches the arena stream without the stream "
+                            "claim; a capture another thread has open makes that illegal")
+    launcher = body_after(backend, "// The device work runs *unlocked* on purpose",
+                          "a.launching = false;")
+    if launcher and "stream_mutex" not in launcher:
+        problems.append("the rendezvous launcher's unlocked device window does not take the "
+                        "stream claim, so it can interleave with the stream-ordered enqueue "
+                        "path -- which has no `launching` election to respect")
         order = [enqueue.find(step) for step in
                  ("issueSweepUploads", "enqueueSweepGate", "launch_sweeps",
                   "enqueueSweepVerdict", "issueSweepDownloads")]
@@ -272,9 +336,9 @@ def main() -> int:
         for p in problems:
             print("  -", p)
         return 1
-    print("outer stream sweep contract: PASS (enqueue is drain-free and single-participant, "
-          "one absorb for both arms, gate before the graph, verdict latches only an "
-          "unfinished drive, residency follows the armed decision)")
+    print("outer stream sweep contract: PASS (enqueue is drain-free, claims the stream "
+          "and joins the caller's, one absorb for both arms, gate before the graph, "
+          "verdict latches only an unfinished drive, residency follows the armed decision)")
     return 0
 
 
