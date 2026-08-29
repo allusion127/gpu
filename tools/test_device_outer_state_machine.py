@@ -168,6 +168,25 @@ want(GRAPH_H_CODE, "kOuterSegmentPlanCount == kOuterQuantumStepCount", "CudaOute
 # at the plan's position would carry a half drive's eigenvalue into the decision.
 # Nothing between the two positions reads CmfdOuterInputs, so the decision is the
 # same one from the same state; what moved is only WHICH probe it reads.
+# =============================================================================
+# WHERE THE PER-OUTER BODY BEGINS  (Rev.7.1 Task 10 part 4)
+# =============================================================================
+#
+# It used to be the body of `for (unsigned int i = 0; i < budget; ++i)`, and
+# every rule below that means "inside one outer" anchored on that line.  The
+# conditional WHILE has to CAPTURE exactly one outer, and a capture is a call
+# and not a loop iteration -- so the body is now a lambda, `runOneOuter`, which
+# the loop calls and the capture records.  The rules are unchanged; what moved
+# is the text they read.  The `for` is still there and still carries the
+# per-pass preamble (the exit observation, the hostfree_enqueued bump), which
+# belongs to the LOOP and not to the outer.
+BODY_ANCHOR = ("auto runOneOuter = [&]("
+               if "auto runOneOuter = [&](" in GRAPH_CU_CODE
+               else "for (unsigned int i = 0")
+if BODY_ANCHOR not in GRAPH_CU_CODE:
+    problems.append("CudaOuterGraph.cu: neither runOneOuter nor the per-outer `for` can be "
+                    "found; every rule that reads the body has nothing to read")
+
 SEQ_ORDER = ["enqueueUpdPsi", "enqueue_cmfd_sweep",
              "enqueueUpdJnet", "enqueue_nodal_drive", "enqueueUpdDhat",
              "enqueueOuterRefreshInputs",
@@ -180,7 +199,7 @@ SEQ_ORDER = ["enqueueUpdPsi", "enqueue_cmfd_sweep",
 # is the order the loop executes: the head (inside the `for`) and then the tail
 # (the lambda it calls).  Concatenating them in that order is what makes the
 # check read the sequence rather than the file layout.
-_HEAD_AT = GRAPH_CU_CODE.find("for (unsigned int i = 0")
+_HEAD_AT = GRAPH_CU_CODE.find(BODY_ANCHOR)
 _TAIL_AT = GRAPH_CU_CODE.find("auto runOuterTail = [&](")
 if _TAIL_AT < 0:
     problems.append("CudaOuterGraph.cu: runOuterTail is gone; the order check has no tail")
@@ -323,7 +342,7 @@ if DHAT and "blockIdx.y" not in DHAT:
 # whose halt state the transition has not been able to publish yet -- a
 # different trajectory, not a faster one, and exactly the failure the original
 # ban was written against.
-LOOP = body_of(GRAPH_CU_CODE, "for (unsigned int i = 0", "DeviceOuterSegmentState seg_out")
+LOOP = body_of(GRAPH_CU_CODE, BODY_ANCHOR, "DeviceOuterSegmentState seg_out")
 if not LOOP:
     problems.append("CudaOuterGraph.cu: the per-outer loop could not be located")
 for banned in ("cudaDeviceSynchronize", "cudaStreamQuery", "cudaEventSynchronize"):
@@ -414,9 +433,30 @@ if GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost") > 18:
                     "the observation, the four exit mirrors and the two traced hashes "
                     "(%d).  Each one is a rendezvous and needs a name"
                     % GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost"))
-if "cudaGraph" in GRAPH_CU_CODE or "cudaGraph" in GRAPH_H_CODE:
-    problems.append("CudaOuterGraph: uses the graph API.  The conditional WHILE wrapper is "
-                    "Task 10; Task 9 is the stream-ordered sequence it will capture.")
+# THE GRAPH API IS NO LONGER BANNED OUTRIGHT -- IT IS FENCED.
+#
+# This rule read "CudaOuterGraph: uses the graph API.  The conditional WHILE
+# wrapper is Task 10; Task 9 is the stream-ordered sequence it will capture."
+# Task 10 part 4 built that wrapper, so the ban would now forbid the thing it
+# was holding the door open for.  What the rule was actually defending is that
+# the STREAM-ORDERED SEQUENCE stays stream-ordered: no capture, no launch, no
+# instantiate anywhere except the one lambda that is the wrapper.  That is what
+# it checks now.
+if "cudaGraph" in GRAPH_H_CODE:
+    problems.append("CudaOuterGraph.h: uses the graph API.  The header is the pure state "
+                    "machine and the enqueue helpers; the WHILE lives in GpuOuterWhile.h "
+                    "and in one lambda of the .cu")
+_WHILE_ARM = body_of(GRAPH_CU_CODE, "auto runGraphWhile = [&]", "if (graph_arm && i == 1u)")
+for _m in re.finditer(r"cudaGraph[A-Za-z]*", GRAPH_CU_CODE):
+    if _m.group(0) in ("cudaGraphExec_t", "cudaGraph_t"):
+        continue
+    if _WHILE_ARM and _m.group(0) in _WHILE_ARM:
+        continue
+    problems.append("CudaOuterGraph.cu: %s outside runGraphWhile.  Every step of the outer "
+                    "except the WHILE that wraps it must be a stream-ordered enqueue, or "
+                    "the graph arm and the stream arm stop being the same body"
+                    % _m.group(0))
+    break
 
 # --- 8. the gate is opt-in ---------------------------------------------------
 want(GRAPH_CU_CODE, '"RASBERY_GPU_OUTER"', "CudaOuterGraph.cu", "the Task 9 feature gate")
@@ -1092,7 +1132,7 @@ for _need in ("ApplyRodCusping(", "cmfd_solver.upddtil()"):
 # region to check is the lambda, and what has to be true of the LOOP is that it
 # calls it -- once per outer, which is the property this rule is about.
 _TAIL = body_of(GRAPH_CU_CODE, "auto runOuterTail = [&](", "// --- the segment exit")
-_LOOP = body_of(GRAPH_CU_CODE, "for (unsigned int i = 0", "// --- the segment exit")
+_LOOP = body_of(GRAPH_CU_CODE, BODY_ANCHOR, "// --- the segment exit")
 if "runOuterTail(i," not in _LOOP:
     problems.append("CudaOuterGraph.cu: the per-outer body loop does not call "
                     "runOuterTail.  A tail that is only reachable from the repair path "
@@ -1148,7 +1188,7 @@ if "scalars.flux_generation" in GRAPH_CU_CODE or "scalars.xs_generation" in GRAP
     problems.append("CudaOuterGraph.cu: an elision reads a generation out of "
                     "OuterSegmentScalars, which is captured once per SEGMENT.  That is the "
                     "b8/b16 failure -- the value is stale for every outer after the first")
-_LOOP22 = body_of(GRAPH_CU_CODE, "for (unsigned int i = 0", "DeviceOuterSegmentState seg_out")
+_LOOP22 = body_of(GRAPH_CU_CODE, BODY_ANCHOR, "DeviceOuterSegmentState seg_out")
 if "read_live_state(m.hooks.ctx, live)" not in _LOOP22:
     problems.append("CudaOuterGraph.cu: the live state is not re-read at the top of the "
                     "per-outer loop, so outers 2..N of a wide segment decide from values "
@@ -1169,7 +1209,7 @@ for _gate, _why in (
                            "segment onto itself"),
         ("auto stageDtil", "the dtil upload has to be gated on the upddtil generation")):
     want(GRAPH_CU_CODE, _gate, "CudaOuterGraph.cu", _why)
-_ARM22 = GRAPH_CU_CODE[:GRAPH_CU_CODE.find("for (unsigned int i = 0")]
+_ARM22 = GRAPH_CU_CODE[:GRAPH_CU_CODE.find(BODY_ANCHOR)]
 for _call, _what in (("stageXsnf()", "xsnf"), ("stageDtil(", "dtil")):
     if _call not in _ARM22:
         problems.append(f"CudaOuterGraph.cu: the {_what} stage is not issued before the "
@@ -1280,7 +1320,7 @@ if "const bool host_reader_next = !live.sweep_will_enqueue;" not in GRAPH_CU_COD
                     "gate.  The mirrors are for the host loop and nothing else, so the "
                     "condition has to be the same predicate that decides whether the host "
                     "loop runs -- anything weaker mirrors on every outer again")
-_LOOP24 = body_of(GRAPH_CU_CODE, "for (unsigned int i = 0",
+_LOOP24 = body_of(GRAPH_CU_CODE, BODY_ANCHOR,
                   "mirror psi to the host at the segment exit")
 if _LOOP24.count("mirror psi to the host") > 1 or _LOOP24.count("mirror dhat to the host") > 1:
     problems.append("CudaOuterGraph.cu: more than one in-loop mirror per array; the pair is "

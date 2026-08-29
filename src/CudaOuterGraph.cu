@@ -2172,8 +2172,19 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     // stream behind the transition at the top of every pass.
     //
     // =======================================================================
-    // WHAT STILL STOPS TASK 10 FROM CAPTURING THIS LOOP AS A CONDITIONAL WHILE
+    // WHAT USED TO STOP TASK 10 FROM CAPTURING THIS LOOP AS A CONDITIONAL WHILE
     // =======================================================================
+    //
+    // KEPT AS THE RECORD OF HOW THE HOLE WAS CLOSED, not as a description of
+    // today.  The WHILE exists: `runGraphWhile` below captures runOneOuter into
+    // a conditional body and launches it once per segment
+    // (RASBERY_GPU_OUTER_GRAPH=1, src/GpuOuterWhile.h).  Hole (1), the sweep
+    // observation, is exactly what part 3's host-free arm deferred to the
+    // segment exit -- which is why the graph arm is a strict subset of that one
+    // and refuses (`not_hostfree`) wherever it refuses.  What the list below
+    // still earns its place for is the ARGUMENT: every term in it is a fact the
+    // captured body depends on, and a change that breaks one of them breaks the
+    // WHILE silently.
     //
     // Re-surveyed after W3 items 3 and 4, which closed two of the four entries
     // this list used to have.  A stream in capture mode RECORDS work; it may not

@@ -710,7 +710,12 @@ def check_host_reader_mirror_is_synchronised(problems: list[str]) -> None:
     run = strip_comments(body_of(runner, "bool CudaOuterSegment::runSegment"))
 
     try:
-        loop_at = run.index("for (unsigned int i = 0")
+        # Rev.7.1 Task 10 part 4: the per-outer body is the runOneOuter lambda,
+        # not the body of the `for` -- the conditional WHILE captures one outer
+        # and a capture is a call.  The rule is unchanged; the text it reads
+        # moved.  The `for` is the fallback so this file still reads a tree
+        # that has not taken that step.
+        loop_at = run.index("auto runOneOuter = [&](") if "auto runOneOuter = [&](" in run             else run.index("for (unsigned int i = 0")
         # The LAST of the two in-loop mirrors, so the guard slice below holds
         # only the synchronise's own condition -- anchoring on the dhat one puts
         # the psi mirror's own `if (host_reader_next ...)` inside it and any
@@ -879,7 +884,8 @@ def check_staged_uploads_have_one_in_body_writer(problems: list[str]) -> None:
     run = strip_comments(body_of(runner_src, "bool CudaOuterSegment::runSegment"))
 
     try:
-        loop_at = run.index("for (unsigned int i = 0")
+        # Same anchor, same reason as above: the body is a lambda since part 4.
+        loop_at = run.index("auto runOneOuter = [&](") if "auto runOneOuter = [&](" in run             else run.index("for (unsigned int i = 0")
     except ValueError:
         problems.append("CudaOuterGraph.cu: runSegment has no body loop to check")
         return
