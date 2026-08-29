@@ -25,6 +25,7 @@
 // ADMISSION FAILS LOUD (Sec 4.4).  A refusal writes a [RASBERY][GPU_ARENA][FAIL]
 // line and leaves the arena unavailable.  It does NOT retry with fewer slots.
 
+#include "GpuCaptureArbiter.h"
 #include "GpuPhysicsArena.h"
 
 #include <cuda_runtime.h>
@@ -77,6 +78,9 @@ GpuPhysicsArena::~GpuPhysicsArena() {
 }
 
 bool GpuPhysicsArena::reserve(const ArenaDims& dims) {
+    // Rev.7.1 Task 18d: cudaMemPoolCreate and the setup drain below are
+    // synchronising, and this reserve runs per deck on the deck's own thread.
+    rasbery::AllocWindow _alloc_window("physics.arena.reserve");
     Impl& d = *_impl;
     if (d.ready) return d.fail("reserve() called twice; the arena is allocated once");
 
@@ -205,6 +209,7 @@ bool GpuPhysicsArena::reserve(const ArenaDims& dims) {
 }
 
 void GpuPhysicsArena::release() {
+    rasbery::AllocWindow _alloc_window("physics.arena.release");
     Impl& d = *_impl;
     if (d.base != nullptr) {
         cudaFreeAsync(d.base, d.setup);

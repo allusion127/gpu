@@ -384,6 +384,19 @@ bool BICGCMFD::prepareDeviceSweeps(double* flux, SweepPrep& p) {
     // The registrations are LEASED (HostPinRegistry.h): the nine fixed-address
     // ranges below are owned by Geometry/CMFD/XSSet and released in THEIR
     // destructors, the four vector-backed ones by ~BICGCMFD.
+    //
+    // AND THEY ARE ARBITRATED (Rev.7.1 Task 18d).  This block is the FIRST
+    // TOUCH: it runs once per instance on that instance's own Driver thread, so
+    // in `--batch-mode M` the late decks reach it while the early decks are
+    // already capturing the shared arena's CMFD graph.  Measured, this block is
+    // the ACCOMPLICE rather than the trigger -- 73 of these registrations
+    // landed inside a capture window without killing it, while a single
+    // cudaDeviceSynchronize from CudaOuterSegment::bindResidency killed it
+    // every time -- but it is what puts a late deck's thread on the device API
+    // at exactly that moment, and cudaHostRegister is on CUDA's unsafe list too.
+    // Nothing here changed; the serialisation lives one level down, in the pin
+    // hook that every one of these calls lands in (CudaBICGBackend.cu /
+    // CudaXsReconBackend.cu, rasbery::AllocWindow).  See src/GpuCaptureArbiter.h.
     if (_ls->arena() != nullptr) {
         auto*        ar   = _ls->arena();
         const size_t nd   = static_cast<size_t>(nxyz);

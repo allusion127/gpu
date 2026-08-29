@@ -4,6 +4,7 @@
 #include "CudaTransferMirror.h"
 #include "CudaXsReconBackend.h" // rasberyHostPinningEnabled(): header-only gate
 #include "Geometry.h"
+#include "GpuCaptureArbiter.h"
 #include "pch.h"
 
 #include <cublas_v2.h>
@@ -26,6 +27,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace rasbery {
@@ -115,6 +117,98 @@ void cublas_check(cublasStatus_t value, const char* expression) {
 
 #define CUDA_CHECK(expr) cuda_check((expr), #expr)
 #define CUBLAS_CHECK(expr) cublas_check((expr), #expr)
+
+/// Rev.7.1 Task 18d: a capture window that CANNOT be left open.
+///
+/// THE HOLE IT CLOSES.  Both graph captures on the arena stream were written as
+///
+///     rc = cudaStreamBeginCapture(stream, ...);
+///     if (rc == cudaSuccess) { enqueue_...(); rc = cudaStreamEndCapture(...); }
+///
+/// and `enqueue_outer` contains a CUDA_CHECK -- which THROWS.  When a sibling
+/// deck's stand-up invalidated the capture, that CUDA_CHECK threw, the
+/// EndCapture was skipped, and the arena stream stayed in capture mode for the
+/// rest of the process: every later operation on it answered "operation not
+/// permitted when stream is capturing" or "operation failed due to a previous
+/// error during capture", and all M decks died.  ONE deck's transient became
+/// the batch's death because of these two lines.
+///
+/// The guard makes the window exception-safe (the destructor ends a capture the
+/// code did not end, discards the partial graph and clears the sticky error)
+/// and pairs it with the process-wide CaptureWindow, which is what stops the
+/// sibling's allocation from invalidating it in the first place.
+class ScopedStreamCapture {
+  public:
+    ScopedStreamCapture(cudaStream_t stream, const char* tag)
+        : _stream(stream), _window(stream, tag) {}
+
+    /// DIAGNOSTIC ONLY.  RASBERY_GPU_CAPTURE_MODE=global asks CUDA to police
+    /// the rule this class enforces: under cudaStreamCaptureModeGlobal every
+    /// unsafe API in EVERY thread fails, loudly and at its own call site,
+    /// instead of silently invalidating somebody else's capture.  It is not a
+    /// mode to run in -- a refused allocation is a dead deck -- but it is the
+    /// mode that turns "somebody violated the rule" into a named line.
+    static cudaStreamCaptureMode captureMode() {
+        static const cudaStreamCaptureMode mode = [] {
+            const char* v = std::getenv("RASBERY_GPU_CAPTURE_MODE");
+            if (v != nullptr && std::string(v) == "global")
+                return cudaStreamCaptureModeGlobal;
+            if (v != nullptr && std::string(v) == "relaxed")
+                return cudaStreamCaptureModeRelaxed;
+            return cudaStreamCaptureModeThreadLocal;
+        }();
+        return mode;
+    }
+
+    cudaError_t begin() {
+        const cudaError_t rc = cudaStreamBeginCapture(_stream, captureMode());
+        _open = (rc == cudaSuccess);
+        // DIAGNOSTIC ONLY, and the reason the root cause is a measurement
+        // rather than a reading of the CUDA manual.  RASBERY_GPU_CAPTURE_
+        // STALL_US widens this window to a chosen number of microseconds, which
+        // turns a 4-in-20 race into a certainty: an 8-deck batch with the
+        // arbiter off and a 200 ms stall died 4 times in 5, and the
+        // [RASBERY][CAPTURE] trace separates the five runs perfectly --
+        // 73 sibling cudaHostRegister calls inside the window and NO
+        // cudaDeviceSynchronize is the run that survived; one
+        // cudaDeviceSynchronize inside the window is every run that died.
+        // With the arbiter on and the SAME stall, 0 of 5.  Unset (the default)
+        // this is one relaxed load per capture.
+        if (_open) {
+            static const long stall_us = [] {
+                const char* v = std::getenv("RASBERY_GPU_CAPTURE_STALL_US");
+                return v == nullptr ? 0L : std::strtol(v, nullptr, 10);
+            }();
+            if (stall_us > 0)
+                std::this_thread::sleep_for(std::chrono::microseconds(stall_us));
+        }
+        return rc;
+    }
+
+    cudaError_t end(cudaGraph_t* graph) {
+        if (!_open) return cudaErrorStreamCaptureUnmatched;
+        _open = false;
+        return cudaStreamEndCapture(_stream, graph);
+    }
+
+    ~ScopedStreamCapture() {
+        if (!_open) return;
+        cudaGraph_t partial = nullptr;
+        cudaStreamEndCapture(_stream, &partial);
+        if (partial != nullptr) cudaGraphDestroy(partial);
+        cudaGetLastError();
+        rasbery::captureArbiterStats().captures_unwound.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+
+    ScopedStreamCapture(const ScopedStreamCapture&)            = delete;
+    ScopedStreamCapture& operator=(const ScopedStreamCapture&) = delete;
+
+  private:
+    cudaStream_t            _stream = nullptr;
+    rasbery::CaptureWindow  _window;
+    bool                    _open   = false;
+};
 
 bool envFlagDisabled(const char* name) {
     const char* value = std::getenv(name);
@@ -2403,6 +2497,13 @@ public:
             return;
         }
 
+        // Rev.7.1 Task 18d.  Everything below allocates, page-locks or copies
+        // synchronously, and in a batch it runs on a Driver thread while OTHER
+        // Drivers may already be capturing the arena's graphs.  One window for
+        // the whole stand-up rather than one per call: the arbiter is a
+        // shared/exclusive lock, so this neither serialises the decks against
+        // each other nor costs anything once the run is warm.
+        rasbery::AllocWindow arena_standup("cmfd.arena.standup");
         try {
             int device = 0;
             CUDA_CHECK(cudaGetDevice(&device));
@@ -2693,9 +2794,15 @@ public:
 
     ~BatchCore() { release(); }
 
-    void allocate(void** pointer, size_t bytes) { CUDA_CHECK(cudaMalloc(pointer, bytes)); }
+    void allocate(void** pointer, size_t bytes) {
+        rasbery::AllocWindow window("cmfd.arena.malloc");
+        CUDA_CHECK(cudaMalloc(pointer, bytes));
+    }
 
     void release() {
+        // cudaFree is a synchronising API and the arena outlives some decks:
+        // a teardown that overlaps a surviving deck's capture invalidates it.
+        rasbery::AllocWindow window("cmfd.arena.release");
         // Every live instantiation is in the caches (a successful capture is
         // pushed there before it is used, a failed one leaves nothing), so
         // this is the single teardown -- destroying graph_exec separately
@@ -3365,10 +3472,24 @@ public:
                 return;
             }
             cudaGraph_t graph = nullptr;
-            cudaError_t rc = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
-            if (rc == cudaSuccess) {
-                enqueue_outer(nmax);
-                rc = cudaStreamEndCapture(stream, &graph);
+            cudaError_t rc    = cudaSuccess;
+            {
+                ScopedStreamCapture capture(stream, "cmfd.outer");
+                rc = capture.begin();
+                if (rc == cudaSuccess) {
+                    // enqueue_outer CUDA_CHECKs its status D2H, so it can throw
+                    // -- and a throw here used to leave the arena stream in
+                    // capture mode for the rest of the process.  It is caught
+                    // and demoted to the SAME fallback a refused capture takes,
+                    // which is exact for the reason stated below: work
+                    // submitted to a capturing stream is recorded, not run.
+                    try {
+                        enqueue_outer(nmax);
+                        rc = capture.end(&graph);
+                    } catch (const std::exception&) {
+                        rc = cudaErrorStreamCaptureInvalidated;
+                    }
+                }
             }
             if (rc == cudaSuccess)
                 // 3-argument form: the legacy (errorNode, logBuffer, size)
@@ -3521,10 +3642,20 @@ public:
                     sweep_graph = e.key;
             const int depth = sweep_graph.captureDepth(unroll);
             cudaGraph_t graph = nullptr;
-            cudaError_t rc = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
-            if (rc == cudaSuccess) {
-                enqueue_sweeps(nmax, depth);
-                rc = cudaStreamEndCapture(stream, &graph);
+            cudaError_t rc    = cudaSuccess;
+            {
+                ScopedStreamCapture capture(stream, "cmfd.sweep");
+                rc = capture.begin();
+                if (rc == cudaSuccess) {
+                    // enqueue_sweeps calls enqueue_outer, which CUDA_CHECKs --
+                    // same throw, same exception-safe demotion to the fallback.
+                    try {
+                        enqueue_sweeps(nmax, depth);
+                        rc = capture.end(&graph);
+                    } catch (const std::exception&) {
+                        rc = cudaErrorStreamCaptureInvalidated;
+                    }
+                }
             }
             if (rc == cudaSuccess)
                 rc = cudaGraphInstantiate(&sweep_graph_exec, graph, 0ull);
@@ -4487,12 +4618,24 @@ namespace {
 /// either can be the first to reach a pinHost call, and the install is
 /// idempotent.  An anonymous namespace in each TU keeps them ODR-private.
 int cudaHostPinRegister(void* address, std::size_t bytes) {
+    // Rev.7.1 Task 18d: THE FIRST-TOUCH PIN IS THE RACE'S OTHER HALF.
+    // BICGCMFD.cpp's `pinHost` block runs once per deck on that deck's own
+    // Driver thread, which in a batch is while the earlier decks are capturing.
+    rasbery::AllocWindow window("pin.register");
     const cudaError_t rc = cudaHostRegister(address, bytes, cudaHostRegisterDefault);
-    if (rc != cudaSuccess) cudaGetLastError(); // already registered / exotic host
+    if (rc != cudaSuccess) {
+        // Named, not just swallowed.  Under the diagnostic global capture mode
+        // this is the line that says "the sibling's first-touch pin is what was
+        // running inside the capture", which is how Task 18d's root cause was
+        // identified rather than guessed.
+        rasbery::captureTrace("register-refused", cudaGetErrorString(rc), address, 0);
+        cudaGetLastError(); // already registered / exotic host
+    }
     return static_cast<int>(rc);
 }
 
 int cudaHostPinUnregister(void* address) {
+    rasbery::AllocWindow window("pin.unregister");
     const cudaError_t rc = cudaHostUnregister(address);
     if (rc != cudaSuccess) cudaGetLastError();
     return static_cast<int>(rc);
@@ -5083,6 +5226,10 @@ void rasberyReleaseBatchArena() {
         reportCmfdCompaction();
     if (!g_arena) return;
     g_arena->reportBatchOccupancy("run");
+    // Printed beside the occupancy because it answers the question the
+    // occupancy raises: the batch is this wide, and this is what it cost to
+    // keep its captures away from its allocations.
+    std::cout << rasbery::captureArbiterReceipt("run") << std::endl;
     const BackendCounters c = g_arena->counters();
     std::cout << "[RASBERY][CUDA][BACKEND_COUNTERS] {"
               << "\"cmfd_gpu_calls\":" << c.cmfd_gpu_calls << ','

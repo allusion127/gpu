@@ -3,6 +3,7 @@
 #include "CudaTransferMirror.h"
 #include "FlatXsKernel.h"
 #include "GpuCanonicalState.h"
+#include "GpuCaptureArbiter.h"
 #include "NodalKernel.h"
 #include "XeFormMask.h"
 #include "XeKernel.h"
@@ -88,6 +89,22 @@ bool nodalXsMirrorEnabled() {
             (sink) = std::string(#expr) + " -> " + cudaGetErrorString(_e);   \
             return false;                                                    \
         }                                                                    \
+    } while (0)
+
+/// Rev.7.1 Task 18d: the ALLOCATING twin of RASBERY_CUDA_TRY.
+///
+/// Identical in every respect except that it holds a rasbery::AllocWindow for
+/// the duration of the call.  Allocation, page-locking and device-wide
+/// synchronisation are exactly the APIs CUDA calls "potentially unsafe" while a
+/// graph capture is open, and `--batch-mode` runs them on one deck's Driver
+/// thread while another deck is capturing the shared arena's graph.  The window
+/// is what keeps the two apart; see GpuCaptureArbiter.h for the failure it
+/// prevents, and tools/test_gpu_capture_arbiter_contract.py for the source rule
+/// that keeps this file using it.
+#define RASBERY_CUDA_TRY_ALLOC(expr, sink)                                   \
+    do {                                                                     \
+        rasbery::AllocWindow _alloc_window(#expr);                           \
+        RASBERY_CUDA_TRY(expr, sink);                                        \
     } while (0)
 
 // max_change >= 0 always (|dXe| / max(|Xe|, 1e-30)), and for non-negative
@@ -872,6 +889,9 @@ private:
     }
 
     void init(const ndl::NodalView& p) {
+        // Rev.7.1 Task 18d: the nodal arena stands up on whichever deck reaches
+        // it first, while the other decks may already be capturing.
+        rasbery::AllocWindow window("nodal.arena.standup");
         _nxyz       = p.nxyz;
         _nsurf      = p.nsurf;
         _chif_empty = p.chif_empty;
@@ -1100,6 +1120,11 @@ private:
         const cudaError_t drc = cudaStreamSynchronize(_stream);
         if (drc != cudaSuccess) { _use_graph = false; return nullptr; }
         cudaGraph_t graph = nullptr;
+        // Rev.7.1 Task 18d: exclusive of every allocation in the process for
+        // the length of the window.  A sibling deck's first-touch pin or lazy
+        // cudaMalloc landing here invalidates the capture, and a nodal capture
+        // invalidated mid-flight is the same class of failure as the CMFD one.
+        rasbery::CaptureWindow _capture_window(_stream, "nodal.bucket");
         cudaError_t rc =
             cudaStreamBeginCapture(_stream, cudaStreamCaptureModeThreadLocal);
         if (rc == cudaSuccess) {
@@ -1870,6 +1895,9 @@ struct XsReconBackend::Impl {
     std::size_t off_phif          = 0;
 
     ~Impl() {
+        // Rev.7.1 Task 18d: a deck's teardown frees while the surviving decks
+        // may be capturing, and cudaFree is a synchronising API.
+        rasbery::AllocWindow _alloc_window("xsrecon.instance.release");
         // Hand the arena slot back BEFORE anything else: a lingering launcher
         // may be counting this instance among the participants it is waiting
         // for, and releaseSlot is what wakes it.
@@ -1913,6 +1941,7 @@ struct XsReconBackend::Impl {
         // The Xe history is sized on n_fuel and its addresses are handed to
         // kernels; a geometry change invalidates both.
         xeRelease();
+        rasbery::AllocWindow _alloc_window("xsrecon.instance.regrow");
         if (dev_block) { cudaFree(dev_block); dev_block = nullptr; }
         if (dev_fuel) { cudaFree(dev_fuel); dev_fuel = nullptr; }
         if (dev_ref) { cudaFree(dev_ref); dev_ref = nullptr; }
@@ -1942,14 +1971,15 @@ struct XsReconBackend::Impl {
         off_phif = off; off += static_cast<std::size_t>(xsr::NG) * nx;
         block_doubles = off;
 
-        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&dev_block),
-                                    block_doubles * sizeof(double)), status);
-        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&dev_fuel),
-                                    static_cast<std::size_t>(nxyz) * sizeof(int)), status);
+        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&dev_block),
+                                          block_doubles * sizeof(double)), status);
+        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&dev_fuel),
+                                          static_cast<std::size_t>(nxyz) * sizeof(int)), status);
         return true;
     }
 
     void xeRelease() {
+        rasbery::AllocWindow _alloc_window("xsrecon.xe.release");
         if (xe_hist) { cudaFree(xe_hist); xe_hist = nullptr; }
         if (xe_processed) { cudaFree(xe_processed); xe_processed = nullptr; }
         if (xe_partials) { cudaFree(xe_partials); xe_partials = nullptr; }
@@ -1974,27 +2004,27 @@ struct XsReconBackend::Impl {
         if (xe_parts > n_fuel) xe_parts = n_fuel; // empty partitions are pure waste
         if (xe_parts < 1) xe_parts = 1;
 
-        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&xe_hist),
-                                    3 * static_cast<std::size_t>(xek::XE_TRIPLE_COUNT) *
-                                        nf * sizeof(double)),
-                         status);
-        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&xe_processed), nf), status);
-        RASBERY_CUDA_TRY(
+        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&xe_hist),
+                                          3 * static_cast<std::size_t>(xek::XE_TRIPLE_COUNT) *
+                                              nf * sizeof(double)),
+                               status);
+        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&xe_processed), nf), status);
+        RASBERY_CUDA_TRY_ALLOC(
             cudaMalloc(reinterpret_cast<void**>(&xe_partials),
                        static_cast<std::size_t>(xek::XE_DOT_COUNT) *
                            static_cast<std::size_t>(xe_parts) * sizeof(double)),
             status);
-        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&xe_dots),
-                                    xek::XE_DOT_COUNT * sizeof(double)),
-                         status);
-        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&xe_pairs),
-                                    3 * xek::XE_DOT_COUNT * sizeof(int)),
-                         status);
-        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&xe_flags), sizeof(int)),
-                         status);
-        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&xe_bits),
-                                    2 * sizeof(unsigned long long)),
-                         status);
+        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&xe_dots),
+                                          xek::XE_DOT_COUNT * sizeof(double)),
+                               status);
+        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&xe_pairs),
+                                          3 * xek::XE_DOT_COUNT * sizeof(int)),
+                               status);
+        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&xe_flags), sizeof(int)),
+                               status);
+        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&xe_bits),
+                                          2 * sizeof(unsigned long long)),
+                               status);
         // The history is READ before it is written on exactly one path: a
         // window column the arm never recorded.  The host guards that with
         // ncol, and so does this arm -- but a NaN sitting in an unwritten
@@ -2085,9 +2115,9 @@ struct XsReconBackend::Impl {
         // two per-call copies were pure API-call overhead (nsys: memcpy CALL
         // COUNT, not payload, dominates the timeline).
         if (dev_dep == nullptr) {
-            RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&dev_dep),
-                                        2 * xsr::NISO * sizeof(double)),
-                             status);
+            RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&dev_dep),
+                                              2 * xsr::NISO * sizeof(double)),
+                                   status);
             RASBERY_CUDA_TRY(cudaMemcpyAsync(dev_dep, host.dep_i135,
                                              xsr::NISO * sizeof(double),
                                              cudaMemcpyHostToDevice, stream),
@@ -2146,6 +2176,7 @@ XsReconBackend::XsReconBackend() : _impl(std::make_unique<Impl>()) {
         _impl->status = std::string("stream: ") + cudaGetErrorString(se);
         return;
     }
+    rasbery::AllocWindow _scalars_window("xsrecon.scalars");
     if (cudaMalloc(reinterpret_cast<void**>(&_impl->dev_scalars),
                    2 * sizeof(unsigned long long)) != cudaSuccess) {
         _impl->status = "scalar buffer allocation failed";
@@ -2531,10 +2562,10 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
             for (int t = 0; t < fxs::N_ACTIVE; ++t) { e.off_mic[t] = off; off += shape.mic_slot; }
             e.off_msm = off; off += shape.msm;
             e.off_knots = off; off += shape.n_knots;
-            RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&e.block),
-                                        off * sizeof(double)), d.status);
-            RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&e.deltas),
-                                        shape.n_deltas * sizeof(fxs::DeltaMeta)), d.status);
+            RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&e.block),
+                                              off * sizeof(double)), d.status);
+            RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&e.deltas),
+                                              shape.n_deltas * sizeof(fxs::DeltaMeta)), d.status);
             // Synchronous copies under the mutex: nothing can race a
             // half-uploaded table, and this happens once per process.
             for (int t = 0; t < fxs::N_ACTIVE; ++t)
@@ -2573,8 +2604,8 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
         d.off_ref_msm = off; off += msm;
         for (int t = 0; t < fxs::N_ACTIVE; ++t) { d.off_ref_lmp[t] = off; off += lmp; }
         d.off_ref_lsm = off; off += ssm;
-        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d.dev_ref),
-                                    off * sizeof(double)), d.status);
+        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.dev_ref),
+                                          off * sizeof(double)), d.status);
         d.resident_ref_generation = 0;
     }
     if (ref_generation != d.resident_ref_generation) {
@@ -2619,8 +2650,8 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     }
 
     if (d.dev_pernode == nullptr)
-        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d.dev_pernode),
-                                    3 * nx * sizeof(double)), d.status);
+        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.dev_pernode),
+                                          3 * nx * sizeof(double)), d.status);
     RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_pernode, host.wvfr, nx * sizeof(double),
                                      cudaMemcpyHostToDevice, d.stream), d.status);
     RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_pernode + nx, host.dmod, nx * sizeof(double),
@@ -2630,16 +2661,17 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
 
     const std::size_t n_nodes = static_cast<std::size_t>(host.n_nodes);
     if (n_nodes > d.nodes_cap) {
+        rasbery::AllocWindow _alloc_window("xsrecon.nodes.regrow");
         if (d.dev_nodes) cudaFree(d.dev_nodes);
         if (d.dev_off) cudaFree(d.dev_off);
         if (d.dev_cnt) cudaFree(d.dev_cnt);
         d.dev_nodes = d.dev_off = d.dev_cnt = nullptr;
-        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d.dev_nodes),
-                                    n_nodes * sizeof(int)), d.status);
-        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d.dev_off),
-                                    n_nodes * sizeof(int)), d.status);
-        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d.dev_cnt),
-                                    n_nodes * sizeof(int)), d.status);
+        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.dev_nodes),
+                                          n_nodes * sizeof(int)), d.status);
+        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.dev_off),
+                                          n_nodes * sizeof(int)), d.status);
+        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.dev_cnt),
+                                          n_nodes * sizeof(int)), d.status);
         d.nodes_cap = n_nodes;
     }
     std::size_t stream_len = 0;
@@ -2647,16 +2679,17 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
         stream_len = static_cast<std::size_t>(host.node_off[host.n_nodes - 1]) +
                      static_cast<std::size_t>(host.node_cnt[host.n_nodes - 1]);
     if (stream_len > d.stream_cap) {
+        rasbery::AllocWindow _alloc_window("xsrecon.stream.regrow");
         if (d.dev_sdid) cudaFree(d.dev_sdid);
         if (d.dev_sx) cudaFree(d.dev_sx);
         if (d.dev_sscale) cudaFree(d.dev_sscale);
         d.dev_sdid = nullptr; d.dev_sx = d.dev_sscale = nullptr;
-        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d.dev_sdid),
-                                    stream_len * sizeof(int)), d.status);
-        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d.dev_sx),
-                                    stream_len * sizeof(double)), d.status);
-        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d.dev_sscale),
-                                    stream_len * sizeof(double)), d.status);
+        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.dev_sdid),
+                                          stream_len * sizeof(int)), d.status);
+        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.dev_sx),
+                                          stream_len * sizeof(double)), d.status);
+        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.dev_sscale),
+                                          stream_len * sizeof(double)), d.status);
         d.stream_cap = stream_len;
     }
     RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_nodes, host.nodes, n_nodes * sizeof(int),
@@ -2829,6 +2862,7 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
 
     if (d.ndev_dbl == nullptr || d.nodal_nsurf != host.nsurf) {
         d.dropNodalGraph(); // baked ndev_dbl-relative pointers
+        rasbery::AllocWindow _alloc_window("nodal.instance.regrow");
         if (d.ndev_dbl) { cudaFree(d.ndev_dbl); d.ndev_dbl = nullptr; }
         if (d.ndev_int) { cudaFree(d.ndev_int); d.ndev_int = nullptr; }
         d.nodal_geom_uploaded       = false;
@@ -2848,16 +2882,16 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         d.n_off_work = off;
         off += 3 * ndg0 + 2 * nx * ndl::NDIR * ndl::NG2 + 4 * nx * ndl::NG2 +
                3 * ndg0;
-        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d.ndev_dbl),
-                                    off * sizeof(double)), d.status);
+        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.ndev_dbl),
+                                          off * sizeof(double)), d.status);
         std::size_t ioff = 0;
         d.n_ioff_lktosfc = ioff; ioff += nx * ndl::NDIR * ndl::NLR;
         d.n_ioff_neib = ioff; ioff += nx * ndl::NEWSB;
         d.n_ioff_lklr = ioff; ioff += ns * ndl::NLR;
         d.n_ioff_idirlr = ioff; ioff += ns * ndl::NLR;
         d.n_ioff_sgnlr = ioff; ioff += ns * ndl::NLR;
-        RASBERY_CUDA_TRY(cudaMalloc(reinterpret_cast<void**>(&d.ndev_int),
-                                    ioff * sizeof(int)), d.status);
+        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.ndev_int),
+                                          ioff * sizeof(int)), d.status);
     }
     const std::size_t ndg = nx * ndl::NDIR * ndl::NG;
 
@@ -3052,6 +3086,7 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     // guard let us get here.
     v.reigv_dev = d.ndev_dbl + d.n_off_reigv;
     if (d.nodal_h_reigv == nullptr) {
+        rasbery::AllocWindow _alloc_window("nodal.reigv.hostalloc");
         if (cudaHostAlloc(reinterpret_cast<void**>(&d.nodal_h_reigv),
                           sizeof(double), cudaHostAllocDefault) != cudaSuccess) {
             cudaGetLastError();
@@ -3227,6 +3262,7 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
         cudaGraph_t graph  = nullptr;
         bool        enq_ok = true;
+        rasbery::CaptureWindow _capture_window(d.stream, "nodal.instance");
         cudaError_t rc =
             cudaStreamBeginCapture(d.stream, cudaStreamCaptureModeThreadLocal);
         if (rc == cudaSuccess) {
@@ -3594,12 +3630,23 @@ namespace {
 /// below at first use, so a stub build (which links neither .cu) keeps the
 /// lease bookkeeping and makes no device call.
 int cudaHostPinRegister(void* address, std::size_t bytes) {
+    // Rev.7.1 Task 18d -- see the twin in CudaBICGBackend.cu: a first-touch pin
+    // taken on one deck's thread must not overlap another deck's capture.
+    rasbery::AllocWindow window("pin.register");
     const cudaError_t rc = cudaHostRegister(address, bytes, cudaHostRegisterDefault);
-    if (rc != cudaSuccess) cudaGetLastError(); // already registered / exotic host
+    if (rc != cudaSuccess) {
+        // Named, not just swallowed.  Under the diagnostic global capture mode
+        // this is the line that says "the sibling's first-touch pin is what was
+        // running inside the capture", which is how Task 18d's root cause was
+        // identified rather than guessed.
+        rasbery::captureTrace("register-refused", cudaGetErrorString(rc), address, 0);
+        cudaGetLastError(); // already registered / exotic host
+    }
     return static_cast<int>(rc);
 }
 
 int cudaHostPinUnregister(void* address) {
+    rasbery::AllocWindow window("pin.unregister");
     const cudaError_t rc = cudaHostUnregister(address);
     if (rc != cudaSuccess) cudaGetLastError();
     return static_cast<int>(rc);

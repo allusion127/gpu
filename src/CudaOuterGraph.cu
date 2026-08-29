@@ -102,6 +102,7 @@
 #include "CudaOuterGraph.h"
 
 #include "CudaTransferMirror.h"
+#include "GpuCaptureArbiter.h"
 #include "GpuPhysicsArena.h"
 #include "OuterTrace.h"
 
@@ -659,6 +660,10 @@ bool CudaOuterSegment::initialize(const DeviceArenaView& arena, int slot_count, 
 
     const std::size_t n = static_cast<std::size_t>(slot_count);
     cudaError_t       rc;
+    // Rev.7.1 Task 18d: this stand-up runs per slot on the owning Driver's
+    // thread, which in a batch is while earlier decks capture the shared CMFD
+    // arena's graph.  See GpuCaptureArbiter.h.
+    rasbery::AllocWindow _alloc_window("outer.segment.standup");
     if ((rc = cudaStreamCreateWithFlags(&_impl->own_stream, cudaStreamNonBlocking)) !=
         cudaSuccess)
         return fail("cudaStreamCreateWithFlags", rc);
@@ -689,6 +694,7 @@ bool CudaOuterSegment::initialize(const DeviceArenaView& arena, int slot_count, 
 
 void CudaOuterSegment::release() {
     if (_impl == nullptr) return;
+    rasbery::AllocWindow _alloc_window("outer.segment.release");
     if (_impl->d_probes != nullptr) cudaFree(_impl->d_probes);
     if (_impl->d_segments != nullptr) cudaFree(_impl->d_segments);
     if (_impl->d_halt != nullptr) cudaFree(_impl->d_halt);
@@ -769,7 +775,14 @@ bool CudaOuterSegment::bindResidency(const OuterSegmentResidency& residency) {
                                    residency.flux, residency.psi, residency.dtil,
                                    residency.dhat, residency.xsnf);
     cudaError_t rc = cudaGetLastError();
-    if (rc == cudaSuccess) rc = cudaDeviceSynchronize();
+    if (rc == cudaSuccess) {
+        // A DEVICE-WIDE synchronise, taken on this deck's Driver thread while
+        // the siblings may be mid-capture.  It is the loudest of the unsafe
+        // APIs in this tree and it is on the arming path of every deck, so it
+        // gets the window like the allocations do (Task 18d).
+        rasbery::AllocWindow _alloc_window("outer.bind.device_sync");
+        rc = cudaDeviceSynchronize();
+    }
     if (rc != cudaSuccess) {
         _impl->status = std::string("bind residency: ") + cudaGetErrorString(rc);
         return false;
@@ -2458,6 +2471,7 @@ bool rasberyStandUpOuterSegment(const OuterSegmentDeck& deck, std::ostream& rece
         return false;
     };
 
+    rasbery::AllocWindow _alloc_window("outer.tables.standup");
     if ((rc = cudaMalloc(&t.slot_views, sizeof(DeviceSlotView) * n)) != cudaSuccess)
         return fail("cudaMalloc(slot_views)");
     if ((rc = cudaMalloc(&t.cmfd_views, sizeof(cmfd::CmfdOuterView) * n)) != cudaSuccess)
@@ -2607,6 +2621,7 @@ bool rasberyOuterSlotAdmitted(int slot, const OuterSegmentDeckShape& shape) {
 }
 
 void rasberyTearDownOuterSegment() {
+    rasbery::AllocWindow _alloc_window("outer.tables.teardown");
     StandUpTables& t = standUpTables();
     for (int i = 0; i < kMaxDeviceSlots; ++i) rasberyOuterSegment(i).release();
     if (t.slot_views != nullptr) cudaFree(t.slot_views);
