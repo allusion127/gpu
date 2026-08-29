@@ -126,7 +126,7 @@ segment escape : flux_converged 1,163(82.4 %) / segment_budget 133 / negative_fl
 
 | 검사 | 결과 |
 |---|---|
-| **feature-off byte 동일성** (본 브랜치 바이너리, env 없음 vs `cad0c0f` 바이너리) | `h5diff` 전 데이터셋 **차이 없음**, outer 12,017 동일 |
+| **feature-off byte 동일성** (본 브랜치 바이너리, env 없음 vs `cad0c0f` 바이너리) | `h5diff` **500/500 데이터셋 0 differences**, outer 12,017 동일 |
 | **run-to-run 결정론 ×2** (`det1`/`det2`, 동일 env) | `h5diff` **IDENTICAL** |
 | **빌드 간 재현성** (커밋 3개 전 바이너리와 동일 arm) | `h5diff` **IDENTICAL** |
 | **kngr_238 Gate A** (s_on vs base) | keff 2.196 pcm / ppm 0.520 / AO 5.4e-4 / 핀 0.129 % — **전부 스크린 내** |
