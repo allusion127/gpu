@@ -107,6 +107,13 @@ struct XeGpuTally {
     /// precondition: the algebra channel of `forms_audit_mask` must equal
     /// `forms_audit_host_mask`, and a receipt where those two differ says
     /// which knob to move rather than only that TXN=1 is N1.
+    ///
+    /// Since the device mask is COMPOSED from this very host value for bits
+    /// 5..12 (src/XeFormMask.h, docs/WP7C_XE_TXN_20260831_KO.md section 9.6),
+    /// the two are equal by construction and a run where they differ is a run
+    /// with RASBERY_XE_FORMS set -- which the receipt's `source` field names.
+    /// Both numbers stay in the tally anyway: "equal by construction" is a
+    /// claim about the source, and this is the receipt that measures it.
     std::atomic<unsigned long long> forms_audit_host_mask{0};
 };
 

@@ -523,6 +523,7 @@ python tools/test_xe_txn_contract.py
 python tools/test_xe_forms_default_contract.py
 python tools/test_xe_forms_shipped_split_contract.py
 python tools/test_xe_forms_audit_contract.py
+python tools/test_xe_forms_host_consistency_contract.py
 python tools/test_xe_gpu_contract.py
 python tools/test_enum_alias_contract.py
 python tools/test_dependent_template_contract.py
@@ -801,6 +802,7 @@ python tools/test_xe_split_arm_sequence_contract.py
 python tools/test_xe_forms_default_contract.py
 python tools/test_xe_forms_shipped_split_contract.py
 python tools/test_xe_forms_audit_contract.py
+python tools/test_xe_forms_host_consistency_contract.py
 python tools/test_xe_gpu_contract.py
 python tools/test_xe_txn_contract.py
 python tools/test_xe_anderson.py

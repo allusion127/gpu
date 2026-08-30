@@ -102,8 +102,10 @@ void auditAndersonFit(const double* dots, int ncol, double min_gram, bool solved
     // this can fail are distinguishable at the log line instead of by reading
     // two headers.
     if ((forms & XE_ALGEBRA_FORMS) != host_forms)
-        std::cerr << "The two algebra channels are DIFFERENT MASKS: set "
-                     "RASBERY_XE_FORMS so its bits 5..12 equal 0x"
+        std::cerr << "The two algebra channels are DIFFERENT MASKS, which the "
+                     "resolver composes to be equal unless RASBERY_XE_FORMS is set "
+                     "-- so an override is in play: clear it, or set it so its bits "
+                     "5..12 equal 0x"
                   << std::hex << host_forms << std::dec
                   << ", or re-pin XE_HOST_FORMS_DEFAULT, and re-run this audit.";
     else

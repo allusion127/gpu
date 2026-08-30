@@ -183,9 +183,24 @@ int main(int argc, char** argv) {
     // a broken override or a broken receipt fails here and not in a campaign.
     const unsigned long long resolved = xe::xeFormMask();
     std::printf("resolved XE_FORMS = 0x%llXull\n", resolved);
-    if (std::getenv("RASBERY_XE_FORMS") == nullptr)
-        check(resolved == mined,
-              "with no override the production resolver returns the mined mask");
+    if (std::getenv("RASBERY_XE_FORMS") == nullptr) {
+        // NOT `resolved == mined` ANY MORE, and the change is the point.  The
+        // resolver composes: the mined bits for the device dot/candidate sites
+        // (0..4) and xeHostFormMask() for the four normal-equations sites
+        // (5..12), because TXN=1 has to reproduce the HOST call site there and
+        // no fixture -- this one included -- can measure that.  See
+        // src/XeFormMask.h and docs/WP7C_XE_TXN_20260831_KO.md section 9.6.
+        const unsigned long long host = xe::xeHostFormMask();
+        const unsigned long long composed =
+            (mined & xe::XE_SHIPPED_FORMS) | (host & xe::XE_ALGEBRA_FORMS);
+        std::printf("mined 0x%llX + host 0x%llX -> composed 0x%llX\n", mined, host,
+                    composed);
+        check(resolved == composed,
+              "with no override the production resolver returns the mined shipped "
+              "bits composed with the host algebra bits");
+        check((resolved & xe::XE_SHIPPED_FORMS) == (mined & xe::XE_SHIPPED_FORMS),
+              "the composition leaves the mined dot/candidate channel alone");
+    }
 
     std::printf(failures == 0 ? "PASS\n" : "FAILURES: %d\n", failures);
     return failures == 0 ? 0 : 1;

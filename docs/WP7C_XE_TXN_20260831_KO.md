@@ -7,11 +7,11 @@
 | 대상 | `RASBERY_GPU_XE` split Xe arm의 safeguarded Anderson step |
 | 상위 계획 | `docs/GPU_RASBERY_BOTTLENECK_PARALLEL_ACCELERATION_IMPLEMENTATION_PLAN_20260830_KO.md` WP7 단계 C, §3.3, §6 |
 | 게이트 등급 | **N1 (현 device arm 대비 — 181에서 측정, §9)** / N1 (host arm 대비, 이미 건너간 선) |
-| 등급 이력 | 출하 시 **B0 (현 device arm 대비)**를 주장했다. 2026-08-30 호스트 181의 실측이 그것을 반증했고 §9가 이유와 함께 강등을 기록한다. |
+| 등급 이력 | 출하 시 **B0 (현 device arm 대비)**를 주장했다. 2026-08-30 호스트 181의 실측이 그것을 반증했고 §9가 이유와 함께 강등을 기록한다. 2026-08-31: 원인(device mask가 host call site와 다른 algebra 비트를 실었다)을 §9.6의 **합성**으로 제거했다 — 등급은 **181에서 env 없는 TXN 0 vs 1 h5diff가 나올 때까지 N1로 둔다**(§9.6.6). |
 | 플래그 | `RASBERY_GPU_XE_TXN=1`, 기본 `0` |
 | receipt | `[RASBERY][XE_GPU]` — `txn_steps`, `txn_accepted`, `txn_declined`, `host_syncs`, `host_syncs_per_step`, `d2h_bytes`, `d2h_bytes_per_step`, `xe_device_steps`, `forms_audits`, `forms_audit_mismatch`, `forms_audit_mask`, `policy_note` |
-| 계약 테스트 | `tools/test_xe_txn_contract.py` (순수 python, negative control 8종), `tools/test_xe_forms_audit_contract.py` (§9.5의 계측, negative control 17종) |
-| 소스 | `src/XeKernel.h`, `src/CudaXsReconBackend.{h,cu}`, `src/Driver.h`, `src/XeGpuReceipt.h`, `src/XeAndersonReference.{h,cpp}`, `src/XeAlgebraReference.cpp`, `src/XeFormMine.h`, `src/XeFormAudit.{h,cpp}`, `src/XSSet.{h,cpp}` |
+| 계약 테스트 | `tools/test_xe_txn_contract.py` (순수 python, negative control 8종), `tools/test_xe_forms_audit_contract.py` (§9.5의 계측, negative control 17종), `tools/test_xe_forms_host_consistency_contract.py` (§9.6의 합성, negative control 20종) |
+| 소스 | `src/XeKernel.h`, `src/CudaXsReconBackend.{h,cu}`, `src/Driver.h`, `src/XeGpuReceipt.h`, `src/XeAndersonReference.{h,cpp}`, `src/XeAlgebraReference.cpp`, `src/XeFormMine.h`, `src/XeFormMask.h`, `src/XeFormMiner.cpp`, `src/XeFormAudit.{h,cpp}`, `src/XSSet.{h,cpp}` |
 | 기준 덱 | KNGR, `nxyz = 8,451`, `NG = 2`, `NISO = 39`, `NXS = 11`, `XE_DEPTH = 2`, `XE_DOT_PARTITIONS = 1024` |
 
 > 이 문서의 sync 수는 **모델이 아니라 계약**이다. `tools/test_xe_txn_contract.py`가
@@ -429,7 +429,104 @@ production의 `a * c - b * b`를 audit의 재계산으로 CSE해서 **값을 자
 
 계약: `tools/test_xe_forms_audit_contract.py` (순수 python, negative control 포함).
 
-### 9.6 다음에 할 수 있는 것 (이 커밋의 범위 밖)
+### 9.6 채택된 수정 — device mask를 host call site로부터 구성한다
+
+**결론부터: 위 3안 중 2번을 "손으로 pin"이 아니라 "구성(composition)"으로 상설화했다.**
+
+#### 9.6.1 181에서 측정된 것 (73f8627)
+
+| 항목 | 값 |
+| --- | --- |
+| 채굴된 device mask (`xeShippedFormMask` 소스의 union) | `0xd3d` |
+| production host call site (`XE_HOST_FORMS_DEFAULT`) | `0xac0` — det=2, g0=1, g1=1, proj=1 |
+| `RASBERY_GPU_XE_TXN` 0 vs 1, pin 없음 | **불일치** — Xe step 1190 vs 1195 |
+| `RASBERY_XE_FORMS=0xadd` pin 후 0 vs 1 | **byte-identical** — h5diff 0, digest `88dc35e408c86ad4`, 양쪽 Xe step 1199 |
+| 같은 조건의 `RASBERY_XE_FORMS_AUDIT=1` | `forms_audit_mismatch 0`, `forms_audit_mask`=채굴값, `forms_audit_host_mask`=`0xac0` |
+
+`0xadd`는 발견된 수가 아니다. **`(0xd3d & 0x1f) | 0xac0`**, 즉 채굴된 비트 0..4와 host
+mask의 비트 5..12를 이어붙인 것이다. 사람이 손으로 한 계산을 바이너리는 두 조각 다 이미
+들고 있었다.
+
+#### 9.6.2 무엇을 바꿨나
+
+`src/XeFormMiner.cpp::xeFormMask()`가 이제 **채널별로 출처가 다른 두 조각을 합성**한다.
+
+```
+resolved = resolveCalibratedFormMask(...)        // 종전과 동일: 채굴 + fallback + env
+host     = xeHostFormMask()                      // XE_HOST_FORMS_DEFAULT + env, 비트 5..12
+composed = (resolved & XE_SHIPPED_FORMS) | (host & XE_ALGEBRA_FORMS)
+value    = env_pinned ? resolved : composed      // source = "env" / "build_default_composed"
+```
+
+- **비트 0..4 (`XE_SHIPPED_FORMS`)** — 고정분할 dot과 candidate loop. 트리 어디에도 host
+  대응물이 없는 **순수 device site**이고 fixture가 정직하게 도달한다. 채굴값을 그대로 쓴다.
+- **비트 5..12 (`XE_ALGEBRA_FORMS`)** — 정규방정식 네 식. TXN=1은 TXN=0을 재현해야 하고,
+  TXN=0에서 그 네 식을 계산하는 것은 `Driver.h::TryAndersonXeStepGpu`의 host 블록
+  (`xe::xeSiteSub`/`xeSiteAdd`, `xeHostFormMask()`)이다. **그러므로 host의 철자가 곧 사양이고,
+  fixture가 결정할 것이 남아 있지 않다.** 채굴이 그 자리에서 답하는 것은 §9.2가 이미 적은
+  대로 *다른 translation unit의 인용문*(`xeref::refAlgebra`)을 gcc가 어떻게 접느냐이다.
+  **틀린 대상을 잰 측정은 측정이라는 이유로 옳아지지 않는다.**
+
+즉 device mask는 이제 **구성상(by construction)** host call site와 일치한다. `0xadd`를
+손으로 넣을 필요가 없어졌고, §9.6.5의 pin 절차는 "B0를 되찾는 길"에서 "이 구성에 반대하는
+절차"로 지위가 바뀌었다.
+
+#### 9.6.3 env override는 여전히 축자적으로 이긴다
+
+`RASBERY_XE_FORMS`를 친 사람은 **자기가 친 수를**, algebra 비트까지 포함해서, 의미한 것이다.
+81 지점 스윕(§9.6.5의 2번)은 정확히 이 구성에 반대하는 절차이고 그것은 계속 가능해야 한다.
+`resolveCalibratedFormMask`가 이미 override를 적용해 두므로 여기서 필요한 것은 *적용됐는지*
+뿐이다 — `source`가 `env`면 합성을 건너뛴다.
+
+#### 9.6.4 receipt
+
+한 줄에 답과 두 재료가 같이 있어서, 리뷰어가 두 번째 런이나 두 번째 파일 없이
+`0xd3d` ⊕ `0xac0` → `0xadd`를 검산할 수 있다.
+
+```
+[RASBERY][FORMS] {"mask":"XE_FORMS","resolved":"0xadd","source":"build_default_composed",
+                  "mined":"0xd3d","host":"0xac0","composed":"0xadd","shipped":"0x1d",
+                  "algebra":"0xac0","live_arm":"shipped","txn_arm":"resolved",
+                  "algebra_sound":1}
+```
+
+`source`는 `build_default_composed`(합성) 또는 `env`(축자 override) 둘 중 하나다.
+
+#### 9.6.5 TXN=0 궤적은 움직이지 않는다
+
+합성이 건드리는 것은 비트 5..12뿐이고, 그 비트의 유일한 소비자는
+`XsReconBackend::xeTransaction` 안의 `kXeAndersonSolve`이며 그것은 `Driver.h`가
+`rasberyGpuXeTxnEnabled()` 뒤에서만 부른다. production split arm의 두 launch
+(`xeDots`/`xeCandidate`)는 `xeShippedFormMask()` = `xeFormMask() & XE_SHIPPED_FORMS`,
+즉 비트 0..4만 받고 `XE_SHIPPED_FORMS ∩ XE_ALGEBRA_FORMS = ∅`이다. **`RASBERY_GPU_XE_TXN`
+unset/0 런은 이 커밋 이전의 그 런과 비트 단위로 같고, 차이는 위 receipt 텍스트가 전부다.**
+
+계약: `tools/test_xe_forms_host_consistency_contract.py` (40 검사 / 음성대조 20).
+
+```bash
+python tools/test_xe_forms_host_consistency_contract.py
+python tools/test_xe_forms_audit_contract.py
+python tools/test_xe_forms_default_contract.py
+python tools/test_xe_forms_shipped_split_contract.py
+python tools/test_xe_host_forms_contract.py
+```
+
+**게이트: 181에서 env 없이 TXN 0 vs 1 B0.** 아직 미실행 — §9.6.6.
+
+#### 9.6.6 181 runbook — env 없는 B0 증명
+
+```bash
+# 이 커밋에서 빌드한 뒤, arm 하나당 한 번씩. RASBERY_XE_FORMS는 어디에도 없다.
+RASBERY_GPU_XE=1 RASBERY_GPU_XE_TXN=0 ./rasbery <deck>   # -> out_txn0.h5
+RASBERY_GPU_XE=1 RASBERY_GPU_XE_TXN=1 ./rasbery <deck>   # -> out_txn1.h5
+h5diff -c out_txn0.h5 out_txn1.h5                        # 기대: 0 차이
+```
+
+두 런의 `[RASBERY][FORMS] {"mask":"XE_FORMS"...}` 줄이 `"source":"build_default_composed"`,
+`"resolved":"0xadd"`로 같아야 하고, `RASBERY_XE_FORMS_AUDIT=1`을 얹은 확인 런에서
+`forms_audit_mismatch == 0`이어야 한다.
+
+#### 9.6.7 남은 선택지 (채택되지 않음)
 
 1. **`RASBERY_XE_FORMS_AUDIT=1`을 181/238에서 한 번 돌린다.** §9.4는 소거법의 결론이다.
    audit은 그것을 직접 측정으로 바꾼다. `forms_audit_mismatch`가 0이면 §9.4는 틀렸고 남은
@@ -437,7 +534,8 @@ production의 `a * c - b * b`를 audit의 재계산으로 CSE해서 **값을 자
 2. **`RASBERY_XE_FORMS`로 site를 직접 쓸어본다.** 네 site × 3상태 = 81 조합. audit이 0을
    내는 조합이 있으면 그것이 이 호스트의 production mask이고, 그 값을 arm-X에
    `RASBERY_XE_FORMS`로 고정하면 TXN A/B가 B0로 돌아온다 — mask는 env override가 최우선이다
-   (`resolveCalibratedFormMask`). **이것이 B0를 되찾는 가장 짧은 길이다.**
+   (`resolveCalibratedFormMask`). **181에서 실제로 그 조합은 `0xadd`였고, 그것이 손 pin이
+   아니라 §9.6.2의 합성으로 상설화됐다.** 스윕 자체는 합성에 반대하기 위한 절차로 남는다.
 3. **또는 양쪽 arm이 같은 body를 쓰게 한다.** `TryAndersonXeStepGpu`가 자기 손으로 쓴 네 식
    대신 `xe::xeAndersonFit`을 호출하면, host g++ 빌드(`xsrMul`의 asm barrier)와 nvcc
    `--fmad=false` 빌드가 **어떤 mask 값에서도** 같은 비트를 낸다 — TXN A/B는 구성상 B0가 된다.

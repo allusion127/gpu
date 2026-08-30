@@ -21,11 +21,37 @@ namespace rasbery::xe {
 /// site nobody shipped demote a mask everybody runs.
 unsigned long long mineXeFormsOnThisHost(bool& sound, bool& algebra_sound);
 
-/// The mask this process runs under: the mined value, overridden by
-/// RASBERY_XE_FORMS, falling back to XE_FORMS_DEFAULT only when the mining
-/// failed.  Resolved once, on first call, and one [RASBERY][FORMS] receipt line
-/// is emitted then -- so a run that never touches the device Xe arm never mines
-/// and never prints.
+/// The mask this process runs under.  COMPOSED FROM TWO SOURCES, one per
+/// channel, and that composition is what makes RASBERY_GPU_XE_TXN=1 agree with
+/// TXN=0 without a hand-typed pin:
+///
+///     bits 0..4  (XE_SHIPPED_FORMS)  the MINED value -- the device dot and
+///                                    candidate sites, which the fixture
+///                                    legitimately determines; XE_FORMS_DEFAULT
+///                                    only when the mining failed;
+///     bits 5..12 (XE_ALGEBRA_FORMS)  xeHostFormMask() -- the four normal-
+///                                    equations sites, taken from the HOST call
+///                                    site because TXN=1 has to reproduce what
+///                                    that call site computes.
+///
+/// WHY THE MINED ALGEBRA BITS ARE DISCARDED.  On host 181 the mining answered
+/// 0xd3d while Driver.h's own block ran 0xac0, and TXN=1 diverged from TXN=0
+/// (1190 versus 1195 Xe steps) until somebody typed RASBERY_XE_FORMS=0xadd --
+/// which is precisely `(0xd3d & 0x1f) | 0xac0`.  The mining scores the four
+/// algebra sites against `xeref::refAlgebra`, a QUOTATION in another translation
+/// unit; the value that has to be reproduced lives at a call site no fixture can
+/// reach (src/XeFormAudit.h).  So for those four sites the host mask is the
+/// ground truth and the mined bits are dropped rather than shipped.
+///
+/// RASBERY_XE_FORMS still wins VERBATIM, algebra bits included -- the 81-point
+/// sweep in docs/WP7C_XE_TXN_20260831_KO.md section 9.6 is the procedure of
+/// disagreeing with this composition, and it stays possible.  The receipt names
+/// the source (`build_default_composed` or `env`) and prints both components,
+/// so `0xd3d` + `0xac0` -> `0xadd` is checkable on one line.
+///
+/// Resolved once, on first call, and one [RASBERY][FORMS] receipt line is
+/// emitted then -- so a run that never touches the device Xe arm never mines and
+/// never prints.
 unsigned long long xeFormMask();
 
 /// THE MASK THE PRODUCTION SPLIT ARM'S KERNELS ARE LAUNCHED WITH: exactly
