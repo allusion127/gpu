@@ -11,6 +11,7 @@
 #include "XferLedger.h"
 #include "pch.h"
 
+#include <cooperative_groups.h> // WP17: the persistent BiCG arm's grid barrier
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
@@ -628,6 +629,153 @@ inline bool cmfdCompactEnabled() {
         return v != nullptr && std::string(v) != "0";
     }();
     return on;
+}
+
+// ---------------------------------------------------------------------------
+// WP17: THE CMFD BLOCK WIDTH (RASBERY_GPU_CMFD_BLOCK), default UNCHANGED.
+//
+// WHAT THE PROFILE SAYS.  238, RTX PRO 6000 Blackwell, 188 SMs, v6 single deck
+// (KNGR, 8,451 nodes x 2 groups): every per-node CMFD kernel dispatches
+// ceil(8451 / 256) = 34 blocks and every per-element one ceil(16902 / 256) =
+// 67, against 188 SMs.  colored_block_sweep alone is 379,027 launches at
+// 2.55 us -- 967.6 ms -- on 34 blocks, i.e. 18 % of the SM array; matvec is 34
+// blocks at 2.75 us.  Even at 8 MPS clients the array is under a third
+// occupied.  The kernels are LAUNCH-LATENCY BOUND, not compute bound, and the
+// 2.5 us floor is what most of the CMFD wall is made of.
+//
+// THE LEVER, AND WHY IT IS B0.  All five per-node/per-element classes -- the
+// colour sweep, the two-group matvec, prepare_p_jacobi, update_s_jacobi and
+// update_solution -- are ELEMENTWISE in the index the launch geometry hands
+// them:
+//
+//   * the index is `blockIdx.x * blockDim.x + threadIdx.x`, guarded by
+//     `>= nxyz` (or `>= n`), so which block owns which node changes but the
+//     SET of nodes touched, and the expression each one evaluates, do not;
+//   * none of the five has a __shared__ array, a __syncthreads(), a warp
+//     shuffle or any cross-thread reduction, so no operand pairing exists to
+//     be re-associated by a different partition;
+//   * the only cross-thread writes are `atomicOr(flags + m, ...)` -- bitwise
+//     OR, commutative and idempotent, so the final mask is the same whatever
+//     order the blocks retire -- and the `l == 0` / `i == 0` scalar stores,
+//     which are keyed to the INDEX and not to the block, so exactly one thread
+//     still performs them wherever it lands.
+//
+// THE ONE THING THIS IS NOT.  The block partition is NOT the Gauss-Seidel
+// colouring.  colored_block_sweep takes `target_color` as an argument and
+// filters on `colors[l] != target_color`, a per-NODE array built once by the
+// greedy BFS colouring in init(); the launch covers every node and the mask
+// selects the colour.  init() throws when two adjacent nodes share a colour,
+// so within one colour no thread reads a node another thread of the same
+// launch writes.  Splitting a colour across MORE blocks therefore keeps the
+// sweep order exactly -- same colour, same one-shot update, same neighbour
+// values from the previous colour's launch.  What would be N1 is changing
+// WHICH colour a node belongs to, or folding two colours into one launch;
+// neither is reachable from this knob.
+//
+// DEFAULT.  0 means "unchanged": the five classes keep `block_size`
+// (kDefaultBlockSize = 256 unless RASBERY_GPU_BLOCK_SIZE says otherwise), so
+// an unset environment reproduces the 34/67-block grids block for block.
+// RASBERY_GPU_BLOCK_SIZE keeps its meaning -- the width of EVERY per-node
+// kernel, the sweep-assembly family included -- and this one narrows the five
+// that run once per BiCGSTAB iteration.  32 is reachable here and not there,
+// because 32 is the width the 265-block arm needs.
+inline int cmfdBlockThreads() {
+    static const int threads = [] {
+        const char* value = std::getenv("RASBERY_GPU_CMFD_BLOCK");
+        if (value == nullptr) return 0;
+        const int requested = std::atoi(value);
+        if (requested == 0) return 0;
+        constexpr int candidates[] = {32, 64, 128, 192, 256};
+        if (std::find(std::begin(candidates), std::end(candidates), requested) ==
+            std::end(candidates)) {
+            std::cerr << "[RASBERY][WARN][cmfd] RASBERY_GPU_CMFD_BLOCK=\"" << value
+                      << "\" is not one of 32|64|128|192|256; keeping the block width"
+                      << " unchanged\n";
+            return 0;
+        }
+        return requested;
+    }();
+    return threads;
+}
+
+/// RASBERY_GPU_CMFD_PERSISTENT, default OFF.  Arms the cooperative
+/// single-launch BiCGSTAB iteration (plan Task 21 / W0 spike 2).  Read once,
+/// like every other gate: the arm is part of the enqueue topology and may not
+/// change between two outers of the same run.
+inline bool cmfdPersistentRequested() {
+    static const bool on = [] {
+        const char* v = std::getenv("RASBERY_GPU_CMFD_PERSISTENT");
+        return v != nullptr && std::string(v) != "0";
+    }();
+    return on;
+}
+
+// ---------------------------------------------------------------------------
+// WHY THE PERSISTENT ARM REFUSES BY NAME.
+//
+// Modelled on BICGCMFD::EnqueueRefusal (src/BICGCMFD.h): a boolean "it did not
+// run" is indistinguishable from "it ran and bought nothing", and the point of
+// the spike is to attribute a measured wall to a named cause.  Every
+// enumerator has a name, the switch carries no `default:` so a new enumerator
+// fails to compile until it is named, and the name is what the
+// [RASBERY][CMFD][OCCUPANCY] receipt prints.
+// ---------------------------------------------------------------------------
+enum class PersistentRefusal : int {
+    None = 0,
+    ArmOff,              ///< RASBERY_GPU_CMFD_PERSISTENT unset or 0
+    OuterGraphActive,    ///< mutually exclusive with the captured outer graph
+    CaptureActive,       ///< a capture is open on the stream at launch time
+    BatchWidth,          ///< lanes != 1; a grid barrier cannot straddle a halted lane
+    NoCooperativeLaunch, ///< cudaDeviceProp::cooperativeLaunch == 0
+    OccupancyTooSmall,   ///< the co-resident grid cannot cover the fixed fold
+    BlockWidthMismatch,  ///< the persistent block is not kReduceThreads wide
+    Fp32Inner,           ///< the mixed-precision inner loop is out of scope
+    LaunchFailed,        ///< cudaLaunchCooperativeKernel refused at run time
+    Count
+};
+
+inline const char* persistentRefusalName(PersistentRefusal r) {
+    switch (r) {
+        case PersistentRefusal::None:                return "none";
+        case PersistentRefusal::ArmOff:              return "arm_off";
+        case PersistentRefusal::OuterGraphActive:    return "outer_graph_active";
+        case PersistentRefusal::CaptureActive:       return "capture_active";
+        case PersistentRefusal::BatchWidth:          return "batch_width";
+        case PersistentRefusal::NoCooperativeLaunch: return "no_cooperative_launch";
+        case PersistentRefusal::OccupancyTooSmall:   return "occupancy_too_small";
+        case PersistentRefusal::BlockWidthMismatch:  return "block_width_mismatch";
+        case PersistentRefusal::Fp32Inner:           return "fp32_inner";
+        case PersistentRefusal::LaunchFailed:        return "launch_failed";
+        case PersistentRefusal::Count:               break;
+    }
+    return "?";
+}
+
+/// One line, the first time a BiCGSTAB iteration is enqueued.  The occupancy
+/// receipt: what the launch geometry actually is, how many dispatches one
+/// iteration costs, and -- when the persistent arm is off -- the NAME of the
+/// reason.  Emitted whatever the graph mode, because a graph-off run has no
+/// [CMFD][GRAPH] line to carry the fields.
+inline void reportCmfdOccupancy(int block_threads, int sweep_block_threads,
+                                int node_blocks, int vector_blocks,
+                                int reduce_blocks, int launches_per_iteration,
+                                bool persistent_arm, int persistent_blocks,
+                                bool cooperative_supported,
+                                PersistentRefusal refusal) {
+    static std::atomic<bool> done{false};
+    if (done.exchange(true, std::memory_order_relaxed)) return;
+    std::cout << "[RASBERY][CMFD][OCCUPANCY] {\"block_threads\":" << block_threads
+              << ",\"sweep_block_threads\":" << sweep_block_threads
+              << ",\"node_blocks\":" << node_blocks
+              << ",\"vector_blocks\":" << vector_blocks
+              << ",\"reduce_blocks\":" << reduce_blocks
+              << ",\"scalar_blocks\":1"
+              << ",\"launches_per_iteration\":" << launches_per_iteration
+              << ",\"persistent_arm\":" << (persistent_arm ? 1 : 0)
+              << ",\"persistent_blocks\":" << persistent_blocks
+              << ",\"cooperative_supported\":" << (cooperative_supported ? 1 : 0)
+              << ",\"persistent_refusal\":\"" << persistentRefusalName(refusal)
+              << "\"}" << std::endl;
 }
 
 std::atomic<unsigned long long> g_cmfd_logical_drives{0};
@@ -1572,6 +1720,439 @@ __global__ void reduce_norm_accumulate_stage2(
 
     accumulate_iteration_active(m, allow_halt, force_halt, scalars, iter_flags,
                                 sticky_flags, counters, halt);
+}
+
+// ---------------------------------------------------------------------------
+// WP17 / plan Task 21, W0 spike 2: THE PERSISTENT COOPERATIVE BiCG ITERATION
+// (RASBERY_GPU_CMFD_PERSISTENT=1, default OFF).
+//
+// WHAT IT IS FOR.  One BiCGSTAB iteration is 18 dispatches at FUSE=15
+// (2 dots + 1 dot2 + 2 x 4 colour sweeps + prepare_p + 2 matvecs + update_s +
+// update_solution + the residual stage 1 + the fused scalar tail).  On 238 the
+// dispatch floor is ~2.5 us and 74,508 iterations ran, so the pure launch floor
+// is ~1.5 s in single and ~64x that summed over an 8-client batch -- paid on a
+// GPU whose SM array these 34- and 67-block grids leave 82 % empty.  This
+// kernel replaces the 18 dispatches with ONE cooperative launch and 17
+// cg::grid_group::sync() barriers.  The gain is exactly
+//     N_node * c_dispatch - N_barrier * c_barrier
+// which is why tools/probe_gridsync_cost.cu (spike 2/5) has to produce
+// c_barrier before this arm may be adopted, and why this is a SPIKE: it is
+// written, gated, refused by name and receipted, and it is off.
+//
+// ORDER-PRESERVATION NOTE -- why the arm is B0.
+//
+//  1. EVERY STAGE BODY IS COPIED, NOT REWRITTEN.  The expressions below are
+//     character for character those of prepare_p_jacobi, colored_block_sweep,
+//     matvec_two_group, update_s_jacobi, update_solution, reduce_dot_stage1,
+//     reduce_dot2_stage1 and the strict stage-2 folds.  Same translation unit,
+//     same --fmad=false, so the same contraction on the same operands.
+//  2. THE PER-NODE STAGES ARE GRID-STRIDED, WHICH IS THE SAME ARGUMENT THE
+//     BLOCK-WIDTH KNOB ABOVE MAKES.  They are elementwise in the index: the
+//     grid-stride loop changes WHICH thread owns node l and covers exactly the
+//     same set of l, with no __shared__, no __syncthreads and no cross-thread
+//     pairing.  The atomicOr flag writes are commutative; the `l == 0` and
+//     `i == 0` scalar stores are keyed to the index, so exactly one thread
+//     still performs them.
+//  3. THE REDUCTION PARTITION IS PINNED TO reduce_blocks, NOT TO THE GRID.
+//     Stage 1 runs on blocks [0, reduce_blocks) with
+//     `chunk = (n + reduce_blocks - 1) / reduce_blocks` -- the host passes
+//     reduce_blocks_for(n), the same 17 the standalone launch used as its
+//     gridDim.x -- the same `begin = blockIdx.x * chunk`, the same per-thread
+//     stride of blockDim.x (pinned to kReduceThreads, see the refusal
+//     BlockWidthMismatch) and the same fixed 256-lane binary tree.  Every
+//     partial is therefore the SAME double the standalone kernel wrote.
+//  4. THE FOLD IS THE SAME SERIAL FOLD, RUN REDUNDANTLY.  After the barrier
+//     every thread folds pm[0 .. reduce_blocks-1] in strict ascending index
+//     order into a register.  Strict order over identical operands is a
+//     deterministic function, so every thread gets the same bits -- the bits
+//     reduce_dot_stage2's one thread produced -- and no thread has to wait for
+//     another to publish them.  Block 0 thread 0 additionally STORES the value
+//     into scalars[], which is what the next iteration and the telemetry read.
+//     This is the only structural difference from the launch chain and it
+//     costs one barrier per reduction rather than two; it moves no addition.
+//  5. THE BARRIERS ARE THE KERNEL BOUNDARIES.  Each grid.sync() stands where a
+//     kernel boundary stood, one for one, and grid.sync() carries a device-wide
+//     memory fence, which is the guarantee the boundary gave.
+//  6. EVERY EARLY RETURN IS GRID-UNIFORM.  The slot guard and HALT_GUARD are
+//     the only returns before a barrier, and the arm refuses lanes != 1
+//     (PersistentRefusal::BatchWidth) precisely so that both are the same
+//     answer in every block; a per-lane return would strand the rest of the
+//     grid at the next barrier for ever.  Everything after the first barrier
+//     is a branch, never a return.
+//
+// MUTUALLY EXCLUSIVE WITH THE CAPTURED GRAPH.  A cooperative launch cannot be
+// recorded into a stream capture, so PERSISTENT is refused whenever the outer
+// graph is armed (OuterGraphActive) and again, defensively, whenever a capture
+// is actually open on the stream at launch time (CaptureActive).  The 238
+// runbook therefore pairs RASBERY_GPU_CMFD_PERSISTENT=1 with
+// RASBERY_GPU_GRAPH=0 / OUTER_GRAPH=0; see
+// docs/WP17_CMFD_OCCUPANCY_20260830_KO.md Sec 5.
+// ---------------------------------------------------------------------------
+
+/// Everything one persistent iteration needs, in one by-value argument so the
+/// cudaLaunchCooperativeKernel argument vector is a single pointer.
+struct PersistentBicgParams {
+    int       nxyz;
+    int       n;
+    int       reduce_blocks;   ///< reduce_blocks_for(n): the FIXED fold partition
+    int       rb_sweeps;
+    int       ncolors;
+    int       allow_halt;
+    int       force_halt;
+    long long vec_stride;
+    long long mat_stride;
+    long long cpl_stride;
+    const int*    colors;
+    const int*    neighbors;
+    const double* cc;
+    const double* diag;
+    const double* dinv;
+    double*       scalars;
+    std::uint32_t* iter_flags;
+    std::uint32_t* sticky_flags;
+    std::uint32_t* counters;
+    std::uint32_t* halt;
+    const std::uint32_t* active;
+    const double* r0;
+    double*       r;
+    double*       p;
+    double*       v;
+    double*       s;
+    double*       t;
+    double*       y;
+    double*       z;
+    double*       phi;
+    double*       partials;
+    double*       partials2;
+};
+
+/// reduce_dot_stage1's body, with gridDim.x replaced by the pinned partition.
+/// Blocks outside the partition simply do not participate; they return to the
+/// caller, which then joins the same grid barrier.
+__device__ inline void persistentDotStage1(const int n, const int reduce_blocks,
+                                           const double* __restrict__ am,
+                                           const double* __restrict__ bm,
+                                           double* __restrict__ pm,
+                                           double* shared) {
+    if (static_cast<int>(blockIdx.x) >= reduce_blocks) return;
+    const int chunk = (n + reduce_blocks - 1) / reduce_blocks;
+    const int begin = static_cast<int>(blockIdx.x) * chunk;
+    const int end   = min(begin + chunk, n);
+
+    double sum = 0.0;
+    for (int i = begin + static_cast<int>(threadIdx.x); i < end;
+         i += static_cast<int>(blockDim.x))
+        sum += am[i] * bm[i];
+
+    shared[threadIdx.x] = sum;
+    __syncthreads();
+
+    // Fixed binary tree: identical operand pairing on every launch.
+    for (int stride = kReduceThreads / 2; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride)
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) pm[blockIdx.x] = shared[0];
+}
+
+/// reduce_dot2_stage1's body, same partition, two independent accumulators.
+__device__ inline void persistentDot2Stage1(const int n, const int reduce_blocks,
+                                            const double* __restrict__ a0m,
+                                            const double* __restrict__ b0m,
+                                            const double* __restrict__ a1m,
+                                            const double* __restrict__ b1m,
+                                            double* __restrict__ p0m,
+                                            double* __restrict__ p1m,
+                                            double* shared0, double* shared1) {
+    if (static_cast<int>(blockIdx.x) >= reduce_blocks) return;
+    const int chunk = (n + reduce_blocks - 1) / reduce_blocks;
+    const int begin = static_cast<int>(blockIdx.x) * chunk;
+    const int end   = min(begin + chunk, n);
+
+    double sum0 = 0.0;
+    double sum1 = 0.0;
+    for (int i = begin + static_cast<int>(threadIdx.x); i < end;
+         i += static_cast<int>(blockDim.x)) {
+        sum0 += a0m[i] * b0m[i];
+        sum1 += a1m[i] * b1m[i];
+    }
+
+    shared0[threadIdx.x] = sum0;
+    shared1[threadIdx.x] = sum1;
+    __syncthreads();
+
+    for (int stride = kReduceThreads / 2; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride) {
+            shared0[threadIdx.x] += shared0[threadIdx.x + stride];
+            shared1[threadIdx.x] += shared1[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        p0m[blockIdx.x] = shared0[0];
+        p1m[blockIdx.x] = shared1[0];
+    }
+}
+
+/// reduce_dot_stage2's fold, verbatim: strict ascending index order over the
+/// same partial row.  Run by every thread after the barrier (see point 4).
+__device__ inline double persistentFold(const int blocks, const double* pm) {
+    double sum = 0.0;
+    for (int i = 0; i < blocks; ++i) sum += pm[i];   // strict index order
+    return sum;
+}
+
+/// colored_block_sweep's body for one node, verbatim.
+__device__ inline void persistentColourSweepNode(const int l,
+                                                 const PersistentBicgParams& a,
+                                                 const int m, const int target_color,
+                                                 const double* bm, double* xm) {
+    if (a.colors[l] != target_color) return;
+    const double* cm = a.cc + m * a.cpl_stride;
+    const double* im = a.dinv + m * a.mat_stride;
+
+    double b0 = bm[2 * l + 0];
+    double b1 = bm[2 * l + 1];
+#pragma unroll
+    for (int slot = 0; slot < 6; ++slot) {
+        const int neighbor = a.neighbors[6 * l + slot];
+        if (neighbor >= 0) {
+            b0 -= cm[12 * l + slot] * xm[2 * neighbor + 0];
+            b1 -= cm[12 * l + 6 + slot] * xm[2 * neighbor + 1];
+        }
+    }
+
+    xm[2 * l + 0] = im[4 * l + 0] * b0 + im[4 * l + 1] * b1;
+    xm[2 * l + 1] = im[4 * l + 2] * b0 + im[4 * l + 3] * b1;
+}
+
+/// matvec_two_group's body for one node, verbatim.
+__device__ inline void persistentMatvecNode(const int l,
+                                            const PersistentBicgParams& a,
+                                            const int m,
+                                            const double* xm, double* ym) {
+    const double* dm = a.diag + m * a.mat_stride;
+    const double* cm = a.cc + m * a.cpl_stride;
+
+    const double x0 = xm[2 * l + 0];
+    const double x1 = xm[2 * l + 1];
+    double       y0 = dm[4 * l + 0] * x0 + dm[4 * l + 1] * x1;
+    double       y1 = dm[4 * l + 2] * x0 + dm[4 * l + 3] * x1;
+
+#pragma unroll
+    for (int slot = 0; slot < 6; ++slot) {
+        const int neighbor = a.neighbors[6 * l + slot];
+        if (neighbor >= 0) {
+            y0 += cm[12 * l + slot] * xm[2 * neighbor + 0];
+            y1 += cm[12 * l + 6 + slot] * xm[2 * neighbor + 1];
+        }
+    }
+
+    ym[2 * l + 0] = y0;
+    ym[2 * l + 1] = y1;
+}
+
+/// ONE BiCGSTAB iteration, one cooperative launch, 17 grid barriers.
+///
+/// Launched ONLY through BatchCore::enqueuePersistentIteration(), which owns
+/// every precondition the body assumes: lanes == 1, blockDim.x ==
+/// kReduceThreads, gridDim.x >= reduce_blocks, gridDim.y == 1, FP64 inner, no
+/// capture open, cooperativeLaunch supported and the grid co-resident.
+__global__ void bicg_iteration_persistent(PersistentBicgParams a,
+                                          RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
+    // The halted slot's ONE observable effect, kept because the launch chain
+    // has it: every compute kernel HALT_GUARDs out, and the scalar tail --
+    // reduce_norm_accumulate_stage2, or accumulate_iteration with the fusion
+    // off -- still bumps kOverrunCount for an ACTIVE slot before returning.
+    // Grid-uniform (lanes == 1), so no block is left at a barrier.
+    if (a.halt[m] != 0u) {
+        if (blockIdx.x == 0u && threadIdx.x == 0u && a.active[m] != 0u)
+            ++a.counters[static_cast<long long>(m) * kCounterSlots + kOverrunCount];
+        return;
+    }
+    __shared__ double shared0[kReduceThreads];
+    __shared__ double shared1[kReduceThreads];
+
+    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+
+    const long long base   = m * a.vec_stride;
+    double*         sm     = a.scalars + static_cast<long long>(m) * kScalarCount;
+    const double*   im     = a.dinv + m * a.mat_stride;
+    double*         pm0    = a.partials + static_cast<long long>(m) * kMaxReduceBlocks;
+    double*         pm1    = a.partials2 + static_cast<long long>(m) * kMaxReduceBlocks;
+    const int       stride = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+    const int       first  = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) +
+                            static_cast<int>(threadIdx.x);
+    const bool      writer = (blockIdx.x == 0u && threadIdx.x == 0u);
+
+    // ---- dot(r0, r) -> kRhoNew --------------------------------------------
+    persistentDotStage1(a.n, a.reduce_blocks, a.r0 + base, a.r + base, pm0, shared0);
+    grid.sync();
+    const double rho_new = persistentFold(a.reduce_blocks, pm0);
+    if (writer) sm[kRhoNew] = rho_new;
+
+    // ---- prepare_p_jacobi --------------------------------------------------
+    {
+        const double rho_old = sm[kRho];
+        const double alpha   = sm[kAlpha];
+        const double omega   = sm[kOmega];
+        const double denom   = rho_old * omega;
+        const bool breakdown = !isfinite(rho_new) || !isfinite(denom) ||
+                               fabs(denom) < 1.0e-30;
+        if (breakdown && writer)
+            atomicOr(a.iter_flags + m, static_cast<std::uint32_t>(BICGSTAB_BREAKDOWN));
+        for (int l = first; l < a.nxyz; l += stride) {
+            const int i0 = 2 * l + 0;
+            const int i1 = 2 * l + 1;
+            double b0, b1;
+            if (breakdown) {
+                b0 = a.r[base + i0];
+                b1 = a.r[base + i1];
+            } else {
+                const double beta = rho_new * alpha / denom;
+                b0 = a.r[base + i0] + beta * (a.p[base + i0] - omega * a.v[base + i0]);
+                b1 = a.r[base + i1] + beta * (a.p[base + i1] - omega * a.v[base + i1]);
+            }
+            a.p[base + i0] = b0;
+            a.p[base + i1] = b1;
+            a.y[base + 2 * l + 0] = im[4 * l + 0] * b0 + im[4 * l + 1] * b1;
+            a.y[base + 2 * l + 1] = im[4 * l + 2] * b0 + im[4 * l + 3] * b1;
+        }
+    }
+    grid.sync();
+
+    // ---- precondition_sweeps(p, y) ----------------------------------------
+    for (int sweep = 0; sweep < a.rb_sweeps; ++sweep) {
+        const int target_color = sweep % a.ncolors;
+        for (int l = first; l < a.nxyz; l += stride)
+            persistentColourSweepNode(l, a, m, target_color, a.p + base, a.y + base);
+        grid.sync();
+    }
+
+    // ---- matvec_two_group(y -> v) -----------------------------------------
+    for (int l = first; l < a.nxyz; l += stride)
+        persistentMatvecNode(l, a, m, a.y + base, a.v + base);
+    grid.sync();
+
+    // ---- dot(r0, v) -> kR0V ------------------------------------------------
+    persistentDotStage1(a.n, a.reduce_blocks, a.r0 + base, a.v + base, pm0, shared0);
+    grid.sync();
+    const double r0v = persistentFold(a.reduce_blocks, pm0);
+    if (writer) sm[kR0V] = r0v;
+
+    // ---- update_s_jacobi ---------------------------------------------------
+    {
+        const bool nonfinite  = !isfinite(rho_new) || !isfinite(r0v);
+        const bool orthogonal = !nonfinite && fabs(r0v) < 1.0e-10;
+        if (writer) {
+            if (nonfinite)
+                atomicOr(a.iter_flags + m, static_cast<std::uint32_t>(NONFINITE_DETECTED));
+            else if (orthogonal)
+                atomicOr(a.iter_flags + m, static_cast<std::uint32_t>(FLUX_CONVERGED));
+        }
+        const double alpha = (!nonfinite && !orthogonal) ? rho_new / r0v : 0.0;
+        if (writer && !nonfinite) {
+            sm[kRho] = rho_new;
+            if (!orthogonal) sm[kAlpha] = alpha;
+        }
+        for (int l = first; l < a.nxyz; l += stride) {
+            const int i0 = 2 * l + 0;
+            const int i1 = 2 * l + 1;
+            double b0, b1;
+            if (nonfinite || orthogonal) {
+                b0 = a.r[base + i0];
+                b1 = a.r[base + i1];
+            } else {
+                b0 = a.r[base + i0] - alpha * a.v[base + i0];
+                b1 = a.r[base + i1] - alpha * a.v[base + i1];
+            }
+            a.s[base + i0] = b0;
+            a.s[base + i1] = b1;
+            a.z[base + 2 * l + 0] = im[4 * l + 0] * b0 + im[4 * l + 1] * b1;
+            a.z[base + 2 * l + 1] = im[4 * l + 2] * b0 + im[4 * l + 3] * b1;
+        }
+    }
+    grid.sync();
+
+    // ---- precondition_sweeps(s, z) ----------------------------------------
+    for (int sweep = 0; sweep < a.rb_sweeps; ++sweep) {
+        const int target_color = sweep % a.ncolors;
+        for (int l = first; l < a.nxyz; l += stride)
+            persistentColourSweepNode(l, a, m, target_color, a.s + base, a.z + base);
+        grid.sync();
+    }
+
+    // ---- matvec_two_group(z -> t) -----------------------------------------
+    for (int l = first; l < a.nxyz; l += stride)
+        persistentMatvecNode(l, a, m, a.z + base, a.t + base);
+    grid.sync();
+
+    // ---- dot2(s.t -> kPts, t.t -> kPtt) ------------------------------------
+    persistentDot2Stage1(a.n, a.reduce_blocks, a.s + base, a.t + base,
+                         a.t + base, a.t + base, pm0, pm1, shared0, shared1);
+    grid.sync();
+    const double pts = persistentFold(a.reduce_blocks, pm0);
+    const double ptt = persistentFold(a.reduce_blocks, pm1);
+    if (writer) {
+        sm[kPts] = pts;
+        sm[kPtt] = ptt;
+    }
+
+    // ---- update_solution ---------------------------------------------------
+    {
+        // The FLUX_CONVERGED test is FIRST, exactly as in update_solution: a
+        // converged slot returns before the isfinite test, so a stale alpha
+        // must not raise NONFINITE_DETECTED here either.
+        const bool converged =
+            (a.iter_flags[m] & static_cast<std::uint32_t>(FLUX_CONVERGED)) != 0;
+        const double alpha = converged ? 0.0 : sm[kAlpha];
+        const bool   scalars_bad =
+            !converged && (!isfinite(alpha) || !isfinite(pts) || !isfinite(ptt));
+        if (scalars_bad && writer)
+            atomicOr(a.iter_flags + m, static_cast<std::uint32_t>(NONFINITE_DETECTED));
+        if (!converged && !scalars_bad) {
+            const double omega = (ptt != 0.0) ? pts / ptt : 0.0;
+            for (int i = first; i < a.n; i += stride) {
+                const double next_phi =
+                    a.phi[base + i] + alpha * a.y[base + i] + omega * a.z[base + i];
+                const double next_r = a.s[base + i] - omega * a.t[base + i];
+                // `continue` is the reference's per-element `return`: that
+                // kernel's thread owned exactly one i, so skipping i is what it
+                // did.  The kOmega store stays BEHIND this guard and behind the
+                // two stores, exactly where `if (i == 0)` sat.
+                if (!isfinite(next_phi) || !isfinite(next_r)) {
+                    atomicOr(a.iter_flags + m,
+                             static_cast<std::uint32_t>(NONFINITE_DETECTED));
+                    continue;
+                }
+                if (next_phi < 0.0)
+                    atomicOr(a.iter_flags + m,
+                             static_cast<std::uint32_t>(NEGATIVE_FLUX));
+                a.phi[base + i] = next_phi;
+                a.r[base + i]   = next_r;
+                if (i == 0) sm[kOmega] = omega;
+            }
+        }
+    }
+    grid.sync();
+
+    // ---- residual norm stage 1 + the fused scalar tail ---------------------
+    persistentDotStage1(a.n, a.reduce_blocks, a.r + base, a.r + base, pm0, shared0);
+    grid.sync();
+    if (!writer) return;
+    if (a.active[m] == 0u) return;
+    std::uint32_t* cm = a.counters + static_cast<long long>(m) * kCounterSlots;
+    if (a.halt[m] != 0u) {
+        ++cm[kOverrunCount];
+        return;
+    }
+    sm[kInitialNorm] = sqrt(persistentFold(a.reduce_blocks, pm0));
+    accumulate_iteration_active(m, a.allow_halt, a.force_halt, a.scalars, a.iter_flags,
+                                a.sticky_flags, a.counters, a.halt);
 }
 
 __global__ void finalize_status(const double* scalars,
@@ -2923,8 +3504,16 @@ __global__ void cmfd_sweep_gate_patch(std::uint32_t* sweep_halt,
 ///   launches_per_outer   what one CMFD outer costs in dispatches.  One sweep
 ///                        carries exactly one outer, so for both graphs this is
 ///                        nodes_per_sweep.  It is the number stage B lowers.
+///   block_threads        WP17: the width of the five per-iteration elementwise
+///                        classes; equal to the arena's block_size unless
+///                        RASBERY_GPU_CMFD_BLOCK narrowed it.
+///   node_blocks          blocks_per_launch for the per-NODE classes.
+///   vector_blocks        blocks_per_launch for the per-ELEMENT class.
+///   persistent_arm       whether the cooperative single-launch iteration ran.
 static void reportCmfdGraphCensus(const char* tag, cudaGraph_t graph, int sweeps,
-                                  int iterations_per_outer, unsigned fuse_mask) {
+                                  int iterations_per_outer, unsigned fuse_mask,
+                                  int block_threads, int node_blocks,
+                                  int vector_blocks, bool persistent_arm) {
     if (graph == nullptr) return;
     size_t count = 0;
     if (cudaGraphGetNodes(graph, nullptr, &count) != cudaSuccess || count == 0) {
@@ -2969,6 +3558,10 @@ static void reportCmfdGraphCensus(const char* tag, cudaGraph_t graph, int sweeps
          << ",\"memset_nodes\":" << memsets
          << ",\"other_nodes\":" << other
          << ",\"launches_per_outer\":" << per
+         << ",\"block_threads\":" << block_threads
+         << ",\"node_blocks\":" << node_blocks
+         << ",\"vector_blocks\":" << vector_blocks
+         << ",\"persistent_arm\":" << (persistent_arm ? 1 : 0)
          << ",\"fuse_mask\":" << fuse_mask << "}";
     std::cout << line.str() << std::endl;
 }
@@ -3235,7 +3828,17 @@ public:
             fuse_sweep_pre = (fuse_mask & kFuseSweepPre) != 0u;
             fp32_inner    = cmfdFp32InnerEnabled();
             telemetry.fp32_active = fp32_inner ? 1u : 0u;
+            // WP17.  Both are latched here, once, for the same reason the fuse
+            // mask is: the block width and the persistent arm are part of the
+            // captured topology and may not change between two outers.
+            cmfd_block = cmfdBlockThreads();
+            armPersistent(properties);
             status += " (block=" + std::to_string(block_size) +
+                      ", cmfd block=" + std::to_string(cmfd_block_threads()) +
+                      ", persistent=" +
+                      (persistent_armed ? std::string("on")
+                                        : std::string("off:") +
+                                              persistentRefusalName(persistent_refusal)) +
                       ", RB sweeps=" + std::to_string(rb_sweeps) +
                       ", graph=" + (use_graph ? "on" : "off") +
                       ", iter batch=" +
@@ -3585,6 +4188,21 @@ public:
 
     [[nodiscard]] int node_blocks() const { return (nxyz + block_size - 1) / block_size; }
     [[nodiscard]] int vector_blocks() const { return (n + block_size - 1) / block_size; }
+
+    /// WP17: the width of the FIVE per-iteration elementwise classes.  0 means
+    /// "unchanged", so with RASBERY_GPU_CMFD_BLOCK unset this IS block_size and
+    /// every grid below is the grid the profile measured.
+    [[nodiscard]] int cmfd_block_threads() const {
+        return cmfd_block > 0 ? cmfd_block : block_size;
+    }
+    [[nodiscard]] int cmfd_node_blocks() const {
+        const int w = cmfd_block_threads();
+        return (nxyz + w - 1) / w;
+    }
+    [[nodiscard]] int cmfd_vector_blocks() const {
+        const int w = cmfd_block_threads();
+        return (n + w - 1) / w;
+    }
     [[nodiscard]] long long vec_stride() const { return static_cast<long long>(n); }
     [[nodiscard]] long long mat_stride() const { return static_cast<long long>(matrix_count); }
     [[nodiscard]] long long cpl_stride() const { return static_cast<long long>(coupling_count); }
@@ -3630,6 +4248,172 @@ public:
     }
     [[nodiscard]] dim3 vector_grid() const {
         return dim3(static_cast<unsigned>(vector_blocks()), static_cast<unsigned>(lanes));
+    }
+    /// WP17: the same two grids at the per-iteration width.  Identical to
+    /// node_grid()/vector_grid() when RASBERY_GPU_CMFD_BLOCK is unset.
+    [[nodiscard]] dim3 cmfd_node_grid() const {
+        return dim3(static_cast<unsigned>(cmfd_node_blocks()), static_cast<unsigned>(lanes));
+    }
+    [[nodiscard]] dim3 cmfd_vector_grid() const {
+        return dim3(static_cast<unsigned>(cmfd_vector_blocks()), static_cast<unsigned>(lanes));
+    }
+
+    /// How many DISPATCHES one BiCGSTAB iteration costs on the launch-chain
+    /// arm.  The same structural model tools/test_cmfd_fuse_contract.py builds
+    /// the graph census from, so the receipt and the census cannot disagree:
+    /// two dots + one dot2 + 2 x rb_sweeps colour sweeps + the five elementwise
+    /// kernels + the residual stage 1 + the scalar tail.
+    [[nodiscard]] int launchesPerIteration() const {
+        const int dot_nodes  = fuse_dot ? 1 : 2;
+        const int dot2_nodes = fuse_dot2 ? 1 : 2;
+        const int tail       = scalar_fusion ? 1 : 2;
+        return 2 * dot_nodes + dot2_nodes + 2 * rb_sweeps + 6 + tail;
+    }
+
+    // -----------------------------------------------------------------------
+    // WP17: THE PERSISTENT ARM'S ADMISSION TEST.
+    //
+    // Every precondition bicg_iteration_persistent's body assumes is decided
+    // HERE, once, at stand-up, and the first one that fails is what the receipt
+    // names.  The ladder order is deliberate: the cheapest and most common
+    // reasons first, so a run that simply did not ask says `arm_off` rather
+    // than a device fact that is true but irrelevant.
+    // -----------------------------------------------------------------------
+    void armPersistent(const cudaDeviceProp& properties) {
+        persistent_request     = cmfdPersistentRequested();
+        cooperative_supported  = properties.cooperativeLaunch != 0;
+        persistent_armed       = false;
+        persistent_blocks      = 0;
+        if (!persistent_request) {
+            persistent_refusal = PersistentRefusal::ArmOff;
+            return;
+        }
+        // A cooperative launch cannot be recorded into a stream capture, so the
+        // captured outer graph and this arm are mutually exclusive BY
+        // CONSTRUCTION, not by preference.  Refusing at stand-up rather than at
+        // launch keeps the capture path exactly as it is.
+        if (use_graph) {
+            persistent_refusal = PersistentRefusal::OuterGraphActive;
+            return;
+        }
+        // One grid barrier spans the whole grid, batch axis included, so a lane
+        // that halts while its neighbours do not would strand the grid for
+        // ever.  The spike serves the single-deck shape only.
+        if (slots != 1) {
+            persistent_refusal = PersistentRefusal::BatchWidth;
+            return;
+        }
+        if (fp32_inner) {
+            persistent_refusal = PersistentRefusal::Fp32Inner;
+            return;
+        }
+        if (!cooperative_supported) {
+            persistent_refusal = PersistentRefusal::NoCooperativeLaunch;
+            return;
+        }
+        // The reduction's binary tree is kReduceThreads lanes wide at compile
+        // time, so the persistent block is kReduceThreads and nothing else --
+        // which is only legal if the device will take a block that wide.  A
+        // runtime test rather than a static_assert, because what can fail here
+        // is the DEVICE, not the constant.
+        if (kReduceThreads > properties.maxThreadsPerBlock) {
+            persistent_refusal = PersistentRefusal::BlockWidthMismatch;
+            return;
+        }
+        int per_sm = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &per_sm, reinterpret_cast<const void*>(&bicg_iteration_persistent),
+                kReduceThreads, 0) != cudaSuccess) {
+            cudaGetLastError();
+            persistent_refusal = PersistentRefusal::OccupancyTooSmall;
+            return;
+        }
+        const int resident = per_sm * properties.multiProcessorCount;
+        const int fold     = reduce_blocks_for(n);
+        // Blocks beyond the node coverage do nothing but wait at barriers, so
+        // the grid is the SMALLER of "what fits resident" and "what the work
+        // needs"; it may never be smaller than the fixed fold partition,
+        // because blocks [0, fold) are the only ones that write partials.
+        const int wanted = std::max(fold, (nxyz + kReduceThreads - 1) / kReduceThreads);
+        const int blocks = std::min(resident, wanted);
+        if (blocks < fold) {
+            persistent_refusal = PersistentRefusal::OccupancyTooSmall;
+            return;
+        }
+        persistent_blocks  = blocks;
+        persistent_armed   = true;
+        persistent_refusal = PersistentRefusal::None;
+    }
+
+    /// The persistent arm's enqueue.  Returns false -- having changed nothing
+    /// on the stream -- when the iteration must fall through to the launch
+    /// chain, so the caller's next statement is the unmodified reference path.
+    bool enqueuePersistentIteration(int allow_halt, int force_halt) {
+        if (!persistent_armed) return false;
+        // Defensive second half of the graph exclusion: `use_graph` was false
+        // at stand-up, but launch_sweeps' RESIDENT_SINGLE segment can still
+        // open a capture on this stream, and a cooperative launch recorded into
+        // one is an error, not a slow path.
+        if (rasbery::graphCaptureActive(stream)) {
+            persistent_refusal = PersistentRefusal::CaptureActive;
+            return false;
+        }
+        if (fp32Active()) {
+            persistent_refusal = PersistentRefusal::Fp32Inner;
+            return false;
+        }
+        PersistentBicgParams args{};
+        args.nxyz          = nxyz;
+        args.n             = n;
+        args.reduce_blocks = reduce_blocks_for(n);
+        args.rb_sweeps     = rb_sweeps;
+        args.ncolors       = ncolors;
+        args.allow_halt    = allow_halt;
+        args.force_halt    = force_halt;
+        args.vec_stride    = vec_stride();
+        args.mat_stride    = mat_stride();
+        args.cpl_stride    = cpl_stride();
+        args.colors        = colors;
+        args.neighbors     = neighbors;
+        args.cc            = cc;
+        args.diag          = diag;
+        args.dinv          = dinv;
+        args.scalars       = scalars;
+        args.iter_flags    = iter_flags;
+        args.sticky_flags  = device_flags;
+        args.counters      = device_counters;
+        args.halt          = device_halt;
+        args.active        = device_active;
+        args.r0            = r0;
+        args.r             = r;
+        args.p             = p;
+        args.v             = v;
+        args.s             = s;
+        args.t             = t;
+        args.y             = y;
+        args.z             = z;
+        args.phi           = phi;
+        args.partials      = partials;
+        args.partials2     = partials2;
+
+        int*      map_arg   = d_slot_map;
+        int       lanes_arg = lanes;
+        void*     argv[]    = {&args, &map_arg, &lanes_arg};
+        const cudaError_t rc = cudaLaunchCooperativeKernel(
+            reinterpret_cast<const void*>(&bicg_iteration_persistent),
+            dim3(static_cast<unsigned>(persistent_blocks), 1u, 1u),
+            dim3(static_cast<unsigned>(kReduceThreads), 1u, 1u), argv, 0, stream);
+        if (rc != cudaSuccess) {
+            // A refused cooperative launch enqueues nothing, so the reference
+            // chain below is the first and only execution of this iteration --
+            // the same argument launch_outer's capture fallback rests on.  The
+            // arm is latched off so the refusal is paid once, not per iteration.
+            cudaGetLastError();
+            persistent_armed   = false;
+            persistent_refusal = PersistentRefusal::LaunchFailed;
+            return false;
+        }
+        return true;
     }
     [[nodiscard]] dim3 scalar_grid() const {
         return dim3(1u, static_cast<unsigned>(lanes));
@@ -3979,7 +4763,7 @@ public:
 
     void precondition_sweeps_f32(const float* b, float* x) {
         for (int sweep = 0; sweep < rb_sweeps; ++sweep)
-            colored_block_sweep_f32<<<node_grid(), block_size, 0, stream>>>(
+            colored_block_sweep_f32<<<cmfd_node_grid(), cmfd_block_threads(), 0, stream>>>(
                 nxyz, vec_stride(), mat_stride(), cpl_stride(), sweep % ncolors, colors,
                 neighbors, cc_f, dinv_f, b, x, device_halt, d_slot_map, lanes);
     }
@@ -3991,26 +4775,26 @@ public:
     /// topology is identical and the counters mean the same thing.
     void enqueue_iteration_f32(int allow_halt, int force_halt = 0) {
         dot_f32(r0_f, r_f, kRhoNew);
-        prepare_p_jacobi_f32<<<node_grid(), block_size, 0, stream>>>(
+        prepare_p_jacobi_f32<<<cmfd_node_grid(), cmfd_block_threads(), 0, stream>>>(
             nxyz, vec_stride(), mat_stride(), scalars, iter_flags, dinv_f, r_f, v_f,
             p_f, y_f, device_halt, d_slot_map, lanes);
         precondition_sweeps_f32(p_f, y_f);
-        matvec_two_group_f32<<<node_grid(), block_size, 0, stream>>>(
+        matvec_two_group_f32<<<cmfd_node_grid(), cmfd_block_threads(), 0, stream>>>(
             nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag_f, cc_f,
             y_f, v_f, device_halt, d_slot_map, lanes);
 
         dot_f32(r0_f, v_f, kR0V);
-        update_s_jacobi_f32<<<node_grid(), block_size, 0, stream>>>(
+        update_s_jacobi_f32<<<cmfd_node_grid(), cmfd_block_threads(), 0, stream>>>(
             nxyz, vec_stride(), mat_stride(), scalars, iter_flags, dinv_f, r_f, v_f,
             s_f, z_f, device_halt, d_slot_map, lanes);
         precondition_sweeps_f32(s_f, z_f);
-        matvec_two_group_f32<<<node_grid(), block_size, 0, stream>>>(
+        matvec_two_group_f32<<<cmfd_node_grid(), cmfd_block_threads(), 0, stream>>>(
             nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag_f, cc_f,
             z_f, t_f, device_halt, d_slot_map, lanes);
 
         dot2_f32(s_f, t_f, kPts, t_f, t_f, kPtt);
 
-        update_solution_f32<<<vector_grid(), block_size, 0, stream>>>(
+        update_solution_f32<<<cmfd_vector_grid(), cmfd_block_threads(), 0, stream>>>(
             n, vec_stride(), scalars, iter_flags, y_f, z_f, s_f, t_f, phi, r_f,
             device_halt, d_slot_map, lanes);
         const int norm_blocks = reduce_blocks_for(n);
@@ -4043,7 +4827,7 @@ public:
     /// exactly as it was.
     void precondition_sweeps(const double* b, double* x) {
         for (int sweep = 0; sweep < rb_sweeps; ++sweep)
-            colored_block_sweep<<<node_grid(), block_size, 0, stream>>>(
+            colored_block_sweep<<<cmfd_node_grid(), cmfd_block_threads(), 0, stream>>>(
                 nxyz, vec_stride(), mat_stride(), cpl_stride(), sweep % ncolors, colors, neighbors,
                 cc, dinv, b, x, device_halt, d_slot_map, lanes);
     }
@@ -4060,20 +4844,25 @@ public:
         // same word at the same points in stream order, so the scratch flags
         // every reader sees are the ones the memset produced -- see the
         // argument at the re-arm site.
+        //
+        // The persistent arm is ONE cooperative launch for this whole function.
+        // It returns false having enqueued nothing when it cannot run, so the
+        // reference chain below is untouched on every refusal path.
+        if (enqueuePersistentIteration(allow_halt, force_halt)) return;
         dot(r0, r, kRhoNew);
-        prepare_p_jacobi<<<node_grid(), block_size, 0, stream>>>(
+        prepare_p_jacobi<<<cmfd_node_grid(), cmfd_block_threads(), 0, stream>>>(
             nxyz, vec_stride(), mat_stride(), scalars, iter_flags, dinv, r, v, p, y,
             device_halt, d_slot_map, lanes);
         precondition_sweeps(p, y);
-        matvec_two_group<<<node_grid(), block_size, 0, stream>>>(
+        matvec_two_group<<<cmfd_node_grid(), cmfd_block_threads(), 0, stream>>>(
             nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag, cc, y, v, device_halt, d_slot_map, lanes);
 
         dot(r0, v, kR0V);
-        update_s_jacobi<<<node_grid(), block_size, 0, stream>>>(
+        update_s_jacobi<<<cmfd_node_grid(), cmfd_block_threads(), 0, stream>>>(
             nxyz, vec_stride(), mat_stride(), scalars, iter_flags, dinv, r, v, s, z,
             device_halt, d_slot_map, lanes);
         precondition_sweeps(s, z);
-        matvec_two_group<<<node_grid(), block_size, 0, stream>>>(
+        matvec_two_group<<<cmfd_node_grid(), cmfd_block_threads(), 0, stream>>>(
             nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag, cc, z, t, device_halt, d_slot_map, lanes);
 
         // s.t and t.t are the only two adjacent dots with no kernel between
@@ -4081,7 +4870,7 @@ public:
         // accumulator and partial array.
         dot2(s, t, kPts, t, t, kPtt);
 
-        update_solution<<<vector_grid(), block_size, 0, stream>>>(
+        update_solution<<<cmfd_vector_grid(), cmfd_block_threads(), 0, stream>>>(
             n, vec_stride(), scalars, iter_flags, y, z, s, t, phi, r, device_halt, d_slot_map, lanes);
         // Absolute residual of the iterate that update_solution just wrote.
         // The stage-1 partition is unchanged; only the scalar stage-2 node is
@@ -4167,6 +4956,14 @@ public:
         // first instruction in every kernel, and is counted as an over-run.
         const int algorithmic = 1 + nmax;
         const int captured    = captured_iterations(nmax);
+        // WP17: the occupancy receipt, once, at the ONE place both precision
+        // arms pass through -- a graph-off run has no [CMFD][GRAPH] line to
+        // carry these fields, and the FP32 arm has no separate receipt.
+        reportCmfdOccupancy(cmfd_block_threads(), block_size, cmfd_node_blocks(),
+                            cmfd_vector_blocks(), reduce_blocks_for(n),
+                            persistent_armed ? 1 : launchesPerIteration(),
+                            persistent_armed, persistent_blocks,
+                            cooperative_supported, persistent_refusal);
         for (int i = 0; i < captured; ++i) {
             const int allow_halt = i == 0 ? 0 : 1;
             const int force_halt =
@@ -4317,7 +5114,9 @@ public:
             // WP7 stage B: the node census, at the one place where a graph is
             // built.  `sweeps` is 0 because the outer graph IS the per-sweep
             // unit -- it carries no assemble prologue and no Wielandt tail.
-            reportCmfdGraphCensus("outer", graph_src, 0, iter_batch_used, fuse_mask);
+            reportCmfdGraphCensus("outer", graph_src, 0, iter_batch_used, fuse_mask,
+                                  cmfd_block_threads(), cmfd_node_blocks(),
+                                  cmfd_vector_blocks(), persistent_armed);
             // The capture itself enqueued nothing: replay it now.
         }
         CUDA_CHECK(rasbery::graphLaunchOrSplice(graph_exec, graph_src, stream));
@@ -4511,7 +5310,8 @@ public:
             // capture, and exactly one cmfd_assemble_operator_2g node sits in
             // front of them.
             reportCmfdGraphCensus("sweep", sweep_graph_src, depth, iter_batch_used,
-                                  fuse_mask);
+                                  fuse_mask, cmfd_block_threads(), cmfd_node_blocks(),
+                                  cmfd_vector_blocks(), persistent_armed);
         }
         CUDA_CHECK(rasbery::graphLaunchOrSplice(sweep_graph_exec, sweep_graph_src, stream));
         ++telemetry.graph_launches;
@@ -5069,6 +5869,16 @@ public:
     double*       assembly_face_area = nullptr;
     double*       assembly_volume = nullptr;
     int           block_size = kDefaultBlockSize;
+    /// WP17 RASBERY_GPU_CMFD_BLOCK.  0 = unchanged; see cmfd_block_threads().
+    int           cmfd_block = 0;
+    /// WP17 persistent arm (RASBERY_GPU_CMFD_PERSISTENT).  `persistent_armed`
+    /// is the only thing enqueue_iteration consults; the other three exist so
+    /// the receipt can say WHY, by name, rather than only whether.
+    bool              persistent_request    = false;
+    bool              persistent_armed      = false;
+    bool              cooperative_supported = false;
+    int               persistent_blocks     = 0;
+    PersistentRefusal persistent_refusal    = PersistentRefusal::ArmOff;
     int           rb_sweeps = 4;
     int           ncolors   = 2; // sweep colour count (2 = historical red/black; >2 under the rotational fold)
     double *diag = nullptr, *dinv = nullptr, *cc = nullptr, *src = nullptr, *phi = nullptr;
