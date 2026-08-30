@@ -197,6 +197,19 @@ struct XsLibraryCacheStats {
 /// is a cohort that can disagree with its own cache.
 std::string XsLibraryContentDigest(const std::string& xs_path);
 
+/// Which RASBERY_XSLIB_DIGEST policy this process resolved: "cached", "always"
+/// or "off".
+///
+/// EXPOSED BECAUSE `off` MAKES THE CASE KEY LIE BY OMISSION.  With the policy
+/// off the digest above is the EMPTY STRING, so casekey::Provenance carries no
+/// library provenance at all and two runs against two different libraries share
+/// a key.  That is a legitimate A/B control (it is the only way to show the
+/// hardening is free), but a run that took it has to SAY so in the receipt --
+/// otherwise a controller recomputing the key with the policy at its default
+/// gets a different answer and has no way to see why.  This is exactly the
+/// WP10.1 failure host 181 hit on kngr_238.json.
+const char* XsLibraryDigestPolicyName();
+
 /// Parse + flatten one library file.  Pure function of (xs_path, ng); enters HDF5.
 std::shared_ptr<const XsLibrary> BuildXsLibrary(const std::string& xs_path, int ng);
 

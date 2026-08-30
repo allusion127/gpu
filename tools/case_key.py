@@ -16,6 +16,7 @@ tool can print the exact payload bytes for a byte-compare on a cache hit.
 
 USAGE
     tools/case_key.py deck.json                       # the key
+    tools/case_key.py deck.json --components          # the five component digests
     tools/case_key.py deck.json --payload             # the bytes it digested
     tools/case_key.py deck.json --json                # key + parts, machine-readable
     tools/case_key.py deck.json --no-xslib            # skip the 34 MB library read
@@ -23,6 +24,15 @@ USAGE
 ENVIRONMENT.  The arm knobs and RASBERY_PHYSICS_FIDELITY are read from THIS
 process's environment, because that is what a launcher would export to the
 solver it is about to start.  `--env NAME=VALUE` overrides one for a what-if.
+RASBERY_XSLIB_DIGEST is honoured exactly as src/XSSet.cpp honours it, including
+`off`, which makes the library digest EMPTY on both sides.
+
+WHY --components EXISTS.  WP10.1's first live gate (host 181, 2026-08-30) had
+the solver and this tool disagree on kngr_238.json while agreeing on two other
+decks, and there was nothing to read: one 64-hex digest each, six inputs behind
+it.  `--components` prints the same five keys the solver's [RASBERY][CASE]
+receipt now prints -- deck_digest, env_digest, xslib_digest, warm_start,
+code_sha -- so which component moved is a diff and not a bisect.
 """
 from __future__ import annotations
 
@@ -64,6 +74,67 @@ def _read_arm_env(path: Path = ARM_ENV_SOURCE) -> list[str]:
 
 
 ARM_ENV = _read_arm_env()
+
+
+# src/IO.cpp NormalizeInputPath() -- READ FROM THE SOURCE, for the same reason
+# the knob list is.
+#
+# THIS IS THE COMPONENT THAT BROKE.  The solver does not open the string the
+# deck wrote: IO::ReadInput runs it through NormalizeInputPath (backslashes to
+# forward slashes, and one WSL UNC prefix rewritten to the POSIX path it names)
+# and then joins it to the DECK's directory lexically.  A tool that opened the
+# raw string instead finds nothing for a deck authored on Windows or through the
+# WSL share, records an EMPTY library digest, and publishes a key the solver
+# never computes -- while every deck that names no library at all still agrees,
+# which is exactly the two-of-three pattern host 181 reported.
+IO_SOURCE = Path(__file__).resolve().parents[1] / "src" / "IO.cpp"
+
+
+def _read_wsl_unc_prefix(path: Path = IO_SOURCE) -> str:
+    text = path.read_text(encoding="utf-8-sig")
+    found = re.search(r'kWslUncPrefix\[\]\s*=\s*"([^"]*)"', text)
+    if not found:
+        raise SystemExit(f"case_key: cannot find kWslUncPrefix in {path}")
+    return found.group(1)
+
+
+WSL_UNC_PREFIX = _read_wsl_unc_prefix()
+
+
+def normalize_input_path(text: str) -> str:
+    """src/IO.cpp NormalizeInputPath(), character for character."""
+    text = text.replace("\\", "/")
+    if text.startswith(WSL_UNC_PREFIX):
+        return "/" + text[len(WSL_UNC_PREFIX):]
+    return text
+
+
+def resolve_xs_path(deck: Path, raw: str) -> str:
+    """src/IO.cpp's `_xs_path` for the same deck and the same raw string.
+
+    LEXICAL, not `Path.resolve()`: the solver uses `lexically_normal()`, which
+    folds `..` WITHOUT consulting the filesystem.  Through a symlinked data
+    mount the two land on different files, and then the two sides digest
+    different bytes and neither is obviously wrong.
+    """
+    if not raw:
+        return ""
+    text = normalize_input_path(raw)
+    if not text.startswith("/"):
+        # IO::ReadInput's `_input_dir` is the deck's parent with a trailing
+        # separator; joining and lexically normalising is what it does next.
+        text = os.path.normpath(os.path.join(str(deck.parent), text))
+    return str(text).replace("\\", "/")
+
+
+def xslib_digest_policy(env) -> str:
+    """src/XSSet.cpp XsLibraryDigestMode(), value for value."""
+    value = env.get("RASBERY_XSLIB_DIGEST", "") or "cached"
+    if value in ("0", "off"):
+        return "off"
+    if value == "always":
+        return "always"
+    return "cached"
 
 
 # src/RunContract.h kFidelityTraits, in rank order (coarsest last).
@@ -224,6 +295,20 @@ def _token(text: str) -> str:
     return text if text else "~"
 
 
+def env_payload(env) -> str:
+    """src/CaseKey.h envPayload(): the env half's bytes, newline-terminated.
+
+    The SAME line spelling payload_of() uses below, so its digest is a digest of
+    the real payload bytes rather than of a paraphrase.  The compiled half of
+    tools/test_case_key_contract.py compares both against src/CaseKey.h.
+    """
+    return "".join(f"env\t{name}\t{_token(env.get(name, ''))}\n" for name in ARM_ENV)
+
+
+def env_digest(env) -> str:
+    return hashlib.sha256(env_payload(env).encode("utf-8")).hexdigest()
+
+
 def payload_of(deck_digest: str, fidelity: str, policy: str,
                env, xslib_digest: str, warm_start: str) -> str:
     lines = [SCHEMA,
@@ -244,17 +329,29 @@ def case_key(deck: Path, env=None, xslib: bool = True, warm_start: str = "") -> 
     dpayload, core_op = deck_payload(config)
     deck_digest = hashlib.sha256(dpayload.encode("utf-8")).hexdigest()
 
+    # The solver resolves a relative XS path against the DECK's directory
+    # (IO.cpp NormalizeInputPath + lexically_normal) and digests the file it
+    # actually opened; a missing file is an empty digest there and here, not a
+    # guess.  `--no-xslib` is the tool's own shortcut and is reported as such,
+    # because a key computed without the library half is not the run's key.
+    xs_path = resolve_xs_path(deck, config.get("data", {}).get("cross-section", ""))
+    policy_name = xslib_digest_policy(env)
     xslib_digest = ""
-    xs_rel = config.get("data", {}).get("cross-section", "")
-    if xslib and xs_rel:
-        # The solver resolves a relative XS path against the DECK's directory
-        # (IO.cpp) and digests the file it actually opened; a missing file is an
-        # empty digest there and here, not a guess.
-        xs_path = Path(xs_rel)
-        if not xs_path.is_absolute():
-            xs_path = (deck.parent / xs_path).resolve()
-        if xs_path.is_file():
-            xslib_digest = sha256_file(xs_path)
+    if not xslib:
+        xslib_source = "skipped"
+    elif not xs_path:
+        xslib_source = "no library in deck"
+    elif policy_name == "off":
+        # src/XSSet.cpp: RASBERY_XSLIB_DIGEST=off returns an EMPTY digest, so
+        # the solver's key carries no library provenance.  A tool that hashed
+        # the file anyway would publish a key no run can produce -- and would
+        # do it only for decks that name a library, which is how this hid.
+        xslib_source = "RASBERY_XSLIB_DIGEST=off"
+    elif not Path(xs_path).is_file():
+        xslib_source = "not a file"
+    else:
+        xslib_digest = sha256_file(Path(xs_path))
+        xslib_source = "content"
 
     rank = effective_fidelity(env)
     policy, fidelity = FIDELITY_TRAITS[rank]
@@ -268,11 +365,31 @@ def case_key(deck: Path, env=None, xslib: bool = True, warm_start: str = "") -> 
         "core_op": core_op,
         "fidelity": fidelity,
         "policy": policy,
-        "xslib_digest": xslib_digest,
+        "env_digest": env_digest(env),
+        # THE PAYLOAD'S SPELLING, not the raw string.  src/CaseKey.h digests
+        # `tokenOrTilde(xslib_digest)` and the [RASBERY][CASE] receipt prints
+        # the same token, so a component whose empty case printed as `""` here
+        # and `~` there would report a mismatch on every deck that names no
+        # library -- a false alarm in exactly the place the real one hid.
+        "xslib_digest": _token(xslib_digest),
+        "xslib_digest_raw": xslib_digest,
+        "xslib_path": xs_path,
+        "xslib_policy": policy_name,
+        "xslib_source": xslib_source,
+        "warm_start_token": _token(warm_start),
+        "code_sha": _token(env.get(CODE_SHA_ENV, "")),
         "warm_start": warm_start,
         "payload": payload,
         "deck_payload": dpayload,
     }
+
+
+# The components the solver's [RASBERY][CASE] receipt prints under the same
+# names.  ORDER IS THE PAYLOAD'S, so reading a diff top to bottom reads the key
+# left to right.
+COMPONENT_FIELDS = ("case_key", "key_schema", "core_op", "deck_digest",
+                    "env_digest", "xslib_digest", "xslib_policy",
+                    "warm_start_token", "code_sha", "fidelity", "policy")
 
 
 def main(argv: list[str]) -> int:
@@ -283,6 +400,9 @@ def main(argv: list[str]) -> int:
                     help="print the exact bytes the key digests, for a byte-compare")
     ap.add_argument("--deck-payload", action="store_true",
                     help="print the deck half's bytes (what deck_digest digests)")
+    ap.add_argument("--components", action="store_true",
+                    help="print the component digests the [RASBERY][CASE] receipt "
+                         "prints, one per line, for a direct diff")
     ap.add_argument("--json", action="store_true", help="print every part")
     ap.add_argument("--no-xslib", action="store_true",
                     help="leave the library digest empty (skips a 34 MB read)")
@@ -299,7 +419,12 @@ def main(argv: list[str]) -> int:
 
     result = case_key(args.deck, env=env, xslib=not args.no_xslib,
                       warm_start=args.warm_start)
-    if args.deck_payload:
+    if args.components:
+        for field in COMPONENT_FIELDS:
+            print(f"{field}\t{result[field]}")
+        print(f"xslib_path\t{result['xslib_path']}")
+        print(f"xslib_source\t{result['xslib_source']}")
+    elif args.deck_payload:
         sys.stdout.write(result["deck_payload"])
     elif args.payload:
         sys.stdout.write(result["payload"])

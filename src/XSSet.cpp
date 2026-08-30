@@ -1092,6 +1092,8 @@ std::string XsLibraryContentDigest(const std::string& xs_path) {
     return XsLibraryKeyOf(xs_path).digest;
 }
 
+const char* XsLibraryDigestPolicyName() { return XsLibraryDigestModeName(); }
+
 XsLibraryCacheStats XsLibraryCacheSnapshot() {
     XsLibraryCacheStats s;
     s.loads        = g_xslib_loads.load(std::memory_order_relaxed);

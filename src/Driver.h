@@ -13,6 +13,7 @@
 #include "Scheduler.h"
 #include "WarmState.h"
 #include "XSTiming.h"
+#include "XeFormAudit.h"
 #include "XeGpuReceipt.h"
 #include "XeKernel.h"
 #include "XsLibrary.h"
@@ -2735,6 +2736,32 @@ private:
                 solved   = true;
             }
         }
+        // WP7-C.  THE ONE MEASUREMENT THE MINING CANNOT MAKE, and it is made
+        // here because HERE is the call site whose codegen is in question.
+        //
+        // The eight doubles above are what RASBERY_GPU_XE_TXN=1 moves onto the
+        // device, where they are re-spelled with explicit fma/mul under the
+        // mined XE_FORMS mask.  Whether that re-spelling is the same bits is a
+        // property of what g++ did to THESE FOUR EXPRESSIONS, INLINED HERE --
+        // and XeFormMine.h can only score a quotation of them, in another
+        // translation unit, with different operand provenance.  Host 181
+        // (2026-08-30) is the case where the two part company: the mask mined
+        // clean (0xd3d, no [WARN][FORMS], every site decisive) and the
+        // full-deck TXN A/B still diverged.  So the audit compares the shipped
+        // body against this block, on this run's own operands, and the
+        // [RASBERY][XE_GPU] receipt carries the count.
+        //
+        // OFF BY DEFAULT AND OUT OF LINE.  `audit` is a cached bool and
+        // xe::auditAndersonFit lives in its own translation unit
+        // (src/XeFormAudit.h says why an inline one would be a false negative),
+        // so with the knob unset this is one predicted branch and the arm is
+        // byte-for-byte the arm it was.
+        {
+            static const bool audit = xe::xeFormAuditEnabled();
+            if (audit)
+                xe::auditAndersonFit(dots, aa.ncol, XE_ANDERSON_MIN_GRAM, solved,
+                                     gamma[0], gamma[1], proj);
+        }
         if (!solved) {
             RejectXeAnderson(ctx, "condition", aa.ncol, picard, gg);
             return false;
@@ -4672,8 +4699,22 @@ public:
         // (XsLibraryContentDigest), so a 64-case batch
         // pays the 34 MB read once and every later case reads the cache.  The
         // deck digest itself was already folded during the parse.
-        const std::string case_key =
-            casekey::keyOf(caseKeyProvenance(input_output, warm_provenance, _fidelity));
+        //
+        // THE PROVENANCE IS A LOCAL NOW, AND THE RECEIPT NAMES ITS COMPONENTS.
+        // WP10.1's first live gate (host 181, 2026-08-30) failed on
+        // kngr_238.json with the solver and tools/case_key.py disagreeing about
+        // the key -- and there was NOTHING TO READ.  One digest on each side and
+        // six inputs behind it: the deck half, the fidelity pair, the env half,
+        // the library's content, the warm-start token and the build identity.
+        // The deck half already had its own digest in this line, which is why
+        // it was the only component the gate could clear; the other four were
+        // guesses.  So each of them gets a component of its own here, and
+        // `tools/case_key.py --components` prints the same five keys with the
+        // same spellings.  A mismatch is then one `diff` and not a bisect.
+        const casekey::Provenance case_provenance =
+            caseKeyProvenance(input_output, warm_provenance, _fidelity);
+        const std::string case_key         = casekey::keyOf(case_provenance);
+        const std::string case_env_digest  = casekey::envDigest(case_provenance);
         _case_receipt.case_key            = case_key;
         // WP10.3.  The per-case fidelity, carried as a value for the same
         // reason the digest is: a mixed wave's sixty-four answers interleave on
@@ -4685,12 +4726,18 @@ public:
         _case_receipt.promoted_from       = _fidelity.promoted_from;
         _case_receipt.acceptance_eligible = _fidelity.acceptanceEligible();
         std::cout << std::format(
-            "  [RASBERY][CASE] {{\"schema_version\":2,\"case_key\":\"{}\",\"key_schema\":\"{}\","
-            "\"core_op\":\"{}\",\"deck_digest\":\"{}\",\"fidelity\":\"{}\",\"policy\":\"{}\","
+            "  [RASBERY][CASE] {{\"schema_version\":3,\"case_key\":\"{}\",\"key_schema\":\"{}\","
+            "\"core_op\":\"{}\",\"deck_digest\":\"{}\",\"env_digest\":\"{}\","
+            "\"xslib_digest\":\"{}\",\"xslib_policy\":\"{}\",\"warm_start_token\":\"{}\","
+            "\"code_sha\":\"{}\",\"fidelity\":\"{}\",\"policy\":\"{}\","
             "\"result_mode\":\"{}\",\"warm_start\":\"{}\",\"statepoint_grid\":\"{}\","
             "\"acceptance_eligible\":{},\"fidelity_declared\":{},\"promoted_from\":{}}}\n",
             case_key, casekey::kSchema, input_output.deck_key_core_op(),
-            input_output.deck_key_digest(),
+            input_output.deck_key_digest(), case_env_digest,
+            casekey::tokenOrTilde(case_provenance.xslib_digest),
+            XsLibraryDigestPolicyName(),
+            jsonString(casekey::tokenOrTilde(case_provenance.warm_start)),
+            jsonString(casekey::codeShaToken()),
             _case_receipt.physics_fidelity, _case_receipt.policy,
             ResultModeName(_result_mode), warm_status, _case_receipt.statepoint_grid,
             _case_receipt.acceptance_eligible ? "true" : "false",

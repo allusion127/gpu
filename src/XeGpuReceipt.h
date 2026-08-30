@@ -23,6 +23,7 @@
 // a receipt with the thing the receipt is measuring.
 
 #include <atomic>
+#include <ios>
 #include <ostream>
 
 namespace rasbery::xe {
@@ -82,7 +83,34 @@ struct XeGpuTally {
     std::atomic<unsigned long long> txn_declined{0};
     std::atomic<unsigned long long> host_syncs{0};
     std::atomic<unsigned long long> d2h_bytes{0};
+    // --- WP7-C: is the mined mask the PRODUCTION contraction? --------------
+    //
+    // RASBERY_XE_FORMS_AUDIT (src/XeFormAudit.h).  Zero unless the audit was
+    // asked for; `forms_audits > 0 && forms_audit_mismatch == 0` is the only
+    // form in which the TXN arm's bit-identity claim can be believed on a given
+    // build, and it is the form host 181 could not produce.
+    std::atomic<unsigned long long> forms_audits{0};
+    std::atomic<unsigned long long> forms_audit_mismatch{0};
+    /// The mask the audit ran under, so the receipt names what it measured.
+    /// Written by the audit and by nothing else: printing xeFormMask() here
+    /// would MINE the mask in a run that never touched the device Xe arm, and
+    /// add a [RASBERY][FORMS] line to a log whose feature was off.
+    std::atomic<unsigned long long> forms_audit_mask{0};
 };
+
+/// The GRADE of the RASBERY_GPU_XE_TXN arm, in the receipt that reports it.
+///
+/// WP7-C shipped claiming B0 against the round-tripping device arm.  Host 181
+/// (2026-08-30) measured otherwise -- different digest, different Xe step count
+/// -- with a mask that mined clean, and src/XeFormAudit.h carries the reason:
+/// the mask is calibrated against a QUOTATION of Driver.h's algebra, and a
+/// quotation is not a call site.  The claim is downgraded here rather than in a
+/// document alone, because the number a gate script reads is this one.
+inline constexpr const char* kXeTxnPolicyNote =
+    "RASBERY_GPU_XE_TXN=1 is N1 against TXN=0: the device normal equations run a "
+    "mined contraction mask, not Driver.h's inlined gcc codegen -- set "
+    "RASBERY_XE_FORMS_AUDIT=1 to measure the gap on this build "
+    "(docs/WP7C_XE_TXN_20260831_KO.md section 9)";
 
 /// One tally per process, and the only global in the arm.
 inline XeGpuTally& xeGpuTally() {
@@ -130,6 +158,22 @@ inline void appendXeGpuReceiptFields(std::ostream& os) {
        << ",\"txn_declined\":" << t.txn_declined.load(std::memory_order_relaxed)
        << ",\"host_syncs\":" << syncs << ",\"host_syncs_per_step\":" << sps
        << ",\"d2h_bytes\":" << d2h << ",\"d2h_bytes_per_step\":" << bps;
+
+    // WP7-C.  The audit's two counters and the mask it measured, then the
+    // grade.  `forms_audit_mask` prints as a hex string because that is how
+    // [RASBERY][FORMS] prints it and how RASBERY_XE_FORMS is written.
+    const unsigned long long audits = t.forms_audits.load(std::memory_order_relaxed);
+    os << ",\"forms_audits\":" << audits << ",\"forms_audit_mismatch\":"
+       << t.forms_audit_mismatch.load(std::memory_order_relaxed)
+       << ",\"forms_audit_mask\":\"";
+    if (audits > 0) {
+        const std::ios_base::fmtflags saved = os.flags();
+        os << "0x" << std::hex << t.forms_audit_mask.load(std::memory_order_relaxed);
+        os.flags(saved);
+    } else {
+        os << '~';
+    }
+    os << "\",\"policy_note\":\"" << kXeTxnPolicyNote << "\"";
 }
 
 } // namespace rasbery::xe

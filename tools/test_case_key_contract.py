@@ -21,14 +21,27 @@ telemetry flag is not.  Each one is a negative control as much as a check.
 
 COMPILED (when a C++ compiler is present; SKIPPED, and said so, otherwise).  The
 half that actually closes the loop between the two implementations without
-needing a GPU: src/CaseKey.h is compiled into a small harness and its canonical
-deck payload is compared BYTE FOR BYTE against tools/case_key.py's, on decks
-seeded with every float spelling the two languages could disagree about.  It
-also runs three FIPS 180-4 SHA-256 vectors.
+needing a GPU: src/CaseKey.h is compiled into a small harness and BOTH payloads
+are compared BYTE FOR BYTE against tools/case_key.py's -- the canonical deck
+payload on decks seeded with every float spelling the two languages could
+disagree about, and the FULL payload (the env lines, the library digest, the
+warm-start token and the build identity) under two environments.  It also runs
+three FIPS 180-4 SHA-256 vectors.
 
 LIVE (`--compare RUN.log DECK.json`).  What is left after the compiled half: the
-provenance the payload takes from the ENVIRONMENT and the cross-section library,
-which only a real run has.  A 238 gate, listed in the WP9/WP10 runbook.
+VALUES the payload takes from the environment and from the cross-section library
+on a real host.  It compares every component the receipt publishes, in payload
+order, so a mismatch names itself.
+
+WHAT 181 COST, AND WHY THE SHAPE CHANGED (2026-08-30).  The live gate failed on
+kngr_238.json and passed on short_rev71.json and s1.json, and the only thing it
+could print was that two 64-hex digests differed.  Two causes were structural:
+the receipt published one component (the deck half), and the library component
+-- the only one that varies with the deck once the environment is fixed -- was
+not exercised by any fixture here, because every fixture passed `xslib=False`.
+Both are closed above: `receipt_component_contract` holds the receipt to the
+tool's component list, and `xslib_contract` runs a deck that really does name an
+external file.
 
 USAGE
     tools/test_case_key_contract.py
@@ -37,6 +50,7 @@ USAGE
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import py_compile
@@ -273,6 +287,191 @@ def key_of(path: Path, env=None, **kw) -> str:
     return case_key.case_key(path, env=dict(env or CLEAN_ENV), xslib=False, **kw)["case_key"]
 
 
+def xslib_contract() -> None:
+    """The library half, on a fixture that ACTUALLY REFERENCES AN EXTERNAL FILE.
+
+    THE GAP THIS CLOSES.  Every fixture above passes `xslib=False`, so until now
+    the library component was never exercised at all -- and it is the only
+    component of the key that varies with the deck once the environment is
+    fixed.  That is exactly the shape of the 181 failure (2026-08-30):
+    kngr_238.json, which names a 34 MB CHIFFON library, disagreed while
+    short_rev71.json and s1.json, which do not, agreed.  Two of three passing is
+    not "mostly right", it is a component that only fires on one of the three.
+
+    Four things are checked and each has its negative control: that the digest
+    is the file's CONTENT, that the three path spellings src/IO.cpp normalises
+    all reach it, that `RASBERY_XSLIB_DIGEST=off` empties it on this side
+    exactly as it empties it in src/XSSet.cpp, and that the tool never silently
+    substitutes one outcome for another.
+    """
+    # The policy parse, against the C++ that owns it.
+    xsset = (ROOT / "src" / "XSSet.cpp").read_text(encoding="utf-8-sig")
+    mode_fn = xsset[xsset.index("XsLibraryDigestPolicy XsLibraryDigestMode()"):]
+    mode_fn = mode_fn[:mode_fn.index("\n}")]
+    for literal, want in (("0", "off"), ("off", "off"), ("always", "always"),
+                          ("cached", "cached"), ("", "cached"), ("nonsense", "cached")):
+        if case_key.xslib_digest_policy({"RASBERY_XSLIB_DIGEST": literal}) != want:
+            fail(f"case_key.xslib_digest_policy({literal!r}) is not {want!r}")
+    for token in ('value == "0" || value == "off"', 'value == "always"'):
+        if token not in mode_fn:
+            fail(f"XsLibraryDigestMode() no longer decides on {token!r}; "
+                 "case_key.xslib_digest_policy mirrors it and would now lie")
+    if "XsLibraryDigestPolicyName" not in (ROOT / "src" / "XsLibrary.h").read_text(
+            encoding="utf-8-sig"):
+        fail("XsLibraryDigestPolicyName is not exported; the [RASBERY][CASE] "
+             "receipt cannot say which policy emptied the library digest")
+
+    # The WSL prefix is PARSED, not copied, and the parse fails closed.
+    if 'WSL_UNC_PREFIX = _read_wsl_unc_prefix()' not in (
+            ROOT / "tools" / "case_key.py").read_text(encoding="utf-8"):
+        fail("case_key.py carries its own copy of kWslUncPrefix again")
+    with tempfile.TemporaryDirectory() as raw:
+        stub = Path(raw) / "IO.cpp"
+        stub.write_text("nothing here", encoding="utf-8")
+        try:
+            case_key._read_wsl_unc_prefix(stub)
+            fail("case_key._read_wsl_unc_prefix accepted an IO.cpp with no "
+                 "kWslUncPrefix; it must fail closed rather than normalise nothing")
+        except SystemExit:
+            pass
+
+    # THE NORMALISER ITSELF, not through the filesystem.  On Windows a
+    # backslash is already a separator, so a fixture that only checked "both
+    # spellings find the file" would pass on the authoring host with the
+    # normaliser deleted -- and fail on 181, which is the host that matters.
+    prefix = case_key.WSL_UNC_PREFIX
+    for raw_text, want in (
+            ("xs\\chiffon.h5", "xs/chiffon.h5"),
+            ("..\\xs\\chiffon.h5", "../xs/chiffon.h5"),
+            (prefix + "home/x/lib.h5", "/home/x/lib.h5"),
+            ("/already/posix.h5", "/already/posix.h5"),
+            ("", "")):
+        got = case_key.normalize_input_path(raw_text)
+        if got != want:
+            fail(f"normalize_input_path({raw_text!r}) = {got!r}, want {want!r} "
+                 "-- src/IO.cpp NormalizeInputPath does exactly this and the two "
+                 "must agree on every host, not just on one whose separator is "
+                 "already the backslash")
+    # NEGATIVE CONTROL: the prefix rewrite is not the identity, so the check
+    # above is testing the rewrite rather than a fixture that needed none.
+    if case_key.normalize_input_path(prefix + "a") == prefix + "a":
+        fail("the WSL UNC rewrite is a no-op")
+
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        libdir = tmp / "xs"
+        libdir.mkdir()
+        lib = libdir / "chiffon.h5"
+        lib.write_bytes(b"\x89HDF\r\n\x1a\n" + b"not really a library, but real bytes")
+        want = hashlib.sha256(lib.read_bytes()).hexdigest()
+
+        def keyed(reference, env=None, xslib=True):
+            path = write(tmp, "ext.json",
+                         deck(QUARTER, extra={"data": {"cross-section": reference}}))
+            return case_key.case_key(path, env=dict(env or CLEAN_ENV), xslib=xslib)
+
+        posix = keyed("xs/chiffon.h5")
+        if posix["xslib_digest"] != posix["xslib_digest_raw"]:
+            fail("a present digest must token to itself; only the empty case "
+                 "becomes a tilde")
+        if posix["xslib_digest"] != want:
+            fail("the tool does not digest the CONTENT of an external library "
+                 f"named relative to the deck ({posix['xslib_source']})")
+        if posix["xslib_source"] != "content":
+            fail(f"xslib_source for a present library is {posix['xslib_source']!r}")
+
+        # src/IO.cpp NormalizeInputPath: a backslash spelling and the WSL UNC
+        # spelling are the SAME file to the solver.  A tool that opened the raw
+        # string finds neither.
+        backslash = keyed("xs\\chiffon.h5")
+        if backslash["xslib_digest"] != want:
+            fail("a backslash-spelled library path does not reach the same file; "
+                 "src/IO.cpp NormalizeInputPath turns it into one and the tool "
+                 "must too, or a Windows-authored deck keys differently")
+        unc = keyed(case_key.WSL_UNC_PREFIX + str(lib).replace("\\", "/").lstrip("/"))
+        # The rewritten prefix names a POSIX path that only exists on the WSL
+        # side, so on this host the file may or may not be there; what is
+        # asserted is the REWRITE, not the lookup.
+        if not unc["xslib_path"].startswith("/"):
+            fail("the WSL UNC prefix was not rewritten to an absolute POSIX path")
+        if case_key.WSL_UNC_PREFIX in unc["xslib_path"]:
+            fail("the WSL UNC prefix survived normalisation")
+        # NEGATIVE CONTROL for the two above: the RAW strings differ, so the
+        # agreement is the normaliser's doing and not the fixture's.
+        if "xs\\chiffon.h5" == "xs/chiffon.h5":
+            fail("the backslash fixture is not a backslash fixture")
+
+        # LEXICAL, like lexically_normal(): `..` is folded without touching the
+        # filesystem, so a symlinked data mount cannot send the two sides to two
+        # different files.
+        dotted = keyed("xs/../xs/chiffon.h5")
+        if dotted["xslib_digest"] != want:
+            fail("a path with `..` in it does not fold to the same library")
+        if ".." in dotted["xslib_path"]:
+            fail("resolve_xs_path left `..` unfolded")
+
+        # RASBERY_XSLIB_DIGEST=off: EMPTY on both sides, and the tool says so.
+        off = keyed("xs/chiffon.h5", env={"PATH": "", "RASBERY_XSLIB_DIGEST": "off"})
+        if off["xslib_digest_raw"] != "" or off["xslib_digest"] != "~":
+            fail("RASBERY_XSLIB_DIGEST=off must empty the library digest here "
+                 "exactly as it empties it in src/XSSet.cpp; otherwise the tool "
+                 "publishes a key no run can produce -- and only for decks that "
+                 "name a library, which is how the 181 mismatch hid")
+        if off["xslib_policy"] != "off" or "off" not in off["xslib_source"]:
+            fail("the tool does not report that the policy emptied the digest")
+        if off["case_key"] == posix["case_key"]:
+            fail("the library digest is not load-bearing: `off` and `cached` "
+                 "produced the same key")
+
+        # And the content itself is load-bearing.
+        lib.write_bytes(b"different bytes entirely")
+        if keyed("xs/chiffon.h5")["xslib_digest"] == want:
+            fail("rewriting the library did not change the digest")
+
+        # `--no-xslib` is the tool's own shortcut and must never masquerade as a
+        # measured empty digest.
+        skipped = keyed("xs/chiffon.h5", xslib=False)
+        if skipped["xslib_source"] != "skipped":
+            fail("--no-xslib does not announce itself in xslib_source")
+
+
+def receipt_component_contract() -> None:
+    """The solver publishes every component the tool publishes.
+
+    Without this the live gate can only say "the keys differ", which is what it
+    said on 181 and why the diagnosis was a guess.
+    """
+    site = DRIVER_H.index('"  [RASBERY][CASE] {{')
+    block = DRIVER_H[site:DRIVER_H.index(");", site)]
+    if '\\"schema_version\\":3' not in block:
+        fail("the [RASBERY][CASE] receipt did not bump schema_version when it "
+             "gained the component fields; a reader cannot tell the two apart")
+    for field in case_key.COMPONENT_FIELDS:
+        if field in ("case_key", "key_schema"):
+            continue
+        if f'\\"{field}\\"' not in block:
+            fail(f"[RASBERY][CASE] does not publish {field!r}; tools/case_key.py "
+                 f"--components prints it and the live gate compares it")
+    if "casekey::envDigest(" not in DRIVER_H:
+        fail("Driver.h does not take env_digest from casekey::envDigest; a second "
+             "spelling of the env half is a second answer")
+    for token in ("inline std::string envPayload(", "inline std::string envDigest(",
+                  "inline std::string codeShaToken()"):
+        if token not in CASEKEY_H:
+            fail(f"CaseKey.h lost {token!r}")
+    # envPayload must use payloadOf's OWN line spelling, or the component digest
+    # is a digest of a paraphrase.
+    env_fn = CASEKEY_H[CASEKEY_H.index("inline std::string envPayload("):]
+    env_fn = env_fn[:env_fn.index("\n}")]
+    for token in ('out += "env\\t";', "out += tokenOrTilde(value);"):
+        if token not in env_fn:
+            fail(f"envPayload does not spell an env line the way payloadOf does "
+                 f"({token!r} missing)")
+    if "codeShaToken()" not in CASEKEY_H[CASEKEY_H.index("inline std::string payloadOf("):]:
+        fail("payloadOf reads RASBERY_CODE_SHA through its own getenv again; the "
+             "receipt and the payload would then be able to disagree")
+
+
 def behaviour_contract() -> None:
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
@@ -395,7 +594,43 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    if (argc < 3) { std::cerr << "usage: harness <deck.json> <out.bin>\n"; return 2; }
+    if (argc < 3) { std::cerr << "usage: harness <deck.json|--payload names.txt> <out.bin>\n"; return 2; }
+
+    // WP10.1 component mode.  The deck half below is the half that walks
+    // arbitrary JSON; THIS is the half the 181 gate actually tripped over --
+    // the env lines, the library digest, the warm-start token and the build
+    // identity, concatenated by payloadOf().  It was never compared because it
+    // "is concatenation of fields the source half already compares one by one",
+    // and a field list compared name by name is not a byte comparison: it does
+    // not see a separator, a tilde rule or a code_sha read through a second
+    // expression.  So it is compared as bytes now, on a provenance whose env
+    // half is read from THIS PROCESS's environment through the same getenv the
+    // solver uses.
+    if (std::string(argv[1]) == "--payload") {
+        if (argc < 4) { std::cerr << "usage: harness --payload <names.txt> <out.bin>\n"; return 2; }
+        std::ifstream names(argv[2]);
+        if (!names) { std::cerr << "cannot open " << argv[2] << "\n"; return 2; }
+        rasbery::casekey::Provenance p;
+        p.deck_digest  = "deadbeef";
+        p.fidelity     = "full_exact";
+        p.policy       = "strict";
+        p.xslib_digest = "cafebabe";
+        p.warm_start   = "";
+        std::string name;
+        while (std::getline(names, name)) {
+            if (name.empty()) continue;
+            const char* value = std::getenv(name.c_str());
+            p.env.emplace_back(name, value != nullptr ? std::string(value) : std::string());
+        }
+        const std::string payload = rasbery::casekey::payloadOf(p);
+        std::ofstream out(argv[3], std::ios::binary);
+        out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+        std::cout << rasbery::casekey::envDigest(p) << "\n"
+                  << rasbery::casekey::keyOf(p) << "\n"
+                  << rasbery::casekey::codeShaToken() << "\n";
+        return 0;
+    }
+
     std::ifstream in(argv[1]);
     if (!in) { std::cerr << "cannot open " << argv[1] << "\n"; return 2; }
     nlohmann::ordered_json config;
@@ -504,6 +739,53 @@ def compiled_contract() -> bool:
                 fail(f"{name}: the canonical deck payloads differ at byte {where}\n"
                      f"  C++    {payloads[name][max(0, where - 70):where + 70]!r}\n"
                      f"  python {py_bytes[max(0, where - 70):where + 70]!r}")
+        # ---- the WHOLE payload, not just the deck half --------------------
+        #
+        # Two environments, and the second one is the negative control: the
+        # first leaves every knob unset (so every env line is the tilde rule)
+        # and the second sets a handful including RASBERY_CODE_SHA, so a
+        # divergence in the separator, the tilde rule or the code_sha read
+        # cannot hide behind "everything was empty anyway".
+        names_file = tmp / "arm_env.txt"
+        names_file.write_text("\n".join(case_key.ARM_ENV) + "\n", encoding="utf-8")
+        base_env = {k: v for k, v in os.environ.items()
+                    if not k.startswith("RASBERY_")}
+        loaded = dict(base_env)
+        loaded.update({"RASBERY_GPU": "1", "RASBERY_GPU_XE": "1",
+                       "RASBERY_XE_FORMS": "0xd3d",
+                       "RASBERY_STAGED_FLUX_TOL": "4.0",
+                       "RASBERY_CODE_SHA": "a1b2c3d4"})
+        for label, environ in (("unset", base_env), ("loaded", loaded)):
+            out = tmp / f"payload_{label}.bin"
+            done = subprocess.run([str(exe), "--payload", str(names_file), str(out)],
+                                  capture_output=True, universal_newlines=True,
+                                  env=environ)
+            if done.returncode != 0:
+                fail(f"the compiled case-key harness failed in payload mode "
+                     f"({label}): {done.stdout}{done.stderr}")
+                return True
+            cpp_env_digest, cpp_key, cpp_code_sha = \
+                (done.stdout.splitlines() + ["", "", ""])[:3]
+            py_payload = case_key.payload_of("deadbeef", "full_exact", "strict",
+                                             environ, "cafebabe", "")
+            cpp_payload = out.read_bytes()
+            if cpp_payload != py_payload.encode("utf-8"):
+                where = next((i for i, (a, b) in enumerate(
+                    zip(cpp_payload, py_payload.encode("utf-8"))) if a != b),
+                    min(len(cpp_payload), len(py_payload)))
+                fail(f"payload({label}): the two implementations differ at byte "
+                     f"{where}\n  C++    {cpp_payload[max(0, where - 70):where + 70]!r}"
+                     f"\n  python {py_payload.encode('utf-8')[max(0, where - 70):where + 70]!r}")
+            if cpp_env_digest != case_key.env_digest(environ):
+                fail(f"payload({label}): env_digest C++ {cpp_env_digest!r} != "
+                     f"python {case_key.env_digest(environ)!r}")
+            want_key = hashlib.sha256(py_payload.encode("utf-8")).hexdigest()
+            if cpp_key != want_key:
+                fail(f"payload({label}): case_key C++ {cpp_key!r} != python {want_key!r}")
+            if cpp_code_sha != (environ.get("RASBERY_CODE_SHA") or "~"):
+                fail(f"payload({label}): codeShaToken C++ {cpp_code_sha!r} != "
+                     f"{environ.get('RASBERY_CODE_SHA') or '~'!r}")
+
         # And the property, proved on the COMPILED side rather than inferred
         # from the python one.
         if payloads["base"] != payloads["transpose"]:
@@ -528,15 +810,31 @@ def compare(log: Path, deck_path: Path) -> int:
         print(f"  FAIL no [RASBERY][CASE] receipt in {log}")
         return 1
     mine = case_key.case_key(deck_path)
+    # EVERY COMPONENT, NOT JUST THE KEY.  The 181 gate (2026-08-30) failed here
+    # on kngr_238.json and passed on two smaller decks, and all it could say was
+    # that two 64-hex digests differed -- so the diagnosis was a guess about
+    # float notation when the components had never been compared.  The receipt
+    # now publishes them (schema_version 3) and this walks them in payload
+    # order, so the FIRST differing component names itself.
     problems = []
-    for field in ("case_key", "key_schema", "core_op", "deck_digest"):
-        want = mine[field] if field != "deck_digest" else mine["deck_digest"]
-        if found.get(field) != want:
-            problems.append(f"{field}: solver {found.get(field)!r} vs tool {want!r}")
+    missing = []
+    for field in case_key.COMPONENT_FIELDS:
+        if field not in found:
+            missing.append(field)
+            continue
+        if found.get(field) != mine[field]:
+            problems.append(f"{field}: solver {found.get(field)!r} vs tool {mine[field]!r}")
+    print(f"  receipt schema_version {found.get('schema_version')}")
+    for field in case_key.COMPONENT_FIELDS:
+        print(f"  {field:<18} solver {str(found.get(field, '(absent)')):<66} "
+              f"tool {mine[field]}")
+    print(f"  {'xslib_path':<18} tool   {mine['xslib_path']}  ({mine['xslib_source']})")
+    if missing:
+        print("  NOTE the receipt predates schema_version 3 and carries no "
+              + ", ".join(missing)
+              + " -- rebuild before reading a component verdict from it")
     for line in problems:
         print(f"  FAIL {line}")
-    print(f"  solver case_key {found.get('case_key')}")
-    print(f"  tool   case_key {mine['case_key']}")
     print("case key live contract:", "FAIL" if problems else "PASS")
     return 1 if problems else 0
 
@@ -550,7 +848,9 @@ def main(argv: list[str]) -> int:
         return compare(Path(args.compare[0]), Path(args.compare[1]))
 
     source_contract()
+    receipt_component_contract()
     behaviour_contract()
+    xslib_contract()
     compiled = compiled_contract()
     py_compile.compile(str(ROOT / "tools" / "case_key.py"), doraise=True)
     py_compile.compile(str(Path(__file__).resolve()), doraise=True)
@@ -558,10 +858,10 @@ def main(argv: list[str]) -> int:
         for message in FAILED:
             print(f"case key contract: FAIL: {message}")
         return 1
-    print("case key contract: PASS"
-          + (" (source + behaviour + compiled byte-for-byte)" if compiled
-             else " (source + behaviour; NO C++ COMPILER -- the byte-for-byte "
-                  "half did not run)"))
+    print("case key contract: PASS (source + receipt components + behaviour + "
+          "external library"
+          + (" + compiled byte-for-byte)" if compiled
+             else "; NO C++ COMPILER -- the byte-for-byte half did not run)"))
     return 0
 
 

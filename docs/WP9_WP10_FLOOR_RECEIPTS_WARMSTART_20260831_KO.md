@@ -350,16 +350,63 @@ median/p10/p90을 기록한다. WP9-A/WP9-D는 **계기 추가**이므로 이 ar
 python3 tools/test_case_key_contract.py --compare $O/off.log kngr_238.json
 ```
 
-`case_key` / `key_schema` / `core_op` / `deck_digest` 네 필드가 모두 일치해야 한다.
-불일치가 나오면 거의 확실히 부동소수 표기다 — 그때는
+`--compare`는 이제 **키 하나가 아니라 성분 전부**를 payload 순서로 인쇄하고 대조한다:
+`case_key` / `key_schema` / `core_op` / `deck_digest` / `env_digest` / `xslib_digest` /
+`xslib_policy` / `warm_start_token` / `code_sha` / `fidelity` / `policy`. 첫 번째로
+어긋나는 성분이 스스로 이름을 댄다.
+
+같은 성분을 도구 쪽에서 단독으로 보려면:
 
 ```bash
-python3 tools/case_key.py kngr_238.json --deck-payload > $O/py_deck_payload.txt
+python3 tools/case_key.py kngr_238.json --components
 ```
-와 C++ 쪽 payload를 비교한다(필요하면 `deckPayload` 결과를 임시로 인쇄하는 1줄 패치).
-**주의**: `case_key.py`는 XS 경로를 덱 디렉터리 기준으로 풀고 내용을 digest 한다. WSL UNC
-경로 등으로 solver와 tool이 서로 다른 파일을 열면 digest가 비고 키가 어긋난다 —
-**같은 호스트, 같은 경로에서 돌릴 것.**
+
+솔버 쪽은 `[RASBERY][CASE]`(`schema_version:3`)가 같은 키 이름으로 인쇄한다. 두 출력을
+그대로 `diff` 하면 된다.
+
+#### 6.3.1 181이 실패한 이유 — 성분이 보이지 않았다 (2026-08-30)
+
+`gates_8919331.md` 블록 (6): `kngr_238.json` **FAIL**, `short_rev71.json` **PASS**,
+`s1.json` **PASS**. 게이트가 인쇄할 수 있었던 것은 서로 다른 64-hex 두 개뿐이었고,
+진단은 "거의 확실히 부동소수 표기"라는 추측에서 멈췄다.
+
+**2 대 1이라는 패턴 자체가 성분을 지목한다.** 세 덱은 같은 arm-X 환경, 같은 바이너리에서
+돌았다. 환경이 고정되면 **덱에 따라 달라지는 성분은 단 하나, 단면 라이브러리 digest**다 —
+그리고 `kngr_238.json`은 외부 CHIFFON 라이브러리를 참조하고 작은 두 덱은 그렇지 않다.
+라이브러리를 부르지 않는 덱은 양쪽 모두 빈 digest를 넣으므로 **자동으로 일치한다**. 즉
+PASS 두 개는 그 성분이 옳다는 증거가 아니라 그 성분이 **작동하지 않았다는** 증거다.
+
+`xslib_digest`가 어긋날 수 있는 경로는 셋이고, 이번 커밋이 셋 다 닫는다.
+
+| 경로 | solver | 이전의 도구 | 지금 |
+|---|---|---|---|
+| `RASBERY_XSLIB_DIGEST=off` / `0` | **빈 digest** (`XSSet.cpp XsLibraryDigestMode`) | 파일을 해시했다 | `xslib_digest_policy()`가 같은 규칙을 따르고, `xslib_policy`로 인쇄한다 |
+| 역슬래시 · WSL UNC 경로 | `NormalizeInputPath` 후 열었다 | 날문자열 그대로 열어 **파일을 못 찾고 빈 digest** | `normalize_input_path()`가 `src/IO.cpp`에서 접두사를 **파싱해서** 같은 변환을 한다 |
+| symlink 아래의 `..` | `lexically_normal()` — 파일시스템을 보지 않는다 | `Path.resolve()` — symlink를 따라가 **다른 파일**에 도달할 수 있었다 | `os.path.normpath`, 즉 어휘적 정규화 |
+
+계약: `tools/test_case_key_contract.py`의 `xslib_contract()`가 **실제로 외부 파일을
+참조하는 덱**으로 세 경로를 모두 돌린다(이전 fixture는 전부 `xslib=False`였다 — 키에서
+덱에 따라 달라지는 유일한 성분이 어떤 fixture로도 실행되지 않고 있었다). 그리고
+`receipt_component_contract()`가 수신증이 도구와 같은 성분 목록을 인쇄하도록 묶는다.
+
+#### 6.3.2 그래도 어긋나면
+
+성분 이름이 나오므로 그 성분만 좁힌다.
+
+```bash
+# deck_digest가 어긋난 경우에만 (부동소수 표기 가설)
+python3 tools/case_key.py kngr_238.json --deck-payload > $O/py_deck_payload.txt
+
+# xslib_digest가 어긋난 경우: 도구가 어떤 파일을 열었는지 --components가 인쇄한다
+python3 tools/case_key.py kngr_238.json --components | grep xslib
+sha256sum "$(python3 tools/case_key.py kngr_238.json --components              | awk -F'	' '$1=="xslib_path"{print $2}')"
+
+# env_digest가 어긋난 경우: 런처가 export한 것과 도구가 본 것이 다르다
+python3 tools/case_key.py kngr_238.json --payload | grep '^env'
+```
+
+**여전히 같은 호스트, 같은 경로에서 돌릴 것.** 위의 셋은 두 구현이 *같은 규칙을* 쓰게
+만들지만, 서로 다른 파일시스템을 보게 만들 수는 없다.
 
 대칭 접힘의 라이브 확인(선택이지만 값싸다):
 

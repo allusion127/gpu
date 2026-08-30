@@ -6,11 +6,12 @@
 |---|---|
 | 대상 | `RASBERY_GPU_XE` split Xe arm의 safeguarded Anderson step |
 | 상위 계획 | `docs/GPU_RASBERY_BOTTLENECK_PARALLEL_ACCELERATION_IMPLEMENTATION_PLAN_20260830_KO.md` WP7 단계 C, §3.3, §6 |
-| 게이트 등급 | **B0 (현 device arm 대비)** / N1 (host arm 대비, 이미 건너간 선) |
+| 게이트 등급 | **N1 (현 device arm 대비 — 181에서 측정, §9)** / N1 (host arm 대비, 이미 건너간 선) |
+| 등급 이력 | 출하 시 **B0 (현 device arm 대비)**를 주장했다. 2026-08-30 호스트 181의 실측이 그것을 반증했고 §9가 이유와 함께 강등을 기록한다. |
 | 플래그 | `RASBERY_GPU_XE_TXN=1`, 기본 `0` |
-| receipt | `[RASBERY][XE_GPU]` — `txn_steps`, `txn_accepted`, `txn_declined`, `host_syncs`, `host_syncs_per_step`, `d2h_bytes`, `d2h_bytes_per_step`, `xe_device_steps` |
-| 계약 테스트 | `tools/test_xe_txn_contract.py` (순수 python, negative control 8종) |
-| 소스 | `src/XeKernel.h`, `src/CudaXsReconBackend.{h,cu}`, `src/Driver.h`, `src/XeGpuReceipt.h`, `src/XeAndersonReference.{h,cpp}`, `src/XeFormMine.h`, `src/XSSet.{h,cpp}` |
+| receipt | `[RASBERY][XE_GPU]` — `txn_steps`, `txn_accepted`, `txn_declined`, `host_syncs`, `host_syncs_per_step`, `d2h_bytes`, `d2h_bytes_per_step`, `xe_device_steps`, `forms_audits`, `forms_audit_mismatch`, `forms_audit_mask`, `policy_note` |
+| 계약 테스트 | `tools/test_xe_txn_contract.py` (순수 python, negative control 8종), `tools/test_xe_forms_audit_contract.py` (§9.5의 계측, negative control 17종) |
+| 소스 | `src/XeKernel.h`, `src/CudaXsReconBackend.{h,cu}`, `src/Driver.h`, `src/XeGpuReceipt.h`, `src/XeAndersonReference.{h,cpp}`, `src/XeAlgebraReference.cpp`, `src/XeFormMine.h`, `src/XeFormAudit.{h,cpp}`, `src/XSSet.{h,cpp}` |
 | 기준 덱 | KNGR, `nxyz = 8,451`, `NG = 2`, `NISO = 39`, `NXS = 11`, `XE_DEPTH = 2`, `XE_DOT_PARTITIONS = 1024` |
 
 > 이 문서의 sync 수는 **모델이 아니라 계약**이다. `tools/test_xe_txn_contract.py`가
@@ -175,8 +176,9 @@ proj     = gamma[0] * p + gamma[1] * q;
 ```
 
 site당 3상태(둘 다 rounded / 첫 곱 fuse / 둘째 곱 fuse), 2비트. `XE_BIT_COUNT`는 5 → **13**.
-`XeFormMine.h`의 descent site table에 넷 모두 들어갔고, `XeAndersonReference.cpp`에
-`refAlgebra`가 **위 네 식을 문자 그대로** 인용한다. 채점 fixture는 별도다: 64개의 **잘 조건화된**
+`XeFormMine.h`의 descent site table에 넷 모두 들어갔고, `src/XeAlgebraReference.cpp`에
+`refAlgebra`가 **위 네 식을 문자 그대로** 인용한다(8919331에서 `XeAndersonReference.cpp`로부터
+분리되었다 — 그 TU는 비트 0..4가 채점되는 기준이라 WP7-C가 건드릴 수 없다). 채점 fixture는 별도다: 64개의 **잘 조건화된**
 Gram case(`|b| < 0.86·sqrt(ac)`)여야 2열 분기가 실제로 실행되고, 그렇지 않으면 세 site가
 don't-care로 채굴된다 — fixture에 대한 진술이지 compiler에 대한 진술이 아닌 값이 나온다.
 
@@ -328,3 +330,117 @@ nsys profile --trace=cuda -o wp7c_txn1 <B 명령>
 - **`XE_FORMS` 비트 5..12의 출하 기본값.** 238의 채굴값이 나오면 `XE_FORMS_DEFAULT`를 그
   호스트의 기록으로 갱신할지 결정한다(CmfdOuter의 0x6/0x7 선례대로, 기록은 갱신하되 런은
   여전히 채굴값을 쓴다).
+
+---
+
+## 9. 호스트 181의 반증 — B0 주장의 강등 (2026-08-30)
+
+`E:\rasbery_runs\20260830\181\gates_8919331.md` 블록 (4). 덱 `kngr_238.json`, arm-X,
+`RASBERY_GPU_XE_TXN` 0 대 1, 같은 바이너리(`8919331`), 같은 호스트.
+
+| 항목 | TXN=0 | TXN=1 | 판정 |
+|---|---|---|---|
+| digest | `1d897e3f77204799` | `7f32414a742623b9` | **다름** |
+| `h5diff` | — | 854줄 | **B0 실패** |
+| `xe_updates` = `device_updates` = `xe_device_steps` | 1195 | 1190 | 5 step 적음 |
+| `anderson_proposed` | 752 | 747 | 5 적음 |
+| `anderson_accepted` | 737 | 733 | 4 적음 |
+| `host_syncs_per_step` | 3.639 | **1.0** | 메커니즘은 §2대로 동작 |
+| `d2h_bytes_per_step` | 1.96069e6 | 1.96072e6 | 허용 범위 |
+| `txn_steps` / `txn_declined` | — | 1190 / **0** | arm 혼합 없음 |
+| TXN=1 ×2 | — | 동일 digest | 결정성 있음 |
+
+**sync 감축 메커니즘 자체는 문서대로 작동했다.** 4→1, drain 불변, arm 혼합 0.
+무너진 것은 B0 주장 하나다.
+
+### 9.1 왜 이것이 "mask가 unsound했다"가 아닌가
+
+양쪽 arm 모두 **같은** `[RASBERY][FORMS]` 줄을 인쇄했다 — `0xd3d` 채굴값, `[WARN][FORMS]`
+없음. 그 두 사실이 각각 다음을 뜻한다:
+
+- `[WARN][FORMS]`가 없다 = `XeFormMine.h::mineStable`의 **algebra 채널이 네 seed 전부에서
+  mismatch 0에 도달했다**(`algebra_sound == true`). 즉 채굴은 실패하지 않았다.
+- `0xd3d`의 비트 5..12는 `0b01101001` — DET=`P1`, G0=`P2`, G1=`P2`, PROJ=`P1`. 네 site
+  **모두 seed 0(전부 0)에서 움직였다**. `descend`는 점수가 *엄격히* 줄어야만 비트를 바꾸므로,
+  네 site 모두 이 fixture가 판별한다. don't-care가 아니다.
+
+그러므로 mask는 자기가 채점된 대상 — `xeref::refAlgebra` — 을 **정확히** 재현한다.
+재현하지 못하는 것은 `Driver.h::TryAndersonXeStepGpu`에 **인라인된** 그 네 식이다.
+
+### 9.2 채굴이 닫을 수 없는 틈
+
+`refAlgebra`는 `src/XeAlgebraReference.cpp`의 **별도 함수, 별도 translation unit**이다.
+피연산자는 `f.alg[]` 배열에서 오고, 결과는 출력 포인터로 나간다. production은 `SolveLoop`에
+인라인된 블록이고, 피연산자는 `xs.XeGpuDots()`가 채운 로컬 `double dots[6]`에서 오며,
+`gamma`/`proj`는 그 뒤 safeguard와 device 커널 인자로 흘러간다. **어느 곱을 add에 접어넣을지는
+gcc의 per-call-site 결정**이고, register pressure와 사용처가 다르면 달라질 수 있다.
+
+이 틈은 fixture를 더 좋게 만들어서는 닫히지 않는다. production call site는 **production 인라인
+안에서만** 도달 가능하기 때문이다. 비트 0..4가 같은 위험을 지고도 지금까지 버틴 이유는 별개다:
+그 비트들이 지배하는 커널(`kXeDotStage1`, `kXeCandidate`)은 **TXN=0과 TXN=1 양쪽에서 똑같이**
+돈다. 오채굴이 있어도 A/B에서 상쇄된다. **비트 5..12만이 이 A/B가 실제로 시험하는 비트**이고,
+그래서 이 A/B가 캠페인 최초로 채굴 mask의 production 충실도를 시험한 자리다 — 그리고 실패했다.
+
+### 9.3 무엇이 원인이 아닌지 (배제한 것들)
+
+소스 대조로 배제했다. `xeAndersonSolveControl`/`xeAndersonGateControl`은 arming(§`ncol==0`,
+`picard < eq_tol`), SAFEGUARD 1~4의 순서·상수·`!(<=)` NaN 규약까지 `TryAndersonXeStepGpu`와
+같다. 거부 step의 commit도 같다 — TXN=0은 `UpdateEquilibriumXenon` → `XeGpuEvaluate`(같은
+상태, 같은 커널, 같은 F) → `XeGpuCommitPicard`(`XE_T_F`, `relax`, `picard_skip=true`)이고,
+TXN=1은 `kXeCommitTxn`의 `accept==0` 가지(`xeBlendOrdinal` + `processed[k]==0` skip)로 같은
+식·같은 skip이다(`relax != 1.0`은 `xeTransaction`이 거절한다). window 부기(`ncol_after`,
+`hist_col`, `hist_rotate`)도 같고, dot layout은 `uploadXeTxnLayouts()`가 `xeDots()`와 같은
+`add` 순서로 만든다. `txn_declined = 0`이므로 혼합도 아니다.
+
+남는 유일한 산술적 차이가 det / γ₀ / γ₁ / proj — 즉 비트 5..12다.
+
+### 9.4 판정
+
+**WP7-C는 현 device arm 대비 N1이다.** B0는 취소한다.
+
+이유를 한 줄로: **TXN=1은 CPU FP64(gcc가 고른 contraction)에서 device(`--fmad=false`,
+명시적 form)로 대수를 옮기고, 그 이동이 비트 보존이려면 13비트 mask가 production call site의
+gcc를 재현해야 하는데, mask는 그 call site가 아니라 그것의 인용을 상대로 교정된다.**
+
+강등은 문서만이 아니라 receipt에도 적혀 있다 — `[RASBERY][XE_GPU]`의 `policy_note`
+(`src/XeGpuReceipt.h::kXeTxnPolicyNote`). 게이트 스크립트가 읽는 값은 그쪽이다.
+
+### 9.5 이것을 잡았어야 할 계측 — `RASBERY_XE_FORMS_AUDIT`
+
+`src/XeFormAudit.{h,cpp}`. **채굴이 만들 수 없는 측정을, 문제의 call site에서 만든다.**
+`RASBERY_GPU_XE=1`, `RASBERY_GPU_XE_TXN=0`으로 돌리면서
+`RASBERY_XE_FORMS_AUDIT=1`을 주면, `TryAndersonXeStepGpu`가 자기 γ/proj를 계산한 직후
+같은 `dots`·같은 `XE_ANDERSON_MIN_GRAM`·**해결된 그 mask**로 shipped body
+(`xe::xeAndersonFit`)를 다시 돌려 비트 단위로 비교한다.
+
+- `forms_audit_mismatch == 0` (그리고 `forms_audits > 0`) → 그 빌드에서 mask는 production을
+  재현한다. B0 주장이 성립할 수 있는 **유일한** 형태다.
+- `forms_audit_mismatch > 0` → N1이고, 숫자가 붙는다. 첫 불일치는 slot 이름과 함께 한 줄
+  `[RASBERY][WARN][FORMS]`로 나온다.
+
+**한 번의 런, h5diff 없음, bisect 없음.** 181은 이 값을 낼 방법이 없었기 때문에 854줄의
+h5diff에서 "trajectory divergence"까지만 갈 수 있었다.
+
+계측은 **자기만의 translation unit**에 있고 그것이 계측의 전부다. 헤더 인라인이었다면 gcc가
+production의 `a * c - b * b`를 audit의 재계산으로 CSE해서 **값을 자기 자신과 비교**하게
+만들 수 있고, 그러면 모든 호스트에서 영원히 mismatch 0이 나온다. 거짓 주장을 잡는 것이 유일한
+일인 계측의 거짓 음성은 계측이 없는 것보다 나쁘다. `src/XeAlgebraReference.cpp`가 존재하는
+이유와 같은 논증을, 기준이 아니라 측정에 적용한 것이다.
+
+계약: `tools/test_xe_forms_audit_contract.py` (순수 python, negative control 포함).
+
+### 9.6 다음에 할 수 있는 것 (이 커밋의 범위 밖)
+
+1. **`RASBERY_XE_FORMS_AUDIT=1`을 181/238에서 한 번 돌린다.** §9.4는 소거법의 결론이다.
+   audit은 그것을 직접 측정으로 바꾼다. `forms_audit_mismatch`가 0이면 §9.4는 틀렸고 남은
+   차이는 다른 곳에 있다 — 그때는 `RASBERY_GPU_XE_DOT_PARTITIONS=1`로 좁힌다.
+2. **`RASBERY_XE_FORMS`로 site를 직접 쓸어본다.** 네 site × 3상태 = 81 조합. audit이 0을
+   내는 조합이 있으면 그것이 이 호스트의 production mask이고, 그 값을 arm-X에
+   `RASBERY_XE_FORMS`로 고정하면 TXN A/B가 B0로 돌아온다 — mask는 env override가 최우선이다
+   (`resolveCalibratedFormMask`). **이것이 B0를 되찾는 가장 짧은 길이다.**
+3. **또는 양쪽 arm이 같은 body를 쓰게 한다.** `TryAndersonXeStepGpu`가 자기 손으로 쓴 네 식
+   대신 `xe::xeAndersonFit`을 호출하면, host g++ 빌드(`xsrMul`의 asm barrier)와 nvcc
+   `--fmad=false` 빌드가 **어떤 mask 값에서도** 같은 비트를 낸다 — TXN A/B는 구성상 B0가 된다.
+   대신 그것은 **`RASBERY_GPU_XE` arm 자신의 수치를 오늘로부터 움직이는 N1 변경**이고,
+   8919331이 명문화한 규칙("production arm이 도는 mask는 새 site의 통로가 아니다")에 따라
+   그 자체로 Gate A/B를 받아야 한다. 2번이 실패했을 때의 길이다.

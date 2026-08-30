@@ -314,6 +314,46 @@ inline std::string tokenOrTilde(const std::string& text) {
     return text.empty() ? std::string("~") : text;
 }
 
+/// The build identity token, spelled ONCE.  `payloadOf` digests it and the
+/// [RASBERY][CASE] receipt prints it, and those two reading the environment
+/// through two expressions is how a receipt starts describing a key it did not
+/// name.
+inline std::string codeShaToken() {
+    const char* code = std::getenv(kCodeShaEnv);
+    return tokenOrTilde(code != nullptr ? std::string(code) : std::string());
+}
+
+/// The ENV HALF of the payload as its own bytes: one `env\tNAME\tVALUE` line
+/// per knob, in kArmEnv order, newline-terminated.
+///
+/// WHY THIS EXISTS SEPARATELY FROM payloadOf.  WP10.1's first live failure
+/// (host 181, kngr_238.json) was a key mismatch with no way to say WHICH of the
+/// six components moved -- the solver published one 64-hex digest and the tool
+/// published another, and the whole diagnosis budget went into guessing.  A
+/// digest per component is what turns that into one line of output: the deck
+/// half already had one (`deck_digest`), and this gives the half that is read
+/// from the environment the same treatment.  Thirty raw values in a receipt
+/// would be unreadable and would leak whatever a launcher exported; one digest
+/// answers "is the env part the same" and nothing else.
+///
+/// THE LINE SPELLING IS payloadOf's, DELIBERATELY, so the component digest is a
+/// digest of the actual payload bytes and not of a paraphrase of them.  The two
+/// are held together by tools/test_case_key_contract.py, which compiles this
+/// header and compares both against tools/case_key.py byte for byte.
+inline std::string envPayload(const Provenance& p) {
+    std::string out;
+    for (const auto& [name, value] : p.env) {
+        out += "env\t";
+        out += name;
+        out += '\t';
+        out += tokenOrTilde(value);
+        out += '\n';
+    }
+    return out;
+}
+
+inline std::string envDigest(const Provenance& p) { return Sha256::hexOf(envPayload(p)); }
+
 /// The full payload.  Line-oriented and readable on purpose: when two runs
 /// disagree about a key, the answer has to be visible in a diff.
 inline std::string payloadOf(const Provenance& p) {
@@ -335,8 +375,7 @@ inline std::string payloadOf(const Provenance& p) {
     out += "\nwarm_start\t";
     out += tokenOrTilde(p.warm_start);
     out += "\ncode_sha\t";
-    const char* code = std::getenv(kCodeShaEnv);
-    out += tokenOrTilde(code != nullptr ? std::string(code) : std::string());
+    out += codeShaToken();
     out += '\n';
     return out;
 }
