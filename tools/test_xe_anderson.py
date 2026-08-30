@@ -49,7 +49,12 @@ have to be checked in the source.  Ten things are guarded here:
      which is what makes a depletion step structurally unable to carry history.
  10. TELEMETRY.  Four additive counters, charged only inside the gated arm,
      with proposed == accepted + rejected by construction, folded into the run
-     totals and published by both SPTELEM receipts.
+     totals and published by both SPTELEM receipts.  There are now THREE arms
+     (host, split device, device transaction), chained by guarded tail calls so
+     that exactly one body runs per call; the per-proposal counters are charged
+     ONCE IN EACH, which is one charge per proposal and is why the WP7-C
+     receipt can claim anderson_proposed/anderson_accepted do not move under
+     RASBERY_GPU_XE_TXN.
 
 It also pins the two DELIBERATE DEVIATIONS from Sec 10 -- no full-exact
 true-residual acceptance, no coupled snapshot/rollback, and therefore no
@@ -112,6 +117,59 @@ AA_CODE = code_lines(AA)
 # about the host arm and stays that way.
 GPU_AA = region(DRIVER, "    static bool TryAndersonXeStepGpu(",
                 "\n    /// One safeguarded Anderson step", "TryAndersonXeStepGpu")
+# WP7-C: the device TRANSACTION sibling (RASBERY_GPU_XE_TXN), which takes the
+# whole step -- safeguards, decision and commit -- inside one device call and
+# reads the outcome back as a reason code.
+TXN_AA = region(DRIVER, "    static bool TryAndersonXeStepGpuTxn(",
+                "\n    /// The DEVICE arm of the safeguarded Anderson step",
+                "TryAndersonXeStepGpuTxn")
+
+# THE ARMS, ENUMERATED.  Three function bodies can take an Anderson step and
+# EXACTLY ONE OF THEM TAKES ANY GIVEN ONE: the dispatch is a chain of tail
+# calls, each guarded by a cached flag and each returning the callee's answer
+# without falling through --
+#
+#     SolveLoop -> TryAndersonXeStep            (host)
+#                    RASBERY_GPU_XE     -> TryAndersonXeStepGpu       (split device)
+#                      RASBERY_GPU_XE_TXN -> TryAndersonXeStepGpuTxn  (device txn)
+#
+# so a per-proposal counter must be charged ONCE IN EACH ARM.  The totals are
+# then independent of which arm ran, which is exactly what the WP7-C receipt
+# claims: anderson_proposed/anderson_accepted are "the same event, the same
+# place" under TXN=0 and TXN=1.  The regions are disjoint, so summing them is
+# a partition and not a double count.
+ARMS = (("host (TryAndersonXeStep)", AA),
+        ("split device (TryAndersonXeStepGpu)", GPU_AA),
+        ("device transaction (TryAndersonXeStepGpuTxn)", TXN_AA))
+for _name, _arm in ARMS:
+    for _other_name, _other in ARMS:
+        if _name is not _other_name and _other in _arm:
+            fail(f"the {_other_name} arm's body is nested inside the {_name} arm's region; "
+                 "the per-arm charge counts would double-count it")
+# ...and the chain is a CHAIN.  Each hand-off is a guarded call whose result is
+# returned immediately, so the caller's own body cannot run as well; and each
+# callee has exactly one call site.  Together that is what turns "one charge
+# per arm" into "one charge per proposal".
+for _caller, _what, _call in (
+    (AA, "host -> split device",
+     "if (rasberyGpuXeEnabled()) return TryAndersonXeStepGpu(ctx, aa, power, max_step, "
+     "xe_change);"),
+    (GPU_AA, "split device -> device transaction",
+     "if (txn && TryAndersonXeStepGpuTxn(ctx, aa, power, max_step, xe_change)) return "
+     "true;"),
+):
+    if _call not in squash(_caller):
+        fail(f"the {_what} hand-off is not a guarded tail call: {_call!r} not found; "
+             "without the immediate return the caller's body would run too and charge "
+             "the same proposal a second time")
+for _callee in ("TryAndersonXeStepGpu(ctx,", "TryAndersonXeStepGpuTxn(ctx,"):
+    if DRIVER.count(_callee) != 1:
+        fail(f"{_callee} has {DRIVER.count(_callee)} call sites; an arm entered from two "
+             "places is an arm whose charges no longer partition the proposals")
+if squash(GPU_AA).index("TryAndersonXeStepGpuTxn(ctx,") > \
+        squash(GPU_AA).index("++ctx.telemetry.xe_aa_proposed;"):
+    fail("the split device arm charges a proposal BEFORE handing off to the transaction; "
+         "a transaction step would then be charged in both arms")
 
 # ---------------------------------------------------------------------------
 # 1. The gate: one read, cached, MODE-DEPENDENT default, env overrides both ways.
@@ -691,6 +749,47 @@ if "have_prev = false;" not in forget or "ncol      = 0;" not in forget:
 # 10. Telemetry: four additive counters, charged only inside the arm.
 # ---------------------------------------------------------------------------
 COUNTERS = ("xe_aa_proposed", "xe_aa_accepted", "xe_aa_rejected", "xe_aa_history_resets")
+# ONE CHARGE PER ARM, AND THE ARMS ARE ENUMERATED (ARMS, above).
+#
+# Rev.7.1 Task 13 made the device arm a SIBLING of the host one rather than a
+# shared body -- Driver.h says why -- and WP7-C added a third sibling, the
+# device transaction.  The price of that decision is that a per-proposal
+# counter is written out once per arm.  That is not a double count: the
+# dispatch chain runs exactly one arm's body per call, so a proposal is charged
+# exactly once however the run is flagged, which is what lets the WP7-C receipt
+# claim anderson_proposed/anderson_accepted are unchanged by TXN.
+#
+# What WOULD break the totals is a second charge INSIDE one arm (the same
+# proposal counted twice) or a charge site outside every arm (a step Anderson
+# never took).  Both are failures, and the two conditions together are what
+# `charge_sites_ok` tests: once in each arm, and no charges left over.
+#
+# "rejected" and "history_resets" stay at ONE site each: all three arms reach
+# them through RejectXeAnderson / ResetXeAndersonHistory, which is what makes
+# the arms' rejection distributions and reset counts comparable at all.
+PER_ARM = ("xe_aa_proposed", "xe_aa_accepted")
+
+
+def charge_sites_ok(counter: str, arms, driver: str) -> bool:
+    """Exactly one charge of `counter` in every arm, and none anywhere else."""
+    charge = f"++ctx.telemetry.{counter};"
+    return (all(arm.count(charge) == 1 for _, arm in arms)
+            and driver.count(charge) == len(arms))
+
+
+# NEGATIVE CONTROL for that rule, because a rule that cannot fail is a comment.
+# A double charge inside one arm and a site outside every arm must each be
+# caught, and a correct layout must pass.
+_CHARGE = "        ++ctx.telemetry.xe_aa_proposed;\n"
+if not charge_sites_ok("xe_aa_proposed", (("a", _CHARGE), ("b", _CHARGE)), _CHARGE * 2):
+    fail("negative control: charge_sites_ok rejects a correct one-per-arm layout")
+if charge_sites_ok("xe_aa_proposed", (("a", _CHARGE), ("b", _CHARGE * 2)), _CHARGE * 3):
+    fail("negative control: a second charge inside one arm is not detected; the same "
+         "proposal would be counted twice")
+if charge_sites_ok("xe_aa_proposed", (("a", _CHARGE), ("b", _CHARGE)), _CHARGE * 3):
+    fail("negative control: a charge site outside every enumerated arm is not detected; "
+         "a fourth arm (or a charge in SolveLoop) would pass unseen")
+
 for counter in COUNTERS:
     if f"long long {counter}" not in DRIVER:
         fail(f"sptelem::Counters has no {counter} field")
@@ -700,22 +799,24 @@ for counter in COUNTERS:
         fail(f"{counter} is not published by both SPTELEM receipts")
     if DRIVER.count(f"c.{counter}") != 2:
         fail(f"{counter} is not passed as an argument at both receipt sites")
-    # ONE CHARGE SITE PER ARM, and no more.  Rev.7.1 Task 13 added a second
-    # Anderson arm (TryAndersonXeStepGpu, RASBERY_GPU_XE) which is a SIBLING of
-    # the host one rather than a shared body -- Driver.h says why, and the price
-    # of that decision is that "proposed" and "accepted" are charged twice, once
-    # in each arm.  Exactly one of the two arms runs in a process, so the totals
-    # are unchanged; what would break them is a THIRD site, or a second site
-    # outside the device arm, and both are still failures here.
-    #
-    # "rejected" and "history_resets" stay at ONE site each: both arms reach
-    # them through RejectXeAnderson / ResetXeAndersonHistory, which is what makes
-    # the two arms' rejection distributions and reset counts comparable at all.
-    per_arm = 2 if counter in ("xe_aa_proposed", "xe_aa_accepted") else 1
-    if DRIVER.count(f"++ctx.telemetry.{counter};") != per_arm:
-        fail(f"{counter} must be charged in exactly {per_arm} place(s)")
-    if per_arm == 2 and GPU_AA.count(f"++ctx.telemetry.{counter};") != 1:
-        fail(f"{counter}'s second charge site is not inside the device Anderson arm")
+    charge = f"++ctx.telemetry.{counter};"
+    if counter in PER_ARM:
+        for name, arm in ARMS:
+            n = arm.count(charge)
+            if n != 1:
+                fail(f"{counter} is charged {n} time(s) in the {name} arm; exactly one arm "
+                     "body runs per call, so each must charge a proposal exactly once -- "
+                     "twice in one arm counts the same proposal twice, never charging it "
+                     "leaves that arm's receipt claiming steps it did not take")
+        if not charge_sites_ok(counter, ARMS, DRIVER):
+            fail(f"{counter} is charged {DRIVER.count(charge)} time(s) in Driver.h but "
+                 f"there are {len(ARMS)} enumerated arms, one charge each; the extra site "
+                 "is outside every arm -- either a FOURTH arm nobody added to ARMS, or a "
+                 "charge on a step Anderson never took")
+    elif DRIVER.count(charge) != 1:
+        fail(f"{counter} must be charged in exactly 1 place; all three arms reach it "
+             "through RejectXeAnderson / ResetXeAndersonHistory, which is what makes "
+             "their rejection distributions and reset counts comparable")
     # ...and that place is inside the gated arm, never in the loop body, where it
     # would be charged on a step Anderson never took.
     if f"ctx.telemetry.{counter}" in SOLVE_CODE:
