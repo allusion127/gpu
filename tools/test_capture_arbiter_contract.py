@@ -418,7 +418,7 @@ def check_retry_path(files: dict[str, str]) -> list[str]:
     arbiter = files.get(os.path.join(SRC, "GpuCaptureArbiter.h"), "")
     for token in ("capture_race_retry", "capture_race_unrecovered",
                   "inline bool captureIllegal(",
-                  "inline void noteCaptureRaceRetry()",
+                  "inline void noteCaptureRaceRetry(",
                   "inline void noteCaptureRaceUnrecovered("):
         if token not in arbiter:
             bad.append("src/GpuCaptureArbiter.h has no %s -- the retry has no "
@@ -433,7 +433,7 @@ def check_retry_path(files: dict[str, str]) -> list[str]:
         if "rasbery::captureIllegal(" not in code:
             bad.append("src/%s: a graph build with no capture-illegal retry -- one "
                        "lost race is one dead case" % name)
-        if "rasbery::noteCaptureRaceRetry()" not in code:
+        if "rasbery::noteCaptureRaceRetry(" not in code:
             bad.append("src/%s: a retry nobody counts" % name)
         if "rasbery::noteCaptureRaceUnrecovered(" not in code:
             bad.append("src/%s: a retry that can lose in silence" % name)
@@ -574,8 +574,8 @@ def controls(files: dict[str, str]):
         ("the retry stops being counted",
          check_retry_path,
          mutate(files, "GpuCaptureArbiter.h",
-                "inline void noteCaptureRaceRetry() {",
-                "inline void noteCaptureRaceRetryX() {")),
+                "inline void noteCaptureRaceRetry(const char* tag",
+                "inline void noteCaptureRaceRetryX(const char* tag")),
     ]
 
 

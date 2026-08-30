@@ -120,6 +120,12 @@ struct CaptureArbiterStats {
     /// one retry, so this is the count of cases that fell back to the
     /// non-capturing arm rather than dying -- and it must be loud.
     std::atomic<unsigned long long> capture_race_unrecovered{0};
+    /// WP19.1.  A capture-illegal refusal that was NOT retried, because the
+    /// build had already run the body's host-side enqueue helpers and a second
+    /// run of them would elide uploads whose bytes never left the host.  See
+    /// noteCaptureRaceAbandoned() -- this is the counter that says "the race
+    /// happened, and the honest answer was to stop".
+    std::atomic<unsigned long long> capture_race_abandoned{0};
 };
 
 inline CaptureArbiterStats& captureArbiterStats() {
@@ -237,8 +243,80 @@ inline bool captureIllegal(int cuda_error) {
 
 /// One capture-illegal build was retried under the arbiter.  Counted here so
 /// the term is process-wide and every capture site reports into one number.
-inline void noteCaptureRaceRetry() {
+///
+/// WP19.1: AND SAID OUT LOUD, WITH THE SITE AND THE STAGE ON IT.
+///
+/// WP19 spelled this `noteCaptureRaceRetry()` -- no arguments, no line, one
+/// process-wide integer printed at teardown between ten others.  The 238
+/// evidence run (2026-08-30, 8 x M16 v6) therefore printed
+/// `"capture_race_retry":1` in BOTH the process that lost a case and the
+/// process that did not, and nothing anywhere said which capture site it was,
+/// which stage refused, or which slot was building -- which is exactly the
+/// three facts that separate a harmless retry (`ppr.while`, a body of pure
+/// kernel launches) from a corrupting one (`outer.while` past record(body)).
+/// The dispatcher does not lift the arbiter receipt either, so the term never
+/// reached the harness log at all.  One line per event, on stderr, fixes both.
+inline void noteCaptureRaceRetry(const char* tag, const char* stage, int cuda_error,
+                                 int slot) {
     captureArbiterStats().capture_race_retry.fetch_add(1, std::memory_order_relaxed);
+    std::ostringstream line;
+    line << "[RASBERY][CUDA][CAPTURE_RACE][RETRY] {\"tag\":\"" << (tag ? tag : "")
+         << "\",\"stage\":\"" << (stage ? stage : "") << "\",\"cuda_error\":"
+         << cuda_error << ",\"slot\":" << slot
+         << ",\"tid\":" << captureThreadOrdinal()
+         << ",\"open\":" << captureArbiterOpen().load(std::memory_order_relaxed)
+         << ",\"retried\":1}";
+    std::cerr << line.str() << std::endl;
+}
+
+/// WP19.1.  A capture-illegal refusal that MUST NOT be retried.
+///
+/// THE DEFECT THIS NAMES.  A graph build that refuses BEFORE its body is
+/// recorded has moved nothing: the same build under a quiet process is a clean
+/// second experiment, which is what WP19's retry leans on.  A build that
+/// refuses AT OR AFTER `record(body)` has already run the body's host-side
+/// enqueue helpers, and those helpers keep byte-exact upload shadows
+/// (CudaTransferMirror.h) and residency generations that they commit AT THE
+/// ISSUE, not at the landing.  The capture that was to carry those copies is
+/// then discarded, so the bytes never reach the device -- while the host now
+/// believes they did.  A second run of the same helpers ELIDES them, and the
+/// graph that gets instantiated has no upload node for data the device does
+/// not hold.  On a lane's first case that device memory is uninitialised, and
+/// the replay produces a non-finite flux with no CUDA error anywhere.
+///
+/// So this rung exists to be taken instead: loud, named, counted, and followed
+/// by the caller's ordinary "the host state moved" hard stop.
+inline void noteCaptureRaceAbandoned(const char* tag, const char* stage, int cuda_error,
+                                     int slot, const char* what) {
+    captureArbiterStats().capture_race_abandoned.fetch_add(1, std::memory_order_relaxed);
+    std::ostringstream line;
+    line << "[RASBERY][CUDA][CAPTURE_RACE][ERROR] {\"tag\":\"" << (tag ? tag : "")
+         << "\",\"stage\":\"" << (stage ? stage : "") << "\",\"cuda_error\":"
+         << cuda_error << ",\"slot\":" << slot << ",\"what\":\""
+         << (what ? what : "") << "\",\"retried\":0,\"recovered\":0,"
+         << "\"why\":\"host state moved: a second body record would elide uploads "
+            "that never left the host\"}";
+    std::cerr << line.str() << std::endl;
+}
+
+/// The arbiter's standing-up provenance, as one compact JSON object body.
+///
+/// WP19.1.  Printed beside a first-case death so the receipt that says WHAT
+/// died sits next to the numbers that say whether a capture window was open
+/// while this lane was standing up.  Deliberately the same terms as the
+/// teardown receipt, so a reader does not have to learn two vocabularies.
+inline std::string captureArbiterProvenance() {
+    const auto&        s = captureArbiterStats();
+    std::ostringstream line;
+    line << "\"capture_windows\":" << s.capture_windows.load() << ','
+         << "\"alloc_overlapped\":" << s.alloc_overlapped.load() << ','
+         << "\"alloc_blocked\":" << s.alloc_blocked.load() << ','
+         << "\"alloc_in_capture\":" << s.alloc_in_capture.load() << ','
+         << "\"captures_unwound\":" << s.captures_unwound.load() << ','
+         << "\"capture_race_retry\":" << s.capture_race_retry.load() << ','
+         << "\"capture_race_abandoned\":" << s.capture_race_abandoned.load() << ','
+         << "\"capture_race_unrecovered\":" << s.capture_race_unrecovered.load();
+    return line.str();
 }
 
 /// The retry lost too.  LOUD, on stderr, with the site that lost -- a silent
@@ -367,6 +445,7 @@ inline std::string captureArbiterReceipt(const char* tag) {
          << "\"alloc_in_capture\":" << s.alloc_in_capture.load() << ','
          << "\"captures_unwound\":" << s.captures_unwound.load() << ','
          << "\"capture_race_retry\":" << s.capture_race_retry.load() << ','
+         << "\"capture_race_abandoned\":" << s.capture_race_abandoned.load() << ','
          << "\"capture_race_unrecovered\":" << s.capture_race_unrecovered.load() << '}';
     return line.str();
 }

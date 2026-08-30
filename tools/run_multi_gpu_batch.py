@@ -968,6 +968,18 @@ EVALUATOR_REFUSED = re.compile(r"\[RASBERY\]\[EVALUATOR\]\[REFUSED\]\s*(\{.*\})"
 # a case that dies before the fold closes may print a receipt this dispatcher
 # cannot parse -- and the whole point of the line is that it survives that.
 EVALUATOR_CASE_ERROR = re.compile(r"\[RASBERY\]\[EVALUATOR\]\[ERROR\]\s*(\{.*\})")
+# WP19.1.  The capture-race evidence, which WP19 counted but never surfaced.
+#
+# `capture_race_retry` lived ONLY in the arbiter's once-per-process teardown
+# receipt, which this dispatcher did not read: the 238 run of 2026-08-30 printed
+# `"capture_race_retry":1` in both the process that lost a case and the process
+# that did not, in a per-worker evaluator log, and the harness log contained the
+# term nowhere at all.  Three lines are lifted now -- the arbiter receipt, the
+# per-event capture-race lines the backends print, and the evaluator's own
+# first-case retry -- so a campaign that fired the race says so on its own log.
+CUDA_CAPTURE_ARBITER = re.compile(r"\[RASBERY\]\[CUDA\]\[CAPTURE_ARBITER\]\s*(\{.*\})")
+CAPTURE_RACE_EVENT = re.compile(
+    r"\[RASBERY\]\[(?:CUDA|EVALUATOR)\]\[CAPTURE_RACE\](?:\[[A-Z_]+\])?\s*(\{.*\})")
 # `[EVALUATOR] {` with WHITESPACE after the tag -- the once-per-process receipt.
 # The wave/case/refused tags are each followed by `[`, so this cannot match one.
 EVALUATOR_PROCESS = re.compile(r"\[RASBERY\]\[EVALUATOR\]\s+(\{.*\})")
@@ -1005,6 +1017,24 @@ def collect_case_errors(result: "WorkerResult", text: str) -> None:
             )
         if entry not in result.failed_case_errors:
             result.failed_case_errors.append(entry)
+    collect_capture_race(result, text)
+
+
+def collect_capture_race(result: "WorkerResult", text: str) -> None:
+    """WP19.1.  Lift the capture-race evidence a child prints.
+
+    The arbiter receipt is a SNAPSHOT (last one wins -- it is cumulative and
+    printed at teardown); the per-event lines are a SET, deduplicated the same
+    way the case errors are, because the dispatcher scans a wave's text twice.
+    """
+    for match in CUDA_CAPTURE_ARBITER.finditer(text):
+        record = _json_or_none(match.group(1))
+        if record is not None:
+            result.capture_arbiter = record
+    for match in CAPTURE_RACE_EVENT.finditer(text):
+        entry = match.group(1)[:400]
+        if entry not in result.capture_race:
+            result.capture_race.append(entry)
 
 
 @dataclass
@@ -1365,6 +1395,12 @@ class WorkerResult:
     #: until they already know what to look for.  These strings go into the
     #: problems list, which is what reaches [MULTI_GPU][FAIL].
     failed_case_errors: list[str] = field(default_factory=list)
+    #: WP19.1.  The arbiter's once-per-process teardown receipt (cumulative;
+    #: the last one seen wins) and every per-event capture-race line the child
+    #: printed.  Both go into the PROC receipt so `capture_race_retry` is a term
+    #: a campaign log carries rather than one a per-worker file hides.
+    capture_arbiter: dict | None = None
+    capture_race: list[str] = field(default_factory=list)
 
     @property
     def fidelities(self) -> dict[str, int]:
@@ -3422,6 +3458,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "fatal_waves": r.fatal_waves,
                     "failed_cases": r.failed_cases,
                     "failed_case_errors": r.failed_case_errors,
+                    "capture_arbiter": r.capture_arbiter,
+                    "capture_race": r.capture_race,
                     "jobs": r.jobs,
                     "wall_s": round(r.wall_s, 3),
                     "cases_per_hour": round(r.cases_per_hour, 1),
@@ -3572,6 +3610,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "failed_cases": sum(len(r.failed_cases) for r in results),
                 "failed_case_errors": [e for r in results
                                       for e in r.failed_case_errors],
+                "capture_race": [e for r in results for e in r.capture_race],
+                "capture_race_retry": sum(
+                    int((r.capture_arbiter or {}).get("capture_race_retry", 0))
+                    for r in results),
+                "capture_race_abandoned": sum(
+                    int((r.capture_arbiter or {}).get("capture_race_abandoned", 0))
+                    for r in results),
+                "capture_race_unrecovered": sum(
+                    int((r.capture_arbiter or {}).get("capture_race_unrecovered", 0))
+                    for r in results),
                 "batch_width": args.batch_width,
                 "jobs": total_jobs,
                 "wall_s": round(wall, 3),

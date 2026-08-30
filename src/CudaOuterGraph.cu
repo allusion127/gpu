@@ -734,6 +734,39 @@ void noteOuterSegmentRefusal(OuterSegmentRefusal why) {
 
 namespace {
 
+/// WP19.1.  HAS THE BUILD ALREADY MOVED HOST STATE BY THE TIME IT REFUSED?
+///
+/// `stage` is buildOuterWhile()'s cursor and its eight values are the contract
+/// written out in GpuOuterWhile.h.  The first eight are pure graph plumbing:
+/// nothing host-side has moved and nothing device-side has run, so the build is
+/// free to be abandoned or repeated.  From `record(body)` on, the body's thirty
+/// enqueue helpers HAVE run as host calls -- they committed the CMFD backend's
+/// byte-exact upload shadows (CudaTransferMirror.h commits AT THE ISSUE) and
+/// the segment's own residency generations, for copies that were only RECORDED
+/// into a capture that is about to be thrown away.
+///
+/// TWO CALLERS, ONE RULE, AND THAT IS THE POINT.  The refusal path below has
+/// asked this question since Task 10 (a repeat there would be "a plausible
+/// wrong answer rather than a slow one").  WP19's capture-race retry did not
+/// ask it, and re-recorded the body unconditionally: the second record found
+/// every shadow already committed, elided the uploads, and instantiated a WHILE
+/// whose body has no H2D node for data the device never received.  On a lane's
+/// FIRST case that device memory is uninitialised and the replay lands in
+/// BICGCMFD's non-finite guard with no CUDA error anywhere -- which is the
+/// silent second face of the WP19 race.  One predicate, asked by both.
+/// [[maybe_unused]]: both callers are inside `#if RASBERY_HAS_OUTER_WHILE`, and
+/// a stub build that compiles this TU without the WHILE arm must not warn.
+[[maybe_unused]] bool outerWhileStageMovedHostState(const char* stage) {
+    if (stage == nullptr) return true; // unknown cursor: assume the worst
+    static const char* const kBeforeBody[] = {
+        "BeginCapture(root)",     "GetCaptureInfo(root)", "ConditionalHandleCreate",
+        "arm",                    "GetCaptureInfo(arm)",  "AddNode(while)",
+        "UpdateCaptureDependencies", "BeginCaptureToGraph(body)"};
+    for (const char* known : kBeforeBody)
+        if (std::strcmp(stage, known) == 0) return false;
+    return true;
+}
+
 /// One physical slot's queue, built on the host.  A segment is single-slot for
 /// now (Sec 3.2 batch integration is Task 10/18), so count and bucket are 1 and
 /// every other entry is padding -- which the kernels must never dereference,
@@ -2887,9 +2920,26 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
             // with the process quiet -- and the sticky error has to be cleared
             // first or the retry inherits it.  A second refusal is a real one
             // and falls through to the named refusal below, loudly.
-            if (rasbery::captureIllegal(static_cast<int>(rc))) {
+            //
+            // WP19.1, AND THIS GATE IS THE WHOLE FIX.  "Worth one rebuild" is
+            // true only while the build has moved nothing.  Past record(body)
+            // the body's enqueue helpers have committed their upload shadows
+            // for copies the discarded capture never carried, so the SECOND
+            // record elides them and bakes a body with no H2D node for data the
+            // device does not hold -- a graph that replays into a non-finite
+            // flux with no CUDA error anywhere.  See
+            // outerWhileStageMovedHostState() above.  When the cursor says the
+            // host state moved, the honest rung is the hard stop below, said
+            // out loud, and NOT a retry.
+            if (rasbery::captureIllegal(static_cast<int>(rc)) &&
+                outerWhileStageMovedHostState(stage)) {
+                rasbery::noteCaptureRaceAbandoned("outer.while", stage,
+                                                  static_cast<int>(rc), slot,
+                                                  cudaGetErrorString(rc));
+            } else if (rasbery::captureIllegal(static_cast<int>(rc))) {
                 cudaGetLastError();
-                rasbery::noteCaptureRaceRetry();
+                rasbery::noteCaptureRaceRetry("outer.while", stage,
+                                              static_cast<int>(rc), slot);
                 root = nullptr;
                 exec = nullptr;
                 {
@@ -2911,15 +2961,9 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                 cudaGetLastError();
                 bump(counters()
                          .graph_refusals[static_cast<int>(OuterGraphRefusal::CaptureFailed)]);
-                const bool host_state_moved =
-                    std::strcmp(stage, "BeginCapture(root)") != 0 &&
-                    std::strcmp(stage, "GetCaptureInfo(root)") != 0 &&
-                    std::strcmp(stage, "ConditionalHandleCreate") != 0 &&
-                    std::strcmp(stage, "arm") != 0 &&
-                    std::strcmp(stage, "GetCaptureInfo(arm)") != 0 &&
-                    std::strcmp(stage, "AddNode(while)") != 0 &&
-                    std::strcmp(stage, "UpdateCaptureDependencies") != 0 &&
-                    std::strcmp(stage, "BeginCaptureToGraph(body)") != 0;
+                // WP19.1: ONE predicate, shared with the retry gate above, so
+                // the two can never disagree about what "the body ran" means.
+                const bool host_state_moved = outerWhileStageMovedHostState(stage);
                 if (!host_state_moved) return 0;
                 bump(counters().refusals[static_cast<int>(OuterSegmentRefusal::LaunchFailed)]);
                 releaseCanonicalNodal(false);

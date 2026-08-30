@@ -2175,6 +2175,19 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
                 // such rather than retried into a hang.  cudaGetLastError()
                 // between the two clears the sticky error the first attempt
                 // left, or the retry inherits the corpse.
+                //
+                // WP19.1, AND WHY THIS RETRY STAYS UNCONDITIONAL WHILE THE
+                // OUTER WHILE'S DOES NOT.  The retry is sound exactly when
+                // re-running the body's recorder moves no host state.  Here the
+                // recorder is `enqueue_round`, which is nothing but kernel
+                // launches on the body stream: every H2D this statepoint needs
+                // (phif/phis/jnet, the four XS blocks, chif/crdf and the loop
+                // scalars) was issued and its generation memo taken BEFORE the
+                // build, outside the capture, so a second record cannot elide
+                // an upload that never landed.  CudaOuterGraph.cu's body is
+                // `runOneOuter`, which does move shadows -- hence the stage gate
+                // there and none here.  If enqueue_round ever grows an upload,
+                // this retry needs that gate too.
                 if (rasbery::captureIllegal(static_cast<int>(brc))) {
                     // `refusals[CaptureRaceRetry]` is the COUNTER the receipt
                     // reports; `last_refusal` is why the LAST statepoint fell
@@ -2182,7 +2195,14 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
                     // rung is counted and the ladder's tip is put back.
                     const ppr::Refusal prev = s.last_refusal;
                     cudaGetLastError();
-                    rasbery::noteCaptureRaceRetry();
+                    // WP19.1: with the site, the stage and the slot on it, so a
+                    // process-wide count of 1 is no longer the only evidence.
+                    // -1 for the slot: a PPR backend is one per Driver and does
+                    // not carry the arena slot id (the receipt's `slot` is
+                    // stamped by the caller), so the honest value is "unknown"
+                    // rather than a number this object does not own.
+                    rasbery::noteCaptureRaceRetry("ppr.while", stage,
+                                                  static_cast<int>(brc), -1);
                     s.noteRefusal(ppr::Refusal::CaptureRaceRetry);
                     root = nullptr;
                     exec = nullptr;
