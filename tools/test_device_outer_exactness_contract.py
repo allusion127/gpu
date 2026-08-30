@@ -378,6 +378,79 @@ def body_of(code: str, signature: str) -> str:
     raise AssertionError("unbalanced braces after " + signature)
 
 
+# ===========================================================================
+# THE LEDGER MOVED THE SPELLING, NOT THE CALL  (WP13.1, commit 914f6b3)
+# ===========================================================================
+#
+# Every cudaMemcpy* / cuda*Synchronize on the single-deck GPU path now goes
+# through src/XferLedger.h.  `rasbery::xfer::streamSync(scope, leaf, stream)`
+# forwards to cudaStreamSynchronize with the same argument, on the same stream,
+# and returns its cudaError_t unmodified -- and
+# tools/test_xfer_ledger_contract.py BANS the raw call outside the wrapper.  So
+# a scan here that looks only for `cudaStreamSynchronize` cannot match a correct
+# tree any more: it reports "nothing synchronises" about source that
+# synchronises on every path.  That is how three invariants in this file went
+# from checking the ordering to checking the spelling.
+#
+# Both spellings are accepted, and the raw one is kept first so a tree that
+# predates the ledger still reads correctly.
+SYNC_SPELLINGS = ("cudaStreamSynchronize", "xfer::streamSync")
+
+
+def has_sync(text: str) -> bool:
+    """Does this span contain a host-visible stream synchronise, either
+    spelling?"""
+    return any(spelling in text for spelling in SYNC_SPELLINGS)
+
+
+def sync_index(text: str) -> int:
+    """Offset of the EARLIEST synchronise, or -1.  Used to slice the guard that
+    precedes it, so it has to be the earliest of the two spellings rather than
+    the earliest spelling that happens to be listed first."""
+    found = [text.index(sp) for sp in SYNC_SPELLINGS if sp in text]
+    return min(found) if found else -1
+
+
+def syncs_on(text: str, stream_expr: str) -> bool:
+    """A synchronise whose stream argument is `stream_expr`.
+
+    The wrapper takes the stream THIRD, behind two string literals, and one of
+    those literals carries parentheses of its own
+    (`"CudaXsReconBackend.cu:solveNodal(hybrid)"`), so this cannot be a
+    paren-balanced match.  Bounded lookahead to the argument name, stopping at
+    the statement terminator, is what keeps it from matching a later
+    synchronise on a different stream."""
+    pattern = (r"(?:" + r"|".join(re.escape(sp) for sp in SYNC_SPELLINGS) +
+               r")\([^;]{0,240}?" + re.escape(stream_expr) + r"\s*\)")
+    return re.search(pattern, text, re.S) is not None
+
+
+def brace_block(code: str, marker: str) -> str:
+    """The brace-balanced block that opens after `marker`, or "".
+
+    WHY NOT A REGEX ON INDENTATION.  The rule below matched
+    `if (m.sweep_host_continued) {` up to the next newline-plus-EIGHT-spaces
+    `}` -- and the block it means is nested twelve deep, so the match ran past
+    its own closing brace to some other statement's, swallowing hundreds of
+    lines and whatever token the rule was looking for.  A brace count cannot do
+    that."""
+    start = code.find(marker)
+    if start < 0:
+        return ""
+    open_brace = code.find("{", start)
+    if open_brace < 0:
+        return ""
+    depth = 0
+    for i in range(open_brace, len(code)):
+        if code[i] == "{":
+            depth += 1
+        elif code[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return code[open_brace:i + 1]
+    return ""
+
+
 def strip_comments(code: str) -> str:
     """Code only.  A rule that can be satisfied by the COMMENT explaining it is
     not a rule -- and every one of these invariants has a long comment next to
@@ -503,38 +576,40 @@ def check_swallowed_step_is_reissued(problems: list[str]) -> None:
             "behind the verdict while it was raised"
         )
 
-    run = body_of(runner, "bool CudaOuterSegment::runSegment")
+    # COMMENT-STRIPPED, because the tokens below appear in the prose that
+    # explains them: a rule its own comment satisfies is not a rule.
+    run = strip_comments(body_of(runner, "bool CudaOuterSegment::runSegment"))
     if "m.sweep_host_continued = false" not in run:
         problems.append(
             "the flag must be cleared at the top of every outer, or it describes an "
             "older one"
         )
-    reissue = re.search(
-        r"if\s*\(\s*m\.sweep_host_continued\s*\)\s*\{(.*?)\n        \}", run, re.S
-    )
-    if reissue is None:
+    reissue_at = run.find("if (m.sweep_host_continued) {")
+    block = brace_block(run, "if (m.sweep_host_continued) {")
+    if not block:
         problems.append(
             "runSegment must re-issue the body step the verdict's halt swallowed"
         )
     else:
-        block = reissue.group(1)
         for needed, why in (
             ("enqueueUpdJnet", "updjnet is the step the halt swallows"),
             (
-                "cudaStreamSynchronize",
+                "a stream synchronise",
                 "the nodal drive reads what it wrote, from another stream and (on the "
                 "bridged arm) from a host array -- an enqueue is not enough",
             ),
             ("updjnet_reissued", "the repair has to be countable in the receipt"),
         ):
-            if needed not in block:
+            present = (has_sync(block) if needed == "a stream synchronise"
+                       else needed in block)
+            if not present:
                 problems.append(f"the re-issue block is missing {needed}: {why}")
 
     # The re-issue has to happen AFTER the observation that finished the drive and
     # BEFORE the nodal drive that consumes it.
     finish = run.index("finish_cmfd_sweep")
     nodal = run.index("enqueue_nodal_drive")
-    if reissue is not None and not (finish < reissue.start() < nodal):
+    if block and not (finish < reissue_at < nodal):
         problems.append(
             "the re-issue must sit between the sweep observation (which is what "
             "finished the drive) and the nodal drive (which reads the jnet)"
@@ -545,12 +620,12 @@ def check_cross_stream_handovers_are_ordered(problems: list[str]) -> None:
     runner = read("src", "CudaOuterGraph.cu")
     xsrecon = read("src", "CudaXsReconBackend.cu")
 
-    run = body_of(runner, "bool CudaOuterSegment::runSegment")
+    run = strip_comments(body_of(runner, "bool CudaOuterSegment::runSegment"))
     # segment stream -> nodal stream: the drive reads what updjnet wrote.
     jnet = run.index("enqueueUpdJnet")
     nodal = run.index("enqueue_nodal_drive")
     between = run[jnet:nodal]
-    if "cudaStreamSynchronize" not in between and "cudaStreamWaitEvent" not in between:
+    if not has_sync(between) and "cudaStreamWaitEvent" not in between:
         problems.append(
             "nothing orders the segment stream against the nodal backend's stream "
             "between updjnet and the nodal drive.  The drive reads the jnet updjnet "
@@ -561,8 +636,8 @@ def check_cross_stream_handovers_are_ordered(problems: list[str]) -> None:
     # drive either drains its own stream before returning, or records an event
     # the segment stream waits on -- W3 item 2 made the second legal, and the
     # rule below pins BOTH halves of it, because either half alone is a race.
-    solve = body_of(xsrecon, "bool XsReconBackend::solveNodal")
-    if "cudaStreamSynchronize(d.stream)" not in solve:
+    solve = strip_comments(body_of(xsrecon, "bool XsReconBackend::solveNodal"))
+    if not syncs_on(solve, "d.stream"):
         problems.append(
             "XsReconBackend::solveNodal must still be able to drain its own stream: "
             "the deferred path is only legal when the drive left NOTHING on the host, "
@@ -730,7 +805,7 @@ def check_host_reader_mirror_is_synchronised(problems: list[str]) -> None:
         return
 
     between = run[mirror_at:hook_at]
-    if "cudaStreamSynchronize" not in between:
+    if not has_sync(between):
         problems.append(
             "CudaOuterGraph.cu: nothing synchronises the stream between the in-loop "
             "psi/dhat mirror and the sweep hook.  Those are async D2Hs into PAGE-LOCKED "
@@ -740,7 +815,7 @@ def check_host_reader_mirror_is_synchronised(problems: list[str]) -> None:
         )
         return
 
-    guard = between[: between.index("cudaStreamSynchronize")]
+    guard = between[: sync_index(between)]
     if "host_reader_next" not in guard:
         problems.append(
             "CudaOuterGraph.cu: the synchronise before the sweep hook is not conditioned "
@@ -1284,6 +1359,106 @@ def check_deferred_observation_moved_its_writers(problems: list[str]) -> None:
         )
 
 
+# ===========================================================================
+# NEGATIVE CONTROLS FOR THE ORDERING RULES
+# ===========================================================================
+#
+# WHY THEY EXIST AND WHY THEY EXIST NOW.  Three of the checks above are of the
+# form "some span of source contains a synchronise", and all three spent a
+# release reporting a violation about source that was correct -- they were
+# reading a spelling the WP13.1 ledger had retired.  A scan that cannot match a
+# correct tree is one edit away from a scan that cannot match a BROKEN one, and
+# nothing in the output distinguishes the two.  So each ported rule is now run
+# against a source tree with exactly the ordering it defends removed, and a rule
+# that still passes is reported as dead.
+#
+# THE MUTATION IS APPLIED THROUGH `read`, not on disk: the checks take their
+# source from that one function, so swapping it is enough and nothing under
+# src/ is ever written.
+CONTROLS = (
+    (
+        "the updjnet -> nodal-drive ordering is removed",
+        "CudaOuterGraph.cu",
+        'rasbery::xfer::streamSync("CudaOuterGraph.cu:runOuterTail",',
+        'noSync("CudaOuterGraph.cu:runOuterTail",',
+        "check_cross_stream_handovers_are_ordered",
+    ),
+    (
+        "solveNodal loses every drain on its own stream",
+        "CudaXsReconBackend.cu",
+        "xfer::streamSync(",
+        "noSync(",
+        "check_cross_stream_handovers_are_ordered",
+    ),
+    (
+        "the re-issue block loses its synchronise",
+        "CudaOuterGraph.cu",
+        'rasbery::xfer::streamSync("CudaOuterGraph.cu:runOuterTail",',
+        'noSync("CudaOuterGraph.cu:runOuterTail",',
+        "check_swallowed_step_is_reissued",
+    ),
+    (
+        "the pre-sweep drain is removed",
+        "CudaOuterGraph.cu",
+        'rasbery::xfer::streamSync("CudaOuterGraph.cu:runOneOuter",',
+        'noSync("CudaOuterGraph.cu:runOneOuter",',
+        "check_host_reader_mirror_is_synchronised",
+    ),
+    (
+        "the pre-sweep drain stops being conditioned on host_reader_next",
+        "CudaOuterGraph.cu",
+        "if (!stream_sweep || host_reader_next) {",
+        "if (true) {",
+        "check_host_reader_mirror_is_synchronised",
+    ),
+)
+
+
+class _DeadAnchor(Exception):
+    pass
+
+
+def run_controls() -> list[str]:
+    """Every control must (a) apply and (b) make its check fail."""
+    global read
+    original = read
+    failures: list[str] = []
+    for label, basename, old, new, check_name in CONTROLS:
+        applied = {"hit": False}
+
+        def mutating_read(*parts, _bn=basename, _old=old, _new=new, _a=applied):
+            text = original(*parts)
+            if parts and parts[-1] == _bn:
+                if _old in text:
+                    _a["hit"] = True
+                    # replace ALL, so a control cannot be satisfied by one of
+                    # several sites while the others keep the property alive
+                    return text.replace(_old, _new)
+            return text
+
+        read = mutating_read
+        try:
+            probs: list[str] = []
+            globals()[check_name](probs)
+        except Exception as exc:  # a check that crashes has not "caught" anything
+            probs = ["crashed: %r" % (exc,)]
+        finally:
+            read = original
+        if not applied["hit"]:
+            failures.append(
+                "negative control %r: the anchor %r no longer appears in %s, so this "
+                "control is measuring nothing.  Update it to the current spelling."
+                % (label, old, basename)
+            )
+        elif not probs:
+            failures.append(
+                "negative control %r: %s PASSED on a tree with that ordering removed -- "
+                "the rule is checking the spelling, not the ordering"
+                % (label, check_name)
+            )
+    return failures
+
+
 def main() -> int:
     problems: list[str] = []
     check_form_mask_is_mined(problems)
@@ -1298,12 +1473,14 @@ def main() -> int:
     check_batch_slot_is_one_index_space(problems)
     check_deferred_observation_moved_its_writers(problems)
 
+    problems.extend(run_controls())
+
     if problems:
         print("FAIL: device outer exactness contract")
         for problem in problems:
             print("  - " + problem)
         return 1
-    print("PASS: device outer exactness contract")
+    print("PASS: device outer exactness contract (%d negative controls)" % len(CONTROLS))
     print("  1. the CMFD outer contraction mask is mined on this host, not baked")
     print("  2. SolveLoop's flux_stall and loop bound are charged in outers")
     print("  3. the step the sweep verdict's halt swallows is re-issued")

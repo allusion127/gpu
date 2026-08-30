@@ -305,12 +305,45 @@ digest·h5diff·pin CSV는 같은 기준으로 받되, **N1로 분류하고 Gate
   그리고 이 파일에 호스트 시계가 들어오지 않을 것.
 * `tools/test_device_outer_state_machine.py` — D2H 사이트 상한을 18 → 19로 올렸다.
   새 사이트는 **랑데부를 추가한 것이 아니라 같은 200 B를 짧은 길로 읽는 것**이며,
-  그 이유를 그 파일의 주석 형식대로 적어 두었다. 이 파일은 `914f6b3`에서도
-  `CudaBICGBackend.cu`의 dhat H2D 건으로 이미 FAIL이고(선행 상태), WP14는 그 건을
-  건드리지 않았다.
+  그 이유를 그 파일의 주석 형식대로 적어 두었다.
 * 함께 돌린 것: `test_enum_alias_contract` PASS, `test_dependent_template_contract`
   PASS, `test_xfer_ledger_contract` PASS(신규 사이트도 래퍼를 통과 — `src/CudaOuterGraph.cu`의
   tagged call sites 50 → 51), `test_cmfd_outer_kernels_contract` / `test_batch_outer_budget_contract`
   / `test_outer_stream_sweep_contract` PASS.
-  `test_device_outer_exactness_contract`와 `test_xfer_elide_contract`는 `914f6b3`에서도
-  같은 항목으로 FAIL이다(선행 상태, WP14 무관 — HEAD 트리에서 대조 실행하여 확인).
+
+---
+
+## 9. 부록 — 스캔이 철자를 검사하고 있었다 (WP14 후속 커밋)
+
+`914f6b3`(WP13.1 레저)에서 `CudaBICGBackend.cu`·`CudaXsReconBackend.cu`·
+`CudaOuterGraph.cu`의 모든 `cudaMemcpy*`/`cuda*Synchronize`가 `src/XferLedger.h`의
+래퍼를 지나가게 되었고, 가드 헬퍼 두 개는 **leaf 태그를 첫 인자로** 얻었다.
+소스 스캔으로 동작하는 계약 테스트 셋이 그 철자를 따라가지 못해, **옳은 트리에 대해
+위반을 보고**하거나 **아무것도 검사하지 않게** 되었다. 셋 다 약화 없이 복구했다.
+
+| 테스트 | 실패하던 한 줄 이유 | 고친 방식 |
+|---|---|---|
+| `test_device_outer_state_machine.py` | `push(dhat_dev` 를 찾는데 소스는 `push("dhat", dhat_dev` — 레저가 `push`에 leaf 태그를 첫 인자로 넣었다 | 태그를 포함한 철자로 스캔(태그 **와** 목적지 둘 다 단언). 덤으로 `pushOrSkip(phi + m` stop 앵커와 주석을 stop으로 쓰던 앵커 3개도 되살렸다 |
+| `test_device_outer_exactness_contract.py` | `cudaStreamSynchronize` 문자열을 찾는데 소스는 `rasbery::xfer::streamSync(...)` — 같은 호출, 다른 철자 | `SYNC_SPELLINGS` 두 철자를 모두 받는 `has_sync`/`sync_index`/`syncs_on` 도입. `d.stream` 인자 매칭은 래퍼가 스트림을 **세 번째**로 받으므로 경계 있는 정규식으로 |
+| `test_xfer_elide_contract.py` | `pushDeviceReadOnly(<dst>` / `uploadGuarded(<dst>` 로 목적지를 캡처하는데 소스는 `("tag", <dst>` — 캡처가 문자열 리터럴에 걸려 **모든 버퍼가 "가드 없음"** 으로 읽혔다. 같은 이유로 C5의 "복사를 아직 발행하는가"도 거짓 | 목적지를 **선택적 태그 접두사**를 지나 매칭(`GUARD_TAG`), raw-copy 스캔은 래퍼 철자(`xfer::memcpyAsync(scope, leaf, dst, ...)`)를 **추가**, 죽어 있던 음성 대조 3개의 앵커를 현재 철자로 갱신 |
+
+**약화하지 않았다는 근거 — 전부 mutate-and-fail로 확인했다.**
+
+* `test_xfer_elide_contract.py`는 자체 음성 대조 하네스를 가지고 있고, 이제
+  **6 checks / 8 negative controls 전부 적용되고 전부 발화**한다(이전: 3개 dead).
+* `test_device_outer_exactness_contract.py`에는 **음성 대조 5개를 새로 넣었다**
+  (`CONTROLS`, `run_controls()`). 순서를 지키는 규칙 3개에 대해 그 순서를 **제거한**
+  트리로 각 검사를 돌리고, 통과하면 "규칙이 순서가 아니라 철자를 검사하고 있다"고
+  **실패로 보고**한다. 대조가 파일에 닿지 못하면(앵커 이동) 그것도 실패다.
+  변이는 디스크가 아니라 `read`를 갈아끼워 적용하므로 `src/` 아래는 쓰지 않는다.
+  하네스 자체도 메타 검증했다: 앵커를 없애면 "measuring nothing"으로 실패,
+  대조를 엉뚱한 검사에 물리면 역시 실패한다.
+* `test_device_outer_state_machine.py`에는 `DEAD_ANCHORS`를 넣었다. `body_of`가
+  **마커나 stop을 못 찾으면 그 사실 자체가 FAIL**이 된다 — 종전에는 마커 실종은
+  빈 문자열(=조용한 통과), stop 실종은 파일 끝까지(=범위가 1,400줄 넓어진 규칙)였다.
+  이 커밋이 되살린 stop 앵커 3개가 정확히 그 두 번째 형태였다.
+  외부 하네스로 4개 변이(dhat 가드 제거, phi 태그 변경, dhat 태그 제거,
+  `runOuterTail` 개명)를 넣어 **4개 모두 잡히는 것**을 확인했다.
+
+`914f6b3`(WP14 이전) 대비 `tools/test_*.py` 전수 비교에서 **PASS→FAIL로 바뀐 것은
+하나도 없고**, FAIL→PASS가 이 세 개다.

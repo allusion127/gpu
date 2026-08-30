@@ -81,15 +81,32 @@ def want(text: str, needle: str, where: str, why: str) -> None:
         problems.append(f"{where}: missing {needle!r} -- {why}")
 
 
+# ANCHORS THAT NO LONGER MATCH ARE A FAILURE, NOT A QUIET PASS.
+#
+# WHAT THIS CLOSES.  `body_of` used to return "" for a missing MARKER and the
+# whole rest of the file for a missing STOP, and both read as "the property
+# holds": a rule scoped to a lambda silently became a rule scoped to 1,400 more
+# lines, and a rule whose marker had been renamed checked nothing at all.  The
+# WP13.1 ledger rewrite is what made that concrete -- it retagged
+# `push(dhat_dev, ...)` as `push("dhat", dhat_dev, ...)` and
+# `pushOrSkip(phi + m, ...)` as `pushOrSkip("issueSweepUploads:phi", phi + m,
+# ...)`, so two anchors here stopped matching the source they were written
+# against -- and three stop markers were COMMENTS, which this file strips before
+# it scans.  Every dead anchor is now reported by name.
+DEAD_ANCHORS: list[tuple[str, str, str]] = []
+
+
 def body_of(code: str, marker: str, stop: str | None = None) -> str:
     start = code.find(marker)
     if start < 0:
+        DEAD_ANCHORS.append(("marker", marker, stop or ""))
         return ""
     rest = code[start:]
     if stop is not None:
         end = rest.find(stop, len(marker))
         if end > 0:
             return rest[:end]
+        DEAD_ANCHORS.append(("stop", marker, stop))
     return rest
 
 
@@ -912,7 +929,10 @@ for flag in ("dhat_resident", "psi_resident"):
          "stageSweeps must carry the residency into the slot the upload loop reads")
 # The dhat push must be GUARDED, and the guard must be the residency.
 DHAT = body_of(BICG_CU, "if (sl.dhat_resident)", "++telemetry.cmfd_assembly_gpu_calls")
-if not DHAT or "push(dhat_dev" not in DHAT:
+# `push` gained a ledger LEAF TAG as its first argument at WP13.1, so the
+# spelling is `push("dhat", dhat_dev, ...)`.  Both halves are asserted: the tag
+# (so the copy is on the ledger) and the destination (so it is THIS buffer).
+if not DHAT or 'push("dhat", dhat_dev' not in DHAT:
     problems.append("CudaBICGBackend.cu: the dhat H2D is not guarded by sl.dhat_resident. "
                     "It is the one sweep input pushed unconditionally every outer, so it "
                     "is the whole 416 KiB/outer link 2 exists to remove")
@@ -921,7 +941,8 @@ if "cmfd_dhat_h2d_elided_bytes" not in BICG_CU:
                     "claim 'the H2D is gone' has no number behind it")
 # psi residency must outrank psi_dirty: dirty means 'the host wrote it', and
 # when the segment owns psi the host never wrote it at all.
-PSI = body_of(BICG_CU, "if (sl.psi_resident)", "pushOrSkip(phi + m")
+PSI = body_of(BICG_CU, "if (sl.psi_resident)",
+              'pushOrSkip("issueSweepUploads:phi", phi + m')
 if PSI and PSI.find("else if (sl.push_psi)") < 0:
     problems.append("CudaBICGBackend.cu: the psi residency test does not outrank psi_dirty. "
                     "psi_dirty is true at every drive boundary, so ranking it first would "
@@ -1152,8 +1173,12 @@ for _need in ("ApplyRodCusping(", "cmfd_solver.upddtil()"):
 # unchanged and in the same order; what moved is where they are written.  So the
 # region to check is the lambda, and what has to be true of the LOOP is that it
 # calls it -- once per outer, which is the property this rule is about.
-_TAIL = body_of(GRAPH_CU_CODE, "auto runOuterTail = [&](", "// --- the segment exit")
-_LOOP = body_of(GRAPH_CU_CODE, BODY_ANCHOR, "// --- the segment exit")
+# CODE MARKERS, NOT COMMENT MARKERS.  GRAPH_CU_CODE is comment-stripped, so
+# "// --- the segment exit" could never be found and both spans silently ran to
+# the end of the file.  runOuterTail is defined before runOneOuter, and the loop
+# ends where the single observation begins.
+_TAIL = body_of(GRAPH_CU_CODE, "auto runOuterTail = [&](", "auto runOneOuter = [&](")
+_LOOP = body_of(GRAPH_CU_CODE, BODY_ANCHOR, "DeviceOuterSegmentState seg_out")
 if "runOuterTail(i," not in _LOOP:
     problems.append("CudaOuterGraph.cu: the per-outer body loop does not call "
                     "runOuterTail.  A tail that is only reachable from the repair path "
@@ -1404,6 +1429,16 @@ if "--fmad=false" not in _graph_opts:
     problems.append("CMakeLists.txt: CudaOuterGraph.cu is not compiled with --fmad=false.  It "
                     "composes the Task 4/5 phase kernels, whose contract is bit-identical "
                     "reproduction of the host loops; Class B0 is unreachable without it")
+
+
+# EVERY ANCHOR THIS FILE SCANNED WITH HAD TO MATCH.  Reported last, because a
+# dead anchor invalidates whatever rule was written on top of it and the reader
+# needs to see the rule's own verdict as unreliable rather than as a pass.
+for _kind, _marker, _stop in DEAD_ANCHORS:
+    problems.append(
+        "this test is measuring nothing: the %s %r (marker %r) no longer appears in the "
+        "source it was written against.  Update the scan to the current spelling -- do not "
+        "delete the rule" % (_kind, _stop if _kind == "stop" else _marker, _marker))
 
 
 def main() -> int:

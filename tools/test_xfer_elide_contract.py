@@ -118,6 +118,31 @@ def check_c1_not_an_arm_knob(src: dict[str, str]) -> list[str]:
     return problems
 
 
+# ===========================================================================
+# THE LEDGER MOVED THE SPELLING, NOT THE CALL  (WP13.1, commit 914f6b3)
+# ===========================================================================
+#
+# Two things happened to this file's scans at once, and both are spelling:
+#
+#   * the guarded-upload helpers gained a LEAF TAG as their FIRST argument --
+#     `pushDeviceReadOnly("issueSweepUploads:device_active", device_active, ...)`
+#     and `uploadGuarded("stream_x", d.dev_sx, ...)` -- so a regex that captured
+#     the first argument as the destination captured a string literal, or
+#     nothing, and every buffer read as "no longer guarded".
+#   * the raw copies became `rasbery::xfer::memcpyAsync(scope, leaf, dst, ...)`,
+#     which puts the DESTINATION third.  A scan for `cudaMemcpyAsync(dst` can
+#     no longer find an unguarded copy, and C5's "does this helper still issue a
+#     copy at all" read as no.
+#
+# So the destination is matched through an OPTIONAL tag prefix, and both copy
+# spellings are accepted.  Nothing here is relaxed: the tag prefix is anchored
+# to a single string literal, so a call with a computed destination still fails
+# to match, and the raw-copy scans gained a spelling rather than losing one.
+GUARD_TAG = r'(?:"[^"]*"\s*,\s*)?'
+COPY_CALL = r'(?:cudaMemcpyAsync\(\s*|(?:rasbery::)?xfer::memcpyAsync\(\s*"[^"]*"\s*,\s*"[^"]*"\s*,\s*)'
+COPY_SPELLINGS = ("cudaMemcpyAsync", "xfer::memcpyAsync")
+
+
 def check_c2_only_readonly_buffers(src: dict[str, str]) -> list[str]:
     problems: list[str] = []
     code = strip_comments(src[BICG])
@@ -125,7 +150,8 @@ def check_c2_only_readonly_buffers(src: dict[str, str]) -> list[str]:
     if "void pushDeviceReadOnly(" not in code:
         return ["C2: BatchCore::pushDeviceReadOnly is gone; nothing is guarded"]
 
-    guarded = re.findall(r"pushDeviceReadOnly\(\s*([A-Za-z_][A-Za-z0-9_]*)", code)
+    guarded = re.findall(
+        r"pushDeviceReadOnly\(\s*" + GUARD_TAG + r"([A-Za-z_][A-Za-z0-9_]*)", code)
     for want in ("d_slot_map", "device_active", "device_assembly_active"):
         if want not in guarded:
             problems.append(
@@ -147,8 +173,7 @@ def check_c2_only_readonly_buffers(src: dict[str, str]) -> list[str]:
     # Every writer of device_active must share the one shadow, or a rendezvous
     # launch leaves it describing bytes the device no longer holds.
     raw_active = re.findall(
-        r"cudaMemcpyAsync\(\s*device_active\b|cudaMemcpyAsync\(\s*device_assembly_active\b"
-        r"|cudaMemcpyAsync\(\s*d_slot_map\b",
+        COPY_CALL + r"(?:device_active|device_assembly_active|d_slot_map)\b",
         code,
     )
     if raw_active:
@@ -166,7 +191,8 @@ def check_c2b_flatxs_inputs_guarded(src: dict[str, str]) -> list[str]:
     if "bool uploadGuarded(" not in code:
         return ["C2b: Impl::uploadGuarded is gone; the flat-XS inputs are unguarded"]
 
-    guarded = re.findall(r"uploadGuarded\(\s*([A-Za-z_][A-Za-z0-9_.+ *]*?),", code)
+    guarded = re.findall(
+        r"uploadGuarded\(\s*" + GUARD_TAG + r"([A-Za-z_][A-Za-z0-9_.+ *]*?),", code)
     guarded_txt = " ".join(guarded)
     for want in (
         "d.dev_pernode",
@@ -184,7 +210,7 @@ def check_c2b_flatxs_inputs_guarded(src: dict[str, str]) -> list[str]:
     # copy that still runs.
     for buf in ("d.dev_pernode", "d.dev_nodes", "d.dev_off", "d.dev_cnt",
                 "d.dev_sdid", "d.dev_sx", "d.dev_sscale"):
-        pattern = r"cudaMemcpyAsync\(\s*" + re.escape(buf) + r"\b"
+        pattern = COPY_CALL + re.escape(buf) + r"\b"
         if re.search(pattern, code):
             problems.append(
                 f"C2b: a raw cudaMemcpyAsync into {buf} is back beside the "
@@ -277,7 +303,7 @@ def check_c5_off_arm_is_untouched(src: dict[str, str]) -> list[str]:
                 "consult and the shadow commit on elideEnabled(); the OFF arm "
                 "is then not the code that shipped"
             )
-        if "cudaMemcpyAsync" not in body:
+        if not any(spelling in body for spelling in COPY_SPELLINGS):
             problems.append(
                 f"C5: {path}'s guarded upload no longer issues a copy at all"
             )
@@ -312,10 +338,11 @@ NEGATIVE_CONTROLS = (
         "sweep_halt shadow-guarded (over-reach)",
         BICG,
         lambda t: t.replace(
-            "CUDA_CHECK(cudaMemcpyAsync(sweep_halt, halt,\n"
-            "                                   static_cast<size_t>(slots) * sizeof(std::uint32_t),\n"
-            "                                   cudaMemcpyHostToDevice, stream));",
-            "pushDeviceReadOnly(sweep_halt, halt, static_cast<size_t>(slots), shadow_active);",
+            'CUDA_CHECK(rasbery::xfer::memcpyAsync(\n'
+            '            "CudaBICGBackend.cu:issueSweepUploads", "sweep_halt", sweep_halt, halt,',
+            'pushDeviceReadOnly("issueSweepUploads:sweep_halt", sweep_halt, halt,\n'
+            '            static_cast<size_t>(slots), shadow_active); if (false) CUDA_CHECK(\n'
+            '            rasbery::xfer::memcpyAsync("x", "y", sweep_halt, halt,',
             1,
         ),
     ),
@@ -324,10 +351,11 @@ NEGATIVE_CONTROLS = (
         "a raw copy into device_active restored beside the guarded one",
         BICG,
         lambda t: t.replace(
-            "        pushDeviceReadOnly(device_assembly_active, assembly,",
-            "        CUDA_CHECK(cudaMemcpyAsync(device_active, active, 4,\n"
-            "                                   cudaMemcpyHostToDevice, stream));\n"
-            "        pushDeviceReadOnly(device_assembly_active, assembly,",
+            '        pushDeviceReadOnly("issueSweepUploads:device_assembly_active",',
+            '        CUDA_CHECK(rasbery::xfer::memcpyAsync(\n'
+            '            "CudaBICGBackend.cu:issueSweepUploads", "raw", device_active,\n'
+            '            active, 4, cudaMemcpyHostToDevice, stream));\n'
+            '        pushDeviceReadOnly("issueSweepUploads:device_assembly_active",',
             1,
         ),
     ),
@@ -336,11 +364,13 @@ NEGATIVE_CONTROLS = (
         "the flat-XS stream upload un-guarded",
         XSR,
         lambda t: t.replace(
-            "        if (!d.uploadGuarded(d.dev_sx, host.stream_x, stream_len, d.mir_stream_x))\n"
-            "            return false;",
-            "        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_sx, host.stream_x,\n"
-            "                                         stream_len * sizeof(double),\n"
-            "                                         cudaMemcpyHostToDevice, d.stream), d.status);",
+            '        if (!d.uploadGuarded("stream_x", d.dev_sx, host.stream_x, stream_len,\n'
+            '                             d.mir_stream_x))\n'
+            '            return false;',
+            '        RASBERY_CUDA_TRY(rasbery::xfer::memcpyAsync(\n'
+            '            "CudaXsReconBackend.cu:solveFlatXs", "stream_x", d.dev_sx,\n'
+            '            host.stream_x, stream_len * sizeof(double),\n'
+            '            cudaMemcpyHostToDevice, d.stream), d.status);',
             1,
         ),
     ),
