@@ -11,6 +11,7 @@
 #include "XeFormMask.h"
 #include "XeGpuReceipt.h"
 #include "XeKernel.h"
+#include "XferLedger.h"
 #include "XsReconKernel.h"
 
 #include <cuda_runtime.h>
@@ -2279,6 +2280,17 @@ struct XsReconBackend::Impl {
         resident_state_generation = 0;
         resident_ref_generation   = 0;
         fuel_uploaded             = false;
+        // WP13: the geometry moved, so every flat-XS input shadow describes a
+        // buffer that is either freed or about to be re-laid-out.  dev_nodes
+        // and the stream arrays are NOT freed here -- they are grow-only and
+        // keyed on their own caps -- which is exactly why they are invalidated
+        // by hand: a shrinking nxyz leaves the cap alone and the shadow would
+        // survive a geometry change it knows nothing about.
+        mir_wvfr.invalidate();
+        mir_dmod.invalidate();
+        mir_bppm.invalidate();
+        invalidateNodeMirrors();
+        invalidateStreamMirrors();
 
         nxyz   = want_nxyz;
         n_fuel = want_fuel;
@@ -2485,6 +2497,7 @@ struct XsReconBackend::Impl {
     /// quotes, measured by the run that quotes it.
     cudaError_t xeSync() {
         xe::xeGpuTally().host_syncs.fetch_add(1, std::memory_order_relaxed);
+        xfer::countSync();
         return cudaStreamSynchronize(stream);
     }
 
@@ -2547,12 +2560,87 @@ struct XsReconBackend::Impl {
     bool upload(const double* src, std::size_t off, std::size_t count) {
         RASBERY_CUDA_TRY(cudaMemcpyAsync(dev_block + off, src, count * sizeof(double),
                                          cudaMemcpyHostToDevice, stream), status);
+        xfer::countH2D(count * sizeof(double));
         return true;
     }
 
     bool download(double* dst, std::size_t off, std::size_t count) {
         RASBERY_CUDA_TRY(cudaMemcpyAsync(dst, dev_block + off, count * sizeof(double),
                                          cudaMemcpyDeviceToHost, stream), status);
+        xfer::countD2H(count * sizeof(double));
+        return true;
+    }
+
+    // -----------------------------------------------------------------------
+    // WP13: the flat-XS per-call INPUT shadows (RASBERY_GPU_XFER_ELIDE)
+    // -----------------------------------------------------------------------
+    //
+    // Nine H2D copies, 665,532 B, issued UNCONDITIONALLY on every solveFlatXs
+    // call -- the only transfers in this file with no generation gate of any
+    // kind.  Three of them (nodes / node_off / node_cnt) are the unrodded node
+    // list, which is byte-identical across every call that does not move a rod
+    // bank; three more (stream_did / stream_x / stream_scale) are the resolved
+    // delta stream, and three (wvfr / dmod / bppm) the per-node coordinates.
+    //
+    // WHY A SHADOW IS SOUND HERE, and this is the whole B0 argument: all nine
+    // device buffers are read-only to the kernel.  fxs::FlatXsView declares
+    // every one of them `const double*` / `const int*` (src/FlatXsKernel.h:170-187),
+    // so no kernel can write them and "what the host last sent" and "what the
+    // device holds" are the same statement.  Skipping a copy whose source bytes
+    // memcmp-equal the shadow therefore leaves the device with the same bits it
+    // would have had, and nothing downstream -- kernel, download, receipt --
+    // can tell the two runs apart.
+    //
+    // INVALIDATED ON REGROW.  dev_nodes / dev_sdid and friends are reallocated
+    // when n_nodes or stream_len outgrows the capacity; a shadow that survived
+    // that would describe bytes in a freed allocation.  See the regrow blocks
+    // in solveFlatXs, which clear these.
+    cuda_transfer::ByteExactMirror<double> mir_wvfr;
+    cuda_transfer::ByteExactMirror<double> mir_dmod;
+    cuda_transfer::ByteExactMirror<double> mir_bppm;
+    cuda_transfer::ByteExactMirror<int>    mir_nodes;
+    cuda_transfer::ByteExactMirror<int>    mir_node_off;
+    cuda_transfer::ByteExactMirror<int>    mir_node_cnt;
+    cuda_transfer::ByteExactMirror<int>    mir_stream_did;
+    cuda_transfer::ByteExactMirror<double> mir_stream_x;
+    cuda_transfer::ByteExactMirror<double> mir_stream_scale;
+
+    void invalidateNodeMirrors() {
+        mir_nodes.invalidate();
+        mir_node_off.invalidate();
+        mir_node_cnt.invalidate();
+    }
+    void invalidateStreamMirrors() {
+        mir_stream_did.invalidate();
+        mir_stream_x.invalidate();
+        mir_stream_scale.invalidate();
+    }
+
+    /// One guarded H2D of a device-read-only input.  Returns false only on a
+    /// CUDA failure; an elision is a success that moved no bytes.
+    ///
+    /// WITH THE FLAG OFF the mirror is neither consulted nor committed, so the
+    /// OFF arm is byte-for-byte the code that shipped -- which is what makes
+    /// the A/B a measurement of the elision and not of the bookkeeping.
+    template <class T>
+    bool uploadGuarded(T* dst, const T* src, std::size_t count,
+                       cuda_transfer::ByteExactMirror<T>& mirror) {
+        const std::size_t bytes = count * sizeof(T);
+        if (xfer::elideEnabled()) {
+            const bool hit = mirror.matches(src, count);
+            xfer::countElisionTest(hit, bytes);
+            if (hit) return true;
+        }
+        RASBERY_CUDA_TRY(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream),
+                         status);
+        xfer::countH2D(bytes);
+        // COMMITTED AT THE ISSUE, and the copy is asynchronous -- so the shadow
+        // says "these bytes are on their way to the device", not "they have
+        // landed".  That is the right meaning for an elision predicate: the
+        // next call is ordered behind this copy on the same stream, so by the
+        // time it could skip one, this one has landed.  It is also the rule
+        // CudaBICGBackend's push_pending settled on, for the same reason.
+        if (xfer::elideEnabled()) mirror.commit(src, count);
         return true;
     }
 };
@@ -2622,6 +2710,8 @@ bool XsReconBackend::solve(const xsr::BatchView& host, unsigned long long micx_g
     RASBERY_CUDA_TRY(cudaMemcpyAsync(scalars, d.dev_scalars,
                                      2 * sizeof(unsigned long long),
                                      cudaMemcpyDeviceToHost, d.stream), d.status);
+    xfer::countD2H(2 * sizeof(unsigned long long));
+    xfer::countSync();
     RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
 
     double max_change;
@@ -3203,20 +3293,26 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
         d.resident_ref_generation = 0;
     }
     if (ref_generation != d.resident_ref_generation) {
-        for (int t = 0; t < fxs::N_ACTIVE; ++t)
+        for (int t = 0; t < fxs::N_ACTIVE; ++t) {
             RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_ref + d.off_ref_mic[t], host.ref_mic[t],
                                              mic * sizeof(double),
                                              cudaMemcpyHostToDevice, d.stream), d.status);
+            xfer::countH2D(mic * sizeof(double));
+        }
         RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_ref + d.off_ref_msm, host.ref_msm,
                                          msm * sizeof(double),
                                          cudaMemcpyHostToDevice, d.stream), d.status);
-        for (int t = 0; t < fxs::N_ACTIVE; ++t)
+        xfer::countH2D(msm * sizeof(double));
+        for (int t = 0; t < fxs::N_ACTIVE; ++t) {
             RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_ref + d.off_ref_lmp[t], host.ref_lmp[t],
                                              lmp * sizeof(double),
                                              cudaMemcpyHostToDevice, d.stream), d.status);
+            xfer::countH2D(lmp * sizeof(double));
+        }
         RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_ref + d.off_ref_lsm, host.ref_lsm,
                                          ssm * sizeof(double),
                                          cudaMemcpyHostToDevice, d.stream), d.status);
+        xfer::countH2D(ssm * sizeof(double));
         d.resident_ref_generation = ref_generation;
     }
 
@@ -3243,15 +3339,22 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
         if (!d.upload(host.iden, d.off_iden, static_cast<std::size_t>(xsr::NISO) * nx)) return false;
     }
 
-    if (d.dev_pernode == nullptr)
+    if (d.dev_pernode == nullptr) {
         RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.dev_pernode),
                                           3 * nx * sizeof(double)), d.status);
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_pernode, host.wvfr, nx * sizeof(double),
-                                     cudaMemcpyHostToDevice, d.stream), d.status);
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_pernode + nx, host.dmod, nx * sizeof(double),
-                                     cudaMemcpyHostToDevice, d.stream), d.status);
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_pernode + 2 * nx, host.bppm, nx * sizeof(double),
-                                     cudaMemcpyHostToDevice, d.stream), d.status);
+        // A fresh allocation holds nothing the shadows describe.
+        d.mir_wvfr.invalidate();
+        d.mir_dmod.invalidate();
+        d.mir_bppm.invalidate();
+    }
+    // WP13: three device-read-only inputs, shadow-guarded under
+    // RASBERY_GPU_XFER_ELIDE.  wvfr is _ref_wvfr copied node by node and moves
+    // only with the spectral history; dmod and bppm move with the T/H state and
+    // the boron, so the boron search's own trials re-upload and the T/H-quiet
+    // calls between them do not.
+    if (!d.uploadGuarded(d.dev_pernode, host.wvfr, nx, d.mir_wvfr)) return false;
+    if (!d.uploadGuarded(d.dev_pernode + nx, host.dmod, nx, d.mir_dmod)) return false;
+    if (!d.uploadGuarded(d.dev_pernode + 2 * nx, host.bppm, nx, d.mir_bppm)) return false;
 
     const std::size_t n_nodes = static_cast<std::size_t>(host.n_nodes);
     if (n_nodes > d.nodes_cap) {
@@ -3267,6 +3370,7 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
         RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.dev_cnt),
                                           n_nodes * sizeof(int)), d.status);
         d.nodes_cap = n_nodes;
+        d.invalidateNodeMirrors();
     }
     std::size_t stream_len = 0;
     if (host.n_nodes > 0)
@@ -3285,23 +3389,22 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
         RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.dev_sscale),
                                           stream_len * sizeof(double)), d.status);
         d.stream_cap = stream_len;
+        d.invalidateStreamMirrors();
     }
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_nodes, host.nodes, n_nodes * sizeof(int),
-                                     cudaMemcpyHostToDevice, d.stream), d.status);
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_off, host.node_off, n_nodes * sizeof(int),
-                                     cudaMemcpyHostToDevice, d.stream), d.status);
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_cnt, host.node_cnt, n_nodes * sizeof(int),
-                                     cudaMemcpyHostToDevice, d.stream), d.status);
+    // WP13: the node list is the unrodded set and the three stream arrays are
+    // BuildFlatXsStream's output.  Both are pure kernel inputs (const pointers
+    // in fxs::FlatXsView), so the shadow means what it says.
+    if (!d.uploadGuarded(d.dev_nodes, host.nodes, n_nodes, d.mir_nodes)) return false;
+    if (!d.uploadGuarded(d.dev_off, host.node_off, n_nodes, d.mir_node_off)) return false;
+    if (!d.uploadGuarded(d.dev_cnt, host.node_cnt, n_nodes, d.mir_node_cnt)) return false;
     if (stream_len > 0) {
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_sdid, host.stream_did,
-                                         stream_len * sizeof(int),
-                                         cudaMemcpyHostToDevice, d.stream), d.status);
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_sx, host.stream_x,
-                                         stream_len * sizeof(double),
-                                         cudaMemcpyHostToDevice, d.stream), d.status);
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_sscale, host.stream_scale,
-                                         stream_len * sizeof(double),
-                                         cudaMemcpyHostToDevice, d.stream), d.status);
+        if (!d.uploadGuarded(d.dev_sdid, host.stream_did, stream_len, d.mir_stream_did))
+            return false;
+        if (!d.uploadGuarded(d.dev_sx, host.stream_x, stream_len, d.mir_stream_x))
+            return false;
+        if (!d.uploadGuarded(d.dev_sscale, host.stream_scale, stream_len,
+                             d.mir_stream_scale))
+            return false;
     }
 
     // --- repoint the view at the device copies ----------------------------
@@ -3373,6 +3476,7 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     // Light-isotope rows H-1/B-10/O-16 are 0..2 -- contiguous by registry design.
     if (!d.download(host.iden, d.off_iden, 3 * nx)) return false;
 
+    xfer::countSync();
     RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
 
     // After the download the host and device copies are bit-identical, so the

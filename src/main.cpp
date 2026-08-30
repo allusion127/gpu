@@ -9,6 +9,7 @@
 #include "EvaluatorServer.h"
 #include "GpuFullContract.h"
 #include "RunContract.h"
+#include "XferLedger.h"
 #include "XSTiming.h"
 #include "plog/Appenders/ConsoleAppender.h"
 #include "plog/Formatters/TxtFormatter.h"
@@ -1104,6 +1105,11 @@ int main(int argc, char* argv[]) {
         if (rasbery::rasberyGpuFlatXsEnabled())
             std::cout << "[RASBERY][FLATXS][GPU] {\"nodes_solved\":"
                       << rasbery::rasberyGpuFlatXsNodes() << "}" << std::endl;
+        if (rasbery::xfer::receiptWanted()) {
+            std::cout << "[RASBERY][XFER] {";
+            rasbery::xfer::appendXferReceiptFields(std::cout);
+            std::cout << "}" << std::endl;
+        }
         if (rasbery::rasberyGpuXeEnabled()) {
             std::cout << "[RASBERY][XE_GPU] {";
             rasbery::xe::appendXeGpuReceiptFields(std::cout);
@@ -1366,6 +1372,11 @@ int main(int argc, char* argv[]) {
         if (rasbery::rasberyGpuFlatXsEnabled())
             std::cout << "[RASBERY][FLATXS][GPU] {\"nodes_solved\":"
                       << rasbery::rasberyGpuFlatXsNodes() << "}" << std::endl;
+        if (rasbery::xfer::receiptWanted()) {
+            std::cout << "[RASBERY][XFER] {";
+            rasbery::xfer::appendXferReceiptFields(std::cout);
+            std::cout << "}" << std::endl;
+        }
         // Rev.7.1 Task 13.  device_updates == 0 with the flag set means the arm
         // never ran and every A/B measured against this run is void (G0); the
         // node counts are the same claim at fuel-node granularity.
@@ -1500,6 +1511,11 @@ int main(int argc, char* argv[]) {
     if (rasbery::rasberyGpuFlatXsEnabled())
         std::cout << "[RASBERY][FLATXS][GPU] {\"nodes_solved\":"
                   << rasbery::rasberyGpuFlatXsNodes() << "}" << std::endl;
+    if (rasbery::xfer::receiptWanted()) {
+        std::cout << "[RASBERY][XFER] {";
+        rasbery::xfer::appendXferReceiptFields(std::cout);
+        std::cout << "}" << std::endl;
+    }
     // See the batch arm above: the Task 13 device Xe receipt, same fields.
     if (rasbery::rasberyGpuXeEnabled()) {
         std::cout << "[RASBERY][XE_GPU] {";

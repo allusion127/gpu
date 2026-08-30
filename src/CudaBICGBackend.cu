@@ -8,6 +8,7 @@
 #include "GpuCaptureArbiter.h"
 #include "GpuFullContract.h" // F9: the seam tally the three fallback fields read
 #include "GpuGraphSplice.h"
+#include "XferLedger.h"
 #include "pch.h"
 
 #include <cublas_v2.h>
@@ -3704,6 +3705,49 @@ public:
         return hit;
     }
 
+    // -----------------------------------------------------------------------
+    // WP13: the three per-outer masks that never change on a single deck
+    // -----------------------------------------------------------------------
+    //
+    // `d_slot_map`, `device_active` and `device_assembly_active` are four bytes
+    // each on a width-1 arena and they were re-sent on EVERY launch: three of
+    // the ~110,000 cudaMemcpyAsync calls nsys counted per run come from here
+    // and carry 12 bytes between them.  Bytes are not the cost -- the API call
+    // is (2.27 s of cudaMemcpyAsync over a 14.4 s wall, dominated by call
+    // COUNT, not payload).
+    //
+    // WHY THESE THREE AND NOT sweep_halt.  All three are declared
+    // `const std::uint32_t* __restrict__` / `const int* __restrict__` in every
+    // kernel signature that takes them, so no device code writes them and a
+    // host shadow of the last upload is a true statement about device content.
+    // `sweep_halt` is the counter-example and is deliberately NOT here:
+    // initialize_solver_state RAISES it for a masked-off slot and
+    // issueSweepDownloads memsets it back, so the device value between two
+    // launches is not the value the host last sent, and a shadow would elide a
+    // copy that is doing real work.
+    //
+    // AND WHY THE SHADOW IS NOT THE STAGING BUFFER.  stageActive()/stageSlotMap()
+    // rotate through per-lane pinned buffers precisely so that no host write can
+    // land in the source range of an in-flight copy; comparing against one of
+    // them would be comparing against a buffer some other lane is about to
+    // rewrite.  These shadows are ordinary heap vectors owned by the core.
+    template <class T>
+    void pushDeviceReadOnly(T* dst, const T* src, size_t count,
+                            std::vector<T>& shadow) {
+        const size_t bytes = count * sizeof(T);
+        if (rasbery::xfer::elideEnabled()) {
+            const bool hit = shadow.size() == count &&
+                             std::memcmp(shadow.data(), src, bytes) == 0;
+            rasbery::xfer::countElisionTest(hit, bytes);
+            if (hit) return;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream));
+        rasbery::xfer::countH2D(bytes);
+        if (rasbery::xfer::elideEnabled()) {
+            shadow.assign(src, src + count);
+        }
+    }
+
     /// Decide this launch's dispatch width and publish the lane -> slot map.
     ///
     /// Called from issueUploads / issueSweepUploads, i.e. on the launcher's
@@ -3731,9 +3775,15 @@ public:
         // Always the FULL fleet width, never `lanes`: a stale entry from a
         // wider previous launch must never be reachable by a later, deeper
         // graph replay.
-        CUDA_CHECK(cudaMemcpyAsync(d_slot_map, map,
-                                   static_cast<size_t>(slots) * sizeof(int),
-                                   cudaMemcpyHostToDevice, stream));
+        //
+        // WP13 (RASBERY_GPU_XFER_ELIDE): and on a single deck it is the SAME
+        // full width every launch -- `compact` is false, so the map is the
+        // identity 0..slots-1 and this 4-byte copy has re-sent it once per
+        // outer for the whole run.  d_slot_map is `const int* __restrict__
+        // slot_map` at every one of the ~50 kernel signatures that take it
+        // (RASBERY_CMFD_SLOT_ARGS), so nothing on the device writes it and a
+        // shadow of what the host last sent IS what the device holds.
+        pushDeviceReadOnly(d_slot_map, map, static_cast<size_t>(slots), shadow_slot_map);
         g_cmfd_logical_drives.fetch_add(static_cast<unsigned long long>(count),
                                         std::memory_order_relaxed);
         g_cmfd_physical_blocks.fetch_add(static_cast<unsigned long long>(count),
@@ -3750,11 +3800,15 @@ public:
         std::uint32_t* const active = stageActive();
         std::memset(active, 0, static_cast<size_t>(slots) * sizeof(std::uint32_t));
         for (int i = 0; i < count; ++i) active[active_slots[i]] = 1u;
-        CUDA_CHECK(cudaMemcpyAsync(device_active,
-                                   active,
-                                   static_cast<size_t>(slots) * sizeof(std::uint32_t),
-                                   cudaMemcpyHostToDevice,
-                                   stream));
+        // THROUGH THE SAME SHADOW as issueSweepUploads', and that is not an
+        // optimisation here but the correctness condition for the one there:
+        // two writers of device_active and one shadow means the shadow has to
+        // see both, or a rendezvous launch would leave it describing bytes the
+        // device no longer holds and the next sweep launch would elide against
+        // it.  (This arm is dead under RASBERY_GPU_CMFD_SWEEP, which is why it
+        // would never have shown up in a PROD A/B.)
+        pushDeviceReadOnly(device_active, active, static_cast<size_t>(slots),
+                           shadow_active);
 
         for (int i = 0; i < count; ++i) {
             const int m  = active_slots[i];
@@ -4545,15 +4599,17 @@ public:
         // tools/test_cmfd_async_h2d_snapshot_contract.py pins it.
         for (int m = 0; m < slots; ++m) halt[m] = active[m] ? 0u : 1u;
 
-        CUDA_CHECK(cudaMemcpyAsync(device_active, active,
-                                   static_cast<size_t>(slots) * sizeof(std::uint32_t),
-                                   cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(device_assembly_active, assembly,
-                                   static_cast<size_t>(slots) * sizeof(std::uint32_t),
-                                   cudaMemcpyHostToDevice, stream));
+        // WP13: the two participation masks are device-read-only and shadowed;
+        // sweep_halt is NOT (see pushDeviceReadOnly's header) and keeps its
+        // unconditional copy.
+        pushDeviceReadOnly(device_active, active, static_cast<size_t>(slots),
+                           shadow_active);
+        pushDeviceReadOnly(device_assembly_active, assembly, static_cast<size_t>(slots),
+                           shadow_assembly_active);
         CUDA_CHECK(cudaMemcpyAsync(sweep_halt, halt,
                                    static_cast<size_t>(slots) * sizeof(std::uint32_t),
                                    cudaMemcpyHostToDevice, stream));
+        rasbery::xfer::countH2D(static_cast<size_t>(slots) * sizeof(std::uint32_t));
 
         for (int i = 0; i < count; ++i) {
             const int m  = active_slots[i];
@@ -5021,6 +5077,15 @@ public:
         return h_slot_map + static_cast<std::size_t>(stage_lane) * slots;
     }
     BackendCounters telemetry{};
+    /// WP13 (RASBERY_GPU_XFER_ELIDE): host shadows of the three device-read-only
+    /// masks.  Empty means "nothing known about the device copy", which is the
+    /// state every one of them is in until its first upload -- including after
+    /// the constructor's cudaMemset, so the first launch always copies.
+    /// Written ONLY by pushDeviceReadOnly, and only when the flag is on, so the
+    /// OFF arm allocates nothing and compares nothing.
+    std::vector<int>           shadow_slot_map;
+    std::vector<std::uint32_t> shadow_active;
+    std::vector<std::uint32_t> shadow_assembly_active;
     std::vector<Slot> slot;
     std::uint32_t* host_assembly_active = nullptr; // pinned, (slots+1) lanes
     bool          use_graph = true;
