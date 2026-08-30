@@ -122,6 +122,11 @@ from exact_audit import DECLARABLE_FIDELITIES, receipt_policy  # noqa: E402
 # is not silently tabulated as a `blocking` row.
 
 REFILL_RECEIPT = re.compile(r"\[RASBERY\]\[REFILL\]\s*(\{.*\})")
+# WP18.  A SEPARATE TAG, on purpose: REFILL_RECEIPT above requires `{`
+# immediately after the tag, so it cannot match this line, and the wave-mode
+# receipt it parses is unchanged byte for byte.  That is what makes
+# `--claim rolling` measurable against `--claim auto` with one binary.
+ROLLING_RECEIPT = re.compile(r"\[RASBERY\]\[REFILL\]\[ROLLING\]\s*(\{.*\})")
 OCCUPANCY_RECEIPT = re.compile(r"\[RASBERY\]\[CUDA\]\[BATCH_OCCUPANCY\]\s*(\{.*\})")
 FAIL_LINE = re.compile(r"\[RASBERY\]\[FAIL\]")
 
@@ -903,6 +908,25 @@ def auto_claim_size(*, index: int, processes: int, jobs: int, remaining: int,
     return max(1, min(halved, share))
 
 
+def rolling_prefetch(overrides: dict[str, str], extra_env: dict[str, str]) -> int:
+    """How many cases beyond the arena width stay outstanding, in the CHILD's terms.
+
+    Read from the resolved environment rather than from an argument of its own,
+    because the evaluator reads the same variable and the two must not be able
+    to disagree: the dispatcher keeps `width + prefetch` sent, the evaluator
+    sizes its queue from the same number, and a private flag here would let one
+    of them be tuned without the other.
+    """
+    raw = overrides.get("RASBERY_EVALUATOR_ROLLING_PREFETCH") or extra_env.get(
+        "RASBERY_EVALUATOR_ROLLING_PREFETCH") or os.environ.get(
+        "RASBERY_EVALUATOR_ROLLING_PREFETCH")
+    try:
+        value = int(raw) if raw is not None else 2
+    except ValueError:
+        value = 2
+    return max(0, value)
+
+
 # ---------------------------------------------------------------------------
 # The persistent evaluator (WP8 stage 1.5)
 # ---------------------------------------------------------------------------
@@ -1156,6 +1180,37 @@ class EvaluatorSession:
             out.returncode = self.returncode
         return out
 
+    # -- the rolling protocol (WP18) ---------------------------------------
+    #
+    # WHAT IS DIFFERENT FROM `wave`.  Nothing about the pipe, and everything
+    # about WHEN.  `wave()` sends a whole chunk and then reads until the chunk's
+    # receipt: the child cannot be given more work while that read is running,
+    # which is exactly the barrier the arena does not need.  These two let the
+    # caller interleave -- send a case, read a completion, send the next case --
+    # so the queue is topped up FROM INSIDE the read loop and the arena never
+    # drains.  They are deliberately thin: every decision about what to send and
+    # when to stop stays in run_worker, where the claim accounting lives.
+    def send_case(self, payload: dict) -> bool:
+        """One `{"op":"case"}` line.  False means the pipe is gone."""
+        request = dict(payload)
+        request.setdefault("op", "case")
+        return self._send(json.dumps(request, separators=(",", ":")))
+
+    def send_request(self, payload: dict) -> bool:
+        return self._send(json.dumps(payload, separators=(",", ":")))
+
+    def pump_until(self, done) -> tuple[str, bool]:
+        """Read child stdout until *done(line)* or EOF.  (text, died).
+
+        *done* MAY WRITE TO THE CHILD.  That is the point -- the rolling top-up
+        happens inside it -- and it is safe in exactly one direction: the child
+        drains its stdin on a dedicated thread while the lanes run, so a write
+        here cannot block behind work.  The reverse (a client that writes
+        without reading) is what the evaluator's bounded queue exists to turn
+        into backpressure instead of a wedge.
+        """
+        return self._pump(done)
+
     # -- plumbing ----------------------------------------------------------
     def _send(self, line: str) -> bool:
         self._note("request", {"line": line})
@@ -1232,6 +1287,10 @@ class WorkerResult:
     fail_lines: int = 0
     problems: list[str] = field(default_factory=list)
     refill_receipts: list[dict] = field(default_factory=list)
+    #: WP18.  `[RASBERY][REFILL][ROLLING]` -- one per rolling session.  Empty in
+    #: every other mode, which is what keeps `--claim auto` numbers comparable
+    #: to every measurement taken before this work package.
+    rolling_receipts: list[dict] = field(default_factory=list)
     occupancy_receipts: list[dict] = field(default_factory=list)
     wall_s: float = 0.0
     # The env this worker's children were actually launched with, on top of the
@@ -1309,6 +1368,44 @@ class WorkerResult:
         return sum(int(x.get("refills", 0)) for x in self.refill_receipts)
 
     @property
+    def rolling_admits(self) -> int:
+        return sum(int(x.get("admits", 0)) for x in self.rolling_receipts)
+
+    @property
+    def rolling_immediate_fraction(self) -> float:
+        """immediate_admits / admits -- was the queue ahead of the arena?
+
+        This is the number that separates the two ways `--claim rolling` can
+        fail to beat `--claim auto`.  Near 1 with no throughput gain means the
+        arena was kept full and the GPU is the wall.  Below 1 means the LANES
+        waited for the dispatcher's round trip, which is a prefetch that is too
+        small and not an arena fact at all.
+        """
+        admits = self.rolling_admits
+        if admits <= 0:
+            return 0.0
+        return sum(int(x.get("immediate_admits", 0))
+                   for x in self.rolling_receipts) / admits
+
+    @property
+    def rolling_width_fill(self) -> float:
+        """The arena occupancy the LEDGER saw, sampled at every admit/finish.
+
+        Reported beside `width_fill` (the rendezvous one) and never instead of
+        it: they answer different questions.  `width_fill` is how many slots a
+        CMFD launch actually gathered; this is how many slots held a deck at
+        all.  The first cannot exceed the second, and the gap between them is
+        host skew rather than scheduling.
+        """
+        fills = [float(x.get("width_fill", 0.0)) for x in self.rolling_receipts]
+        return sum(fills) / len(fills) if fills else 0.0
+
+    @property
+    def rolling_tail_idle_s(self) -> float:
+        return sum(float(x.get("tail_idle_ms", 0.0))
+                   for x in self.rolling_receipts) / 1000.0
+
+    @property
     def cases_per_hour(self) -> float:
         return 3600.0 * self.jobs / self.wall_s if self.wall_s > 0 else 0.0
 
@@ -1338,6 +1435,249 @@ class WorkerResult:
         out["images"] = len(self.evaluator_receipts)
         out["stop_reason"] = self.evaluator_receipts[-1].get("stop_reason")
         return out
+
+
+def _run_rolling_worker(
+    *,
+    result: "WorkerResult",
+    queue: Queue,
+    jobs: list[tuple[str, str, str]],
+    index: int,
+    budget: HostBudget,
+    batch_width: int,
+    prefetch: int,
+    evaluator_command: Sequence[str],
+    env: dict[str, str],
+    cwd: str | None,
+    workdir: Path,
+    stem: str,
+    gpu: str,
+    proc: int,
+    result_mode: str | None,
+    declared_fidelity: str,
+    evaluator_max_restarts: int,
+) -> EvaluatorSession | None:
+    """`--claim rolling`: one worker, one session, one barrier.
+
+    WHAT THE CHUNKED PATH DOES, AND WHY IT COSTS.  `auto` claims `batch_width`
+    jobs (auto_claim_size: 128 jobs / 8 workers / width 8 -> 8), sends them as
+    ONE wave, and cannot claim again until the evaluator has answered -- which
+    it does only after the slowest of the eight finishes.  So every chunk is one
+    case per lane, no lane ever refills, and the arena drains sixteen times over
+    a 128-job manifest.  Measured on 238: width_fill 0.447, tail_idle_max 155 s
+    of a 390 s wall at M8; 0.367 and 356 s of 373 s at M16.
+
+    WHAT THIS DOES INSTEAD.  Claim ONE job at a time, keep `batch_width +
+    prefetch` of them outstanding, and re-claim from inside the read loop the
+    moment a case reports.  The evaluator admits each one into whichever lane
+    just went free (RASBERY_EVALUATOR_ROLLING=1), so a case that finishes early
+    does not leave a slot empty until its wave ends.  One barrier remains, at
+    the very end, and it is where the wave-shaped receipts are printed.
+
+    WHY IT CLAIMS ONE AT A TIME.  A claim is a flock'd read-modify-write over a
+    file, it costs microseconds, and the whole reason `auto` claims in chunks is
+    to amortise a PROCESS START that this mode does not pay.  Claiming one keeps
+    the queue steal-able to the last job, which is the property that made
+    `--claim auto` beat `--claim all` in the first place.
+
+    NO RESTARTS.  A chunked worker can lose a chunk and re-queue it; a rolling
+    worker's outstanding set is spread across the arena, so a death loses up to
+    `batch_width + prefetch` cases at once.  Rather than re-queue a set that
+    large into a process that has just proved it can die, the worker stops
+    claiming and the rest of the manifest is left to the workers that are still
+    up -- the same decision `run_worker` already makes when restarts run out.
+    """
+    # The first claim comes BEFORE the process, for the reason the chunked path
+    # stands its session up lazily: a worker with nothing to claim must start no
+    # process at all, or it measures its own startup and reports 0 cases/hour.
+    start, end = queue.claim(1, index)
+    if start >= end:
+        return None
+
+    session = EvaluatorSession(
+        command=list(evaluator_command), env=env, cwd=cwd,
+        log_path=workdir / f"{stem}.evaluator.log",
+        max_restarts=evaluator_max_restarts,
+    )
+    if not session.start():
+        result.problems.append(
+            "gpu%s p%d: the evaluator never reached [READY] (rc=%r); see %s"
+            % (gpu, proc, session.returncode, session.log_path)
+        )
+        if result.returncode == 0:
+            result.returncode = session.returncode or 1
+        result.jobs += 1
+        result.failed_cases.append(jobs[start][0])
+        return session
+
+    ready = session.ready_receipts[-1] if session.ready_receipts else {}
+    if not ready.get("rolling"):
+        # FAIL LOUD.  A binary without WP18 answers a `case` line by COLLECTING
+        # it and running nothing until a `wave` line arrives, so this loop would
+        # send one case, wait forever for a receipt, and be killed as a hang.
+        # An operator who set --claim rolling and got wave scheduling would
+        # publish the wave arm's number under the rolling arm's name.
+        result.problems.append(
+            "gpu%s p%d: --claim rolling needs an evaluator that reports "
+            '"rolling":true in its [READY] receipt (RASBERY_EVALUATOR_ROLLING=1 '
+            "and a binary that has WP18); this one reported %r"
+            % (gpu, proc, ready.get("rolling"))
+        )
+        if result.returncode == 0:
+            result.returncode = 2
+        return session
+
+    target = max(1, batch_width + max(0, prefetch))
+    #: output path -> the manifest job that named it.  Keyed on the output
+    #: because that is what the evaluator echoes back and what the manifest
+    #: guarantees is unique.
+    outstanding: dict[str, tuple[str, str, str]] = {}
+    reported: set[str] = set()
+    cases: list[dict] = []
+    exhausted = False
+    pipe_ok = True
+
+    def send(job: tuple[str, str, str]) -> bool:
+        deck, output, mode = job
+        payload: dict[str, object] = {"op": "case", "deck": deck, "output": output,
+                                      "key": output}
+        effective = mode or result_mode
+        if effective:
+            payload["result_mode"] = effective
+        if not session.send_case(payload):
+            return False
+        outstanding[output] = job
+        result.jobs += 1
+        return True
+
+    def top_up() -> None:
+        nonlocal exhausted, pipe_ok
+        while pipe_ok and not exhausted and len(outstanding) < target:
+            lo, hi = queue.claim(1, index)
+            if lo >= hi:
+                exhausted = True
+                return
+            if not send(jobs[lo]):
+                pipe_ok = False
+                # The claim is spent and the case was never sent: it is lost
+                # unless it is named, and a lost candidate has to be a line in a
+                # receipt rather than a gap between the manifest and the outputs.
+                result.jobs += 1
+                result.failed_cases.append(jobs[lo][0])
+                return
+
+    if not send(jobs[start]):
+        result.problems.append("gpu%s p%d: could not write the first case" % (gpu, proc))
+        result.jobs += 1
+        result.failed_cases.append(jobs[start][0])
+        return session
+    top_up()
+
+    refused: list[dict] = []
+
+    def on_line(line: str) -> bool:
+        # A REFUSAL ENDS THE READ.  A refused request never produces a CASE
+        # receipt, so `outstanding` would never empty and this pump would block
+        # until the campaign's own timeout killed a child that was perfectly
+        # healthy and had told us exactly what was wrong.
+        refusal = EVALUATOR_REFUSED.search(line)
+        if refusal is not None:
+            refused.append(_json_or_none(refusal.group(1)) or {"what": refusal.group(1)})
+            return True
+        match = EVALUATOR_CASE_RECEIPT.search(line)
+        if match is not None:
+            case = _json_or_none(match.group(1))
+            if case is not None and not case.get("isolation_check"):
+                output = case.get("output")
+                if output in outstanding and output not in reported:
+                    reported.add(output)
+                    cases.append(case)
+                    del outstanding[output]
+                    # THE REFILL, from this side: a completion is a claim.
+                    top_up()
+        return exhausted and not outstanding
+
+    text, died = session.pump_until(on_line)
+
+    # The one barrier.  It is what makes the evaluator print the wave-shaped
+    # receipts -- [BATCH_HOST], [REFILL], [REFILL][ROLLING], [EVALUATOR][WAVE] --
+    # that the post-run audit below and every campaign table are built on.
+    wave_id = 1
+    if not died and session.alive and not refused:
+        if session.send_request({"op": "wave", "wave_id": wave_id}):
+            barrier, died = session.pump_until(
+                lambda line: EVALUATOR_WAVE_RECEIPT.search(line) is not None
+                or EVALUATOR_REFUSED.search(line) is not None
+            )
+            text += barrier
+
+    for match in EVALUATOR_CASE_RECEIPT.finditer(text):
+        case = _json_or_none(match.group(1))
+        if case is not None and not case.get("isolation_check"):
+            if case.get("status") == "failed":
+                result.failed_cases.append(str(case.get("deck")))
+    for match in EVALUATOR_REFUSED.finditer(text):
+        refusal = _json_or_none(match.group(1)) or {"what": match.group(1)}
+        result.problems.append(
+            "gpu%s p%d: the evaluator REFUSED a rolling request: %s"
+            % (gpu, proc, refusal.get("what"))
+        )
+    if outstanding:
+        result.failed_cases.extend(job[0] for job in outstanding.values())
+        result.problems.append(
+            "gpu%s p%d: %d case(s) were never reported (child alive=%s); see %s"
+            % (gpu, proc, len(outstanding), session.alive, session.log_path)
+        )
+        if result.returncode == 0:
+            result.returncode = session.returncode or 1
+
+    result.waves += 1
+    result.processes = session.starts
+    result.restarts = session.restarts
+    result.fail_lines += len(FAIL_LINE.findall(text))
+
+    audit_text = session.preamble + text
+    plan = LaunchPlan(
+        batch_width=batch_width,
+        jobs=max(result.jobs, batch_width),
+        visible_cpus=budget.visible_cpus,
+        # NO `jobs` TERM.  runWave caps its lanes at the size of the chunk it was
+        # handed; a rolling session does not know how many cases it will see and
+        # stands the full width up, so the number the child prints -- and the
+        # number this audit has to expect -- has no chunk in it.
+        host_workers=min(budget.driver_workers, batch_width),
+        worker_policy="multi_gpu_rolling",
+        gpu=gpu,
+        result_mode=chunk_result_mode(list(outstanding.values()) or jobs[start:end],
+                                      result_mode),
+        declared_fidelity=declared_fidelity,
+    )
+    result.problems.extend(
+        f"gpu{gpu} p{proc} rolling: {p}" for p in check_run_receipts(audit_text, plan)
+    )
+    result.case_fidelity.append({
+        "chunk": 1,
+        "jobs": result.jobs,
+        "policy": receipt_policy(audit_text),
+        "result_mode": plan.result_mode,
+        "scope": "process",
+    })
+    for match in REFILL_RECEIPT.finditer(text):
+        try:
+            result.refill_receipts.append(json.loads(match.group(1)))
+        except ValueError:
+            result.problems.append(f"gpu{gpu} p{proc}: unparseable REFILL receipt")
+    for match in ROLLING_RECEIPT.finditer(text):
+        try:
+            result.rolling_receipts.append(json.loads(match.group(1)))
+        except ValueError:
+            result.problems.append(f"gpu{gpu} p{proc}: unparseable ROLLING receipt")
+    for match in OCCUPANCY_RECEIPT.finditer(text):
+        try:
+            result.occupancy_receipts.append(json.loads(match.group(1)))
+        except ValueError:
+            pass
+    return session
 
 
 def _run_wave_chunk(
@@ -1533,6 +1873,30 @@ def run_worker(
 
     while True:
         if deadline is not None and time.monotonic() >= deadline:
+            break
+        if claim == "rolling":
+            # ONE session for this worker's whole share.  Everything the chunk
+            # loop does per chunk -- claim, send, audit, parse receipts -- is
+            # done there, interleaved instead of serialised, and the teardown
+            # block below is reached with the same `session` object it would
+            # have had.
+            if dry_run:
+                print(
+                    f"[RASBERY][MULTI_GPU][DRY] gpu={gpu} proc={proc} claim=rolling "
+                    + " ".join(list(evaluator_command) + ["<<", "case*, wave"])
+                )
+                result.processes += 1
+                result.waves += 1
+                break
+            session = _run_rolling_worker(
+                result=result, queue=queue, jobs=jobs, index=index, budget=budget,
+                batch_width=batch_width, prefetch=rolling_prefetch(overrides, extra_env),
+                evaluator_command=evaluator_command, env=env,
+                cwd=str(cwd) if cwd else None, workdir=workdir, stem=stem,
+                gpu=gpu, proc=proc, result_mode=result_mode,
+                declared_fidelity=declared_fidelity,
+                evaluator_max_restarts=0,
+            )
             break
         if claim == "all":
             # Static split: each WORKER takes its equal share once, and that is
@@ -2322,7 +2686,10 @@ def parser() -> argparse.ArgumentParser:
         "--claim",
         default="auto",
         help="jobs per claim: auto (half the remaining queue per worker, floored at "
-        "--batch-width), all (static split, one process per worker), or an integer",
+        "--batch-width), all (static split, one process per worker), rolling (WP18: "
+        "one job per claim, re-claimed as each case reports, so the arena refills "
+        "per slot instead of per wave -- sets RASBERY_EVALUATOR_ROLLING=1 and "
+        "requires --evaluator), or an integer",
     )
     p.add_argument("--pin", default="taskset", choices=("taskset", "numactl", "none"),
                    help="how each process is bound to its CPU share")
@@ -2594,7 +2961,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if len(set(gpus)) != len(gpus):
         print("error: --gpus must be distinct", file=sys.stderr)
         return 2
-    if args.claim not in ("auto", "all"):
+    if args.claim == "rolling" and not args.evaluator:
+        print("error: --claim rolling needs the persistent evaluator; it streams cases "
+              "into ONE running arena and has no chunked form", file=sys.stderr)
+        return 2
+    if args.claim not in ("auto", "all", "rolling"):
         try:
             if int(args.claim) <= 0:
                 raise ValueError
@@ -2855,6 +3226,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     extra_env = mps.client_env()
+    if args.claim == "rolling":
+        # WP18.  Set HERE, so it lands in the [MULTI_GPU][ENV] receipt every
+        # worker prints before anything runs: the arm a run took has to be
+        # readable off the run, not inferred from the command line somebody
+        # remembers typing.
+        extra_env["RASBERY_EVALUATOR_ROLLING"] = "1"
     # stop() clears .active, and the TOTAL receipt is printed after it: what
     # the run was is not what the daemon is by then.
     mps_active = mps.active
@@ -2972,6 +3349,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "refills": r.refills,
                     "tail_idle_s": round(r.tail_idle_s, 3),
                     "slot_busy_fraction": round(sum(busy) / len(busy), 4) if busy else 0.0,
+                    # WP18.  ABSENT unless the worker ran `--claim rolling`, so
+                    # every receipt taken before this work package still parses
+                    # and every arm's table has exactly the columns its arm
+                    # produced.
+                    **({"rolling": {
+                        "admits": r.rolling_admits,
+                        "immediate_fraction": round(r.rolling_immediate_fraction, 4),
+                        "width_fill": round(r.rolling_width_fill, 4),
+                        "tail_idle_s": round(r.rolling_tail_idle_s, 3),
+                        "wave_barriers_avoided": sum(
+                            int(x.get("wave_barriers_avoided", 0))
+                            for x in r.rolling_receipts),
+                        "slot_idle_ms_total": round(sum(
+                            float(x.get("slot_idle_ms_total", 0.0))
+                            for x in r.rolling_receipts), 1),
+                    }} if r.rolling_receipts else {}),
                     "rc": r.returncode,
                     "fail_lines": r.fail_lines,
                     "declared_fidelity": r.declared_fidelity,
@@ -3031,6 +3424,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     if duplicates or stale:
         problems.append(
             f"tenancy audit: duplicates={duplicates} stale_tenants={stale} (both must be 0)"
+        )
+
+    # WP18's two, and they gate the same way for the same reason: each names a
+    # way a rolling session's numbers can come from the wrong tenancy.
+    # `stale_tenant_refusals` is a lane that asked for a case while the ledger
+    # still had it holding one; `epoch_regressions` is a completion retiring an
+    # epoch nobody held.  Neither can happen while one Driver owns one lane,
+    # which is exactly why a nonzero value voids the measurement rather than
+    # merely annotating it.
+    rolling_stale = sum(int(x.get("stale_tenant_refusals", 0))
+                        for r in results for x in r.rolling_receipts)
+    rolling_epochs = sum(int(x.get("epoch_regressions", 0))
+                         for r in results for x in r.rolling_receipts)
+    rolling_live = sum(int(x.get("live_tenancies_at_close", 0))
+                       for r in results for x in r.rolling_receipts)
+    if rolling_stale or rolling_epochs or rolling_live:
+        problems.append(
+            "rolling tenancy audit: stale_tenant_refusals=%d epoch_regressions=%d "
+            "live_tenancies_at_close=%d (all three must be 0)"
+            % (rolling_stale, rolling_epochs, rolling_live)
         )
 
     # The WP8 acceptance counters, aggregated for the same reason the tenancy

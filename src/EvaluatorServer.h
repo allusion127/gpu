@@ -106,12 +106,15 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <fstream>
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -289,6 +292,59 @@ inline std::size_t sampleWindowCapacity() {
         return requested > 0 ? static_cast<std::size_t>(requested) : std::size_t{4096};
     }();
     return capacity;
+}
+
+// ---------------------------------------------------------------------------
+// WP18  The rolling gates
+// ---------------------------------------------------------------------------
+
+/// RASBERY_EVALUATOR_ROLLING -- read ONCE, like every other gate in this tree.
+///
+/// OFF IS BYTE-IDENTICAL, and that is a design constraint and not a hope: the
+/// flag is read in exactly two places (here, and once in run()), every line the
+/// mode prints is inside a branch this predicate guards, and the wave path is
+/// not touched at all.  A campaign that measures the two arms is comparing one
+/// binary against itself, so a difference in the receipts is a difference in
+/// the SCHEDULING and can be nothing else.
+inline bool rollingEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("RASBERY_EVALUATOR_ROLLING");
+        return v != nullptr && *v != '\0' && std::string(v) != "0";
+    }();
+    return on;
+}
+
+/// How many cases the queue holds AHEAD of the arena.
+///
+/// WHY IT IS BOUNDED AT ALL.  An unbounded queue would let a client hand the
+/// evaluator its whole campaign in one write and then stop reading, which is
+/// the classic two-pipe deadlock: stdin fills, the reader blocks, stdout fills,
+/// the lanes block in reportCase, and nothing moves.  A bound turns that into
+/// backpressure the client feels immediately.
+///
+/// WHY THE DEFAULT IS GENEROUS (4 per lane).  The number that has to stay above
+/// zero is `queue.size()` AT THE MOMENT A LANE FINISHES -- that is what makes an
+/// admit `immediate`.  With one case in hand per lane, a burst of simultaneous
+/// completions empties it and the next admits wait for the client's round trip.
+/// Four per lane is ~2 s of arena at the measured 30-90 s case, and it is 800
+/// bytes a lane.
+inline int rollingQueueCapacity(int lanes) {
+    static const int per_lane = [] {
+        const char*     v = std::getenv("RASBERY_EVALUATOR_ROLLING_QUEUE");
+        const long long r = (v != nullptr && *v != '\0') ? std::atoll(v) : 0;
+        return r > 0 ? static_cast<int>(r) : 4;
+    }();
+    return std::max(1, lanes) * per_lane;
+}
+
+/// What the READY receipt tells a client to keep in flight: width + prefetch.
+inline int rollingPrefetch() {
+    static const int n = [] {
+        const char*     v = std::getenv("RASBERY_EVALUATOR_ROLLING_PREFETCH");
+        const long long r = (v != nullptr && *v != '\0') ? std::atoll(v) : -1;
+        return r >= 0 ? static_cast<int>(r) : 2;
+    }();
+    return n;
 }
 
 } // namespace detail
@@ -694,6 +750,177 @@ struct WaveJobs {
     std::vector<bool>         promoted;
 };
 
+// ---------------------------------------------------------------------------
+// WP18  The rolling queue
+// ---------------------------------------------------------------------------
+//
+// WHAT THE ARENA ALREADY IS, AND WHY THAT IS THE WHOLE ARGUMENT.
+//
+// The batch arena is NOT lockstep.  A slot is owned by one host thread for one
+// deck's whole life; that thread runs its own statepoint loop, its own T/H
+// loop and its own boron search, and GpuPhysicsArena.h:40 says so in as many
+// words ("under an asynchronous scheduler slot A is in Outer while slot B is in
+// Depletion").  The only coupling between slots is a per-LAUNCH opportunistic
+// rendezvous: a thread arriving at a CMFD solve joins whatever batch is open,
+// and the elected launcher lingers only while `pending.size() < inUseCount()`
+// (CudaBICGBackend.cu:6907) -- i.e. it waits for the slots that are CURRENTLY
+// HELD, not for a phase, not for a statepoint, and not for a wave.  Release a
+// slot and inUseCount() drops and the rendezvous stops waiting for it
+// (CudaBICGBackend.cu:6452-6466).  The one thing participants of a single
+// launch must share is the inner BiCGSTAB budget `nmax`, which is a per-deck
+// environment constant and not a position in a schedule.
+//
+// So there is no barrier in the arena to remove.  The barrier is HERE: runWave
+// takes a fixed job vector and ends in an implicit OpenMP `for` barrier, and
+// the dispatcher claims exactly `batch_width` jobs per chunk
+// (auto_claim_size(): 128 jobs / 8 workers / width 8 -> claim 8), so every wave
+// is ONE case per lane, no lane ever refills, and the wave ends when its
+// slowest case does.  That is the measured 0.447 width_fill and the 155 s tail
+// of a 390 s wall -- an artefact of how the job list is cut up, not of the GPU.
+//
+// WHAT THIS QUEUE CHANGES.  Cases stream in while the lanes run.  A lane that
+// finishes pops the next one and admits it immediately: the Driver is destroyed
+// (slot released, `Slot{}` reset, batchSlotIsReset audited, admissions++), and
+// the next Driver acquires a slot through exactly the same door.  Nothing about
+// what a case computes moves, which is why the gate is per-case digest equality
+// against the wave arm.
+//
+// THE ONE RULE THAT IS NOT THE WAVE'S.  Wave mode refuses a wave whose --raso
+// paths collide, because two Drivers on one output race inside one HDF5 file.
+// A rolling session has no wave to scope that to, and reusing an output across
+// generations is legitimate (it is how a GA re-evaluates a promoted elite).  So
+// the rule becomes what it always meant: an output may not be held by two
+// tenants AT THE SAME TIME.  A case whose output is in flight is not refused
+// and not dropped -- it waits for the tenant that holds it, which is the same
+// serialisation a wave boundary used to provide by accident.
+
+/// One admitted case, and the epoch its tenancy owns.
+struct RollingJob {
+    std::string  deck;
+    std::string  output;
+    std::string  key;
+    std::string  warm_from;
+    std::string  warm_save;
+    ResultMode   mode = ResultMode::Full;
+    CaseFidelity fidelity;
+    bool         promoted = false;
+    int          index    = 0;
+};
+
+/// A bounded MPSC queue with one extra rule: an output may have one tenant.
+class RollingQueue {
+public:
+    void configure(std::size_t capacity) {
+        std::lock_guard<std::mutex> lock(_mutex);
+        _capacity = capacity > 0 ? capacity : 1;
+        _closed   = false;
+    }
+
+    /// Producer side.  Blocks while the queue is at capacity; returns false
+    /// only if the queue closed while waiting, in which case the job was NOT
+    /// taken and the caller still owns it.
+    bool push(RollingJob job) {
+        std::unique_lock<std::mutex> lock(_mutex);
+        _space.wait(lock, [&] { return _queue.size() < _capacity || _closed; });
+        if (_closed) return false;
+        _queue.push_back(std::move(job));
+        _work.notify_one();
+        return true;
+    }
+
+    /// Consumer side.  Returns false ONLY when the queue is closed and there is
+    /// nothing left to run -- an empty-but-open queue waits, because in this
+    /// mode "empty" means "the client has not sent the next one yet" and not
+    /// "the run is over".  That distinction is the whole mode.
+    ///
+    /// `immediate` is false iff the lane had to wait, which is what separates
+    /// "the arena was kept full" from "the arena drained and the harness was
+    /// late"; the two have the same throughput symptom and different fixes.
+    bool pop(RollingJob& out, bool& immediate, double& waited_ms) {
+        std::unique_lock<std::mutex> lock(_mutex);
+        const auto t0 = std::chrono::steady_clock::now();
+        immediate     = true;
+        waited_ms     = 0.0;
+        for (;;) {
+            const auto it = firstAdmissible();
+            if (it != _queue.end()) {
+                out = std::move(*it);
+                _queue.erase(it);
+                _inflight.push_back(out.output);
+                if (!immediate)
+                    waited_ms = std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() - t0)
+                                    .count() *
+                                1.0e3;
+                _space.notify_one();
+                return true;
+            }
+            // Closed AND nothing left: the session is over.  Note the order --
+            // a closed queue that still holds a job whose output is in flight
+            // must WAIT for that tenant, not drop the job.
+            if (_closed && _queue.empty()) return false;
+            immediate = false;
+            _work.wait(lock);
+        }
+    }
+
+    /// A tenancy ended: its output is free for the next case that names it.
+    void finish(const std::string& output) {
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            const auto it = std::find(_inflight.begin(), _inflight.end(), output);
+            if (it != _inflight.end()) _inflight.erase(it);
+        }
+        _work.notify_all();
+        _space.notify_all();
+    }
+
+    /// No more work is coming: the lanes drain what is queued and then exit.
+    void close() {
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            _closed = true;
+        }
+        _work.notify_all();
+        _space.notify_all();
+    }
+
+    /// A new session on the same queue object.  Only ever called after every
+    /// lane has exited, so there is nothing to race with.
+    void reopen() {
+        std::lock_guard<std::mutex> lock(_mutex);
+        _closed = false;
+    }
+
+    [[nodiscard]] std::size_t queued() const {
+        std::lock_guard<std::mutex> lock(_mutex);
+        return _queue.size();
+    }
+    [[nodiscard]] std::size_t inflight() const {
+        std::lock_guard<std::mutex> lock(_mutex);
+        return _inflight.size();
+    }
+
+private:
+    /// The first queued job whose output nobody is holding.  FIFO otherwise:
+    /// skipping is the exception the one-tenant-per-output rule forces, never a
+    /// scheduling policy.
+    std::deque<RollingJob>::iterator firstAdmissible() {
+        for (auto it = _queue.begin(); it != _queue.end(); ++it)
+            if (std::find(_inflight.begin(), _inflight.end(), it->output) == _inflight.end())
+                return it;
+        return _queue.end();
+    }
+
+    mutable std::mutex       _mutex;
+    std::condition_variable  _work;
+    std::condition_variable  _space;
+    std::deque<RollingJob>   _queue;
+    std::vector<std::string> _inflight;
+    std::size_t              _capacity = 64;
+    bool                     _closed   = false;
+};
+
 class Server {
 public:
     Server(const Options& options, std::ostream& out) : _options(options), _out(out) {
@@ -728,8 +955,18 @@ public:
              << "\",\"fidelity_floor\":\"" << physicsPolicyName(processFidelityFloor())
              << "\",\"statepoint_grid_default\":\"" << processCaseFidelity().gridToken()
              << "\",\"idle_timeout_s\":" << _options.idle_timeout_s
-             << ",\"isolation_check\":" << (_options.isolation_check ? "true" : "false")
-             << "}" << std::endl;
+             << ",\"isolation_check\":" << (_options.isolation_check ? "true" : "false");
+        // WP18.  PRINTED ONLY WHEN THE MODE IS ON, so a wave-mode run's stdout
+        // is byte-for-byte what it was before this work package existed -- the
+        // feature-off identity gate is a property of the source, not of a diff
+        // somebody remembered to run.  A client reads `rolling` to learn that
+        // this binary will run cases as they arrive instead of collecting them,
+        // and `rolling_target_inflight` to learn how many to keep sent.
+        if (detail::rollingEnabled())
+            _out << ",\"rolling\":true,\"rolling_prefetch\":" << detail::rollingPrefetch()
+                 << ",\"rolling_target_inflight\":"
+                 << (std::max(1, _options.batch_width) + detail::rollingPrefetch());
+        _out << "}" << std::endl;
 
         std::vector<CaseRequest> pending;
         std::string              line;
@@ -785,6 +1022,27 @@ public:
                                line);
                         continue;
                     }
+                }
+                // WP18.  IN ROLLING MODE A CASE IS ADMITTED WHERE IT IS READ.
+                // Wave mode collects `case` lines and runs them when the `wave`
+                // line arrives, which is what makes a wave a barrier; here the
+                // line goes straight into the queue and a free lane takes it.
+                //
+                // The fidelity is therefore resolved HERE and not at the wave
+                // line, which is the one thing this mode cannot do the wave
+                // way: applyWaveFidelityDefault fills a case's unset fields
+                // from a declaration that arrives AFTERWARDS, and a case that
+                // is already running cannot be told what it should have been.
+                // A `wave` line that carries fidelity fields after a case has
+                // been admitted is refused by name below.
+                if (detail::rollingEnabled()) {
+                    if (!resolveCaseFidelity(request.request_fidelity, processCaseFidelity(),
+                                             request.resolved_fidelity, error)) {
+                        refuse(error + "  (deck: " + request.deck + ")", line);
+                        continue;
+                    }
+                    rollingAdmit(request);
+                    continue;
                 }
                 pending.push_back(std::move(request));
                 continue;
@@ -856,11 +1114,36 @@ public:
                         continue;
                     }
                 }
+                if (detail::rollingEnabled()) {
+                    // A rolling `wave` line is a BARRIER REQUEST, not a run
+                    // request: the cases it would have carried are already
+                    // running.  What it still does is exactly what the wave
+                    // receipt has always meant -- "tell me when this much is
+                    // finished" -- so it drains the session, prints the same
+                    // receipt tags in the same order, and lets the next case
+                    // open a new session on the same process and the same
+                    // arena.
+                    // A refusal is reported BY NAME inside; either way this
+                    // line is done and the stream moves on.
+                    (void)rollingWaveLine(wave, wave_fidelity, wave_mode, line);
+                    continue;
+                }
                 wave.cases.swap(pending);
                 runWave(wave, wave_mode);
                 continue;
             }
             refuse("unknown op \"" + op + "\" (case | wave | run | shutdown)", line);
+        }
+
+        // WP18.  A rolling session that the stream ended in the middle of gets
+        // the same final barrier a `wave` line would have given it: the lanes
+        // drain, the receipts print, and the process receipt below is final.
+        // Dropping the queue here would lose whatever the client had sent and
+        // not yet been told about, which is the one thing that must not happen.
+        if (detail::rollingEnabled() && _roll.running) {
+            WaveRequest closing;
+            closing.wave_id = _roll.session;
+            rollingBarrier(closing, _options.default_result_mode);
         }
 
         // A stream that ended with cases enqueued and no wave line meant them:
@@ -979,6 +1262,12 @@ public:
 
 private:
     void refuse(const std::string& why, const std::string& line) {
+        // WP18.  A refusal can now be raised by the READER thread while lanes
+        // are mid-case, so `_summary.refused`, `_exit_code` and `_out` are all
+        // shared.  The lock is uncontended in wave mode (nothing else holds it
+        // there), so the line this prints is byte-for-byte what it printed
+        // before -- the ordering is what is being bought, not the content.
+        std::lock_guard<std::mutex> lock(_out_mutex);
         ++_summary.refused;
         if (_exit_code == 0) _exit_code = 2;
         _out << "[RASBERY][EVALUATOR][REFUSED] {\"what\":" << detail::quoted(why)
@@ -1336,6 +1625,368 @@ private:
         _out.unsetf(std::ios::floatfield);
     }
 
+    // -----------------------------------------------------------------------
+    // WP18  Rolling admission
+    // -----------------------------------------------------------------------
+
+    /// Everything one rolling session owns.  A session is opened by the first
+    /// case admitted after a barrier and closed by the next barrier; the arena,
+    /// the CUDA context, the library and the cohort cache all outlive it, which
+    /// is what WP8 already established and this mode does not touch.
+    struct RollingState {
+        bool               running = false;
+        long long          session = 0;
+        int                width   = 0;
+        int                lanes   = 0;
+        int                capacity = 0;
+        int                jobs    = 0;   ///< admitted this session
+        long long          ok      = 0;
+        long long          failed  = 0;
+        std::thread        pool;
+        std::chrono::steady_clock::time_point t0{};
+        /// The session's FIRST case, kept for the isolation recheck -- the same
+        /// A -> ... -> A the wave path runs, with the same "not adjacent" point.
+        bool                first_seen   = false;
+        int                 first_status = 0;
+        Driver::CaseReceipt first_receipt;
+        RollingJob          first_job;
+    };
+
+    /// Admit one case: open a session if none is running, then queue it.
+    void rollingAdmit(CaseRequest& request) {
+        if (!_roll.running) rollingOpen();
+        else refill::rollingLedger().noteBarrierAvoided();
+
+        RollingJob job;
+        job.deck      = request.deck;
+        job.output    = request.output;
+        job.key       = request.key;
+        job.warm_from = request.warm_start_from;
+        job.warm_save = request.save_warm_state;
+        job.mode      = request.result_mode;
+        job.fidelity  = request.resolved_fidelity;
+        job.promoted  = request.promoted;
+        job.index     = _roll.jobs++;
+        // Defensive: the queue is only ever closed by a barrier, and a barrier
+        // runs on THIS thread, so a closed queue here would mean the reader and
+        // the barrier had come apart.  Refuse loudly rather than drop a case.
+        const std::string dropped_deck   = job.deck;
+        const std::string dropped_output = job.output;
+        if (!_queue.push(std::move(job))) {
+            --_roll.jobs;
+            refuse("the rolling queue was closed while admitting \"" + dropped_deck +
+                       "\" -> \"" + dropped_output +
+                       "\"; the case was NOT run. (rolling_queue_closed)",
+                   dropped_deck);
+        }
+    }
+
+    /// Stand a session up: latch the width exactly as runWave does, open the
+    /// ledger, and start the lanes.
+    ///
+    /// THE LANES RUN ON A HELPER THREAD, and the reason is structural: the
+    /// OpenMP team's master blocks until the region ends, and the thread that
+    /// has to keep reading the request stream is this one.  So the pool thread
+    /// opens `#pragma omp parallel` and this thread goes back to the stream.
+    /// The lanes are OpenMP threads and not std::threads deliberately -- the
+    /// campaign's whole environment (OMP_PROC_BIND, RASBERY_OMP_THREADS, the
+    /// taskset cpu-list) places OpenMP threads, and a pool that opted out of
+    /// that would be measuring a different machine.
+    void rollingOpen() {
+        if (_summary.latched_width == 0) {
+            _summary.latched_width = std::max(1, _options.batch_width);
+            rasberySetBatchWidth(_summary.latched_width);
+            rasberyNodalSetBatchWidth(_summary.latched_width);
+            rasberySetHostPinningEnabled(rasberyHostPinningMode() != HostPinningMode::Off);
+        }
+        _roll.width = _summary.latched_width;
+        // No `njobs` term, and that is the difference: runWave caps the lanes
+        // at the size of the chunk it was handed, which is precisely why a
+        // claim of 1 collapsed the arena to one lane.  A rolling session does
+        // not know how many cases it will see, so it stands the full width up
+        // and lets the queue decide how much of it is busy.
+        _roll.lanes = _roll.width;
+#ifdef _OPENMP
+        if (_options.host_threads_override > 0)
+            _roll.lanes = std::min(_options.host_threads_override, _roll.width);
+        omp_set_num_threads(_roll.lanes);
+#else
+        _roll.lanes = 1;
+#endif
+        _roll.capacity = detail::rollingQueueCapacity(_roll.lanes);
+        _roll.session  = _summary.generations + 1;
+        _roll.jobs     = 0;
+        _roll.ok       = 0;
+        _roll.failed   = 0;
+        _roll.first_seen = false;
+        _roll.t0       = std::chrono::steady_clock::now();
+        _queue.configure(static_cast<std::size_t>(_roll.capacity));
+        refill::rollingLedger().open(_roll.lanes, _roll.width, _roll.capacity);
+        _out << "[RASBERY][EVALUATOR][ROLLING_START] {\"session\":" << _roll.session
+             << ",\"arena_width\":" << _roll.width << ",\"host_threads\":" << _roll.lanes
+             << ",\"queue_capacity\":" << _roll.capacity
+             << ",\"prefetch\":" << detail::rollingPrefetch()
+             << ",\"visible_cpus\":" << _options.visible_cpus
+             << ",\"process_reused\":" << (_summary.generations > 0 ? "true" : "false")
+             << "}" << std::endl;
+        _roll.running = true;
+        _roll.pool    = std::thread(&Server::rollingPool, this, _roll.lanes);
+    }
+
+    /// The team, on its own thread.  A plain member function and NOT a lambda:
+    /// an OpenMP directive inside a lambda body is a compiler-support question
+    /// this tree has no reason to ask, and the answer differs between the nvcc
+    /// build and the MSVC stub build that also has to compile this header.
+    void rollingPool(int lanes) {
+#ifdef _OPENMP
+    #pragma omp parallel num_threads(lanes)
+        { rollingLane(); }
+#else
+        (void)lanes;
+        rollingLane();
+#endif
+    }
+
+    /// One lane.  Pop, admit, run, release, pop again -- and no barrier
+    /// anywhere in it.  This IS the per-slot refill: `runOneCase` scopes the
+    /// Driver, so the arena slot is released, whole-struct reset and audited
+    /// (CudaBICGBackend.cu acquireSlot) between one tenancy and the next,
+    /// through exactly the door the wave path uses.
+    void rollingLane() {
+#ifdef _OPENMP
+        const int lane = omp_get_thread_num();
+#else
+        const int lane = 0;
+#endif
+        RollingJob job;
+        bool       immediate = true;
+        double     waited_ms = 0.0;
+        while (_queue.pop(job, immediate, waited_ms)) {
+            const auto epoch = refill::rollingLedger().admit(
+                lane, immediate, waited_ms, static_cast<int>(_queue.inflight()));
+            int                 status   = 0;
+            std::string         failure;
+            Driver::CaseReceipt receipt;
+            double              seconds  = 0.0;
+            double              teardown = 0.0;
+            runOneCase(job.deck, job.output, job.mode, job.warm_from, job.warm_save,
+                       job.fidelity, status, failure, receipt, seconds, teardown);
+            // Order matters and is the tenancy rule: the ledger is told the
+            // tenancy ended BEFORE the output is released, so no other lane can
+            // take the output while this one still counts as holding it.
+            refill::rollingLedger().finish(lane, epoch, static_cast<int>(_queue.inflight()));
+            _queue.finish(job.output);
+            {
+                // `_out` is one stream and the lanes are many; a receipt is
+                // built into a string and written under this lock so two cases
+                // finishing together cannot interleave a line.
+                std::lock_guard<std::mutex> lock(_out_mutex);
+                reportCase(_roll.session, job.index, job.key, job.deck, job.output, job.mode,
+                           status, failure, receipt, seconds, teardown, lane, false);
+                if (status == 0) ++_roll.ok; else ++_roll.failed;
+                ++_summary.cases;
+                if (status == 0) ++_summary.ok; else ++_summary.failed;
+                _summary.case_seconds.push(seconds);
+                _summary.teardown_ms.push(teardown);
+                if (job.fidelity.policy() != processCaseFidelity().policy() ||
+                    job.fidelity.gridToken() != processCaseFidelity().gridToken())
+                    ++_summary.fidelity_overrides;
+                if (job.promoted) ++_summary.promotions;
+                if (status != 0 && _exit_code == 0) _exit_code = 1;
+                // THE FIRST ADMITTED case, not the first to finish: the
+                // isolation recheck's whole claim is "after every other case in
+                // the session has been through", and the earliest case is the
+                // one that has the most of them behind it.  The lanes start
+                // together, so whichever finishes first is an accident of deck
+                // length and would make the check adjacent by luck.
+                if (job.index == 0 && !_roll.first_seen) {
+                    _roll.first_seen   = true;
+                    _roll.first_status = status;
+                    _roll.first_receipt = receipt;
+                    _roll.first_job     = job;
+                }
+            }
+        }
+    }
+
+    /// A `wave`/`run` line while rolling.  Returns false when it was refused.
+    bool rollingWaveLine(const WaveRequest& wave, const FidelityRequest& wave_fidelity,
+                         ResultMode wave_mode, const std::string& line) {
+        // The width refusal is the wave path's, verbatim in meaning: the arena
+        // is one allocation fixed at the first admission.
+        const int requested = wave.batch_width > 0 ? wave.batch_width : _options.batch_width;
+        if (_summary.latched_width != 0 && requested != _summary.latched_width) {
+            refuse("this process latched batch_width=" + std::to_string(_summary.latched_width) +
+                       " and the arena is one allocation fixed for the process; wave " +
+                       std::to_string(wave.wave_id) + " asked for " + std::to_string(requested) +
+                       ". (rolling_batch_width_latched)",
+                   line);
+            return false;
+        }
+        // A fidelity DEFAULT cannot be applied to a case that is already
+        // running.  Wave mode fills a case's unset fields from the wave line
+        // that arrives after it; rolling mode resolved them at the `case` line
+        // because the case started there.  Silently ignoring the declaration
+        // would be a screening wave whose cases ran at the process default --
+        // exactly the class WP10.3's equality check exists for.
+        if (_roll.running && _roll.jobs > 0 && !wave_fidelity.empty()) {
+            refuse("a rolling session resolves each case's fidelity when the case line is "
+                   "read, because the case starts there; wave " + std::to_string(wave.wave_id) +
+                   " declares fidelity fields after " + std::to_string(_roll.jobs) +
+                   " case(s) were already admitted, and a declaration cannot be applied "
+                   "retroactively. Declare fidelity on the case lines, or send the wave line "
+                   "first. (rolling_wave_fidelity_after_admit)",
+                   line);
+            return false;
+        }
+        // A manifest still expands here, and its --raso namespace rule is the
+        // wave's, checked before a single job is admitted.
+        if (!wave.jobs_manifest.empty()) {
+            WaveJobs    jobs;
+            std::string error;
+            if (!_options.read_manifest ||
+                !_options.read_manifest(wave.jobs_manifest, jobs.inputs, jobs.outputs, jobs.modes,
+                                        wave_mode, error)) {
+                refuse(error.empty() ? "no manifest reader is installed" : error,
+                       wave.jobs_manifest);
+                return false;
+            }
+            for (std::size_t i = 0; i < jobs.outputs.size(); ++i)
+                for (std::size_t j = i + 1; j < jobs.outputs.size(); ++j)
+                    if (jobs.outputs[i] == jobs.outputs[j]) {
+                        refuse("--raso paths must be distinct within a manifest: \"" +
+                                   jobs.outputs[i] + "\" appears at entries " +
+                                   std::to_string(i + 1) + " and " + std::to_string(j + 1),
+                               wave.jobs_manifest);
+                        return false;
+                    }
+            CaseFidelity manifest_fidelity = processCaseFidelity();
+            if (!resolveCaseFidelity(wave_fidelity, processCaseFidelity(), manifest_fidelity,
+                                     error)) {
+                refuse(error, line);
+                return false;
+            }
+            for (std::size_t i = 0; i < jobs.inputs.size(); ++i) {
+                CaseRequest request;
+                request.deck              = jobs.inputs[i];
+                request.output            = jobs.outputs[i];
+                request.result_mode       = jobs.modes[i];
+                request.resolved_fidelity = manifest_fidelity;
+                rollingAdmit(request);
+            }
+        }
+        if (!_roll.running) {
+            refuse("a wave with no jobs (neither \"jobs_manifest\" nor preceding "
+                   "\"op\":\"case\" lines)",
+                   wave.jobs_manifest);
+            return false;
+        }
+        rollingBarrier(wave, wave_mode);
+        return true;
+    }
+
+    /// Drain the session and print the wave-shaped receipts.
+    ///
+    /// SAME TAGS, SAME ORDER as runWave's tail, and that is not cosmetic: the
+    /// dispatcher's post-run audit (run_single_gpu_batch.check_run_receipts)
+    /// reads [RASBERY][BATCH_HOST] to answer "did the multi-instance batch
+    /// branch actually run", and it pumps the child until the
+    /// [EVALUATOR][WAVE] receipt with the wave id it asked for.  A mode that
+    /// printed different tags would be audited as a run that never happened.
+    void rollingBarrier(const WaveRequest& wave, ResultMode wave_mode) {
+        _queue.close();
+        if (_roll.pool.joinable()) _roll.pool.join();
+        _roll.running = false;
+        refill::rollingLedger().close();
+        _queue.reopen();
+
+        const int njobs = _roll.jobs;
+        {
+            const bool host_pinning = rasberyHostPinningMode() != HostPinningMode::Off;
+            _out << "[RASBERY][BATCH_HOST] {\"jobs\":" << njobs
+                 << ",\"arena_width\":" << _roll.width
+                 << ",\"host_threads\":" << _roll.lanes
+                 << ",\"visible_cpus\":" << _options.visible_cpus
+                 << ",\"host_pinning\":" << (host_pinning ? "true" : "false")
+                 << ",\"pin_lease\":true"
+                 << ",\"legacy_pinning_criterion\":"
+                 << (_roll.lanes >= njobs ? "true" : "false")
+                 << ",\"wave_id\":" << wave.wave_id << "}" << std::endl;
+        }
+
+        // The same A -> ... -> A the wave path runs, for the same reason and
+        // with the same comparand: the session's FIRST case, re-run after every
+        // other case in the session has been through the lanes.  Run here, on
+        // the reader thread, with every lane already joined -- so it is the one
+        // case in the session that is not concurrent with anything, which is
+        // what makes a digest mismatch a statement about carried state.
+        bool isolation_mismatch = false;
+        if (_options.isolation_check && _roll.first_seen && _roll.first_status == 0) {
+            const RollingJob& f = _roll.first_job;
+            const std::string recheck_output = detail::isolationOutput(f.output, wave.wave_id);
+            int                 recheck_status = 0;
+            std::string         recheck_error;
+            Driver::CaseReceipt recheck;
+            double              recheck_seconds  = 0.0;
+            double              recheck_teardown = 0.0;
+            runOneCase(f.deck, recheck_output, f.mode, f.warm_from, std::string(), f.fidelity,
+                       recheck_status, recheck_error, recheck, recheck_seconds,
+                       recheck_teardown);
+            ++_summary.isolation_checks;
+            if (njobs < 2) ++_summary.isolation_adjacent;
+            isolation_mismatch = recheck_status != 0 || !recheck.complete ||
+                                 !_roll.first_receipt.complete ||
+                                 recheck.digest != _roll.first_receipt.digest;
+            if (isolation_mismatch) {
+                ++_summary.isolation_mismatches;
+                if (_exit_code == 0) _exit_code = 1;
+            }
+            reportCase(wave.wave_id, -1, f.key, f.deck, recheck_output, f.mode, recheck_status,
+                       recheck_error, recheck, recheck_seconds, recheck_teardown, -1, true);
+            _out << "[RASBERY][EVALUATOR][ISOLATION] {\"wave_id\":" << wave.wave_id
+                 << ",\"deck\":" << detail::quoted(f.deck)
+                 << ",\"cases_between\":" << (njobs - 1)
+                 << ",\"adjacent\":" << (njobs < 2 ? "true" : "false")
+                 << ",\"digest_first\":\"" << std::hex << std::setw(16) << std::setfill('0')
+                 << _roll.first_receipt.digest << std::dec << std::setfill(' ')
+                 << "\",\"digest_recheck\":\"" << std::hex << std::setw(16) << std::setfill('0')
+                 << recheck.digest << std::dec << std::setfill(' ')
+                 << "\",\"match\":" << (isolation_mismatch ? "false" : "true") << "}"
+                 << std::endl;
+        }
+
+        // The two deferred teardown steps, asserted rather than run -- the
+        // between-wave contract of WP8 stage 1, unchanged.
+        iowriter::flushLines();
+        const std::uint64_t live_ranges =
+            static_cast<std::uint64_t>(rasberyHostPinLiveRanges());
+        _summary.pin_live_ranges_between_waves =
+            std::max(_summary.pin_live_ranges_between_waves, live_ranges);
+        if (live_ranges > 0 && _exit_code == 0) _exit_code = 1;
+
+        const double wall =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - _roll.t0).count();
+        _summary.drive_s += wall;
+        ++_summary.generations;
+
+        refill::rollingLedger().report(_out, _roll.session);
+        const XsLibraryCacheStats xslib = XsLibraryCacheSnapshot();
+        _out << "[RASBERY][EVALUATOR][WAVE] {\"wave_id\":" << wave.wave_id
+             << ",\"jobs\":" << njobs << ",\"ok\":" << _roll.ok << ",\"failed\":" << _roll.failed
+             << std::fixed << std::setprecision(3) << ",\"wall_s\":" << wall
+             << ",\"cases_per_hour\":"
+             << (wall > 0.0 ? 3600.0 * static_cast<double>(njobs) / wall : 0.0)
+             << ",\"process_reused\":" << (_summary.generations > 1 ? "true" : "false")
+             << ",\"xslib_loads\":" << xslib.loads << ",\"xslib_hits\":" << xslib.hits
+             << ",\"pin_live_ranges\":" << live_ranges
+             << ",\"isolation_match\":"
+             << (_options.isolation_check ? (isolation_mismatch ? "false" : "true") : "null")
+             << ",\"rolling\":true}" << std::endl;
+        _out.unsetf(std::ios::floatfield);
+        (void)wave_mode;
+        reportMemory(wave.wave_id);
+    }
+
     /// Build a Driver, drive it, destroy it -- and time the destruction apart
     /// from the drive.
     ///
@@ -1472,6 +2123,12 @@ private:
     int                                   _exit_code      = 0;
     long long                             _arena_releases = 0;
     std::chrono::steady_clock::time_point _t0{};
+    // WP18.  Untouched -- not merely unused -- when RASBERY_EVALUATOR_ROLLING
+    // is unset: no thread is started, no queue is configured, and the wave path
+    // never names any of it.
+    RollingQueue                          _queue;
+    RollingState                          _roll;
+    std::mutex                            _out_mutex;
 };
 
 } // namespace rasbery::evaluator

@@ -44,6 +44,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <mutex>
 #include <ostream>
 #include <vector>
@@ -238,6 +239,247 @@ private:
 
 inline Ledger& ledger() {
     static Ledger instance;
+    return instance;
+}
+
+// ---------------------------------------------------------------------------
+// WP18  The ROLLING ledger -- per-slot refill, counted
+// ---------------------------------------------------------------------------
+
+/// What the wave ledger above cannot say, because in wave mode it is not true.
+///
+/// THE DIFFERENCE, IN ONE SENTENCE.  `Ledger` measures a run whose job list was
+/// known when the run began: `begin(jobs, ...)` sizes a vector by it.  A rolling
+/// session has no such number -- cases arrive on the stream while the arena is
+/// already full -- so the thing to measure is not "how did N jobs tile M lanes"
+/// but "how often was a lane holding a deck at all, and how long did it sit
+/// empty between two of them".
+///
+/// WHY IT IS A SECOND LINE AND NOT SIX MORE KEYS ON THE FIRST.  `[RASBERY]
+/// [REFILL]` is parsed by tools/run_multi_gpu_batch.py (REFILL_RECEIPT) and by
+/// the campaign tables built off it, and WP18's own gate is that the flag OFF
+/// produces byte-identical output.  Adding keys to that line would change every
+/// wave-mode run's stdout, which is exactly what the gate forbids.  So the
+/// rolling receipt is `[RASBERY][REFILL][ROLLING]`, which the existing regex
+/// cannot match (it requires `{` immediately after the tag), and the wave line
+/// is emitted unchanged beside it.
+///
+/// EVERY COUNTER IS EITHER A LEVER OR A BUG WITNESS.
+///
+///   admits / immediate_admits   the lever.  An admit is IMMEDIATE when the
+///       lane found a case already queued and never waited -- i.e. the refill
+///       cost the lane nothing.  `immediate_admits / admits` is the fraction of
+///       the run in which the prefetch queue was actually ahead of the arena;
+///       below 1 the queue ran dry, and that is a HARNESS fact (the top-up did
+///       not keep pace) rather than an arena one.
+///
+///   wave_barriers_avoided       what the mode is FOR.  In wave mode every
+///       request batch ends in a barrier: the lanes drain, the slowest case
+///       runs alone, and only then does the next chunk start.  In rolling mode
+///       every request batch but the last is merged into the running session,
+///       so this counts the drains that did not happen.
+///
+///   slot_idle_ms_total          the cost that is left.  Summed over lanes, the
+///       wall between one case ending on a lane and the next beginning there.
+///       In wave mode that number is dominated by the barrier; here what
+///       remains is Driver teardown plus the next deck's import, which is the
+///       honest floor of the mode.
+///
+///   width_* percentiles         the number the campaign compares on.  Sampled
+///       at every admit AND every finish, so it is the occupancy of the arena
+///       over EVENTS and not over a clock the sampler chose.
+///
+///   stale_tenant_refusals       a bug witness, and it must be 0.  A lane that
+///       asked for a new case while the ledger still believed it held one means
+///       a Driver outlived the finish stamp -- the tenancy rule of Sec 3.2
+///       broken on the host side, where the arena's own `stale_tenants` audit
+///       (CudaBICGBackend.cu batchSlotIsReset) cannot see it because the slot
+///       really was reset; what was not reset is the LANE.
+///
+///   epoch_regressions           the other one.  Every admission takes a
+///       monotonic epoch and every finish must retire exactly the epoch its
+///       admission took.  A finish that retires an epoch nobody holds is a
+///       completion attributed to the wrong tenancy, which is how a rolling
+///       receipt would report a width it never had.
+class RollingLedger {
+public:
+    void open(int lanes, int width, int capacity) {
+        std::lock_guard<std::mutex> lock(_mutex);
+        _open     = true;
+        _lanes    = std::max(1, lanes);
+        _width    = std::max(1, width);
+        _capacity = capacity;
+        _lane_busy.assign(static_cast<std::size_t>(_lanes), false);
+        _lane_last_end.assign(static_cast<std::size_t>(_lanes), 0.0);
+        _lane_jobs.assign(static_cast<std::size_t>(_lanes), 0);
+        _widths.clear();
+        _admit_wait_ms.clear();
+        _live_epochs.clear();
+        _admits            = 0;
+        _immediate         = 0;
+        _barriers_avoided  = 0;
+        _stale_refusals    = 0;
+        _epoch_regressions = 0;
+        _epoch             = 0;
+        _idle_ms_total     = 0.0;
+        _t0                = std::chrono::steady_clock::now();
+        _t1                = _t0;
+    }
+
+    [[nodiscard]] bool isOpen() const {
+        std::lock_guard<std::mutex> lock(_mutex);
+        return _open;
+    }
+
+    /// One admission.  Returns the epoch this tenancy owns; `finish` must be
+    /// handed the same value back, which is what makes the pairing checkable.
+    std::uint64_t admit(int lane, bool immediate, double waited_ms, int width_now) {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (!_open) return 0;
+        const double now = elapsed();
+        const auto   l   = laneIndex(lane);
+        // The lane still believes it holds a deck.  See stale_tenant_refusals
+        // above: counted, never thrown, because the physics is not what is
+        // wrong here -- the accounting is, and losing the run would lose the
+        // evidence with it.
+        if (_lane_busy[l]) ++_stale_refusals;
+        if (_lane_jobs[l] > 0) _idle_ms_total += std::max(0.0, now - _lane_last_end[l]) * 1.0e3;
+        _lane_busy[l] = true;
+        ++_admits;
+        if (immediate) ++_immediate;
+        else _admit_wait_ms.push_back(waited_ms);
+        _widths.push_back(width_now);
+        const std::uint64_t epoch = ++_epoch;
+        _live_epochs.push_back(epoch);
+        return epoch;
+    }
+
+    void finish(int lane, std::uint64_t epoch, int width_now) {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (!_open) return;
+        const auto l      = laneIndex(lane);
+        _lane_busy[l]     = false;
+        _lane_last_end[l] = elapsed();
+        ++_lane_jobs[l];
+        _widths.push_back(width_now);
+        const auto it = std::find(_live_epochs.begin(), _live_epochs.end(), epoch);
+        if (it == _live_epochs.end()) ++_epoch_regressions;
+        else _live_epochs.erase(it);
+    }
+
+    /// One request batch merged into a session that was already running.
+    void noteBarrierAvoided() {
+        std::lock_guard<std::mutex> lock(_mutex);
+        ++_barriers_avoided;
+    }
+
+    void close() {
+        std::lock_guard<std::mutex> lock(_mutex);
+        _t1 = std::chrono::steady_clock::now();
+    }
+
+    /// The WP18 receipt.  One line, machine-readable, always the same keys.
+    void report(std::ostream& out, long long session_id) const {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (!_open) return;
+        const double wall = std::chrono::duration<double>(_t1 - _t0).count();
+
+        // The drain that is left: with per-slot refill it is ONE case, not a
+        // whole wave, and that claim is exactly this number over the per-case
+        // wall.
+        double tail_ms = 0.0;
+        for (std::size_t l = 0; l < _lane_last_end.size(); ++l) {
+            if (_lane_jobs[l] == 0) continue;
+            tail_ms += std::max(0.0, wall - _lane_last_end[l]) * 1.0e3;
+        }
+
+        std::vector<int> widths = _widths;
+        std::sort(widths.begin(), widths.end());
+        double width_mean = 0.0;
+        for (int w : widths) width_mean += static_cast<double>(w);
+        if (!widths.empty()) width_mean /= static_cast<double>(widths.size());
+
+        std::vector<double> waits = _admit_wait_ms;
+        std::sort(waits.begin(), waits.end());
+
+        int lanes_used = 0;
+        for (int n : _lane_jobs)
+            if (n > 0) ++lanes_used;
+
+        out << "[RASBERY][REFILL][ROLLING] {\"session\":" << session_id
+            << ",\"arena_width\":" << _width
+            << ",\"lanes\":" << _lanes
+            << ",\"lanes_used\":" << lanes_used
+            << ",\"queue_capacity\":" << _capacity
+            << ",\"admits\":" << _admits
+            << ",\"immediate_admits\":" << _immediate
+            << ",\"wave_barriers_avoided\":" << _barriers_avoided
+            << ",\"slot_idle_ms_total\":" << _idle_ms_total
+            << ",\"tail_idle_ms\":" << tail_ms
+            << ",\"wall_s\":" << wall
+            << ",\"width_history\":{\"samples\":" << widths.size()
+            << ",\"p10\":" << pct(widths, 0.10)
+            << ",\"p50\":" << pct(widths, 0.50)
+            << ",\"p90\":" << pct(widths, 0.90)
+            << ",\"mean\":" << width_mean
+            << ",\"max\":" << (widths.empty() ? 0 : widths.back())
+            << "}"
+            << ",\"width_fill\":" << (_width > 0 ? width_mean / static_cast<double>(_width) : 0.0)
+            << ",\"admit_wait_ms\":{\"p50\":" << pctd(waits, 0.50)
+            << ",\"max\":" << (waits.empty() ? 0.0 : waits.back()) << "}"
+            << ",\"epoch\":" << _epoch
+            << ",\"epoch_regressions\":" << _epoch_regressions
+            << ",\"stale_tenant_refusals\":" << _stale_refusals
+            << ",\"live_tenancies_at_close\":" << _live_epochs.size()
+            << "}" << std::endl;
+    }
+
+private:
+    [[nodiscard]] std::size_t laneIndex(int lane) const {
+        if (lane < 0 || lane >= static_cast<int>(_lane_busy.size())) return 0;
+        return static_cast<std::size_t>(lane);
+    }
+    [[nodiscard]] double elapsed() const {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - _t0).count();
+    }
+    static int pct(const std::vector<int>& sorted, double q) {
+        if (sorted.empty()) return 0;
+        std::size_t i = static_cast<std::size_t>(q * static_cast<double>(sorted.size() - 1) + 0.5);
+        if (i >= sorted.size()) i = sorted.size() - 1;
+        return sorted[i];
+    }
+    static double pctd(const std::vector<double>& sorted, double q) {
+        if (sorted.empty()) return 0.0;
+        std::size_t i = static_cast<std::size_t>(q * static_cast<double>(sorted.size() - 1) + 0.5);
+        if (i >= sorted.size()) i = sorted.size() - 1;
+        return sorted[i];
+    }
+
+    mutable std::mutex         _mutex;
+    bool                       _open     = false;
+    int                        _lanes    = 0;
+    int                        _width    = 0;
+    int                        _capacity = 0;
+    std::vector<bool>          _lane_busy;
+    std::vector<double>        _lane_last_end;
+    std::vector<int>           _lane_jobs;
+    std::vector<int>           _widths;
+    std::vector<double>        _admit_wait_ms;
+    std::vector<std::uint64_t> _live_epochs;
+    unsigned long long         _admits            = 0;
+    unsigned long long         _immediate         = 0;
+    unsigned long long         _barriers_avoided  = 0;
+    unsigned long long         _stale_refusals    = 0;
+    unsigned long long         _epoch_regressions = 0;
+    std::uint64_t              _epoch             = 0;
+    double                     _idle_ms_total     = 0.0;
+
+    std::chrono::steady_clock::time_point _t0{};
+    std::chrono::steady_clock::time_point _t1{};
+};
+
+inline RollingLedger& rollingLedger() {
+    static RollingLedger instance;
     return instance;
 }
 

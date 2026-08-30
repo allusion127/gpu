@@ -117,11 +117,34 @@ def check_receipt(server: str) -> list[str]:
                        "as the explanation for 3.3 GB")
     if "reportMemory(" not in server:
         bad.append("the memory receipt is not a named function called from the wave")
-    # ONCE PER GENERATION, from runWave, after the wave's own receipt.  A
-    # mid-wave sample measures where the wave happened to be; the question is
-    # what is left behind when it is over.
-    if server.count("reportMemory(wave.wave_id);") != 1:
-        bad.append("reportMemory is not called exactly once per wave from runWave")
+    # ONCE PER GENERATION, from the function that CLOSES one, after that
+    # generation's own receipt.  A mid-wave sample measures where the wave
+    # happened to be; the question is what is left behind when it is over.
+    #
+    # THERE ARE TWO SUCH FUNCTIONS since WP18: `runWave` closes a wave-mode
+    # generation and `rollingBarrier` closes a rolling one.  The rule is not
+    # "exactly one call in the file" -- that was only ever a proxy -- it is
+    # "exactly one call per closing path, and no call from anywhere else".  A
+    # sample taken from, say, runOneCase would satisfy a bare count and would be
+    # precisely the mid-wave measurement this check exists to forbid.
+    CLOSERS = {"runWave", "rollingBarrier"}
+    callers: list[str] = []
+    cursor = 0
+    while True:
+        at = server.find("reportMemory(wave.wave_id);", cursor)
+        if at < 0:
+            break
+        cursor = at + 1
+        marker = "\n    void "
+        head = server.rfind(marker, 0, at)
+        name = server[head + len(marker):server.find("(", head)] if head >= 0 else "?"
+        callers.append(name.strip())
+    if sorted(callers) != sorted(CLOSERS):
+        bad.append(
+            "reportMemory(wave.wave_id) must be called exactly once from each of %s "
+            "and from nowhere else; it is called from %r"
+            % (sorted(CLOSERS), callers)
+        )
     if "/proc/self/statm" not in server:
         bad.append("the receipt does not read RSS from /proc/self/statm, which is the "
                    "same quantity tools/soak_run.py samples from outside; a second "
