@@ -64,14 +64,112 @@
 // FAIL OPEN.  Any CUDA failure, an unsupported deck (ng != 2), or
 // RASBERY_PPR_MODE=master makes the entry point return false and the caller runs
 // the untouched host reset+drive.  The receipt counts those as host_fallbacks.
+//
+// ===========================================================================
+// WP6 (bottleneck plan 20260830 Sec WP6) -- WHAT STAGES B/C/E CHANGED
+// ===========================================================================
+//
+// STAGE B, THE STOPPING TEST MOVED TO THE DEVICE.  The loop above paid one
+// `cudaStreamSynchronize` PER PICARD ITERATION so the host could fold 4x256
+// partials and apply RelativeChange.  On kngr_238 that is ~50 syncs per
+// statepoint and the drive is serialised behind every one of them.  The fold
+// and the test are now a kernel (`kCornerFoldAndCheck<<<1,4>>>`), and the loop
+// is driven one of three ways -- RASBERY_GPU_PPR_DEVICE_LOOP / _GRAPH:
+//
+//     host_sync      the c502856 loop, kept verbatim for the A/B
+//     device_stream  niter bodies enqueued; every body kernel returns
+//                    immediately once the device flag is raised  (default)
+//     device_graph   ONE body captured into a conditional WHILE, armed and
+//                    re-armed by the same predicate kernel     (opt-in)
+//
+// THE ITERATION COUNT IS IDENTICAL TO THE HOST'S, and that is a property of
+// the fold, not a hope:
+//
+//   * the fold is the SAME association -- one thread per corner, chunk 0 to
+//     nchunk-1 ascending, which is byte for byte the loop the host ran over
+//     the D2H'd partials;
+//   * `iters` is incremented by the fold kernel and only when the flag is
+//     down, so it counts exactly the rounds the host's `citer` would have;
+//   * a `device_stream` body enqueued AFTER convergence writes nothing -- every
+//     kernel in it returns on the flag -- so the extra launches are no-ops and
+//     the final state is the state at the converged round.  The batch does not
+//     "run extra iterations that change the result": it runs empty ones.  That
+//     is what buys exactness at the price of launches, and it is why K-batched
+//     checking (which does run real extra rounds) was NOT chosen.
+//
+// The WHILE's predicate is `iters < niter && converged == 0`, evaluated by the
+// same kernel in the arm node and as the body's last node -- the do-while the
+// host loop is.
+//
+// STAGE C, THE INPUTS STOPPED BEING RE-UPLOADED.  Three separate reductions,
+// and only the first is conditional:
+//
+//   * chif and crdf are gated on GENERATIONS (XSSet::refGeneration and a PPR
+//     local counter).  chif is the burnup-interpolated fission spectrum, which
+//     moves when the library reference blocks are rebuilt, not per statepoint;
+//     crdf is all-ones unless RASBERY_PPR_CRDF.  Both are unconditional wins.
+//   * phif / phis / jnet are BORROWED from the canonical nodal set when the
+//     outer segment holds one (RASBERY_GPU_PPR_CANONICAL).  That is the whole
+//     surface traffic of the arm.
+//   * RASBERY_GPU_PPR_CANONICAL=verify borrows AND uploads the host copy into
+//     a scratch buffer and compares elementwise on the device, reporting
+//     `canonical_mismatch`.  The borrow is only sound if the device buffers
+//     hold what the host arrays hold at PPR time; `verify` is how 238 answers
+//     that instead of the header asserting it.
+//
+// The receipt carries `h2d_bytes` and `h2d_bytes_elided` so the reduction is a
+// measurement rather than a claim, per slot.
+//
+// STAGE E, THE BATCH ARENA IS STILL CONDITIONAL, AND THE RECEIPT IS WHY.  The
+// plan makes `CudaPprArena` conditional on PPR exceeding 10 % of the M64
+// profile.  What a per-slot backend has to prove in the meantime is that it
+// does not allocate per STATEPOINT -- `allocations` counts every cudaMalloc
+// this instance has ever made, so `allocations == 21 + k` for any number of
+// statepoints is the observable, and a slot that re-shaped mid-run shows up as
+// `reallocations > 0` rather than as a wall-time mystery.
 
 #include <cstddef>
+#include <cstdlib>
 #include <memory>
 #include <string>
 
 namespace rasbery {
 
 namespace ppr {
+
+/// Stage C.  How much of the borrow the caller is asking for.
+enum class CanonicalMode : int {
+    Off = 0,  ///< upload everything, as before (default)
+    Borrow,   ///< use the device-resident nodal set, skip the three uploads
+    Verify    ///< borrow AND upload-and-compare, reporting the mismatch count
+};
+
+/// RASBERY_GPU_PPR_CANONICAL, read once.  DEFAULT OFF, because the borrow's
+/// premise -- that the device buffers hold at PPR time what the host arrays
+/// hold -- is a property of the outer segment's exit, not of this arm, and
+/// `verify` is how a deck establishes it.  Anything else truthy is `Borrow`.
+inline CanonicalMode canonicalModeFromEnv() {
+    static const CanonicalMode mode = [] {
+        const char* v = std::getenv("RASBERY_GPU_PPR_CANONICAL");
+        if (v == nullptr) return CanonicalMode::Off;
+        const std::string s(v);
+        if (s.empty() || s == "0" || s == "off" || s == "OFF" || s == "false" ||
+            s == "FALSE")
+            return CanonicalMode::Off;
+        if (s == "verify" || s == "VERIFY" || s == "2") return CanonicalMode::Verify;
+        return CanonicalMode::Borrow;
+    }();
+    return mode;
+}
+
+inline const char* canonicalModeName(CanonicalMode m) {
+    switch (m) {
+        case CanonicalMode::Off:    return "off";
+        case CanonicalMode::Borrow: return "borrow";
+        case CanonicalMode::Verify: return "verify";
+    }
+    return "?";
+}
 
 /// Geometry that never changes for a deck.  Uploaded once, on first call.
 struct GeomView {
@@ -108,6 +206,25 @@ struct StepView {
     double* q    = nullptr; ///< [nxyz * 15 * ng]
     double* l    = nullptr; ///< [nxyz * 9 * ng]
     double* bt   = nullptr; ///< [nxyz * ng]
+
+    // --- WP6 stage C -------------------------------------------------------
+    //
+    // BORROWED DEVICE POINTERS, all-or-nothing.  A partial set would pair the
+    // segment's device jnet with a freshly uploaded host phif -- two different
+    // outer iterations, silently blended -- which is the shape
+    // gpu::canonicalNodalSetIsCoherent refuses one layer down.  The backend
+    // checks the same rule and declines the borrow (not the statepoint) if the
+    // three are not all present.
+    CanonicalMode canonical = CanonicalMode::Off;
+    const double* dev_phif  = nullptr; ///< canonical Flux,  [l*ng + ig]
+    const double* dev_phis  = nullptr; ///< canonical Phis,  [ls*ng + ig]
+    const double* dev_jnet  = nullptr; ///< canonical Jnet,  [ls*ng + ig]
+
+    /// Generations for the two inputs that do NOT move every statepoint.  The
+    /// upload is issued when the value differs from the one the device copy was
+    /// built from; 0 means "unknown", which always uploads.
+    unsigned long long chif_generation = 0;
+    unsigned long long crdf_generation = 0;
 };
 
 } // namespace ppr
@@ -139,6 +256,43 @@ public:
     [[nodiscard]] unsigned long long iterations() const;
     [[nodiscard]] double             wallMs() const;
     [[nodiscard]] int                deviceOrdinal() const;
+
+    // --- WP6 receipt counters ----------------------------------------------
+
+    /// Which loop drove the Picard iteration: "host_sync", "device_stream" or
+    /// "device_graph".  Never null.
+    [[nodiscard]] const char* loopArm() const;
+    /// Every cudaStreamSynchronize this arm has issued.
+    [[nodiscard]] unsigned long long hostSyncs() const;
+    /// hostSyncs() / statepoints(), 0 when nothing ran.  The stage B number.
+    [[nodiscard]] double hostSyncsPerStatepoint() const;
+    /// Conditional-WHILE graph launches (0 on the other two arms), and the
+    /// instantiations behind them.
+    [[nodiscard]] unsigned long long graphLaunches() const;
+    [[nodiscard]] unsigned long long graphBuilds() const;
+    /// Why the graph arm was refused, "" when it was not asked for or not
+    /// refused.  A refusal falls back to device_stream, never to the host.
+    [[nodiscard]] const std::string& graphRefusal() const;
+
+    /// Bytes this arm actually pushed H2D, and the bytes stage C did not have
+    /// to push (borrowed canonical buffers plus generation-held uploads).
+    [[nodiscard]] unsigned long long h2dBytes() const;
+    [[nodiscard]] unsigned long long h2dBytesElided() const;
+    [[nodiscard]] unsigned long long d2hBytes() const;
+
+    /// Statepoints whose nodal inputs were borrowed rather than uploaded, and
+    /// -- under CanonicalMode::Verify -- the number of elements at which a
+    /// borrowed buffer disagreed with the host array it replaced.  A non-zero
+    /// mismatch means the borrow is NOT sound for this deck and the arm says so
+    /// rather than shipping the difference as physics.
+    [[nodiscard]] unsigned long long canonicalStatepoints() const;
+    [[nodiscard]] unsigned long long canonicalMismatch() const;
+
+    /// Every cudaMalloc this instance has made, and how many of them were a
+    /// RE-shape (the second and later ensureShape).  Stage E's observable:
+    /// a per-slot backend must allocate once per slot, not once per statepoint.
+    [[nodiscard]] unsigned long long allocations() const;
+    [[nodiscard]] unsigned long long reallocations() const;
 
 private:
     struct Impl;

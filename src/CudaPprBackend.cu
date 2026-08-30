@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -60,6 +61,25 @@ bool truthy(const char* v) {
              s == "FALSE");
 }
 
+/// WP6 stage B.  The Picard loop's whole host-visible state, in device memory.
+///
+/// WHY `reigv` LIVES HERE and not in DevCtx-by-value.  The conditional WHILE
+/// captures the body ONCE per (deck, shape) and replays it at every statepoint,
+/// and a kernel node's parameters are baked at capture time.  A `reigv` passed
+/// by value would therefore be the FIRST statepoint's eigenvalue forever --
+/// finite, plausible, and wrong.  Every per-statepoint scalar the body reads is
+/// in this block, which the host refreshes with one 64-byte H2D and the body
+/// reads through a pointer that never moves.
+struct PprLoopState {
+    double reigv;      ///< 1/k_eff for THIS statepoint
+    double prev[4];    ///< the previous round's fuel-only corner sums
+    double cur[4];     ///< this round's
+    int    iters;      ///< rounds actually executed == the host's `citer + 1`
+    int    converged;  ///< the break test fired; every guarded kernel no-ops
+    int    niter;      ///< the cap the caller passed
+    int    pad;
+};
+
 /// Everything a kernel needs, by value.  Pointers are device pointers.
 struct DevCtx {
     int ng;
@@ -67,7 +87,13 @@ struct DevCtx {
     int nxy;
     int nsurf;
     int has_chif;
-    double reigv;
+    int nchunk;
+
+    /// Per-statepoint scalars and the loop's own state.  NEVER null once
+    /// ensureShape has run.
+    PprLoopState* loop;
+    /// The corner-sum partials the fold kernel reads.  Also never null.
+    double* partials;
 
     const double*        hmesh;
     const int*           lktosfc;
@@ -130,6 +156,19 @@ __device__ inline int dNeib(const DevCtx& x, int dir, int l) { return x.neibrb[l
 __device__ inline double dCrdf(const DevCtx& x, int lk, int g) {
     return x.crdf[static_cast<size_t>(lk) * x.ng + g];
 }
+
+/// WP6 stage B.  THE ONE READ THAT MAKES AN ENQUEUED BODY A NO-OP.
+///
+/// Every kernel of the Picard body starts with this, and the `device_stream`
+/// arm relies on nothing else: the fold kernel raises `converged` at the end of
+/// round i, and every kernel of rounds i+1..niter-1 -- already enqueued, and
+/// nobody is going to wait to find out -- returns before writing anything.  The
+/// state is therefore frozen at round i, which is exactly where the host's
+/// `break` left it.
+///
+/// It is a template parameter and not a runtime `if` because the reset() half
+/// launches the SAME kUpdateSource, where there is no loop and no flag to read.
+__device__ inline bool pprHalted(const DevCtx& x) { return x.loop->converged != 0; }
 
 /// Upper-triangular slot of the 15-term expansion: 5i - i(i-1)/2 + j.
 __device__ inline int triIdx(int i, int j) { return 5 * i - (i * (i - 1)) / 2 + j; }
@@ -365,11 +404,13 @@ __global__ void kAxialLeakage(DevCtx x) {
 
 /// updateSource().  ng == 2 by construction (the host body hardcodes it too --
 /// coeff[2][2], c0/c1, q0/q1 -- and the caller refuses any other deck).
+template <bool kGuarded>
 __global__ void kUpdateSource(DevCtx x) {
+    if (kGuarded && pprHalted(x)) return;
     const int lk = blockIdx.x * blockDim.x + threadIdx.x;
     if (lk >= x.nxyz) return;
     const int    ng    = x.ng;
-    const double reigv = x.reigv;
+    const double reigv = x.loop->reigv;
 
     double coeff[2][2];
     for (int g = 0; g < ng; ++g)
@@ -406,7 +447,9 @@ __global__ void kUpdateSource(DevCtx x) {
 /// updateFused(): particular + homogeneous + projectFlux, one thread per (node,
 /// group).  Purely node-local -- it reads q/phic of its own node only -- so the
 /// host's `for g { for lk { ... } }` sweep order is not a dependence.
+template <bool kGuarded>
 __global__ void kUpdateFused(DevCtx x) {
+    if (kGuarded && pprHalted(x)) return;
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= x.nxyz * x.ng) return;
     const int lk = t / x.ng;
@@ -579,7 +622,9 @@ __device__ inline double jnetDirD(const DevCtx& x, int dir, int lk, int g,
 /// updateCorner().  Reads the 3x3 stencil's fitting coefficients, writes only
 /// its own node's corner fluxes -- no write conflict, and no dependence on the
 /// host loop's node order.
+template <bool kGuarded>
 __global__ void kUpdateCorner(DevCtx x) {
+    if (kGuarded && pprHalted(x)) return;
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= x.nxyz * x.ng) return;
     const int lk = t / x.ng;
@@ -617,8 +662,12 @@ __global__ void kUpdateCorner(DevCtx x) {
 /// thread per chunk, each summing ITS range in ascending (node, group) order,
 /// so the value depends on the partition and not on the launch.  The host then
 /// folds the partials in ascending chunk index.
-__global__ void kCornerPartials(DevCtx x, int nchunk, double* partials) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+template <bool kGuarded>
+__global__ void kCornerPartials(DevCtx x) {
+    if (kGuarded && pprHalted(x)) return;
+    const int nchunk   = x.nchunk;
+    double*   partials = x.partials;
+    const int c        = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nchunk) return;
 
     const int lb = detChunkBegin(x.nxyz, nchunk, c);
@@ -641,12 +690,296 @@ __global__ void kCornerPartials(DevCtx x, int nchunk, double* partials) {
     partials[3 * nchunk + c] = se;
 }
 
-double relativeChange(double current, double previous) {
+__host__ __device__ inline double relativeChange(double current, double previous) {
     return (previous != 0.0) ? fabs((current - previous) / previous) : 1.0;
 }
 
-} // namespace
+/// WP6 stage B.  THE FOLD AND THE BREAK TEST, ON THE DEVICE.
+///
+/// `<<<1, 4>>>` -- one thread per corner, and each thread walks chunk 0 to
+/// nchunk-1 ASCENDING into a double it started at 0.0.  That is not "a
+/// deterministic reduction" in the general sense; it is byte for byte the loop
+/// the host ran over the D2H'd partials, which is what makes the arm's result
+/// bit-identical to the c502856 host-sync arm rather than merely close to it.
+/// A tree reduction over 256 chunks would have been faster and would have moved
+/// the sum, so it is not used.
+///
+/// Thread 0 then applies PPR::drive's own test to PPR::drive's own tolerance,
+/// increments the round counter, and either raises the flag or rolls `cur` into
+/// `prev`.  `__threadfence()` before the flag: the guarded kernels of the NEXT
+/// body read `converged` and must not see it raised before `cur`/`prev`/`iters`
+/// are visible.  (Stream order already sequences the kernels; the fence is what
+/// makes the WRITES ordered rather than only the launches.)
+__global__ void kCornerFoldAndCheck(DevCtx x) {
+    if (pprHalted(x)) return;
 
+    __shared__ double err[4];
+
+    const int          t        = static_cast<int>(threadIdx.x);
+    const int          nchunk   = x.nchunk;
+    const double*      partials = x.partials;
+    PprLoopState*      st       = x.loop;
+
+    if (t < 4) {
+        double s = 0.0;
+        for (int c = 0; c < nchunk; ++c) s += partials[t * nchunk + c];
+        st->cur[t] = s;
+        err[t]     = relativeChange(s, st->prev[t]);
+    }
+    __syncthreads();
+
+    if (t != 0) return;
+
+    const double err_nw = err[0];
+    const double err_sw = err[1];
+    const double err_ne = err[2];
+    const double err_se = err[3];
+
+    st->iters = st->iters + 1;
+
+    if (err_nw < kCornerFluxTolerance && err_sw < kCornerFluxTolerance &&
+        err_ne < kCornerFluxTolerance && err_se < kCornerFluxTolerance) {
+        __threadfence();
+        st->converged = 1;
+        return;
+    }
+
+    st->prev[0] = st->cur[0];
+    st->prev[1] = st->cur[1];
+    st->prev[2] = st->cur[2];
+    st->prev[3] = st->cur[3];
+}
+
+// ---------------------------------------------------------------------------
+// WP6 stage C: the borrow, checked rather than asserted
+// ---------------------------------------------------------------------------
+
+/// Elementwise BITWISE comparison of a borrowed device buffer against the host
+/// array it replaces (uploaded into this instance's own block for the purpose).
+///
+/// BITWISE, not `!=`.  The question is "is the borrow the same bytes", and two
+/// NaNs compare unequal under `!=` while being the same value for every
+/// consumer here; a tolerance would answer a different and easier question.
+///
+/// NO ATOMIC.  One thread per deterministic chunk writing its own count, folded
+/// by kFoldMismatch -- the same partition the corner sums use, for the same
+/// reason: this file may not contain a launch-order-dependent reduction.
+__global__ void kCanonicalCompare(const double* borrowed, const double* uploaded,
+                                  long long n, int nchunk, int slot,
+                                  unsigned long long* counts) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nchunk) return;
+    const long long    lb  = (n * c) / nchunk;
+    const long long    le  = (n * (c + 1)) / nchunk;
+    unsigned long long bad = 0;
+    for (long long i = lb; i < le; ++i)
+        if (__double_as_longlong(borrowed[i]) != __double_as_longlong(uploaded[i])) ++bad;
+    counts[static_cast<long long>(slot) * nchunk + c] = bad;
+}
+
+__global__ void kFoldMismatch(unsigned long long* counts, int n) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    unsigned long long s = 0;
+    for (int i = 0; i < n; ++i) s += counts[i];
+    counts[n] = s;
+}
+
+// ---------------------------------------------------------------------------
+// WP6 stage B: the conditional WHILE
+// ---------------------------------------------------------------------------
+//
+// A LOCAL COPY OF GpuOuterWhile.h's SEVEN-CALL SEQUENCE, deliberately.  That
+// header's `buildOuterWhile` is bound to DeviceOuterSegmentState and its
+// predicate kernel is a non-static `__global__` already defined in
+// CudaOuterGraph.cu -- including it here would be a duplicate definition at
+// link time.  What is shared is the ORDER OF THE CALLS and the CUDA-13
+// signature split, and tools/test_ppr_device_loop_contract.py checks that the
+// two files still spell both the same way.
+
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12030
+#define RASBERY_HAS_PPR_WHILE 1
+#else
+#define RASBERY_HAS_PPR_WHILE 0
+#endif
+
+#if RASBERY_HAS_PPR_WHILE
+
+/// The stop rule, in one kernel, used TWICE -- as the root graph's arm node and
+/// as the body's last node.  It is PPR::drive's loop header and nothing else:
+/// `citer < niter` and "the break test has not fired".  Two spellings of a stop
+/// rule are two chances to spell it differently, so there is one.
+__global__ void kPprWhileCond(cudaGraphConditionalHandle handle,
+                              const PprLoopState* st) {
+    cudaGraphSetConditional(
+        handle, (st->converged == 0 && st->iters < st->niter) ? 1u : 0u);
+}
+
+/// cudaGraphAddNode's signature changed in CUDA 13.0 (an edge-data pointer was
+/// inserted before numDependencies).  Same split, same reason, same wording as
+/// GpuOuterWhile.h::addWhileNode.
+inline cudaError_t addPprWhileNode(cudaGraphNode_t* out_node, cudaGraph_t parent,
+                                   const cudaGraphNode_t* deps, std::size_t ndeps,
+                                   cudaGraphConditionalHandle handle,
+                                   cudaGraph_t* body_out) {
+    cudaGraphNodeParams np{};
+    std::memset(&np, 0, sizeof(np));
+    np.type               = cudaGraphNodeTypeConditional;
+    np.conditional.handle = handle;
+    np.conditional.type   = cudaGraphCondTypeWhile;
+    np.conditional.size   = 1;
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+    const cudaError_t e = cudaGraphAddNode(out_node, parent, deps, nullptr, ndeps, &np);
+#else
+    const cudaError_t e = cudaGraphAddNode(out_node, parent, deps, ndeps, &np);
+#endif
+    if (e != cudaSuccess) return e;
+    *body_out = np.conditional.phGraph_out[0];
+    return cudaSuccess;
+}
+
+/// Build the WHILE.  `record` is handed the body stream and must enqueue
+/// EXACTLY ONE Picard round on it.  Every early return ends both captures, so a
+/// refusal leaves neither stream in capture mode; `stage` names the call that
+/// refused and becomes the receipt's `graph_refusal`.
+template <typename RecordBody>
+inline cudaError_t buildPprWhile(cudaStream_t root_stream, cudaStream_t body_stream,
+                                 const PprLoopState* d_loop, const char** stage,
+                                 RecordBody record, cudaGraph_t* root_out,
+                                 cudaGraphExec_t* exec_out) {
+    *stage         = "BeginCapture(root)";
+    cudaError_t rc = cudaStreamBeginCapture(root_stream, cudaStreamCaptureModeRelaxed);
+    if (rc != cudaSuccess) return rc;
+
+    auto abandon_root = [&](cudaError_t err) {
+        cudaGraph_t dead = nullptr;
+        cudaStreamEndCapture(root_stream, &dead);
+        if (dead != nullptr) cudaGraphDestroy(dead);
+        cudaGetLastError();
+        return err;
+    };
+
+    cudaStreamCaptureStatus st    = cudaStreamCaptureStatusNone;
+    unsigned long long      id    = 0;
+    cudaGraph_t             g     = nullptr;
+    const cudaGraphNode_t*  deps  = nullptr;
+    std::size_t             ndeps = 0;
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+    const cudaGraphEdgeData* edge_data = nullptr;
+#endif
+
+    *stage = "GetCaptureInfo(root)";
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+    rc = cudaStreamGetCaptureInfo(root_stream, &st, &id, &g, &deps, &edge_data, &ndeps);
+#else
+    rc = cudaStreamGetCaptureInfo(root_stream, &st, &id, &g, &deps, &ndeps);
+#endif
+    if (rc != cudaSuccess) return abandon_root(rc);
+    if (g == nullptr) return abandon_root(cudaErrorStreamCaptureUnsupported);
+
+    *stage = "ConditionalHandleCreate";
+    cudaGraphConditionalHandle handle{};
+    // Default 0 and NO cudaGraphCondAssignDefault: the arm kernel is the only
+    // thing entitled to open the loop, and a default of 1 would run one round
+    // on a statepoint whose cap is zero.
+    rc = cudaGraphConditionalHandleCreate(&handle, g, 0, 0);
+    if (rc != cudaSuccess) return abandon_root(rc);
+
+    *stage = "arm";
+    kPprWhileCond<<<1, 1, 0, root_stream>>>(handle, d_loop);
+    rc = cudaGetLastError();
+    if (rc != cudaSuccess) return abandon_root(rc);
+
+    *stage = "GetCaptureInfo(arm)";
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+    rc = cudaStreamGetCaptureInfo(root_stream, &st, &id, &g, &deps, &edge_data, &ndeps);
+#else
+    rc = cudaStreamGetCaptureInfo(root_stream, &st, &id, &g, &deps, &ndeps);
+#endif
+    if (rc != cudaSuccess) return abandon_root(rc);
+
+    *stage = "AddNode(while)";
+    cudaGraphNode_t cond = nullptr;
+    cudaGraph_t     body = nullptr;
+    rc                   = addPprWhileNode(&cond, g, deps, ndeps, handle, &body);
+    if (rc != cudaSuccess) return abandon_root(rc);
+
+    *stage = "UpdateCaptureDependencies";
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
+    rc = cudaStreamUpdateCaptureDependencies(root_stream, &cond, nullptr, 1,
+                                             cudaStreamSetCaptureDependencies);
+#else
+    rc = cudaStreamUpdateCaptureDependencies(root_stream, &cond, 1,
+                                             cudaStreamSetCaptureDependencies);
+#endif
+    if (rc != cudaSuccess) return abandon_root(rc);
+
+    *stage = "BeginCaptureToGraph(body)";
+    rc     = cudaStreamBeginCaptureToGraph(body_stream, body, nullptr, nullptr, 0,
+                                           cudaStreamCaptureModeRelaxed);
+    if (rc != cudaSuccess) return abandon_root(rc);
+
+    *stage              = "record(body)";
+    const bool recorded = record(body_stream);
+
+    // The body's LAST node is the stop rule, and it is the same kernel the arm
+    // is.  Issued even when `recorded` is false: the body capture has to be
+    // ended either way, and a body without it would be an infinite loop if it
+    // ever reached an exec.
+    kPprWhileCond<<<1, 1, 0, body_stream>>>(handle, d_loop);
+    const cudaError_t cond_rc = cudaGetLastError();
+
+    *stage                    = "EndCapture(body)";
+    cudaGraph_t       body_out = nullptr;
+    const cudaError_t body_rc  = cudaStreamEndCapture(body_stream, &body_out);
+
+    *stage                   = "EndCapture(root)";
+    cudaGraph_t       root    = nullptr;
+    const cudaError_t root_rc = cudaStreamEndCapture(root_stream, &root);
+
+    if (!recorded || cond_rc != cudaSuccess || body_rc != cudaSuccess ||
+        root_rc != cudaSuccess) {
+        if (root != nullptr) cudaGraphDestroy(root);
+        cudaGetLastError();
+        if (body_rc != cudaSuccess) { *stage = "EndCapture(body)"; return body_rc; }
+        if (root_rc != cudaSuccess) { *stage = "EndCapture(root)"; return root_rc; }
+        if (cond_rc != cudaSuccess) { *stage = "cond"; return cond_rc; }
+        *stage = "record(body)";
+        return cudaErrorStreamCaptureInvalidated;
+    }
+
+    *stage = "Instantiate";
+    cudaGraphExec_t exec = nullptr;
+    // 3-argument form: the legacy (errorNode, logBuffer, size) overload is gone
+    // in CUDA 13, which the 238 server builds with.
+    rc = cudaGraphInstantiate(&exec, root, 0ull);
+    if (rc != cudaSuccess) {
+        cudaGraphDestroy(root);
+        cudaGetLastError();
+        return rc;
+    }
+    *root_out = root;
+    *exec_out = exec;
+    *stage    = "ok";
+    return cudaSuccess;
+}
+
+#endif // RASBERY_HAS_PPR_WHILE
+
+/// Which loop drives the Picard iteration.  RASBERY_GPU_PPR_DEVICE_LOOP=0 puts
+/// the c502856 host-sync loop back for the A/B; RASBERY_GPU_PPR_GRAPH=1 asks
+/// for the WHILE on top of it.
+enum class LoopArm : int { HostSync = 0, DeviceStream, DeviceGraph };
+
+inline const char* loopArmName(LoopArm a) {
+    switch (a) {
+        case LoopArm::HostSync:     return "host_sync";
+        case LoopArm::DeviceStream: return "device_stream";
+        case LoopArm::DeviceGraph:  return "device_graph";
+    }
+    return "?";
+}
+
+} // namespace
 // ---------------------------------------------------------------------------
 // Impl
 // ---------------------------------------------------------------------------
@@ -658,6 +991,12 @@ struct PprBackend::Impl {
     int         device = -1;
 
     cudaStream_t stream = nullptr;
+
+    // WP6 stage B.  The arm the caller asked for, and the arm actually in use
+    // (they differ only when the graph refused and fell back to the stream).
+    LoopArm     arm_requested = LoopArm::DeviceStream;
+    LoopArm     arm           = LoopArm::DeviceStream;
+    std::string graph_refusal;
 
     // Shape this instance is sized for; a change re-allocates.
     int ng = 0, nxyz = 0, nxy = 0, nsurf = 0;
@@ -692,25 +1031,85 @@ struct PprBackend::Impl {
     double* d_partials = nullptr;
     double* h_partials = nullptr; ///< pinned, 4 * nchunk
 
+    // WP6 stage B.  The Picard loop's device-side state, and its pinned mirror.
+    // The mirror is written before the statepoint (reigv, the cap, the zeroed
+    // sums) and read after it (the round count) -- one 64-byte transfer each
+    // way, both async on the same stream, no extra synchronise.
+    PprLoopState* d_loop = nullptr;
+    PprLoopState* h_loop = nullptr;
+
+    // WP6 stage C.  3*nchunk per-chunk mismatch counts plus one folded total,
+    // only ever written under CanonicalMode::Verify.
+    unsigned long long* d_mismatch = nullptr;
+    unsigned long long* h_mismatch = nullptr; ///< pinned, 1
+
     bool geometry_uploaded = false;
+
+    // WP6 stage C.  The generations the device copies of chif / crdf were built
+    // from.  0 is "nothing uploaded yet", which always uploads.
+    unsigned long long chif_gen_seen = 0;
+    unsigned long long crdf_gen_seen = 0;
+
+#if RASBERY_HAS_PPR_WHILE
+    // WP6 stage B.  ONE instantiation per (deck, shape, bound pointer set).
+    // The key is the DevCtx the body was captured with, compared bytewise: the
+    // captured kernel nodes bake every pointer and every scalar in it, so a
+    // DevCtx that differs by one field is a graph that would replay the wrong
+    // operand.  Padding can only make the comparison say "changed", which costs
+    // an instantiation and cannot cost correctness.
+    cudaStream_t    graph_root_stream = nullptr;
+    cudaGraph_t     graph_root        = nullptr;
+    cudaGraphExec_t graph_exec        = nullptr;
+    DevCtx          graph_ctx{};
+    bool            graph_valid = false;
+#endif
 
     unsigned long long n_statepoints = 0;
     unsigned long long n_iterations  = 0;
     double             wall_ms       = 0.0;
+
+    unsigned long long n_host_syncs      = 0;
+    unsigned long long n_graph_launches  = 0;
+    unsigned long long n_graph_builds    = 0;
+    unsigned long long n_h2d_bytes       = 0;
+    unsigned long long n_h2d_elided      = 0;
+    unsigned long long n_d2h_bytes       = 0;
+    unsigned long long n_canonical_sp    = 0;
+    unsigned long long n_canonical_bad   = 0;
+    unsigned long long n_allocations     = 0;
+    unsigned long long n_reallocations   = 0;
+    unsigned long long n_shapes          = 0;
 
     cudaEvent_t ev_start = nullptr;
     cudaEvent_t ev_stop  = nullptr;
 
     ~Impl() { release(); }
 
+    void releaseGraph() {
+#if RASBERY_HAS_PPR_WHILE
+        if (graph_exec != nullptr) cudaGraphExecDestroy(graph_exec);
+        if (graph_root != nullptr) cudaGraphDestroy(graph_root);
+        graph_exec  = nullptr;
+        graph_root  = nullptr;
+        graph_valid = false;
+#endif
+    }
+
     void release() {
+        releaseGraph();
+#if RASBERY_HAS_PPR_WHILE
+        if (graph_root_stream != nullptr) cudaStreamDestroy(graph_root_stream);
+        graph_root_stream = nullptr;
+#endif
         auto f  = [](void* p) { if (p) cudaFree(p); };
         f(d_hmesh);  f(d_lktosfc); f(d_neibrb); f(d_is_fuel);
         f(d_phif);   f(d_phis);    f(d_jnet);
         f(d_xsdf);   f(d_xsrf);    f(d_xsnf);   f(d_xssm);  f(d_chif); f(d_crdf);
         f(d_phic);   f(d_p);       f(d_a);      f(d_c);     f(d_q);    f(d_l);  f(d_bt);
-        f(d_partials);
+        f(d_partials); f(d_loop);  f(d_mismatch);
         if (h_partials) cudaFreeHost(h_partials);
+        if (h_loop) cudaFreeHost(h_loop);
+        if (h_mismatch) cudaFreeHost(h_mismatch);
         if (ev_start) cudaEventDestroy(ev_start);
         if (ev_stop) cudaEventDestroy(ev_stop);
         if (stream) cudaStreamDestroy(stream);
@@ -719,8 +1118,12 @@ struct PprBackend::Impl {
         d_xsdf = d_xsrf = d_xsnf = d_xssm = d_chif = d_crdf = nullptr;
         d_phic = d_p = d_a = d_c = d_q = d_l = d_bt = nullptr;
         d_partials = nullptr; h_partials = nullptr;
+        d_loop = nullptr; h_loop = nullptr;
+        d_mismatch = nullptr; h_mismatch = nullptr;
         ev_start = nullptr; ev_stop = nullptr; stream = nullptr;
         geometry_uploaded = false;
+        chif_gen_seen = 0;
+        crdf_gen_seen = 0;
     }
 
     bool fail(const char* what, cudaError_t rc) {
@@ -737,6 +1140,11 @@ struct PprBackend::Impl {
         if (ng == g.ng && nxyz == g.nxyz && nxy == g.nxy && nsurf == g.nsurf &&
             stream != nullptr)
             return true;
+        // WP6 stage E.  A RE-shape is the thing a per-slot backend must not do
+        // per statepoint, so it is counted rather than assumed away: a run whose
+        // receipt says `reallocations > 0` allocated inside the statepoint loop.
+        if (n_shapes > 0) ++n_reallocations;
+        ++n_shapes;
         release();
         ng     = g.ng;
         nxyz   = g.nxyz;
@@ -783,20 +1191,52 @@ struct PprBackend::Impl {
             {(void**)&d_l,       nng * 9 * sizeof(double),            "l"},
             {(void**)&d_bt,      nng * sizeof(double),                "bt"},
             {(void**)&d_partials, static_cast<size_t>(4 * nchunk) * sizeof(double), "partials"},
+            {(void**)&d_loop,    sizeof(PprLoopState),                "loop_state"},
+            {(void**)&d_mismatch,
+             (static_cast<size_t>(3 * nchunk) + 1) * sizeof(unsigned long long), "mismatch"},
         };
         for (const Alloc& a : allocs) {
             rc = cudaMalloc(a.p, a.bytes);
             if (rc != cudaSuccess) return fail(a.name, rc);
+            ++n_allocations;
         }
         rc = cudaMallocHost((void**)&h_partials,
                             static_cast<size_t>(4 * nchunk) * sizeof(double));
         if (rc != cudaSuccess) return fail("cudaMallocHost(partials)", rc);
+        ++n_allocations;
+        rc = cudaMallocHost((void**)&h_loop, sizeof(PprLoopState));
+        if (rc != cudaSuccess) return fail("cudaMallocHost(loop_state)", rc);
+        ++n_allocations;
+        rc = cudaMallocHost((void**)&h_mismatch, sizeof(unsigned long long));
+        if (rc != cudaSuccess) return fail("cudaMallocHost(mismatch)", rc);
+        ++n_allocations;
         return true;
     }
 };
 
 PprBackend::PprBackend() : _impl(new Impl) {
     _impl->enabled = truthy(std::getenv("RASBERY_GPU_PPR"));
+    // WP6 stage B.  The device loop is the DEFAULT inside an arm that is itself
+    // default off; RASBERY_GPU_PPR_DEVICE_LOOP=0 restores c502856's per-round
+    // host synchronise, which is the A/B control and nothing else.  The WHILE is
+    // opt-in on top of it, for the same reason RASBERY_GPU_OUTER_GRAPH is: a
+    // capture freezes the body's operands, which is a different KIND of claim
+    // from "the same kernels in the same order".
+    {
+        const char* e = std::getenv("RASBERY_GPU_PPR_DEVICE_LOOP");
+        const bool  device_loop = (e == nullptr) ? true : truthy(e);
+        const bool  want_graph  = truthy(std::getenv("RASBERY_GPU_PPR_GRAPH"));
+        _impl->arm_requested =
+            !device_loop ? LoopArm::HostSync
+                         : (want_graph ? LoopArm::DeviceGraph : LoopArm::DeviceStream);
+        _impl->arm = _impl->arm_requested;
+#if !RASBERY_HAS_PPR_WHILE
+        if (_impl->arm == LoopArm::DeviceGraph) {
+            _impl->arm           = LoopArm::DeviceStream;
+            _impl->graph_refusal = "toolkit < 12.3 (no conditional nodes)";
+        }
+#endif
+    }
     if (!_impl->enabled) {
         _impl->status_text = "off (RASBERY_GPU_PPR unset)";
         return;
@@ -823,6 +1263,25 @@ unsigned long long PprBackend::iterations() const { return _impl->n_iterations; 
 double             PprBackend::wallMs() const { return _impl->wall_ms; }
 int                PprBackend::deviceOrdinal() const { return _impl->device; }
 
+const char*        PprBackend::loopArm() const { return loopArmName(_impl->arm); }
+unsigned long long PprBackend::hostSyncs() const { return _impl->n_host_syncs; }
+double             PprBackend::hostSyncsPerStatepoint() const {
+    return (_impl->n_statepoints == 0)
+               ? 0.0
+               : static_cast<double>(_impl->n_host_syncs) /
+                     static_cast<double>(_impl->n_statepoints);
+}
+unsigned long long PprBackend::graphLaunches() const { return _impl->n_graph_launches; }
+unsigned long long PprBackend::graphBuilds() const { return _impl->n_graph_builds; }
+const std::string& PprBackend::graphRefusal() const { return _impl->graph_refusal; }
+unsigned long long PprBackend::h2dBytes() const { return _impl->n_h2d_bytes; }
+unsigned long long PprBackend::h2dBytesElided() const { return _impl->n_h2d_elided; }
+unsigned long long PprBackend::d2hBytes() const { return _impl->n_d2h_bytes; }
+unsigned long long PprBackend::canonicalStatepoints() const { return _impl->n_canonical_sp; }
+unsigned long long PprBackend::canonicalMismatch() const { return _impl->n_canonical_bad; }
+unsigned long long PprBackend::allocations() const { return _impl->n_allocations; }
+unsigned long long PprBackend::reallocations() const { return _impl->n_reallocations; }
+
 
 bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& step,
                                int niter, int* iters) {
@@ -832,6 +1291,7 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
         s.status_text = "declined: ng != 2 (updateSource body is 2-group)";
         return false;
     }
+    if (niter <= 0) return false;
     if (!s.ensureShape(geom)) return false;
 
     const size_t nn  = static_cast<size_t>(geom.nxyz);
@@ -841,6 +1301,13 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
     cudaError_t rc = cudaSuccess;
     auto        h2d = [&](void* d, const void* h, size_t bytes, const char* name) -> bool {
         rc = cudaMemcpyAsync(d, h, bytes, cudaMemcpyHostToDevice, s.stream);
+        if (rc != cudaSuccess) return s.fail(name, rc);
+        s.n_h2d_bytes += bytes;
+        return true;
+    };
+    auto sync = [&](const char* name) -> bool {
+        rc = cudaStreamSynchronize(s.stream);
+        ++s.n_host_syncs;
         if (rc != cudaSuccess) return s.fail(name, rc);
         return true;
     };
@@ -853,17 +1320,67 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
         s.geometry_uploaded = true;
     }
 
-    if (!h2d(s.d_phif, step.phif, nng * sizeof(double), "H2D phif")) return false;
-    if (!h2d(s.d_phis, step.phis, nsg * sizeof(double), "H2D phis")) return false;
-    if (!h2d(s.d_jnet, step.jnet, nsg * sizeof(double), "H2D jnet")) return false;
+    // --- WP6 stage C: which of the three nodal arrays are borrowed ----------
+    //
+    // ALL THREE OR NONE.  A borrowed jnet paired with an uploaded phif is two
+    // different outer iterations blended into one reconstruction, which is the
+    // shape gpu::canonicalNodalSetIsCoherent refuses one layer up; refusing it
+    // again here means the rule holds even if a future caller forgets it.
+    const bool have_set = step.dev_phif != nullptr && step.dev_phis != nullptr &&
+                          step.dev_jnet != nullptr;
+    const bool borrow = step.canonical != ppr::CanonicalMode::Off && have_set;
+    const bool verify = borrow && step.canonical == ppr::CanonicalMode::Verify;
+
+    const size_t nodal_bytes = (nng + 2 * nsg) * sizeof(double);
+    if (!borrow || verify) {
+        if (!h2d(s.d_phif, step.phif, nng * sizeof(double), "H2D phif")) return false;
+        if (!h2d(s.d_phis, step.phis, nsg * sizeof(double), "H2D phis")) return false;
+        if (!h2d(s.d_jnet, step.jnet, nsg * sizeof(double), "H2D jnet")) return false;
+    } else {
+        s.n_h2d_elided += nodal_bytes;
+    }
+
     if (!h2d(s.d_xsdf, step.xsdf, nng * sizeof(double), "H2D xsdf")) return false;
     if (!h2d(s.d_xsrf, step.xsrf, nng * sizeof(double), "H2D xsrf")) return false;
     if (!h2d(s.d_xsnf, step.xsnf, nng * sizeof(double), "H2D xsnf")) return false;
     if (!h2d(s.d_xssm, step.xssm, nn * geom.ng * geom.ng * sizeof(double), "H2D xssm")) return false;
-    if (step.chif != nullptr &&
-        !h2d(s.d_chif, step.chif, nng * sizeof(double), "H2D chif"))
-        return false;
-    if (!h2d(s.d_crdf, step.crdf, nng * sizeof(double), "H2D crdf")) return false;
+
+    // chif and crdf do NOT move every statepoint (the fission spectrum moves
+    // when the library reference blocks are rebuilt; crdf is all-ones unless
+    // RASBERY_PPR_CRDF).  A generation of 0 means the caller cannot vouch for
+    // it, which uploads -- the conservative direction.
+    if (step.chif != nullptr) {
+        const bool stale = (step.chif_generation == 0) || (s.chif_gen_seen == 0) ||
+                           (step.chif_generation != s.chif_gen_seen);
+        if (stale) {
+            if (!h2d(s.d_chif, step.chif, nng * sizeof(double), "H2D chif")) return false;
+            s.chif_gen_seen = step.chif_generation;
+        } else {
+            s.n_h2d_elided += nng * sizeof(double);
+        }
+    }
+    {
+        const bool stale = (step.crdf_generation == 0) || (s.crdf_gen_seen == 0) ||
+                           (step.crdf_generation != s.crdf_gen_seen);
+        if (stale) {
+            if (!h2d(s.d_crdf, step.crdf, nng * sizeof(double), "H2D crdf")) return false;
+            s.crdf_gen_seen = step.crdf_generation;
+        } else {
+            s.n_h2d_elided += nng * sizeof(double);
+        }
+    }
+
+    // --- the per-statepoint scalars, and the loop's own state ---------------
+    s.h_loop->reigv     = step.reigv;
+    s.h_loop->iters     = 0;
+    s.h_loop->converged = 0;
+    s.h_loop->niter     = niter;
+    s.h_loop->pad       = 0;
+    for (int i = 0; i < 4; ++i) {
+        s.h_loop->prev[i] = 0.0;
+        s.h_loop->cur[i]  = 0.0;
+    }
+    if (!h2d(s.d_loop, s.h_loop, sizeof(PprLoopState), "H2D loop state")) return false;
 
     DevCtx& x   = s.ctx;
     x.ng        = geom.ng;
@@ -871,14 +1388,16 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
     x.nxy       = geom.nxy;
     x.nsurf     = geom.nsurf;
     x.has_chif  = (step.chif != nullptr) ? 1 : 0;
-    x.reigv     = step.reigv;
+    x.nchunk    = s.nchunk;
+    x.loop      = s.d_loop;
+    x.partials  = s.d_partials;
     x.hmesh     = s.d_hmesh;
     x.lktosfc   = s.d_lktosfc;
     x.neibrb    = s.d_neibrb;
     x.is_fuel   = s.d_is_fuel;
-    x.phif      = s.d_phif;
-    x.phis      = s.d_phis;
-    x.jnet      = s.d_jnet;
+    x.phif      = borrow ? step.dev_phif : s.d_phif;
+    x.phis      = borrow ? step.dev_phis : s.d_phis;
+    x.jnet      = borrow ? step.dev_jnet : s.d_jnet;
     x.xsdf      = s.d_xsdf;
     x.xsrf      = s.d_xsrf;
     x.xsnf      = s.d_xsnf;
@@ -905,53 +1424,141 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
 
     cudaEventRecord(s.ev_start, s.stream);
 
+    // WP6 stage C, verify mode: compare the borrowed buffers against the host
+    // arrays (already uploaded into this instance's own block above) BEFORE
+    // anything reads them, so a run that reports a mismatch also reports the
+    // physics that mismatch produced rather than hiding one behind the other.
+    if (verify) {
+        kCanonicalCompare<<<blocks_ch, threads, 0, s.stream>>>(
+            step.dev_phif, s.d_phif, static_cast<long long>(nng), s.nchunk, 0, s.d_mismatch);
+        kCanonicalCompare<<<blocks_ch, threads, 0, s.stream>>>(
+            step.dev_phis, s.d_phis, static_cast<long long>(nsg), s.nchunk, 1, s.d_mismatch);
+        kCanonicalCompare<<<blocks_ch, threads, 0, s.stream>>>(
+            step.dev_jnet, s.d_jnet, static_cast<long long>(nsg), s.nchunk, 2, s.d_mismatch);
+        kFoldMismatch<<<1, 1, 0, s.stream>>>(s.d_mismatch, 3 * s.nchunk);
+        if ((rc = cudaGetLastError()) != cudaSuccess) return s.fail("canonical compare", rc);
+    }
+
     // reset()
     kBuckling<<<blocks_ng, threads, 0, s.stream>>>(x);
     kCornerInit<<<blocks_ng, threads, 0, s.stream>>>(x);
     kFit<<<blocks_ng, threads, 0, s.stream>>>(x);
     kAxialLeakage<<<blocks_ng, threads, 0, s.stream>>>(x);
-    kUpdateSource<<<blocks_n, threads, 0, s.stream>>>(x);
+    kUpdateSource<false><<<blocks_n, threads, 0, s.stream>>>(x);
 
     if ((rc = cudaGetLastError()) != cudaSuccess) return s.fail("reset kernels", rc);
 
-    // drive(niter): the host's loop, kernel for kernel, break test for break test.
-    double prev_nw = 0.0, prev_sw = 0.0, prev_ne = 0.0, prev_se = 0.0;
-    int    iters_done = 0;
-    for (int citer = 0; citer < niter; ++citer) {
-        for (int f = 0; f < kSourceSweepsPerIteration; ++f) {
-            kUpdateFused<<<blocks_ng, threads, 0, s.stream>>>(x);
-            kUpdateSource<<<blocks_n, threads, 0, s.stream>>>(x);
+    // --- drive(niter) -------------------------------------------------------
+    //
+    // ONE Picard round, spelled once.  All three arms enqueue exactly this and
+    // differ only in WHO decides to run it again: the host after a synchronise,
+    // the enqueue count with the device flag making the surplus rounds no-ops,
+    // or the WHILE's predicate.
+    auto enqueue_round = [&](cudaStream_t st, bool guarded) {
+        if (guarded) {
+            for (int f = 0; f < kSourceSweepsPerIteration; ++f) {
+                kUpdateFused<true><<<blocks_ng, threads, 0, st>>>(x);
+                kUpdateSource<true><<<blocks_n, threads, 0, st>>>(x);
+            }
+            kUpdateCorner<true><<<blocks_ng, threads, 0, st>>>(x);
+            kCornerPartials<true><<<blocks_ch, threads, 0, st>>>(x);
+            kCornerFoldAndCheck<<<1, 4, 0, st>>>(x);
+        } else {
+            for (int f = 0; f < kSourceSweepsPerIteration; ++f) {
+                kUpdateFused<false><<<blocks_ng, threads, 0, st>>>(x);
+                kUpdateSource<false><<<blocks_n, threads, 0, st>>>(x);
+            }
+            kUpdateCorner<false><<<blocks_ng, threads, 0, st>>>(x);
+            kCornerPartials<false><<<blocks_ch, threads, 0, st>>>(x);
         }
-        kUpdateCorner<<<blocks_ng, threads, 0, s.stream>>>(x);
-        kCornerPartials<<<blocks_ch, threads, 0, s.stream>>>(x, s.nchunk, s.d_partials);
+    };
 
-        rc = cudaMemcpyAsync(s.h_partials, s.d_partials,
-                             static_cast<size_t>(4 * s.nchunk) * sizeof(double),
-                             cudaMemcpyDeviceToHost, s.stream);
-        if (rc != cudaSuccess) return s.fail("D2H corner partials", rc);
-        if ((rc = cudaStreamSynchronize(s.stream)) != cudaSuccess)
-            return s.fail("drive sync", rc);
+    int iters_done = 0;
 
-        double nw = 0.0, sw = 0.0, ne = 0.0, se = 0.0;
-        for (int c = 0; c < s.nchunk; ++c) nw += s.h_partials[0 * s.nchunk + c];
-        for (int c = 0; c < s.nchunk; ++c) sw += s.h_partials[1 * s.nchunk + c];
-        for (int c = 0; c < s.nchunk; ++c) ne += s.h_partials[2 * s.nchunk + c];
-        for (int c = 0; c < s.nchunk; ++c) se += s.h_partials[3 * s.nchunk + c];
+    if (s.arm == LoopArm::HostSync) {
+        // c502856, verbatim: the host folds the partials and applies the test.
+        double prev_nw = 0.0, prev_sw = 0.0, prev_ne = 0.0, prev_se = 0.0;
+        for (int citer = 0; citer < niter; ++citer) {
+            enqueue_round(s.stream, false);
 
-        const double err_nw = relativeChange(nw, prev_nw);
-        const double err_sw = relativeChange(sw, prev_sw);
-        const double err_ne = relativeChange(ne, prev_ne);
-        const double err_se = relativeChange(se, prev_se);
+            rc = cudaMemcpyAsync(s.h_partials, s.d_partials,
+                                 static_cast<size_t>(4 * s.nchunk) * sizeof(double),
+                                 cudaMemcpyDeviceToHost, s.stream);
+            if (rc != cudaSuccess) return s.fail("D2H corner partials", rc);
+            s.n_d2h_bytes += static_cast<size_t>(4 * s.nchunk) * sizeof(double);
+            if (!sync("drive sync")) return false;
 
-        iters_done = citer + 1;
-        if (err_nw < kCornerFluxTolerance && err_sw < kCornerFluxTolerance &&
-            err_ne < kCornerFluxTolerance && err_se < kCornerFluxTolerance)
-            break;
+            double nw = 0.0, sw = 0.0, ne = 0.0, se = 0.0;
+            for (int c = 0; c < s.nchunk; ++c) nw += s.h_partials[0 * s.nchunk + c];
+            for (int c = 0; c < s.nchunk; ++c) sw += s.h_partials[1 * s.nchunk + c];
+            for (int c = 0; c < s.nchunk; ++c) ne += s.h_partials[2 * s.nchunk + c];
+            for (int c = 0; c < s.nchunk; ++c) se += s.h_partials[3 * s.nchunk + c];
 
-        prev_nw = nw;
-        prev_sw = sw;
-        prev_ne = ne;
-        prev_se = se;
+            const double err_nw = relativeChange(nw, prev_nw);
+            const double err_sw = relativeChange(sw, prev_sw);
+            const double err_ne = relativeChange(ne, prev_ne);
+            const double err_se = relativeChange(se, prev_se);
+
+            iters_done = citer + 1;
+            if (err_nw < kCornerFluxTolerance && err_sw < kCornerFluxTolerance &&
+                err_ne < kCornerFluxTolerance && err_se < kCornerFluxTolerance)
+                break;
+
+            prev_nw = nw;
+            prev_sw = sw;
+            prev_ne = ne;
+            prev_se = se;
+        }
+    } else {
+#if RASBERY_HAS_PPR_WHILE
+        if (s.arm == LoopArm::DeviceGraph) {
+            // The key is the body's baked operands.  A borrow that engaged (or
+            // stopped engaging) between statepoints moves x.phif/phis/jnet, and
+            // replaying a graph captured with the old pointers would read the
+            // wrong buffer with every value finite.
+            if (s.graph_valid && std::memcmp(&s.graph_ctx, &x, sizeof(DevCtx)) != 0)
+                s.releaseGraph();
+            if (!s.graph_valid) {
+                if (s.graph_root_stream == nullptr &&
+                    (rc = cudaStreamCreate(&s.graph_root_stream)) != cudaSuccess)
+                    return s.fail("cudaStreamCreate(graph root)", rc);
+                const char* stage = "?";
+                cudaGraph_t root  = nullptr;
+                cudaGraphExec_t exec = nullptr;
+                const cudaError_t brc = buildPprWhile(
+                    s.graph_root_stream, s.stream, s.d_loop, &stage,
+                    [&](cudaStream_t bs) {
+                        enqueue_round(bs, true);
+                        return cudaGetLastError() == cudaSuccess;
+                    },
+                    &root, &exec);
+                if (brc == cudaSuccess) {
+                    s.graph_root  = root;
+                    s.graph_exec  = exec;
+                    s.graph_ctx   = x;
+                    s.graph_valid = true;
+                    ++s.n_graph_builds;
+                } else {
+                    // A REFUSAL IS NOT A FAILURE.  Capture is the only claim in
+                    // this arm that the stream arm does not also make, so the
+                    // stream arm is what a refusal falls back to -- for the rest
+                    // of the run, named, and never to the host.
+                    s.graph_refusal = std::string(stage) + ": " + cudaGetErrorString(brc);
+                    s.arm           = LoopArm::DeviceStream;
+                    cudaGetLastError();
+                }
+            }
+            if (s.graph_valid) {
+                rc = cudaGraphLaunch(s.graph_exec, s.stream);
+                if (rc != cudaSuccess) return s.fail("cudaGraphLaunch(ppr while)", rc);
+                ++s.n_graph_launches;
+            }
+        }
+#endif
+        if (s.arm == LoopArm::DeviceStream) {
+            for (int citer = 0; citer < niter; ++citer) enqueue_round(s.stream, true);
+        }
+        if ((rc = cudaGetLastError()) != cudaSuccess) return s.fail("drive kernels", rc);
     }
 
     // Only what the host reconstruction reads comes back; phic follows so the
@@ -966,6 +1573,7 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
     auto d2h = [&](void* h, const void* d, size_t bytes, const char* name) -> bool {
         rc = cudaMemcpyAsync(h, d, bytes, cudaMemcpyDeviceToHost, s.stream);
         if (rc != cudaSuccess) return s.fail(name, rc);
+        s.n_d2h_bytes += bytes;
         return true;
     };
     if (!d2h(step.p, s.d_p, nng * 15 * sizeof(double), "D2H p")) return false;
@@ -975,13 +1583,24 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
     if (!d2h(step.phic, s.d_phic, nng * 4 * sizeof(double), "D2H phic")) return false;
     if (!d2h(step.q, s.d_q, nng * 15 * sizeof(double), "D2H q")) return false;
     if (!d2h(step.l, s.d_l, nng * 9 * sizeof(double), "D2H l")) return false;
+    // The round count rides the same batch: on the device arms it is the only
+    // way the host learns how many rounds ran, and it costs no extra sync.
+    if (!d2h(s.h_loop, s.d_loop, sizeof(PprLoopState), "D2H loop state")) return false;
+    if (verify &&
+        !d2h(s.h_mismatch, s.d_mismatch + 3 * s.nchunk, sizeof(unsigned long long),
+             "D2H canonical mismatch"))
+        return false;
 
     cudaEventRecord(s.ev_stop, s.stream);
-    if ((rc = cudaStreamSynchronize(s.stream)) != cudaSuccess) return s.fail("final sync", rc);
+    if (!sync("final sync")) return false;
 
     float ms = 0.0f;
     if (cudaEventElapsedTime(&ms, s.ev_start, s.ev_stop) == cudaSuccess)
         s.wall_ms += static_cast<double>(ms);
+
+    if (s.arm != LoopArm::HostSync) iters_done = s.h_loop->iters;
+    if (borrow) ++s.n_canonical_sp;
+    if (verify) s.n_canonical_bad += *s.h_mismatch;
 
     ++s.n_statepoints;
     s.n_iterations += static_cast<unsigned long long>(iters_done);

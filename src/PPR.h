@@ -51,6 +51,30 @@ namespace rasbery {
 // so CohortContext.h can hold the table without dragging Geometry, XSSet and
 // the CUDA backend header in behind it.
 
+/// WP6 stage C.  The device-resident nodal arrays the CALLER is offering PPR in
+/// place of the host copies it would otherwise upload.
+///
+/// BORROWED AND ALL-OR-NOTHING.  These are GpuPhysicsArena addresses reached
+/// through CudaOuterSegment::canonicalNodalSet(), which already answers "not
+/// yet" with an empty set rather than with a partial one; PPR checks the rule a
+/// second time because the cost of getting it wrong is a reconstruction that
+/// blends two different outer iterations and looks entirely plausible.
+///
+/// The MODE is the caller's, not this class's: `Verify` uploads the host copies
+/// as well and has the device compare them elementwise, which is how 238
+/// establishes that the borrow is sound for a deck instead of the header
+/// asserting that it is.
+struct PprCanonicalInputs {
+    ppr::CanonicalMode mode = ppr::CanonicalMode::Off;
+    const double*      phif = nullptr;
+    const double*      phis = nullptr;
+    const double*      jnet = nullptr;
+
+    [[nodiscard]] bool complete() const {
+        return phif != nullptr && phis != nullptr && jnet != nullptr;
+    }
+};
+
 class PPR {
 private:
     Geometry& _g;
@@ -122,6 +146,18 @@ private:
     /// Corner-balance iterations spent by the host drive() over this run.
     unsigned long long _host_iters = 0;
 
+    /// WP6 stage C.  What the caller most recently offered, and how much of it
+    /// PPR is allowed to use.  Re-offered per statepoint (the arena addresses
+    /// are fixed, but whether the binding is LIVE is not), so a stale offer
+    /// cannot outlive the segment that made it.
+    PprCanonicalInputs _canonical;
+
+    /// The generation of `_crdf`.  It moves only when the corner-DF correction
+    /// is enabled AND recomputed; with RASBERY_PPR_CRDF off the array is all
+    /// ones for the life of the run, which is exactly the case the device arm
+    /// should upload once and never again.
+    unsigned long long _crdf_generation = 1;
+
     /// @brief MASTER MM 6.1 reconstruction: fill _c with the 13-term Legendre
     /// coefficients (even terms from surfaces/currents, cross terms from the
     /// CPB corner solve).
@@ -183,6 +219,14 @@ public:
     /// same way reset() sets them.
     bool resetAndDriveGpu(double reigv, double* jnet, const double* phif,
                           double* phis, int niter);
+
+    /// @brief WP6 stage C.  Offer (or withdraw) the device-resident nodal set.
+    ///
+    /// Called once per statepoint by the Driver, immediately before
+    /// resetAndDriveGpu.  A default-constructed argument withdraws the offer,
+    /// which is what a statepoint whose outer segment was not resident must
+    /// pass -- silence would leave the previous statepoint's offer standing.
+    void adoptCanonicalDeviceInputs(const PprCanonicalInputs& in) { _canonical = in; }
 
     /// @brief The device arm's receipt source (never null).
     [[nodiscard]] const PprBackend& gpu() const { return *_gpu; }

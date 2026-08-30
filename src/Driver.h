@@ -4864,6 +4864,36 @@ public:
             // ppr_drive, so `ppr_reset + ppr_drive` is the like-for-like
             // comparison between the two arms and `ppr_reset == 0` is how the
             // receipt says which one ran.
+            //
+            // WP6 stage C.  THE OFFER IS MADE PER STATEPOINT, AND WITHDRAWN THE
+            // SAME WAY.  The arena's per-slot addresses are fixed for the run,
+            // but whether the SEGMENT is still the thing that wrote them is not:
+            // a statepoint whose outer ran on the host leaves the device buffers
+            // an outer stale, and PPR reading them would blend two iterations
+            // with every value finite.  `canonicalNodalBound()` is the segment's
+            // own answer to "did a backend adopt this set and is it live", which
+            // is why it -- and not the mere existence of the pointers -- is the
+            // condition.  A default-constructed offer WITHDRAWS: silence would
+            // leave the previous statepoint's standing.
+            {
+                PprCanonicalInputs       ppr_canon;
+                const ppr::CanonicalMode ppr_canon_mode = ppr::canonicalModeFromEnv();
+                if (ppr_canon_mode != ppr::CanonicalMode::Off) {
+                    // OuterSlotClaim::query()'s rule, spelled the same way: -1
+                    // (no resident CMFD) asks segment 0, which is the segment the
+                    // single-instance path binds.
+                    const int resident = cmfd_solver.residentSlot();
+                    auto&     seg = gpu::rasberyOuterSegment(resident >= 0 ? resident : 0);
+                    if (seg.canonicalNodalBound()) {
+                        const gpu::CanonicalSlotBuffers set = seg.canonicalNodalSet();
+                        ppr_canon.mode = ppr_canon_mode;
+                        ppr_canon.phif = set.flux;
+                        ppr_canon.phis = set.phis;
+                        ppr_canon.jnet = set.jnet;
+                    }
+                }
+                pin_power_reconstruction.adoptCanonicalDeviceInputs(ppr_canon);
+            }
             bool ppr_on_device = false;
             {
                 outer_timing::Scope ppr_drive_scope(sptelem::PH_PPR_DRIVE);
@@ -5155,14 +5185,36 @@ public:
             // comparison would have only one side.  A run with neither is
             // byte-identical on stdout to the binary before this change.
             if (g.available() || g.statepoints() > 0 || sp_telem) {
+                // WP6 raised schema_version to 2.  The stage B/C/E numbers
+                // are the whole point of the work package and none of them
+                // is derivable from the four that were here before:
+                // `host_syncs_per_statepoint` says whether the per-round
+                // synchronise actually went away, `h2d_bytes` /
+                // `h2d_bytes_elided` price the borrow, `canonical_mismatch`
+                // says whether the borrow was SOUND, and `allocations` /
+                // `reallocations` are stage E's "once per slot, not once
+                // per statepoint".
                 std::cout << std::format(
-                    "  [RASBERY][PPR_GPU] {{\"schema_version\":1,\"slot\":{},"
+                    "  [RASBERY][PPR_GPU] {{\"schema_version\":2,\"slot\":{},"
                     "\"statepoints\":{},\"device\":{},\"host_fallbacks\":{},"
                     "\"iterations\":{},\"host_iterations\":{},"
+                    "\"loop_arm\":\"{}\",\"host_syncs\":{},"
+                    "\"host_syncs_per_statepoint\":{:.3f},"
+                    "\"graph_launches\":{},\"graph_builds\":{},"
+                    "\"graph_refusal\":\"{}\",\"canonical_mode\":\"{}\","
+                    "\"canonical_statepoints\":{},\"canonical_mismatch\":{},"
+                    "\"h2d_bytes\":{},\"h2d_bytes_elided\":{},\"d2h_bytes\":{},"
+                    "\"allocations\":{},\"reallocations\":{},"
                     "\"wall_ms\":{:.3f},\"status\":\"{}\"}}\n",
                     cmfd_solver.batchSlot(), g.statepoints(), g.deviceOrdinal(),
                     ppr_host_statepoints, g.iterations(),
-                    pin_power_reconstruction.hostIterations(), g.wallMs(), g.status());
+                    pin_power_reconstruction.hostIterations(), g.loopArm(),
+                    g.hostSyncs(), g.hostSyncsPerStatepoint(), g.graphLaunches(),
+                    g.graphBuilds(), g.graphRefusal(),
+                    ppr::canonicalModeName(ppr::canonicalModeFromEnv()),
+                    g.canonicalStatepoints(), g.canonicalMismatch(), g.h2dBytes(),
+                    g.h2dBytesElided(), g.d2hBytes(), g.allocations(),
+                    g.reallocations(), g.wallMs(), g.status());
             }
         }
 

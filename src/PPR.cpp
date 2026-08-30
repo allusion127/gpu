@@ -89,6 +89,12 @@ bool PPR::resetAndDriveGpu(const double reigv, double* jnet, const double* phif,
             for (int g = 0; g < _ng; g++)
                 _crdf[static_cast<size_t>(lk) * _ng + g] = model.CornerToSurfaceDFRatio(g, burn);
         }
+        // WP6 stage C.  The array was just rewritten, so the device copy is
+        // stale -- bumped HERE, at the write, and nowhere else: a bump at the
+        // caller would be a policy that a second writer could silently break.
+        // With the correction off this line never runs and the generation holds
+        // at 1 forever, which is what turns crdf into a one-time upload.
+        ++_crdf_generation;
     }
 
     const size_t nng = static_cast<size_t>(_nxyz) * _ng;
@@ -124,6 +130,21 @@ bool PPR::resetAndDriveGpu(const double reigv, double* jnet, const double* phif,
     step.xssm  = _xs.xssmData();
     step.chif  = _xs.chifData();
     step.crdf  = _crdf.data();
+    // WP6 stage C.  chif is the burnup-interpolated fission spectrum, rebuilt
+    // by PrecomputeBranchCoefficients (XSSet::_ref_generation) and NOT once per
+    // statepoint; crdf carries PPR's own counter.  Everything else in StepView
+    // moves every statepoint and is uploaded every statepoint.
+    step.chif_generation = _xs.refGeneration();
+    step.crdf_generation = _crdf_generation;
+    // The borrowed nodal set, if the caller offered one this statepoint.  The
+    // completeness test is repeated here rather than trusted: a partial set
+    // would pair a device jnet with an uploaded phif.
+    if (_canonical.mode != ppr::CanonicalMode::Off && _canonical.complete()) {
+        step.canonical = _canonical.mode;
+        step.dev_phif  = _canonical.phif;
+        step.dev_phis  = _canonical.phis;
+        step.dev_jnet  = _canonical.jnet;
+    }
     step.phic  = _phic;
     step.p     = _p;
     step.a     = _a;
@@ -279,6 +300,12 @@ void PPR::reset(const double reigv, double* jnet, const double* phif, double* ph
             for (int g = 0; g < _ng; g++)
                 _crdf[static_cast<size_t>(lk) * _ng + g] = model.CornerToSurfaceDFRatio(g, burn);
         }
+        // WP6 stage C.  The array was just rewritten, so the device copy is
+        // stale -- bumped HERE, at the write, and nowhere else: a bump at the
+        // caller would be a policy that a second writer could silently break.
+        // With the correction off this line never runs and the generation holds
+        // at 1 forever, which is what turns crdf into a one-time upload.
+        ++_crdf_generation;
     }
 
     for (int lk = 0; lk < _nxyz; lk++) {
