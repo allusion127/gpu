@@ -194,16 +194,49 @@ inline std::size_t queueByteLimit() {
 // the same order from the same values, so the file is byte-identical; only the
 // thread and the moment differ.
 //
-//   RASBERY_RESULT_ASYNC unset/0  -> sync   (default; the pre-WP12 path)
+//   RASBERY_RESULT_ASYNC unset    -> async  (DEFAULT since the v5 freeze)
+//   RASBERY_RESULT_ASYNC=0        -> sync   (the off switch; the pre-WP12 path)
 //   RASBERY_RESULT_ASYNC=1        -> async  (needs the writer thread)
 //
 // Feature-off is not a second code path: the snapshot is never built, the task
 // is never formed, and the emitter runs inline exactly where it used to.
+//
+// THE DEFAULT FLIPPED, AND WHAT PAID FOR IT.  The gate's whole claim is that
+// the CSV is produced by the same code from the same values in the same order,
+// so only the thread and the moment change -- and that claim is checkable in
+// exactly one way, which is `cmp` on the two files, because h5diff cannot see a
+// CSV at all.  Both hosts ran that comparison on 2026-08-30:
+//
+//   238  pricing_388e8f2.md block 11 -- sync and async CSVs both 119,013,281
+//        bytes, `cmp` identical; h5diff 0; digest 1f36e75dc00ed2b4 / 4377 on
+//        both arms; wall 14.432 -> 11.952 s, io_wall 2.894 -> 0.111 s.
+//   181  gates_8919331.md block 13 -- three arms (sync, async, async+CTA), all
+//        CSVs 119,013,920 bytes and `cmp` identical pairwise, h5diff 0/0,
+//        digest 1afab8adb152bb44 / 4381 on all three.
+//
+// TWO NO-OPS THE FLIP MUST NOT DISTURB, and does not:
+//
+//   * `--result light` (and batch, which is light by default) writes no result
+//     records at all, so there is no CSV to move.  The [RASBERY][RESULT_IO]
+//     receipt still prints, with records:0 and bytes:0 -- 238 block 13-i
+//     confirms the all-zero line under a light batch.  A no-op is what this
+//     must be, and the receipt says so rather than leaving a reader to assume
+//     it.
+//   * RASBERY_IO_WRITER=inline has no second thread to hand a task to, so
+//     resultAsyncEnabled() below degrades the request to sync and the receipt
+//     records `sync`.  That degradation is unchanged by the flip: it now
+//     applies to a request nobody typed, which is precisely what a default is.
 // ---------------------------------------------------------------------------
 inline bool resultAsyncRequested() {
     static const bool requested = [] {
         const char* value = std::getenv("RASBERY_RESULT_ASYNC");
-        if (value == nullptr || *value == '\0') return false;
+        // Unset is the default arm.  An EMPTY string is not: an exported but
+        // empty variable is how a shell spells "off" by accident, and every
+        // other RASBERY_* gate reads it that way (envFlagDisabled treats "" as
+        // falsy), so this one must too or two knobs would disagree about the
+        // same shell.
+        if (value == nullptr) return true;
+        if (*value == '\0') return false;
         std::string v(value);
         std::transform(v.begin(), v.end(), v.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });

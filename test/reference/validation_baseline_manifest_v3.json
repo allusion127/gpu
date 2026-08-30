@@ -3,10 +3,12 @@
   "frozen": false,
   "frozen_utc": "TBD_V3_FREEZE",
   "supersedes": "validation_baseline_manifest_v2.json",
-  "status": "SKELETON. Every TBD_V3_FREEZE below is filled by the validation runner from the v3 freeze run on 238 (protocol in docs/V3_FREEZE_20260829_KO.md s6). Nothing here is authoritative until \"frozen\" is true.",
+  "status": "PARTIALLY FILLED SKELETON, still frozen:false. The fields the 2026-08-30 PROD verification pass measured directly (docs/PRICING_PROD_20260830_KO.md block 1: the v3 freeze commit 926497d, its digest, its outer count and its wall) have been written in. Every remaining TBD_V3_FREEZE needs the v3 freeze PROTOCOL run (docs/V3_FREEZE_20260829_KO.md s6) and cannot be recovered from any existing report. Nothing here is authoritative until \"frozen\" is true.",
+  "partial_fill_20260830": "WHAT WAS FILLED AND FROM WHERE. baseline_commit_sha, golden_outputs.trajectory_digest, golden_outputs.outers_total and throughput_baselines.single_deck_wall_s come from the 2026-08-30 238 PROD verification: three commits, warm-up 1 + hot 3 each, all three at the same digest and outer count and mutually h5diff 0. WHAT WAS NOT, AND WHY. The compiler and GPU provenance strings, the h5 sha256, the dataset count, the repeat walls, the determinism check, the Anderson health counters, the 238 instrumentation-neutrality result and the Gate B numbers all require the freeze run itself. The Gate B parentheses below are a 2026-08-29 A2 CANDIDATE measurement and are deliberately not promoted: a candidate number moved into a baseline field becomes indistinguishable from a measured one the moment the parenthesis is dropped. NOTE ON THE WALL: campaign prose rounds the v3 arm to 16.9 s; what is recorded here is the interleaved hot median actually measured for the freeze commit, 16.763 s. They are not the same measurement, and a Gate A comparison should use the measured one.",
   "frozen_field_note": "MACHINE-CHECKABLE GUARD. Any consumer of this file must refuse it while \"frozen\" is false - a template read as authoritative would gate a campaign on TBD_V3_FREEZE placeholders. The fill-in flips it to true in the same commit that replaces the last placeholder.",
   "why_v3": "v2 froze the trajectory of a single-deck run whose only non-default component was Anderson Xe on the HOST. v3 freezes the production arm the Rev.7.1 campaign actually reaches: the outer body on the device (B0), the Wielandt fold chunked and the Xe Anderson algebra on the device (N1), and the A2 staged tolerance (N1). Three of those four are trajectory-changing by construction and each was gated separately; v3 is the point at which they are measured together, once, and the result becomes the reference every later Gate A is taken against.",
-  "baseline_commit_sha": "TBD_V3_FREEZE",
+  "baseline_commit_sha": "926497d",
+  "baseline_commit_note": "The v3 freeze commit. Measured 2026-08-30 under the strict PROD env at 16.763 s median (16.763 / 16.756 / 16.773), digest 0d15abf29d222a02, 4382 outers - identical in digest and outers to 73f8627 (16.772 s) and 388e8f2 (16.785 s), with h5diff 0 between them. The baseline is intact: no wall drift exists anywhere in the 926497d -> 388e8f2 -> 73f8627 chain.",
   "branch": "codex/exact-throughput-campaign",
   "compiler": "TBD_V3_FREEZE (238 toolchain; record the exact g++ path and version)",
   "cuda_compiler": "TBD_V3_FREEZE (238 nvcc version and path)",
@@ -65,14 +67,15 @@
   },
   "golden_outputs": {
     "single_deck_h5_sha256": "TBD_V3_FREEZE",
-    "trajectory_digest": "TBD_V3_FREEZE",
+    "trajectory_digest": "0d15abf29d222a02",
     "trajectory_digest_note": "The [RASBERY][TRAJECTORY] receipt's `digest` field for the frozen run. A candidate claiming to reproduce the v3 baseline must print this digest; a candidate that does not is a different trajectory whatever its h5 says about the datasets it happened to compare.",
     "repeats": "TBD_V3_FREEZE (>= 3 hot, warm-up excluded)",
     "repeat_walls_s": "TBD_V3_FREEZE",
     "determinism": "TBD_V3_FREEZE (h5diff -r across repeats; never cmp)",
     "dataset_count": "TBD_V3_FREEZE",
     "dataset_count_note": "v2 recorded 500 datasets; the local 1080 Ti tree writes 644 for the same deck. The freeze run must record what 238 actually compares and, if it is not 500, say in one line which commit added the datasets - a gate quoted as 0/500 against a file holding 644 is a gate that skipped 144 of them.",
-    "outers_total": "TBD_V3_FREEZE (base arm 10,483 -> v3 arm 3,114 measured 2026-08-29, to be re-measured at freeze)"
+    "outers_total": 4382,
+    "outers_total_note": "Measured 2026-08-30 on 238 under the strict PROD env, identical across 926497d, 388e8f2, 73f8627 and 7cfe3a4. It supersedes the 2026-08-29 expectation of 3,114 this field used to carry: that number came from an arm-X shell missing RASBERY_PC_MODE / RASBERY_PPR_MODE / RASBERY_OMP_THREADS, the same env artifact that produced the discarded 23.98 s / 4566-outer PPR reading."
   },
   "instrumentation_neutrality": {
     "claim": "RASBERY_STATEPOINT_TELEMETRY changes wall time and I/O contention only. It must not change the iteration.",
@@ -99,7 +102,8 @@
     "source": "[RASBERY][SPTELEM][SUMMARY] and [RASBERY][XE_GPU] counters; requires RASBERY_STATEPOINT_TELEMETRY=1, which must be run SEPARATELY from the timing repeats (telemetry perturbs I/O contention, not the iteration - see instrumentation_neutrality)"
   },
   "throughput_baselines": {
-    "single_deck_wall_s": "TBD_V3_FREEZE (2026-08-29 candidate: 16.3 s against MASTER 27.2 s = 1.67x)",
+    "single_deck_wall_s": 16.763,
+    "single_deck_wall_note": "238 GPU0, 926497d, strict PROD env, median of 3 hot with a warm-up excluded (docs/PRICING_PROD_20260830_KO.md block 1). 27.2 / 16.763 = 1.62x MASTER. The 2026-08-29 candidate figure of 16.3 s this field used to carry was not measured under the interleaved protocol and is dropped.",
     "master_single_deck_wall_s": 27.2,
     "m64_exact_cases_per_hour": "TBD_V3_FREEZE (batch adoption is NOT part of this freeze; see docs/V3_FREEZE_20260829_KO.md s5)",
     "master_w16_cases_per_hour": 217.0

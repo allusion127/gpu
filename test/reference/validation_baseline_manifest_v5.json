@@ -1,0 +1,265 @@
+{
+  "schema_version": 5,
+  "frozen": true,
+  "frozen_utc": "2026-08-30",
+  "frozen_utc_note": "DATE, not a timestamp, and deliberately so. The two source reports (238 pricing_388e8f2.md, 181 gates_8919331.md) record a measurement SESSION dated 2026-08-30, not a clock reading per arm; inventing an hour here would be a precision the evidence does not have.",
+  "supersedes": "validation_baseline_manifest_v4_candidate.json",
+  "status": "FROZEN. v5 is the first manifest of this campaign that is a freeze rather than a candidate: every row below was measured on 238 AND cross-gated on 181, and the four B0 rows have been promoted to CODE DEFAULTS in the same commit that writes this file. See default_flip for the one confirmation run that is still owed, and why it does not gate the freeze.",
+  "frozen_field_note": "MACHINE-CHECKABLE GUARD, inherited from v3/v4. A consumer must refuse a manifest whose \"frozen\" is false. This one is true, and every field that would otherwise carry a TBD placeholder is either measured or explicitly named in open_items as unmeasured - a frozen file with a placeholder in it would defeat the guard rather than satisfy it.",
+
+  "why_v5": "v4 was a candidate that named five knobs and never had 181 for three of them. v5 differs in two ways that matter. FIRST, the cross-host gate closed: 91004f7 composes the Xe algebra mask from the host's own bits instead of mining it per machine (d25efe6), which reversed 181's XE_TXN B0 failure, and the PPR master-mode device port (91004f7) made the PPR row worth measuring at all. SECOND, two features that did not exist when v4 was written - WP12's async pin-power CSV and WP5's CTA-per-node flat-XS kernel - turned out to be the two largest single wins of the whole campaign (-2.480 s and -0.913 s against a base of 16.658 s), and both are B0. The result is 11.189 s single-deck against MASTER's 27.2 s, and 981.7 cases/hour in batch against MASTER W16's 217.",
+
+  "baseline_commit_sha": "b903225",
+  "baseline_commit_note": "b903225 (perf(WP12)) is the tree the v5 arm was MEASURED on, on both hosts: 238 blocks 11-13 and 181 block 13. The four B0 knobs were still opt-in there and were passed explicitly on the command line. The commit that writes this manifest flips those four to code defaults; see default_flip.",
+  "prior_commits_in_the_chain": {
+    "91004f7": "PPR master-mode device port + the composed XE_FORMS resolution. REQUIRED for the PPR row (every earlier commit refuses the device PPR loop under RASBERY_PPR_MODE=master and reports host_fallbacks 35/35) and for the XE_TXN row on 181.",
+    "73f8627": "the PROD baseline the CRAM and FUSE rows were first priced against (16.729 / 16.724 s).",
+    "926497d": "the v3 freeze commit, 16.763 s / 0d15abf29d222a02 / 4382."
+  },
+  "branch": "codex/exact-throughput-campaign",
+  "compiler": "gcc13 host compiler on 238 (exact g++ path and version not captured in the 2026-08-30 session; see open_items.provenance_not_captured)",
+  "cuda_compiler": "nvcc 13.0 on 238 (exact path not captured; see open_items.provenance_not_captured)",
+  "release_flags": "Release, RASBERY_ENABLE_CUDA=ON, CMAKE_CUDA_ARCHITECTURES=120, HDF5_ROOT=codex/tools/gcc13 - the same flags as the build_388e8f2 / build_926497d / build_b903225 trees. The per-TU --fmad=false on CudaXsReconBackend.cu must be re-verified through compile_commands.json on any rebuild, exactly as v2, v3 and v4 require.",
+
+  "gpu": {
+    "model": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "host": "238 GPU0",
+    "uuid": "not captured in the 2026-08-30 session",
+    "driver": "not captured in the 2026-08-30 session",
+    "cuda_runtime": "not captured in the 2026-08-30 session",
+    "thermal_bracket_238_block14a": "before a batch run P8 / 31 C, after P0 / 57 C, with SW power cap, HW slowdown and SW thermal slowdown all Not Active in both snapshots."
+  },
+
+  "benchmark_input": {
+    "deck": "kngr_238.json (APR1400/KNGR CY1 PSAR, 35-state natural EOC, quarter core 8451 nodes NG=2)",
+    "input_sha256": "ac6a28bae361dcd072abb742c1610bd05c03337b7a8a114cee488550231b51c7",
+    "env": "RASBERY_PPR_MODE=master RASBERY_PC_MODE=decart RASBERY_GPU=1 RASBERY_GPU_CMFD_SWEEP=1 RASBERY_GPU_CMFD_RESIDENT_SINGLE=1 RASBERY_GPU_NODAL=1 RASBERY_GPU_NODAL_FULL=1 RASBERY_GPU_XSRECON=1 RASBERY_GPU_FLATXS=1 RASBERY_GPU_OUTER=1 RASBERY_GPU_OUTER_SEGMENT_MAX=8 RASBERY_GPU_WIEL_FOLD=chunked RASBERY_GPU_XE=1 RASBERY_STAGED_FLUX_TOL=50 RASBERY_STAGED_XE_TOL=1000 RASBERY_STAGED_LOOSE_SETTLE=1 RASBERY_OMP_THREADS=12 RASBERY_GPU_CRAM=1 RASBERY_GPU_PPR=1 RASBERY_GPU_PPR_GRAPH=1 RASBERY_GPU_CMFD_FUSE=15 RASBERY_GPU_XE_TXN=1 RASBERY_RESULT_ASYNC=1 RASBERY_GPU_FLATXS_CTA=1",
+    "env_note": "SELF-DESCRIBING ON PURPOSE. The last four knobs are now CODE DEFAULTS and an env that omitted them would resolve identically - but this file would then describe a binary instead of a run, and a reader could not tell an intended arm from an inherited one. There is also an operational reason: src/CaseKey.h digests the RAW env strings in kArmEnv order, so an unset knob and an explicit `1` are two different case keys for one arm. A controller that stopped exporting them after the flip would miss every cached case.",
+    "env_note_absences": "RASBERY_XE_ANDERSON stays DELIBERATELY ABSENT (single-deck default ON, and a baseline must exercise the default). RASBERY_STATEPOINT_TELEMETRY stays absent from the timing repeats. RASBERY_XE_FORMS stays absent and must NEVER be pinned: 0xadd was composed on 181 from 181's own mined 0xd3d, and pinning it on 238 overrides 238's correctly-mined shipped bits and moves the trajectory to 4374 outers even with XE_TXN off. Since d25efe6 the composition is automatic on both hosts and the pin is retired.",
+    "env_measurement_rule": "A wall or digest measured outside this env is not a measurement of this arm. The 2026-08-30 session produced a whole block of 'PPR is expensive' numbers (23.98 s / 4566 outers / digest 22b9a3187bfb4beb) whose only cause was a shell missing RASBERY_PC_MODE, RASBERY_PPR_MODE and RASBERY_OMP_THREADS. Every run starts from `env -i` and prints [RASBERY][TRAJECTORY], so its arm is provable from its own log."
+  },
+
+  "default_flip": {
+    "what": "Four knobs of the env above are now the binary's DEFAULT behaviour. Each keeps an explicit `=0` off switch, and each off arm is load-bearing rather than ceremonial.",
+    "flipped": {
+      "RASBERY_GPU_CMFD_FUSE": {
+        "old_default": "0",
+        "new_default": "15 (kFuseDefaultMask = kFuseAllBits)",
+        "resolver": "src/CudaBICGBackend.cu cmfdFuseMask()",
+        "off_switch": "RASBERY_GPU_CMFD_FUSE=0 launches the reference kernels, which is what keeps mask 0 a LIVE reference rather than a memory of one",
+        "unparseable": "falls back to the DEFAULT, not to 0. After the flip, silently dropping a typo to the reference path would look like a performance regression with no cause in any receipt."
+      },
+      "RASBERY_GPU_XE_TXN": {
+        "old_default": "0",
+        "new_default": "1",
+        "resolver": "src/CudaXsReconBackend.cu rasberyGpuXeTxnEnabled(), now !envFlagDisabled",
+        "off_switch": "RASBERY_GPU_XE_TXN=0 is the ONLY arm the forms audit runs on - the audit call site is on the TXN=0 host path (src/XeFormAudit.h), so RASBERY_XE_FORMS_AUDIT=1 with TXN=1 yields forms_audits:0, a no-op"
+      },
+      "RASBERY_RESULT_ASYNC": {
+        "old_default": "0 (sync)",
+        "new_default": "1 (async), with an EMPTY string still read as off",
+        "resolver": "src/IoWriter.h resultAsyncRequested()",
+        "off_switch": "RASBERY_RESULT_ASYNC=0 runs the emitter inline, which is the reference the byte-identity claim is measured against",
+        "degradation": "RASBERY_IO_WRITER=inline still degrades the request to sync and the [RASBERY][RESULT_IO] receipt still says `sync`, because there is no second thread to hand a task to"
+      },
+      "RASBERY_GPU_FLATXS_CTA": {
+        "old_default": "0",
+        "new_default": "1",
+        "resolver": "src/CudaXsReconBackend.cu rasberyGpuFlatXsCtaEnabled(), now !envFlagDisabled",
+        "off_switch": "RASBERY_GPU_FLATXS_CTA=0 launches the thread-per-node kernelFlatXs, which is the reference test/flatxs_device_replay.cu --cta scores the CTA arm against",
+        "threads": "RASBERY_GPU_FLATXS_CTA_THREADS is UNCHANGED at 128 and stays performance-only: every value on the 64/128/256 ladder produces the same bytes."
+      }
+    },
+    "not_flipped": {
+      "RASBERY_GPU_CRAM": "N1. The device depletion writes the isotope inventory the next statepoint reconstructs from, so it moves keff, critical boron and AO from the first statepoint onward - which is exactly why v5's digest and outer count differ from v3's. Per tools/promotion_gate.py an N1 feature is HOLD without a recorded project acceptance: a passed gate is not an approval.",
+      "RASBERY_GPU_PPR / RASBERY_GPU_PPR_GRAPH": "B0 outside pin-derived datasets, N1 inside them (pin_power, summary/fqp, summary/frp). A feature that moves any published dataset does not become a default.",
+      "RASBERY_GPU_XFER_ELIDE / RASBERY_XFER_LEDGER": "not priced at all. An unpriced feature does not get a default, whatever its gate class."
+    },
+    "receipt_semantics": "UNCHANGED, and this is the subtle part. trajectory::armEnvJson() prints the RAW exported string or `null` when unset - it does not resolve defaults, so that the receipt can never disagree with the solver about what the run was asked for. Consequence: an env-free v5 run prints `null` for RASBERY_GPU_FLATXS_CTA and RASBERY_GPU_XE_TXN where the explicit env prints \"1\". The `digest` field is unaffected, because it folds statepoints / outers / T-H steps / the bit patterns of efpd, k_eff and boron - and nothing from the environment. Both flipped knobs are B0, so an env-free run prints the SAME digest as the explicit-ON env by construction, on both hosts. The `case_key` IS affected (src/CaseKey.h digests the raw strings): unset and `1` are different keys for one arm, which is a cache MISS and never a wrong hit.",
+    "contract": "tools/test_v5_defaults_contract.py pins all four defaults, all four off switches, the three knobs that must stay opt-in, the raw set-vs-unset semantics of armEnvJson(), and the absence of any environment read from the digest fold - each with a negative control in both directions (back to opt-in, and forward to no-off-switch).",
+    "confirmation_owed": "ONE run per host, and it is the only thing in this file that has not been executed: the v5 env with the four flipped knobs REMOVED from the command line must reproduce the per-host digest and outer count below on a build of the flip commit. Both are B0 by three independent measurements each, so a failure would mean the flip itself was mis-wired rather than that the physics moved - which is why it is recorded here as owed rather than as blocking the freeze. See reproduce.confirmation_run."
+  },
+
+  "per_host_results": {
+    "238": {
+      "role": "the performance host. Walls, cases-per-hour and adoption thresholds are decided here and nowhere else.",
+      "trajectory_digest": "1f36e75dc00ed2b4",
+      "outers_total": 4377,
+      "statepoints": 35,
+      "single_deck_wall_s": 11.189,
+      "single_deck_wall_note": "238 GPU0, b903225, block 12 arm B, median of 3 hot (11.364 / 11.189 / 11.182) with a 11.361 s warm-up excluded, interleaved against arm A. 27.2 / 11.189 = 2.43x MASTER. The same-commit v4+ASYNC arm in the same interleave measured 12.102 s and the block 9 PROD base 16.658 s, so the v5 stack is worth -5.469 s (-32.8 pct) against that base.",
+      "walls_not_to_quote": "14.744 s (with RASBERY_STATEPOINT_TELEMETRY=1), 19.444 s and 20.314 s (under nsys, +60 pct). Instrumented walls are shares, not wall claims.",
+      "dataset_count": 644,
+      "determinism": "h5diff 0 across the A/B pairs of blocks 11 and 12, and 0 for the full v4 stack against its own sub-arm in block 9. A dedicated three-replicate self-comparison of the exact v5 arm was not run; see open_items."
+    },
+    "181": {
+      "role": "the exactness host. NO wall or cases-per-hour figure measured on 181 is a performance claim; its job is to show that a B0 or N1 claim survives a second machine and a second toolchain.",
+      "trajectory_digest": "1afab8adb152bb44",
+      "outers_total": 4381,
+      "statepoints": 35,
+      "single_deck_wall_s": null,
+      "single_deck_wall_note": "deliberately null. 181 measures identity, not speed.",
+      "digest_differs_from_238_note": "EXPECTED AND NOT A DEFECT. Two different machines and toolchains contract floating-point expressions differently; the same-host rule is what the digest exists for. What matters is that on 181 the sync, async and async+CTA arms all print 1afab8adb152bb44 / 4381 - A = B = C - and that the pin-power CSVs are byte-identical across all three."
+    }
+  },
+
+  "arm_components": {
+    "note": "v3's five rows are carried forward unchanged and are not restated (see validation_baseline_manifest_v3.json). Below are the six rows v4 and v5 add, each with its gate class, its off switch, and its evidence on BOTH hosts.",
+
+    "gpu_cram_depletion": {
+      "env": "RASBERY_GPU_CRAM=1",
+      "gate_class": "N1 (trajectory-moving by design)",
+      "default": "OPT-IN, unchanged",
+      "claim": "the Bateman depletion predictor/corrector runs on the device; the inventory it writes is read by the next statepoint, so keff, critical boron and AO move from the first statepoint onward. This is the one component of v5 that changes the answer, and it is why v5's digest and outer count differ from v3's.",
+      "extra_gate": "[RASBERY][CRAM_GPU].host_fallbacks == 0 (a fail-open run prices nothing); statepoints == predictor_calls == corrector_calls",
+      "evidence_238": "block 3 + 3b at 73f8627: off 16.729 s / 0d15abf29d222a02 / 4382 vs on 16.043 s / 1f36e75dc00ed2b4 / 4377 (-0.686 s). h5diff 419 differences (summary tm_avg / tm_max / tf_max / xe_ao / xe_avg, 34 each, plus others) - designed, not defective. Gate A max|dkeff| 0.0653 pcm, max|dppm| 0.0038, max|dAO| 0.0001, max pin rel 0.0211 pct, all inside the A2 screen. Gate B 15.334 ppm / 1.847 pcm / 0.012 AO / pin 0.238 pct / 0.80 pct. Determinism h5diff 0 across three hot replicates. Receipt gs_iters_mean 2.384, micx_h2d_mb 1367.9 over 34 statepoints, bos_reuse 34.",
+      "evidence_181": "gates_8919331.md block 2 at 8919331: G0 (kPredictor/kCorrector REG 68, STACK 5008/5040 B, LOCAL 0), G1 (arm-off identity x2), G2 (on x2 byte-identical, host_fallbacks 0) and G4 (4-deck batch, one CRAM_GPU line per slot, no slot-0 bug) all PASS. TWO GAPS, recorded rather than smoothed: G2's nuclide-density comparator could not run (kngr_238.json emits no isotope_density datasets) and G5 was skipped (the kngr3/CY01/CY02 trimmed decks do not exist on 181)."
+    },
+
+    "gpu_ppr_device_loop": {
+      "env": "RASBERY_GPU_PPR=1 RASBERY_GPU_PPR_GRAPH=1",
+      "gate_class": "B0 outside pin-derived datasets; N1 for pin_power / summary fqp / summary frp",
+      "default": "OPT-IN, unchanged",
+      "claim": "the PPR Picard loop, its termination test, the canonical borrow and the pin-power reconstruction all run on the device, INCLUDING under RASBERY_PPR_MODE=master, which is the mode production actually runs. The master CPB is Jacobi where the host's is Gauss-Seidel: same diagonally-dominant system, same fixed point, different stopping place, corner-flux relative difference ~1e-5.",
+      "extra_gate": "host_fallbacks == 0 AND refusal == none AND refusals == {} in every ON receipt; iterations != 0 and not at the 200x35 cap; reallocations == 0; Gate B pin RMS must reproduce to printed precision (0.238 pct / 0.80 pct). 0.522 pct / 2.13 pct means the device ran SENM under the master flag and the arm is invalid.",
+      "evidence_238": "block 7 at 91004f7: OFF 16.885 s vs ON 15.206 s vs ON+GRAPH 15.024 s (-1.861 s, -11.0 pct), digest 0d15abf29d222a02 / 4382 unchanged in every arm, host_fallbacks 0/35, iterations 766, refusal none, allocations 28, reallocations 0. h5diff OFF vs ON = 37 differences confined to steps/0028..0035/pin_power + summary/fqp + summary/frp; ON x2 h5diff 0. All 7 runbook conditions PASS. PPR loop wall_ms 144-149 (stream) -> 106-107 (graph).",
+      "evidence_181": "gates_8919331.md block 12 at 91004f7 - the measurement v4 could not have, because the 8919331 pass predates the master-mode device port entirely.",
+      "prior_refusal_note": "Before 91004f7 this arm was worth exactly nothing in production: src/PPR.cpp:79 carried `if (_mode_master) return false;` and every ON arm under the PROD env reported host_fallbacks 35/35 with statepoints 0 and iterations 0, while [GPU_FULL] printed contract_pass:false next to first_violation:null. The refusal had no name, so it survived a whole campaign. That is why the refusal ladder now has names."
+    },
+
+    "cmfd_kernel_fusion": {
+      "env": "RASBERY_GPU_CMFD_FUSE=15",
+      "gate_class": "B0",
+      "default": "DEFAULT ON (15) since this freeze; =0 is the off switch",
+      "claim": "the four fusible CMFD graph kernels are fused. A fused body is the two reference bodies CONCATENATED with every expression copied character for character, so the arithmetic and its association are unchanged and every mask is bit-identical to mask 0. The receipt is [RASBERY][CMFD][GRAPH] carrying fuse_mask:N - there is no separate [CMFD][FUSE] line.",
+      "extra_gate": "digest identical across masks {0,1,2,4,8,15}; adoption threshold median >= 0.2 s below base under warm-up 1 + hot 3, interleaved",
+      "evidence_238": "block 4 (all six masks digest 0d15abf29d222a02 / 4382) + block 4b interleaved: base 16.724 s, FUSE=4 16.541 s (-0.183, MISSES the threshold), FUSE=15 16.328 s (-0.396, CLEARS it). Mask 15 is adopted; mask 4 is not. The first single-shot pass (base 21.004 s, FUSE=2 19.232 s) is a cold-start outlier and is not used to rank arms.",
+      "evidence_181": "gates_8919331.md block 3: all six masks digest 1d897e3f77204799, h5diff 0 lines vs mask 0, and the [CMFD][GRAPH] outer/sweep node counts (90/98, 82/90, 86/94, 90/97, 90/98, 78/85) match the 238 census table EXACTLY - a structural cross-check, since the census is config-derived rather than host-timing-derived."
+    },
+
+    "xe_transaction": {
+      "env": "RASBERY_GPU_XE_TXN=1",
+      "gate_class": "B0",
+      "default": "DEFAULT ON since this freeze; =0 is the off switch and is the arm RASBERY_XE_FORMS_AUDIT=1 has to run on",
+      "claim": "the Anderson accept/reject control moves into two device kernels with a fused history update, cutting host_syncs_per_step from ~3.6 to exactly 1.0 while consuming the identical algebra. The device mask's algebra channel (bits 5..12) is COMPOSED from the host's XE_HOST_FORMS rather than mined, so the two arms provably share the same expressions.",
+      "extra_gate": "forms_audit_mask & XE_ALGEBRA_FORMS (0xfe0) == forms_audit_host_mask == 0xac0 AND forms_audit_mismatch == 0, run with RASBERY_GPU_XE_TXN=0",
+      "evidence_238": "blocks 5 / 5b / 5c at 91004f7 with NO pin: TXN=0 16.791 s and TXN=1 16.652 s both at 0d15abf29d222a02 / 4382, h5diff 0 between them, both byte-identical to the 73f8627 PROD-off run across trees. FORMS resolution mined 0xd2d, host 0xac0, resolved 0xacd, source build_default_composed. forms_audit 693 audits, 0 mismatches. Re-confirmed under the full stack in block 9: (e) vs (d) h5diff 0 over the whole dataset.",
+      "evidence_181": "gates_8919331.md block 11 at 91004f7, unpinned: base, TXN=0 and TXN=1 all at e1964c0cd8bbb3d4 (35 statepoints, 4368 outers, 125 T-H updates), h5diff 0 lines on both pairs. Xe step counts identical between arms (1119 each, anderson_proposed 682, accepted 671, both arms) where they had differed 1195 vs 1190 before. host_syncs_per_step 3.61573 -> 1. forms_audit_mismatch 0 against the composed 0xadd.",
+      "reversal_note": "This row FAILED on 181 at 8919331 - digests 1d897e3f77204799 vs 7f32414a742623b9, 854 h5diff lines, five Xe steps apart - and B0 was restored there only by hand-pinning RASBERY_XE_FORMS=0xadd. That tree predates d25efe6. The composition fix closes both the failure and the workaround, and the pin is retired. A default flipped on the strength of the pinned result would have been wrong; this one is flipped on the strength of the unpinned one."
+    },
+
+    "result_async_csv": {
+      "env": "RASBERY_RESULT_ASYNC=1",
+      "gate_class": "B0",
+      "default": "DEFAULT ON since this freeze; =0 is the off switch. NO-OP under --result light and in batch, which writes no result records at all.",
+      "claim": "the pin-power CSV serialisation - ~119 MB of ostream << per --result full case, on the solver thread, inside PH_RESULT_WRITE - moves to the existing HDF5 writer thread as a side task over a by-value snapshot. Same code, same values, same order: only the thread and the moment differ.",
+      "extra_gate": "cmp on the two CSVs must be IDENTICAL. h5diff cannot see a CSV at all, so h5diff alone would pass a run whose CSV came from the wrong statepoint - this is the row where the usual gate is not the gate.",
+      "evidence_238": "block 11 at b903225, v4 env, --result full, interleaved warm-up 1 + hot 3: sync median 14.432 s vs async 11.952 s (-2.480 s, -17.2 pct), digest 1f36e75dc00ed2b4 / 4377 both arms, h5diff 0, cmp on the two 119,013,281-byte CSVs IDENTICAL, [RESULT_IO] records/bytes equal (35 / 119013281), IO_WRITER failures 0 skipped 0 both arms, io_wall 2.894 s -> 0.111 s (-96 pct).",
+      "evidence_181": "gates_8919331.md block 13 at b903225, three arms (sync, async, async+CTA): all three at 1afab8adb152bb44 / 4381, h5diff 0 on both pairs, cmp identical on both pairs, all three CSVs exactly 119,013,920 bytes, [RESULT_IO] mode reads sync / async / async correctly and records+bytes identical across all three, IO_WRITER failures 0 skipped 0 on all three.",
+      "light_mode_note": "238 block 13-i confirms the no-op directly: under a light batch the [RASBERY][RESULT_IO] receipt is PRINTED but every field reads zero (records 0, bytes 0, writer_wall_ms 0, queue_max_depth 0). After the default flip the same light run reports mode async instead of sync; the record and byte counts stay zero, because light mode writes no result records for either arm to move.",
+      "writer_wall_note": "writer_wall_ms is NOT expected equal between arms (238: 2770 -> 5570; 181: 1340 -> 1550). It is measured on different threads, and in async mode the writer also carries work that used to hide behind solver-thread stalls. That is the cost the async mode pays on its own thread so the solver thread does not."
+    },
+
+    "flatxs_cta_kernel": {
+      "env": "RASBERY_GPU_FLATXS_CTA=1",
+      "gate_class": "B0",
+      "default": "DEFAULT ON since this freeze; =0 launches the thread-per-node reference kernel",
+      "claim": "one CTA per node instead of one thread per node, with the 919-double workspace in shared memory. Each workspace element's accumulation chain stays inside one lane, so every block size on the 64/128/256 ladder produces the same bytes as the reference kernel.",
+      "extra_gate": "cta_vs_ref_mismatches == 0 at every block size in test/flatxs_device_replay.cu --cta, and production h5diff CTA=0 vs CTA=1 identical",
+      "evidence_238": "block 12 at b903225, arm A = v4+ASYNC, arm B = A + CTA, interleaved warm-up 1 + hot 3: 12.102 s -> 11.189 s (-0.913 s, -7.5 pct), digest 1f36e75dc00ed2b4 / 4377 both arms, h5diff 0 differences, [FLATXS][GPU] nodes_solved 3245184 identical. nsys: kernelFlatXs 948.6 ms / 58.8 pct of kernel time -> kernelFlatXsCta<128> 103.6 ms / 13.5 pct, a ~9.16x reduction in that kernel's own GPU time, with every other kernel's ABSOLUTE time unchanged to within 1 ms.",
+      "evidence_181": "gates_8919331.md block 5 at 8919331: flatxs_resource_report.py verdict PROCEED_CTA (reference 255 registers, 8608 B/thread local, 3456 B spill; CTA 61 registers, 40 B, 0 spill), replay cta_vs_ref_mismatches 0 at 64/128/256, and production CTA=0 vs CTA=1 h5diff byte-identical at every thread count with digest 1d897e3f77204799 throughout. Re-confirmed stacked on the v5 candidate in block 13 (arm C).",
+      "capture_mismatch_note": "cta_vs_capture_mismatches is 30825, IDENTICALLY for the reference arm and for every CTA block size. That disagreement is between the DEVICE arm and the host/gcc capture and is a pre-existing property of the reference kernel, unchanged by the CTA rewrite. The large nominal worst_ulp on xs9/xs10 sits at magnitudes ~1e-20/1e-23 where ULP counting stops meaning anything. Recorded, not re-litigated, and explicitly not something this row introduced.",
+      "counter_intuitive_finding": "arm B's GPU BUSY FRACTION is LOWER than arm A's (3.9 pct vs 7.9 pct against the nsys-wrapped wall; 6.9 pct vs 13.3 pct against the real median). CTA cut total kernel time roughly in half while the wall moved much less, so the GPU now idles a LARGER share of the run. The bottleneck has moved off the kernels and onto host-side sync and the ~110K small cudaMemcpyAsync calls per run. That is where the next lever is, and it is not more kernel work."
+    }
+  },
+
+  "golden_outputs": {
+    "single_deck_h5_sha256": "not recorded in the 2026-08-30 session; the identity gates were run as h5diff and cmp against a live sibling run rather than against a stored hash, which is the stronger comparison and the one the reports carry",
+    "trajectory_digest_238": "1f36e75dc00ed2b4",
+    "trajectory_digest_181": "1afab8adb152bb44",
+    "trajectory_digest_note": "PER HOST, and that is the whole rule. A candidate claiming to reproduce the v5 arm must print the digest OF ITS OWN HOST. 1f36e75dc00ed2b4 is CRAM's signature on 238 - FUSE, PPR, PPR_GRAPH, XE_TXN, RESULT_ASYNC and FLATXS_CTA all ride on top without moving it further, which blocks 4/4b, 7, 9, 11 and 12 establish independently.",
+    "outers_total_238": 4377,
+    "outers_total_181": 4381,
+    "repeats": "3 hot, warm-up excluded, interleaved A/B (238 blocks 11 and 12)",
+    "repeat_walls_s_238": [11.364, 11.189, 11.182],
+    "warmup_wall_s_238": 11.361,
+    "dataset_count": 644,
+    "determinism": "PASS for every A/B pair measured (h5diff 0 in blocks 11 and 12 on 238; h5diff 0 on both pairs in block 13 on 181) and for the full v4 stack against its own sub-arm (block 9, 0 differences over the full dataset). A dedicated repeat-against-itself determinism check of the exact v5 arm is listed in open_items."
+  },
+
+  "throughput_baselines": {
+    "single_deck_wall_s": 11.189,
+    "master_single_deck_wall_s": 27.2,
+    "single_deck_speedup_vs_master": 2.43,
+    "m64_cases_per_hour": 981.7,
+    "m64_arm": "8 processes x M8 + MPS at 12 pct thread percent, GPU0 only, b903225, --result light, 64-job manifest. wall_s 234.692, mean_width 3.57, width_fill 0.4462, 64/64 ok, 0 failed, per_process_gb 1.625, per_device_gb 30.92, mps_residue_lines 0. Fallback scan: 128 x host_fallbacks:0 and 64 x refusal:none - no PPR refusal and no CRAM/FUSE fallback anywhere in batch mode.",
+    "master_w16_cases_per_hour": 217.0,
+    "m64_speedup_vs_master_w16": 4.52,
+    "m64_raw_width64_cases_per_hour": 734.2,
+    "m64_raw_width64_note": "1 process at width 64, no MPS: 734.2 c/h against v4's own 738.6, essentially flat (-0.6 pct). CTA's win is masked in the single wide arena, which already saturates the GPU differently from 8 independent narrow processes under MPS.",
+    "solver_threads_sweep": "1 -> 304.1 c/h (width_fill 0.125), 2 -> 725.4 (0.1813), 4 -> 841.1 (0.2608), 8 (the default, = batch_width) -> 981.7 (0.4462). Monotonic; the default is best and no forced lower value helps.",
+    "control_discrepancy": "THE ONE NUMBER THIS FREEZE DOES NOT EXPLAIN. The same-day control (old env, same procs/width/MPS share) measured 677.6 c/h against a historical reference of 877.6 c/h - 22.8 pct low, in the wrong direction, cause unknown. Five candidates were tested and four excluded outright: thermal/clock (no throttle flag active before or after), manifest (byte-identical job list), old build + old harness (386.8 c/h - reproduces the historical PLAN fields exactly and is far SLOWER), and solver_threads=1 forced on today's binary (304.1 c/h, the worst point of the sweep). The remaining untested cell is old binary + TODAY's policy (solver_threads=8 on 7cfe3a4).",
+    "which_baseline_to_quote": "Against the same-day control, v5 batch is +44.9 pct (981.7 vs 677.6). Against the historical reference it is +11.9 pct (981.7 vs 877.6). Both are recorded. The same-day control is the more defensible comparison because it isolates the env change from whatever else drifted, but the historical number is not discarded, because nothing was found that explains it away."
+  },
+
+  "master_agreement_at_freeze": {
+    "reactivity_pcm": 1.847,
+    "cbc_ppm": 15.334,
+    "ao_abs": 0.012,
+    "boc_pin_rms_pct": 0.238,
+    "boc_pin_max_pct": 0.80,
+    "fqp_abs": 0.071,
+    "frp_abs": 0.017,
+    "measured_on": "238, 2026-08-30, block 3b (CRAM ON at 73f8627) against MASTER over 33 joined states; the stacked arm of block 8 and the PPR runbook of block 7 both reproduce the BOC pin figures 0.238 pct / 0.80 pct exactly",
+    "envelope_note": "Identical in magnitude to the v2-baseline-vs-MASTER envelope already on file (15.309 ppm / 1.905 pcm / 0.013 AO / 0.238 pct / 0.80 pct). The v5 stack does not measurably add to the code's existing disagreement with MASTER: the only N1 rows are CRAM and the pin-derived half of PPR, and neither moves these numbers at the printed precision.",
+    "comparator": "tools/compare_master_rasbery.py for the summary metrics; tools/gate_b_pin_rms.py for the BOC pin RMS and max"
+  },
+
+  "anderson_health_at_freeze": {
+    "aa_proposed_238": 693,
+    "aa_proposed_181": 682,
+    "aa_accepted_181": 671,
+    "acceptance_rate_pct_181": 98.4,
+    "acceptance_rate_note": "The 181 figures are from block 11's TXN=0 / TXN=1 pair at 91004f7 and are IDENTICAL between the two arms, which is part of what makes the B0 claim readable: same proposals, same acceptances, same 1119 Xe device steps. The v2 reference rate is 95.01 pct and the N1 gate is +-10 pp, so 98.4 is inside. 238's aa_accepted was not separately recorded in the forms-audit run; its 693 proposals equal its forms_audits exactly, i.e. every proposed step was audited and none mismatched.",
+    "source": "[RASBERY][XE_GPU] counters; the [SPTELEM][SUMMARY] variant requires RASBERY_STATEPOINT_TELEMETRY=1, which must be run SEPARATELY from the timing repeats (telemetry perturbs I/O contention, not the iteration)"
+  },
+
+  "instrumentation_neutrality": {
+    "claim": "RASBERY_STATEPOINT_TELEMETRY changes wall time and I/O contention only. It must not change the iteration.",
+    "gate": "tools/test_telemetry_neutrality.py --compare OFF.log TELEMETRY.log on the v5 arm: same env, same digest, telemetry differing",
+    "result_238": "PASS for the v4 arm (block 9b: digest and outers unchanged with telemetry attached). Not re-run for the v5 arm; see open_items.",
+    "result_181": "PASS at 8919331 (digest 1d897e3f77204799, statepoints 35, outers 4616 in both arms; only the telemetry field differs)"
+  },
+
+  "gate_evidence": {
+    "238": "E:/rasbery_runs/2026-08-30/238/pricing_388e8f2.md - blocks 3 and 3b (CRAM), 4 and 4b (FUSE), 5 / 5b / 5c (XE_TXN and the FORMS correction), 7 (PPR master-mode runbook), 8 (partial stack), 9 and 9b (full v4 stack and its phase breakdown), 10 (v4 batch), 11 (RESULT_ASYNC), 12 (FLATXS_CTA), 13 (v5 batch), 14 and its sub-blocks (the control-drift investigation).",
+    "181": "E:/rasbery_runs/20260830/181/gates_8919331.md - blocks 2 (CRAM), 3 (FUSE), 5 (FLATXS_CTA), 11 (XE_TXN unpinned B0 at 91004f7), 12 (PPR master mode), 13 (RESULT_ASYNC three arms plus the v5 CTA extension), and 9 (the warm-start pair that was REJECTED).",
+    "how_to_read_them": "Both files are session logs written in the order the runs happened, and both contain superseded numbers that are explicitly marked as such. Block 2 of the 238 file concludes that PPR is worthless in production; block 7 reverses that completely, because block 2 predates 91004f7. Block 5's FORMS table quotes the FIRST of three [FORMS] lines (the pre-composition shipped-only mining result); block 5c corrects it to the third, which is the resolution. Reading either file top to bottom without its corrections will produce a wrong summary."
+  },
+
+  "reproduce": {
+    "build_238": "cmake -DCMAKE_BUILD_TYPE=Release -DRASBERY_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DHDF5_ROOT=<gcc13 prefix>; verify the per-TU --fmad=false on CudaXsReconBackend.cu through compile_commands.json before quoting any number.",
+    "single_deck": "start from `env -i`, export the benchmark_input.env string verbatim, then: RASBERY --rasi kngr_238.json --raso out.h5 --result full. Read [RASBERY][TRAJECTORY] for digest and outers, and check [PPR_GPU].host_fallbacks, [CRAM_GPU].host_fallbacks and [XE_GPU].host_fallbacks are all 0 before believing the wall.",
+    "protocol": "warm-up 1, hot 3, arms INTERLEAVED (a-b-a-b-a-b, not a-a-a-b-b-b), median of the hot three. A single-shot pass is a cold-start measurement: block 4's first attempt reported a 21.004 s base against the same commit's 16.724 s interleaved figure.",
+    "b0_identity": "h5diff -r out_off.h5 out_on.h5 must print nothing and exit 0. For RESULT_ASYNC that is NOT sufficient - h5diff does not look at the CSV - so also run cmp on the two <stem>_pinpower.csv files.",
+    "gate_b_pin": "tools/gate_b_pin_rms.py compares the run's BOC pin powers against the MASTER reference and prints RMS and max in percent. Point it at the run's HDF5 output and the MASTER BOC pin file (kngr_mas_ppi_boc.txt from the MASTER 4.0 KNGQ01 campaign of 2026-08-22..24); the v5 arm must reproduce 0.238 pct RMS / 0.80 pct max to printed precision. 0.522 pct / 2.13 pct is the signature of the device running SENM under RASBERY_PPR_MODE=master, i.e. the PPR arm being invalid rather than merely different.",
+    "gate_a": "tools/gate_a_compare.py --per-step between the candidate and this baseline; tools/compare_master_rasbery.py for Gate B's summary metrics.",
+    "batch": "tools/run_multi_gpu_batch.py --gpus 0 --procs-per-gpu 8 --batch-width 8 --mps --result light, with the v5 deltas passed via --set. RASBERY_ALLOW_SCREENING is the OPERATOR's export, never the harness's.",
+    "confirmation_run": "THE ONE RUN THIS FILE STILL OWES, per host, on a build of the default-flip commit. Take the benchmark_input.env string and DELETE the four flipped knobs from it (RASBERY_GPU_CMFD_FUSE, RASBERY_GPU_XE_TXN, RASBERY_RESULT_ASYNC, RASBERY_GPU_FLATXS_CTA), leaving CRAM, PPR and PPR_GRAPH explicit. Run once per host. PASS is: 238 prints digest 1f36e75dc00ed2b4 with 4377 outers, 181 prints 1afab8adb152bb44 with 4381; both print [RASBERY][CMFD][GRAPH] fuse_mask:15, [RASBERY][RESULT_IO] mode:async with records 35, and [RASBERY][XE_GPU] txn_steps equal to xe_device_steps; and the [RASBERY][TRAJECTORY] env field shows null for the two flipped knobs that are in kArmEnv, which is the point - same digest, different env line. A 238 wall within jitter of 11.189 s is expected but is not the gate."
+  },
+
+  "threshold_file": "validation_thresholds_v3.json",
+  "threshold_file_note": "v5 introduces NO new thresholds and deliberately reuses v3's file, as v4 did. A v5 threshold file, if one is ever needed, is a separate decision with its own justification.",
+
+  "v3_v4_retention": "validation_baseline_manifest_v3.json, validation_baseline_manifest_v4_candidate.json and validation_thresholds_v{1,2,3}.json are kept UNTOUCHED as history, except that v3's known placeholders have been filled from docs/PRICING_PROD_20260830_KO.md block 1 (see that file's own note). v4 remains a CANDIDATE and is superseded, not promoted: three of its rows were cross-gated only after it was written, and one of them (XE_TXN) was failing on 181 at the time. v3 remains the correct Gate A reference for any run whose env is v3's.",
+
+  "open_items": {
+    "default_flip_confirmation": "The env-free run described in reproduce.confirmation_run has not been executed on either host. Everything it would check is established by three independent measurements each, but 'the default resolves to the value we think it does' is a property of the flip commit, not of b903225.",
+    "v5_self_determinism": "A repeat-against-itself h5diff of the exact v5 arm (three hot replicates, same env) was not run. Every A/B pair in blocks 11-13 is h5diff 0, and CRAM's own three-replicate check passed in block 3b, but the stacked arm has not been compared to itself.",
+    "telemetry_neutrality_238_on_v5": "Confirmed for the v4 arm in block 9b, not re-run after RESULT_ASYNC and FLATXS_CTA were added. RESULT_ASYNC in particular changes what the writer thread does, which is exactly the kind of thing a neutrality check exists to catch.",
+    "provenance_not_captured": "GPU uuid, driver version, CUDA runtime version, and the exact g++/nvcc paths were not recorded in the 2026-08-30 session. They are recorded as absent rather than guessed. Any rebuild that intends to reproduce these numbers should capture them.",
+    "batch_control_drift": "The 677.6-vs-877.6 c/h same-day control gap remains unattributed after five hypotheses; see throughput_baselines.control_discrepancy. It does not affect any exactness claim, and it makes every batch RATIO in this file baseline-dependent, which is why both ratios are printed.",
+    "warm_start_rejected": "NOT an open item so much as a closed and negative one, recorded here so it is not re-proposed. WP10.2 warm-start was measured on 181 with the real parent/child pair (block 9): total outers INCREASED (8652 cold -> 8855 warm), which is the doc's own immediate-discard rule, and max|dk| landed at 2.36-2.40 pcm against a 1.905 pcm envelope and the tool's own 2 pcm tolerance. dppm (0.160-0.169) and dAO (0.0053) were comfortably inside. The mechanism is correct and fully wired - load:applied, provenance populated, flag-off prints no receipt at all - so this is a physics-acceptance rejection, not a defect. Warm-start stays OFF.",
+    "next_levers": "Named by the instruments rather than by preference. (1) Host-side sync and transfer: with CTA in, the GPU is busy only 6.9 pct of the real wall, cudaStreamSynchronize is 65-67 pct of API time, and a single deck moves 40.3 GB over ~110K copies. WP13/13.1 have named 169 of those sites but neither elision nor the ledger has been priced. (2) Outer count, which is the A2 workstream and not a kernel question. (3) Batch width_fill, still 0.446 at the best arm."
+  }
+}

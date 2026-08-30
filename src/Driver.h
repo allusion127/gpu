@@ -567,6 +567,34 @@ namespace trajectory {
 /// does change.  If a future change ever lets PPR feed back, this list is where
 /// that change has to be declared -- tools/test_ppr_gpu_contract.py asserts the
 /// absence so the declaration cannot be forgotten.
+///
+/// SET-VS-UNSET, AND WHAT THE v5 DEFAULT FLIP DID NOT CHANGE.  This list is
+/// reported RAW: `armEnvJson()` prints the string the shell exported, or `null`
+/// when the variable is unset.  So from 2026-08-30, when RASBERY_GPU_FLATXS_CTA
+/// and RASBERY_GPU_XE_TXN became DEFAULT ON, two runs of the SAME arm can print
+/// two different `env` objects -- `"1"` if the launcher exported the knob,
+/// `null` if it relied on the default.  That is the receipt doing its job: it
+/// reports what it was asked for, not what it resolved to, precisely so it can
+/// never disagree with the solver's own reading.
+///
+/// THE `digest` IS UNAFFECTED, and this is a statement about the features, not
+/// about the fold.  `digest` folds statepoints, outers, T/H steps and the bit
+/// patterns of efpd / k_eff / boron -- `env` is not mixed into it at all.  Both
+/// flipped knobs are B0: 238 measured TXN=0 and TXN=1 at the same
+/// 0d15abf29d222a02 / 4382 and CTA=0 and CTA=1 at the same 1f36e75dc00ed2b4 /
+/// 4377, and 181 measured the same identity on its own digests.  So a v5 run
+/// with an EMPTY env prints the SAME digest as the old explicit-ON env, and
+/// tools/test_v5_defaults_contract.py holds the four defaults in place so that
+/// stays true.
+///
+/// THE `case_key` IS AFFECTED, and it is the one place this costs something.
+/// src/CaseKey.h's env half digests the same raw strings in this same order, so
+/// an unset knob (`~`) and an explicit `1` are two different payloads and two
+/// different keys for what is now one arm.  That is conservative in the safe
+/// direction -- a cache MISS, never a wrong hit -- but it means a GA controller
+/// that wants cache continuity across the flip must keep exporting the knobs it
+/// exported before.  The v5 manifest therefore lists all four flipped knobs
+/// EXPLICITLY in its env, even though unset would resolve identically.
 inline constexpr const char* kArmEnv[] = {
     "RASBERY_GPU",
     "RASBERY_GPU_CMFD_SWEEP",

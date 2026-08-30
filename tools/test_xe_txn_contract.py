@@ -82,19 +82,29 @@ def body_of(text: str, start_marker: str, end_marker: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 1. THE FLAG IS OFF BY DEFAULT AND DECLARED WHERE ARMS ARE DECLARED.
+# 1. THE FLAG IS ON BY DEFAULT (SINCE v5) AND DECLARED WHERE ARMS ARE DECLARED.
 #
-# A performance change carrying a bit-identity claim must not be on for anyone
-# who did not ask for it: default-on would mean the claim ships unchecked.
+# The claim did ship checked, and it took two attempts.  At 8919331 host 181
+# measured TXN=0 and TXN=1 at DIFFERENT digests with 854 h5diff lines and five
+# fewer Xe steps -- the algebra channel of the device mask was being mined per
+# host instead of composed from xeHostFormMask().  d25efe6 composes it, and at
+# 91004f7 both hosts agree: 238 at 0d15abf29d222a02 / 4382 with h5diff 0 (and
+# 0 differences again under the full v5 stack), 181 at e1964c0cd8bbb3d4 with
+# h5diff 0 and no RASBERY_XE_FORMS pin at all.
+#
+# What this rule holds now is the off switch, and it is not ceremonial: the
+# forms audit (src/XeFormAudit.h) is called from the TXN=0 path, so
+# RASBERY_XE_FORMS_AUDIT=1 is a no-op unless TXN can be turned off.
 # ---------------------------------------------------------------------------
-def rule_flag_default_off(backend: str) -> bool:
-    return 'envFlagEnabled("RASBERY_GPU_XE_TXN")' in backend
+def rule_flag_default_on(backend: str) -> bool:
+    return '!envFlagDisabled("RASBERY_GPU_XE_TXN")' in backend
 
 
 check(
-    rule_flag_default_off(BACKEND),
-    "RASBERY_GPU_XE_TXN is resolved with envFlagEnabled, i.e. absent means OFF "
-    "(envFlagDisabled would make it default-ON)",
+    rule_flag_default_on(BACKEND),
+    "RASBERY_GPU_XE_TXN is resolved with !envFlagDisabled, i.e. absent means ON "
+    "and =0 is the off switch the forms audit runs on (envFlagEnabled would put "
+    "it back to default-OFF)",
 )
 check(
     "bool rasberyGpuXeTxnEnabled() { return false; }" in STUB,
@@ -552,8 +562,10 @@ check("PrepareXeDeviceCall(power, 1.0," in XSSET_TXN,
 # NEGATIVE CONTROLS.  Each rule, fed a snippet that breaks it, must fail.
 # ---------------------------------------------------------------------------
 NEGATIVES = [
-    ("flag default-on",
-     lambda: rule_flag_default_off('static const bool on = envFlagDisabled("RASBERY_GPU_XE_TXN");')),
+    ("flag back to default-off",
+     lambda: rule_flag_default_on('static const bool on = envFlagEnabled("RASBERY_GPU_XE_TXN");')),
+    ("off switch removed -- RASBERY_XE_FORMS_AUDIT=1 would have no arm to run on",
+     lambda: rule_flag_default_on("static const bool on = true;")),
     ("dispatch not guarded",
      lambda: rule_dispatch_is_guarded("        TryAndersonXeStepGpuTxn(ctx, aa, power);")),
     ("control block hoisted to file scope",

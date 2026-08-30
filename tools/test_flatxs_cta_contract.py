@@ -115,21 +115,27 @@ CTA_STREAM = body_of(CTA_BODY, "for (int s = s0; s < s1; ++s) {",
 
 
 # ---------------------------------------------------------------------------
-# 1. THE FLAG IS OFF BY DEFAULT AND DECLARED WHERE ARMS ARE DECLARED.
+# 1. THE FLAG IS ON BY DEFAULT (SINCE v5) AND DECLARED WHERE ARMS ARE DECLARED.
 #
-# A performance change carrying a bit-identity claim must not be on for anyone
-# who did not ask for it: default-on would ship the claim unchecked, and the
-# tracker's own R1 finding is that this campaign has already quoted one number
-# that nobody re-measured.
+# The rule this replaces was "default-on would ship the claim unchecked".  The
+# claim is no longer unchecked: 238 priced the arm under PROD on 2026-08-30
+# (pricing block 12 -- h5diff 0 differences, digest 1f36e75dc00ed2b4 / 4377 on
+# both arms, 12.102 -> 11.189 s) and 181 gated it on a second toolchain
+# (gates block 5 -- cta_vs_ref_mismatches 0 at 64/128/256 and byte-identical
+# production h5 at every thread count).
+#
+# So what this rule now holds is the OTHER half, which never changed: the off
+# switch has to survive, because RASBERY_GPU_FLATXS_CTA=0 is the live reference
+# the bit-identity claim is measured against.
 # ---------------------------------------------------------------------------
-def rule_flag_default_off(backend: str) -> bool:
-    return 'envFlagEnabled("RASBERY_GPU_FLATXS_CTA")' in backend
+def rule_flag_default_on(backend: str) -> bool:
+    return '!envFlagDisabled("RASBERY_GPU_FLATXS_CTA")' in backend
 
 
 check(
-    rule_flag_default_off(BACKEND),
-    "RASBERY_GPU_FLATXS_CTA is resolved with envFlagEnabled, i.e. absent means OFF "
-    "(envFlagDisabled would make it default-ON)",
+    rule_flag_default_on(BACKEND),
+    "RASBERY_GPU_FLATXS_CTA is resolved with !envFlagDisabled, i.e. absent means ON "
+    "and =0 is the off switch (envFlagEnabled would put it back to default-OFF)",
 )
 check(
     "bool rasberyGpuFlatXsCtaEnabled() { return false; }" in STUB,
@@ -559,9 +565,12 @@ check(
 # NEGATIVE CONTROLS.
 # ---------------------------------------------------------------------------
 NEGATIVES: list[tuple[str, object]] = [
-    ("flag default-on",
-     lambda: rule_flag_default_off(
-         'static const bool on = envFlagDisabled("RASBERY_GPU_FLATXS_CTA");')),
+    ("flag back to default-off",
+     lambda: rule_flag_default_on(
+         'static const bool on = envFlagEnabled("RASBERY_GPU_FLATXS_CTA");')),
+    ("off switch removed -- the reference arm becomes unreachable",
+     lambda: rule_flag_default_on(
+         "static const bool on = true;")),
     ("dispatch not guarded / reference arm gone",
      lambda: rule_dispatch_is_guarded(
          "    fxs::flatxsCtaLaunch(v, 128, d.stream);\n")),

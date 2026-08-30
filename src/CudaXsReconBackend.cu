@@ -4605,13 +4605,21 @@ bool rasberyGpuFlatXsEnabled() {
 }
 
 bool rasberyGpuFlatXsCtaEnabled() {
-    // WP5 stage B.  envFlagEnabled, i.e. ABSENT MEANS OFF -- same rule and
-    // same reason as RASBERY_GPU_XE_TXN: this is a performance change carrying
-    // a bit-identity claim, and a default-on performance change is a claim
-    // nobody was asked to check.  The thread-per-node kernelFlatXs stays the
-    // mask-0 reference and stays the default until the 238 runbook in
-    // docs/WP5_FLATXS_CTA_20260831_KO.md says otherwise.
-    static const bool on = envFlagEnabled("RASBERY_GPU_FLATXS_CTA");
+    // WP5 stage B.  envFlagDisabled, i.e. ABSENT MEANS ON, since the v5 freeze
+    // (2026-08-30).  The rule this reverses -- "a default-on performance change
+    // is a claim nobody was asked to check" -- was satisfied, not waived: the
+    // 238 runbook of docs/WP5_FLATXS_CTA_20260831_KO.md was run
+    // (E:/rasbery_runs/2026-08-30/238/pricing_388e8f2.md block 12: h5diff 0
+    // differences, digest 1f36e75dc00ed2b4 / 4377 outers on both arms, wall
+    // 12.102 -> 11.189 s) and 181 gated the same claim on a second toolchain
+    // (gates_8919331.md block 5: cta_vs_ref_mismatches 0 at every block size,
+    // and every production h5diff CTA=0 vs CTA=1 byte-identical).
+    //
+    // The thread-per-node kernelFlatXs stays in the tree and stays reachable
+    // with RASBERY_GPU_FLATXS_CTA=0.  It is not dead code kept for sentiment:
+    // it is the reference the B0 claim is measured AGAINST, and a claim whose
+    // reference has been deleted is not checkable any more.
+    static const bool on = !envFlagDisabled("RASBERY_GPU_FLATXS_CTA");
     return on;
 }
 
@@ -4641,10 +4649,23 @@ bool rasberyGpuXeEnabled() {
 }
 
 bool rasberyGpuXeTxnEnabled() {
-    // WP7-C.  envFlagEnabled, i.e. ABSENT MEANS OFF.  The transaction is a
-    // performance change with a bit-identity claim attached, and a default-on
-    // performance change is a claim nobody was asked to check.
-    static const bool on = envFlagEnabled("RASBERY_GPU_XE_TXN");
+    // WP7-C.  envFlagDisabled, i.e. ABSENT MEANS ON, since the v5 freeze
+    // (2026-08-30).  The bit-identity claim was asked for and answered on both
+    // hosts AFTER the composition fix d25efe6 landed: 238 at 91004f7 puts TXN=0
+    // and TXN=1 at the same digest 0d15abf29d222a02 / 4382 with h5diff 0
+    // (pricing block 5 + the full-stack recheck in block 9, (e) vs (d) 0
+    // differences over the whole dataset), and 181 at 91004f7 puts base / TXN=0
+    // / TXN=1 all at e1964c0cd8bbb3d4 with h5diff 0 and NO env pin
+    // (gates_8919331.md block 11) -- which is the measurement that reverses the
+    // earlier 8919331 failure, since that tree predated d25efe6.
+    //
+    // WHY THE FLIP IS SAFE EVEN THOUGH THE ARM MOVED ONCE.  The 8919331 failure
+    // was the device mask's algebra channel being MINED per host instead of
+    // composed from xeHostFormMask(); the composition makes the two arms consume
+    // provably the same expressions.  TXN=0 remains reachable and remains the
+    // arm the forms audit runs on (src/XeFormAudit.h) -- RASBERY_XE_FORMS_AUDIT=1
+    // is a no-op under TXN=1, so the audit needs the off switch to exist.
+    static const bool on = !envFlagDisabled("RASBERY_GPU_XE_TXN");
     return on;
 }
 

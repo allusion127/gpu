@@ -457,10 +457,15 @@ bool rasberyGpuXsReconEnabled();
 bool rasberyGpuFlatXsEnabled();
 
 /// RASBERY_GPU_FLATXS_CTA, read once per process: WP5 stage B's CTA-per-node
-/// flat-XS kernel.  Default OFF; the arm it changes is the
-/// RASBERY_GPU_FLATXS one, and it claims to change it BIT FOR BIT -- the
-/// argument is written at the top of src/FlatXsCtaKernel.cuh and gated by
-/// test/flatxs_device_replay.cu --cta.  Stub builds return false.
+/// flat-XS kernel.  DEFAULT ON since the v5 freeze (RASBERY_GPU_FLATXS_CTA=0 is
+/// the off switch); the arm it changes is the RASBERY_GPU_FLATXS one, and it
+/// changes it BIT FOR BIT -- the argument is written at the top of
+/// src/FlatXsCtaKernel.cuh, gated by test/flatxs_device_replay.cu --cta, and
+/// measured on both hosts (238 pricing block 12, 181 gates block 5).
+/// Stub builds return false: a CUDA-less build has no flat-XS device arm at
+/// all, so "the CTA arm is on" would be a claim about a kernel that is not
+/// there.  The default is about which DEVICE kernel runs, not about whether a
+/// device runs.
 bool rasberyGpuFlatXsCtaEnabled();
 
 /// Threads per CTA for that arm (RASBERY_GPU_FLATXS_CTA_THREADS; 64/128/256,
@@ -481,8 +486,11 @@ unsigned long long rasberyGpuFlatXsNodes();
 bool rasberyGpuXeEnabled();
 
 /// RASBERY_GPU_XE_TXN, read once per process: WP7 stage C's single-transaction
-/// Xe step.  Default OFF; the arm it changes is the RASBERY_GPU_XE one, and it
-/// claims to change it bit for bit.
+/// Xe step.  DEFAULT ON since the v5 freeze (RASBERY_GPU_XE_TXN=0 is the off
+/// switch, and is the arm RASBERY_XE_FORMS_AUDIT=1 has to run on); the arm it
+/// changes is the RASBERY_GPU_XE one, and it changes it bit for bit on both
+/// hosts once the algebra channel is composed rather than mined (d25efe6).
+/// Stub builds return false, for the same reason the CTA gate does.
 bool rasberyGpuXeTxnEnabled();
 
 /// The fixed partition count the device inner product is cut into

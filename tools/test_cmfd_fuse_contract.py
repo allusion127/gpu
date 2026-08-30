@@ -153,7 +153,14 @@ def preamble_of(code: str, kernel: str) -> str:
 
 
 def rule_flag_family(code: str) -> list:
-    """One env name, read once, masked to the declared bits, default 0."""
+    """One env name, read once, masked to the declared bits, default 15.
+
+    THE DEFAULT FLIPPED AT THE v5 FREEZE and this rule flipped with it.  What it
+    still enforces is the part that was never about which value is the default:
+    ONE read, LATCHED, MASKED to the declared bits, and a named constant rather
+    than a literal -- so that "which mask is the default" is a question with one
+    answer in the source instead of a number repeated in three places.
+    """
     problems = []
     reads = re.findall(r'getenv\s*\(\s*"RASBERY_GPU_CMFD_FUSE"\s*\)', code)
     if len(reads) != 1:
@@ -176,10 +183,38 @@ def rule_flag_family(code: str) -> list:
             "cmfdFuseMask() must mask the parsed value with kFuseAllBits, so an "
             "unknown bit cannot arm an undeclared path"
         )
-    if "return 0u" not in gate:
+    if "kFuseDefaultMask" not in gate:
         problems.append(
-            "cmfdFuseMask() must fall back to 0 (the reference path) when the "
-            "variable is unset or unparseable"
+            "cmfdFuseMask() must fall back to the NAMED default kFuseDefaultMask "
+            "when the variable is unset or unparseable -- a literal here is a "
+            "second answer to 'what is the default mask'"
+        )
+    if "return 0u" in gate:
+        problems.append(
+            "cmfdFuseMask() still falls back to 0.  Since the v5 freeze the "
+            "default is kFuseDefaultMask (= kFuseAllBits = 15); 0 survives only "
+            "as the EXPLICIT off switch, which strtoul already produces"
+        )
+    return problems
+
+
+def rule_default_mask_is_all_bits(code: str) -> list:
+    """The named default exists and is the mask both hosts gated.
+
+    238 measured every mask in {0,1,2,4,8,15} at digest 0d15abf29d222a02 / 4382
+    and 181 measured every one of them at 1d897e3f77204799 with h5diff 0 lines
+    against mask 0, so B0 is established for the whole family; 15 is the member
+    that also cleared the 0.2 s adoption threshold (-0.396 s interleaved, where
+    mask 4 managed -0.183 s).  A default that quietly became a DIFFERENT member
+    of the family would be a wall claim nobody measured, so the constant is
+    pinned to kFuseAllBits by name.
+    """
+    problems = []
+    if "kFuseDefaultMask = kFuseAllBits" not in code:
+        problems.append(
+            "kFuseDefaultMask must be defined as kFuseAllBits: the adopted "
+            "default is mask 15, and spelling it as a literal or as a subset "
+            "would change the arm without changing the receipt's vocabulary"
         )
     return problems
 
@@ -315,7 +350,12 @@ EXPECTED_STRUCTURE = {
     "void enqueue_outer(": {
         "<<<": 9,         # init, fp32 mirror, 2 begin variants, stage1, 3 stage2
                           # variants, finalize_status
-        "cudaMemcpyAsync(": 1,
+        # The status D2H.  Spelled `xfer::memcpyAsync(` since WP13.1 routed
+        # every transfer in src/ through the site-tagged wrapper; the token is
+        # the SUFFIX so this counts the call whichever of the two it is, because
+        # what the node model cares about is that there is exactly ONE copy node
+        # here -- not which header the call went through.
+        "memcpyAsync(": 1,
     },
     "void enqueue_sweeps(": {
         "<<<": 11,        # assemble + 6 tail kernels + 4 Wielandt-fold variants
@@ -436,6 +476,26 @@ def self_test() -> list:
         '    return m;\n}\n',
         "RASBERY_GPU_CMFD_FUSE read twice",
     )
+    # 2b. The default silently back to the reference mask.  This is the control
+    # the v5 flip needs: a gate that still reads the variable once, still
+    # latches it and still masks it, and is wrong ONLY in which value an unset
+    # variable resolves to.
+    expect_fail(
+        rule_flag_family,
+        'unsigned cmfdFuseMask() {\n'
+        '    static const unsigned m = [] {\n'
+        '        const char* v = std::getenv("RASBERY_GPU_CMFD_FUSE");\n'
+        '        if (v == nullptr) return 0u;\n'
+        '        return 1u & kFuseAllBits; }();\n'
+        '    return m;\n}\n',
+        "cmfdFuseMask() defaulting back to the reference mask 0",
+    )
+    # 2c. The default spelled as a literal instead of the named constant.
+    expect_fail(
+        rule_default_mask_is_all_bits,
+        "enum : unsigned { kFuseDefaultMask = 15u };\n",
+        "kFuseDefaultMask spelled as a literal rather than kFuseAllBits",
+    )
     # 3. Fused kernel with no order note.
     expect_fail(
         rule_order_notes,
@@ -500,6 +560,7 @@ def main() -> int:
         return 1
 
     problems += rule_flag_family(code)
+    problems += rule_default_mask_is_all_bits(code)
     problems += rule_order_notes(code)
     problems += rule_reference_survives(code)
     problems += rule_colour_sweep_refusal(code)

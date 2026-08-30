@@ -22,9 +22,14 @@ here:
      back-pressuring the solver.
   3. THE JOIN IS MISSING.  CloseResult() resets the session (and the file
      handle) without fencing the queue first, so a task can outlive its file.
-  4. FEATURE-OFF DRIFTED.  The default is no longer sync, or the sync branch no
-     longer calls the same emitter, so `RASBERY_RESULT_ASYNC` unset stops being
-     the pre-WP12 path and the B0 claim is unverifiable.
+  4. THE OFF SWITCH DRIFTED.  Since the v5 freeze the DEFAULT is async, which
+     both hosts gated on the only comparison that can see a CSV -- `cmp` on the
+     two files (238 pricing block 11: 119,013,281 bytes, identical; 181 gates
+     block 13: 119,013,920 bytes, identical across three arms).  So the rule is
+     no longer "unset must be sync"; it is that `RASBERY_RESULT_ASYNC=0` must
+     still reach the SAME emitter inline.  A gate with no off switch, or a sync
+     branch that stopped calling `csv_record.Emit()`, makes the B0 claim
+     unverifiable in exactly the way a default-off gate used to.
 
 NEGATIVE CONTROLS.  Every scan is run against a synthetic source that violates
 it.  A scan that cannot fail its own control is a scan that proves nothing, and
@@ -185,8 +190,13 @@ def scan_feature_off(io_cpp: str, io_writer: str) -> list[str]:
         return ["resultAsyncRequested is gone -- the gate has no default"]
     if "RASBERY_RESULT_ASYNC" not in req:
         bad.append("the gate no longer reads RASBERY_RESULT_ASYNC")
+    if "value == nullptr) return true" not in req.replace("  ", " "):
+        bad.append("the gate has no unset->true default; since the v5 freeze async "
+                   "is the default and an unset variable must resolve to it")
     if "return false" not in req:
-        bad.append("the gate has no unset->false default; feature-off is not the default")
+        bad.append("the gate has no falsy->false path; RASBERY_RESULT_ASYNC=0 must "
+                   "still reach the inline emitter, because that arm IS the "
+                   "reference the byte-identity claim is measured against")
     if "mode() == Mode::Thread" not in io_writer:
         bad.append("async is not conditioned on the writer thread existing")
 
@@ -245,10 +255,30 @@ void IO::FenceJobWrites() const {
 }
 """
 
+# The off switch deleted: still reads the variable, still latches, and is wrong
+# only in that nothing can turn it off any more.
 CONTROL_FEATURE_OFF_WRITER = """
 inline bool resultAsyncRequested() {
-    return true;
+    static const bool requested = [] {
+        (void)std::getenv("RASBERY_RESULT_ASYNC");
+        return true;
+    }();
+    return requested;
 }
+"""
+
+# The other direction: the default quietly back to sync, which would make every
+# v5 wall claim a measurement of an arm nobody is running.
+CONTROL_DEFAULT_BACK_TO_SYNC = """
+inline bool resultAsyncRequested() {
+    static const bool requested = [] {
+        const char* value = std::getenv("RASBERY_RESULT_ASYNC");
+        if (value == nullptr) return false;
+        return std::string(value) == "1";
+    }();
+    return requested;
+}
+inline bool resultAsyncEnabled() { return resultAsyncRequested() && mode() == Mode::Thread; }
 """
 
 CONTROL_FEATURE_OFF_IO = """
@@ -273,8 +303,10 @@ def main() -> int:
         ("snapshot leaks a solver reference", scan_snapshot(CONTROL_SNAPSHOT)),
         ("queue unbounded / task under the HDF5 guard", scan_queue(CONTROL_QUEUE)),
         ("join after the session is dropped", scan_join(CONTROL_JOIN)),
-        ("gate defaults to async / CSV still written inline",
+        ("off switch deleted / CSV still written inline",
          scan_feature_off(CONTROL_FEATURE_OFF_IO, CONTROL_FEATURE_OFF_WRITER)),
+        ("gate defaults back to sync",
+         scan_feature_off(io_cpp, CONTROL_DEFAULT_BACK_TO_SYNC)),
     ]
     for name, hits in controls:
         if not hits:

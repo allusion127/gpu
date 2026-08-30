@@ -259,7 +259,9 @@ bool cmfdScalarFusionEnabled() {
 }
 
 // ---------------------------------------------------------------------------
-// WP7 stage B -- RASBERY_GPU_CMFD_FUSE, a BITMASK, default 0.
+// WP7 stage B -- RASBERY_GPU_CMFD_FUSE, a BITMASK, DEFAULT 15 (kFuseDefaultMask)
+// since the v5 freeze (2026-08-30).  `RASBERY_GPU_CMFD_FUSE=0` is the off switch
+// and still launches the reference kernels, unchanged.
 //
 // Every bit below merges two ADJACENT graph nodes into one kernel.  The
 // reference kernels stay exactly where they are and are what mask 0 launches,
@@ -311,17 +313,35 @@ enum CmfdFuseBit : unsigned {
     kFuseAllBits  = kFuseDot | kFuseDot2 | kFuseWiel | kFuseSweepPre
 };
 
+/// THE DEFAULT, since the v5 freeze.  Mask 15 was measured B0 against mask 0 on
+/// BOTH hosts -- 238 (all six masks digest 0d15abf29d222a02 / 4382, pricing
+/// block 4) and 181 (all six masks digest 1d897e3f77204799, h5diff 0 lines vs
+/// mask 0) -- and it is the only mask that cleared the 0.2 s adoption threshold
+/// (-0.396 s interleaved, block 4b; mask 4 managed -0.183 s and was not
+/// adopted).  A default is a claim, and this one is the strongest kind the
+/// campaign has: the fused body is the two reference bodies concatenated
+/// character for character, so "same operations, same order, same rounding"
+/// is a property of the text, not of a measurement that could drift.
+enum : unsigned { kFuseDefaultMask = kFuseAllBits };
+
 /// Read ONCE, like every other RASBERY_* gate: the mask fixes the captured
 /// graph topology, so it must not be able to change between two outers of the
-/// same run.  Decimal or 0x-prefixed hex; anything unparseable is 0, which is
-/// the reference path.
+/// same run.  Decimal or 0x-prefixed hex.
+///
+/// UNSET IS kFuseDefaultMask, not 0.  Explicit `=0` still parses to 0 and still
+/// selects the reference kernels, so the off switch survives the flip -- that is
+/// what keeps mask 0 a LIVE reference rather than a memory of one.  An
+/// UNPARSEABLE value also falls back to the default rather than to 0: after the
+/// flip, silently dropping a typo to the reference path would look like a
+/// performance regression with no cause in any receipt, and the [CMFD][GRAPH]
+/// receipt's `fuse_mask` is what a reader would have to catch it with.
 unsigned cmfdFuseMask() {
     static const unsigned mask = [] {
         const char* v = std::getenv("RASBERY_GPU_CMFD_FUSE");
-        if (v == nullptr) return 0u;
+        if (v == nullptr) return static_cast<unsigned>(kFuseDefaultMask);
         char*               end    = nullptr;
         const unsigned long parsed = std::strtoul(v, &end, 0);
-        if (end == v) return 0u;
+        if (end == v) return static_cast<unsigned>(kFuseDefaultMask);
         return static_cast<unsigned>(parsed) & static_cast<unsigned>(kFuseAllBits);
     }();
     return mask;
