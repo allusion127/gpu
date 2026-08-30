@@ -162,6 +162,29 @@ inline constexpr unsigned int kOuterSegmentBudgetDefault = 8u;
 inline constexpr unsigned int kOuterSegmentBudgetMax = 64u;
 [[nodiscard]] unsigned int outerSegmentBudget();
 
+/// WP14: RASBERY_GPU_OUTER_SEGMENT_V2, default OFF.
+///
+/// WHAT IT IS AND WHAT IT IS NOT.  It is a set of PURE RENDEZVOUS ELISIONS at
+/// the segment exit -- two host calls removed on the path where the loop already
+/// broke on an exit observation, on the proof that the observation's own
+/// cudaStreamSynchronize left the stream EMPTY and the 32 bytes the exit is read
+/// from were already in the pinned exit word.  No kernel moves, no copy changes
+/// its bytes, no decision changes its order, and nothing device-side is asked a
+/// different question.  That is B0 by the same argument RASBERY_GPU_XFER_ELIDE
+/// makes (src/XferLedger.h), and for the same reason this flag is NOT in
+/// trajectory::kArmEnv: a knob that cannot move a trajectory must not fork the
+/// evaluator's case key.
+///
+/// IT IS NOT THE SEGMENT-LENGTH FIX.  WP14's measurement (docs/WP14_...) found
+/// that kngr_238 exits its segments after 3.30 outers of a budget of 8 because
+/// the CMFD decision hands the slot to a HOST phase -- Xenon, overwhelmingly --
+/// and no device-side predicate can continue across that.  The exit observation
+/// that costs 0.88 ms is therefore not a discovery cost, it is the host waiting
+/// for an outer it had to wait for anyway; what removes it is the conditional
+/// WHILE (RASBERY_GPU_OUTER_GRAPH, src/GpuOuterWhile.h), which overlaps the
+/// host's ~30 enqueues with the device's execution rather than deleting a wait.
+[[nodiscard]] bool outerSegmentV2Enabled();
+
 // ---------------------------------------------------------------------------
 // The segment plan, AS DATA
 // ---------------------------------------------------------------------------
@@ -464,6 +487,39 @@ inline const char* outerEscapeName(DeviceEscape e) {
         case DeviceEscape::MaxIteration:         return "max_iteration";
         case DeviceEscape::CramZeroDiagonal:     return "cram_zero_diagonal";
         case DeviceEscape::CramNotConverged:     return "cram_not_converged";
+    }
+    return "?";
+}
+
+/// WP14: the PHASE a segment exited INTO, named.
+///
+/// WHY THE ESCAPE ALONE COULD NOT ANSWER "WHY DID THIS SEGMENT STOP".  Five of
+/// the six CmfdOuterAction values leave the Outer phase, and three of them --
+/// Xenon, ThermalHydraulics, Search -- carry `escape = None`
+/// (src/CmfdOuterKernel.h: only the converged, limit-cycle and stall-fatal arms
+/// set one).  So `escapes{"none":N}` was the largest bucket in every receipt and
+/// it named nothing: an Xe hand-off, a T/H perturbation and a search commit were
+/// one number.  `exit_reasons{}` is that number split by DeviceOuterSegmentState
+/// ::next_phase, which the exit observation already downloads.
+inline const char* outerExitPhaseName(DevicePhase p) {
+    switch (p) {
+        case DevicePhase::Empty:              return "empty";
+        case DevicePhase::Import:             return "import";
+        case DevicePhase::Material:           return "material";
+        case DevicePhase::Outer:              return "outer";
+        case DevicePhase::Xenon:              return "xenon";
+        case DevicePhase::ThermalHydraulics:  return "thermal_hydraulics";
+        case DevicePhase::Search:             return "search";
+        case DevicePhase::NormalizeFluxSign:  return "normalize_flux_sign";
+        case DevicePhase::Derivative:         return "derivative";
+        case DevicePhase::RodOp:              return "rod_op";
+        case DevicePhase::Ppr:                return "ppr";
+        case DevicePhase::ResultAggregate:    return "result_aggregate";
+        case DevicePhase::DepletionPredictor: return "depletion_predictor";
+        case DevicePhase::DepletionCorrector: return "depletion_corrector";
+        case DevicePhase::OutputPack:         return "output_pack";
+        case DevicePhase::Done:               return "done";
+        case DevicePhase::Failed:             return "failed";
     }
     return "?";
 }
@@ -990,6 +1046,38 @@ struct OuterSegmentCounters {
     std::uint64_t jnet_mirror_bytes        = 0;
     std::uint64_t refusals[static_cast<int>(OuterSegmentRefusal::Count)] = {};
     std::uint64_t escapes[kDeviceEscapeCount]                           = {};
+    // ---- WP14: WHY the segment stopped, and what the loop cost to find out --
+    /// The phase the segment exited INTO, indexed by DevicePhase.  The companion
+    /// to `escapes{}` and the half of the answer it could not give: Xenon,
+    /// ThermalHydraulics and Search all carry `escape = none`, so a receipt with
+    /// one "none" bucket could not tell an Xe hand-off from a search commit.
+    /// `exit_reasons[Outer]` is the segment that stopped WITHOUT a phase change
+    /// -- the budget, a Rayleigh hand-back or a cusping re-entry -- and the
+    /// escape then says which.
+    std::uint64_t exit_reasons[kDevicePhaseCount] = {};
+    /// Iterations of the segment's host loop, committed or not.  `segment_passes
+    /// - device_outers` is the DISCOVERY-ONLY passes, and the pair is what makes
+    /// "the exit observation fires once per outer" measurable rather than
+    /// inferred from sync_exit_observation alone.
+    std::uint64_t segment_passes           = 0;
+    /// Passes that synchronised, saw the exit already latched, and broke without
+    /// committing an outer.  One per segment that ended before its budget.
+    std::uint64_t discovery_passes         = 0;
+    /// WP14 V2: cudaStreamSynchronize calls NOT made because the loop had
+    /// already broken on an exit observation and the stream was therefore empty.
+    std::uint64_t v2_exit_syncs_elided     = 0;
+    /// WP14 V2: 32-byte D2H of DeviceOuterSegmentState NOT made because the
+    /// pinned exit word already held those exact bytes.
+    std::uint64_t v2_state_d2h_elided      = 0;
+    /// THE HOST/DEVICE SPLIT IS NOT HERE, DELIBERATELY.
+    /// tools/test_device_outer_state_machine.py bans host clocks from
+    /// CudaOuterGraph.cu -- a timer on a per-outer path is a tax on the thing it
+    /// measures -- and it does not need one: the exit observation's wall is
+    /// already a ledger row (`CudaOuterGraph.cu:runSegment:exit observation`,
+    /// calls AND ns, under RASBERY_XFER_LEDGER), and the host's own share is the
+    /// run's wall minus that ledger's sync_ns.  If the two are equal the segment
+    /// loop is perfectly serialised and the ceiling is 2x, which is the number
+    /// the WHILE arm exists to collect.
 };
 
 /// Process-wide counters.  One deck per process on the single-run path, which is

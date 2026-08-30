@@ -62,6 +62,16 @@ bool outerGpuEnabled() {
     return on;
 }
 
+/// WP14.  Declared in the header, so it must resolve in a CPU-only link even
+/// though nothing in this build can reach a segment exit to elide.  It answers
+/// the environment truthfully rather than `false`: a receipt that said the arm
+/// was off on a box where the operator set the variable would be the one wrong
+/// answer a flag reader must never give.
+bool outerSegmentV2Enabled() {
+    static const bool on = outerEnvFlagOn("RASBERY_GPU_OUTER_SEGMENT_V2");
+    return on;
+}
+
 unsigned int outerSegmentBudget() {
     static const unsigned int budget = [] {
         const char* v = std::getenv("RASBERY_GPU_OUTER_SEGMENT_MAX");

@@ -202,10 +202,17 @@ struct AtomicCounters {
     std::atomic<std::uint64_t> jnet_mirror_bytes{0};
     std::atomic<std::uint64_t> refusals[static_cast<int>(OuterSegmentRefusal::Count)];
     std::atomic<std::uint64_t> escapes[kDeviceEscapeCount];
+    // WP14: the exit reason by PHASE, the loop's pass census, and the V2 arm.
+    std::atomic<std::uint64_t> exit_reasons[kDevicePhaseCount];
+    std::atomic<std::uint64_t> segment_passes{0};
+    std::atomic<std::uint64_t> discovery_passes{0};
+    std::atomic<std::uint64_t> v2_exit_syncs_elided{0};
+    std::atomic<std::uint64_t> v2_state_d2h_elided{0};
 
     AtomicCounters() {
         for (auto& c : refusals) c.store(0, std::memory_order_relaxed);
         for (auto& c : escapes) c.store(0, std::memory_order_relaxed);
+        for (auto& c : exit_reasons) c.store(0, std::memory_order_relaxed);
         for (auto& c : hostfree_refusals) c.store(0, std::memory_order_relaxed);
         for (auto& c : graph_refusals) c.store(0, std::memory_order_relaxed);
     }
@@ -307,6 +314,43 @@ bool outerHostFreeFull() {
     return on;
 }
 
+/// WP14: RASBERY_GPU_OUTER_SEGMENT_V2 -- the segment exit, observed ONCE.
+///
+/// TWO ELISIONS, AND BOTH ARE ARGUED FROM THE SAME FACT: when the segment loop
+/// breaks at the top of a pass it has just returned from
+/// cudaStreamSynchronize(m.stream), so the stream is EMPTY and the pinned exit
+/// word `m.h_seg` holds the 32 bytes the last committed outer's transition
+/// wrote.  On that path
+///
+///   (1) the host-free exit's SECOND cudaStreamSynchronize has nothing to wait
+///       for.  Its only job is to make the sweep accumulator visible, and a
+///       blocking cudaMemcpy on an empty stream does that in one host call
+///       instead of an async copy plus a rendezvous.
+///   (2) the exit observation's D2H of DeviceOuterSegmentState re-reads bytes
+///       that are already in `m.h_seg`, byte for byte, with no kernel in between
+///       that could have written d_segments.
+///
+/// WHAT IS NOT CLAIMED.  This does not make segments longer and does not remove
+/// the 0.88 ms the exit observation costs -- WP14 measured that segments stop
+/// after 3.30 outers because the CMFD decision hands the slot to a HOST phase
+/// (Xenon, overwhelmingly), and the observation is the host waiting for an outer
+/// it had to wait for anyway.  The two elisions above are worth their own
+/// counters and nothing more; the 2x is in the WHILE arm.
+///
+/// B0 BY CONSTRUCTION, so it is NOT in trajectory::kArmEnv.  Nothing device-side
+/// is asked a different question and no host decision changes its inputs or its
+/// order: the ON arm reads the same bytes through a shorter path.
+bool outerSegmentV2Enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("RASBERY_GPU_OUTER_SEGMENT_V2");
+        if (v == nullptr) return false;
+        const std::string s(v);
+        return !(s.empty() || s == "0" || s == "off" || s == "OFF" || s == "false" ||
+                 s == "FALSE");
+    }();
+    return on;
+}
+
 unsigned int outerSegmentBudget() {
     static const unsigned int budget = [] {
         const char* v = std::getenv("RASBERY_GPU_OUTER_SEGMENT_MAX");
@@ -387,6 +431,12 @@ OuterSegmentCounters snapshotSlotCounters(const AtomicCounters& a) {
         out.refusals[i] = a.refusals[i].load(std::memory_order_relaxed);
     for (int i = 0; i < kDeviceEscapeCount; ++i)
         out.escapes[i] = a.escapes[i].load(std::memory_order_relaxed);
+    for (int i = 0; i < kDevicePhaseCount; ++i)
+        out.exit_reasons[i] = a.exit_reasons[i].load(std::memory_order_relaxed);
+    out.segment_passes       = a.segment_passes.load(std::memory_order_relaxed);
+    out.discovery_passes     = a.discovery_passes.load(std::memory_order_relaxed);
+    out.v2_exit_syncs_elided = a.v2_exit_syncs_elided.load(std::memory_order_relaxed);
+    out.v2_state_d2h_elided  = a.v2_state_d2h_elided.load(std::memory_order_relaxed);
     return out;
 }
 
@@ -441,6 +491,12 @@ void addCounters(OuterSegmentCounters& into, const OuterSegmentCounters& add) {
         into.refusals[i] += add.refusals[i];
     for (int i = 0; i < kDeviceEscapeCount; ++i)
         into.escapes[i] += add.escapes[i];
+    for (int i = 0; i < kDevicePhaseCount; ++i)
+        into.exit_reasons[i] += add.exit_reasons[i];
+    into.segment_passes       += add.segment_passes;
+    into.discovery_passes     += add.discovery_passes;
+    into.v2_exit_syncs_elided += add.v2_exit_syncs_elided;
+    into.v2_state_d2h_elided  += add.v2_state_d2h_elided;
 }
 
 } // namespace
@@ -512,7 +568,22 @@ std::string outerSegmentReceiptJson() {
                          : std::to_string(static_cast<double>(c.graph_iterations) /
                                           static_cast<double>(c.graph_launches))) +
                     ",\"graph_instantiations\":" + std::to_string(c.graph_instantiations) +
-                    ",\"graph_warmup_misses\":" + std::to_string(c.graph_warmup_misses);
+                    ",\"graph_warmup_misses\":" + std::to_string(c.graph_warmup_misses) +
+                    // WP14.  segment_passes - device_outers IS discovery_passes;
+                    // both are printed so the identity is checkable rather than
+                    // assumed, and outers_per_segment is printed because it is
+                    // the number that decides whether the budget is reachable
+                    // at all on this deck.
+                    ",\"segment_v2_arm\":" + std::to_string(outerSegmentV2Enabled() ? 1 : 0) +
+                    ",\"segment_passes\":" + std::to_string(c.segment_passes) +
+                    ",\"discovery_passes\":" + std::to_string(c.discovery_passes) +
+                    ",\"outers_per_segment\":" +
+                    (c.segment_launches == 0
+                         ? std::string("0")
+                         : std::to_string(static_cast<double>(c.device_outers) /
+                                          static_cast<double>(c.segment_launches))) +
+                    ",\"v2_exit_syncs_elided\":" + std::to_string(c.v2_exit_syncs_elided) +
+                    ",\"v2_state_d2h_elided\":" + std::to_string(c.v2_state_d2h_elided);
 
     // Only the non-zero buckets, so a healthy run's line stays readable and a
     // nonzero escape stands out instead of hiding among ten zeros.
@@ -525,6 +596,23 @@ std::string outerSegmentReceiptJson() {
         s += "\"";
         s += outerEscapeName(static_cast<DeviceEscape>(i));
         s += "\":" + std::to_string(c.escapes[i]);
+    }
+    s += "}";
+
+    // WP14: the same census by the PHASE the segment left for.  Same non-zero
+    // rule.  This is the line that answers "why does a budget of 8 stop at 3":
+    // an `xenon` bucket the size of segment_launches says the CMFD decision is
+    // handing the slot to a host phase, and no device-side predicate can
+    // continue across that.
+    s += ",\"exit_reasons\":{";
+    first = true;
+    for (int i = 0; i < kDevicePhaseCount; ++i) {
+        if (c.exit_reasons[i] == 0) continue;
+        if (!first) s += ",";
+        first = false;
+        s += "\"";
+        s += outerExitPhaseName(static_cast<DevicePhase>(i));
+        s += "\":" + std::to_string(c.exit_reasons[i]);
     }
     s += "}";
 
@@ -1743,6 +1831,18 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     }
     const bool hostfree = hostfree_why == OuterHostFreeRefusal::None;
     const bool keep_exit_obs = hostfree && !outerHostFreeFull();
+    // WP14.  Read ONCE per segment into a local, because the two elisions below
+    // are a pair: a segment that took the shorter accumulator read must also be
+    // the one that skips the second synchronise, and a static read twice would
+    // let a mid-run reconfiguration split them.  (It cannot today -- the reader
+    // caches -- and that is exactly why the local costs nothing.)
+    const bool segment_v2 = outerSegmentV2Enabled();
+    // Set by the loop below when it BREAKS on an exit observation.  Its meaning
+    // is narrow and load-bearing: cudaStreamSynchronize(m.stream) returned
+    // success and nothing has been enqueued on m.stream since, so the stream is
+    // empty and `m.h_seg` holds the bytes the last committed outer's transition
+    // wrote.  Every V2 elision is argued from this one fact.
+    bool observed_exit = false;
     if (!hostfree) bump(counters().hostfree_refusals[static_cast<int>(hostfree_why)]);
 
     // THE FLAG THE SWEEP HOOK READS, AND THE ONE THING THAT MUST NOT LEAK.
@@ -2812,6 +2912,12 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     };
 
     for (unsigned int i = 0; i < budget; ++i) {
+        // WP14: the pass census, counted at the TOP so a pass the WHILE arm
+        // consumes is a pass.  On the stream arm `segment_passes -
+        // device_outers` is exactly `discovery_passes`, and that identity is
+        // what makes "the exit observation fires once per outer" a measurement
+        // rather than an inference from sync_exit_observation alone.
+        bump(counters().segment_passes);
         // THE ONE PLACE THE GRAPH ARM DIVERGES FROM THE STREAM ARM, and it is
         // one break.  Outer 0 has run eagerly above (the warm-up rule), its
         // transition has published outer_in_segment = 1, and everything the body
@@ -2860,10 +2966,28 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         if (i > 0 && (!hostfree || keep_exit_obs)) {
             bump(counters().in_body_host_syncs);
             bump(counters().sync_exit_observation);
+            // NOT TIMED HERE, AND THAT IS A RULE RATHER THAN AN OMISSION.
+            // tools/test_device_outer_state_machine.py bans host clocks from
+            // this file: a timer on a per-outer path is a tax on the thing it
+            // measures.  The wall this synchronise costs is already a ledger
+            // row -- `CudaOuterGraph.cu:runSegment:exit observation` under
+            // RASBERY_XFER_LEDGER carries calls AND ns -- so the number exists
+            // and is paid for once, in the wrapper.
             if ((rc = rasbery::xfer::streamSync("CudaOuterGraph.cu:runSegment",
-                                        "exit observation", m.stream)) != cudaSuccess)
+                                                "exit observation", m.stream)) != cudaSuccess)
                 return launchFailed("synchronize on the segment exit", rc);
-            if (m.h_seg != nullptr && m.h_seg->exit != 0u) break;
+            if (m.h_seg != nullptr && m.h_seg->exit != 0u) {
+                // WP14: THE DISCOVERY-ONLY PASS, NAMED.  It synchronised, saw the
+                // exit and committed nothing, and it is the pass the receipt
+                // could not previously distinguish from a committing one.  The
+                // flag it sets is what licenses the two V2 elisions at the exit:
+                // from here to the end of this function nothing is enqueued on
+                // m.stream that a kernel could observe, so the stream is empty
+                // and the exit word is current.
+                bump(counters().discovery_passes);
+                observed_exit = true;
+                break;
+            }
         }
         if (hostfree) bump(counters().hostfree_enqueued);
 
@@ -2885,18 +3009,48 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     // observation below cannot serve: it must be issued AFTER the exit mirrors,
     // and the mirrors' correctness depends on what this observation decides --
     // whether an abandoned outer still owes its tail.
+    //
+    // WP14 V2: AND WHY THE SEGMENT THAT ALREADY OBSERVED DOES NOT PAY IT TWICE.
+    // `observed_exit` says the loop broke at the top of a pass, on a
+    // cudaStreamSynchronize of this same stream that returned success, and that
+    // nothing has been enqueued on it since -- the break is the next statement.
+    // The accumulator D2H below is then the ONLY outstanding work this
+    // synchronise would have waited for, so a blocking cudaMemcpy on an empty
+    // stream reads the same bytes at the same point in the same order, in one
+    // host call instead of two.  It is a shorter path to identical bytes, which
+    // is the whole B0 claim; if the loop did NOT break on an observation (the
+    // budget was spent, or the WHILE ran) the stream is live and the arm falls
+    // through to the synchronise it always did.
+    //
+    // REFUSED IN A BATCH, BY NAME.  A blocking cudaMemcpy is issued on the
+    // LEGACY stream, which implicitly synchronises with every blocking stream in
+    // the context -- harmless when this segment owns the only one, and a sibling
+    // deck's whole sweep to wait on when it does not.  That is a scheduling
+    // hazard rather than a trajectory one, and it is refused rather than
+    // measured: the async pair below is what a batch keeps.
+    const bool v2_exit_drained = segment_v2 && observed_exit && batch_width <= 1;
     if (hostfree) {
-        if (m.h_sweep_accum != nullptr && m.d_sweep_accum != nullptr) {
-            if ((rc = rasbery::xfer::memcpyAsync(
-                     "CudaOuterGraph.cu:runSegment", "sweep accumulator",
+        if (v2_exit_drained) {
+            if (m.h_sweep_accum != nullptr && m.d_sweep_accum != nullptr &&
+                (rc = rasbery::xfer::memcpy(
+                     "CudaOuterGraph.cu:runSegment", "sweep accumulator (v2 drained)",
                      m.h_sweep_accum, m.d_sweep_accum + slot, sizeof(*m.h_sweep_accum),
-                     cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+                     cudaMemcpyDeviceToHost)) != cudaSuccess)
                 return launchFailed("download the sweep accumulator", rc);
+            bump(counters().v2_exit_syncs_elided);
+        } else {
+            if (m.h_sweep_accum != nullptr && m.d_sweep_accum != nullptr) {
+                if ((rc = rasbery::xfer::memcpyAsync(
+                         "CudaOuterGraph.cu:runSegment", "sweep accumulator",
+                         m.h_sweep_accum, m.d_sweep_accum + slot, sizeof(*m.h_sweep_accum),
+                         cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+                    return launchFailed("download the sweep accumulator", rc);
+            }
+            bump(counters().sync_hostfree_exit);
+            if ((rc = rasbery::xfer::streamSync("CudaOuterGraph.cu:runSegment",
+                                                "host-free exit", m.stream)) != cudaSuccess)
+                return launchFailed("synchronize on the host-free segment exit", rc);
         }
-        bump(counters().sync_hostfree_exit);
-        if ((rc = rasbery::xfer::streamSync("CudaOuterGraph.cu:runSegment", "host-free exit",
-                                    m.stream)) != cudaSuccess)
-            return launchFailed("synchronize on the host-free segment exit", rc);
         m.sweep_host_continued = false;
         if (!m.hooks.finish_cmfd_sweep_deferred(m.hooks.ctx, m.h_sweep_accum, slot))
             return hookFailed("the deferred CMFD sweep observation hook");
@@ -2931,6 +3085,13 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         // from the state this one leaves.
         if (m.sweep_host_continued) {
             bump(counters().hostfree_repairs);
+            // WP14 V2: THE REPAIR PUTS A WHOLE OUTER TAIL BACK ON THE STREAM,
+            // and its transition writes d_segments.  So the fact the elisions
+            // below are argued from -- "the stream is empty and `m.h_seg` is
+            // current" -- stops being true here, and the flag that carries it
+            // is retired rather than reasoned around.  The exit observation
+            // reverts to the D2H it always made.
+            observed_exit = false;
             double* const repair_reigv_slot =
                 m.hooks.nodal_reigv_slot != nullptr
                     ? static_cast<double*>(m.hooks.nodal_reigv_slot(m.hooks.ctx))
@@ -3059,10 +3220,29 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     DeviceSlotState         state_out{};
     unsigned long long      halted_out = 0;
     CmfdOuterDecision       decision_out{};
-    if ((rc = rasbery::xfer::memcpyAsync("CudaOuterGraph.cu:runSegment", "exit segment state",
-                                  &seg_out, m.d_segments + slot, sizeof(seg_out),
-                                  cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+    // WP14 V2: THE 32 BYTES THAT ARE ALREADY ON THE HOST.
+    //
+    // `runOuterTail` D2H's this exact struct into the pinned `m.h_seg` behind
+    // every transition, and the observation the loop broke on made the last
+    // one visible.  Between that synchronise and here the stream has carried
+    // the exit mirrors and a 4-byte halt clear and NOTHING THAT WRITES
+    // d_segments -- the repair pass, which does, retires `observed_exit` where
+    // it runs.  So the copy below would read bytes the host already holds, and
+    // taking them from the pinned word is the same value by a shorter path.
+    //
+    // THE FALLBACK IS THE COPY, not an assumption: without `observed_exit` (a
+    // budget exit, the WHILE arm, a repair) the exit word is stale by
+    // construction and the D2H is the only correct read.
+    const bool v2_seg_from_pin = segment_v2 && observed_exit && m.h_seg != nullptr;
+    if (v2_seg_from_pin) {
+        seg_out = *m.h_seg;
+        bump(counters().v2_state_d2h_elided);
+    } else if ((rc = rasbery::xfer::memcpyAsync(
+                    "CudaOuterGraph.cu:runSegment", "exit segment state", &seg_out,
+                    m.d_segments + slot, sizeof(seg_out), cudaMemcpyDeviceToHost,
+                    m.stream)) != cudaSuccess) {
         return launchFailed("download segment state", rc);
+    }
     if ((rc = rasbery::xfer::memcpyAsync("CudaOuterGraph.cu:runSegment", "exit slot state",
                                   &state_out, m.arena.states + slot, sizeof(state_out),
                                   cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
@@ -3134,6 +3314,12 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     bump(counters().host_outer_observations);
     if (seg_out.escape < static_cast<std::uint32_t>(kDeviceEscapeCount))
         bump(counters().escapes[seg_out.escape]);
+    // WP14: the exit reason the escape could not name.  `next_phase` is written
+    // by the same transition that wrote the escape, in the same 32 bytes, so
+    // this costs one bounds test and one relaxed increment on a path that runs
+    // once per SEGMENT.
+    if (seg_out.next_phase < static_cast<std::uint32_t>(kDevicePhaseCount))
+        bump(counters().exit_reasons[seg_out.next_phase]);
     if (seg_out.escape == static_cast<std::uint32_t>(DeviceEscape::SegmentBudget))
         bump(counters().budget_exits);
     // The device counter is cumulative across segments; publish the delta.

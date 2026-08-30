@@ -428,10 +428,25 @@ for bridge, counter in (("mirror psi to the host", "host_mirror_bytes"),
 #
 # The invariant this number defends is unchanged: no D2H may appear inside the
 # per-outer loop that is not one of the named bridges or a debug-gated hash.
-if GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost") > 18:
+#
+# NINETEEN since WP14, and the new one is NOT a new rendezvous -- it is the SAME
+# 200 bytes, read a shorter way:
+#
+#   1  the sweep accumulator again, as a BLOCKING cudaMemcpy, taken only on the
+#      RASBERY_GPU_OUTER_SEGMENT_V2 path where the segment loop already broke on
+#      an exit observation.  That observation's cudaStreamSynchronize returned
+#      and nothing has been enqueued since, so the stream is empty and the
+#      blocking copy IS the rendezvous the async copy would have needed a second
+#      synchronise for.  It replaces a sync; it does not add one, and
+#      `v2_exit_syncs_elided` in the [OUTER_GPU] receipt is the count.
+#
+# The invariant is still the one below: no D2H inside the per-outer LOOP that is
+# not a named bridge or a debug-gated hash.  This one is at the exit.
+if GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost") > 19:
     problems.append("CudaOuterGraph.cu: more D2H sites than the four named bridges plus "
-                    "the observation, the four exit mirrors and the two traced hashes "
-                    "(%d).  Each one is a rendezvous and needs a name"
+                    "the observation, the four exit mirrors, the two traced hashes and "
+                    "the V2 drained accumulator read (%d).  Each one is a rendezvous and "
+                    "needs a name"
                     % GRAPH_CU_CODE.count("cudaMemcpyDeviceToHost"))
 # THE GRAPH API IS NO LONGER BANNED OUTRIGHT -- IT IS FENCED.
 #
