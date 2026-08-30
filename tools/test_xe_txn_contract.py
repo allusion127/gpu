@@ -487,7 +487,9 @@ check(
 # xe_updates/device_updates in UpdateEquilibriumXenon; the transaction makes one
 # call instead of two, so it charges both from the downloaded reason.
 # ---------------------------------------------------------------------------
-TXN_ARM = body_of(DRIVER, "static bool TryAndersonXeStepGpuTxn(",
+# The signature carries RASBERY_NEVER_INLINE, so the anchor starts at the
+# return type (docs/REGRESSION_7cfe3a4_d7b81af_20260831_KO.md Sec 7).
+TXN_ARM = body_of(DRIVER, "bool TryAndersonXeStepGpuTxn(SolverContext",
                   "/// The DEVICE arm of the safeguarded Anderson step")
 for term in ("xe_updates.fetch_add", "device_updates.fetch_add",
              "aa_proposed.fetch_add", "aa_accepted.fetch_add",

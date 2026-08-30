@@ -33,6 +33,36 @@
 #include <string>
 #include <vector>
 
+// A FUNCTION BODY THAT MAY NOT JOIN ITS CALLER, AND WHY THAT IS A CONTRACT.
+//
+// Everything in this header is an implicitly-inline member of one class, and
+// the whole solver reaches g++ as ONE translation unit (src/main.cpp is the
+// only .cpp that includes Driver.h; there is no LTO).  SolveLoop's Xe step is
+// a chain of static member functions with EXACTLY ONE CALL SITE EACH --
+// SolveLoop -> TryAndersonXeStep -> TryAndersonXeStepGpu -- so
+// -finline-functions-called-once folds every one of them into SolveLoop.  A new
+// sibling with one call site therefore does not sit "next to" the production
+// arm: its body is spliced INTO the hottest function in the tree, and the
+// inlining, scheduling and -ffp-contract=fast decisions of everything already
+// there are re-made around it.  That is not a hypothesis; it is what moved the
+// flag-off trajectory in `71092e2` (docs/REGRESSION_7cfe3a4_d7b81af_20260831_KO.md
+// Sec 7).
+//
+// So a default-off arm that lives in this header is written the way
+// xe::auditAndersonFit is written -- a cached bool and an OPAQUE CALL -- and
+// when it cannot live in its own translation unit, this attribute is what makes
+// the call opaque.  It is a correctness contract for the OFF arm, not a
+// performance hint for the ON one.
+#if !defined(RASBERY_NEVER_INLINE)
+#  if defined(__GNUC__)
+#    define RASBERY_NEVER_INLINE __attribute__((noinline, cold))
+#  elif defined(_MSC_VER)
+#    define RASBERY_NEVER_INLINE __declspec(noinline)
+#  else
+#    define RASBERY_NEVER_INLINE
+#  endif
+#endif
+
 namespace rasbery {
 
 // Per-statepoint decomposition telemetry (plan Rev.4 Sec 8), behind
@@ -2551,9 +2581,36 @@ private:
     /// UpdateEquilibriumXenon; there is one call here instead of two, so both
     /// are charged from the downloaded reason.  A receipt that changed under a
     /// flag claiming bit-identity would be the first thing to disbelieve.
-    static bool TryAndersonXeStepGpuTxn(SolverContext& ctx, XeAndersonState& aa,
-                                        double power, double max_step,
-                                        double& xe_change) {
+    ///
+    /// ---------------------------------------------------------------------
+    /// RASBERY_NEVER_INLINE, AND IT IS THE OFF ARM THAT NEEDS IT
+    /// ---------------------------------------------------------------------
+    ///
+    /// This body has ONE call site, in TryAndersonXeStepGpu, which itself has
+    /// one call site in TryAndersonXeStep, which has one in SolveLoop.  Without
+    /// the attribute -finline-functions-called-once splices all ~110 lines of it
+    /// into SolveLoop, where the four normal-equation expressions of the SPLIT
+    /// arm (`det = a*c - b*b` and the three below it, further down this file)
+    /// are compiled -- unbarriered, at -O3 -march=native with gcc's default
+    /// -ffp-contract=fast.  Re-making SolveLoop's inlining and contraction
+    /// decisions around a body nobody runs is exactly what a default-off flag
+    /// may not do, and it is what `71092e2` did: flag-off digest
+    /// 22b9a3187bfb4beb / 4566 outers became c1a5d9116df9edb3 / 4601 with
+    /// RASBERY_GPU_XE_TXN unset.
+    ///
+    /// The shape that is PROVEN neutral on the same host is the audit hook a
+    /// few hundred lines below -- a cached `static const bool audit` and, under
+    /// it, one call to xe::auditAndersonFit -- and what makes it neutral is that
+    /// auditAndersonFit is defined in src/XeFormAudit.cpp, so the call is
+    /// opaque and nothing joins the caller (`8919331` added it and the
+    /// trajectory did not move).  This attribute buys the same opacity for a
+    /// body that cannot leave the header, because it reaches SolverContext,
+    /// XeAndersonState and RejectXeAnderson, all of which are declared here.
+    /// tools/test_xe_split_arm_sequence_contract.py pins it.
+    static RASBERY_NEVER_INLINE bool TryAndersonXeStepGpuTxn(SolverContext& ctx,
+                                                             XeAndersonState& aa,
+                                                             double power, double max_step,
+                                                             double& xe_change) {
         XSSet& xs = ctx.cross_sections;
         if (xs.fuel_nodes().empty())
             return false;
@@ -2671,6 +2728,13 @@ private:
         // same shape Task 13's own dispatch takes.  With the flag unset this is
         // a load of a cached bool and the round-tripping arm runs exactly as it
         // always has, which is what makes the flag's A/B an A/B.
+        //
+        // "ONE LINE" IS ONLY TRUE BECAUSE THE CALLEE IS RASBERY_NEVER_INLINE.
+        // It was not true when this shipped: the callee had one call site, so
+        // gcc inlined its whole body here and from here into SolveLoop, and the
+        // flag-off trajectory moved (22b9a3187bfb4beb/4566 -> c1a5d911.../4601).
+        // See TryAndersonXeStepGpuTxn's header and
+        // docs/REGRESSION_7cfe3a4_d7b81af_20260831_KO.md Sec 7.
         static const bool txn = rasberyGpuXeTxnEnabled();
         if (txn && TryAndersonXeStepGpuTxn(ctx, aa, power, max_step, xe_change))
             return true;

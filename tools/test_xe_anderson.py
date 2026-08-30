@@ -120,7 +120,10 @@ GPU_AA = region(DRIVER, "    static bool TryAndersonXeStepGpu(",
 # WP7-C: the device TRANSACTION sibling (RASBERY_GPU_XE_TXN), which takes the
 # whole step -- safeguards, decision and commit -- inside one device call and
 # reads the outcome back as a reason code.
-TXN_AA = region(DRIVER, "    static bool TryAndersonXeStepGpuTxn(",
+# The signature carries RASBERY_NEVER_INLINE (see the header there and
+# docs/REGRESSION_7cfe3a4_d7b81af_20260831_KO.md Sec 7), so the anchor starts
+# at the return type rather than at `static`.
+TXN_AA = region(DRIVER, "bool TryAndersonXeStepGpuTxn(SolverContext",
                 "\n    /// The DEVICE arm of the safeguarded Anderson step",
                 "TryAndersonXeStepGpuTxn")
 

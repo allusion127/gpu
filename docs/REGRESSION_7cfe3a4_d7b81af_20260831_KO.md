@@ -377,3 +377,193 @@ h5diff -c results_7cfe3a4.h5 results_fix.h5 | tail -3
 | `"shipped":"0xd"` | `7cfe3a4`의 `value`와 동일 | shipped 채널이 실제로 움직인 것 → §2.1이 되살아난다 |
 | `"algebra":"0xd20"`, `"algebra_sound":1` | 238의 첫 실측 그대로 | 채굴 불안정, WP7-C 게이트 문제 |
 | digest `22b9a3187bfb4beb` / outers `4566` / h5diff `0/644` | — | **예상대로 어긋난다.** §6.3이 맞다면 이 커밋은 궤적을 되돌리지 않는다. 그때는 §4의 B2/B1 이분이 유일한 다음 수이며, 이 커밋은 그 이분에서 mask 채널을 영구히 배제해 준 것이다 |
+
+---
+
+## 7. 원인 확정 (2026-08-31): `71092e2`가 옮긴 것은 **산술이 아니라 산술이 컴파일되는 함수**다
+
+### 7.1 238이 새로 준 격리 관측
+
+§6까지의 조사는 `7cfe3a4..d7b81af` 24커밋 구간에서 후보를 좁히지 못했다.
+238이 `71092e2` **하나만** cherry-pick해 격리했다 (arm X, `RASBERY_GPU_XE_TXN` unset):
+
+| 트리 | digest / outers | `[RASBERY][FORMS]` XE_FORMS |
+| --- | --- | --- |
+| `47161ed` | `22b9a3187bfb4beb` / **4566** | `0xd` |
+| `47161ed` + `71092e2` (clean apply) | `c1a5d9116df9edb3` / **4601** | `0xd2d` |
+
+`d7b81af`와 같은 값이다. **`71092e2` 단독이 원인이고, 나머지 23커밋은 무해**임이
+소스 판정(§2.2)과 함께 실측으로도 확정되었다.
+
+### 7.2 `71092e2`가 flag-off 경로에서 바꿀 수 있는 것 — 전수 판정
+
+지시받은 6개 용의자를 순서대로 소스 판정했다. **여섯 모두 음성이다.**
+
+| # | 용의자 | 판정 | 근거 (file:line) |
+| --- | --- | --- | --- |
+| 1 | `kXeHistory` (rotate+record+save 융합) | **음성 — split arm이 발사하지 않는다** | 유일한 발사점이 `src/CudaXsReconBackend.cu:3020` (`XsReconBackend::xeTransaction` 본문 내부). split arm은 `src/Driver.h:2758,2762,2766`에서 여전히 `XeGpuRotateHistory` / `XeGpuRecordColumn(aa.ncol)` / `XeGpuSaveEvaluation` 세 진입점을 순서대로 부른다. 회전 순서·기록 컬럼(`aa.ncol`, `ncol-1` 아님)·저장 시점(기록 뒤, 무조건)·`--aa.ncol`/`++aa.ncol` 모두 `47161ed`와 동일 — `tools/test_xe_split_arm_sequence_contract.py`가 이제 이 전부를 고정한다 |
+| 2 | `xeCommit` / `drainXeCommit` | **음성 — 값 변경 없음** | `drainXeCommit`은 마지막 `return download(...)`가 `if (!download(...)) return false; countXeD2H(...); return true;`로 풀렸을 뿐(`src/CudaXsReconBackend.cu:2670`). `xeCommit`에 추가된 것은 `countXeD2H` 1회와 `xe_device_steps.fetch_add` 1회. "post-commit download failure retires the instance"는 `xeTransaction` 전용 문장이며 `xeCommit` 본문은 손대지 않았다 |
+| 3 | `TryAndersonXeStepGpu`의 dispatch·수락/감쇠/reset-edge | **음성 — 본문 텍스트 무변경** | dispatch는 `src/Driver.h:2738-2740` 두 문장뿐이고 그 아래 `XSSet& xs = ctx.cross_sections;`부터 끝까지는 `47161ed`와 문자 단위로 동일(정규방정식 4식 `src/Driver.h:2808-2814`, 안전장치 4개, `RejectXeAnderson` 4곳 포함). 감쇠와 reset edge는 이 커밋이 건드리지 않았다 |
+| 4 | `XSSet.cpp` Xe 진입점 | **음성 — 기존 진입점 서명·인자 무변경** | `XSSet::XeGpuTransaction`은 **새 함수**로 추가(`src/XSSet.cpp:4199`). `UpdateEquilibriumXenon` / `XeGpuEvaluate` / `XeGpuCommitPicard`의 서명도 본문도 diff에 없다. `PrepareXeDeviceCall`은 호출부가 5→6개로 늘었지만 부동소수 산술이 없는 포인터 배선 함수라 인라이닝이 값을 바꿀 수 없다 |
+| 5 | `XeGpuReceipt.h` 카운터 | **음성 — 읽는 쪽이 없다** | 추가된 6필드(`xe_device_steps`/`txn_steps`/`txn_accepted`/`txn_declined`/`host_syncs`/`d2h_bytes`)는 `appendXeGpuReceiptFields`에서 출력될 뿐, 어떤 분기 조건에도 들어가지 않는다 |
+| 6 | `xeDots`/`xeCandidate` 인자와 `XE_DOT_*` 상수 | **음성 — 상수 불변, 필드 폭 불변** | `XE_DOT_FIRST_BIT=0` / `XE_DOT_THIRD_BIT=2` / `XE_CAND1_BIT=3` / `XE_CAND2_BIT=4`는 그대로이고, 소비자는 각자 자기 필드만 좁혀 읽는다: `src/XeKernel.h:432,433`(`&3ull`, `&1ull`), `src/XeKernel.h:336`(`cand_bit = (ncol<=1)?XE_CAND1_BIT:XE_CAND2_BIT`, `&1ull`). §6.3의 결론 그대로이며 `c645124` 이후로는 발사 인자 자체가 `xeShippedFormMask()`(비트 0..4)다. 채굴값이 `0xd`→`0xd2d`로 움직였지만 **하위 5비트는 두 트리에서 같은 `0xd`** 이므로 production 산술은 같은 mask로 돌았다 |
+
+### 7.3 그러면 남는 것은 하나뿐 — **main.cpp TU의 콜그래프 질량**
+
+`src/Driver.h`를 include하는 `.cpp`는 `src/main.cpp` 하나뿐이고
+(`src/EvaluatorServer.h`가 include하지만 그 헤더 역시 `main.cpp`가 먹는다),
+`CMakeLists.txt`에 LTO는 없다. 즉 **솔버 전체가 하나의 TU**로 g++에 들어가고,
+릴리스 플래그는 `-O3 -march=native`(`CMakeLists.txt:147`) — gcc의 C++ 기본
+`-ffp-contract=fast`가 살아 있다.
+
+그 TU 안에서 Xe 스텝은 **호출부가 정확히 하나씩인 static 멤버 함수의 사슬**이다:
+
+```
+SolveLoop            src/Driver.h:3965  -> TryAndersonXeStep
+TryAndersonXeStep    src/Driver.h:2936  -> TryAndersonXeStepGpu
+TryAndersonXeStepGpu src/Driver.h:2739  -> TryAndersonXeStepGpuTxn   <-- 71092e2가 추가
+```
+
+`-finline-functions-called-once`(-O1 이상 기본)는 호출부가 하나인 함수를
+**크기와 무관하게** 호출자 안으로 접는다. 따라서 `71092e2`가 추가한
+`TryAndersonXeStepGpuTxn` 약 110줄은 "옆에 놓인 죽은 코드"가 아니라
+**`SolveLoop` 본문 안으로 들어간 110줄**이다. 그 결과 `SolveLoop`의 인라이닝·
+스케줄링·수축 결정이 전부 새 몸통을 끼고 다시 계산된다.
+
+그리고 그 `SolveLoop` 안에는 **배리어가 없는 host 산술**이 있다 —
+split arm의 정규방정식 네 식(`src/Driver.h:2808-2814`):
+
+```cpp
+const double det = a * c - b * b;
+gamma[0] = (c * p - b * q) / det;
+gamma[1] = (a * q - b * p) / det;
+proj     = gamma[0] * p + gamma[1] * q;
+```
+
+이들은 `xsrMul`/`xsrFma`(`src/XsReconKernel.h:83`의 `asm volatile` 배리어)를
+쓰지 않는다. 어느 곱을 add에 fuse할지는 gcc가 그때그때 정하고, 그 선택은
+**이 식들이 어느 함수 몸통 안에서 컴파일되느냐**에 달려 있다.
+`71092e2` 자신의 커밋 메시지가 그 사실을 적어 두었다("g++ at -O3 may fuse
+either"), 그리고 `src/Driver.h:2840-2852`의 audit 훅 주석은 이 호스트에서
+그 gap이 실제로 벌어진 사례(호스트 181)를 이름으로 적어 두었다.
+
+**+35 outer(0.77 %), h5diff 435/644 — 마지막 비트 섭동의 크기다.**
+제어흐름이 바뀌었다면 이것보다 훨씬 크게 벌어졌을 것이다(§1).
+
+### 7.4 대조군이 있다 — 같은 모양인데 움직이지 않은 훅
+
+`8919331`은 **같은 함수의 한가운데에** 같은 모양의 훅을 넣었다
+(`src/Driver.h:2853-2857`):
+
+```cpp
+static const bool audit = xe::xeFormAuditEnabled();
+if (audit)
+    xe::auditAndersonFit(dots, aa.ncol, XE_ANDERSON_MIN_GRAM, solved, ...);
+```
+
+그리고 §6.1의 실측대로 **궤적은 움직이지 않았다**(`d7b81af`와 동일한
+`c1a5d9116df9edb3`/4601, h5diff 435 불변). 두 훅의 유일한 구조적 차이는:
+
+| | 캐시된 bool | 호출되는 몸통이 있는 곳 | 궤적 |
+| --- | --- | --- | --- |
+| audit 훅 (`8919331`) | 예 | `src/XeFormAudit.cpp` — **다른 TU**, 불투명 호출 | **불변** |
+| TXN 훅 (`71092e2`) | 예 | `src/Driver.h` — **같은 TU, 호출부 1개** → 인라인 | **이동** |
+
+`src/XeFormAudit.h`의 머리주석이 "인라인이면 false negative"라고 이미
+적어 둔 규칙이며, `71092e2`는 그 규칙을 한 단계 아래에서 어겼다.
+**"ONE LINE, AT THE TOP"은 콜리가 불투명할 때만 참이다.**
+
+### 7.5 hunk-bisect와의 대응 (238 러너와 반드시 일치해야 하는 표)
+
+| hunk 묶음 | 소스 판정 | 예상 bisect 결과 |
+| --- | --- | --- |
+| **mask 파일** (`XeFormMine.h`, `XeAndersonReference.*`, `test/xe_form_probe.cpp`) | 무해 — 채굴 하위 5비트 불변(§6.2), 참조 TU는 `32ac308`에서 이미 원복 | 4566 유지 |
+| **kernel 파일** (`XeKernel.h`, `CudaXsReconBackend.cu/.h`, `XeGpuReceipt.h`) | 무해 — device TU는 `--fmad=false`(`CMakeLists.txt:30`)이고 shipped body는 `xsrMul`/`xsrFma`로 고정. `XeKernel.h`가 새로 넣은 inline 함수들은 **main.cpp TU에서 아무도 참조하지 않으므로** cgraph에서 제거되어 인라이닝 예산에 들어가지 않는다 (참조자는 `CudaXsReconBackend.cu`, `XeFormAudit.cpp`, `XeFormMine.h`뿐) | 4566 유지 |
+| **host 파일** (`Driver.h`, `XSSet.cpp/.h`, `CudaXsReconBackendStub.cpp`) | **원인** — `Driver.h`의 `TryAndersonXeStepGpuTxn`(+본문)과 그 유일 호출부 | **4601로 이동** |
+
+`Driver.h` 안에서 다시 3개 hunk로 쪼갠다면:
+
+| Driver.h hunk | 판정 |
+| --- | --- |
+| `kArmEnv`에 `"RASBERY_GPU_XE_TXN"` 추가 (`src/Driver.h:571`) | 무해 — 소비자는 `armEnvJson()`(receipt)과 `caseKeyProvenance()`(case key) 둘뿐, 물리 경로 없음. unset이면 두 트리 모두 `null` |
+| `TryAndersonXeStepGpuTxn` 본문 (+110줄) | **원인** |
+| dispatch 2줄 (`src/Driver.h:2738-2740`) | 원인의 **전달자** — 이 참조가 없으면 위 본문은 cgraph에서 제거되어 무해해진다 |
+
+### 7.6 수정 (본 커밋)
+
+| 파일 | 변경 |
+| --- | --- |
+| `src/Driver.h:56-63` | `RASBERY_NEVER_INLINE` — gcc `__attribute__((noinline, cold))`, MSVC `__declspec(noinline)`. 헤더 안에서만 살 수 있는 default-off arm이 audit 훅과 같은 **불투명성**을 사는 수단이며, **ON arm의 성능 힌트가 아니라 OFF arm의 정확성 계약**이라고 주석이 못박는다 |
+| `src/Driver.h:2610` | `static RASBERY_NEVER_INLINE bool TryAndersonXeStepGpuTxn(...)`. 본문·의미·TXN=1 동작은 한 글자도 바꾸지 않았다 |
+| `src/Driver.h:2727-2740` | dispatch 주석에 "ONE LINE은 콜리가 NEVER_INLINE일 때만 참"이라는 이유와 이 회귀의 digest를 적었다 |
+| `tools/test_xe_split_arm_sequence_contract.py` | **신규.** 55 검사 / 음성대조 13 |
+| `tools/test_xe_anderson.py`, `tools/test_xe_txn_contract.py` | 앵커가 `static bool ...Txn(`에 붙어 있었으므로 반환형 기준으로 옮김. 검사 내용 무변경 |
+
+`cold`까지 붙인 이유: dispatch 분기를 unlikely로 표시해 `SolveLoop`의 블록
+배치를 분기가 **없던** 시절에 더 가깝게 되돌린다. TXN=1 arm은 그대로 동작하며
+(호스트 쪽 일은 request 구성 + 호출 + 카운터뿐, 산술은 전부 device),
+`-Os`로 컴파일되는 것이 그 arm의 벽시계에 의미 있는 영향을 주지 않는다.
+
+#### 7.6.1 새 계약 테스트가 잠그는 규칙
+
+1. `RASBERY_NEVER_INLINE`이 gcc에서 실제로 `__attribute__((noinline, ...))`으로 전개된다 (빈 매크로 = 이름 붙은 주석).
+2. `TryAndersonXeStepGpuTxn` 정의가 그 속성을 달고 있고, 호출부는 정확히 하나다.
+3. 중립 대조군이 진짜 중립이다 — `auditAndersonFit`은 `XeFormAudit.h`에서 **선언만** 되고 `XeFormAudit.cpp`에서 정의된다.
+4. dispatch는 두 문장뿐이고 `XSSet& xs = ctx.cross_sections;` 앞에 다른 것이 없다.
+5. split arm의 device 호출 순서: evaluate → rotate → record → save → dots → candidate → commit, 각 1회.
+6. 윈도 부기: 회전은 `aa.ncol == XE_ANDERSON_DEPTH` 가드 뒤 `--aa.ncol`, 기록은 `XeGpuRecordColumn(aa.ncol)`(≠ `ncol-1`), `++aa.ncol`은 기록과 저장 사이, 저장은 `if (aa.have_prev)` **밖**, `aa.have_prev = true`는 저장 뒤, dots/candidate는 `aa.ncol`.
+7. split arm은 `XeGpuTransaction`/`XeTxnControl`/`xeAndersonFit`/`xeHistoryOrdinal` 등 TXN 기계를 언급하지 않고, `kXeHistory`·`kXeAndersonSolve`·`kXeCandidateTxn`·`kXeAndersonGate`·`kXeCommitTxn`은 `XsReconBackend::xeTransaction` 안에서만 발사된다.
+8. 정규방정식 네 식이 문자 그대로 남아 있다 (`std::fma`나 `xsrMul`로 다시 쓰면 다른 반올림을 고정해 기준선 자체가 움직인다).
+
+```bash
+python tools/test_xe_split_arm_sequence_contract.py
+python tools/test_xe_anderson.py
+python tools/test_xe_txn_contract.py
+python tools/test_xe_forms_default_contract.py
+python tools/test_xe_forms_shipped_split_contract.py
+python tools/test_xe_forms_audit_contract.py
+python tools/test_xe_gpu_contract.py
+python tools/test_enum_alias_contract.py
+python tools/test_dependent_template_contract.py
+python tools/test_telemetry_neutrality.py
+```
+
+### 7.7 238 검증 라인
+
+arm X 환경은 §4.1 그대로, **`RASBERY_GPU_XE_TXN`은 unset**.
+
+```bash
+# (1) 수정본 -- B0 복구 여부
+git checkout <이 커밋>
+# 빌드: 캠페인 표준 (WSL micromamba CUDA 12.6, 238 = sm120, GPU0만)
+grep -h 'TRAJECTORY'  run_fix.log     # -> digest 22b9a3187bfb4beb, outers 4566
+grep -h 'FORMS'       run_fix.log     # -> shipped 0xd (algebra 0xd20은 움직여도 무방)
+h5diff -c results_47161ed.h5 results_fix.h5 | tail -3   # -> 0/644
+
+# (2) A/B 확증 -- 속성만 제거한 대조 빌드
+#     src/Driver.h:2610 의 RASBERY_NEVER_INLINE 한 토큰만 지우고 재빌드
+grep -h 'TRAJECTORY'  run_inlined.log # -> c1a5d9116df9edb3 / 4601 이 나와야 한다
+
+# (3) TXN=1 이 여전히 작동하는지 (N1이어도 무방, 죽지만 않으면 된다)
+#     arm X + RASBERY_GPU_XE_TXN=1
+grep -h 'XE_GPU'      run_txn.log
+#     txn_steps > 0 이고 txn_declined == 0 이어야 census가 한 arm의 것이다
+```
+
+판정:
+
+| 관측 | 기대 | 어긋나면 |
+| --- | --- | --- |
+| (1) digest `22b9a3187bfb4beb` / outers `4566` / h5diff `0/644` | B0 복구 | §7.3이 맞더라도 잔여분이 남은 것 — 다음 수는 `TryAndersonXeStepGpuTxn` 본문을 자체 TU로 내보내 `overall_size` 기여까지 없애는 것(현재 fix는 인라인만 막고 cgraph 노드 자체는 남긴다) |
+| (2) `c1a5d9116df9edb3` / `4601` | 인라이닝이 원인임을 A/B로 확정 | (2)도 4566이면 원인은 이 훅이 아니라 `71092e2`의 다른 hunk이며, §7.5의 3분할 bisect로 되돌아간다 |
+| (3) `txn_steps > 0`, `txn_declined == 0` | TXN arm 생존 | `noinline/cold`가 arm을 깨뜨린 것이 아니라 arm이 declined하는 것 — `xeTransaction`의 refusal 조건을 본다 |
+
+### 7.8 §5.2와 §6.3에 대한 정정
+
+- §5.2의 "남는 가설: 헤더 추가로 인한 host 인라이닝/수축 변화"는 **맞았다.**
+  다만 그 가설은 "include가 늘어서"라고 적혀 있었고, 실제 기전은 include가
+  아니라 **호출부가 하나인 새 함수가 `SolveLoop` 안으로 접힌 것**이다.
+  `71092e2`가 `Driver.h`에 추가한 include는 없다(`XeKernel.h`·`XeGpuReceipt.h`
+  둘 다 이미 있었다).
+- §6.3의 "비트 5 이상을 소비하는 live-arm 코드는 없다"는 **유효하다.**
+  이번 판정은 그것을 뒤집지 않고, 그 음성 판정이 남긴 공백을 메운다.
