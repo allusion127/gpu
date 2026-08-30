@@ -267,6 +267,41 @@ def audit_physics_mode(output: str, declared: str = "strict") -> list[str]:
 CASE_REQUIRED_FIELDS = ("policy", "physics_fidelity", "statepoint_grid",
                         "acceptance_eligible")
 
+#: WP10.4.  ONE VALUE, TWO SPELLINGS, AND THE AUDIT HAS TO KNOW IT.
+#:
+#: The evaluator's [EVALUATOR][CASE] line spells the Sec 6.2 word
+#: `physics_fidelity`; the Driver's own [RASBERY][CASE] line has always spelled
+#: the SAME value `fidelity`, because tools/case_key.py keys the case on that
+#: name and every manifest on disk carries it.  parse_case_receipts() reads both
+#: tags into one list, so before this map every Driver-side receipt in a run --
+#: 83 of the 86 findings in the host 181 soak at 91004f7 -- was refused as
+#: "predates WP10.3" by a binary that had the field all along.
+#:
+#: THIS DOES NOT WEAKEN THE VERSION REFUSAL.  `fidelity` is a WP10.1 field;
+#: `statepoint_grid` and `acceptance_eligible` are the WP10.3 ones and have no
+#: synonym, so a receipt from a binary that really predates WP10.3 is still
+#: refused -- by the two fields that would have voided the case, which is the
+#: rule the refusal exists to enforce.
+CASE_FIELD_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "physics_fidelity": ("fidelity",),
+}
+
+
+def case_field(receipt: Mapping, field: str, default=None):
+    """*receipt*'s value for *field*, accepting its documented synonyms."""
+    if field in receipt:
+        return receipt[field]
+    for alias in CASE_FIELD_SYNONYMS.get(field, ()):
+        if alias in receipt:
+            return receipt[alias]
+    return default
+
+
+def case_field_present(receipt: Mapping, field: str) -> bool:
+    """True when *receipt* carries *field* under any of its spellings."""
+    return field in receipt or any(alias in receipt
+                                   for alias in CASE_FIELD_SYNONYMS.get(field, ()))
+
 
 def parse_case_receipts(output: str) -> list[dict]:
     """Every per-case receipt in *output*, evaluator lines preferred.
@@ -325,7 +360,7 @@ def audit_case_fidelity(output: str, declared: "str | Mapping[str, str]" = "stri
         # field already reports and the dispatcher already counts.
         if receipt.get("status") == "failed" and receipt.get("policy") is None:
             continue
-        missing = [f for f in CASE_REQUIRED_FIELDS if f not in receipt]
+        missing = [f for f in CASE_REQUIRED_FIELDS if not case_field_present(receipt, f)]
         if missing:
             problems.append(
                 "%s: the per-case receipt is missing %s -- this binary predates WP10.3 "
@@ -424,7 +459,8 @@ def strip_non_strict(env: dict[str, str],
 
 
 __all__ = ["POLICIES", "DECLARABLE_FIDELITIES", "REQUIRED_FIELDS",
-           "CASE_REQUIRED_FIELDS",
+           "CASE_REQUIRED_FIELDS", "CASE_FIELD_SYNONYMS", "case_field",
+           "case_field_present",
            "STAGED_TOLERANCE_KEYS", "STAGED_KEYS", "NON_STRICT_ENV_KEYS",
            "PHYSICS_MODE_RECEIPT", "CASE_RECEIPT", "EVALUATOR_CASE_RECEIPT",
            "parse_physics_mode", "receipt_policy", "parse_case_receipts",

@@ -135,6 +135,7 @@ public:
         text << std::hex << std::setfill('0') << std::setw(16) << hash;
         const std::string result = text.str();
         std::lock_guard<std::mutex> lock(HashMutex());
+        TrimLocked(FingerprintCache());
         FingerprintCache().emplace(path, result);
         return result;
     }
@@ -171,6 +172,7 @@ public:
         }
         const std::string result = Sha256File(path);
         std::lock_guard<std::mutex> lock(HashMutex());
+        TrimLocked(Sha256Cache());
         Sha256Cache().emplace(path, result);
         return result;
     }
@@ -310,7 +312,56 @@ public:
         output.flush();
     }
 
+public:
+    /// WP10.4.  Entries resident in the two per-path digest memos.
+    ///
+    /// Both are keyed by PATH ALONE and never expired, which is exactly right
+    /// for a one-shot run (one deck, one library, two entries) and unbounded in
+    /// a GA evaluator, where every candidate is its own deck file.  They are
+    /// small per entry, so this is a REPORTED number rather than a suspected
+    /// one -- and the cap below keeps "small and unbounded" from becoming the
+    /// answer to a memory question nobody could close.
+    static std::size_t HashCacheEntries() {
+        std::lock_guard<std::mutex> lock(HashMutex());
+        return FingerprintCache().size() + Sha256Cache().size();
+    }
+
+    /// Times a memo was dropped whole because it hit the cap.
+    static std::uint64_t HashCacheClears() {
+        std::lock_guard<std::mutex> lock(HashMutex());
+        return HashCacheClearsRef();
+    }
+
+    /// Cap per memo.  `RASBERY_DIGEST_MEMO_ENTRIES`, default 4096: four
+    /// thousand distinct deck paths is far past any wave and far below a leak.
+    static std::size_t HashCacheLimit() {
+        static const std::size_t limit = [] {
+            const char*     v = std::getenv("RASBERY_DIGEST_MEMO_ENTRIES");
+            const long long requested = (v && *v) ? std::atoll(v) : 0;
+            return requested > 0 ? static_cast<std::size_t>(requested)
+                                 : static_cast<std::size_t>(4096);
+        }();
+        return limit;
+    }
+
 private:
+    static std::uint64_t& HashCacheClearsRef() {
+        static std::uint64_t clears = 0;
+        return clears;
+    }
+
+    /// Drop the memo whole when it is full.  DELIBERATELY NOT AN LRU: these are
+    /// memos of a pure function of a file, a miss costs one re-read, and an
+    /// eviction policy with its own bookkeeping would be more machinery than
+    /// the thing it manages.  What matters is that the table cannot grow
+    /// without limit and that a clear is COUNTED, so a receipt can say whether
+    /// re-reads are being paid for.
+    static void TrimLocked(std::unordered_map<std::string, std::string>& cache) {
+        if (cache.size() < HashCacheLimit()) return;
+        cache.clear();
+        ++HashCacheClearsRef();
+    }
+
     static std::mutex& HashMutex() {
         static std::mutex mutex;
         return mutex;

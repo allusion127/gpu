@@ -48,6 +48,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <ostream>
@@ -90,6 +91,19 @@ struct Stats {
     std::uint64_t cohorts    = 0; ///< distinct keys resident
     std::uint64_t quadrature_builds = 0; ///< PinQuadTables actually computed
     std::uint64_t quadrature_hits   = 0;
+    /// WP10.4 -- THE REGISTRY IS BOUNDED NOW, AND SAYS SO.
+    ///
+    /// The key is (geometry payload digest, library digest, ng), and a GA
+    /// candidate IS a different geometry payload: in a campaign the cohort
+    /// count grows with the number of distinct candidates, i.e. forever, and
+    /// the process holds every Context it ever built.  One Context is small,
+    /// but "small and unbounded" is the shape of every leak that took a week to
+    /// find -- and `cohorts` was already the number that was supposed to prove
+    /// the middle lifetime exists, so letting it grow without limit made it
+    /// prove nothing.  Bounded by `RASBERY_COHORT_CACHE_ENTRIES` (default 64),
+    /// least-recently-used first, and each eviction counted.
+    std::uint64_t evictions  = 0;
+    std::uint64_t limit      = 0;
 };
 
 namespace detail {
@@ -104,10 +118,12 @@ inline std::atomic<std::uint64_t>& counter(int which) {
     static std::atomic<std::uint64_t> hits{0};
     static std::atomic<std::uint64_t> quad_builds{0};
     static std::atomic<std::uint64_t> quad_hits{0};
+    static std::atomic<std::uint64_t> evictions{0};
     switch (which) {
         case 0:  return builds;
         case 1:  return hits;
         case 2:  return quad_builds;
+        case 4:  return evictions;
         default: return quad_hits;
     }
 }
@@ -131,11 +147,29 @@ inline std::mutex& quadMutex() {
 struct Entry {
     std::string                    key;
     std::shared_ptr<const Context> value;
+    /// Monotonic stamp of the last acquire() that used this entry; the victim
+    /// is the smallest.  Evicting by insertion order would throw away the
+    /// cohort every case is still asking for.
+    std::uint64_t                  last_use = 0;
 };
 
 inline std::vector<Entry>& entries() {
     static std::vector<Entry> list;
     return list;
+}
+
+inline std::atomic<std::uint64_t>& clock() {
+    static std::atomic<std::uint64_t> tick{0};
+    return tick;
+}
+
+inline std::size_t limit() {
+    static const std::size_t value = [] {
+        const char*     v = std::getenv("RASBERY_COHORT_CACHE_ENTRIES");
+        const long long requested = (v && *v) ? std::atoll(v) : 0;
+        return requested > 0 ? static_cast<std::size_t>(requested) : std::size_t{64};
+    }();
+    return value;
 }
 
 } // namespace detail
@@ -171,7 +205,7 @@ inline std::shared_ptr<const PinQuadTable> acquirePinQuadrature(int ndivxy, int 
 inline std::shared_ptr<const Context> acquire(const Descriptor& d) {
     const std::string key = d.key();
     std::lock_guard<std::mutex> guard(detail::registryMutex());
-    for (const auto& e : detail::entries())
+    for (auto& e : detail::entries())
         if (e.key == key) {
             const Context& c = *e.value;
             if (c.ng != d.ng || c.ndivxy != d.ndivxy || c.npins != d.npins)
@@ -184,13 +218,29 @@ inline std::shared_ptr<const Context> acquire(const Descriptor& d) {
                     "). The cohort key does not cover something the shared state depends "
                     "on; fix the key (src/CohortKey.h) rather than the symptom.");
             detail::counter(1).fetch_add(1, std::memory_order_relaxed);
+            e.last_use = detail::clock().fetch_add(1, std::memory_order_relaxed) + 1;
             return e.value;
         }
     std::shared_ptr<const Context> built(new Context{
         key, d.geometry_digest, d.xslib_digest, d.ng, d.ndivxy, d.npins,
         acquirePinQuadrature(d.ndivxy, d.npins)});
     detail::counter(0).fetch_add(1, std::memory_order_relaxed);
-    detail::entries().push_back(detail::Entry{key, built});
+    detail::entries().push_back(detail::Entry{
+        key, built, detail::clock().fetch_add(1, std::memory_order_relaxed) + 1});
+    // Bounded, least-recently-used first.  Dropping an entry is safe at any
+    // moment: every case holds its own shared_ptr, so the Context dies when the
+    // last case using it does, and a later case with the same key rebuilds a
+    // BIT-IDENTICAL one (the Context is a pure function of the key's inputs --
+    // that is the whole argument for sharing it).  What an eviction costs is a
+    // rebuild, and `evictions` is what says it happened.
+    while (detail::entries().size() > detail::limit()) {
+        auto victim = detail::entries().begin();
+        for (auto it = detail::entries().begin(); it != detail::entries().end(); ++it)
+            if (it->last_use < victim->last_use) victim = it;
+        if (victim->key == key) break; // never the one we are about to hand back
+        detail::entries().erase(victim);
+        detail::counter(4).fetch_add(1, std::memory_order_relaxed);
+    }
     return built;
 }
 
@@ -200,6 +250,8 @@ inline Stats snapshot() {
     s.hits              = detail::counter(1).load(std::memory_order_relaxed);
     s.quadrature_builds = detail::counter(2).load(std::memory_order_relaxed);
     s.quadrature_hits   = detail::counter(3).load(std::memory_order_relaxed);
+    s.evictions         = detail::counter(4).load(std::memory_order_relaxed);
+    s.limit             = static_cast<std::uint64_t>(detail::limit());
     std::lock_guard<std::mutex> guard(detail::registryMutex());
     s.cohorts = static_cast<std::uint64_t>(detail::entries().size());
     return s;
@@ -218,6 +270,8 @@ inline void printReceipt(std::ostream& out) {
         << ",\"cohorts\":" << s.cohorts
         << ",\"quadrature_builds\":" << s.quadrature_builds
         << ",\"quadrature_hits\":" << s.quadrature_hits
+        << ",\"limit\":" << s.limit
+        << ",\"evictions\":" << s.evictions
         << ",\"schema\":\"" << kSchema << "\"}" << std::endl;
 }
 

@@ -302,6 +302,35 @@ def run_chunked(argv: list[str]) -> int:
     return 0 if ok else 1
 
 
+def emit_mem(wave_id: int, cases: int) -> None:
+    """WP10.4 `[RASBERY][EVALUATOR][MEM]`, the shape EvaluatorServer prints.
+
+    The fake carries it for the same reason it carries every other receipt the
+    harness asserts on: `tools/soak_run.py` reads this line to ATTRIBUTE an RSS
+    finding to a container, and a reader exercised only against a stream that
+    never contains the line is a reader nobody has run.  That is exactly how the
+    `physics_fidelity` mismatch survived -- the fake never printed the tag that
+    was wrong.  Flat numbers on purpose: a healthy process is what the default
+    fake models, and FAKE_RASBERY_MEM_GROWTH_MB drives the other case.
+    """
+    grow = float(os.environ.get("FAKE_RASBERY_MEM_GROWTH_MB") or 0.0)
+    emit("[RASBERY][EVALUATOR][MEM] " + json.dumps({
+        "wave_id": wave_id,
+        "rss_mb": 100.0 + grow * wave_id,
+        "rss_delta_mb": grow,
+        "rss_since_first_mb": grow * wave_id,
+        "rss_peak_mb": 100.0 + grow * wave_id,
+        "rss_readable": True,
+        "live_cases": 0,
+        "cache_entries": {"xslib": 1, "xslib_digest": 1, "cohorts": 1,
+                          "quadratures": 1, "pin_records": 0, "digest_memo": 2,
+                          "case_samples": cases},
+        "cache_bytes": {"xslib": 34_000_000},
+        "evictions": {"xslib": 0, "xslib_digest": 0, "cohort": 0,
+                      "digest_memo_clears": 0},
+        "cuda_host_bytes": 0}))
+
+
 def run_evaluator(argv: list[str]) -> int:
     width = int(argv[argv.index("--batch-mode") + 1])
     result_mode = argv[argv.index("--result") + 1] if "--result" in argv else "full"
@@ -416,6 +445,7 @@ def run_evaluator(argv: list[str]) -> int:
                 "process_reused": waves > 1, "xslib_loads": 1,
                 "xslib_hits": cases - 1, "pin_live_ranges": 0,
                 "isolation_match": None}))
+            emit_mem(wave_id, cases)
             continue
         jobs = read_manifest(Path(request["jobs_manifest"]))
         host = min(int(os.environ.get("RASBERY_BATCH_HOST_THREADS", width)), width, len(jobs))
@@ -442,6 +472,7 @@ def run_evaluator(argv: list[str]) -> int:
             "cases_per_hour": 3600.0 * len(jobs) / 0.01,
             "process_reused": waves > 1, "xslib_loads": 1, "xslib_hits": cases - 1,
             "pin_live_ranges": 0, "isolation_match": None}))
+        emit_mem(wave_id, cases)
 
     # Teardown, in the order main.cpp's evaluator branch uses it: the arena is
     # released ONCE, here, which is why the occupancy receipt is a shutdown

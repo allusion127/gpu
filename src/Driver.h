@@ -4978,12 +4978,26 @@ public:
         _case_receipt.fidelity_declared   = _fidelity.declared;
         _case_receipt.promoted_from       = _fidelity.promoted_from;
         _case_receipt.acceptance_eligible = _fidelity.acceptanceEligible();
+        // WP10.4.  `physics_fidelity` IS `fidelity`, PRINTED TWICE ON PURPOSE.
+        // The evaluator's [RASBERY][EVALUATOR][CASE] line spells this value
+        // `physics_fidelity` (plan Sec 6.2); this line spelled it `fidelity`
+        // (the campaign shorthand tools/case_key.py keys the case on), and
+        // tools/exact_audit.py CASE_REQUIRED_FIELDS audits BOTH tags for the
+        // Sec 6.2 spelling.  So every Driver-side receipt was reported as
+        // "this binary predates WP10.3" -- 83 of the 86 findings in the host
+        // 181 soak at 91004f7, on a binary that had carried the field all
+        // along under the other name.  The old key STAYS: the case key is
+        // computed from it on both sides (tools/case_key.py COMPONENT_FIELDS)
+        // and dropping it would invalidate every manifest on disk.  The new
+        // one is the name the audit reads.  schema_version 5 is what lets a
+        // reader tell a receipt that carries it from one that cannot.
         std::cout << std::format(
-            "  [RASBERY][CASE] {{\"schema_version\":4,\"case_key\":\"{}\",\"key_schema\":\"{}\","
+            "  [RASBERY][CASE] {{\"schema_version\":5,\"case_key\":\"{}\",\"key_schema\":\"{}\","
             "\"core_op\":\"{}\",\"deck_digest\":\"{}\",\"env_digest\":\"{}\","
             "\"env_set\":\"{}\","
             "\"xslib_digest\":\"{}\",\"xslib_policy\":\"{}\",\"warm_start_token\":\"{}\","
-            "\"code_sha\":\"{}\",\"fidelity\":\"{}\",\"policy\":\"{}\","
+            "\"code_sha\":\"{}\",\"fidelity\":\"{}\",\"physics_fidelity\":\"{}\","
+            "\"policy\":\"{}\","
             "\"result_mode\":\"{}\",\"warm_start\":\"{}\",\"statepoint_grid\":\"{}\","
             "\"acceptance_eligible\":{},\"fidelity_declared\":{},\"promoted_from\":{}}}\n",
             case_key, casekey::kSchema, input_output.deck_key_core_op(),
@@ -4993,7 +5007,8 @@ public:
             XsLibraryDigestPolicyName(),
             jsonString(casekey::tokenOrTilde(case_provenance.warm_start)),
             jsonString(casekey::codeShaToken()),
-            _case_receipt.physics_fidelity, _case_receipt.policy,
+            _case_receipt.physics_fidelity, _case_receipt.physics_fidelity,
+            _case_receipt.policy,
             ResultModeName(_result_mode), warm_status, _case_receipt.statepoint_grid,
             _case_receipt.acceptance_eligible ? "true" : "false",
             _fidelity.declared.empty()

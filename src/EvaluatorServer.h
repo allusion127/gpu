@@ -103,6 +103,7 @@
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -294,6 +295,11 @@ struct Summary {
     std::vector<double> teardown_ms;
     StopReason stop = StopReason::EndOfStream;
     std::uint64_t pin_live_ranges_between_waves = 0;
+    /// WP10.4.  The previous generation's RSS sample, so the per-generation
+    /// DELTA is a fact the process states rather than a subtraction a reader
+    /// has to do across two lines that may not both be present.
+    std::uint64_t rss_bytes_last  = 0;
+    std::uint64_t rss_bytes_first = 0;
 };
 
 namespace detail {
@@ -332,6 +338,77 @@ inline std::string jsonEscape(const std::string& text) {
 
 inline std::string quoted(const std::string& text) {
     return "\"" + jsonEscape(text) + "\"";
+}
+
+// ---------------------------------------------------------------------------
+// WP10.4 -- THE MEMORY RECEIPT
+// ---------------------------------------------------------------------------
+//
+// WHY THIS EXISTS.  The host 181 soak at `91004f7` (5 generations x width 16,
+// persistent evaluator) measured RSS growing +17.41 MB per generation over its
+// second half, against an 8.0 MB/generation budget -- and the run before it
+// measured +37.64 MB/generation, so it is a signal and not a sample.  Every
+// mechanism receipt the soak asserts on came back ZERO (no slot duplicates, no
+// stale tenants, no double releases, no pin ranges between waves), which is the
+// problem: the process was growing and NOTHING IN ANY RECEIPT COULD NAME WHAT
+// WAS GROWING.  An evaluator that has to survive 10k generations cannot be
+// debugged one profiler session at a time on a host nobody can attach to.
+//
+// So the process now reports, once per generation, the number the soak measures
+// from outside (RSS) BESIDE the sizes of every container that could explain it.
+// A generation where rss_delta_mb is large and every cache_entries number is
+// flat says the growth is not in these caches and the next place to look is the
+// allocator or a library; a generation where one of them moves with the RSS has
+// named itself.  That is the whole design goal: the NEXT soak should not have
+// to guess.
+//
+// `live_cases` is the other half.  It is incremented before a Driver is
+// constructed and decremented after it is destroyed, so at the moment this line
+// prints -- after every case in the wave has been joined -- it MUST be 0.  A
+// nonzero value is a Driver that outlived its case, which is a leak of
+// everything a case owns and would otherwise be invisible.
+
+/// Drivers currently constructed.  See the note above.
+inline std::atomic<long long>& liveCases() {
+    static std::atomic<long long> live{0};
+    return live;
+}
+
+/// Resident set size of this process in bytes, or 0 where it cannot be read.
+///
+/// /proc/self/statm field 2 is the resident page count -- the same quantity
+/// tools/soak_run.py samples from outside with `ps`, deliberately, so the two
+/// numbers can be compared instead of merely coexisting.  Returning 0 rather
+/// than guessing on a platform without /proc is the honest failure: the receipt
+/// then says the process could not measure itself, which is a different fact
+/// from "the process did not grow".
+inline std::uint64_t residentBytes() {
+    std::ifstream statm("/proc/self/statm");
+    if (!statm) return 0;
+    unsigned long long total = 0, resident = 0;
+    if (!(statm >> total >> resident)) return 0;
+    return static_cast<std::uint64_t>(resident) * static_cast<std::uint64_t>(4096);
+}
+
+/// Peak RSS in bytes (VmHWM), or 0.  A peak that is far above the current value
+/// says the growth is transient and the allocator is holding it, which is a
+/// different repair from a container that never shrinks.
+inline std::uint64_t peakResidentBytes() {
+    std::ifstream status("/proc/self/status");
+    if (!status) return 0;
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.rfind("VmHWM:", 0) != 0) continue;
+        std::istringstream fields(line.substr(6));
+        unsigned long long kb = 0;
+        if (!(fields >> kb)) return 0;
+        return static_cast<std::uint64_t>(kb) * 1024ull;
+    }
+    return 0;
+}
+
+inline double toMiB(std::uint64_t bytes) {
+    return static_cast<double>(bytes) / (1024.0 * 1024.0);
 }
 
 /// `<output>` with `.iso<n>` spliced before the extension.
@@ -1099,6 +1176,72 @@ private:
              << (_options.isolation_check ? (isolation_mismatch ? "false" : "true") : "null")
              << "}" << std::endl;
         _out.unsetf(std::ios::floatfield);
+        reportMemory(wave.wave_id);
+    }
+
+    /// WP10.4.  One line per generation: what the process weighs, and the size
+    /// of every container that could explain a change.  See the note beside
+    /// detail::residentBytes().
+    ///
+    /// PRINTED BETWEEN GENERATIONS, NOT DURING ONE, for the same reason
+    /// tools/soak_run.py samples RSS between waves: a mid-wave sample measures
+    /// where the wave happened to be, and the question is what is LEFT BEHIND
+    /// when it is over.
+    void reportMemory(long long wave_id) {
+        const std::uint64_t rss   = detail::residentBytes();
+        const std::uint64_t peak  = detail::peakResidentBytes();
+        const std::uint64_t prev  = _summary.rss_bytes_last;
+        if (_summary.rss_bytes_first == 0) _summary.rss_bytes_first = rss;
+        _summary.rss_bytes_last = rss;
+
+        const XsLibraryCacheStats xslib   = XsLibraryCacheSnapshot();
+        const cohort::Stats       cohorts = cohort::snapshot();
+        const long long           live    = detail::liveCases().load(std::memory_order_relaxed);
+
+        _out << std::fixed << std::setprecision(3)
+             << "[RASBERY][EVALUATOR][MEM] {\"wave_id\":" << wave_id
+             << ",\"rss_mb\":" << detail::toMiB(rss)
+             // Signed on purpose: a generation that gives memory BACK is a fact
+             // an unsigned delta would hide, and it is the fact that separates
+             // allocator retention from a container that never shrinks.
+             << ",\"rss_delta_mb\":"
+             << (rss == 0 || prev == 0
+                     ? 0.0
+                     : detail::toMiB(rss) - detail::toMiB(prev))
+             << ",\"rss_since_first_mb\":"
+             << (rss == 0 || _summary.rss_bytes_first == 0
+                     ? 0.0
+                     : detail::toMiB(rss) - detail::toMiB(_summary.rss_bytes_first))
+             << ",\"rss_peak_mb\":" << detail::toMiB(peak)
+             << ",\"rss_readable\":" << (rss > 0 ? "true" : "false")
+             // MUST be 0.  A Driver that outlived its case leaks everything a
+             // case owns and nothing else in any receipt would say so.
+             << ",\"live_cases\":" << live
+             << ",\"cache_entries\":{"
+             << "\"xslib\":" << xslib.entries
+             << ",\"xslib_digest\":" << xslib.digest_entries
+             << ",\"cohorts\":" << cohorts.cohorts
+             << ",\"quadratures\":" << cohorts.quadrature_builds
+             << ",\"pin_records\":" << rasberyHostPinLiveRanges()
+             << ",\"digest_memo\":" << BatchLightResult::HashCacheEntries()
+             // The two per-case vectors this receipt itself keeps.  Bounded by
+             // the case count and by nothing else, so they are REPORTED rather
+             // than assumed innocent: at 8 bytes a case they are ~10 MB after
+             // 10k generations of width 64, which is small and is not zero.
+             << ",\"case_samples\":" << _summary.case_seconds.size()
+             << "}"
+             << ",\"cache_bytes\":{\"xslib\":" << xslib.bytes << "}"
+             << ",\"evictions\":{\"xslib\":" << xslib.evictions
+             << ",\"xslib_digest\":" << xslib.digest_evictions
+             << ",\"cohort\":" << cohorts.evictions
+             << ",\"digest_memo_clears\":" << BatchLightResult::HashCacheClears()
+             << "}"
+             // Bytes page-locked through HostPinRegistry right now.  The arena's
+             // own cudaMallocHost blocks are stood up once for the process and
+             // are NOT here: this is the number that moves with cases.
+             << ",\"cuda_host_bytes\":" << rasberyHostPinLiveBytes()
+             << "}" << std::endl;
+        _out.unsetf(std::ios::floatfield);
     }
 
     /// Build a Driver, drive it, destroy it -- and time the destruction apart
@@ -1121,6 +1264,16 @@ private:
         // exactly such an exception and MUST fail only this case.  The process
         // keeps answering.
         try {
+            // WP10.4.  `live_cases` counts CONSTRUCTED Drivers.  The guard is
+            // declared outside the Driver's own scope so it is destroyed after
+            // the Driver is -- i.e. the count falls when the case's state is
+            // actually gone, which is what the between-generation receipt
+            // asserts is 0.  The Driver keeps its own brace: the slot release
+            // in its destructor has to land inside the measured teardown.
+            detail::liveCases().fetch_add(1, std::memory_order_relaxed);
+            struct LiveGuard {
+                ~LiveGuard() { detail::liveCases().fetch_sub(1, std::memory_order_relaxed); }
+            } live_guard;
             {
                 Driver driver(deck, output, mode);
                 driver.setWarmStart(warm_from, warm_save);

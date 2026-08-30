@@ -245,6 +245,59 @@ def leak_slope_mb_per_generation(series: Sequence[float | None]) -> float | None
     return sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denominator
 
 
+def attribute_rss_growth(generations: "Sequence[GenerationResult]") -> list[str]:
+    """Name the container, when the process reported enough to name one.
+
+    WHY THIS IS NOT OPTIONAL.  The host 181 soak at `91004f7` found RSS climbing
+    +17.41 MB/generation with every mechanism receipt at zero, and the finding
+    said only that.  A number with no suspects cannot be closed on a host nobody
+    can attach a profiler to, and at 10k generations that slope is 170 GB.
+
+    So the evaluator now prints `[RASBERY][EVALUATOR][MEM]` between generations
+    with the size of every process-lifetime container beside its own RSS, and
+    this walks the first and last of those receipts.  A container that moved
+    while RSS moved is the suspect; ALL of them flat is also an answer -- it
+    says the growth is not in the caches this receipt can see, and the next
+    place to look is the allocator, HDF5's own free lists or the device runtime.
+    Saying that is worth more than saying nothing.
+    """
+    receipts = [g.mem for g in generations if isinstance(g.mem, dict)]
+    if len(receipts) < 2:
+        return ["and the binary printed no [RASBERY][EVALUATOR][MEM] receipt, so the "
+                "growth cannot be attributed to a container from this run: rebuild at "
+                "a commit that carries WP10.4 and repeat"]
+    first, last = receipts[0], receipts[-1]
+    moved: list[str] = []
+    for group in ("cache_entries", "evictions", "cache_bytes"):
+        before = first.get(group) or {}
+        after = last.get(group) or {}
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            continue
+        for name in sorted(set(before) | set(after)):
+            start, end = before.get(name, 0), after.get(name, 0)
+            if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+                if end != start:
+                    moved.append(f"{group}.{name} {start} -> {end}")
+    notes: list[str] = []
+    live = last.get("live_cases")
+    if isinstance(live, (int, float)) and live != 0:
+        notes.append(f"and live_cases={live} between generations: a Driver outlived its "
+                     "case, which leaks everything a case owns")
+    pinned_first = first.get("cuda_host_bytes")
+    pinned_last = last.get("cuda_host_bytes")
+    if isinstance(pinned_first, (int, float)) and isinstance(pinned_last, (int, float)):
+        if pinned_last != pinned_first:
+            moved.append(f"cuda_host_bytes {pinned_first} -> {pinned_last}")
+    if moved:
+        notes.append("and the process's own [EVALUATOR][MEM] receipts show these moving "
+                     "across the run: " + "; ".join(moved))
+    else:
+        notes.append("and every container [EVALUATOR][MEM] can see was FLAT across the "
+                     "run, so the growth is not in the evaluator's caches: look at the "
+                     "allocator, HDF5's free lists or the device runtime next")
+    return notes
+
+
 # ---------------------------------------------------------------------------
 # The workload
 # ---------------------------------------------------------------------------
@@ -266,6 +319,12 @@ class GenerationResult:
     alive: bool = True
     refused: list[dict] = field(default_factory=list)
     fidelity_problems: list[str] = field(default_factory=list)
+    #: WP10.4.  The generation's `[RASBERY][EVALUATOR][MEM]` receipt, or None
+    #: from a binary that predates it.  The soak measures RSS from OUTSIDE; this
+    #: is the process's own view of the same quantity plus the size of every
+    #: container that could explain a change -- which is what turns "something
+    #: grew 17 MB" into a named suspect.
+    mem: dict | None = None
 
 
 def build_generation(*, generation: int, width: int, deck: Path, workdir: Path,
@@ -558,6 +617,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         # left behind when it is over.
         result.vram_mb = sample_vram_mb(args.gpu)
         result.rss_mb = sample_rss_mb(session.pid)
+        mem_receipts = receipts_of(outcome.text, "[RASBERY][EVALUATOR][MEM]")
+        result.mem = mem_receipts[-1] if mem_receipts else None
+        # FALL BACK TO THE PROCESS'S OWN RSS, and only then.  /proc/<pid>/status
+        # is the primary because it is an OUTSIDE measurement and cannot be
+        # wrong in the same direction as the thing it is measuring; where there
+        # is no /proc for the child, a self-report is strictly better than the
+        # `None` that silently disables the whole leak gate.
+        if result.rss_mb is None and isinstance(result.mem, dict):
+            reported = result.mem.get("rss_mb")
+            if isinstance(reported, (int, float)) and reported > 0:
+                result.rss_mb = float(reported)
         generations.append(result)
         if not outcome.alive and not session.restart():
             break
@@ -664,6 +734,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{what} grew {slope:.2f} MB/generation over the run's second half "
                 f"(limit {limit}); after the warm plateau nothing should still be "
                 "climbing")
+            if what == "rss":
+                problems.extend(attribute_rss_growth(generations))
 
     cases_reported = sum(g.cases for g in generations)
     if cases_reported < cases_requested:
@@ -700,7 +772,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             {"index": g.index, "cases": g.cases, "ok": g.ok, "failed": g.failed,
              "wall_s": g.wall_s, "cases_per_hour": g.cases_per_hour,
              "vram_mb": g.vram_mb, "rss_mb": g.rss_mb, "screens": g.screens,
-             "promotions": g.promotions, "poisoned": g.poisoned, "alive": g.alive}
+             "promotions": g.promotions, "poisoned": g.poisoned, "alive": g.alive,
+             "mem": g.mem}
             for g in generations],
         "problems": problems,
     }

@@ -581,9 +581,19 @@ def receipt_component_contract() -> None:
     """
     site = DRIVER_H.index('"  [RASBERY][CASE] {{')
     block = DRIVER_H[site:DRIVER_H.index(");", site)]
-    if '\\"schema_version\\":4' not in block:
+    if '\\"schema_version\\":5' not in block:
         fail("the [RASBERY][CASE] receipt did not bump schema_version when it "
              "gained the component fields; a reader cannot tell the two apart")
+    # WP10.4.  The Sec 6.2 spelling of the fidelity, BESIDE the campaign one.
+    # tools/exact_audit.py audits `physics_fidelity` on both case tags and this
+    # line carried only `fidelity`; see the Driver.h comment at the receipt.
+    if '\\"physics_fidelity\\"' not in block:
+        fail("[RASBERY][CASE] does not publish 'physics_fidelity'; "
+             "exact_audit.CASE_REQUIRED_FIELDS audits this tag for it and every "
+             "Driver-side receipt is refused as pre-WP10.3 without it")
+    if '\\"fidelity\\"' not in block:
+        fail("[RASBERY][CASE] dropped 'fidelity'; tools/case_key.py keys the case "
+             "on that name and every manifest on disk carries it")
     for field in case_key.COMPONENT_FIELDS:
         if field in ("case_key", "key_schema"):
             continue

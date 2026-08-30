@@ -837,6 +837,11 @@ struct XsLibraryCacheEntry {
     int                              ng        = 0;
     std::shared_ptr<const XsLibrary> value;
     bool                             building = false; ///< one worker is parsing this key
+    /// WP10.4.  Monotonic stamp of the last acquisition that used this entry.
+    /// The table is bounded and evicts the LEAST RECENTLY USED resident parse;
+    /// without a stamp the victim would be "whichever came first", which in a
+    /// long-lived evaluator is the library every case is still asking for.
+    std::uint64_t                    last_use = 0;
 };
 
 // Deliberately a plain mutex and a small vector: every run this campaign has
@@ -863,6 +868,40 @@ std::atomic<std::uint64_t> g_xslib_hits{0};
 std::atomic<std::uint64_t> g_xslib_waits{0};
 std::atomic<std::uint64_t> g_xslib_lock_wait_ns{0};
 std::atomic<std::uint64_t> g_xslib_digest_computes{0};
+std::atomic<std::uint64_t> g_xslib_evictions{0};
+std::atomic<std::uint64_t> g_xslib_digest_evictions{0};
+std::atomic<std::uint64_t> g_xslib_clock{0};
+
+/// How many resident parses this process may hold.
+///
+/// WHY A BOUND AT ALL, WHEN THE CAMPAIGN NAMES ONE LIBRARY.  Because the key
+/// discriminates on CONTENT (see XsLibrary.h): a library rewritten under a
+/// running evaluator gets a new entry beside the old one, and the old one holds
+/// ~34 MB for the life of the process with no receipt naming it.  One-shot runs
+/// never saw it; a GA evaluator that must survive 10k generations does.
+///
+/// The default is 2, not 1: an A/B that alternates two libraries must not
+/// re-parse 34 MB on every case, and 2 is the smallest number that makes the
+/// bound free for every use this campaign has.  Evictions are COUNTED, so a
+/// deployment that needs more learns it from the receipt rather than from a
+/// throughput regression.
+std::size_t XsLibraryCacheLimit() {
+    static const std::size_t limit = [] {
+        const char*     v = std::getenv("RASBERY_XSLIB_CACHE_ENTRIES");
+        const long long requested = (v && *v) ? std::atoll(v) : 0;
+        return requested > 0 ? static_cast<std::size_t>(requested) : std::size_t{2};
+    }();
+    return limit;
+}
+
+std::size_t XsLibraryDigestLimit() {
+    static const std::size_t limit = [] {
+        const char*     v = std::getenv("RASBERY_XSLIB_DIGEST_ENTRIES");
+        const long long requested = (v && *v) ? std::atoll(v) : 0;
+        return requested > 0 ? static_cast<std::size_t>(requested) : std::size_t{64};
+    }();
+    return limit;
+}
 
 struct XsLibraryKeyFields {
     std::string   path;
@@ -959,6 +998,14 @@ std::string XsLibraryDigestCached(const std::string& canonical, std::uint64_t si
             return e.digest;
     XsLibraryDigestEntries().push_back(
         XsLibraryDigestEntry{canonical, size, mtime, digest});
+    // WP10.4.  Bounded, oldest first.  One entry is ~200 bytes and a campaign
+    // sees one library, so this never evicts in practice -- but the table is
+    // keyed on (path, size, mtime) and a process that outlives N library
+    // rewrites accumulated N entries with nothing to trim them.
+    while (XsLibraryDigestEntries().size() > XsLibraryDigestLimit()) {
+        XsLibraryDigestEntries().erase(XsLibraryDigestEntries().begin());
+        g_xslib_digest_evictions.fetch_add(1, std::memory_order_relaxed);
+    }
     return digest;
 }
 
@@ -1030,6 +1077,7 @@ std::shared_ptr<const XsLibrary> AcquireXsLibrary(const std::string& xs_path, in
             break; // this thread builds it
         }
         if (entry->value != nullptr) {
+            entry->last_use = g_xslib_clock.fetch_add(1, std::memory_order_relaxed) + 1;
             g_xslib_hits.fetch_add(1, std::memory_order_relaxed);
             g_xslib_lock_wait_ns.fetch_add(
                 static_cast<std::uint64_t>(
@@ -1082,6 +1130,30 @@ std::shared_ptr<const XsLibrary> AcquireXsLibrary(const std::string& xs_path, in
     if (XsLibraryCacheEntry* entry = find()) {
         entry->value    = built;
         entry->building = false;
+        entry->last_use = g_xslib_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+    // WP10.4.  EVICT THE LEAST RECENTLY USED RESIDENT PARSE, never a placeholder.
+    //
+    // An entry with `value == nullptr` is a key another worker is mid-parse on
+    // and other workers are waiting on it by key; erasing it would leave them
+    // waiting for a parse that will never be published.  Dropping a RESIDENT
+    // entry is safe at any moment: every holder took a shared_ptr copy, so the
+    // eviction frees the 34 MB only when the last case using it is gone.
+    {
+        auto& entries = XsLibraryCacheEntries();
+        std::size_t resident = 0;
+        for (const auto& e : entries) resident += (e.value != nullptr) ? 1u : 0u;
+        while (resident > XsLibraryCacheLimit()) {
+            auto victim = entries.end();
+            for (auto it = entries.begin(); it != entries.end(); ++it) {
+                if (it->value == nullptr || it->building) continue;
+                if (victim == entries.end() || it->last_use < victim->last_use) victim = it;
+            }
+            if (victim == entries.end()) break;
+            entries.erase(victim);
+            --resident;
+            g_xslib_evictions.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     lock.unlock();
     XsLibraryCacheReady().notify_all();
@@ -1101,6 +1173,13 @@ XsLibraryCacheStats XsLibraryCacheSnapshot() {
     s.waits        = g_xslib_waits.load(std::memory_order_relaxed);
     s.lock_wait_ms = g_xslib_lock_wait_ns.load(std::memory_order_relaxed) / 1000000ULL;
     s.digest_computes = g_xslib_digest_computes.load(std::memory_order_relaxed);
+    s.evictions       = g_xslib_evictions.load(std::memory_order_relaxed);
+    s.digest_evictions = g_xslib_digest_evictions.load(std::memory_order_relaxed);
+    s.entry_limit      = static_cast<std::uint64_t>(XsLibraryCacheLimit());
+    {
+        std::lock_guard<std::mutex> guard(XsLibraryDigestMutex());
+        s.digest_entries = static_cast<std::uint64_t>(XsLibraryDigestEntries().size());
+    }
     std::lock_guard<std::mutex> guard(XsLibraryCacheMutex());
     s.entries = XsLibraryCacheEntries().size();
     for (const auto& e : XsLibraryCacheEntries())
@@ -1118,6 +1197,13 @@ void PrintXsLibraryCacheReceipt(std::ostream& out) {
         // (path, size, mtime) triples this process saw -- ONE for a normal
         // campaign -- and must not grow with the case count.
         << ",\"digest_computes\":" << s.digest_computes
+        // WP10.4.  The bound and what it cost.  `evictions` must be 0 for a
+        // campaign that names one library; a nonzero value says this process
+        // outlived a library rewrite, which is a fact no other number reports.
+        << ",\"entry_limit\":" << s.entry_limit
+        << ",\"evictions\":" << s.evictions
+        << ",\"digest_entries\":" << s.digest_entries
+        << ",\"digest_evictions\":" << s.digest_evictions
         << ",\"digest_policy\":\"" << XsLibraryDigestModeName() << "\""
         << ",\"enabled\":" << (XsLibraryCacheDisabled() ? "false" : "true") << "}\n";
 }

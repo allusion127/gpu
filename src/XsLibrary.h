@@ -188,6 +188,25 @@ struct XsLibraryCacheStats {
     /// case count -- if it does, the memoisation is not working and every case
     /// is paying a 34 MB read for a key.
     std::uint64_t digest_computes = 0;
+    /// WP10.4 -- THE BOUND, AND ITS WITNESS.
+    ///
+    /// Every entry here holds a whole ~34 MB parse alive for the process
+    /// lifetime, and the key carries the file's size, mtime and content digest:
+    /// a library REPLACED under a running evaluator does not overwrite its
+    /// entry, it adds one.  In a one-shot process that could not happen (the
+    /// process is shorter than the operation that would replace the library);
+    /// in a GA evaluator that must survive 10k generations it is 34 MB per
+    /// rebuild, kept forever, and nothing in the old receipt named it.  So the
+    /// table is bounded (`RASBERY_XSLIB_CACHE_ENTRIES`, default 2 -- enough to
+    /// hold both sides of a swap without re-parsing either) and every eviction
+    /// is counted.  `evictions > 0` means this process outlived a library.
+    std::uint64_t evictions       = 0;
+    std::uint64_t entry_limit     = 0;
+    /// The (path, size, mtime) -> digest memo behind the key above.  Tiny per
+    /// entry and unbounded for the same reason, so bounded for the same reason
+    /// (`RASBERY_XSLIB_DIGEST_ENTRIES`, default 64).
+    std::uint64_t digest_entries   = 0;
+    std::uint64_t digest_evictions = 0;
 };
 
 /// Content digest of one library file, memoised by (path, size, mtime).

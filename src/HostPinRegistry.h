@@ -651,6 +651,22 @@ inline std::size_t rasberyHostPinLiveRanges() {
     return rasberyHostPinRecords().size();
 }
 
+/// WP10.4.  Bytes currently page-locked through this registry.
+///
+/// `rasberyHostPinLiveRanges()` above counts RECORDS, which is the right number
+/// for the between-wave lease assertion (a leaked lease is a leaked lease
+/// whatever its size) and the wrong one for a memory receipt: 40 records of a
+/// megabyte each and 40 of a kilobyte each are the same count and are not the
+/// same process.  The soak's RSS finding needs the second number, so it has a
+/// name of its own rather than being inferred from the first.
+inline std::uint64_t rasberyHostPinLiveBytes() {
+    std::lock_guard<std::mutex> lock(rasberyHostPinMutex());
+    std::uint64_t bytes = 0;
+    for (const auto& entry : rasberyHostPinRecords())
+        bytes += static_cast<std::uint64_t>(entry.second.registered_bytes);
+    return bytes;
+}
+
 /// Owner count of the record covering `base`, or 0 when nothing covers it.
 inline unsigned rasberyHostPinOwners(const void* base_pointer) {
     if (base_pointer == nullptr) return 0;
