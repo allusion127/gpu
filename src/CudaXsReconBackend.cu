@@ -1181,7 +1181,9 @@ private:
         rc = cudaMallocHost(reinterpret_cast<void**>(&_h_slot_map), S * sizeof(int));
         if (rc != cudaSuccess) { fail("cudaMallocHost(nodal arena slot map)", rc); return; }
         for (std::size_t i = 0; i < S; ++i) _h_slot_map[i] = -1;
-        rc = cudaMemcpy(_d_slot_map, _h_slot_map, S * sizeof(int), cudaMemcpyHostToDevice);
+        rc = rasbery::xfer::memcpy("CudaXsReconBackend.cu:NodalArena::init", "slot map",
+                             _d_slot_map, _h_slot_map, S * sizeof(int),
+                             cudaMemcpyHostToDevice);
         if (rc != cudaSuccess) { fail("cudaMemcpy(nodal arena slot map)", rc); return; }
         rc = cudaMalloc(reinterpret_cast<void**>(&_d_views), S * sizeof(ndl::NodalView));
         if (rc != cudaSuccess) { fail("cudaMalloc(nodal arena view table)", rc); return; }
@@ -1204,7 +1206,8 @@ private:
         for (const auto& g : geo) {
             void* dst = g.is_int ? static_cast<void*>(_idx + g.off)
                                  : static_cast<void*>(_dbl + g.off);
-            rc = cudaMemcpy(dst, g.src, g.bytes, cudaMemcpyHostToDevice);
+            rc = rasbery::xfer::memcpy("CudaXsReconBackend.cu:NodalArena::init", "geometry",
+                                 dst, g.src, g.bytes, cudaMemcpyHostToDevice);
             if (rc != cudaSuccess) { fail("cudaMemcpy(nodal arena geometry)", rc); return; }
         }
 
@@ -1296,7 +1299,9 @@ private:
 
     bool memcpyAsyncOrFail(void* dst, const void* src, std::size_t bytes,
                            cudaMemcpyKind kind, const char* what) {
-        const cudaError_t rc = cudaMemcpyAsync(dst, src, bytes, kind, _stream);
+        const cudaError_t rc = rasbery::xfer::memcpyAsync(
+            "CudaXsReconBackend.cu:NodalArena::memcpyAsyncOrFail", what, dst, src, bytes,
+            kind, _stream);
         if (rc != cudaSuccess) { fail(what, rc); return false; }
         return true;
     }
@@ -1328,7 +1333,9 @@ private:
                 e.nsurf == _nsurf)
                 return e.exec;
 
-        const cudaError_t drc = cudaStreamSynchronize(_stream);
+        const cudaError_t drc =
+            rasbery::xfer::streamSync("CudaXsReconBackend.cu:NodalArena::ensureGraph",
+                               "pre-capture drain", _stream);
         if (drc != cudaSuccess) { _use_graph = false; return nullptr; }
         cudaGraph_t graph = nullptr;
         // Rev.7.1 Task 18d: exclusive of every allocation in the process for
@@ -1406,10 +1413,10 @@ private:
             if (c.phis != nullptr) v.phis = c.phis;
             _h_views[m] = v;
         }
-        const cudaError_t rc =
-            cudaMemcpy(_d_views, _h_views,
-                       static_cast<std::size_t>(_slots) * sizeof(ndl::NodalView),
-                       cudaMemcpyHostToDevice);
+        const cudaError_t rc = rasbery::xfer::memcpy(
+            "CudaXsReconBackend.cu:NodalArena::refreshViews", "view table", _d_views,
+            _h_views, static_cast<std::size_t>(_slots) * sizeof(ndl::NodalView),
+            cudaMemcpyHostToDevice);
         if (rc != cudaSuccess) { fail("cudaMemcpy(nodal arena view table)", rc); return false; }
         _views_dirty = false;
         return true;
@@ -1672,7 +1679,9 @@ private:
             }
         }
 
-        const cudaError_t src = cudaStreamSynchronize(_stream);
+        const cudaError_t src =
+            rasbery::xfer::streamSync("CudaXsReconBackend.cu:NodalArena::launchBatch", "drain",
+                               _stream);
         if (src != cudaSuccess) { fail("nodal arena drain", src); return false; }
 
         // Commit only after the drain proved the queued H2D reached the device.
@@ -1697,7 +1706,8 @@ private:
     /// every participant is about to run its own CPU body over the very
     /// host.jnet this stream might still be writing.  Drain first.
     bool drained() {
-        cudaStreamSynchronize(_stream);
+        rasbery::xfer::streamSync("CudaXsReconBackend.cu:NodalArena::drained", "failure drain",
+                           _stream);
         cudaGetLastError();
         return false;
     }
@@ -2417,10 +2427,11 @@ struct XsReconBackend::Impl {
         const std::size_t ssm = static_cast<std::size_t>(xsr::NG) * xsr::NG * nx;
 
         if (!fuel_uploaded) {
-            RASBERY_CUDA_TRY(cudaMemcpyAsync(dev_fuel, host.fuel,
-                                             static_cast<std::size_t>(host.n_fuel) *
-                                                 sizeof(int),
-                                             cudaMemcpyHostToDevice, stream),
+            RASBERY_CUDA_TRY(rasbery::xfer::memcpyAsync("CudaXsReconBackend.cu:xeEnsure", "fuel",
+                                         dev_fuel, host.fuel,
+                                         static_cast<std::size_t>(host.n_fuel) *
+                                             sizeof(int),
+                                         cudaMemcpyHostToDevice, stream),
                              status);
             fuel_uploaded = true;
         }
@@ -2429,11 +2440,15 @@ struct XsReconBackend::Impl {
         // rebuild paths), so one generation covers both.
         if (micx_generation != resident_micx_generation) {
             for (int xt = 0; xt < xsr::NXS; ++xt)
-                if (!upload(host.mic[xt], off_mic[xt], mic)) return false;
-            if (!upload(host.mic_ssm, off_mic_ssm, msm)) return false;
+                if (!upload("xsrecon micx mic", host.mic[xt], off_mic[xt], mic))
+                    return false;
+            if (!upload("xsrecon micx mic_ssm", host.mic_ssm, off_mic_ssm, msm))
+                return false;
             for (int xt = 0; xt < xsr::NXS; ++xt)
-                if (!upload(host.lmp[xt], off_lmp[xt], lmp)) return false;
-            if (!upload(host.lmp_ssm, off_lmp_ssm, ssm)) return false;
+                if (!upload("xsrecon micx lmp", host.lmp[xt], off_lmp[xt], lmp))
+                    return false;
+            if (!upload("xsrecon micx lmp_ssm", host.lmp_ssm, off_lmp_ssm, ssm))
+                return false;
             resident_micx_generation = micx_generation;
         }
 
@@ -2445,14 +2460,18 @@ struct XsReconBackend::Impl {
         // already bit-identical on the device and the ~4.4 MB re-upload is
         // skipped.
         if (state_generation != resident_state_generation) {
-            if (!upload(host.iden, off_iden, static_cast<std::size_t>(xsr::NISO) * nx))
+            if (!upload("xsrecon state iden", host.iden, off_iden,
+                        static_cast<std::size_t>(xsr::NISO) * nx))
                 return false;
             for (int xt = 0; xt < xsr::NXS; ++xt)
-                if (!upload(host.xs[xt], off_xs[xt], lmp)) return false;
-            if (!upload(host.xs_ssm, off_xs_ssm, ssm)) return false;
+                if (!upload("xsrecon state xs", host.xs[xt], off_xs[xt], lmp))
+                    return false;
+            if (!upload("xsrecon state xs_ssm", host.xs_ssm, off_xs_ssm, ssm))
+                return false;
         }
         if (upload_phif &&
-            !upload(host.phif, off_phif, static_cast<std::size_t>(xsr::NG) * nx))
+            !upload("xsrecon stage phif", host.phif, off_phif,
+                    static_cast<std::size_t>(xsr::NG) * nx))
             return false;
 
         v = host;
@@ -2476,13 +2495,15 @@ struct XsReconBackend::Impl {
             RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&dev_dep),
                                               2 * xsr::NISO * sizeof(double)),
                                    status);
-            RASBERY_CUDA_TRY(cudaMemcpyAsync(dev_dep, host.dep_i135,
-                                             xsr::NISO * sizeof(double),
-                                             cudaMemcpyHostToDevice, stream),
+            RASBERY_CUDA_TRY(rasbery::xfer::memcpyAsync("CudaXsReconBackend.cu:xeEnsure", "dep_i135",
+                                         dev_dep, host.dep_i135,
+                                         xsr::NISO * sizeof(double),
+                                         cudaMemcpyHostToDevice, stream),
                              status);
-            RASBERY_CUDA_TRY(cudaMemcpyAsync(dev_dep + xsr::NISO, host.dep_xe135,
-                                             xsr::NISO * sizeof(double),
-                                             cudaMemcpyHostToDevice, stream),
+            RASBERY_CUDA_TRY(rasbery::xfer::memcpyAsync("CudaXsReconBackend.cu:xeEnsure", "dep_xe135",
+                                         dev_dep + xsr::NISO, host.dep_xe135,
+                                         xsr::NISO * sizeof(double),
+                                         cudaMemcpyHostToDevice, stream),
                              status);
         }
         v.dep_i135  = dev_dep;
@@ -2497,8 +2518,7 @@ struct XsReconBackend::Impl {
     /// quotes, measured by the run that quotes it.
     cudaError_t xeSync() {
         xe::xeGpuTally().host_syncs.fetch_add(1, std::memory_order_relaxed);
-        xfer::countSync();
-        return cudaStreamSynchronize(stream);
+        return xfer::streamSync("CudaXsReconBackend.cu:xeSync", "xe drain", stream);
     }
 
     static void countXeD2H(std::size_t bytes) {
@@ -2530,13 +2550,17 @@ struct XsReconBackend::Impl {
                 add(xek::XE_DOT_Q, xek::XE_T_DG1, xek::XE_T_G);
             }
         }
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(xe_pairs + 3 * xek::XE_DOT_COUNT, host,
-                                         sizeof(host), cudaMemcpyHostToDevice, stream),
+        RASBERY_CUDA_TRY(rasbery::xfer::memcpyAsync("CudaXsReconBackend.cu:uploadXeTxnLayouts",
+                                         "layouts", xe_pairs + 3 * xek::XE_DOT_COUNT,
+                                         host, sizeof(host), cudaMemcpyHostToDevice,
+                                         stream),
                          status);
         // The layouts are read by kernels this call does not order against, so
         // the upload is completed here rather than left in flight.  Once per
         // allocation, never per step.
-        RASBERY_CUDA_TRY(cudaStreamSynchronize(stream), status);
+        RASBERY_CUDA_TRY(rasbery::xfer::streamSync("CudaXsReconBackend.cu:uploadXeTxnLayouts",
+                                       "layout drain", stream),
+                     status);
         return true;
     }
 
@@ -2547,9 +2571,10 @@ struct XsReconBackend::Impl {
         const std::size_t lmp = static_cast<std::size_t>(xsr::NG) * nx;
         const std::size_t ssm = static_cast<std::size_t>(xsr::NG) * xsr::NG * nx;
         for (int xt = 0; xt < xsr::NXS; ++xt)
-            if (!download(host.xs[xt], off_xs[xt], lmp)) return false;
-        if (!download(host.xs_ssm, off_xs_ssm, ssm)) return false;
-        if (!download(host.iden + static_cast<std::size_t>(xsr::I135) * nx,
+            if (!download("xe commit xs", host.xs[xt], off_xs[xt], lmp)) return false;
+        if (!download("xe commit xs_ssm", host.xs_ssm, off_xs_ssm, ssm)) return false;
+        if (!download("xe commit iden I135..",
+                      host.iden + static_cast<std::size_t>(xsr::I135) * nx,
                       off_iden + static_cast<std::size_t>(xsr::I135) * nx, 3 * nx))
             return false;
         countXeD2H((static_cast<std::size_t>(xsr::NXS) * lmp + ssm + 3 * nx) *
@@ -2557,17 +2582,22 @@ struct XsReconBackend::Impl {
         return true;
     }
 
-    bool upload(const double* src, std::size_t off, std::size_t count) {
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(dev_block + off, src, count * sizeof(double),
-                                         cudaMemcpyHostToDevice, stream), status);
-        xfer::countH2D(count * sizeof(double));
+    bool upload(const char* leaf, const double* src, std::size_t off,
+                std::size_t count) {
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:DeviceBlock::upload", leaf,
+                                            dev_block + off, src,
+                                            count * sizeof(double),
+                                            cudaMemcpyHostToDevice, stream),
+                         status);
         return true;
     }
 
-    bool download(double* dst, std::size_t off, std::size_t count) {
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(dst, dev_block + off, count * sizeof(double),
-                                         cudaMemcpyDeviceToHost, stream), status);
-        xfer::countD2H(count * sizeof(double));
+    bool download(const char* leaf, double* dst, std::size_t off, std::size_t count) {
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:DeviceBlock::download", leaf,
+                                            dst, dev_block + off,
+                                            count * sizeof(double),
+                                            cudaMemcpyDeviceToHost, stream),
+                         status);
         return true;
     }
 
@@ -2623,7 +2653,7 @@ struct XsReconBackend::Impl {
     /// OFF arm is byte-for-byte the code that shipped -- which is what makes
     /// the A/B a measurement of the elision and not of the bookkeeping.
     template <class T>
-    bool uploadGuarded(T* dst, const T* src, std::size_t count,
+    bool uploadGuarded(const char* leaf, T* dst, const T* src, std::size_t count,
                        cuda_transfer::ByteExactMirror<T>& mirror) {
         const std::size_t bytes = count * sizeof(T);
         if (xfer::elideEnabled()) {
@@ -2631,9 +2661,9 @@ struct XsReconBackend::Impl {
             xfer::countElisionTest(hit, bytes);
             if (hit) return true;
         }
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream),
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:uploadGuarded", leaf, dst,
+                                            src, bytes, cudaMemcpyHostToDevice, stream),
                          status);
-        xfer::countH2D(bytes);
         // COMMITTED AT THE ISSUE, and the copy is asynchronous -- so the shadow
         // says "these bytes are on their way to the device", not "they have
         // landed".  That is the right meaning for an elision predicate: the
@@ -2707,12 +2737,12 @@ bool XsReconBackend::solve(const xsr::BatchView& host, unsigned long long micx_g
     if (!d.drainXeCommit(host)) return false;
 
     unsigned long long scalars[2] = {0, 0};
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(scalars, d.dev_scalars,
-                                     2 * sizeof(unsigned long long),
-                                     cudaMemcpyDeviceToHost, d.stream), d.status);
-    xfer::countD2H(2 * sizeof(unsigned long long));
-    xfer::countSync();
-    RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
+    RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solve", "scalars", scalars,
+                                 d.dev_scalars, 2 * sizeof(unsigned long long),
+                                 cudaMemcpyDeviceToHost, d.stream),
+                     d.status);
+    RASBERY_CUDA_TRY(xfer::streamSync("CudaXsReconBackend.cu:solve", "drain", d.stream),
+                     d.status);
 
     double max_change;
     static_assert(sizeof(max_change) == sizeof(scalars[0]), "bit width");
@@ -2772,8 +2802,9 @@ bool XsReconBackend::xeEvaluate(const xsr::BatchView& host,
     RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
 
     unsigned long long bits = 0;
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(&bits, d.xe_bits, sizeof(bits),
-                                     cudaMemcpyDeviceToHost, d.stream),
+    RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:xeEvaluate", "xe_bits", &bits,
+                                 d.xe_bits, sizeof(bits), cudaMemcpyDeviceToHost,
+                                 d.stream),
                      d.status);
     Impl::countXeD2H(sizeof(bits));
     RASBERY_CUDA_TRY(d.xeSync(), d.status);
@@ -2808,8 +2839,9 @@ bool XsReconBackend::xeRotateHistory() {
         for (int row = 0; row < 3; ++row) {
             double* dst = const_cast<double*>(xeRow(d.xe_hist, row, pr[1], d.xe_hist_fuel));
             const double* src = xeRow(d.xe_hist, row, pr[0], d.xe_hist_fuel);
-            RASBERY_CUDA_TRY(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice,
-                                             d.stream),
+            RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:xeRotateHistory",
+                                         "history row (D2D)", dst, src, bytes,
+                                         cudaMemcpyDeviceToDevice, d.stream),
                              d.status);
         }
     return true;
@@ -2841,8 +2873,9 @@ bool XsReconBackend::xeSaveEvaluation() {
         for (int row = 0; row < 3; ++row) {
             double* dst = const_cast<double*>(xeRow(d.xe_hist, row, pr[1], d.xe_hist_fuel));
             const double* src = xeRow(d.xe_hist, row, pr[0], d.xe_hist_fuel);
-            RASBERY_CUDA_TRY(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice,
-                                             d.stream),
+            RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:xeSaveEvaluation",
+                                         "history row (D2D)", dst, src, bytes,
+                                         cudaMemcpyDeviceToDevice, d.stream),
                              d.status);
         }
     return true;
@@ -2877,13 +2910,15 @@ bool XsReconBackend::xeDots(int ncol, double* out_six) {
         add(xek::XE_DOT_Q, xek::XE_T_DG1, xek::XE_T_G);
     }
 
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(d.xe_pairs, host_pairs,
-                                     static_cast<std::size_t>(2 * npairs) * sizeof(int),
-                                     cudaMemcpyHostToDevice, d.stream),
+    RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:xeDots", "pairs", d.xe_pairs,
+                                 host_pairs,
+                                 static_cast<std::size_t>(2 * npairs) * sizeof(int),
+                                 cudaMemcpyHostToDevice, d.stream),
                      d.status);
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(d.xe_pairs + 2 * xek::XE_DOT_COUNT, host_slots,
-                                     static_cast<std::size_t>(npairs) * sizeof(int),
-                                     cudaMemcpyHostToDevice, d.stream),
+    RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:xeDots", "slots",
+                                 d.xe_pairs + 2 * xek::XE_DOT_COUNT, host_slots,
+                                 static_cast<std::size_t>(npairs) * sizeof(int),
+                                 cudaMemcpyHostToDevice, d.stream),
                      d.status);
     RASBERY_CUDA_TRY(cudaMemsetAsync(d.xe_dots, 0, xek::XE_DOT_COUNT * sizeof(double),
                                      d.stream),
@@ -2904,9 +2939,9 @@ bool XsReconBackend::xeDots(int ncol, double* out_six) {
         d.xe_dots);
     RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
 
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(out_six, d.xe_dots,
-                                     xek::XE_DOT_COUNT * sizeof(double),
-                                     cudaMemcpyDeviceToHost, d.stream),
+    RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:xeDots", "dots", out_six,
+                                 d.xe_dots, xek::XE_DOT_COUNT * sizeof(double),
+                                 cudaMemcpyDeviceToHost, d.stream),
                      d.status);
     Impl::countXeD2H(xek::XE_DOT_COUNT * sizeof(double));
     RASBERY_CUDA_TRY(d.xeSync(), d.status);
@@ -2933,11 +2968,13 @@ bool XsReconBackend::xeCandidate(const double* gamma, int ncol, double* step_out
 
     int                bad  = 0;
     unsigned long long bits = 0;
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(&bad, d.xe_flags, sizeof(int),
-                                     cudaMemcpyDeviceToHost, d.stream),
+    RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:xeCandidate", "flags", &bad,
+                                 d.xe_flags, sizeof(int), cudaMemcpyDeviceToHost,
+                                 d.stream),
                      d.status);
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(&bits, d.xe_bits, sizeof(bits),
-                                     cudaMemcpyDeviceToHost, d.stream),
+    RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:xeCandidate", "bits", &bits,
+                                 d.xe_bits, sizeof(bits), cudaMemcpyDeviceToHost,
+                                 d.stream),
                      d.status);
     Impl::countXeD2H(sizeof(bad) + sizeof(bits));
     RASBERY_CUDA_TRY(d.xeSync(), d.status);
@@ -2984,8 +3021,9 @@ bool XsReconBackend::xeCommit(const xsr::BatchView& host, int triple, double rel
     if (!d.drainXeCommit(host)) return false;
 
     unsigned long long solved = 0;
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(&solved, d.xe_bits + 1, sizeof(solved),
-                                     cudaMemcpyDeviceToHost, d.stream),
+    RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:xeCommit", "solved", &solved,
+                                 d.xe_bits + 1, sizeof(solved), cudaMemcpyDeviceToHost,
+                                 d.stream),
                      d.status);
     Impl::countXeD2H(sizeof(solved));
     RASBERY_CUDA_TRY(d.xeSync(), d.status);
@@ -3158,10 +3196,12 @@ bool XsReconBackend::xeTransaction(const xsr::BatchView& host,
     //    shipped, and did not say so.)
     unsigned long long solved = 0;
     if (!d.drainXeCommit(host) ||
-        cudaMemcpyAsync(&d.xe_ctl_host, d.xe_ctl, sizeof(xek::XeTxnControl),
-                        cudaMemcpyDeviceToHost, d.stream) != cudaSuccess ||
-        cudaMemcpyAsync(&solved, d.xe_bits + 2, sizeof(solved), cudaMemcpyDeviceToHost,
-                        d.stream) != cudaSuccess ||
+        xfer::memcpyAsync("CudaXsReconBackend.cu:xeTransaction", "ctl",
+                            &d.xe_ctl_host, d.xe_ctl, sizeof(xek::XeTxnControl),
+                            cudaMemcpyDeviceToHost, d.stream) != cudaSuccess ||
+        xfer::memcpyAsync("CudaXsReconBackend.cu:xeTransaction", "solved", &solved,
+                            d.xe_bits + 2, sizeof(solved), cudaMemcpyDeviceToHost,
+                            d.stream) != cudaSuccess ||
         d.xeSync() != cudaSuccess) {
         d.status    = "xeTransaction: download failed after the commit kernel";
         d.available = false;
@@ -3253,28 +3293,40 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
             // Synchronous copies under the mutex: nothing can race a
             // half-uploaded table, and this happens once per process.
             for (int t = 0; t < fxs::N_ACTIVE; ++t)
-                RASBERY_CUDA_TRY(cudaMemcpy(e.block + e.off_lmp[t], host.coeff_lmp[t],
-                                            shape.lmp_slot * sizeof(double),
-                                            cudaMemcpyHostToDevice), d.status);
-            RASBERY_CUDA_TRY(cudaMemcpy(e.block + e.off_lsm, host.coeff_lsm,
-                                        shape.lsm * sizeof(double),
-                                        cudaMemcpyHostToDevice), d.status);
+                RASBERY_CUDA_TRY(xfer::memcpy("CudaXsReconBackend.cu:flatxsLibrary", "coeff_lmp",
+                                        e.block + e.off_lmp[t], host.coeff_lmp[t],
+                                        shape.lmp_slot * sizeof(double),
+                                        cudaMemcpyHostToDevice),
+                             d.status);
+            RASBERY_CUDA_TRY(xfer::memcpy("CudaXsReconBackend.cu:flatxsLibrary", "coeff_lsm",
+                                    e.block + e.off_lsm, host.coeff_lsm,
+                                    shape.lsm * sizeof(double), cudaMemcpyHostToDevice),
+                         d.status);
             if (host.has_coeff_micx) {
                 for (int t = 0; t < fxs::N_ACTIVE; ++t)
-                    RASBERY_CUDA_TRY(cudaMemcpy(e.block + e.off_mic[t], host.coeff_mic[t],
-                                                shape.mic_slot * sizeof(double),
-                                                cudaMemcpyHostToDevice), d.status);
-                RASBERY_CUDA_TRY(cudaMemcpy(e.block + e.off_msm, host.coeff_msm,
-                                            shape.msm * sizeof(double),
-                                            cudaMemcpyHostToDevice), d.status);
+                    RASBERY_CUDA_TRY(xfer::memcpy("CudaXsReconBackend.cu:flatxsLibrary",
+                                            "coeff_mic", e.block + e.off_mic[t],
+                                            host.coeff_mic[t],
+                                            shape.mic_slot * sizeof(double),
+                                            cudaMemcpyHostToDevice),
+                                 d.status);
+                RASBERY_CUDA_TRY(xfer::memcpy("CudaXsReconBackend.cu:flatxsLibrary", "coeff_msm",
+                                        e.block + e.off_msm, host.coeff_msm,
+                                        shape.msm * sizeof(double),
+                                        cudaMemcpyHostToDevice),
+                             d.status);
             }
             if (shape.n_knots > 0)
-                RASBERY_CUDA_TRY(cudaMemcpy(e.block + e.off_knots, host.knots,
-                                            shape.n_knots * sizeof(double),
-                                            cudaMemcpyHostToDevice), d.status);
-            RASBERY_CUDA_TRY(cudaMemcpy(e.deltas, host.deltas,
-                                        shape.n_deltas * sizeof(fxs::DeltaMeta),
-                                        cudaMemcpyHostToDevice), d.status);
+                RASBERY_CUDA_TRY(xfer::memcpy("CudaXsReconBackend.cu:flatxsLibrary", "knots",
+                                        e.block + e.off_knots, host.knots,
+                                        shape.n_knots * sizeof(double),
+                                        cudaMemcpyHostToDevice),
+                             d.status);
+            RASBERY_CUDA_TRY(xfer::memcpy("CudaXsReconBackend.cu:flatxsLibrary", "deltas",
+                                    e.deltas, host.deltas,
+                                    shape.n_deltas * sizeof(fxs::DeltaMeta),
+                                    cudaMemcpyHostToDevice),
+                         d.status);
             g_flatxs_libs->push_back(e);
             found = &g_flatxs_libs->back();
         }
@@ -3294,25 +3346,29 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     }
     if (ref_generation != d.resident_ref_generation) {
         for (int t = 0; t < fxs::N_ACTIVE; ++t) {
-            RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_ref + d.off_ref_mic[t], host.ref_mic[t],
-                                             mic * sizeof(double),
-                                             cudaMemcpyHostToDevice, d.stream), d.status);
-            xfer::countH2D(mic * sizeof(double));
+            RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveFlatXs", "ref mic",
+                                         d.dev_ref + d.off_ref_mic[t], host.ref_mic[t],
+                                         mic * sizeof(double), cudaMemcpyHostToDevice,
+                                         d.stream),
+                             d.status);
         }
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_ref + d.off_ref_msm, host.ref_msm,
-                                         msm * sizeof(double),
-                                         cudaMemcpyHostToDevice, d.stream), d.status);
-        xfer::countH2D(msm * sizeof(double));
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveFlatXs", "ref msm",
+                                     d.dev_ref + d.off_ref_msm, host.ref_msm,
+                                     msm * sizeof(double), cudaMemcpyHostToDevice,
+                                     d.stream),
+                         d.status);
         for (int t = 0; t < fxs::N_ACTIVE; ++t) {
-            RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_ref + d.off_ref_lmp[t], host.ref_lmp[t],
-                                             lmp * sizeof(double),
-                                             cudaMemcpyHostToDevice, d.stream), d.status);
-            xfer::countH2D(lmp * sizeof(double));
+            RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveFlatXs", "ref lmp",
+                                         d.dev_ref + d.off_ref_lmp[t], host.ref_lmp[t],
+                                         lmp * sizeof(double), cudaMemcpyHostToDevice,
+                                         d.stream),
+                             d.status);
         }
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.dev_ref + d.off_ref_lsm, host.ref_lsm,
-                                         ssm * sizeof(double),
-                                         cudaMemcpyHostToDevice, d.stream), d.status);
-        xfer::countH2D(ssm * sizeof(double));
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveFlatXs", "ref lsm",
+                                     d.dev_ref + d.off_ref_lsm, host.ref_lsm,
+                                     ssm * sizeof(double), cudaMemcpyHostToDevice,
+                                     d.stream),
+                         d.status);
         d.resident_ref_generation = ref_generation;
     }
 
@@ -3321,11 +3377,13 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     // ACTIVE 9, but the xsrecon condense loop reads every slot later).
     if (micx_generation != d.resident_micx_generation) {
         for (int xt = 0; xt < xsr::NXS; ++xt)
-            if (!d.upload(host.mic_all[xt], d.off_mic[xt], mic)) return false;
-        if (!d.upload(host.msm, d.off_mic_ssm, msm)) return false;
+            if (!d.upload("flatxs micx mic", host.mic_all[xt], d.off_mic[xt], mic))
+                return false;
+        if (!d.upload("flatxs micx msm", host.msm, d.off_mic_ssm, msm)) return false;
         for (int xt = 0; xt < xsr::NXS; ++xt)
-            if (!d.upload(host.lmp_all[xt], d.off_lmp[xt], lmp)) return false;
-        if (!d.upload(host.lsm, d.off_lmp_ssm, ssm)) return false;
+            if (!d.upload("flatxs micx lmp", host.lmp_all[xt], d.off_lmp[xt], lmp))
+                return false;
+        if (!d.upload("flatxs micx lsm", host.lsm, d.off_lmp_ssm, ssm)) return false;
         d.resident_micx_generation = micx_generation;
     }
 
@@ -3334,9 +3392,13 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     // says the resident copies are still bit-identical.
     if (state_generation != d.resident_state_generation) {
         for (int xt = 0; xt < xsr::NXS; ++xt)
-            if (!d.upload(host.xs[xt], d.off_xs[xt], lmp)) return false;
-        if (!d.upload(host.xs_ssm, d.off_xs_ssm, ssm)) return false;
-        if (!d.upload(host.iden, d.off_iden, static_cast<std::size_t>(xsr::NISO) * nx)) return false;
+            if (!d.upload("flatxs state xs", host.xs[xt], d.off_xs[xt], lmp))
+                return false;
+        if (!d.upload("flatxs state xs_ssm", host.xs_ssm, d.off_xs_ssm, ssm))
+            return false;
+        if (!d.upload("flatxs state iden", host.iden, d.off_iden,
+                      static_cast<std::size_t>(xsr::NISO) * nx))
+            return false;
     }
 
     if (d.dev_pernode == nullptr) {
@@ -3352,9 +3414,11 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     // only with the spectral history; dmod and bppm move with the T/H state and
     // the boron, so the boron search's own trials re-upload and the T/H-quiet
     // calls between them do not.
-    if (!d.uploadGuarded(d.dev_pernode, host.wvfr, nx, d.mir_wvfr)) return false;
-    if (!d.uploadGuarded(d.dev_pernode + nx, host.dmod, nx, d.mir_dmod)) return false;
-    if (!d.uploadGuarded(d.dev_pernode + 2 * nx, host.bppm, nx, d.mir_bppm)) return false;
+    if (!d.uploadGuarded("wvfr", d.dev_pernode, host.wvfr, nx, d.mir_wvfr)) return false;
+    if (!d.uploadGuarded("dmod", d.dev_pernode + nx, host.dmod, nx, d.mir_dmod))
+        return false;
+    if (!d.uploadGuarded("bppm", d.dev_pernode + 2 * nx, host.bppm, nx, d.mir_bppm))
+        return false;
 
     const std::size_t n_nodes = static_cast<std::size_t>(host.n_nodes);
     if (n_nodes > d.nodes_cap) {
@@ -3394,15 +3458,20 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     // WP13: the node list is the unrodded set and the three stream arrays are
     // BuildFlatXsStream's output.  Both are pure kernel inputs (const pointers
     // in fxs::FlatXsView), so the shadow means what it says.
-    if (!d.uploadGuarded(d.dev_nodes, host.nodes, n_nodes, d.mir_nodes)) return false;
-    if (!d.uploadGuarded(d.dev_off, host.node_off, n_nodes, d.mir_node_off)) return false;
-    if (!d.uploadGuarded(d.dev_cnt, host.node_cnt, n_nodes, d.mir_node_cnt)) return false;
+    if (!d.uploadGuarded("nodes", d.dev_nodes, host.nodes, n_nodes, d.mir_nodes))
+        return false;
+    if (!d.uploadGuarded("node_off", d.dev_off, host.node_off, n_nodes, d.mir_node_off))
+        return false;
+    if (!d.uploadGuarded("node_cnt", d.dev_cnt, host.node_cnt, n_nodes, d.mir_node_cnt))
+        return false;
     if (stream_len > 0) {
-        if (!d.uploadGuarded(d.dev_sdid, host.stream_did, stream_len, d.mir_stream_did))
+        if (!d.uploadGuarded("stream_did", d.dev_sdid, host.stream_did, stream_len,
+                             d.mir_stream_did))
             return false;
-        if (!d.uploadGuarded(d.dev_sx, host.stream_x, stream_len, d.mir_stream_x))
+        if (!d.uploadGuarded("stream_x", d.dev_sx, host.stream_x, stream_len,
+                             d.mir_stream_x))
             return false;
-        if (!d.uploadGuarded(d.dev_sscale, host.stream_scale, stream_len,
+        if (!d.uploadGuarded("stream_scale", d.dev_sscale, host.stream_scale, stream_len,
                              d.mir_stream_scale))
             return false;
     }
@@ -3464,20 +3533,25 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     static const bool skip_micx_dl = envFlagEnabled("RASBERY_FLATXS_SKIP_MICX_DL");
     if (!skip_micx_dl) {
         for (int t = 0; t < fxs::N_ACTIVE; ++t) {
-            if (!d.download(host.lmp[t], d.off_lmp[ACTIVE_XT9[t]], lmp)) return false;
-            if (!d.download(host.mic[t], d.off_mic[ACTIVE_XT9[t]], mic)) return false;
+            if (!d.download("flatxs lmpx lmp", host.lmp[t], d.off_lmp[ACTIVE_XT9[t]],
+                            lmp))
+                return false;
+            if (!d.download("flatxs micx mic", host.mic[t], d.off_mic[ACTIVE_XT9[t]],
+                            mic))
+                return false;
         }
-        if (!d.download(host.lsm, d.off_lmp_ssm, ssm)) return false;
-        if (!d.download(host.msm, d.off_mic_ssm, msm)) return false;
+        if (!d.download("flatxs lmpx lsm", host.lsm, d.off_lmp_ssm, ssm)) return false;
+        if (!d.download("flatxs micx msm", host.msm, d.off_mic_ssm, msm)) return false;
     }
     for (int xt = 0; xt < xsr::NXS; ++xt)
-        if (!d.download(host.xs[xt], d.off_xs[xt], lmp)) return false;
-    if (!d.download(host.xs_ssm, d.off_xs_ssm, ssm)) return false;
+        if (!d.download("flatxs macro xs", host.xs[xt], d.off_xs[xt], lmp)) return false;
+    if (!d.download("flatxs macro xs_ssm", host.xs_ssm, d.off_xs_ssm, ssm)) return false;
     // Light-isotope rows H-1/B-10/O-16 are 0..2 -- contiguous by registry design.
-    if (!d.download(host.iden, d.off_iden, 3 * nx)) return false;
+    if (!d.download("flatxs light iden", host.iden, d.off_iden, 3 * nx)) return false;
 
-    xfer::countSync();
-    RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
+    RASBERY_CUDA_TRY(xfer::streamSync("CudaXsReconBackend.cu:solveFlatXs", "drain",
+                                       d.stream),
+                     d.status);
 
     // After the download the host and device copies are bit-identical, so the
     // caller's post-call generation bump can be marked already-resident and
@@ -3605,27 +3679,41 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     const std::size_t ndg = nx * ndl::NDIR * ndl::NG;
 
     if (!d.nodal_geom_uploaded) {
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_hmesh, host.hmesh,
-                                         nx * ndl::NDIR * sizeof(double),
-                                         cudaMemcpyHostToDevice, d.stream), d.status);
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_albedo, host.albedo,
-                                         ndl::NDIR * ndl::NLR * sizeof(double),
-                                         cudaMemcpyHostToDevice, d.stream), d.status);
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_int + d.n_ioff_lktosfc, host.lktosfc,
-                                         nx * ndl::NDIR * ndl::NLR * sizeof(int),
-                                         cudaMemcpyHostToDevice, d.stream), d.status);
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_int + d.n_ioff_neib, host.neib,
-                                         nx * ndl::NEWSB * sizeof(int),
-                                         cudaMemcpyHostToDevice, d.stream), d.status);
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_int + d.n_ioff_lklr, host.lklr,
-                                         ns * ndl::NLR * sizeof(int),
-                                         cudaMemcpyHostToDevice, d.stream), d.status);
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_int + d.n_ioff_idirlr, host.idirlr,
-                                         ns * ndl::NLR * sizeof(int),
-                                         cudaMemcpyHostToDevice, d.stream), d.status);
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_int + d.n_ioff_sgnlr, host.sgnlr,
-                                         ns * ndl::NLR * sizeof(int),
-                                         cudaMemcpyHostToDevice, d.stream), d.status);
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal", "hmesh",
+                                     d.ndev_dbl + d.n_off_hmesh, host.hmesh,
+                                     nx * ndl::NDIR * sizeof(double),
+                                     cudaMemcpyHostToDevice, d.stream),
+                         d.status);
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal", "albedo",
+                                     d.ndev_dbl + d.n_off_albedo, host.albedo,
+                                     ndl::NDIR * ndl::NLR * sizeof(double),
+                                     cudaMemcpyHostToDevice, d.stream),
+                         d.status);
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal", "lktosfc",
+                                     d.ndev_int + d.n_ioff_lktosfc, host.lktosfc,
+                                     nx * ndl::NDIR * ndl::NLR * sizeof(int),
+                                     cudaMemcpyHostToDevice, d.stream),
+                         d.status);
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal", "neib",
+                                     d.ndev_int + d.n_ioff_neib, host.neib,
+                                     nx * ndl::NEWSB * sizeof(int),
+                                     cudaMemcpyHostToDevice, d.stream),
+                         d.status);
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal", "lklr",
+                                     d.ndev_int + d.n_ioff_lklr, host.lklr,
+                                     ns * ndl::NLR * sizeof(int),
+                                     cudaMemcpyHostToDevice, d.stream),
+                         d.status);
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal", "idirlr",
+                                     d.ndev_int + d.n_ioff_idirlr, host.idirlr,
+                                     ns * ndl::NLR * sizeof(int),
+                                     cudaMemcpyHostToDevice, d.stream),
+                         d.status);
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal", "sgnlr",
+                                     d.ndev_int + d.n_ioff_sgnlr, host.sgnlr,
+                                     ns * ndl::NLR * sizeof(int),
+                                     cudaMemcpyHostToDevice, d.stream),
+                         d.status);
         // The three per-drive host buffers are Geometry-owned; page-locking
         // them once makes the per-drive copies truly async and keeps them
         // capturable as graph memcpy nodes.  pinHost is idempotent, and the
@@ -3642,16 +3730,20 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
                                    host.m264, host.diagD, host.diagDI};
         for (int i = 0; i < 9; ++i)
             RASBERY_CUDA_TRY(
-                cudaMemcpyAsync(d.ndev_dbl + d.n_off_consts + i * ndg, consts[i],
-                                ndg * sizeof(double), cudaMemcpyHostToDevice,
-                                d.stream), d.status);
+                xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal", "consts",
+                                    d.ndev_dbl + d.n_off_consts + i * ndg, consts[i],
+                                    ndg * sizeof(double), cudaMemcpyHostToDevice,
+                                    d.stream),
+                d.status);
         d.resident_const_generation = const_generation;
     }
 
     if (!host.chif_empty && ref_generation != d.resident_chif_generation) {
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_chif, host.chif,
-                                         ndl::NG * nx * sizeof(double),
-                                         cudaMemcpyHostToDevice, d.stream), d.status);
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal", "chif",
+                                     d.ndev_dbl + d.n_off_chif, host.chif,
+                                     ndl::NG * nx * sizeof(double),
+                                     cudaMemcpyHostToDevice, d.stream),
+                         d.status);
         d.resident_chif_generation = ref_generation;
     }
 
@@ -3661,9 +3753,9 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     const std::size_t lmp = static_cast<std::size_t>(xsr::NG) * nx;
     const std::size_t ssm = static_cast<std::size_t>(xsr::NG) * xsr::NG * nx;
     if (state_generation != d.resident_state_generation) {
-        if (!d.upload(host.xsrf, d.off_xs[xsr::T_XSRF], lmp)) return false;
-        if (!d.upload(host.xsnf, d.off_xs[xsr::T_XSNF], lmp)) return false;
-        if (!d.upload(host.xssm, d.off_xs_ssm, ssm)) return false;
+        if (!d.upload("nodal xsrf", host.xsrf, d.off_xs[xsr::T_XSRF], lmp)) return false;
+        if (!d.upload("nodal xsnf", host.xsnf, d.off_xs[xsr::T_XSNF], lmp)) return false;
+        if (!d.upload("nodal xssm", host.xssm, d.off_xs_ssm, ssm)) return false;
     }
 
     ndl::NodalView v = host;
@@ -3733,8 +3825,10 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         if (!gpu::canonicalElidesUpload(canon, gpu::CanonicalRegion::Jnet,
                                         d.canonical.ownerOf(gpu::CanonicalRegion::Jnet),
                                         gpu::CanonicalOwner::Nodal)) {
-            RASBERY_CUDA_TRY(cudaMemcpyAsync(v.jnet, host.jnet, surf_bytes,
-                                             cudaMemcpyHostToDevice, d.stream), d.status);
+            RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal(hybrid)",
+                                         "jnet upload", v.jnet, host.jnet, surf_bytes,
+                                         cudaMemcpyHostToDevice, d.stream),
+                             d.status);
         } else {
             ++d.canonical_uploads_elided;
             g_canon_up_bytes.fetch_add(
@@ -3743,9 +3837,11 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         if (!gpu::canonicalElidesUpload(canon, gpu::CanonicalRegion::Flux,
                                         d.canonical.ownerOf(gpu::CanonicalRegion::Flux),
                                         gpu::CanonicalOwner::Nodal)) {
-            RASBERY_CUDA_TRY(cudaMemcpyAsync(const_cast<double*>(v.flux), host.flux,
-                                             nx * ndl::NG * sizeof(double),
-                                             cudaMemcpyHostToDevice, d.stream), d.status);
+            RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal(hybrid)",
+                                         "flux upload", const_cast<double*>(v.flux),
+                                         host.flux, nx * ndl::NG * sizeof(double),
+                                         cudaMemcpyHostToDevice, d.stream),
+                             d.status);
         } else {
             ++d.canonical_uploads_elided;
             g_canon_up_bytes.fetch_add(
@@ -3762,17 +3858,24 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         // and finish in solveNodalPost.
         const std::size_t ndg2 = nx * ndl::NDIR * ndl::NG;
         double* wk0 = d.ndev_dbl + d.n_off_work;
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(host.trlcff0, wk0,
-                                         ndg2 * sizeof(double),
-                                         cudaMemcpyDeviceToHost, d.stream), d.status);
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(host.trlcff2, wk0 + 2 * ndg2,
-                                         ndg2 * sizeof(double),
-                                         cudaMemcpyDeviceToHost, d.stream), d.status);
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal(hybrid)",
+                                     "trlcff0", host.trlcff0, wk0,
+                                     ndg2 * sizeof(double), cudaMemcpyDeviceToHost,
+                                     d.stream),
+                         d.status);
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal(hybrid)",
+                                     "trlcff2", host.trlcff2, wk0 + 2 * ndg2,
+                                     ndg2 * sizeof(double), cudaMemcpyDeviceToHost,
+                                     d.stream),
+                         d.status);
         double* wmat = wk0 + 3 * ndg2 + 2 * nx * ndl::NDIR * ndl::NG2;
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(host.matM, wmat,
-                                         nx * ndl::NG2 * sizeof(double),
-                                         cudaMemcpyDeviceToHost, d.stream), d.status);
-        RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal(hybrid)", "matM",
+                                     host.matM, wmat, nx * ndl::NG2 * sizeof(double),
+                                     cudaMemcpyDeviceToHost, d.stream),
+                         d.status);
+        RASBERY_CUDA_TRY(xfer::streamSync("CudaXsReconBackend.cu:solveNodal(hybrid)", "drain",
+                                    d.stream),
+                         d.status);
         // Hybrid D2H per drive = trlcff0 + trlcff2 + matM here, jnet + phis in
         // solveNodalPost.
         g_nodal_d2h_bytes.store((2 * ndg2 + nx * ndl::NG2) * sizeof(double) +
@@ -3841,8 +3944,10 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         if (!gpu::canonicalElidesUpload(canon, gpu::CanonicalRegion::Jnet,
                                         d.canonical.ownerOf(gpu::CanonicalRegion::Jnet),
                                         gpu::CanonicalOwner::Nodal)) {
-            RASBERY_CUDA_TRY(cudaMemcpyAsync(v.jnet, host.jnet, surf_bytes,
-                                             cudaMemcpyHostToDevice, d.stream), d.status);
+            RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal(full)",
+                                         "jnet upload", v.jnet, host.jnet, surf_bytes,
+                                         cudaMemcpyHostToDevice, d.stream),
+                             d.status);
         } else {
             ++d.canonical_uploads_elided;
             g_canon_up_bytes.fetch_add(
@@ -3851,9 +3956,11 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         if (!gpu::canonicalElidesUpload(canon, gpu::CanonicalRegion::Flux,
                                         d.canonical.ownerOf(gpu::CanonicalRegion::Flux),
                                         gpu::CanonicalOwner::Nodal)) {
-            RASBERY_CUDA_TRY(cudaMemcpyAsync(const_cast<double*>(v.flux), host.flux,
-                                             nx * ndl::NG * sizeof(double),
-                                             cudaMemcpyHostToDevice, d.stream), d.status);
+            RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal(full)",
+                                         "flux upload", const_cast<double*>(v.flux),
+                                         host.flux, nx * ndl::NG * sizeof(double),
+                                         cudaMemcpyHostToDevice, d.stream),
+                             d.status);
         } else {
             ++d.canonical_uploads_elided;
             g_canon_up_bytes.fetch_add(
@@ -3874,8 +3981,10 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         // them straight out of the same buffers.
         if (!gpu::canonicalElidesDownload(canon, gpu::CanonicalRegion::Jnet,
                                           d.canonical_materialize)) {
-            RASBERY_CUDA_TRY(cudaMemcpyAsync(host.jnet, v.jnet, surf_bytes,
-                                             cudaMemcpyDeviceToHost, d.stream), d.status);
+            RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal(full)",
+                                         "jnet download", host.jnet, v.jnet, surf_bytes,
+                                         cudaMemcpyDeviceToHost, d.stream),
+                             d.status);
         } else {
             ++d.canonical_downloads_elided;
             g_canon_down_bytes.fetch_add(
@@ -3883,8 +3992,10 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         }
         if (!gpu::canonicalElidesDownload(canon, gpu::CanonicalRegion::Phis,
                                           d.canonical_materialize)) {
-            RASBERY_CUDA_TRY(cudaMemcpyAsync(host.phis, v.phis, surf_bytes,
-                                             cudaMemcpyDeviceToHost, d.stream), d.status);
+            RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal(full)",
+                                         "phis download", host.phis, v.phis, surf_bytes,
+                                         cudaMemcpyDeviceToHost, d.stream),
+                             d.status);
         } else {
             ++d.canonical_downloads_elided;
             g_canon_down_bytes.fetch_add(
@@ -3935,7 +4046,7 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     // TryDriveGpu answers false and the CPU body then writes the very same
     // host.jnet/host.phis this stream is still copying into.  Drain first.
     auto fail_drained = [&]() {
-        cudaStreamSynchronize(d.stream);
+        xfer::streamSync("CudaXsReconBackend.cu:solveNodal", "fail drain", d.stream);
         cudaGetLastError();
         return false;
     };
@@ -3961,9 +4072,10 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     // cudaStreamBeginCapture -- there is a drain between the two -- so the
     // recorded graph never contains it.
     if (!reigv_device) {
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(d.ndev_dbl + d.n_off_reigv, reigv_src,
-                                         sizeof(double),
-                                         cudaMemcpyHostToDevice, d.stream), d.status);
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal", "reigv",
+                                     d.ndev_dbl + d.n_off_reigv, reigv_src,
+                                     sizeof(double), cudaMemcpyHostToDevice, d.stream),
+                         d.status);
     } else {
         g_nodal_reigv_device.fetch_add(1, std::memory_order_relaxed);
     }
@@ -4012,7 +4124,9 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         // backend's stream and it is not in the segment's in_body_host_syncs,
         // so if the graph key moves the cost is real and nothing reports it.
         g_nodal_graph_captures.fetch_add(1, std::memory_order_relaxed);
-        RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
+        RASBERY_CUDA_TRY(xfer::streamSync("CudaXsReconBackend.cu:solveNodal", "pre-capture drain",
+                                    d.stream),
+                         d.status);
         cudaGraph_t graph  = nullptr;
         bool        enq_ok = true;
         rasbery::CaptureWindow _capture_window(d.stream, "nodal.instance");
@@ -4117,7 +4231,7 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     const cudaError_t lasterr = cudaGetLastError();
     if (lasterr != cudaSuccess) {
         d.status = std::string("nodal FULL -> ") + cudaGetErrorString(lasterr);
-        cudaStreamSynchronize(d.stream);
+        xfer::streamSync("CudaXsReconBackend.cu:solveNodal", "error drain", d.stream);
         cudaGetLastError();
         return false;
     }
@@ -4125,13 +4239,15 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         const cudaError_t erc = cudaEventRecord(d.nodal_done_event, d.stream);
         if (erc != cudaSuccess) {
             d.status = std::string("nodal FULL event -> ") + cudaGetErrorString(erc);
-            cudaStreamSynchronize(d.stream);
+            xfer::streamSync("CudaXsReconBackend.cu:solveNodal", "event error drain",
+                               d.stream);
             cudaGetLastError();
             return false;
         }
         d.nodal_drain_deferred = true;
         g_nodal_drains_deferred.fetch_add(1, std::memory_order_relaxed);
-    } else if (const cudaError_t syncrc = cudaStreamSynchronize(d.stream);
+    } else if (const cudaError_t syncrc = xfer::streamSync(
+                   "CudaXsReconBackend.cu:solveNodal", "final drain", d.stream);
                syncrc != cudaSuccess) {
         d.status = std::string("nodal FULL -> ") + cudaGetErrorString(syncrc);
         cudaGetLastError();
@@ -4163,14 +4279,18 @@ bool XsReconBackend::solveNodalPost(const ndl::NodalView& host) {
     double* wk0 = d.ndev_dbl + d.n_off_work;
     double* wds = wk0 + 3 * ndg2 + 2 * nx * ndl::NDIR * ndl::NG2 +
                   4 * nx * ndl::NG2;
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(wds, host.dsncff2, ndg2 * sizeof(double),
-                                     cudaMemcpyHostToDevice, d.stream), d.status);
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(wds + ndg2, host.dsncff4,
-                                     ndg2 * sizeof(double),
-                                     cudaMemcpyHostToDevice, d.stream), d.status);
-    RASBERY_CUDA_TRY(cudaMemcpyAsync(wds + 2 * ndg2, host.dsncff6,
-                                     ndg2 * sizeof(double),
-                                     cudaMemcpyHostToDevice, d.stream), d.status);
+    RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodalPost", "dsncff2", wds,
+                                 host.dsncff2, ndg2 * sizeof(double),
+                                 cudaMemcpyHostToDevice, d.stream),
+                     d.status);
+    RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodalPost", "dsncff4",
+                                 wds + ndg2, host.dsncff4, ndg2 * sizeof(double),
+                                 cudaMemcpyHostToDevice, d.stream),
+                     d.status);
+    RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodalPost", "dsncff6",
+                                 wds + 2 * ndg2, host.dsncff6, ndg2 * sizeof(double),
+                                 cudaMemcpyHostToDevice, d.stream),
+                     d.status);
 
     ndl::NodalView v = host;
     v.lklr    = d.ndev_int + d.n_ioff_lklr;
@@ -4217,9 +4337,10 @@ bool XsReconBackend::solveNodalPost(const ndl::NodalView& host) {
 
     if (!gpu::canonicalElidesDownload(canon, gpu::CanonicalRegion::Jnet,
                                       d.canonical_materialize)) {
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(host.jnet, v.jnet,
-                                         ns * ndl::NG * sizeof(double),
-                                         cudaMemcpyDeviceToHost, d.stream), d.status);
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodalPost", "jnet",
+                                     host.jnet, v.jnet, ns * ndl::NG * sizeof(double),
+                                     cudaMemcpyDeviceToHost, d.stream),
+                         d.status);
     } else {
         ++d.canonical_downloads_elided;
         g_canon_down_bytes.fetch_add(ns * ndl::NG * sizeof(double),
@@ -4227,15 +4348,17 @@ bool XsReconBackend::solveNodalPost(const ndl::NodalView& host) {
     }
     if (!gpu::canonicalElidesDownload(canon, gpu::CanonicalRegion::Phis,
                                       d.canonical_materialize)) {
-        RASBERY_CUDA_TRY(cudaMemcpyAsync(host.phis, v.phis,
-                                         ns * ndl::NG * sizeof(double),
-                                         cudaMemcpyDeviceToHost, d.stream), d.status);
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodalPost", "phis",
+                                     host.phis, v.phis, ns * ndl::NG * sizeof(double),
+                                     cudaMemcpyDeviceToHost, d.stream),
+                         d.status);
     } else {
         ++d.canonical_downloads_elided;
         g_canon_down_bytes.fetch_add(ns * ndl::NG * sizeof(double),
                                      std::memory_order_relaxed);
     }
-    RASBERY_CUDA_TRY(cudaStreamSynchronize(d.stream), d.status);
+    RASBERY_CUDA_TRY(xfer::streamSync("CudaXsReconBackend.cu:solveNodalPost", "drain", d.stream),
+                     d.status);
 
     // The drive produced jnet and phis on the device; record that so the next
     // drive's upload predicate knows it does not have to push them back.

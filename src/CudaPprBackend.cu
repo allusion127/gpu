@@ -11,6 +11,7 @@
 
 #include "CudaPprBackend.h"
 #include "PprReconstructionKernel.cuh"
+#include "XferLedger.h"
 
 #include <cuda_runtime.h>
 
@@ -1492,7 +1493,8 @@ struct PprBackend::Impl {
     /// n_host_syncs moves.  Both entry points call it, so
     /// host_syncs_per_statepoint stays the truth when stage D is on.
     bool syncStream(const char* what) {
-        const cudaError_t rc = cudaStreamSynchronize(stream);
+        const cudaError_t rc =
+            rasbery::xfer::streamSync("CudaPprBackend.cu:syncStream", what, stream);
         ++n_host_syncs;
         if (rc != cudaSuccess) return fail(what, rc);
         return true;
@@ -1834,7 +1836,8 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
 
     cudaError_t rc = cudaSuccess;
     auto        h2d = [&](void* d, const void* h, size_t bytes, const char* name) -> bool {
-        rc = cudaMemcpyAsync(d, h, bytes, cudaMemcpyHostToDevice, s.stream);
+        rc = rasbery::xfer::memcpyAsync("CudaPprBackend.cu:drive", name, d, h, bytes,
+                                        cudaMemcpyHostToDevice, s.stream);
         if (rc != cudaSuccess) return s.fail(name, rc);
         s.n_h2d_bytes += bytes;
         return true;
@@ -2040,9 +2043,10 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
         for (int citer = 0; citer < niter; ++citer) {
             enqueue_round(s.stream, false);
 
-            rc = cudaMemcpyAsync(s.h_partials, s.d_partials,
-                                 static_cast<size_t>(s.nchunk) * sizeof(double),
-                                 cudaMemcpyDeviceToHost, s.stream);
+            rc = rasbery::xfer::memcpyAsync(
+                "CudaPprBackend.cu:drive", "master partials", s.h_partials, s.d_partials,
+                static_cast<size_t>(s.nchunk) * sizeof(double), cudaMemcpyDeviceToHost,
+                s.stream);
             if (rc != cudaSuccess) return s.fail("D2H master partials", rc);
             s.n_d2h_bytes += static_cast<size_t>(s.nchunk) * sizeof(double);
             if (!s.syncStream("master drive sync")) return false;
@@ -2060,9 +2064,10 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
         for (int citer = 0; citer < niter; ++citer) {
             enqueue_round(s.stream, false);
 
-            rc = cudaMemcpyAsync(s.h_partials, s.d_partials,
-                                 static_cast<size_t>(4 * s.nchunk) * sizeof(double),
-                                 cudaMemcpyDeviceToHost, s.stream);
+            rc = rasbery::xfer::memcpyAsync(
+                "CudaPprBackend.cu:drive", "corner partials", s.h_partials, s.d_partials,
+                static_cast<size_t>(4 * s.nchunk) * sizeof(double), cudaMemcpyDeviceToHost,
+                s.stream);
             if (rc != cudaSuccess) return s.fail("D2H corner partials", rc);
             s.n_d2h_bytes += static_cast<size_t>(4 * s.nchunk) * sizeof(double);
             if (!s.syncStream("drive sync")) return false;
@@ -2158,7 +2163,8 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
     // reconstructPinPower reads any of them.  There is no partial state to
     // repair, so there is no repair path to get wrong.
     auto d2h = [&](void* h, const void* d, size_t bytes, const char* name) -> bool {
-        rc = cudaMemcpyAsync(h, d, bytes, cudaMemcpyDeviceToHost, s.stream);
+        rc = rasbery::xfer::memcpyAsync("CudaPprBackend.cu:drive", name, h, d, bytes,
+                                        cudaMemcpyDeviceToHost, s.stream);
         if (rc != cudaSuccess) return s.fail(name, rc);
         s.n_d2h_bytes += bytes;
         return true;
@@ -2246,7 +2252,8 @@ bool PprBackend::reconstructPinPower(const ppr::ReconGeomView& geom,
 
     cudaError_t rc = cudaSuccess;
     auto        h2d = [&](void* d, const void* h, size_t bytes, const char* name) -> bool {
-        rc = cudaMemcpyAsync(d, h, bytes, cudaMemcpyHostToDevice, s.stream);
+        rc = rasbery::xfer::memcpyAsync("CudaPprBackend.cu:reconstructPinPower", name, d,
+                                        h, bytes, cudaMemcpyHostToDevice, s.stream);
         if (rc != cudaSuccess) return s.fail(name, rc);
         s.n_h2d_bytes += bytes;
         return true;
@@ -2379,7 +2386,8 @@ bool PprBackend::reconstructPinPower(const ppr::ReconGeomView& geom,
     if ((rc = cudaGetLastError()) != cudaSuccess) return s.fail("recon kernels", rc);
 
     auto d2h = [&](void* h, const void* d, size_t bytes, const char* name) -> bool {
-        rc = cudaMemcpyAsync(h, d, bytes, cudaMemcpyDeviceToHost, s.stream);
+        rc = rasbery::xfer::memcpyAsync("CudaPprBackend.cu:reconstructPinPower", name, h,
+                                        d, bytes, cudaMemcpyDeviceToHost, s.stream);
         if (rc != cudaSuccess) return s.fail(name, rc);
         s.n_d2h_bytes += bytes;
         return true;

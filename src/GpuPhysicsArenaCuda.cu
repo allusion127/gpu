@@ -27,6 +27,7 @@
 
 #include "GpuCaptureArbiter.h"
 #include "GpuPhysicsArena.h"
+#include "XferLedger.h"
 
 #include <cuda_runtime.h>
 
@@ -176,7 +177,7 @@ bool GpuPhysicsArena::reserve(const ArenaDims& dims) {
 
     // The one synchronisation: after this the base address is final, which is
     // the precondition for capturing a graph over any pointer derived from it.
-    rc = cudaStreamSynchronize(d.setup);
+    rc = rasbery::xfer::streamSync("GpuPhysicsArenaCuda.cu:reserve", "alloc", d.setup);
     if (rc != cudaSuccess) return abort_reserve(cudaWhy("cudaStreamSynchronize(reserve)", rc));
 
     d.base = static_cast<unsigned char*>(raw);
@@ -200,7 +201,7 @@ bool GpuPhysicsArena::reserve(const ArenaDims& dims) {
     // reads zeros, not a previous run's bytes.
     rc = cudaMemsetAsync(d.base, 0, d.offsets.total_bytes, d.setup);
     if (rc != cudaSuccess) return abort_reserve(cudaWhy("cudaMemsetAsync(arena)", rc));
-    rc = cudaStreamSynchronize(d.setup);
+    rc = rasbery::xfer::streamSync("GpuPhysicsArenaCuda.cu:reserve", "memset", d.setup);
     if (rc != cudaSuccess) return abort_reserve(cudaWhy("cudaStreamSynchronize(memset)", rc));
 
     d.ready  = true;
@@ -213,7 +214,7 @@ void GpuPhysicsArena::release() {
     Impl& d = *_impl;
     if (d.base != nullptr) {
         cudaFreeAsync(d.base, d.setup);
-        cudaStreamSynchronize(d.setup);
+        rasbery::xfer::streamSync("GpuPhysicsArenaCuda.cu:release", "setup", d.setup);
         d.base = nullptr;
     }
     if (d.owns_pool && d.pool != nullptr) {
@@ -489,9 +490,12 @@ DeviceSlotView GpuPhysicsArena::slotView(int slot) const {
 
 namespace {
 
-bool copyAsync(void* dst, const void* src, std::size_t bytes, cudaMemcpyKind kind,
-               cudaStream_t stream, std::string& status) {
-    const cudaError_t rc = cudaMemcpyAsync(dst, src, bytes, kind, stream);
+/// WP13.1: `leaf` is the CALLER, because this helper is the arena's only
+/// copy and four different regions come through it.
+bool copyAsync(const char* leaf, void* dst, const void* src, std::size_t bytes,
+               cudaMemcpyKind kind, cudaStream_t stream, std::string& status) {
+    const cudaError_t rc = rasbery::xfer::memcpyAsync(
+        "GpuPhysicsArenaCuda.cu:copyAsync", leaf, dst, src, bytes, kind, stream);
     if (rc != cudaSuccess) {
         status = cudaWhy("cudaMemcpyAsync", rc);
         return false;
@@ -507,8 +511,8 @@ bool GpuPhysicsArena::importGeometryAsync(GeometryRegion region, const void* hos
     if (!d.ready) return d.fail("importGeometryAsync on an unavailable arena");
     const ArenaRegion& r = d.offsets.geometry[static_cast<int>(region)];
     if (bytes > r.bytes) return d.fail("importGeometryAsync: payload wider than the region");
-    return copyAsync(d.base + r.offset, host, bytes, cudaMemcpyHostToDevice,
-                     static_cast<cudaStream_t>(stream), d.status);
+    return copyAsync("importGeometryAsync", d.base + r.offset, host, bytes,
+                     cudaMemcpyHostToDevice, static_cast<cudaStream_t>(stream), d.status);
 }
 
 bool GpuPhysicsArena::importLibraryAsync(LibraryRegion region, const void* host,
@@ -517,8 +521,8 @@ bool GpuPhysicsArena::importLibraryAsync(LibraryRegion region, const void* host,
     if (!d.ready) return d.fail("importLibraryAsync on an unavailable arena");
     const ArenaRegion& r = d.offsets.library[static_cast<int>(region)];
     if (bytes > r.bytes) return d.fail("importLibraryAsync: payload wider than the region");
-    return copyAsync(d.base + r.offset, host, bytes, cudaMemcpyHostToDevice,
-                     static_cast<cudaStream_t>(stream), d.status);
+    return copyAsync("importLibraryAsync", d.base + r.offset, host, bytes,
+                     cudaMemcpyHostToDevice, static_cast<cudaStream_t>(stream), d.status);
 }
 
 bool GpuPhysicsArena::importSlotAsync(int slot, SlotRegion region, const void* host,
@@ -529,8 +533,9 @@ bool GpuPhysicsArena::importSlotAsync(int slot, SlotRegion region, const void* h
         return d.fail("importSlotAsync: slot out of range");
     if (bytes > d.offsets.slotRegionBytes(region))
         return d.fail("importSlotAsync: payload wider than the region");
-    return copyAsync(d.base + d.offsets.slotRegionOffset(slot, region), host, bytes,
-                     cudaMemcpyHostToDevice, static_cast<cudaStream_t>(stream), d.status);
+    return copyAsync("importSlotAsync", d.base + d.offsets.slotRegionOffset(slot, region),
+                     host, bytes, cudaMemcpyHostToDevice,
+                     static_cast<cudaStream_t>(stream), d.status);
 }
 
 bool GpuPhysicsArena::exportSnapshotAsync(int slot, SlotRegion region, void* host,
@@ -541,7 +546,8 @@ bool GpuPhysicsArena::exportSnapshotAsync(int slot, SlotRegion region, void* hos
         return d.fail("exportSnapshotAsync: slot out of range");
     if (bytes > d.offsets.slotRegionBytes(region))
         return d.fail("exportSnapshotAsync: request wider than the region");
-    return copyAsync(host, d.base + d.offsets.slotRegionOffset(slot, region), bytes,
+    return copyAsync("exportSnapshotAsync", host,
+                     d.base + d.offsets.slotRegionOffset(slot, region), bytes,
                      cudaMemcpyDeviceToHost, static_cast<cudaStream_t>(stream), d.status);
 }
 

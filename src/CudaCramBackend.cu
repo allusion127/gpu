@@ -11,6 +11,7 @@
 // being attributable to the one place the header documents.
 
 #include "CudaCramBackend.h"
+#include "XferLedger.h"
 
 #include <cuda_runtime.h>
 
@@ -722,8 +723,12 @@ struct CramBackend::Impl {
         return true;
     }
 
+    /// WP13.1: `name` was already the site's own label for the failure
+    /// message; it is now also its ledger leaf, so every one of the
+    /// seventeen callers gets its own row without a second argument.
     bool h2d(void* d, const void* h, size_t bytes, const char* name) {
-        const cudaError_t rc = cudaMemcpyAsync(d, h, bytes, cudaMemcpyHostToDevice, stream);
+        const cudaError_t rc = rasbery::xfer::memcpyAsync(
+            "CudaCramBackend.cu:h2d", name, d, h, bytes, cudaMemcpyHostToDevice, stream);
         if (rc != cudaSuccess) return fail(name, rc);
         return true;
     }
@@ -893,7 +898,8 @@ bool CramBackend::predictor(const cram::LibView& lib, const cram::PredictorView&
 
     if (s.micx_resident != v.micx_generation) {
         for (int k = 0; k < 4; ++k) {
-            if (!s.h2d(s.d_mic[k], v.mic[kSlot[k]], nmic * sizeof(double), "H2D mic"))
+            if (!s.h2d(s.d_mic[k], v.mic[kSlot[k]], nmic * sizeof(double),
+                       "H2D mic (predictor)"))
                 return false;
             s.n_micx_bytes += nmic * sizeof(double);
         }
@@ -903,9 +909,9 @@ bool CramBackend::predictor(const cram::LibView& lib, const cram::PredictorView&
     // The BOS snapshot the matching corrector will read: a device-to-device copy
     // of the block that is already here, not a second 21 MB trip over the bus.
     for (int k = 0; k < 4; ++k) {
-        const cudaError_t rc = cudaMemcpyAsync(s.d_mic_bos[k], s.d_mic[k],
-                                               nmic * sizeof(double),
-                                               cudaMemcpyDeviceToDevice, s.stream);
+        const cudaError_t rc = rasbery::xfer::memcpyAsync(
+            "CudaCramBackend.cu:predictor", "mic_bos (D2D)", s.d_mic_bos[k], s.d_mic[k],
+            nmic * sizeof(double), cudaMemcpyDeviceToDevice, s.stream);
         if (rc != cudaSuccess) return s.fail("D2D mic_bos", rc);
     }
 
@@ -923,10 +929,13 @@ bool CramBackend::predictor(const cram::LibView& lib, const cram::PredictorView&
     kPredictor<<<blocks, s.block, 0, s.stream>>>(x);
     if ((rc = cudaGetLastError()) != cudaSuccess) return s.fail("kPredictor launch", rc);
 
-    rc = cudaMemcpyAsync(s.h_stats, s.d_stats, 3 * sizeof(unsigned long long),
-                         cudaMemcpyDeviceToHost, s.stream);
+    rc = rasbery::xfer::memcpyAsync("CudaCramBackend.cu:predictor", "stats", s.h_stats,
+                                    s.d_stats, 3 * sizeof(unsigned long long),
+                                    cudaMemcpyDeviceToHost, s.stream);
     if (rc != cudaSuccess) return s.fail("D2H stats", rc);
-    if ((rc = cudaStreamSynchronize(s.stream)) != cudaSuccess) return s.fail("predictor sync", rc);
+    if ((rc = rasbery::xfer::streamSync("CudaCramBackend.cu:predictor", "stats drain",
+                                        s.stream)) != cudaSuccess)
+        return s.fail("predictor sync", rc);
 
     // NOTHING has touched a host array yet.  A node that hit either of milk.h's
     // throw conditions, or produced a non-finite density, makes the entire call
@@ -942,12 +951,16 @@ bool CramBackend::predictor(const cram::LibView& lib, const cram::PredictorView&
     // exact set DepleteNode writes is one copy.
     const size_t off  = static_cast<size_t>(lib.first) * nn;
     const size_t rows = static_cast<size_t>(lib.niso - lib.first) * nn;
-    rc = cudaMemcpyAsync(v.iden + off, s.d_iden_out + off, rows * sizeof(double),
-                         cudaMemcpyDeviceToHost, s.stream);
+    rc = rasbery::xfer::memcpyAsync("CudaCramBackend.cu:predictor", "iden out",
+                                    v.iden + off, s.d_iden_out + off,
+                                    rows * sizeof(double), cudaMemcpyDeviceToHost,
+                                    s.stream);
     if (rc != cudaSuccess) return s.fail("D2H iden", rc);
 
     cudaEventRecord(s.ev_stop, s.stream);
-    if ((rc = cudaStreamSynchronize(s.stream)) != cudaSuccess) return s.fail("predictor final sync", rc);
+    if ((rc = rasbery::xfer::streamSync("CudaCramBackend.cu:predictor", "final drain",
+                                        s.stream)) != cudaSuccess)
+        return s.fail("predictor final sync", rc);
 
     float ms = 0.0f;
     if (cudaEventElapsedTime(&ms, s.ev_start, s.ev_stop) == cudaSuccess)
@@ -996,7 +1009,8 @@ bool CramBackend::corrector(const cram::LibView& lib, const cram::CorrectorView&
 
     if (s.micx_resident != v.micx_generation) {
         for (int k = 0; k < 4; ++k) {
-            if (!s.h2d(s.d_mic[k], v.mic[kSlot[k]], nmic * sizeof(double), "H2D mic"))
+            if (!s.h2d(s.d_mic[k], v.mic[kSlot[k]], nmic * sizeof(double),
+                       "H2D mic (corrector)"))
                 return false;
             s.n_micx_bytes += nmic * sizeof(double);
         }
@@ -1021,10 +1035,13 @@ bool CramBackend::corrector(const cram::LibView& lib, const cram::CorrectorView&
     kCorrector<<<blocks, s.block, 0, s.stream>>>(x);
     if ((rc = cudaGetLastError()) != cudaSuccess) return s.fail("kCorrector launch", rc);
 
-    rc = cudaMemcpyAsync(s.h_stats, s.d_stats, 3 * sizeof(unsigned long long),
-                         cudaMemcpyDeviceToHost, s.stream);
+    rc = rasbery::xfer::memcpyAsync("CudaCramBackend.cu:corrector", "stats", s.h_stats,
+                                    s.d_stats, 3 * sizeof(unsigned long long),
+                                    cudaMemcpyDeviceToHost, s.stream);
     if (rc != cudaSuccess) return s.fail("D2H stats", rc);
-    if ((rc = cudaStreamSynchronize(s.stream)) != cudaSuccess) return s.fail("corrector sync", rc);
+    if ((rc = rasbery::xfer::streamSync("CudaCramBackend.cu:corrector", "stats drain",
+                                        s.stream)) != cudaSuccess)
+        return s.fail("corrector sync", rc);
 
     if (s.h_stats[0] != 0) {
         s.status_text = "declined: node status " + std::to_string(s.h_stats[0]) +
@@ -1034,15 +1051,20 @@ bool CramBackend::corrector(const cram::LibView& lib, const cram::CorrectorView&
 
     const size_t off  = static_cast<size_t>(lib.first) * nn;
     const size_t rows = static_cast<size_t>(lib.niso - lib.first) * nn;
-    rc = cudaMemcpyAsync(v.iden + off, s.d_iden_out + off, rows * sizeof(double),
-                         cudaMemcpyDeviceToHost, s.stream);
+    rc = rasbery::xfer::memcpyAsync("CudaCramBackend.cu:corrector", "iden out",
+                                    v.iden + off, s.d_iden_out + off,
+                                    rows * sizeof(double), cudaMemcpyDeviceToHost,
+                                    s.stream);
     if (rc != cudaSuccess) return s.fail("D2H iden", rc);
-    rc = cudaMemcpyAsync(v.burn, s.d_burn_out, nn * sizeof(int),
-                         cudaMemcpyDeviceToHost, s.stream);
+    rc = rasbery::xfer::memcpyAsync("CudaCramBackend.cu:corrector", "burn out", v.burn,
+                                    s.d_burn_out, nn * sizeof(int),
+                                    cudaMemcpyDeviceToHost, s.stream);
     if (rc != cudaSuccess) return s.fail("D2H burn", rc);
 
     cudaEventRecord(s.ev_stop, s.stream);
-    if ((rc = cudaStreamSynchronize(s.stream)) != cudaSuccess) return s.fail("corrector final sync", rc);
+    if ((rc = rasbery::xfer::streamSync("CudaCramBackend.cu:corrector", "final drain",
+                                        s.stream)) != cudaSuccess)
+        return s.fail("corrector final sync", rc);
 
     float ms = 0.0f;
     if (cudaEventElapsedTime(&ms, s.ev_start, s.ev_stop) == cudaSuccess)

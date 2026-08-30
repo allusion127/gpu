@@ -1110,6 +1110,10 @@ int main(int argc, char* argv[]) {
             rasbery::xfer::appendXferReceiptFields(std::cout);
             std::cout << "}" << std::endl;
         }
+        // WP13.1: the per-site breakdown, and nothing at all unless
+        // RASBERY_XFER_LEDGER is set.  It follows the aggregate so a reader
+        // meets the totals first and the 200-row table second.
+        rasbery::xfer::printLedgerReceipt(std::cout);
         if (rasbery::rasberyGpuXeEnabled()) {
             std::cout << "[RASBERY][XE_GPU] {";
             rasbery::xe::appendXeGpuReceiptFields(std::cout);
@@ -1377,6 +1381,10 @@ int main(int argc, char* argv[]) {
             rasbery::xfer::appendXferReceiptFields(std::cout);
             std::cout << "}" << std::endl;
         }
+        // WP13.1: the per-site breakdown, and nothing at all unless
+        // RASBERY_XFER_LEDGER is set.  It follows the aggregate so a reader
+        // meets the totals first and the 200-row table second.
+        rasbery::xfer::printLedgerReceipt(std::cout);
         // Rev.7.1 Task 13.  device_updates == 0 with the flag set means the arm
         // never ran and every A/B measured against this run is void (G0); the
         // node counts are the same claim at fuel-node granularity.
@@ -1516,6 +1524,7 @@ int main(int argc, char* argv[]) {
         rasbery::xfer::appendXferReceiptFields(std::cout);
         std::cout << "}" << std::endl;
     }
+    rasbery::xfer::printLedgerReceipt(std::cout);
     // See the batch arm above: the Task 13 device Xe receipt, same fields.
     if (rasbery::rasberyGpuXeEnabled()) {
         std::cout << "[RASBERY][XE_GPU] {";

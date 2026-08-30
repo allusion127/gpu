@@ -112,6 +112,7 @@
 #include "GpuOuterWhile.h"
 #include "GpuPhysicsArena.h"
 #include "OuterTrace.h"
+#include "XferLedger.h"
 
 #include <cuda_runtime.h>
 
@@ -1017,7 +1018,7 @@ bool CudaOuterSegment::bindResidency(const OuterSegmentResidency& residency) {
         // APIs in this tree and it is on the arming path of every deck, so it
         // gets the window like the allocations do (Task 18d).
         rasbery::AllocWindow _alloc_window("outer.bind.device_sync");
-        rc = cudaDeviceSynchronize();
+        rc = rasbery::xfer::deviceSync("CudaOuterGraph.cu:bindResidency", "device drain");
     }
     if (rc != cudaSuccess) {
         _impl->status = std::string("bind residency: ") + cudaGetErrorString(rc);
@@ -1044,10 +1045,12 @@ bool CudaOuterSegment::bindResidency(const OuterSegmentResidency& residency) {
         static_cast<std::size_t>(_impl->binding.ng) * sizeof(double);
     const std::size_t seed_psi_bytes =
         static_cast<std::size_t>(_impl->binding.nxyz) * sizeof(double);
-    if ((rc = cudaMemcpy(residency.dhat, residency.host_dhat, seed_dhat_bytes,
-                         cudaMemcpyHostToDevice)) != cudaSuccess ||
-        (rc = cudaMemcpy(residency.psi, residency.host_psi, seed_psi_bytes,
-                         cudaMemcpyHostToDevice)) != cudaSuccess) {
+    if ((rc = rasbery::xfer::memcpy("CudaOuterGraph.cu:bindResidency", "seed dhat",
+                            residency.dhat, residency.host_dhat, seed_dhat_bytes,
+                            cudaMemcpyHostToDevice)) != cudaSuccess ||
+        (rc = rasbery::xfer::memcpy("CudaOuterGraph.cu:bindResidency", "seed psi",
+                            residency.psi, residency.host_psi, seed_psi_bytes,
+                            cudaMemcpyHostToDevice)) != cudaSuccess) {
         _impl->status = std::string("seed residency: ") + cudaGetErrorString(rc);
         return false;
     }
@@ -1155,14 +1158,17 @@ bool CudaOuterSegment::publishProbe(int slot, double eigv, double residual,
     // believed it was getting.
     cudaStream_t stream = _impl->stream;
     if (stream == nullptr) {
-        const cudaError_t rc = cudaMemcpy(_impl->d_probes + slot, &probe, sizeof(probe),
-                                          cudaMemcpyHostToDevice);
+        const cudaError_t rc =
+            rasbery::xfer::memcpy("CudaOuterGraph.cu:publishProbe", "probe (streamless)",
+                           _impl->d_probes + slot, &probe, sizeof(probe),
+                           cudaMemcpyHostToDevice);
         return rc == cudaSuccess;
     }
-    cudaError_t rc = cudaMemcpyAsync(_impl->d_probes + slot, &probe, sizeof(probe),
-                                     cudaMemcpyHostToDevice, stream);
+    cudaError_t rc = rasbery::xfer::memcpyAsync("CudaOuterGraph.cu:publishProbe", "probe",
+                                         _impl->d_probes + slot, &probe, sizeof(probe),
+                                         cudaMemcpyHostToDevice, stream);
     if (rc != cudaSuccess) return false;
-    rc = cudaStreamSynchronize(stream);
+    rc = rasbery::xfer::streamSync("CudaOuterGraph.cu:publishProbe", "probe drain", stream);
     return rc == cudaSuccess;
 }
 
@@ -1184,14 +1190,17 @@ bool CudaOuterSegment::republishAfterHostSweep(int slot, double eigv, double res
     const std::uint32_t clear = 0u;
     cudaStream_t        stream = _impl->stream;
     if (stream == nullptr) {
-        const cudaError_t rc =
-            cudaMemcpy(_impl->d_halt + slot, &clear, sizeof(clear), cudaMemcpyHostToDevice);
+        const cudaError_t rc = rasbery::xfer::memcpy(
+            "CudaOuterGraph.cu:republishAfterHostSweep", "halt (streamless)",
+            _impl->d_halt + slot, &clear, sizeof(clear), cudaMemcpyHostToDevice);
         return rc == cudaSuccess;
     }
-    cudaError_t rc = cudaMemcpyAsync(_impl->d_halt + slot, &clear, sizeof(clear),
-                                     cudaMemcpyHostToDevice, stream);
+    cudaError_t rc = rasbery::xfer::memcpyAsync("CudaOuterGraph.cu:republishAfterHostSweep",
+                                         "halt", _impl->d_halt + slot, &clear,
+                                         sizeof(clear), cudaMemcpyHostToDevice, stream);
     if (rc != cudaSuccess) return false;
-    rc = cudaStreamSynchronize(stream);
+    rc = rasbery::xfer::streamSync("CudaOuterGraph.cu:republishAfterHostSweep", "halt drain",
+                            stream);
     return rc == cudaSuccess;
 }
 
@@ -1210,7 +1219,8 @@ bool rasberyPublishOuterProbe(int slot, double eigv, double residual, bool negat
 
 bool rasberySyncSegmentStream(OuterSegmentStream stream) {
     if (stream == nullptr) return true;
-    const cudaError_t rc = cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
+    const cudaError_t rc = rasbery::xfer::streamSync("CudaOuterGraph.cu:rasberySyncSegmentStream",
+                                              "segment", static_cast<cudaStream_t>(stream));
     if (rc != cudaSuccess) {
         cudaGetLastError();
         return false;
@@ -1394,11 +1404,13 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                 static_cast<std::size_t>(bound_.geom.nsurf) *
                 static_cast<std::size_t>(bound_.ng) * sizeof(double);
             if (bound_.host_jnet != nullptr && bound_.device_jnet != nullptr)
-                cudaMemcpy(bound_.host_jnet, bound_.device_jnet, surf_bytes,
-                           cudaMemcpyDeviceToHost);
+                rasbery::xfer::memcpy("CudaOuterGraph.cu:releaseCanonicalNodal", "jnet",
+                               bound_.host_jnet, bound_.device_jnet, surf_bytes,
+                               cudaMemcpyDeviceToHost);
             if (bound_.host_phis != nullptr && bound_.device_phis != nullptr)
-                cudaMemcpy(bound_.host_phis, bound_.device_phis, surf_bytes,
-                           cudaMemcpyDeviceToHost);
+                rasbery::xfer::memcpy("CudaOuterGraph.cu:releaseCanonicalNodal", "phis",
+                               bound_.host_phis, bound_.device_phis, surf_bytes,
+                               cudaMemcpyDeviceToHost);
             cudaGetLastError();
         }
         if (m.hooks.canonical_nodal_mode != nullptr)
@@ -1476,8 +1488,9 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
             return true;
         }
         const std::size_t xsnf_bytes = xsnf_count * sizeof(double);
-        const cudaError_t r = cudaMemcpyAsync(bound_.device_xsnf, bound_.host_xsnf,
-                                              xsnf_bytes, cudaMemcpyHostToDevice, m.stream);
+        const cudaError_t r = rasbery::xfer::memcpyAsync(
+            "CudaOuterGraph.cu:stageXsnf", "xsnf", bound_.device_xsnf, bound_.host_xsnf,
+            xsnf_bytes, cudaMemcpyHostToDevice, m.stream);
         if (r != cudaSuccess) return launchFailed("upload xsnf", r);
         bump(counters().flux_sync_bytes, xsnf_bytes);
         // COMMITTED AT THE ISSUE.  The general rule (CudaTransferMirror.h) is to
@@ -1503,8 +1516,9 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         }
         const std::size_t dtil_bytes = static_cast<std::size_t>(bound_.geom.nsurf) *
                                        static_cast<std::size_t>(bound_.ng) * sizeof(double);
-        const cudaError_t r = cudaMemcpyAsync(bound_.device_dtil, bound_.host_dtil,
-                                              dtil_bytes, cudaMemcpyHostToDevice, m.stream);
+        const cudaError_t r = rasbery::xfer::memcpyAsync(
+            "CudaOuterGraph.cu:stageDtil", "dtil", bound_.device_dtil, bound_.host_dtil,
+            dtil_bytes, cudaMemcpyHostToDevice, m.stream);
         if (r != cudaSuccess) return launchFailed("upload dtil", r);
         bump(counters().flux_sync_bytes, dtil_bytes);
         m.resident_dtil_generation = live.dtil_generation;
@@ -1517,24 +1531,30 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     // first D2H is what stops a converged segment's exit from breaking the NEXT
     // segment out at its second outer.
     if (m.h_seg != nullptr) *m.h_seg = seg;
-    if ((rc = cudaMemcpyAsync(m.d_segments + slot, &seg, sizeof(seg), cudaMemcpyHostToDevice,
-                              m.stream)) != cudaSuccess)
+    if ((rc = rasbery::xfer::memcpyAsync("CudaOuterGraph.cu:runSegment", "segment state",
+                                  m.d_segments + slot, &seg, sizeof(seg),
+                                  cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
         return launchFailed("upload segment state", rc);
-    if ((rc = cudaMemcpyAsync(m.d_probes + slot, &probe, sizeof(probe), cudaMemcpyHostToDevice,
-                              m.stream)) != cudaSuccess)
+    if ((rc = rasbery::xfer::memcpyAsync("CudaOuterGraph.cu:runSegment", "probe",
+                                  m.d_probes + slot, &probe, sizeof(probe),
+                                  cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
         return launchFailed("upload probe", rc);
-    if ((rc = cudaMemcpyAsync(m.d_halt + slot, &clear_halt, sizeof(clear_halt),
-                              cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
+    if ((rc = rasbery::xfer::memcpyAsync("CudaOuterGraph.cu:runSegment", "halt clear",
+                                  m.d_halt + slot, &clear_halt, sizeof(clear_halt),
+                                  cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
         return launchFailed("clear halt", rc);
-    if ((rc = cudaMemcpyAsync(m.d_inputs + slot, &inputs, sizeof(inputs),
-                              cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
+    if ((rc = rasbery::xfer::memcpyAsync("CudaOuterGraph.cu:runSegment", "outer inputs",
+                                  m.d_inputs + slot, &inputs, sizeof(inputs),
+                                  cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
         return launchFailed("upload outer inputs", rc);
 
     // prev_inner lives in DeviceSlotState::previous_eigv and the convergence
     // body reads it through cmfdLoadOuterState.  The host owns it BETWEEN
     // segments (Driver.h's `prev_inner` local); inside one, the device does.
-    if ((rc = cudaMemcpyAsync(&m.arena.states[slot].previous_eigv, &scalars.prev_inner,
-                              sizeof(double), cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
+    if ((rc = rasbery::xfer::memcpyAsync("CudaOuterGraph.cu:runSegment", "prev_inner",
+                                  &m.arena.states[slot].previous_eigv,
+                                  &scalars.prev_inner, sizeof(double),
+                                  cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
         return launchFailed("upload prev_inner", rc);
 
     // flux_stall lives in DeviceSlotState::flux_stall and is read through the
@@ -1544,9 +1564,10 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     // segment's leftovers and could not stop at the outer the host's
     // limit-cycle test would have stopped at -- so a budget-8 segment ran up to
     // eight times as far past a stalling trial point as the host ever would.
-    if ((rc = cudaMemcpyAsync(&m.arena.states[slot].flux_stall, &scalars.flux_stall,
-                              sizeof(std::uint32_t), cudaMemcpyHostToDevice, m.stream)) !=
-        cudaSuccess)
+    if ((rc = rasbery::xfer::memcpyAsync("CudaOuterGraph.cu:runSegment", "flux_stall",
+                                  &m.arena.states[slot].flux_stall, &scalars.flux_stall,
+                                  sizeof(std::uint32_t), cudaMemcpyHostToDevice,
+                                  m.stream)) != cudaSuccess)
         return launchFailed("upload flux_stall", rc);
 
     // --- the staged operator uploads, once -----------------------------------
@@ -1627,10 +1648,12 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     const bool trace_steps = outertrace::active();
     auto traceHash = [&](const double* dev, std::size_t n) -> std::uint64_t {
         if (dev == nullptr || n == 0) return 0ull;
-        if (cudaStreamSynchronize(m.stream) != cudaSuccess) { cudaGetLastError(); return 0ull; }
+        if (rasbery::xfer::streamSync("CudaOuterGraph.cu:traceHash", "drain", m.stream) !=
+            cudaSuccess) { cudaGetLastError(); return 0ull; }
         if (m.trace_scratch.size() < n) m.trace_scratch.resize(n);
-        if (cudaMemcpy(m.trace_scratch.data(), dev, n * sizeof(double),
-                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+        if (rasbery::xfer::memcpy("CudaOuterGraph.cu:traceHash", "scratch",
+                           m.trace_scratch.data(), dev, n * sizeof(double),
+                           cudaMemcpyDeviceToHost) != cudaSuccess) {
             cudaGetLastError();
             return 0ull;
         }
@@ -1645,8 +1668,10 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     /// `eigv` local, and the probe is where the sweep's verdict kernel wrote it.
     auto traceProbeEigv = [&]() -> double {
         DeviceOuterProbe p{};
-        if (cudaStreamSynchronize(m.stream) != cudaSuccess) { cudaGetLastError(); return 0.0; }
-        if (cudaMemcpy(&p, m.d_probes + slot, sizeof(p), cudaMemcpyDeviceToHost) !=
+        if (rasbery::xfer::streamSync("CudaOuterGraph.cu:traceProbeEigv", "drain", m.stream) !=
+            cudaSuccess) { cudaGetLastError(); return 0.0; }
+        if (rasbery::xfer::memcpy("CudaOuterGraph.cu:traceProbeEigv", "probe", &p,
+                           m.d_probes + slot, sizeof(p), cudaMemcpyDeviceToHost) !=
             cudaSuccess) {
             cudaGetLastError();
             return 0.0;
@@ -1821,8 +1846,10 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                 // a HOST array, so it has to have landed before that call, not
                 // merely been enqueued.
                 if (bridge_jnet &&
-                    (rc = cudaMemcpyAsync(bound_.host_jnet, bound_.device_jnet, jnet_bytes,
-                                          cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+                    (rc = rasbery::xfer::memcpyAsync(
+                         "CudaOuterGraph.cu:runOuterTail", "jnet re-download",
+                         bound_.host_jnet, bound_.device_jnet, jnet_bytes,
+                         cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
                     return launchFailed("re-download jnet after the host finished the sweep", rc);
                 // AND SO DOES THE RECIPROCAL, FOR THE SAME REASON AND ONE MORE.
                 // The kernel above the sweep read the probe the VERDICT kernel
@@ -1844,7 +1871,9 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                 // one by nothing but this synchronise.
                 bump(counters().in_body_host_syncs);
                 bump(counters().sync_sweep_reissue);
-                if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
+                if ((rc = rasbery::xfer::streamSync("CudaOuterGraph.cu:runOuterTail",
+                                            "updjnet reissue drain", m.stream)) !=
+                    cudaSuccess)
                     return launchFailed("synchronize after the re-issued updjnet", rc);
             }
 
@@ -2065,8 +2094,10 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                     const std::size_t dtil_bytes =
                         static_cast<std::size_t>(bound_.geom.nsurf) *
                         static_cast<std::size_t>(bound_.ng) * sizeof(double);
-                    if ((rc = cudaMemcpyAsync(bound_.device_dtil, bound_.host_dtil, dtil_bytes,
-                                              cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
+                    if ((rc = rasbery::xfer::memcpyAsync(
+                             "CudaOuterGraph.cu:runOuterTail", "dtil after cusping",
+                             bound_.device_dtil, bound_.host_dtil, dtil_bytes,
+                             cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
                         return launchFailed("re-upload dtil after cusping", rc);
                     bump(counters().cusping_dtil_bytes, dtil_bytes);
                     // upddtil() bumped the generation; the re-upload above made the
@@ -2097,8 +2128,10 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
             }
 
             if (bridge_jnet) {
-                if ((rc = cudaMemcpyAsync(bound_.device_jnet, bound_.host_jnet, jnet_bytes,
-                                          cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
+                if ((rc = rasbery::xfer::memcpyAsync(
+                         "CudaOuterGraph.cu:runOuterTail", "jnet bridge upload",
+                         bound_.device_jnet, bound_.host_jnet, jnet_bytes,
+                         cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
                     return launchFailed("upload jnet after the nodal drive", rc);
                 bump(counters().jnet_bridge_bytes, jnet_bytes);
             }
@@ -2145,8 +2178,10 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
             // The exit word, straight behind the transition that writes it, so the
             // NEXT pass's synchronise makes it visible without one of its own.
             if (m.h_seg != nullptr &&
-                (rc = cudaMemcpyAsync(m.h_seg, m.d_segments + slot, sizeof(*m.h_seg),
-                                      cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+                (rc = rasbery::xfer::memcpyAsync(
+                     "CudaOuterGraph.cu:runOuterTail", "segment exit word", m.h_seg,
+                     m.d_segments + slot, sizeof(*m.h_seg), cudaMemcpyDeviceToHost,
+                     m.stream)) != cudaSuccess)
                 return launchFailed("download segment exit", rc);
         return true;
     };
@@ -2380,8 +2415,10 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
             const std::size_t flux_bytes =
                 static_cast<std::size_t>(bound_.nxyz) *
                 static_cast<std::size_t>(bound_.ng) * sizeof(double);
-            if ((rc = cudaMemcpyAsync(m.residency.flux, bound_.host_flux, flux_bytes,
-                                      cudaMemcpyHostToDevice, m.stream)) != cudaSuccess)
+            if ((rc = rasbery::xfer::memcpyAsync(
+                     "CudaOuterGraph.cu:runOneOuter", "flux upload", m.residency.flux,
+                     bound_.host_flux, flux_bytes, cudaMemcpyHostToDevice, m.stream)) !=
+                cudaSuccess)
                 return launchFailed("upload flux", rc);
             bump(counters().flux_sync_bytes, flux_bytes);
         }
@@ -2418,16 +2455,20 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
             const std::size_t dhat_bytes =
                 static_cast<std::size_t>(bound_.geom.nsurf) *
                 static_cast<std::size_t>(bound_.ng) * sizeof(double);
-            if ((rc = cudaMemcpyAsync(bound_.host_dhat, bound_.device_dhat, dhat_bytes,
-                                      cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+            if ((rc = rasbery::xfer::memcpyAsync(
+                     "CudaOuterGraph.cu:runOneOuter", "dhat mirror", bound_.host_dhat,
+                     bound_.device_dhat, dhat_bytes, cudaMemcpyDeviceToHost, m.stream)) !=
+                cudaSuccess)
                 return launchFailed("mirror dhat to the host", rc);
             bump(counters().host_mirror_bytes, dhat_bytes);
         }
         if (host_reader_next && bound_.host_psi != nullptr && bound_.device_psi != nullptr) {
             const std::size_t psi_bytes =
                 static_cast<std::size_t>(bound_.nxyz) * sizeof(double);
-            if ((rc = cudaMemcpyAsync(bound_.host_psi, bound_.device_psi, psi_bytes,
-                                      cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+            if ((rc = rasbery::xfer::memcpyAsync(
+                     "CudaOuterGraph.cu:runOneOuter", "psi mirror", bound_.host_psi,
+                     bound_.device_psi, psi_bytes, cudaMemcpyDeviceToHost, m.stream)) !=
+                cudaSuccess)
                 return launchFailed("mirror psi to the host", rc);
             bump(counters().host_mirror_bytes, psi_bytes);
         }
@@ -2471,7 +2512,8 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         if (!stream_sweep || host_reader_next) {
             bump(counters().in_body_host_syncs);
             bump(counters().sync_mirror_drain);
-            if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
+            if ((rc = rasbery::xfer::streamSync("CudaOuterGraph.cu:runOneOuter",
+                                        "pre-sweep drain", m.stream)) != cudaSuccess)
                 return launchFailed("synchronize before the CMFD sweep", rc);
         }
 
@@ -2555,8 +2597,10 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         if (bridge_jnet) {
             jnet_bytes = static_cast<std::size_t>(bound_.geom.nsurf) *
                          static_cast<std::size_t>(bound_.ng) * sizeof(double);
-            if ((rc = cudaMemcpyAsync(bound_.host_jnet, bound_.device_jnet, jnet_bytes,
-                                      cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+            if ((rc = rasbery::xfer::memcpyAsync(
+                     "CudaOuterGraph.cu:runOneOuter", "jnet bridge download",
+                     bound_.host_jnet, bound_.device_jnet, jnet_bytes,
+                     cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
                 return launchFailed("download jnet for the nodal drive", rc);
             bump(counters().jnet_bridge_bytes, jnet_bytes);
         }
@@ -2573,7 +2617,8 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         if (!hostfree) {
             bump(counters().in_body_host_syncs);
             bump(counters().sync_pre_nodal);
-            if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
+            if ((rc = rasbery::xfer::streamSync("CudaOuterGraph.cu:runOneOuter",
+                                        "pre-nodal drain", m.stream)) != cudaSuccess)
                 return launchFailed("synchronize before the nodal drive", rc);
         }
 
@@ -2815,7 +2860,8 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         if (i > 0 && (!hostfree || keep_exit_obs)) {
             bump(counters().in_body_host_syncs);
             bump(counters().sync_exit_observation);
-            if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
+            if ((rc = rasbery::xfer::streamSync("CudaOuterGraph.cu:runSegment",
+                                        "exit observation", m.stream)) != cudaSuccess)
                 return launchFailed("synchronize on the segment exit", rc);
             if (m.h_seg != nullptr && m.h_seg->exit != 0u) break;
         }
@@ -2841,13 +2887,15 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     // whether an abandoned outer still owes its tail.
     if (hostfree) {
         if (m.h_sweep_accum != nullptr && m.d_sweep_accum != nullptr) {
-            if ((rc = cudaMemcpyAsync(m.h_sweep_accum, m.d_sweep_accum + slot,
-                                      sizeof(*m.h_sweep_accum), cudaMemcpyDeviceToHost,
-                                      m.stream)) != cudaSuccess)
+            if ((rc = rasbery::xfer::memcpyAsync(
+                     "CudaOuterGraph.cu:runSegment", "sweep accumulator",
+                     m.h_sweep_accum, m.d_sweep_accum + slot, sizeof(*m.h_sweep_accum),
+                     cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
                 return launchFailed("download the sweep accumulator", rc);
         }
         bump(counters().sync_hostfree_exit);
-        if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
+        if ((rc = rasbery::xfer::streamSync("CudaOuterGraph.cu:runSegment", "host-free exit",
+                                    m.stream)) != cudaSuccess)
             return launchFailed("synchronize on the host-free segment exit", rc);
         m.sweep_host_continued = false;
         if (!m.hooks.finish_cmfd_sweep_deferred(m.hooks.ctx, m.h_sweep_accum, slot))
@@ -2920,11 +2968,15 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         const std::size_t psi_bytes = static_cast<std::size_t>(bound_.nxyz) * sizeof(double);
         const std::size_t dhat_bytes = static_cast<std::size_t>(bound_.geom.nsurf) *
                                        static_cast<std::size_t>(bound_.ng) * sizeof(double);
-        if ((rc = cudaMemcpyAsync(bound_.host_psi, bound_.device_psi, psi_bytes,
-                                  cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+        if ((rc = rasbery::xfer::memcpyAsync(
+                 "CudaOuterGraph.cu:runSegment", "psi exit mirror", bound_.host_psi,
+                 bound_.device_psi, psi_bytes, cudaMemcpyDeviceToHost, m.stream)) !=
+            cudaSuccess)
             return launchFailed("mirror psi to the host at the segment exit", rc);
-        if ((rc = cudaMemcpyAsync(bound_.host_dhat, bound_.device_dhat, dhat_bytes,
-                                  cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+        if ((rc = rasbery::xfer::memcpyAsync(
+                 "CudaOuterGraph.cu:runSegment", "dhat exit mirror", bound_.host_dhat,
+                 bound_.device_dhat, dhat_bytes, cudaMemcpyDeviceToHost, m.stream)) !=
+            cudaSuccess)
             return launchFailed("mirror dhat to the host at the segment exit", rc);
         bump(counters().host_mirror_bytes, mirrorPairBytes(bound_));
         bump(counters().mirror_exits);
@@ -2960,14 +3012,18 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         const std::size_t surf_bytes = static_cast<std::size_t>(bound_.geom.nsurf) *
                                        static_cast<std::size_t>(bound_.ng) * sizeof(double);
         if (bound_.host_jnet != nullptr && bound_.device_jnet != nullptr) {
-            if ((rc = cudaMemcpyAsync(bound_.host_jnet, bound_.device_jnet, surf_bytes,
-                                      cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+            if ((rc = rasbery::xfer::memcpyAsync(
+                     "CudaOuterGraph.cu:runSegment", "jnet exit mirror", bound_.host_jnet,
+                     bound_.device_jnet, surf_bytes, cudaMemcpyDeviceToHost, m.stream)) !=
+                cudaSuccess)
                 return launchFailed("mirror jnet to the host at the segment exit", rc);
             bump(counters().jnet_mirror_bytes, surf_bytes);
         }
         if (bound_.host_phis != nullptr && bound_.device_phis != nullptr) {
-            if ((rc = cudaMemcpyAsync(bound_.host_phis, bound_.device_phis, surf_bytes,
-                                      cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+            if ((rc = rasbery::xfer::memcpyAsync(
+                     "CudaOuterGraph.cu:runSegment", "phis exit mirror", bound_.host_phis,
+                     bound_.device_phis, surf_bytes, cudaMemcpyDeviceToHost, m.stream)) !=
+                cudaSuccess)
                 return launchFailed("mirror phis to the host at the segment exit", rc);
             bump(counters().phis_mirror_bytes, surf_bytes);
         }
@@ -2991,9 +3047,10 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     // necessarily the one that installed it.
     {
         const std::uint32_t clear_exit_halt = 0u;
-        if ((rc = cudaMemcpyAsync(m.d_halt + slot, &clear_exit_halt,
-                                  sizeof(clear_exit_halt), cudaMemcpyHostToDevice,
-                                  m.stream)) != cudaSuccess)
+        if ((rc = rasbery::xfer::memcpyAsync(
+                 "CudaOuterGraph.cu:runSegment", "exit halt clear", m.d_halt + slot,
+                 &clear_exit_halt, sizeof(clear_exit_halt), cudaMemcpyHostToDevice,
+                 m.stream)) != cudaSuccess)
             return launchFailed("clear the halt at the segment exit", rc);
     }
 
@@ -3002,23 +3059,29 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
     DeviceSlotState         state_out{};
     unsigned long long      halted_out = 0;
     CmfdOuterDecision       decision_out{};
-    if ((rc = cudaMemcpyAsync(&seg_out, m.d_segments + slot, sizeof(seg_out),
-                              cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+    if ((rc = rasbery::xfer::memcpyAsync("CudaOuterGraph.cu:runSegment", "exit segment state",
+                                  &seg_out, m.d_segments + slot, sizeof(seg_out),
+                                  cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
         return launchFailed("download segment state", rc);
-    if ((rc = cudaMemcpyAsync(&state_out, m.arena.states + slot, sizeof(state_out),
-                              cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+    if ((rc = rasbery::xfer::memcpyAsync("CudaOuterGraph.cu:runSegment", "exit slot state",
+                                  &state_out, m.arena.states + slot, sizeof(state_out),
+                                  cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
         return launchFailed("download slot state", rc);
-    if ((rc = cudaMemcpyAsync(&halted_out, m.d_halted, sizeof(halted_out),
-                              cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+    if ((rc = rasbery::xfer::memcpyAsync("CudaOuterGraph.cu:runSegment", "exit halted count",
+                                  &halted_out, m.d_halted, sizeof(halted_out),
+                                  cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
         return launchFailed("download halted count", rc);
     // The decision, for SolveLoop's ladder.  It rides the SAME observation as
     // the other three -- one more 24-byte copy on a stream that is about to be
     // synchronised anyway -- rather than becoming a second rendezvous.
-    if ((rc = cudaMemcpyAsync(&decision_out, m.d_decisions + slot, sizeof(decision_out),
-                              cudaMemcpyDeviceToHost, m.stream)) != cudaSuccess)
+    if ((rc = rasbery::xfer::memcpyAsync("CudaOuterGraph.cu:runSegment", "exit decision",
+                                  &decision_out, m.d_decisions + slot,
+                                  sizeof(decision_out), cudaMemcpyDeviceToHost,
+                                  m.stream)) != cudaSuccess)
         return launchFailed("download outer decision", rc);
     bump(counters().sync_segment_exit);
-    if ((rc = cudaStreamSynchronize(m.stream)) != cudaSuccess)
+    if ((rc = rasbery::xfer::streamSync("CudaOuterGraph.cu:runSegment", "exit drain",
+                                m.stream)) != cudaSuccess)
         return launchFailed("segment synchronize", rc);
 
     // THE RELEASE RIDES THE SYNC THAT JUST HAPPENED, which is the whole reason it
@@ -3288,8 +3351,9 @@ bool rasberyStandUpOuterSegment(const OuterSegmentDeck& deck, std::ostream& rece
     std::vector<DeviceSlotView> host_views(static_cast<std::size_t>(n));
     for (int i = 0; i < n; ++i)
         host_views[static_cast<std::size_t>(i)] = outerArena().slotView(i);
-    if ((rc = cudaMemcpy(t.slot_views, host_views.data(), sizeof(DeviceSlotView) * n,
-                         cudaMemcpyHostToDevice)) != cudaSuccess)
+    if ((rc = rasbery::xfer::memcpy("CudaOuterGraph.cu:rasberyStandUpOuterSegment", "slot_views",
+                            t.slot_views, host_views.data(), sizeof(DeviceSlotView) * n,
+                            cudaMemcpyHostToDevice)) != cudaSuccess)
         return fail("upload slot_views");
 
     // The four control arrays are DENSE and below slot_base, so slot 0's
@@ -3330,7 +3394,9 @@ bool rasberyStandUpOuterSegment(const OuterSegmentDeck& deck, std::ostream& rece
         k_outer_seed_slot<<<1, 1>>>(arena, i, seed_generation);
         if ((rc = cudaGetLastError()) != cudaSuccess) return fail("seed slot state");
     }
-    if ((rc = cudaDeviceSynchronize()) != cudaSuccess) return fail("stand-up synchronize");
+    if ((rc = rasbery::xfer::deviceSync("CudaOuterGraph.cu:rasberyStandUpOuterSegment",
+                                "stand-up")) != cudaSuccess)
+        return fail("stand-up synchronize");
 
     // --- 6. hand it to the runners -------------------------------------------
     //

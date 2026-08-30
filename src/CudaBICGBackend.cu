@@ -3232,28 +3232,34 @@ public:
 
             const size_t S = static_cast<size_t>(slots);
             allocate(reinterpret_cast<void**>(&neighbors), host_neighbors.size() * sizeof(int));
-            CUDA_CHECK(cudaMemcpy(neighbors,
+            CUDA_CHECK(rasbery::xfer::memcpy("CudaBICGBackend.cu:BatchCore::init", "neighbors", neighbors,
                                   host_neighbors.data(),
                                   host_neighbors.size() * sizeof(int),
                                   cudaMemcpyHostToDevice));
             allocate(reinterpret_cast<void**>(&colors), host_colors.size() * sizeof(int));
-            CUDA_CHECK(cudaMemcpy(colors,
+            CUDA_CHECK(rasbery::xfer::memcpy("CudaBICGBackend.cu:BatchCore::init", "colors", colors,
                                   host_colors.data(),
                                   host_colors.size() * sizeof(int),
                                   cudaMemcpyHostToDevice));
             allocate(reinterpret_cast<void**>(&assembly_node_surface),
                      host_node_surface.size() * sizeof(int));
-            CUDA_CHECK(cudaMemcpy(assembly_node_surface, host_node_surface.data(),
+            CUDA_CHECK(rasbery::xfer::memcpy("CudaBICGBackend.cu:BatchCore::init",
+                                  "assembly_node_surface", assembly_node_surface,
+                                  host_node_surface.data(),
                                   host_node_surface.size() * sizeof(int),
                                   cudaMemcpyHostToDevice));
             allocate(reinterpret_cast<void**>(&assembly_face_area),
                      host_face_area.size() * sizeof(double));
-            CUDA_CHECK(cudaMemcpy(assembly_face_area, host_face_area.data(),
+            CUDA_CHECK(rasbery::xfer::memcpy("CudaBICGBackend.cu:BatchCore::init",
+                                  "assembly_face_area", assembly_face_area,
+                                  host_face_area.data(),
                                   host_face_area.size() * sizeof(double),
                                   cudaMemcpyHostToDevice));
             allocate(reinterpret_cast<void**>(&assembly_volume),
                      host_geometry_volume.size() * sizeof(double));
-            CUDA_CHECK(cudaMemcpy(assembly_volume, host_geometry_volume.data(),
+            CUDA_CHECK(rasbery::xfer::memcpy("CudaBICGBackend.cu:BatchCore::init",
+                                  "assembly_volume", assembly_volume,
+                                  host_geometry_volume.data(),
                                   host_geometry_volume.size() * sizeof(double),
                                   cudaMemcpyHostToDevice));
             allocate(reinterpret_cast<void**>(&diag), S * matrix_count * sizeof(double));
@@ -3404,8 +3410,9 @@ public:
                                       SL * sizeof(int)));
             for (std::size_t i = 0; i < SL; ++i)
                 h_slot_map[i] = static_cast<int>(i % S);
-            CUDA_CHECK(cudaMemcpy(d_slot_map, stageSlotMap(), S * sizeof(int),
-                                  cudaMemcpyHostToDevice));
+            CUDA_CHECK(rasbery::xfer::memcpy("CudaBICGBackend.cu:BatchCore::init",
+                                  "d_slot_map seed", d_slot_map, stageSlotMap(),
+                                  S * sizeof(int), cudaMemcpyHostToDevice));
             lanes = slots;
 
             CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -3732,7 +3739,7 @@ public:
     // them would be comparing against a buffer some other lane is about to
     // rewrite.  These shadows are ordinary heap vectors owned by the core.
     template <class T>
-    void pushDeviceReadOnly(T* dst, const T* src, size_t count,
+    void pushDeviceReadOnly(const char* leaf, T* dst, const T* src, size_t count,
                             std::vector<T>& shadow) {
         const size_t bytes = count * sizeof(T);
         if (rasbery::xfer::elideEnabled()) {
@@ -3741,8 +3748,8 @@ public:
             rasbery::xfer::countElisionTest(hit, bytes);
             if (hit) return;
         }
-        CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream));
-        rasbery::xfer::countH2D(bytes);
+        CUDA_CHECK(rasbery::xfer::memcpyAsync("CudaBICGBackend.cu:pushDeviceReadOnly", leaf,
+                                       dst, src, bytes, cudaMemcpyHostToDevice, stream));
         if (rasbery::xfer::elideEnabled()) {
             shadow.assign(src, src + count);
         }
@@ -3783,7 +3790,8 @@ public:
         // slot_map` at every one of the ~50 kernel signatures that take it
         // (RASBERY_CMFD_SLOT_ARGS), so nothing on the device writes it and a
         // shadow of what the host last sent IS what the device holds.
-        pushDeviceReadOnly(d_slot_map, map, static_cast<size_t>(slots), shadow_slot_map);
+        pushDeviceReadOnly("buildSlotMap:d_slot_map", d_slot_map, map,
+                           static_cast<size_t>(slots), shadow_slot_map);
         g_cmfd_logical_drives.fetch_add(static_cast<unsigned long long>(count),
                                         std::memory_order_relaxed);
         g_cmfd_physical_blocks.fetch_add(static_cast<unsigned long long>(count),
@@ -3807,8 +3815,8 @@ public:
         // device no longer holds and the next sweep launch would elide against
         // it.  (This arm is dead under RASBERY_GPU_CMFD_SWEEP, which is why it
         // would never have shown up in a PROD A/B.)
-        pushDeviceReadOnly(device_active, active, static_cast<size_t>(slots),
-                           shadow_active);
+        pushDeviceReadOnly("issueUploads:device_active", device_active, active,
+                           static_cast<size_t>(slots), shadow_active);
 
         for (int i = 0; i < count; ++i) {
             const int m  = active_slots[i];
@@ -3819,23 +3827,23 @@ public:
             // the ones whose mirrors drop uploads.
             {
                 const size_t bytes = matrix_count * sizeof(double);
-                CUDA_CHECK(cudaMemcpyAsync(diag + m * mat_stride(), sl.host_diag,
-                                           bytes, cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(rasbery::xfer::memcpyAsync(
+                    "CudaBICGBackend.cu:issueUploads", "diag", diag + m * mat_stride(),
+                    sl.host_diag, bytes, cudaMemcpyHostToDevice, stream));
                 ++telemetry.bulk_h2d_calls_during_iteration;
                 telemetry.bulk_h2d_bytes_during_iteration += bytes;
             }
-            pushOrSkip(cc + m * cpl_stride(), sl.host_cc, coupling_count,
-                       sl.push_cc, sl.cc_mirror);
-            pushOrSkip(phi + m * vec_stride(), sl.host_phi, static_cast<size_t>(n),
-                       sl.push_phi, sl.phi_mirror);
+            pushOrSkip("issueUploads:cc", cc + m * cpl_stride(), sl.host_cc,
+                       coupling_count, sl.push_cc, sl.cc_mirror);
+            pushOrSkip("issueUploads:phi", phi + m * vec_stride(), sl.host_phi,
+                       static_cast<size_t>(n), sl.push_phi, sl.phi_mirror);
 
             // src is rebuilt from psi on the host at the top of every outer; it
             // is the one buffer that is genuinely new each time.
-            CUDA_CHECK(cudaMemcpyAsync(src + m * vec_stride(),
-                                       sl.host_src,
-                                       static_cast<size_t>(n) * sizeof(double),
-                                       cudaMemcpyHostToDevice,
-                                       stream));
+            CUDA_CHECK(rasbery::xfer::memcpyAsync(
+                "CudaBICGBackend.cu:issueUploads", "src", src + m * vec_stride(),
+                sl.host_src, static_cast<size_t>(n) * sizeof(double),
+                cudaMemcpyHostToDevice, stream));
             ++telemetry.bulk_h2d_calls_during_iteration;
             telemetry.bulk_h2d_bytes_during_iteration +=
                 static_cast<size_t>(n) * sizeof(double);
@@ -3844,11 +3852,10 @@ public:
             // keeping it in device memory is what lets one captured graph serve
             // every outer of every instance.
             if (!(sl.eps == sl.eps_on_device)) {
-                CUDA_CHECK(cudaMemcpyAsync(scalars + static_cast<long long>(m) * kScalarCount + kEps,
-                                           &sl.eps,
-                                           sizeof(double),
-                                           cudaMemcpyHostToDevice,
-                                           stream));
+                CUDA_CHECK(rasbery::xfer::memcpyAsync(
+                    "CudaBICGBackend.cu:issueUploads", "eps",
+                    scalars + static_cast<long long>(m) * kScalarCount + kEps, &sl.eps,
+                    sizeof(double), cudaMemcpyHostToDevice, stream));
                 // Graph/direct kernels are submitted to this same stream, so
                 // stream order publishes eps without draining the pipeline.
                 sl.eps_on_device = sl.eps;
@@ -3860,15 +3867,16 @@ public:
         }
     }
 
-    void pushOrSkip(double* device_buffer, const double* host_buffer, size_t count,
-                    bool push, MirroredUpload& mirror) {
+    void pushOrSkip(const char* leaf, double* device_buffer, const double* host_buffer,
+                    size_t count, bool push, MirroredUpload& mirror) {
         if (!push) {
             ++telemetry.bulk_h2d_skipped_during_iteration;
             return;
         }
         const size_t bytes = count * sizeof(double);
-        CUDA_CHECK(cudaMemcpyAsync(
-            device_buffer, host_buffer, bytes, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(rasbery::xfer::memcpyAsync("CudaBICGBackend.cu:pushOrSkip", leaf,
+                                       device_buffer, host_buffer, bytes,
+                                       cudaMemcpyHostToDevice, stream));
         mirror.shadow.assign(host_buffer, host_buffer + count);
         mirror.valid = true;
         ++telemetry.bulk_h2d_calls_during_iteration;
@@ -4156,11 +4164,14 @@ public:
 
         finalize_status<<<full_scalar_grid(), 1, 0, stream>>>(
             scalars, device_flags, device_counters, device_status, device_active);
-        CUDA_CHECK(cudaMemcpyAsync(host_status,
-                                   device_status,
-                                   static_cast<size_t>(slots) * sizeof(DeviceSolveStatus),
-                                   cudaMemcpyDeviceToHost,
-                                   stream));
+        // WP13.1: launch_outer CAPTURES this body when use_graph, so on that
+        // arm the ledger sees one call per capture and the replays are
+        // invisible to it.  The scope says so rather than leaving a reader
+        // to reconcile the row against nsys and conclude the site is cold.
+        CUDA_CHECK(rasbery::xfer::memcpyAsync(
+            "CudaBICGBackend.cu:enqueue_outer(captured)", "host_status", host_status,
+            device_status, static_cast<size_t>(slots) * sizeof(DeviceSolveStatus),
+            cudaMemcpyDeviceToHost, stream));
     }
 
     /// Capture enqueue_outer once and replay it.  Every kernel argument is a
@@ -4602,42 +4613,45 @@ public:
         // WP13: the two participation masks are device-read-only and shadowed;
         // sweep_halt is NOT (see pushDeviceReadOnly's header) and keeps its
         // unconditional copy.
-        pushDeviceReadOnly(device_active, active, static_cast<size_t>(slots),
-                           shadow_active);
-        pushDeviceReadOnly(device_assembly_active, assembly, static_cast<size_t>(slots),
-                           shadow_assembly_active);
-        CUDA_CHECK(cudaMemcpyAsync(sweep_halt, halt,
-                                   static_cast<size_t>(slots) * sizeof(std::uint32_t),
-                                   cudaMemcpyHostToDevice, stream));
-        rasbery::xfer::countH2D(static_cast<size_t>(slots) * sizeof(std::uint32_t));
+        pushDeviceReadOnly("issueSweepUploads:device_active", device_active, active,
+                           static_cast<size_t>(slots), shadow_active);
+        pushDeviceReadOnly("issueSweepUploads:device_assembly_active",
+                           device_assembly_active, assembly,
+                           static_cast<size_t>(slots), shadow_assembly_active);
+        CUDA_CHECK(rasbery::xfer::memcpyAsync(
+            "CudaBICGBackend.cu:issueSweepUploads", "sweep_halt", sweep_halt, halt,
+            static_cast<size_t>(slots) * sizeof(std::uint32_t), cudaMemcpyHostToDevice,
+            stream));
 
         for (int i = 0; i < count; ++i) {
             const int m  = active_slots[i];
             Slot&     sl = slot[static_cast<size_t>(m)];
 
-            pushOrSkip(xs_chif + m * vec_stride(), sl.host_chif,
+            pushOrSkip("issueSweepUploads:chif", xs_chif + m * vec_stride(), sl.host_chif,
                        static_cast<size_t>(n), sl.chif_mirror.valid
                            ? !mirrorMatches(sl.chif_mirror, sl.host_chif,
                                             static_cast<size_t>(n))
                            : true,
                        sl.chif_mirror);
-            pushOrSkip(node_vol + m * node_stride(), sl.host_vol,
+            pushOrSkip("issueSweepUploads:vol", node_vol + m * node_stride(), sl.host_vol,
                        static_cast<size_t>(nxyz), sl.vol_mirror.valid
                            ? !mirrorMatches(sl.vol_mirror, sl.host_vol,
                                             static_cast<size_t>(nxyz))
                            : true,
                        sl.vol_mirror);
 
-            auto push = [&](double* dst, const double* src_host, size_t cnt) {
+            auto push = [&](const char* leaf, double* dst, const double* src_host,
+                            size_t cnt) {
                 if (src_host == nullptr)
                     throw std::invalid_argument("CMFD sweep upload received a null host buffer");
-                CUDA_CHECK(cudaMemcpyAsync(dst, src_host, cnt * sizeof(double),
-                                           cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(rasbery::xfer::memcpyAsync(
+                    "CudaBICGBackend.cu:issueSweepUploads:push", leaf, dst, src_host,
+                    cnt * sizeof(double), cudaMemcpyHostToDevice, stream));
                 ++telemetry.bulk_h2d_calls_during_iteration;
                 telemetry.bulk_h2d_bytes_during_iteration += cnt * sizeof(double);
             };
-            auto push_pending = [&](double* dst, const double* src_host, size_t cnt,
-                                    bool& pushed,
+            auto push_pending = [&](const char* leaf, double* dst, const double* src_host,
+                                    size_t cnt, bool& pushed,
                                     cuda_transfer::ByteExactMirror<double>& mirror) {
                 if (src_host == nullptr)
                     throw std::invalid_argument("CMFD assembly upload received a null host buffer");
@@ -4646,7 +4660,7 @@ public:
                     ++telemetry.bulk_h2d_skipped_during_iteration;
                     return;
                 }
-                push(dst, src_host, cnt);
+                push(leaf, dst, src_host, cnt);
                 // ==========================================================
                 // Rev.7.1 Task 10 part 3: COMMITTED AT THE ISSUE, NOT AT THE
                 // OBSERVATION
@@ -4685,15 +4699,15 @@ public:
             };
 
             if (sl.device_assembly) {
-                push_pending(xs_xsnf + m * vec_stride(), sl.host_xsnf,
+                push_pending("xsnf", xs_xsnf + m * vec_stride(), sl.host_xsnf,
                              static_cast<size_t>(n), sl.pushed_xsnf,
                              sl.xsnf_mirror);
-                push_pending(xs_xsrf + m * vec_stride(), sl.host_xsrf,
+                push_pending("xsrf", xs_xsrf + m * vec_stride(), sl.host_xsrf,
                              static_cast<size_t>(n), sl.pushed_xsrf,
                              sl.xsrf_mirror);
-                push_pending(xs_xssm + m * mat_stride(), sl.host_xssm,
+                push_pending("xssm", xs_xssm + m * mat_stride(), sl.host_xssm,
                              matrix_count, sl.pushed_xssm, sl.xssm_mirror);
-                push_pending(dtil_dev + m * surface_stride(), sl.host_dtil,
+                push_pending("dtil", dtil_dev + m * surface_stride(), sl.host_dtil,
                              surface_group_count, sl.pushed_dtil,
                              sl.dtil_mirror);
                 // dhat changes after every nodal correction, so comparing it
@@ -4709,7 +4723,7 @@ public:
                     telemetry.cmfd_dhat_h2d_elided_bytes +=
                         surface_group_count * sizeof(double);
                 } else {
-                    push(dhat_dev + m * surface_stride(), sl.host_dhat,
+                    push("dhat", dhat_dev + m * surface_stride(), sl.host_dhat,
                          surface_group_count);
                 }
 
@@ -4728,11 +4742,14 @@ public:
                 // mirror; a stale shadow must not elide a later assembly-path
                 // upload if the slot toggles back.
                 sl.xsnf_mirror.invalidate();
-                push(xs_xsnf + m * vec_stride(), sl.host_xsnf, static_cast<size_t>(n));
-                push(udiag_dev + m * mat_stride(), sl.host_udiag, matrix_count);
-                push(diag + m * mat_stride(), sl.host_diag, matrix_count);
-                pushOrSkip(cc + m * cpl_stride(), sl.host_cc, coupling_count,
-                           sl.push_cc, sl.cc_mirror);
+                push("xsnf (host assembly)", xs_xsnf + m * vec_stride(), sl.host_xsnf,
+                     static_cast<size_t>(n));
+                push("udiag (host assembly)", udiag_dev + m * mat_stride(),
+                     sl.host_udiag, matrix_count);
+                push("diag (host assembly)", diag + m * mat_stride(), sl.host_diag,
+                     matrix_count);
+                pushOrSkip("issueSweepUploads:cc", cc + m * cpl_stride(), sl.host_cc,
+                           coupling_count, sl.push_cc, sl.cc_mirror);
                 ++telemetry.cmfd_assembly_cpu_fallbacks;
             }
 
@@ -4752,20 +4769,23 @@ public:
                 telemetry.cmfd_resident_psi_h2d_elided_bytes +=
                     static_cast<std::uint64_t>(nxyz) * sizeof(double);
             } else if (sl.push_psi) {
-                push(psi_dev + m * node_stride(), sl.host_psi, static_cast<size_t>(nxyz));
+                push("psi", psi_dev + m * node_stride(), sl.host_psi,
+                     static_cast<size_t>(nxyz));
             } else {
                 ++telemetry.bulk_h2d_skipped_during_iteration;
                 telemetry.cmfd_psi_h2d_elided_bytes +=
                     static_cast<std::uint64_t>(nxyz) * sizeof(double);
             }
-            pushOrSkip(phi + m * vec_stride(), sl.host_phi, static_cast<size_t>(n),
-                       sl.push_phi, sl.phi_mirror);
-            CUDA_CHECK(cudaMemcpyAsync(
+            pushOrSkip("issueSweepUploads:phi", phi + m * vec_stride(), sl.host_phi,
+                       static_cast<size_t>(n), sl.push_phi, sl.phi_mirror);
+            CUDA_CHECK(rasbery::xfer::memcpyAsync(
+                "CudaBICGBackend.cu:issueSweepUploads", "sweep_in",
                 scalars + static_cast<long long>(m) * kScalarCount + kSweepFirst,
                 sl.sweep_in, kSweepCount * sizeof(double), cudaMemcpyHostToDevice,
                 stream));
             if (!(sl.eps == sl.eps_on_device)) {
-                CUDA_CHECK(cudaMemcpyAsync(
+                CUDA_CHECK(rasbery::xfer::memcpyAsync(
+                    "CudaBICGBackend.cu:issueSweepUploads", "eps",
                     scalars + static_cast<long long>(m) * kScalarCount + kEps, &sl.eps,
                     sizeof(double), cudaMemcpyHostToDevice, stream));
                 sl.eps_on_device = sl.eps;
@@ -4789,8 +4809,8 @@ public:
             const int m  = active_slots[i];
             Slot&     sl = slot[static_cast<size_t>(m)];
             sl.psi_downloaded = false;
-            CUDA_CHECK(cudaMemcpyAsync(
-                sl.sweep_out,
+            CUDA_CHECK(rasbery::xfer::memcpyAsync(
+                "CudaBICGBackend.cu:issueSweepDownloads", "sweep_out", sl.sweep_out,
                 scalars + static_cast<long long>(m) * kScalarCount + kSweepFirst,
                 kSweepCount * sizeof(double), cudaMemcpyDeviceToHost, stream));
             ++telemetry.bulk_d2h_calls_during_iteration;
@@ -4809,11 +4829,10 @@ public:
         for (int i = 0; i < count; ++i) {
             const int m  = active_slots[i];
             Slot&     sl = slot[static_cast<size_t>(m)];
-            CUDA_CHECK(cudaMemcpyAsync(sl.out_phi,
-                                       phi + m * vec_stride(),
-                                       static_cast<size_t>(n) * sizeof(double),
-                                       cudaMemcpyDeviceToHost,
-                                       stream));
+            CUDA_CHECK(rasbery::xfer::memcpyAsync(
+                "CudaBICGBackend.cu:issueFluxDownloads", "out_phi", sl.out_phi,
+                phi + m * vec_stride(), static_cast<size_t>(n) * sizeof(double),
+                cudaMemcpyDeviceToHost, stream));
             ++telemetry.bulk_d2h_calls_during_iteration;
             telemetry.bulk_d2h_bytes_during_iteration +=
                 static_cast<std::uint64_t>(n) * sizeof(double);
@@ -4850,9 +4869,11 @@ public:
             // and this is the one launch on which it does.  Unconditional on
             // device_assembly: the host arm needs the new fission source too.
             if (sl.host_psi != nullptr && !sl.psi_downloaded) {
-                CUDA_CHECK(cudaMemcpyAsync(sl.host_psi, psi_dev + m * node_stride(),
-                                           static_cast<size_t>(nxyz) * sizeof(double),
-                                           cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(rasbery::xfer::memcpyAsync(
+                    "CudaBICGBackend.cu:issueExceptionalOperatorDownloads", "psi",
+                    sl.host_psi, psi_dev + m * node_stride(),
+                    static_cast<size_t>(nxyz) * sizeof(double), cudaMemcpyDeviceToHost,
+                    stream));
                 sl.psi_downloaded = true;
                 ++telemetry.bulk_d2h_calls_during_iteration;
                 telemetry.bulk_d2h_bytes_during_iteration +=
@@ -4866,15 +4887,18 @@ public:
                 sl.host_udiag == nullptr)
                 throw std::runtime_error(
                     "CMFD device assembly fallback has no writable host operator buffers");
-            CUDA_CHECK(cudaMemcpyAsync(sl.host_diag_out, diag + m * mat_stride(),
-                                       matrix_count * sizeof(double),
-                                       cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaMemcpyAsync(sl.host_cc_out, cc + m * cpl_stride(),
-                                       coupling_count * sizeof(double),
-                                       cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaMemcpyAsync(sl.host_udiag, udiag_dev + m * mat_stride(),
-                                       matrix_count * sizeof(double),
-                                       cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(rasbery::xfer::memcpyAsync(
+                "CudaBICGBackend.cu:issueExceptionalOperatorDownloads", "diag",
+                sl.host_diag_out, diag + m * mat_stride(), matrix_count * sizeof(double),
+                cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(rasbery::xfer::memcpyAsync(
+                "CudaBICGBackend.cu:issueExceptionalOperatorDownloads", "cc",
+                sl.host_cc_out, cc + m * cpl_stride(), coupling_count * sizeof(double),
+                cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(rasbery::xfer::memcpyAsync(
+                "CudaBICGBackend.cu:issueExceptionalOperatorDownloads", "udiag",
+                sl.host_udiag, udiag_dev + m * mat_stride(),
+                matrix_count * sizeof(double), cudaMemcpyDeviceToHost, stream));
             telemetry.bulk_d2h_calls_during_iteration += 3;
             telemetry.bulk_d2h_bytes_during_iteration +=
                 (2 * static_cast<std::uint64_t>(matrix_count) +
@@ -4883,7 +4907,8 @@ public:
         }
         if (!queued) return;
         ++telemetry.stream_sync_calls_during_iteration;
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(rasbery::xfer::streamSync(
+            "CudaBICGBackend.cu:issueExceptionalOperatorDownloads", "drain", stream));
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -4891,7 +4916,8 @@ public:
     /// packets the graph already queued, which is why the inner loop needs none.
     void drain(const int* active_slots, int count) {
         ++telemetry.stream_sync_calls_during_iteration;
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(rasbery::xfer::streamSync("CudaBICGBackend.cu:BatchCore::drain", "launch",
+                                      stream));
         CUDA_CHECK(cudaGetLastError());
         absorb(active_slots, count);
     }
@@ -5833,7 +5859,8 @@ bool CudaBatchArena::enqueueSweeps(int m, double* out_phi, const CmfdSweepIO& io
         // the caller run a blocking drive over buffers this launch is writing,
         // so the honest recovery is to make the ordering by hand.
         cudaGetLastError();
-        if (cudaStreamSynchronize(a.core.stream) != cudaSuccess) {
+        if (rasbery::xfer::streamSync("CudaBICGBackend.cu:enqueueSweep", "event fallback",
+                               a.core.stream) != cudaSuccess) {
             cudaGetLastError();
             return false;
         }
@@ -5904,7 +5931,8 @@ void CudaBatchArena::syncSweepStream() {
     // going to take anyway, on the path where the caller is about to run a
     // blocking host CMFD drive.
     TimedStreamClaim stream_claim(_impl->stream_mutex, _impl->claim_sync);
-    CUDA_CHECK(cudaStreamSynchronize(_impl->core.stream));
+    CUDA_CHECK(rasbery::xfer::streamSync("CudaBICGBackend.cu:syncSweepStream", "segment",
+                                  _impl->core.stream));
     CUDA_CHECK(cudaGetLastError());
 }
 
