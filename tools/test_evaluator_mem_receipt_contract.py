@@ -78,7 +78,14 @@ MEM_FIELDS = ("wave_id", "rss_mb", "rss_delta_mb", "rss_peak_mb", "live_cases",
 #: state that a case can add to; one missing is one suspect the next soak cannot
 #: rule in or out.
 MEM_CACHES = ("xslib", "xslib_digest", "cohorts", "quadratures", "pin_records",
-              "digest_memo", "case_samples")
+              "digest_memo", "case_samples", "case_samples_cap")
+
+#: WP10.5.  Counts alone are not enough.  At 55c0dce the attribution named
+#: `cache_entries.case_samples 18 -> 72` as the container that grew on a run
+#: whose RSS grew by 3.3 GB -- it was the only counter that moved, and it moved
+#: by 576 bytes.  A mover a reader cannot WEIGH is a mover a reader will
+#: believe, so every container the receipt can price now publishes its bytes.
+MEM_PRICED = ("xslib", "case_samples")
 
 
 def check_receipt(server: str) -> list[str]:
@@ -98,6 +105,16 @@ def check_receipt(server: str) -> list[str]:
             bad.append(f"the memory receipt does not size the {cache!r} container; a "
                        "cache the receipt cannot see is a cache the next soak cannot "
                        "accuse or clear")
+    bytes_start = block.find('\\"cache_bytes\\"')
+    bytes_block = block[bytes_start:block.find('\\"evictions\\"', bytes_start)] \
+        if bytes_start >= 0 else ""
+    if not bytes_block:
+        bad.append("the memory receipt has no cache_bytes group")
+    for cache in MEM_PRICED:
+        if f'\\"{cache}\\"' not in bytes_block:
+            bad.append(f"cache_bytes does not price {cache!r}; an attribution can "
+                       "then only say it moved, which is how 576 bytes were offered "
+                       "as the explanation for 3.3 GB")
     if "reportMemory(" not in server:
         bad.append("the memory receipt is not a named function called from the wave")
     # ONCE PER GENERATION, from runWave, after the wave's own receipt.  A
@@ -190,6 +207,40 @@ def check_cohort_bound(cohort: str) -> list[str]:
     return bad
 
 
+def check_sample_window(server: str) -> list[str]:
+    """WP10.5.  The per-case sample series must be capped."""
+    bad: list[str] = []
+    if "class SampleWindow" not in server:
+        bad.append("Summary still keeps unbounded per-case sample vectors; at "
+                   "55c0dce they were the only container in the memory receipt "
+                   "that grew, which made them the answer to a question they "
+                   "cannot answer")
+        return bad
+    if "RASBERY_EVALUATOR_SAMPLE_WINDOW" not in server:
+        bad.append("the sample window has no environment override")
+    if "std::vector<double> case_seconds" in server:
+        bad.append("case_seconds is still a raw growing vector")
+    if "std::vector<double> teardown_ms" in server:
+        bad.append("teardown_ms is still a raw growing vector")
+    # The two facts a ring would otherwise destroy.
+    for token in ("observed()", "max()"):
+        if token not in server:
+            bad.append(f"SampleWindow does not expose {token}; a windowed receipt "
+                       "that cannot say how many cases it saw, or what the worst "
+                       "one was, has traded a real number for a bounded one")
+    if '\\"window\\"' not in server or '\\"observed\\"' not in server:
+        bad.append("the process receipt does not say what its percentiles are a "
+                   "percentile OF; a windowed p90 that looks like a whole-run p90 "
+                   "is worse than no p90")
+    # A reservoir would be nondeterministic, which this repository cannot have.
+    for forbidden in ("rand()", "std::mt19937", "random_device"):
+        if forbidden in server:
+            bad.append(f"the sample window uses {forbidden}: a percentile that "
+                       "depends on a seed is a receipt two runs of one deck can "
+                       "disagree about, in a tree gated on bit identity")
+    return bad
+
+
 def check_memo_bound(light: str) -> list[str]:
     bad: list[str] = []
     if "TrimLocked" not in light:
@@ -256,7 +307,53 @@ def check_soak_attribution() -> list[str]:
         bad.append("a binary that predates the receipt is not reported as unattributable; "
                    "silence there reads as 'nothing grew'")
 
-    if "attribute_rss_growth(generations)" not in (ROOT / "tools" / "soak_run.py").read_text(
+    # WP10.5.  THE 55c0dce CASE, REPLAYED.  case_samples grew by 72 doubles on a
+    # run that gained 3.3 GB and was reported as the moving container.  It must
+    # now be reported as unable to explain anything.
+    small_a = {"cache_entries": {"case_samples": 18}, "evictions": {},
+               "cache_bytes": {"case_samples": 288}, "live_cases": 0,
+               "cuda_host_bytes": 0, "rss_mb": 1263.3}
+    small_b = {"cache_entries": {"case_samples": 90}, "evictions": {},
+               "cache_bytes": {"case_samples": 1440}, "live_cases": 0,
+               "cuda_host_bytes": 0, "rss_mb": 4556.5}
+    weighed = " ".join(soak_run.attribute_rss_growth([Gen(small_a), Gen(small_b)]))
+    if "CANNOT be the cause" not in weighed:
+        bad.append("a container that grew by a kilobyte on a run that grew by "
+                   "gigabytes is still offered as the explanation; that is the "
+                   "55c0dce finding verbatim and it cost a session")
+    if "allocator" not in weighed:
+        bad.append("when nothing can explain the growth the attribution does not "
+                   "point anywhere next")
+
+    big_a = dict(small_a, cache_bytes={"xslib": 0})
+    big_b = dict(small_b, cache_bytes={"xslib": 3_000 * 1024 * 1024})
+    real = " ".join(soak_run.attribute_rss_growth([Gen(big_a), Gen(big_b)]))
+    if "growing by enough to matter" not in real:
+        bad.append("a container that DOES account for the growth is not reported "
+                   "as an explanation, so the weighing rejects everything")
+
+    # And the slopes.
+    series = [1263.301, 4251.379, 4501.695, 4581.957, 4556.508]
+    slopes = soak_run.growth_slopes(series, 1)
+    if slopes["slope_raw_mb_per_generation"] is None:
+        bad.append("the raw slope is not reported beside the gated one")
+    if slopes["slope_mb_per_generation"] is None:
+        bad.append("no gated slope was produced for a five-generation series")
+    if slopes["slope_mb_per_generation"] >= slopes["slope_raw_mb_per_generation"]:
+        bad.append("dropping the warm-up generation did not lower the slope on the "
+                   "181 series, where the stand-up step is +2988 MB of a +3293 MB "
+                   "total: the warm-up exclusion is not working")
+    if soak_run.growth_slopes(series, 0)["slope_mb_per_generation"] != \
+            slopes["slope_raw_mb_per_generation"]:
+        bad.append("warmup=0 must fit every generation, so the knob has an "
+                   "identity setting a reader can check it against")
+    if slopes["warmup_generations"] != 1:
+        bad.append("the report does not say how many generations were dropped")
+    if "--warmup-generations" not in (ROOT / "tools" / "soak_run.py").read_text(
+            encoding="utf-8-sig"):
+        bad.append("the warm-up count is not an operator-visible flag")
+
+    if "attribute_rss_growth(generations," not in (ROOT / "tools" / "soak_run.py").read_text(
             encoding="utf-8-sig"):
         bad.append("soak_run never calls attribute_rss_growth on an RSS finding")
     return bad
@@ -288,6 +385,15 @@ def controls() -> list[str]:
         broken.append("the memo bound check passes an unbounded memo")
     if not check_pin_bytes(PINREG.replace("rasberyHostPinLiveBytes", "nope")):
         broken.append("the pinned-bytes check passes a registry with no byte accessor")
+    if not check_sample_window(SERVER.replace("class SampleWindow", "class NotAWindow")):
+        broken.append("the sample-window check passes a Summary with no window")
+    if not check_sample_window(SERVER.replace("RASBERY_EVALUATOR_SAMPLE_WINDOW", "NOPE")):
+        broken.append("the sample-window check passes a window with no cap knob")
+    if not check_sample_window(SERVER.replace("std::mt19937", "x") + "std::mt19937"):
+        broken.append("the sample-window check accepts a nondeterministic reservoir")
+    if not check_receipt(SERVER.replace('\\"case_samples\\"', '\\"nothing\\"')):
+        broken.append("the receipt check passes a receipt that neither counts nor "
+                      "prices the sample window")
     return broken
 
 
@@ -378,6 +484,117 @@ EXPECTED = {
 }
 
 
+def brace_block(text: str, signature: str) -> str:
+    """`signature` plus its brace-balanced body, verbatim from the source."""
+    start = text.index(signature)
+    depth, i = 0, text.index("{", start)
+    while i < len(text):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+        i += 1
+    raise AssertionError("unbalanced braces after " + signature)
+
+
+WINDOW_HARNESS = r"""
+#include <cstdint>
+#include <cstdlib>
+#include <iostream>
+#include <vector>
+namespace detail {
+%s
+}
+%s;
+
+int main() {
+#ifdef _WIN32
+    _putenv_s("RASBERY_EVALUATOR_SAMPLE_WINDOW", "8");
+#else
+    setenv("RASBERY_EVALUATOR_SAMPLE_WINDOW", "8", 1);
+#endif
+    SampleWindow w;
+    // 100 pushes, with the maximum EARLY so a window that dropped it would say
+    // so: the exact max is the fact a ring destroys unless it is kept apart.
+    w.push(999.0);
+    for (int i = 1; i < 100; ++i) w.push(static_cast<double>(i));
+    std::cout << "bounded " << (w.resident() == 8) << "\n";
+    std::cout << "observed_exact " << (w.observed() == 100) << "\n";
+    std::cout << "max_exact " << (w.max() == 999.0) << "\n";
+    std::cout << "bytes " << (w.bytes() == 8 * sizeof(double)) << "\n";
+    // The window holds the MOST RECENT samples: the last 8 pushes were 92..99.
+    bool recent = w.values().size() == 8;
+    for (double v : w.values()) recent = recent && v >= 92.0 && v <= 99.0;
+    std::cout << "recent " << recent << "\n";
+    SampleWindow empty;
+    std::cout << "empty_max_zero " << (empty.max() == 0.0) << "\n";
+    std::cout << "empty_observed " << (empty.observed() == 0) << "\n";
+    return 0;
+}
+"""
+
+WINDOW_EXPECTED = {
+    "bounded": "the sample window did not respect RASBERY_EVALUATOR_SAMPLE_WINDOW=8",
+    "observed_exact": "observed() must count every case, not the resident ones -- a "
+                      "windowed receipt that cannot say how many cases it saw has "
+                      "traded away the number the window was supposed to protect",
+    "max_exact": "max() dropped a maximum that fell out of the window; the worst "
+                 "teardown a fleet ever paid is a fact about the run",
+    "bytes": "bytes() does not price the resident window, so the memory receipt "
+             "cannot weigh it",
+    "recent": "the ring does not hold the MOST RECENT samples, so its percentiles "
+              "describe an arbitrary subset of the run",
+    "empty_max_zero": "an empty window reports a nonzero maximum",
+    "empty_observed": "an empty window claims to have observed cases",
+}
+
+
+def compiled_window_contract() -> bool:
+    """Drive the shipped SampleWindow text.  True when it actually ran."""
+    compiler = find_compiler()
+    if compiler is None:
+        return False
+    capacity = brace_block(SERVER, "inline std::size_t sampleWindowCapacity()")
+    window = brace_block(SERVER, "class SampleWindow")
+    source = WINDOW_HARNESS % (capacity, window)
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        cpp = tmp / "window_harness.cpp"
+        cpp.write_text(source, encoding="utf-8")
+        exe = tmp / ("window_harness.exe" if os.name == "nt" else "window_harness")
+        try:
+            if compiler.lower().endswith("vcvars64.bat"):
+                script = tmp / "build_window_harness.bat"
+                script.write_text(
+                    "@echo off\r\n"
+                    + 'call "%s" >nul 2>&1\r\n' % compiler
+                    + 'cd /d "%s"\r\n' % tmp
+                    + 'cl /nologo /std:c++20 /EHsc /D_CRT_SECURE_NO_WARNINGS "%s" /Fe:"%s"\r\n'
+                      % (cpp, exe),
+                    encoding="utf-8")
+                subprocess.run(["cmd", "/c", str(script)], check=True, cwd=str(tmp),
+                               capture_output=True, universal_newlines=True)
+            else:
+                subprocess.run([compiler, "-std=c++20", "-O0", str(cpp), "-o", str(exe)],
+                               check=True, capture_output=True, universal_newlines=True)
+        except subprocess.CalledProcessError as failure:
+            failures.append("the sample-window harness does not compile:\n"
+                            + (failure.stdout or "") + (failure.stderr or ""))
+            return True
+        done = subprocess.run([str(exe)], capture_output=True, universal_newlines=True)
+        if done.returncode != 0:
+            failures.append(f"the sample-window harness failed: {done.stdout}{done.stderr}")
+            return True
+        results = dict(line.split() for line in done.stdout.split("\n") if line.strip())
+        for name, why in WINDOW_EXPECTED.items():
+            if results.get(name) != "1":
+                failures.append(f"compiled sample-window contract [{name}]: {why} "
+                                f"(harness said {results.get(name)!r})")
+    return True
+
+
 def find_compiler():
     """MSVC's vcvars64.bat, or a g++/clang++ on PATH, or None."""
     if os.name == "nt":
@@ -457,6 +674,7 @@ failures += check_xslib_bound(XSSET)
 failures += check_cohort_bound(COHORT)
 failures += check_memo_bound(LIGHT)
 failures += check_pin_bytes(PINREG)
+failures += check_sample_window(SERVER)
 failures += check_soak_attribution()
 
 broken_controls = controls()
@@ -465,6 +683,7 @@ if broken_controls:
                     "therefore comments:\n    " + "\n    ".join(broken_controls))
 
 compiled = compiled_contract()
+compiled_window = compiled_window_contract()
 
 if failures:
     raise SystemExit("evaluator memory receipt: FAIL\n  " + "\n  ".join(failures))
@@ -472,5 +691,7 @@ if not compiled:
     print("evaluator memory receipt: NOTE -- no C++ compiler found; the bound was "
           "checked by source scan only", file=sys.stderr)
 print(f"evaluator memory receipt: PASS ({len(MEM_FIELDS)} fields, "
-      f"{len(MEM_CACHES)} sized containers, 3 bounded caches"
-      + (", 7 compiled" if compiled else "") + ")")
+      f"{len(MEM_CACHES)} sized containers, 4 bounded caches"
+      + (", 7 compiled" if compiled else "")
+      + (f", {len(WINDOW_EXPECTED)} compiled window" if compiled_window else "")
+      + ")")

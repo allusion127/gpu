@@ -245,21 +245,104 @@ def leak_slope_mb_per_generation(series: Sequence[float | None]) -> float | None
     return sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denominator
 
 
-def attribute_rss_growth(generations: "Sequence[GenerationResult]") -> list[str]:
-    """Name the container, when the process reported enough to name one.
+def linear_slope_mb_per_generation(series: Sequence[float | None]) -> float | None:
+    """MB per generation over EVERY present sample of *series*, or None.
 
-    WHY THIS IS NOT OPTIONAL.  The host 181 soak at `91004f7` found RSS climbing
+    Reported beside the gated slope, never gated on.  It is the number a reader
+    computes by eye from the table, and publishing it is what stops an argument
+    about whether the tool and the eye disagree: at 55c0dce they did, and only
+    the tool's number was in the report.
+    """
+    values = [(i, v) for i, v in enumerate(series) if v is not None]
+    if len(values) < 2:
+        return None
+    xs = [float(i) for i, _ in values]
+    ys = [v for _, v in values]
+    mean_x = statistics.fmean(xs)
+    mean_y = statistics.fmean(ys)
+    denominator = sum((x - mean_x) ** 2 for x in xs)
+    if denominator == 0.0:
+        return None
+    return sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denominator
+
+
+def growth_slopes(series: Sequence[float | None], warmup: int
+                  ) -> "dict[str, float | None]":
+    """Every slope worth reporting, and which one the gate uses.
+
+    WHY THE WARM-UP GENERATIONS COME OUT.  The host 181 soak at 55c0dce measured
+    RSS 1263 -> 4251 -> 4502 -> 4582 -> 4557 MB: a ONE-TIME +2988 MB step as the
+    first generation stood the arenas, the device library and the graph cache
+    up, and then a curve that is nearly flat and ends by going DOWN.  Fitting a
+    line through the step reports a leak that is a stand-up cost, and no
+    threshold can be set that tells those apart -- the step is 300x the budget.
+    `leak_slope_mb_per_generation` already dropped the first half, which was
+    enough at five generations and stops being enough as a soak gets longer (at
+    50 generations the second half starts at 25 and the step is long forgotten,
+    but so is everything else the gate wanted to see).  Dropping a named number
+    of WARM-UP generations is the rule that holds at both lengths, and the raw
+    slope is published beside it so nothing is hidden by the choice.
+    """
+    tail = list(series)[max(0, warmup):]
+    return {
+        # THE GATE: a straight fit through the POST-WARM-UP series, all of it.
+        #
+        # Not its second half.  Halving was the old way of dodging the stand-up
+        # step, and once the step is dropped by name it only throws samples
+        # away: at five generations the post-warm-up second half is TWO points,
+        # and a gate that turns on two points is a coin. The 55c0dce numbers are
+        # the worked example -- second-half-of-post-warm-up reads -25.4 MB/gen
+        # (PASS) from the last two samples while the run actually gained 305 MB
+        # over the three post-warm-up generations, which is +99.6 MB/gen and a
+        # correct FAIL.  The halved figures stay in the receipt below; they are
+        # not what decides.
+        "slope_mb_per_generation": linear_slope_mb_per_generation(tail),
+        "slope_post_warmup_second_half_mb_per_generation":
+            leak_slope_mb_per_generation(tail),
+        # Everything a reader might otherwise recompute by hand.
+        "slope_raw_mb_per_generation": linear_slope_mb_per_generation(series),
+        "slope_post_warmup_mb_per_generation": linear_slope_mb_per_generation(tail),
+        "slope_second_half_all_mb_per_generation":
+            leak_slope_mb_per_generation(series),
+        "warmup_generations": warmup,
+    }
+
+
+#: A mover has to account for at least this share of the observed RSS growth
+#: before it is offered as an explanation rather than as a note.  5% is chosen
+#: to be forgiving -- a real container is usually most of the growth -- while
+#: still refusing the case that made this necessary: `case_samples` grew by 72
+#: doubles (576 bytes) on a run whose RSS grew by 3.3 GB, and was reported as
+#: THE moving container because it was the only counter that moved at all.
+ATTRIBUTION_SHARE = 0.05
+
+
+def _mb(byte_delta: float) -> float:
+    return byte_delta / (1024.0 * 1024.0)
+
+
+def attribute_rss_growth(generations: "Sequence[GenerationResult]",
+                         rss_growth_mb: float | None = None) -> list[str]:
+    """Name the container -- and say whether it is big enough to be the cause.
+
+    WHY THIS EXISTS.  The host 181 soak at `91004f7` found RSS climbing
     +17.41 MB/generation with every mechanism receipt at zero, and the finding
     said only that.  A number with no suspects cannot be closed on a host nobody
-    can attach a profiler to, and at 10k generations that slope is 170 GB.
+    can attach a profiler to, and at 10k generations that slope is 170 GB.  So
+    the evaluator prints `[RASBERY][EVALUATOR][MEM]` between generations with
+    the size of every process-lifetime container beside its own RSS, and this
+    walks the first and last of them.
 
-    So the evaluator now prints `[RASBERY][EVALUATOR][MEM]` between generations
-    with the size of every process-lifetime container beside its own RSS, and
-    this walks the first and last of those receipts.  A container that moved
-    while RSS moved is the suspect; ALL of them flat is also an answer -- it
-    says the growth is not in the caches this receipt can see, and the next
-    place to look is the allocator, HDF5's own free lists or the device runtime.
-    Saying that is worth more than saying nothing.
+    WHY IT WAS NOT ENOUGH, AND WHAT WP10.5 CHANGED.  At `55c0dce` it worked and
+    was wrong: it named `cache_entries.case_samples 18 -> 72` as the container
+    that moved on a run that gained 3.3 GB.  It was the only counter that moved,
+    and it moved by 576 bytes.  A reader who trusts an attribution spends a day
+    on the wrong container, which is worse than no attribution -- so a mover is
+    now WEIGHED.  Anything the receipt can price is compared against the growth
+    it is supposed to explain, and a mover that cannot explain it is reported as
+    exactly that, by name and by size.  All of them flat, or all of them too
+    small, is the same answer and a useful one: the growth is not in the caches
+    this receipt can see.
     """
     receipts = [g.mem for g in generations if isinstance(g.mem, dict)]
     if len(receipts) < 2:
@@ -267,34 +350,78 @@ def attribute_rss_growth(generations: "Sequence[GenerationResult]") -> list[str]
                 "growth cannot be attributed to a container from this run: rebuild at "
                 "a commit that carries WP10.4 and repeat"]
     first, last = receipts[0], receipts[-1]
-    moved: list[str] = []
-    for group in ("cache_entries", "evictions", "cache_bytes"):
-        before = first.get(group) or {}
-        after = last.get(group) or {}
+
+    # What the process itself says it gained, when the caller did not say.
+    if rss_growth_mb is None:
+        head, tail = first.get("rss_mb"), last.get("rss_mb")
+        if isinstance(head, (int, float)) and isinstance(tail, (int, float)):
+            rss_growth_mb = float(tail) - float(head)
+
+    def moved_in(group: str) -> list[tuple[str, float, float]]:
+        before, after = first.get(group) or {}, last.get(group) or {}
         if not isinstance(before, dict) or not isinstance(after, dict):
-            continue
+            return []
+        out = []
         for name in sorted(set(before) | set(after)):
-            start, end = before.get(name, 0), after.get(name, 0)
-            if isinstance(start, (int, float)) and isinstance(end, (int, float)):
-                if end != start:
-                    moved.append(f"{group}.{name} {start} -> {end}")
+            a, b = before.get(name, 0), after.get(name, 0)
+            if isinstance(a, (int, float)) and isinstance(b, (int, float)) and a != b:
+                out.append((name, float(a), float(b)))
+        return out
+
+    byte_moves = {name: (a, b) for name, a, b in moved_in("cache_bytes")}
+    pinned = (first.get("cuda_host_bytes"), last.get("cuda_host_bytes"))
+    if all(isinstance(v, (int, float)) for v in pinned) and pinned[0] != pinned[1]:
+        byte_moves["cuda_host_bytes"] = (float(pinned[0]), float(pinned[1]))
+
+    explains: list[str] = []
+    too_small: list[str] = []
+    unpriced: list[str] = []
+
+    def weigh(label: str, delta_bytes: float) -> None:
+        gained = _mb(delta_bytes)
+        if (rss_growth_mb is None or rss_growth_mb <= 0.0
+                or gained >= ATTRIBUTION_SHARE * rss_growth_mb):
+            explains.append(f"{label} (+{gained:.3f} MB)")
+        else:
+            too_small.append(f"{label} (+{gained:.3f} MB of the "
+                             f"{rss_growth_mb:.1f} MB gained)")
+
+    for name, (a, b) in byte_moves.items():
+        weigh(f"cache_bytes.{name} {a:.0f} -> {b:.0f}", b - a)
+
+    for group in ("cache_entries", "evictions"):
+        for name, a, b in moved_in(group):
+            label = f"{group}.{name} {a:.0f} -> {b:.0f}"
+            # A counter the receipt also prices is already weighed above; do not
+            # report the same container twice under two units.
+            if group == "cache_entries" and name in byte_moves:
+                continue
+            unpriced.append(label)
+
     notes: list[str] = []
     live = last.get("live_cases")
     if isinstance(live, (int, float)) and live != 0:
         notes.append(f"and live_cases={live} between generations: a Driver outlived its "
-                     "case, which leaks everything a case owns")
-    pinned_first = first.get("cuda_host_bytes")
-    pinned_last = last.get("cuda_host_bytes")
-    if isinstance(pinned_first, (int, float)) and isinstance(pinned_last, (int, float)):
-        if pinned_last != pinned_first:
-            moved.append(f"cuda_host_bytes {pinned_first} -> {pinned_last}")
-    if moved:
-        notes.append("and the process's own [EVALUATOR][MEM] receipts show these moving "
-                     "across the run: " + "; ".join(moved))
-    else:
+                     "case, which leaks everything a case owns -- look here FIRST, it "
+                     "outranks every cache below")
+    if explains:
+        notes.append("and the process's own [EVALUATOR][MEM] receipts show these growing "
+                     "by enough to matter: " + "; ".join(explains))
+    if too_small:
+        notes.append("and these moved but CANNOT be the cause -- they are too small by "
+                     "orders of magnitude, so do not spend a day on them: "
+                     + "; ".join(too_small))
+    if unpriced:
+        notes.append("and these counters moved with no byte price in the receipt: "
+                     + "; ".join(unpriced))
+    if not (explains or too_small or unpriced):
         notes.append("and every container [EVALUATOR][MEM] can see was FLAT across the "
-                     "run, so the growth is not in the evaluator's caches: look at the "
-                     "allocator, HDF5's free lists or the device runtime next")
+                     "run -- not one counter or byte total moved")
+    if not explains:
+        notes.append("so nothing [EVALUATOR][MEM] can see accounts for the growth: look "
+                     "at the allocator (compare rss_peak_mb with rss_mb -- a large gap "
+                     "is retention, not a leak), HDF5's own free lists, and the device "
+                     "runtime's host-side allocations next")
     return notes
 
 
@@ -340,6 +467,24 @@ def build_generation(*, generation: int, width: int, deck: Path, workdir: Path,
     """
     cases: list[dict] = []
     declared: dict[str, str] = {}
+
+    def declare(word: str, *names: str) -> None:
+        """Declare one case under EVERY name a receipt could identify it by.
+
+        WP10.5.  The map used to be keyed on the client `key` alone, which is the
+        only name `[RASBERY][EVALUATOR][CASE]` carries -- and the Driver's own
+        `[RASBERY][CASE]` line does not carry it.  exact_audit reads BOTH tags,
+        so half the receipts in every run were unmatchable and reported as
+        undeclared: 82 of them on 181 at 55c0dce.  src/Driver.h now prints
+        `output`; this declares under it, and the two halves meet.
+
+        Declaring under several names is safe because they all name ONE case:
+        the evaluator refuses duplicate `--raso` paths within a wave, so an
+        output path can never carry two declarations at once.
+        """
+        for name in names:
+            if name:
+                declared[name] = word
     n_light = int(round(width * light_fraction))
     n_screen = int(round(width * screen_fraction))
     for i in range(width):
@@ -365,10 +510,10 @@ def build_generation(*, generation: int, width: int, deck: Path, workdir: Path,
         if i < n_screen:
             request["fidelity"] = "L3coarse"
             request["statepoint_grid"] = "coarse"
-            declared[key] = "L3coarse"
+            declare("L3coarse", key, str(request["output"]))
         else:
-            declared[key] = "strict"
             request["fidelity"] = "strict"
+            declare("strict", key, str(request["output"]))
         cases.append(request)
 
     if poison:
@@ -393,7 +538,7 @@ def build_generation(*, generation: int, width: int, deck: Path, workdir: Path,
             # receipt and sends that.  Both are strings the receipts carry.
             "promoted_from": parent,
         })
-        declared[key] = "strict"
+        declare("strict", key, str(workdir / "out" / f"{key}.h5"))
     return cases, declared
 
 
@@ -457,10 +602,22 @@ def render_markdown(report: dict) -> str:
                  f"worst drift {drift['worst_drift']:.3%} "
                  f"(budget {drift['budget']:.1%})")
     for what in ("vram", "rss"):
-        slope = report["growth"][what]["slope_mb_per_generation"]
-        limit = report["growth"][what]["limit_mb_per_generation"]
-        shown = "not measured" if slope is None else f"{slope:+.2f} MB/gen"
-        lines.append(f"- {what} growth (second half): {shown}, limit {limit} MB/gen")
+        block = report["growth"][what]
+        limit = block["limit_mb_per_generation"]
+        warm = block.get("warmup_generations", 0)
+
+        def shown(key: str) -> str:
+            value = block.get(key)
+            return "not measured" if value is None else f"{value:+.2f} MB/gen"
+
+        # Gated number first, raw beside it.  Printing only one of them is how
+        # the 55c0dce report ended up arguing with the table above it.
+        lines.append(
+            f"- {what} growth (gate, post-warm-up, {warm} gen dropped): "
+            f"{shown('slope_mb_per_generation')}, limit {limit} MB/gen "
+            f"[raw over every generation {shown('slope_raw_mb_per_generation')}; "
+            f"second half of the whole run "
+            f"{shown('slope_second_half_all_mb_per_generation')}]")
     if report["problems"]:
         lines.append("")
         lines.append("## Problems")
@@ -508,6 +665,12 @@ def parser() -> argparse.ArgumentParser:
                     help="MB per generation of VRAM growth over the run's second "
                          "half that counts as a leak")
     ap.add_argument("--rss-leak-mb", type=float, default=8.0)
+    ap.add_argument("--warmup-generations", type=int, default=1,
+                    help="generations dropped before the leak slope is fitted. The "
+                         "first generation stands the arenas, the device library and "
+                         "the graph cache up -- on 181 that was a one-time +2988 MB "
+                         "step -- and a line fitted through it reports a stand-up cost "
+                         "as a leak. The raw slope is reported either way.")
     ap.add_argument("--max-restarts", type=int, default=3,
                     help="how many times the dispatcher may replace a dead child "
                          "before giving up; this is the RECOVERY budget")
@@ -688,16 +851,42 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Output collisions: this driver's own bookkeeping, because the evaluator
     # scopes its namespace rule to a wave and would not see a cross-generation
     # reuse at all.
-    outputs: dict[str, str] = {}
+    # WP10.5.  COMPARE LIKE WITH LIKE.  This used to fold `key` and `case_key`
+    # into one identity with an `or`, which was harmless only while exactly one
+    # of the two case tags carried an `output` field.  Now both do, and the two
+    # tags name the SAME case by different identities on purpose -- the client's
+    # opaque label and the solver's canonical duplicate key -- so folding them
+    # reported every case in the run as colliding with itself.  A collision is
+    # two DIFFERENT cases on one path, and the only way to see that is to
+    # compare a key against a key and a case_key against a case_key.
+    #
+    # `case_key` alone can never prove a collision, either: it is a duplicate
+    # class, and two cases that legitimately share one (same deck, same
+    # fidelity, same warm token) share it by design.  So its map is kept for the
+    # receipts that carry nothing else, and a disagreement there is reported in
+    # the weaker language it deserves.
+    by_key: dict[str, str] = {}
+    by_case_key: dict[str, str] = {}
     for receipt in exact_audit.parse_case_receipts(transcript):
         out_path = receipt.get("output")
-        key = receipt.get("key") or receipt.get("case_key") or ""
-        if isinstance(out_path, str) and out_path:
-            if out_path in outputs and outputs[out_path] != key:
+        if not (isinstance(out_path, str) and out_path):
+            continue
+        label = receipt.get("key")
+        if isinstance(label, str) and label:
+            if by_key.get(out_path, label) != label:
                 problems.append(
                     f"output collision: {out_path!r} was written by both "
-                    f"{outputs[out_path]!r} and {key!r}")
-            outputs[out_path] = key
+                    f"{by_key[out_path]!r} and {label!r}")
+            by_key[out_path] = label
+            continue
+        canonical = receipt.get("case_key")
+        if isinstance(canonical, str) and canonical:
+            if by_case_key.get(out_path, canonical) != canonical:
+                problems.append(
+                    f"output collision: {out_path!r} was written by two different "
+                    f"case_keys, {by_case_key[out_path]!r} and {canonical!r} -- two "
+                    "cases that are not duplicates of each other wrote one --raso path")
+            by_case_key[out_path] = canonical
 
     for gen in generations:
         for problem in gen.fidelity_problems:
@@ -725,17 +914,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     for what, series, limit in (
             ("vram", [g.vram_mb for g in generations], args.vram_leak_mb),
             ("rss", [g.rss_mb for g in generations], args.rss_leak_mb)):
-        slope = leak_slope_mb_per_generation(series)
-        growth[what] = {"slope_mb_per_generation": slope,
-                        "limit_mb_per_generation": limit,
-                        "samples": series}
+        slopes = growth_slopes(series, args.warmup_generations)
+        slope = slopes["slope_mb_per_generation"]
+        growth[what] = dict(slopes,
+                            limit_mb_per_generation=limit,
+                            samples=series)
         if slope is not None and slope > limit:
+            raw = slopes["slope_raw_mb_per_generation"]
+            post = slopes["slope_post_warmup_mb_per_generation"]
             problems.append(
-                f"{what} grew {slope:.2f} MB/generation over the run's second half "
-                f"(limit {limit}); after the warm plateau nothing should still be "
-                "climbing")
+                f"{what} grew {slope:.2f} MB/generation over the post-warm-up run "
+                f"({args.warmup_generations} generation(s) dropped, limit {limit}); "
+                f"after the warm plateau nothing should still be climbing. Raw slope "
+                f"over every generation including the stand-up step "
+                f"{'n/a' if raw is None else format(raw, '.2f')} MB/gen"
+                + ("" if post is None or slope is None or abs(post - slope) < 1e-9
+                   else f", post-warm-up {post:.2f} MB/gen"))
             if what == "rss":
-                problems.extend(attribute_rss_growth(generations))
+                present = [v for v in series if v is not None]
+                observed = (present[-1] - present[0]) if len(present) >= 2 else None
+                problems.extend(attribute_rss_growth(generations, observed))
 
     cases_reported = sum(g.cases for g in generations)
     if cases_reported < cases_requested:

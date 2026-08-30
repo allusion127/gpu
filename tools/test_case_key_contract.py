@@ -581,7 +581,7 @@ def receipt_component_contract() -> None:
     """
     site = DRIVER_H.index('"  [RASBERY][CASE] {{')
     block = DRIVER_H[site:DRIVER_H.index(");", site)]
-    if '\\"schema_version\\":5' not in block:
+    if '\\"schema_version\\":6' not in block:
         fail("the [RASBERY][CASE] receipt did not bump schema_version when it "
              "gained the component fields; a reader cannot tell the two apart")
     # WP10.4.  The Sec 6.2 spelling of the fidelity, BESIDE the campaign one.

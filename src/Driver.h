@@ -5017,16 +5017,29 @@ public:
         // along under the other name.  The old key STAYS: the case key is
         // computed from it on both sides (tools/case_key.py COMPONENT_FIELDS)
         // and dropping it would invalidate every manifest on disk.  The new
-        // one is the name the audit reads.  schema_version 5 is what lets a
-        // reader tell a receipt that carries it from one that cannot.
+        // one is the name the audit reads.
+        //
+        // WP10.5.  `output` IS THE PER-CASE IDENTIFIER, and this line had none.
+        // It carried `case_key`, which is the CANONICAL DUPLICATE key -- and in
+        // a width-16 cold wave of one deck at one fidelity every case has the
+        // SAME one, by design.  So a mixed-fidelity audit, which resolves a
+        // receipt to the word its case was declared at, could not resolve this
+        // tag at all: the 55c0dce soak on 181 reported 82 cases as "no fidelity
+        // was declared for it" purely because the Driver's receipt named no
+        // case a declarer could have keyed on.  The `--raso` path is that name.
+        // It is unique per case by the evaluator's own wave namespace rule, it
+        // exists in every mode (argv, `--jobs` manifest, evaluator) -- unlike
+        // the evaluator's optional client `key` -- and the Driver already has
+        // it, so nothing is plumbed to print it.  schema_version 6.
         std::cout << std::format(
-            "  [RASBERY][CASE] {{\"schema_version\":5,\"case_key\":\"{}\",\"key_schema\":\"{}\","
+            "  [RASBERY][CASE] {{\"schema_version\":6,\"case_key\":\"{}\",\"key_schema\":\"{}\","
             "\"core_op\":\"{}\",\"deck_digest\":\"{}\",\"env_digest\":\"{}\","
             "\"env_set\":\"{}\","
             "\"xslib_digest\":\"{}\",\"xslib_policy\":\"{}\",\"warm_start_token\":\"{}\","
             "\"code_sha\":\"{}\",\"fidelity\":\"{}\",\"physics_fidelity\":\"{}\","
             "\"policy\":\"{}\","
-            "\"result_mode\":\"{}\",\"warm_start\":\"{}\",\"statepoint_grid\":\"{}\","
+            "\"result_mode\":\"{}\",\"output\":\"{}\","
+            "\"warm_start\":\"{}\",\"statepoint_grid\":\"{}\","
             "\"acceptance_eligible\":{},\"fidelity_declared\":{},\"promoted_from\":{}}}\n",
             case_key, casekey::kSchema, input_output.deck_key_core_op(),
             input_output.deck_key_digest(), case_env_digest,
@@ -5037,7 +5050,8 @@ public:
             jsonString(casekey::codeShaToken()),
             _case_receipt.physics_fidelity, _case_receipt.physics_fidelity,
             _case_receipt.policy,
-            ResultModeName(_result_mode), warm_status, _case_receipt.statepoint_grid,
+            ResultModeName(_result_mode), jsonString(result_path),
+            warm_status, _case_receipt.statepoint_grid,
             _case_receipt.acceptance_eligible ? "true" : "false",
             _fidelity.declared.empty()
                 ? std::string("null")

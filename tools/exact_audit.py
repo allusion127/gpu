@@ -261,6 +261,21 @@ def audit_physics_mode(output: str, declared: str = "strict") -> list[str]:
 # fields and this is what checks them, one case at a time, against what that
 # case was DECLARED as.
 
+#: The fields a per-case receipt may be IDENTIFIED by, in the order the audit
+#: tries them.  A declaration map is keyed on one of these, and a receipt that
+#: carries none of them cannot be matched to what its case was declared at.
+#:
+#: WP10.5 ADDED NOTHING HERE AND FIXED THE PROBLEM ANYWAY, which is worth saying
+#: because it is the shape of the bug: `[RASBERY][CASE]` carried only
+#: `case_key`, and a case key is the CANONICAL DUPLICATE key -- a width-16 cold
+#: wave of one deck at one fidelity gives all sixteen cases the same one, by
+#: design.  So the Driver tag was unmatchable in exactly the wave a
+#: mixed-fidelity audit exists for, and the 55c0dce soak on 181 reported 82
+#: cases as undeclared.  The repair was in the emitter: src/Driver.h now prints
+#: `output`, which the evaluator's own wave namespace rule already guarantees is
+#: unique per case.
+CASE_IDENTIFIER_FIELDS = ("key", "case_key", "output", "deck")
+
 #: What a per-case receipt must carry to be auditable at all.  A receipt missing
 #: one is from a binary older than WP10.3, and that is a REFUSAL rather than a
 #: pass: the field that would have voided the case is the missing one.
@@ -325,7 +340,7 @@ def parse_case_receipts(output: str) -> list[dict]:
 
 
 def _case_label(receipt: Mapping) -> str:
-    for field in ("key", "case_key", "output", "deck"):
+    for field in CASE_IDENTIFIER_FIELDS:
         value = receipt.get(field)
         if isinstance(value, str) and value:
             return value
@@ -378,7 +393,7 @@ def audit_case_fidelity(output: str, declared: "str | Mapping[str, str]" = "stri
             want = declared
         else:
             want = None
-            for field in ("key", "case_key", "output", "deck"):
+            for field in CASE_IDENTIFIER_FIELDS:
                 value = receipt.get(field)
                 if isinstance(value, str) and value in declared:
                     want = declared[value]
@@ -386,10 +401,28 @@ def audit_case_fidelity(output: str, declared: "str | Mapping[str, str]" = "stri
             if want is None:
                 want = declared.get("*")
             if want is None:
+                # WP10.5.  AN UNAMBIGUOUS REFUSAL.  The old message said only
+                # that the case was undeclared, which is true of two completely
+                # different faults: an operator who forgot to declare a case,
+                # and an emitter whose receipt carries no name the declarer
+                # could have used.  On 181 it was the second, 82 times, and the
+                # message could not tell them apart -- so the finding sat for a
+                # session as "not yet diagnosed".  Now it prints both sides.
+                carried = ", ".join(
+                    "%s=%r" % (f, receipt[f]) for f in CASE_IDENTIFIER_FIELDS
+                    if isinstance(receipt.get(f), str) and receipt[f])
+                sample = sorted(k for k in declared if k != "*")[:3]
                 problems.append(
-                    "%s: ran at policy=%r and no fidelity was declared for it. In a "
-                    "mixed-fidelity wave every case has to be declared, or its number "
-                    "has no column to go in." % (label, policy))
+                    "%s: ran at policy=%r and no fidelity was declared for it. The "
+                    "receipt is identified by [%s]; the declaration is keyed on [%s%s]. "
+                    "In a mixed-fidelity wave every case has to be declared, or its "
+                    "number has no column to go in. If the two lists share no field, "
+                    "the fault is in the EMITTER, not in the operator: a receipt whose "
+                    "only name is `case_key` names a duplicate class, not a case, and "
+                    "every case of one deck at one fidelity shares it."
+                    % (label, policy, carried or "nothing",
+                       ", ".join(repr(k) for k in sample),
+                       ", ..." if len(declared) > len(sample) else ""))
                 continue
         if want not in POLICIES:
             problems.append("%s: the declared fidelity %r is not one of %s"
@@ -459,7 +492,8 @@ def strip_non_strict(env: dict[str, str],
 
 
 __all__ = ["POLICIES", "DECLARABLE_FIDELITIES", "REQUIRED_FIELDS",
-           "CASE_REQUIRED_FIELDS", "CASE_FIELD_SYNONYMS", "case_field",
+           "CASE_REQUIRED_FIELDS", "CASE_IDENTIFIER_FIELDS",
+           "CASE_FIELD_SYNONYMS", "case_field",
            "case_field_present",
            "STAGED_TOLERANCE_KEYS", "STAGED_KEYS", "NON_STRICT_ENV_KEYS",
            "PHYSICS_MODE_RECEIPT", "CASE_RECEIPT", "EVALUATOR_CASE_RECEIPT",

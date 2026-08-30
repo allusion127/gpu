@@ -107,6 +107,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -272,6 +273,74 @@ struct Options {
     ManifestReader read_manifest;
 };
 
+namespace detail {
+
+/// How many per-case samples the process keeps resident, per series.
+///
+/// 4096 is chosen against the two things it has to serve.  A generation is 16
+/// to 64 cases, so the window spans 64 to 256 GENERATIONS -- far more than any
+/// percentile needs to be stable, and far more than the drift a reader is
+/// looking for.  And 4096 doubles is 32 kB per series: it can never again be
+/// the largest number in the memory receipt, which is exactly what went wrong.
+inline std::size_t sampleWindowCapacity() {
+    static const std::size_t capacity = [] {
+        const char*     v = std::getenv("RASBERY_EVALUATOR_SAMPLE_WINDOW");
+        const long long requested = (v && *v) ? std::atoll(v) : 0;
+        return requested > 0 ? static_cast<std::size_t>(requested) : std::size_t{4096};
+    }();
+    return capacity;
+}
+
+} // namespace detail
+
+/// A fixed-capacity ring of the most recent samples, plus the two facts a ring
+/// would otherwise destroy: how many were ever observed, and the exact maximum.
+///
+/// WHY A RING AND NOT A RESERVOIR.  A reservoir sample keeps the whole run in
+/// view but needs a random number generator, and a receipt whose p90 depends on
+/// a seed is a receipt two runs of the same deck can disagree about.  This
+/// repository's entire gate structure is bit-identity; a nondeterministic
+/// percentile has no place in it.  A ring is deterministic, and what it gives
+/// up -- the first cases of a very long run -- is the part a stability question
+/// least wants: "is the process still behaving" is a question about NOW.
+///
+/// `observed` and `max` are exact over every case regardless, so nothing that
+/// was true of the whole run before is unavailable after.
+class SampleWindow {
+public:
+    void push(double value) {
+        ++_observed;
+        if (value > _max) _max = value;
+        const std::size_t capacity = detail::sampleWindowCapacity();
+        if (_ring.size() < capacity) {
+            _ring.push_back(value);
+            return;
+        }
+        // A capacity lowered by the environment between two pushes would leave
+        // the ring longer than the cap; trim before writing so the bound holds
+        // from the first push after the change rather than never.
+        while (_ring.size() > capacity) _ring.erase(_ring.begin());
+        if (_cursor >= _ring.size()) _cursor = 0;
+        _ring[_cursor] = value;
+        _cursor = (_cursor + 1) % _ring.size();
+    }
+
+    /// The resident samples.  Order is not preserved and does not matter:
+    /// percentile() sorts.
+    [[nodiscard]] const std::vector<double>& values() const { return _ring; }
+    [[nodiscard]] std::size_t   resident() const { return _ring.size(); }
+    [[nodiscard]] std::uint64_t observed() const { return _observed; }
+    [[nodiscard]] std::size_t   bytes() const { return _ring.size() * sizeof(double); }
+    /// Exact over every case, not over the window.
+    [[nodiscard]] double max() const { return _observed == 0 ? 0.0 : _max; }
+
+private:
+    std::vector<double> _ring;
+    std::size_t         _cursor   = 0;
+    std::uint64_t       _observed = 0;
+    double              _max      = 0.0;
+};
+
 /// Everything the process receipt reports, accumulated across waves.
 struct Summary {
     long long cases        = 0;
@@ -291,8 +360,17 @@ struct Summary {
     double    uptime_s     = 0.0;
     double    drive_s      = 0.0;
     int       latched_width = 0;
-    std::vector<double> case_seconds;
-    std::vector<double> teardown_ms;
+    /// WP10.5.  BOUNDED, because the host 181 soak at 55c0dce watched these two
+    /// climb 18 -> 36 -> 54 -> 72 -> 90 and the new attribution named them as the
+    /// only container that moved -- on a run whose RSS moved by 3.3 GB.  Ninety
+    /// doubles is 1.4 kB; they were never the leak, but "the only thing that
+    /// grew" is what an attribution reports when the only thing that grows is
+    /// the thing that cannot matter.  Two repairs, and the second is the one
+    /// that mattered: the window is capped so it stops being a false lead, and
+    /// the receipt now publishes its BYTES so a mover can be weighed instead of
+    /// merely noticed.
+    SampleWindow case_seconds;
+    SampleWindow teardown_ms;
     StopReason stop = StopReason::EndOfStream;
     std::uint64_t pin_live_ranges_between_waves = 0;
     /// WP10.4.  The previous generation's RSS sample, so the per-generation
@@ -868,17 +946,23 @@ public:
             << ",\"geometry_builds\":" << _summary.cases
             << ",\"pin_live_ranges_between_waves\":"
             << _summary.pin_live_ranges_between_waves
+            // WP10.5.  The percentiles are over the RESIDENT WINDOW -- the last
+            // `window` cases -- and the window says how many that was, so a
+            // reader is never left guessing what the p50 is a p50 OF.  `max` is
+            // NOT windowed: it is tracked exactly, over every case the process
+            // ran, because the worst teardown a fleet ever paid is a fact about
+            // the run and not about the last four thousand cases of it.
             << ",\"case_seconds\":{\"p50\":"
-            << detail::percentile(_summary.case_seconds, 0.50)
-            << ",\"p90\":" << detail::percentile(_summary.case_seconds, 0.90) << "}"
+            << detail::percentile(_summary.case_seconds.values(), 0.50)
+            << ",\"p90\":" << detail::percentile(_summary.case_seconds.values(), 0.90)
+            << ",\"window\":" << _summary.case_seconds.resident()
+            << ",\"observed\":" << _summary.case_seconds.observed() << "}"
             << ",\"case_teardown_ms\":{\"p50\":"
-            << detail::percentile(_summary.teardown_ms, 0.50)
-            << ",\"p90\":" << detail::percentile(_summary.teardown_ms, 0.90)
-            << ",\"max\":" << (_summary.teardown_ms.empty()
-                                   ? 0.0
-                                   : *std::max_element(_summary.teardown_ms.begin(),
-                                                       _summary.teardown_ms.end()))
-            << "}"
+            << detail::percentile(_summary.teardown_ms.values(), 0.50)
+            << ",\"p90\":" << detail::percentile(_summary.teardown_ms.values(), 0.90)
+            << ",\"max\":" << _summary.teardown_ms.max()
+            << ",\"window\":" << _summary.teardown_ms.resident()
+            << ",\"observed\":" << _summary.teardown_ms.observed() << "}"
             << ",\"fidelity_overrides\":" << _summary.fidelity_overrides
             << ",\"promotions\":" << _summary.promotions
             << ",\"isolation_checks\":" << _summary.isolation_checks
@@ -1068,8 +1152,8 @@ private:
             reportCase(wave.wave_id, i, jobs.keys[u], jobs.inputs[u], jobs.outputs[u],
                        jobs.modes[u], status[u], failure[u], receipts[u], seconds[u],
                        teardown[u], lanes[u], false);
-            _summary.case_seconds.push_back(seconds[u]);
-            _summary.teardown_ms.push_back(teardown[u]);
+            _summary.case_seconds.push(seconds[u]);
+            _summary.teardown_ms.push(teardown[u]);
         }
         _summary.cases  += njobs;
         _summary.ok     += ok;
@@ -1224,13 +1308,21 @@ private:
              << ",\"quadratures\":" << cohorts.quadrature_builds
              << ",\"pin_records\":" << rasberyHostPinLiveRanges()
              << ",\"digest_memo\":" << BatchLightResult::HashCacheEntries()
-             // The two per-case vectors this receipt itself keeps.  Bounded by
-             // the case count and by nothing else, so they are REPORTED rather
-             // than assumed innocent: at 8 bytes a case they are ~10 MB after
-             // 10k generations of width 64, which is small and is not zero.
-             << ",\"case_samples\":" << _summary.case_seconds.size()
+             // The two per-case sample series this receipt itself keeps.  They
+             // WERE bounded by the case count and by nothing else; WP10.5 caps
+             // them at `case_samples_cap` after the 55c0dce soak reported them
+             // as the only growing container on a run that grew by 3.3 GB.
+             << ",\"case_samples\":" << _summary.case_seconds.resident()
+             << ",\"case_samples_cap\":" << detail::sampleWindowCapacity()
              << "}"
-             << ",\"cache_bytes\":{\"xslib\":" << xslib.bytes << "}"
+             // WP10.5.  BYTES BESIDE COUNTS, for every container that has a
+             // cheap answer.  The 55c0dce soak's attribution named
+             // `case_samples` because it was the only count that moved -- and
+             // it moved by 72 doubles while RSS moved by 3.3 GB.  A mover a
+             // reader cannot weigh is a mover a reader will believe.
+             << ",\"cache_bytes\":{\"xslib\":" << xslib.bytes
+             << ",\"case_samples\":"
+             << (_summary.case_seconds.bytes() + _summary.teardown_ms.bytes()) << "}"
              << ",\"evictions\":{\"xslib\":" << xslib.evictions
              << ",\"xslib_digest\":" << xslib.digest_evictions
              << ",\"cohort\":" << cohorts.evictions

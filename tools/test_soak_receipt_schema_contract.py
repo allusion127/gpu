@@ -125,10 +125,67 @@ def emitters_carry_every_audited_field() -> None:
 
 def driver_receipt_bumped_schema() -> None:
     block = driver_case_block()
-    if block and '\\"schema_version\\":5' not in block:
-        fail("[RASBERY][CASE] gained 'physics_fidelity' without bumping "
-             "schema_version to 5; a reader cannot tell a receipt that carries "
-             "the audited spelling from one that cannot")
+    if block and '\\"schema_version\\":6' not in block:
+        fail("[RASBERY][CASE] gained fields without bumping schema_version to 6; "
+             "a reader cannot tell a receipt that carries them from one that "
+             "cannot")
+
+
+def emitters_carry_a_per_case_identifier() -> None:
+    """WP10.5.  A receipt has to name a CASE, not a duplicate class.
+
+    THE 55c0dce REGRESSION.  With the WP10.4 field fix in, the Driver's receipts
+    stopped being refused as pre-WP10.3 and immediately started being refused
+    for a second reason: 82 of them, one per case, "ran at policy='strict' and
+    no fidelity was declared for it".  [RASBERY][CASE] carried exactly one
+    identifier -- case_key -- and a case key is the CANONICAL DUPLICATE key:
+    every case of one deck at one fidelity in a cold wave has the same one, by
+    design.  So the tag could not be matched to a per-case declaration in
+    precisely the mixed-fidelity wave the per-case audit exists for.
+
+    `output` is the identifier that works: unique per case by the evaluator's
+    own wave namespace rule, present in argv, manifest and evaluator modes
+    alike, and already in the Driver's hand -- nothing is plumbed to print it.
+    """
+    block = driver_case_block()
+    if not block:
+        return
+    fields = emitted_fields(block)
+    identifiers = [f for f in exact_audit.CASE_IDENTIFIER_FIELDS if f in fields]
+    if identifiers == ["case_key"]:
+        fail("[RASBERY][CASE]'s only identifier is 'case_key', which names a "
+             "DUPLICATE CLASS and not a case: one deck at one fidelity gives a "
+             "whole cold wave the same one. A per-case declaration can never be "
+             "resolved for this tag -- 82 cases on host 181 at 55c0dce")
+    if "output" not in fields:
+        fail("[RASBERY][CASE] does not publish 'output'; it is the only per-case "
+             "identifier the Driver holds in every mode")
+    if not identifiers:
+        fail("[RASBERY][CASE] carries no field in "
+             "exact_audit.CASE_IDENTIFIER_FIELDS at all")
+
+    server = server_case_block()
+    if server and "key" not in emitted_fields(server):
+        fail("[RASBERY][EVALUATOR][CASE] stopped echoing the client's 'key'")
+
+
+def soak_declares_every_identifier() -> None:
+    """The declarer has to key on a name the receipts actually carry."""
+    if "def declare(" not in SOAK_PY:
+        fail("tools/soak_run.py declares cases without the helper that registers "
+             "every name a receipt could be identified by")
+    if 'str(request["output"])' not in SOAK_PY:
+        fail("tools/soak_run.py does not declare a case under its output path, so "
+             "the Driver's own receipt has no declaration to resolve to")
+    fake = (ROOT / "tools" / "fake_rasbery_child.py").read_text(
+        encoding="utf-8", errors="replace")
+    if '"  [RASBERY][CASE] "' not in fake:
+        fail("tools/fake_rasbery_child.py does not emit [RASBERY][CASE]; the soak "
+             "harness would again be exercising only the tag that was already "
+             "right, which is how both WP10.4 and WP10.5 reached a host")
+    if '"output": output' not in fake:
+        fail("the fake's [RASBERY][CASE] carries no 'output', so the declaration "
+             "path it is meant to exercise is not exercised")
 
 
 def soak_audits_through_exact_audit() -> None:
@@ -152,7 +209,8 @@ DRIVER_RECEIPT = {
     "core_op": "op", "deck_digest": "d", "env_digest": "e", "env_set": "~",
     "xslib_digest": "x", "xslib_policy": "cached", "warm_start_token": "~",
     "code_sha": "sha", "fidelity": "full_exact", "physics_fidelity": "full_exact",
-    "policy": "strict", "result_mode": "full", "warm_start": "cold",
+    "policy": "strict", "result_mode": "full", "output": "/w/out/g0000c0000.h5",
+    "warm_start": "cold",
     "statepoint_grid": "full", "acceptance_eligible": True,
     "fidelity_declared": None, "promoted_from": None,
 }
@@ -214,6 +272,33 @@ def version_refusal_survives() -> None:
              "synonym is supposed to accept an alias, not the absence of one")
 
 
+def undeclared_refusal_is_unambiguous() -> None:
+    """The refusal must say WHICH side failed to name the case.
+
+    The old message said only "no fidelity was declared", which is true both of
+    an operator who forgot a case and of an emitter whose receipt carries no
+    name the declarer could have used.  On 181 it was the second, 82 times, and
+    the finding sat a whole session as "not yet diagnosed".
+    """
+    blind = audit(driver_line(output=...), {"g0000c0000": "strict"})
+    if not blind:
+        fail("a receipt with no declarable identifier was accepted; the audit "
+             "cannot then tell a declared case from an unmatched one")
+        return
+    message = " ".join(blind)
+    for token in ("case_key", "g0000c0000", "EMITTER"):
+        if token not in message:
+            fail(f"the undeclared-case refusal does not name {token!r}: it has to "
+                 "print what the receipt WAS identified by, what the declaration "
+                 "was keyed on, and which of the two is at fault")
+
+    resolved = audit(driver_line(), {"g0000c0000": "strict",
+                                     "/w/out/g0000c0000.h5": "strict"})
+    if resolved:
+        fail("a receipt declared under its output path still did not resolve: "
+             + "; ".join(resolved))
+
+
 def negative_controls() -> None:
     """Each check above must be able to fail."""
     controls: list[str] = []
@@ -249,10 +334,13 @@ def negative_controls() -> None:
 
 def main() -> int:
     emitters_carry_every_audited_field()
+    emitters_carry_a_per_case_identifier()
     driver_receipt_bumped_schema()
+    soak_declares_every_identifier()
     soak_audits_through_exact_audit()
     audit_reads_the_driver_tag()
     version_refusal_survives()
+    undeclared_refusal_is_unambiguous()
     negative_controls()
 
     if FAILURES:
@@ -262,7 +350,7 @@ def main() -> int:
         return 1
     print("soak receipt schema contract: PASS (2 emitters x "
           f"{len(exact_audit.CASE_REQUIRED_FIELDS)} audited fields, 1 synonym, "
-          "version refusal intact)")
+          "version refusal intact, per-case identifier declarable both ways)")
     return 0
 
 

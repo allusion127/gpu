@@ -256,6 +256,37 @@ def run_case(deck: str, output: str, mode: str, *, wave_id: int, index: int,
         "statepoint_grid": "full",
         "acceptance_eligible": declared_policy()[0] == "strict",
         "fidelity_declared": None, "promoted_from": None}
+    # WP10.5.  THE DRIVER'S OWN TAG, which the fake did not print.
+    #
+    # This is the second time the same hole cost a session.  WP10.4: the fake
+    # emitted only [EVALUATOR][CASE], so nothing exercised the tag whose
+    # `physics_fidelity` spelling was wrong.  WP10.5: the same silence hid that
+    # [RASBERY][CASE] carried no per-case identifier, so exact_audit could not
+    # resolve it to a declaration and reported 82 cases as undeclared on 181.
+    # A tag the harness never prints is a tag the harness cannot defend, so the
+    # fake now prints BOTH -- and unconditionally, exactly as Driver.h does
+    # (the real one is not behind a telemetry gate either).
+    if not failed:
+        emit("  [RASBERY][CASE] " + json.dumps({
+            "schema_version": 6,
+            "case_key": f"fake-{Path(deck).stem}",
+            "key_schema": "casekey/v1",
+            "core_op": "op",
+            "deck_digest": "d", "env_digest": "e", "env_set": "~",
+            "xslib_digest": "x", "xslib_policy": "cached",
+            "warm_start_token": "~", "code_sha": "sha",
+            "fidelity": resolved.get("physics_fidelity"),
+            "physics_fidelity": resolved.get("physics_fidelity"),
+            "policy": resolved.get("policy"),
+            "result_mode": mode or "full",
+            # The identifier.  Unique per case by the evaluator's own wave
+            # namespace rule, and the only name both halves can agree on.
+            "output": output,
+            "warm_start": "cold",
+            "statepoint_grid": resolved.get("statepoint_grid"),
+            "acceptance_eligible": resolved.get("acceptance_eligible"),
+            "fidelity_declared": resolved.get("fidelity_declared"),
+            "promoted_from": resolved.get("promoted_from")}))
     if receipts:
         receipt = {
             "wave_id": wave_id, "case": index, "key": key,
