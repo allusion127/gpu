@@ -279,3 +279,101 @@ python tools/test_dependent_template_contract.py
   `WarmState.h`·`XSTiming.h`·`XsLibrary.h`)와 `XSSet.cpp`의 `Sha256.h`가 host
   인라이닝을 바꿔 수축이 달라지는 경우다. 이는 소스로 판정할 수 없고 §4의 이분으로만
   좁혀진다.
+
+---
+
+## 6. 부록 (2026-08-30 추가): §3의 판정표는 틀렸다 — mask는 원인이 아니다
+
+### 6.1 238이 실제로 준 세 줄
+
+같은 호스트, 같은 arm-X 환경, `RASBERY_GPU_XE=1`, `XE_TXN` unset/0:
+
+| 커밋 | `[RASBERY][FORMS]` XE_FORMS | arm-X digest / outers |
+| --- | --- | --- |
+| `7cfe3a4` | `{"value":"0xd","source":"mined_matches_default","mined":"0xd"}` | `22b9a3187bfb4beb` / 4566 |
+| `d7b81af` | `{"value":"0xd2d","source":"mined","mined":"0xd2d"}` | `c1a5d9116df9edb3` / 4601 |
+| `8919331` | `{"value":"0xd2d","source":"mined","mined":"0xd2d"}` | `c1a5d9116df9edb3` / 4601 (h5diff 435, 불변) |
+
+`src/XeAndersonReference.cpp`는 `8919331`에서 `7cfe3a4`와 **byte identical**임이
+확인되었다. 즉 §2.1(b)(참조 TU 편집) 가설은 이미 되돌려졌고, 되돌린 뒤에도 궤적은
+움직인 채다.
+
+### 6.2 `0xd2d`를 분해하면 §3의 판정 규칙이 무너진다
+
+```
+0xd2d = 0xd | (1<<5) | (1<<8) | (1<<11)
+        ^^^   ^^^^^^^^^^^^^^^^^^^^^^^^^
+     shipped        algebra (WP7-C: DET=1, G0=0, G1=1, PROJ=1)
+```
+
+**shipped 하위 마스크(비트 0..4)는 두 커밋에서 동일한 `0xd`다.** 움직인 것은
+`RASBERY_GPU_XE_TXN` 전용 채널뿐이다. §3의 표는 `value`가 다르면 §2.1이 원인이라고
+적었지만, `value`는 **두 채널의 합집합**이었고 합집합이 움직였다는 사실만으로는
+production arm이 움직였는지 알 수 없다. 그 표의 첫 행은 폐기한다.
+
+### 6.3 비트 5 이상을 소비하는 live-arm 코드는 없다 (소스 판정)
+
+지시받은 대로 `xeFormMask()`의 모든 소비자를 훑었다. 결과는 **음성**이다.
+
+| 소비자 | file:line | 읽는 것 |
+| --- | --- | --- |
+| `xeDotChunk` (`kXeDotStage1`) | `src/XeKernel.h:432,433` | `(forms >> XE_DOT_FIRST_BIT) & 3ull`, `(forms >> XE_DOT_THIRD_BIT) & 1ull` |
+| `xeCandidateOrdinal` (`kXeCandidate`) | `src/XeKernel.h:336,337` | `(forms >> cand_bit) & 1ull`, `cand_bit ∈ {3,4}` |
+| `xeAndersonFit` (`kXeAndersonSolve`, TXN 전용) | `src/XeKernel.h:614,618,620,623` | `xeSiteState(forms, XE_TXN_*_BIT)` |
+| `auditAndersonFit` | `src/XeFormAudit.cpp:50` | full mask, `RASBERY_XE_FORMS_AUDIT` 뒤 |
+
+`kXeCommit`/`kXeHistory`/`kXeEvaluate`는 mask를 **인자로도 받지 않는다**.
+`forms != XE_FORMS_DEFAULT` / `popcount` / `switch(forms)` 형태의 전체-마스크 술어는
+트리 어디에도 없다. `resolveCalibratedFormMask`는 mask 폭을 검사하지 않으므로
+`XE_BIT_COUNT`가 5에서 13으로 커진 것도 값에 영향이 없다. 그리고 case key는
+`trajectory::kArmEnv`를 **raw getenv**로 읽으므로(`src/Driver.h:611`) unset인
+`RASBERY_XE_FORMS`는 두 커밋에서 똑같이 `null`이다 — 채굴값은 키에 들어가지 않는다.
+
+**결론: `71092e2`는 §2.1(a)로도 (b)로도 arm-X 궤적을 움직이지 않았다.**
+`7cfe3a4..d7b81af`의 회귀는 아직 **미귀속**이며, 남은 유일한 가설은 §5.2의 두 번째
+항목(헤더 추가로 인한 host 인라이닝/수축 변화)이다. §4의 B0 → B2(`47161ed`) →
+B1(`3df4ea7`) 이분을 끝까지 진행해야 한다. **B2가 이미 움직여 있으면 WP7-C는 완전히
+배제되고 범위는 `7cfe3a4..47161ed`(Task 10 PPR / Task 16 CRAM / WP1 guards / WP8-1)로
+바뀐다.**
+
+### 6.4 이 커밋이 그럼에도 바꾼 것 — 인자에서 채널을 없앤다
+
+소비자들이 각자 자기 필드만 좁혀 읽는다는 것은 **소스 사실이지 계약이 아니었다.**
+`forms != XE_FORMS_DEFAULT` 한 줄, `__popcll(forms)` 한 줄, 또는 새 열거자가 shipped
+비트 자리와 겹치는 순간, TXN 전용 채굴 결과가 플래그 하나 움직이지 않은 채 production
+궤적을 바꾼다 — WP7-C가 soundness 채널로 이미 한 번 저지른 바로 그 모양이다.
+
+| 파일 | 변경 |
+| --- | --- |
+| `src/XeKernel.h` | `XE_SHIPPED_FORMS`(비트 0..4) / `XE_ALGEBRA_FORMS`(비트 5..12). 리터럴이 아니라 `XE_TXN_DET_BIT`·`XE_BIT_COUNT`에서 유도 |
+| `src/XeFormMask.h` / `src/XeFormMiner.cpp` | `xeShippedFormMask()` = `xeFormMask() & XE_SHIPPED_FORMS`. 재해결 없음, 두 번째 getenv 없음 |
+| `src/CudaXsReconBackend.cu` | `xeDots`·`xeCandidate` 발사가 `xeShippedFormMask()`. `xeTransaction`만 full mask (호출 자체가 `rasberyGpuXeTxnEnabled()` 뒤) |
+| `src/XeFormMiner.cpp` | `[RASBERY][FORMS] {"mask":"XE_FORMS","resolved":...,"shipped":...,"algebra":...,"live_arm":"shipped","txn_arm":"resolved","algebra_sound":n}` 한 줄 추가. 합집합 줄은 그대로 남는다 |
+| `tools/test_xe_forms_shipped_split_contract.py` | **신규.** 33 검사 / 음성대조 18 |
+
+### 6.5 채굴 `0xd2d` 자체는 건전한가 — 그렇다
+
+`XE_FORMS_DEFAULT`의 비트 5 이상이 0인 것은 **측정이 아니라 측정의 부재**다
+(`src/XeKernel.h` 주석이 그렇게 적어 두었다: 저작 호스트에 nvcc가 없어 WP7-C 사이트는
+한 번도 측정된 적이 없다). 238은 그 네 사이트를 처음으로 실제 채굴했고, DET/G1/PROJ가
+"첫 곱을 add에 fuse"(state 1), G0가 "fuse 없음"(state 0)으로 나온 것은 `-O3
+-ffp-contract=fast`의 g++에서 전혀 이상하지 않다. `[WARN][FORMS]`도 뜨지 않았으므로
+`algebra_sound=true`, 즉 네 사이트 모두 0 mismatch로 결정적이었다. **채굴은 정상이고
+고칠 것이 없다.** 고칠 것은 그 값이 production 발사 인자에 실려 다니던 것이었다.
+
+### 6.6 238 검증 (이 커밋)
+
+```bash
+# arm X 1회, XE_TXN unset
+grep -h 'TRAJECTORY'          run_fix.log   # digest / outers
+grep -h 'RASBERY\]\[FORMS'    run_fix.log   # 2줄: 합집합 + shipped/algebra 분해
+h5diff -c results_7cfe3a4.h5 results_fix.h5 | tail -3
+```
+
+기대값과 판정:
+
+| 관측 | 기대 | 어긋나면 |
+| --- | --- | --- |
+| `"shipped":"0xd"` | `7cfe3a4`의 `value`와 동일 | shipped 채널이 실제로 움직인 것 → §2.1이 되살아난다 |
+| `"algebra":"0xd20"`, `"algebra_sound":1` | 238의 첫 실측 그대로 | 채굴 불안정, WP7-C 게이트 문제 |
+| digest `22b9a3187bfb4beb` / outers `4566` / h5diff `0/644` | — | **예상대로 어긋난다.** §6.3이 맞다면 이 커밋은 궤적을 되돌리지 않는다. 그때는 §4의 B2/B1 이분이 유일한 다음 수이며, 이 커밋은 그 이분에서 mask 채널을 영구히 배제해 준 것이다 |

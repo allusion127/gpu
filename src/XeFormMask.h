@@ -28,4 +28,24 @@ unsigned long long mineXeFormsOnThisHost(bool& sound, bool& algebra_sound);
 /// and never prints.
 unsigned long long xeFormMask();
 
+/// THE MASK THE PRODUCTION SPLIT ARM'S KERNELS ARE LAUNCHED WITH: exactly
+/// `xeFormMask() & XE_SHIPPED_FORMS`, bits 0..4 and nothing else.
+///
+/// WHY THIS IS A SECOND FUNCTION AND NOT A COMMENT ASKING CALLERS TO MASK.  The
+/// resolved mask is one number that answers TWO questions -- "how does this
+/// build contract the dot and the candidate" (bits 0..4, every Xe step of the
+/// RASBERY_GPU_XE arm) and "how does it contract WP7-C's normal equations"
+/// (bits 5..12, RASBERY_GPU_XE_TXN only).  On 238 the mined value moved from
+/// 0xd to 0xd2d when WP7-C's sites became minable, and the split arm's kernels
+/// were handed the whole 0xd2d.  Their bodies happened to extract only their
+/// own fields, so nothing moved; but the ARGUMENT carried bits from a channel
+/// no gate had cleared for that arm, and a single future `forms != DEFAULT` or
+/// `popcount(forms)` inside those kernels would have turned a TXN-only mining
+/// result into a production trajectory change with no flag moved.
+///
+/// The receipt still prints the FULL mined and resolved value -- a mask that is
+/// measured must be reported whole -- plus the two sub-masks, so a log says
+/// which bits each arm actually ran under.
+unsigned long long xeShippedFormMask();
+
 } // namespace rasbery::xe

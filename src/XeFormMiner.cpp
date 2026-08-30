@@ -66,9 +66,30 @@ unsigned long long xeFormMask() {
                          "shipped dot/candidate mask above is unaffected, but "
                          "RASBERY_GPU_XE_TXN=1 has no measured contraction contract on "
                          "this build and must not be trusted for a bit-identity claim\n";
+        // THE SPLIT, NAMED IN THE RECEIPT.  resolveCalibratedFormMask reports
+        // ONE number because CMFD_OUTER_FORMS is one channel; XE_FORMS is two,
+        // and a log that printed only the union could not answer the question
+        // 238 actually asked -- "did the bits the PRODUCTION arm runs under
+        // move?".  On 238 the union moved (0xd -> 0xd2d) and the shipped
+        // sub-mask did not (0xd -> 0xd); those are opposite verdicts about the
+        // B0 rule and only this line tells them apart.
+        std::cerr << "[RASBERY][FORMS] {\"mask\":\"XE_FORMS\",\"resolved\":\"0x"
+                  << std::hex << resolved << "\",\"shipped\":\"0x"
+                  << (resolved & XE_SHIPPED_FORMS) << "\",\"algebra\":\"0x"
+                  << (resolved & XE_ALGEBRA_FORMS) << std::dec
+                  << "\",\"live_arm\":\"shipped\",\"txn_arm\":\"resolved\","
+                     "\"algebra_sound\":"
+                  << (algebra_sound ? 1 : 0) << "}" << std::endl;
         return resolved;
     }();
     return mask;
+}
+
+unsigned long long xeShippedFormMask() {
+    // No second resolution and no second receipt: the same cached value, with
+    // the channel the caller is not allowed to see removed.  See XeFormMask.h
+    // for why the removal is here and not left to each kernel body.
+    return xeFormMask() & XE_SHIPPED_FORMS;
 }
 
 } // namespace rasbery::xe

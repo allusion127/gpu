@@ -2801,9 +2801,13 @@ bool XsReconBackend::xeDots(int ncol, double* out_six) {
 
     const int block1 = 128;
     const int total  = npairs * d.xe_parts;
+    // xeShippedFormMask() AND NOT xeFormMask(): this is the PRODUCTION split
+    // arm, and it must be launched with bits 0..4 only.  The WP7-C algebra bits
+    // (5..12) belong to xeTransaction below and to nothing else; see
+    // src/XeFormMask.h for what handing them to this launch cost on 238.
     kXeDotStage1<<<(total + block1 - 1) / block1, block1, 0, d.stream>>>(
         d.xe_hist, d.xe_hist_fuel, d.xe_parts, npairs, d.xe_pairs, d.xe_partials,
-        xe::xeFormMask());
+        xe::xeShippedFormMask());
     RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
     kXeDotStage2<<<1, xek::XE_DOT_COUNT, 0, d.stream>>>(
         d.xe_parts, npairs, d.xe_partials, d.xe_pairs + 2 * xek::XE_DOT_COUNT,
@@ -2831,9 +2835,10 @@ bool XsReconBackend::xeCandidate(const double* gamma, int ncol, double* step_out
 
     const int block = 256;
     const int grid  = (d.xe_hist_fuel + block - 1) / block;
+    // Shipped channel only -- same rule and same reason as xeDots above.
     kXeCandidate<<<grid, block, 0, d.stream>>>(d.xe_hist, d.xe_hist_fuel, ncol, gamma[0],
-                                               gamma[1], xe::xeFormMask(), d.xe_flags,
-                                               d.xe_bits);
+                                               gamma[1], xe::xeShippedFormMask(),
+                                               d.xe_flags, d.xe_bits);
     RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
 
     int                bad  = 0;
@@ -2964,6 +2969,11 @@ bool XsReconBackend::xeTransaction(const xsr::BatchView& host,
     xsr::BatchView v{};
     if (!d.stage(host, micx_generation, state_generation, true, v)) return false;
 
+    // THE ONE PLACE THE FULL RESOLVED MASK IS ALLOWED THROUGH.  This function
+    // runs only under RASBERY_GPU_XE_TXN=1 (Driver.h TryAndersonXeStepGpu gates
+    // the call), and kXeAndersonSolve is the only kernel in the tree that reads
+    // bits 5..12.  kXeDotStage1 and kXeCandidateTxn below still read only bits
+    // 0..4 out of it, which is why they can take the same argument.
     const unsigned long long forms = xe::xeFormMask();
 
     // 1. Evaluate.  x, F(x), g into the device history; the residual reduces

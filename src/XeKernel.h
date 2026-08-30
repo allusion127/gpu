@@ -131,6 +131,30 @@ constexpr int XE_TXN_G1_BIT    = 9;  ///< 2 bits, 3 states: a*q - b*p
 constexpr int XE_TXN_PROJ_BIT  = 11; ///< 2 bits, 3 states: g0*p + g1*q
 constexpr int XE_BIT_COUNT     = 13;
 
+/// THE TWO SUB-MASKS, AND WHY THE SPLIT IS A CONSTANT AND NOT A CONVENTION.
+///
+/// Bits 0..4 are the SHIPPED channel: the fixed-partition dot and the candidate
+/// loop, the two things the production RASBERY_GPU_XE arm launches on every Xe
+/// step whatever RASBERY_GPU_XE_TXN says.  Bits 5..12 are the ALGEBRA channel:
+/// WP7-C's normal equations, which only the transaction evaluates.
+///
+/// 8919331 already stopped the algebra channel's SOUNDNESS from demoting the
+/// shipped channel's VALUE.  It did not stop the algebra channel's BITS from
+/// travelling into the shipped kernels' `forms` argument: on 238 the mined mask
+/// went 0xd -> 0xd2d and the split arm's kernels were handed 0xd2d, relying on
+/// every consumer inside them to extract its own two-bit field and ignore the
+/// rest.  They do (xeDotChunk masks &3 and &1, xeCandidateOrdinal masks &1), so
+/// the arithmetic did not move -- but "relies on every future reader to mask"
+/// is not a contract, it is a hope, and the WP7-C episode is what a broken hope
+/// costs.  The shipped kernels are now handed `resolved & XE_SHIPPED_FORMS`
+/// and the algebra bits are unrepresentable in that argument.
+///
+/// tools/test_xe_forms_shipped_split_contract.py pins both halves.
+constexpr unsigned long long XE_SHIPPED_FORMS =
+    (1ull << XE_TXN_DET_BIT) - 1ull; ///< bits 0..4 -- dot + candidate, 0x1f
+constexpr unsigned long long XE_ALGEBRA_FORMS =
+    (((1ull << XE_BIT_COUNT) - 1ull) & ~XE_SHIPPED_FORMS); ///< bits 5..12, 0x1fe0
+
 /// States of the first dot site.
 constexpr unsigned XE_DOT_FIRST_NONE = 0u; ///< both products rounded, plain add
 constexpr unsigned XE_DOT_FIRST_P1   = 1u; ///< fma(a1,b1, mul(a2,b2))
