@@ -337,3 +337,199 @@ flat-XS device 블록에서 내려온 것이다 — device → host → device.
 같이 사라진다. `kSlot = {XSAF, XSFF, XS2N, XS3N}`는 `CudaCramBackend.cu:55`의
 private 상수이므로, XSSet에 그 목록을 **복제하지 않는 것**이 조건이다 —
 복제한 순간 두 번째 의견이 생기고, 그것은 이 트리가 반복해서 피해 온 실수다.
+
+---
+
+# WP15.1 — batch(8×M8+MPS)는 PCIe-bound이고, 그 절반이 micro-XS다 (addendum)
+
+## 9. 새 기준 사실 (238 block 18, batch 8×M8+MPS, 64 case, 236 s, 8 프로세스 ledger 합)
+
+| 항목 | 값 |
+|---|---:|
+| 총 PCIe | **4.7 TB** (H2D 1.71 TB / 6.24 M copy, D2H 2.99 TB / 5.23 M copy) |
+| 지속 대역 | **≈ 20 GB/s** — 런 전체가 PCIe-bound |
+
+상위 지점:
+
+| # | 지점 | dir | TB | case당 |
+|---|---|---|---:|---:|
+| 1 | `DeviceBlock::download:flatxs micx mic` | D2H | **1.68** | 26.2 GB |
+| 2 | `NodalArena::memcpyAsyncOrFail:nodal arena consts H2D` | H2D | **0.43** | 6.7 GB |
+| 3 | `flatxs micx msm` | D2H | 0.37 | 5.8 GB |
+| 4 | `solveFlatXs:ref mic` | H2D | 0.31 | 4.8 GB |
+| 5 | `nodal arena jnet H2D` | H2D | 0.23 | 3.6 GB |
+| 6 | `nodal arena jnet D2H` | D2H | 0.23 | 3.6 GB |
+| 7 | `nodal arena phis D2H` | D2H | 0.23 | 3.6 GB |
+| 8 | `issueSweepUploads:push:dhat` (CudaBICGBackend) | H2D | 0.23 | 3.6 GB |
+| 9 | `xe commit xs` | D2H | 0.18 | 2.8 GB |
+
+**1 + 3 = 2.05 TB, 전체의 43.6 %가 micx/lmpx 다운로드 한 지점이다.**
+
+## 10. (1) batch 경로가 이미 덮이는가 — **덮인다. 새 코드가 필요 없다**
+
+확인한 것:
+
+- **flat-XS solve는 트리에 하나뿐이다.** `solveFlatXs`를 부르는 곳은
+  `XSSet::TryUpdateFlatXSGpu` 한 곳이고, batch/evaluator는 프로세스 하나에
+  Driver M개를 두는 구조라 **XSSet도 XsReconBackend도 인스턴스마다 하나**다.
+  `micx_scalars_pending` / `micx_scatter_pending`는 `Impl`의 필드,
+  `_micx_device_scalars` / `_micx_device_scatter`는 XSSet의 필드이므로 슬롯당 독립이다.
+- **`NodalArena`는 nodal 전용이다.** 그 클래스 본문에 `micx`도 `flatxs`도 없다
+  (계약 테스트 M10이 이 부재를 지킨다). CMFD의 `CudaBatchArena`도 마찬가지다.
+  즉 **batch에는 두 번째 flat-XS 경로가 없고**, 6bdfdc2의 지연이 그대로 적용된다.
+- **evaluator의 재활용 워커**: `_xsrecon_backend`는 XSSet이 소유하므로 새 케이스가
+  새 XSSet을 만들면 backend도 새로 생기고 플래그는 false에서 출발한다.
+  `mark_micx_resident`는 batch에서도 `!any_rodded`로 같은 값이다.
+
+**따라서 항목 1은 코드 변경이 아니라 계약 테스트(M10)와 이 문단으로 닫는다.**
+
+## 11. (2) CRAM `H2D mic` → D2D — **구현했다**
+
+`CudaCramBackend.cu`가 depletion step마다 4슬롯 × 5.27 MB를 host에서 올렸고,
+그 host 복사본은 바로 이 flat-XS device 블록에서 내려온 것이었다. device→host→device.
+
+- 생산자(`CudaXsReconBackend`): `micxDeviceSlot(xt)` — resident 블록 안의 device 주소.
+  `micxReadyEvent()` — **매 요청마다 다시 record하는** stream event. 다시 record하는
+  이유는 소비자가 원하는 것이 "지금까지 큐된 것이 끝났다"이지 "어떤 특정 solve가
+  끝났다"가 아니기 때문이다.
+- 중개자(`XSSet::FillCramMicDevice`): **세대 검사가 안전성의 전부다.**
+  `micxResidentGeneration() != _micx_generation`이면 거절하고, 호출자는 종전대로
+  실체화 후 업로드한다. **11개 전부 아니면 0개** — 반쪽 테이블은 한 축약에 두 epoch를
+  섞고, 그것은 어떤 세대 검사로도 보이지 않는다.
+- 소비자(`CudaCramBackend::fillMic`): `kSlot` 의미는 그대로다 — 여전히 호출자의
+  **11슬롯 배열**을 인덱싱하고, 올리는 4개는 여전히 `{XSAF, XSFF, XS2N, XS3N}`이다.
+  바뀐 것은 그 4개의 **출처**뿐. `cudaStreamWaitEvent`가 없으면 D2D를 하지 않는다 —
+  두 backend는 다른 스트림이고, event 없는 D2D는 유한하고 그럴듯한 오답을 만든다.
+
+**부수 효과가 본체만큼 크다**: D2D가 성립하면 `DepleteGpu` / `CorrectorStepGpu`는
+host `_micx`를 **읽지 않으므로** `EnsureMicxHost`도 건너뛴다.
+
+| | before/case | after/case |
+|---|---:|---:|
+| CRAM `H2D mic` | 1.43 GB | **0** (D2D) |
+| corrector 쪽 실체화 D2H | 1.67 GB | **0** |
+
+## 12. (3)(4)(5) — 재기만 하고 고치지 않은 것들, 그리고 이유
+
+### (3) `solveFlatXs:ref mic/msm` 0.31 TB — **전제가 틀렸다**
+
+"ref 블록은 이전 statepoint에 device에서 온 host 복사본"이라는 전제를 확인했고,
+**아니다**. `_ref_micx` / `_ref_lmpx`는 device가 한 번도 쓰지 않는다 —
+`PrecomputeBranchCoefficients`가 **라이브러리 `lib_micx`를 연소도에서 보간해서**
+짓는 host 배열이다. 그래서 D2D도 포인터 교체도 성립하지 않고,
+`_ref_generation`이 오르는 69회/case는 전부 **값이 실제로 달라진** 재구축이다
+(35 statepoint × ~2 = 연소도 갱신 + predictor의 `UpdateBurnup`).
+`ByteExactMirror`를 걸면 hit ≈ 0에 인스턴스당 59.5 MB의 host 그림자와 statepoint당
+~6 ms의 memcmp만 남는다 — batch에서는 인스턴스 64개니까 3.8 GB의 host RAM이다.
+**넣지 않았다.**
+
+**올바른 형태는 WP13 §6의 7번 그대로다: 연소도 보간을 device에서 하는 것.**
+라이브러리 계수 테이블은 **이미 device에 있다**(`d.lib->block`, 프로세스당 1회,
+content-hash로 인스턴스 간 공유). 그러면 필요한 업로드는 노드당 `(lo, hi, f)` 세 값
+= 8,451 × 20 B ≈ 0.17 MB로, 59.5 MB를 **350배** 줄인다. 다만 host 식이
+`lo + f*(hi-lo)`이고 gcc가 이것을 FMA로 접으므로 이 트리의 mined-form 규약
+(`xsrFma` / `ncMa1`)을 거쳐야 B0다 — **커널 작성 + form mining + replay 게이트**가
+필요하고 컴파일러 없이 검증할 수 없어 이번에 하지 않았다.
+
+### (4) NodalArena — consts는 못 지운다, jnet H2D는 지웠다
+
+**consts 0.43 TB: §4와 같은 이유로 B0가 아니다.** 9종은 host 산술
+(`Nodal::updateConstant`)이고 device 대체 커널(`src/CudaNodalConstantKernel.h`)은
+**N1**이다(CUDA `exp`가 glibc와 1 ulp 차이, 이 body가 평가하는 인자의 3.34 %).
+arena의 게이트는 이미 `sl.const_gen != sl.res_const_gen`이라 "바뀌었다"고 말한 뒤에
+도달하므로 byte-mirror는 hit ≈ 0이다.
+
+batch가 single(3.92 GB/case)보다 큰 6.7 GB/case인 것은 **슬롯 재입주** 때문이다 —
+`acquireSlot`의 `sl = Slot{}`이 `have_const=false`로 되돌리므로 새 tenant는 9종을
+전부 다시 올린다. 그것은 옳다(이전 tenant의 잔류를 물려받는 것이 이 arena가 이미
+한 번 물린 버그다). 지우려면 슬롯보다 오래 사는 content 키가 필요하고, 별도 WP다.
+
+**jnet H2D 0.23 TB: `Slot::jnet_mirror`를 넣었다. 그리고 이 그림자는 트리의 다른
+모든 그림자와 반대로 DOWNLOAD에서 commit된다.** jnet에는 device writer가 있으므로
+(`kNodalJnet`) "내가 마지막으로 보낸 바이트"는 device 내용에 대한 참인 진술이
+아니다. 그러나 drive는 **바로 그 버퍼를 `h_jnet`으로 내려받으며 끝나므로**, drain
+직후 host와 device는 비트 동일하고 거기서 commit한 그림자는 정확히 "device가 이
+바이트를 들고 있다"이다. 다음 drive까지 `h_jnet`을 건드릴 수 있는 것은 host뿐이고,
+batch arm의 host outer body는 jnet을 **읽어서 dhat을 만들 뿐 쓰지 않는다** — 그래서
+hit률이 높을 것으로 본다. `nodal_jnet_hit_rate`가 그것을 잰다.
+
+**legacy 슬롯 전용이다.** adopted 슬롯의 `v.jnet`은 CMFD backend의 canonical 버퍼이고
+device sweep이 두 drive 사이에 쓸 수 있다 — 거기서는 기존 `canonicalElides*`가 결정을
+소유한다. 엘리전이 D2H가 **실제로 일어난** drive에서만 commit되는 것도 같은 이유다:
+elide된 다운로드는 `h_jnet`에 더 오래된 device 상태를 남긴다.
+계약 테스트 M9가 이 세 성질을 지킨다.
+
+per-instance 경로의 같은 업로드에는 **넣지 않았다**: 그쪽 `enqueue_full`은
+**CUDA 그래프로 캡처**되므로 호출마다 토폴로지가 바뀌는 조건부 memcpy를 넣을 수 없다.
+arena의 업로드/다운로드는 그래프 밖(`cudaGraphLaunch` 전후의 평범한 async copy)이라
+가능했다. 그쪽은 canonical 바인딩이 담당한다.
+
+**jnet/phis D2H 0.46 TB는 남는다.** 이 둘은 host가 정말로 읽는다 — 그리고 무엇을 위해
+읽는지가 §9의 8번이다: `push:dhat H2D 0.23 TB`. **nodal jnet D2H → host가 dhat 형성 →
+dhat H2D**, §4의 consts와 **같은 모양의 왕복**이다. 지우려면 dhat을 device에서 만들어야
+하고 그것은 `src/CudaBICGBackend.cu`다 — 다른 에이전트의 파일이므로 **후속으로
+남긴다**(§14가 그 인계다).
+
+### (5) `xe commit xs` 0.18 TB — 인구조사는 했고, 슬라이스는 넣지 않았다
+
+`_xs`를 이름으로 부르는 XSSet 함수 18개를 전수 조사했다. host가 읽는 슬롯은
+`xsdf, xsnf, xsrf, xskf, xsaf, xssf` + `xssm`이고, `xstf` · `xsff` · `fyld` 접근자는
+XSSet 밖 호출자가 **0개**다. 그래서 11 → 7 슬라이스는 13 copy 중 4개,
+case당 0.51 GB(batch 0.055 TB)로 **작다**.
+
+**그리고 작은 것보다 나쁜 것은 안전 증명이 micx보다 어렵다는 것이다.**
+`_xs`는 `state_generation` 불일치 때 `stage()` / `solveFlatXs`가 **11슬롯 통째로 다시
+업로드**한다. 내려받지 않은 슬롯이 host에 남아 있으면 그 stale 바이트가 device로
+되올라간다 — micx에는 없는 경로다(micx는 `micx_generation` 게이트가 지연과 짝을
+이룬다). 게다가 `PredictorStep`의 `_xs_bos` 스냅샷은 11슬롯 전부를 복사한다.
+즉 `_xs`의 올바른 처방은 슬라이스가 아니라 **micx와 같은 dirty-flag 전체 처리**이고,
+reader 인구가 다르므로 별도 WP다.
+
+## 13. batch 런북 부록 (8×M8+MPS, ledger on)
+
+```
+# BASE : v5 PROD env + --batch-mode 8 (×8 프로세스, MPS) + RASBERY_XFER_LEDGER=1
+# MICX : BASE + RASBERY_GPU_MICX_RESIDENT=1
+```
+
+64 case / 236 s 기준, **case당 바이트 before → after**:
+
+| 지점 | before | after | 근거 |
+|---|---:|---:|---|
+| `flatxs micx mic` D2H | 26.2 GB | **1.61 GB** | 실체화 **34회** × 9 × 5.27 MB |
+| `flatxs micx msm` D2H | 5.8 GB | **0** | §2(c)가 PROD에서 0회 |
+| `flatxs lmpx lmp/lsm` D2H | 0.9 GB | **0.04 GB** | 34 × 9 × 135 KB |
+| CRAM `H2D mic` | 1.43 GB | **0** | §11 D2D |
+| `nodal arena jnet H2D` | 3.6 GB | **≈0.4 GB** | 그림자 hit률 ~90 % 가정; `nodal_jnet_hit_rate`가 잰다 |
+| **소계** | **37.9 GB** | **≈2.05 GB** | |
+
+**실체화가 68회가 아니라 34회인 것이 §11의 두 번째 효과다.** §7.3은 depletion step당
+2회(predictor + corrector)를 예상했는데, CRAM D2D가 corrector 쪽을 없앤다. 남는 34회는
+`PredictorStep`의 `_micx_bos` 스냅샷 — 순수 host 복사이고, 그것을 없애는 것은
+`_micx_bos`에 같은 dirty-flag를 다는 별도 작업이다(§14). **단일 덱 §7.3의 수치도
+같은 비율로 갱신된다: 실체화 68 → 34, micx D2H 3.33 → 1.65 GB.**
+
+64 case 합: **2.43 TB → 0.13 TB, −2.30 TB (전체 4.7 TB의 49 %)**.
+20 GB/s 지속 대역이 그대로라면 **236 s → 약 120 s**가 상한이고, PCIe가 유일한 병목이
+아니므로 실측은 그보다 클 것이다 — **그 차이가 다음 병목의 크기다.**
+
+게이트는 §7.2와 동일하고, batch에서 여섯 줄이 더 붙는다:
+
+| 게이트 | 기준 |
+|---|---|
+| 64 case digest | BASE와 **전부 동일** |
+| `[RASBERY][ERROR][micx]` | 8 프로세스 로그 통틀어 0회 |
+| `[RASBERY][MICX] resident_hits` | 슬롯마다 > 0 (G0) |
+| `cram_micx_h2d_mb` | **≈0**, `cram_micx_d2d_mb`가 종전 값을 이어받는다 |
+| `nodal_jnet_elision_tests` | > 0 (0이면 arm이 arena에 닿지 않은 것) |
+| `stale_tenants` | 0 — `jnet_mirror`가 슬롯 재입주에서 초기화되는지의 영수증 |
+
+## 14. 후속 (이 작업의 파일 범위 밖)
+
+| 지점 | TB | 필요한 것 | 파일 |
+|---|---:|---|---|
+| `push:dhat` H2D + `nodal jnet/phis` D2H | ~0.69 | dhat을 device에서 형성 → jnet/phis 왕복 소멸 | `src/CudaBICGBackend.cu` (다른 에이전트) |
+| `nodal arena consts` H2D | 0.43 | N1 상수 커널 채택(Task 22) 또는 `Nodal::updateConstant`의 dirty 노드 추적 | `src/Nodal.cpp` |
+| `solveFlatXs:ref mic/msm` H2D | 0.31 | device 연소도 보간 + form mining + replay 게이트 | `src/FlatXsKernel.h` 신규 커널 |
+| `xe commit xs` D2H | 0.18 | `_xs` 전체 dirty-flag 처리(슬라이스 아님) | 별도 WP |
+| `PredictorStep`의 `_micx_bos` 스냅샷 | (0.10 유발) | `_micx_bos`에 같은 dirty-flag — 이것을 없애면 실체화가 34 → ~0이 된다 | `src/XSSet.cpp` |

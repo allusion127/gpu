@@ -483,6 +483,13 @@ std::atomic<unsigned long long> g_nodal_drives{0};
 /// main() long after any particular backend went away.
 std::atomic<unsigned long long> g_canon_up_bytes{0};
 std::atomic<unsigned long long> g_canon_down_bytes{0};
+/// WP15.1: the batch nodal arena's jnet upload shadow.  `tests` is the
+/// denominator the hit rate needs -- an arm with 0 tests elided nothing because
+/// it was never consulted, which reads very differently from one that was
+/// consulted and always missed.
+std::atomic<unsigned long long> g_nodal_jnet_elided_bytes{0};
+std::atomic<unsigned long long> g_nodal_jnet_elision_hits{0};
+std::atomic<unsigned long long> g_nodal_jnet_elision_tests{0};
 std::atomic<unsigned long long> g_nodal_graph_launches{0};
 std::atomic<unsigned long long> g_nodal_graph_fallbacks{0};
 /// Rev.7.1 Task 10 part 4: how many times the drive had to CAPTURE, as opposed
@@ -792,6 +799,7 @@ public:
         _use_graph     = !envFlagDisabled("RASBERY_GPU_NODAL_GRAPH");
         _fuse_mat_even = nodalFuseMatEvenEnabled();
         _mirror_xs     = nodalXsMirrorEnabled();
+        _jnet_mirror   = rasberyGpuMicxResidentEnabled();
         init(proto);
     }
 
@@ -1071,6 +1079,26 @@ private:
         cuda_transfer::ByteExactMirror<double> xssm_mirror;
         // RASBERY_NODAL_XS_MIRROR_NO_BATCH_ALLOCATION
         bool pushed_xsrf = false, pushed_xsnf = false, pushed_xssm = false;
+        // WP15.1: the jnet shadow, and it is COMMITTED AT THE DOWNLOAD, not at
+        // the upload -- which is the opposite of every other mirror in this
+        // tree and the only reason this one is sound.
+        //
+        // jnet has a DEVICE writer: kNodalJnet writes it on every drive.  So
+        // "what the host last sent" is not a statement about device content and
+        // the usual upload-committed shadow would be wrong here.  But the drive
+        // ENDS by downloading that same buffer into `h_jnet`, so at the drain
+        // host and device are bit-equal, and a shadow committed THERE says
+        // exactly "the device holds these bytes".  If the host has not touched
+        // `h_jnet` by the next drive -- and in the batch arm nothing does, the
+        // host outer body reads jnet to form dhat and never writes it -- the
+        // upload is a copy of bytes the device already has.
+        //
+        // ONLY FOR A LEGACY SLOT.  An ADOPTED slot's `v.jnet` is the CMFD
+        // backend's canonical buffer, which a device sweep can write between
+        // two nodal drives; there the existing canonicalElides* predicate owns
+        // the decision and this shadow must not be consulted.
+        cuda_transfer::ByteExactMirror<double> jnet_mirror;
+        bool                                   downloaded_jnet = false;
         // Page-locking is idempotent but it is a synchronising call, so it runs
         // only when one of these pointers actually changed (i.e. once).
         const void* pin_bulk[6]  = {}; // jnet, phis, flux, xsrf, xsnf, xssm
@@ -1120,6 +1148,10 @@ private:
             return false;
         if (sl.xsrf_mirror.valid() || sl.xsnf_mirror.valid() || sl.xssm_mirror.valid())
             return false;
+        // WP15.1: the jnet shadow is per-slot state that lives in Slot, so the
+        // `sl = Slot{}` in acquireSlot does reach it -- but the audit's job is
+        // to notice a field that stops being reset, not to assume it.
+        if (sl.jnet_mirror.valid() || sl.downloaded_jnet) return false;
         for (int i = 0; i < 6; ++i)
             if (sl.pin_bulk[i] != nullptr) return false;
         for (int i = 0; i < 9; ++i)
@@ -1654,9 +1686,21 @@ private:
                                            sl.ownerOf(gpu::CanonicalRegion::Jnet),
                                            gpu::CanonicalOwner::Nodal)) {
                 g_canon_up_bytes.fetch_add(sgb, std::memory_order_relaxed);
-            } else if (!memcpyAsyncOrFail(v.jnet, sl.h_jnet, sgb, cudaMemcpyHostToDevice,
-                                          "nodal arena jnet H2D")) {
-                return drained();
+            } else if (_jnet_mirror && canon.jnet == nullptr &&
+                       sl.jnet_mirror.matches(sl.h_jnet, _cnt_sg)) {
+                // WP15.1.  See Slot::jnet_mirror: the shadow was committed at
+                // the previous drive's DOWNLOAD of this same buffer, so a match
+                // means the device already holds these bytes.  Legacy slots
+                // only -- an adopted slot's jnet has a second device writer.
+                g_nodal_jnet_elided_bytes.fetch_add(sgb, std::memory_order_relaxed);
+                g_nodal_jnet_elision_hits.fetch_add(1, std::memory_order_relaxed);
+                g_nodal_jnet_elision_tests.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                if (_jnet_mirror && canon.jnet == nullptr)
+                    g_nodal_jnet_elision_tests.fetch_add(1, std::memory_order_relaxed);
+                if (!memcpyAsyncOrFail(v.jnet, sl.h_jnet, sgb, cudaMemcpyHostToDevice,
+                                       "nodal arena jnet H2D"))
+                    return drained();
             }
             if (gpu::canonicalElidesUpload(canon, gpu::CanonicalRegion::Flux,
                                            sl.ownerOf(gpu::CanonicalRegion::Flux),
@@ -1700,12 +1744,19 @@ private:
             const std::size_t s  = static_cast<std::size_t>(m);
             const ndl::NodalView&            v     = _h_views[s];
             const gpu::CanonicalSlotBuffers& canon = _canon[s];
+            sl.downloaded_jnet = false;
             if (gpu::canonicalElidesDownload(canon, gpu::CanonicalRegion::Jnet,
                                              sl.canon_materialize)) {
                 g_canon_down_bytes.fetch_add(sgb, std::memory_order_relaxed);
             } else if (!memcpyAsyncOrFail(sl.h_jnet, v.jnet, sgb, cudaMemcpyDeviceToHost,
                                           "nodal arena jnet D2H")) {
                 return drained();
+            } else {
+                // WP15.1: the ONLY event that makes the shadow true.  An elided
+                // download leaves `h_jnet` describing some earlier device state,
+                // and committing that would license an elision of an upload the
+                // device does need.
+                sl.downloaded_jnet = _jnet_mirror && canon.jnet == nullptr;
             }
             if (gpu::canonicalElidesDownload(canon, gpu::CanonicalRegion::Phis,
                                              sl.canon_materialize)) {
@@ -1730,6 +1781,10 @@ private:
             if (sl.pushed_xsnf) sl.xsnf_mirror.commit(sl.h_xsnf, _cnt_ng1);
             if (sl.pushed_xssm) sl.xssm_mirror.commit(sl.h_xssm, _cnt_ng2);
             sl.pushed_xsrf = sl.pushed_xsnf = sl.pushed_xssm = false;
+            // WP15.1: after the drain the D2H has LANDED, so `h_jnet` is the
+            // device's jnet.  Committed here and nowhere else.
+            if (sl.downloaded_jnet) sl.jnet_mirror.commit(sl.h_jnet, _cnt_sg);
+            sl.downloaded_jnet = false;
         }
         g_nodal_batch_xs_h2d_bytes.fetch_add(xs_h2d_bytes, std::memory_order_relaxed);
         g_nodal_batch_xs_h2d_skipped_bytes.fetch_add(
@@ -1799,6 +1854,11 @@ private:
     bool                     _use_graph = true;
     bool            _fuse_mat_even = true;
     bool            _mirror_xs = true;
+    /// WP15.1: the jnet shadow arm.  Shares RASBERY_GPU_MICX_RESIDENT because
+    /// it is the same claim about the same run -- a copy whose bytes the device
+    /// already holds -- and a second knob for one 238 gate is a second thing to
+    /// forget to set.
+    bool            _jnet_mirror = false;
 
     std::size_t _cnt_ndg = 0, _cnt_ng1 = 0, _cnt_ng2 = 0, _cnt_sg = 0;
 
@@ -2003,6 +2063,10 @@ struct XsReconBackend::Impl {
     // materialisation, and that is the only way this can be wrong.
     bool micx_scalars_pending = false; // 9 mic + 9 lmp live only on the device
     bool micx_scatter_pending = false; // msm + lsm live only on the device
+    /// WP15.1: the handover the CRAM backend's stream waits on before it reads
+    /// this block D2D.  Created on first ask, re-recorded on every ask: it is a
+    /// point in THIS stream's history, not a promise about a particular solve.
+    cudaEvent_t micx_ready_event = nullptr;
 
     // --- flat-XS extension (RASBERY_GPU_FLATXS) ---------------------------
     double*            dev_ref = nullptr; // [9 mic | msm | 9 lmp | lsm]
@@ -3700,6 +3764,49 @@ bool XsReconBackend::micxScatterPending() const {
 unsigned long long XsReconBackend::micxResidentGeneration() const {
     return _impl->resident_micx_generation;
 }
+
+const double* XsReconBackend::micxDeviceSlot(int xt) const {
+    const Impl& d = *_impl;
+    // resident_micx_generation == 0 is the "nothing is resident" sentinel this
+    // file has used since the xsrecon solve: without it a caller would be handed
+    // an address into a block no solve has written.
+    if (!d.available || d.dev_block == nullptr || d.resident_micx_generation == 0)
+        return nullptr;
+    if (xt < 0 || xt >= xsr::NXS) return nullptr;
+    return d.dev_block + d.off_mic[xt];
+}
+
+void* XsReconBackend::micxReadyEvent() {
+    Impl& d = *_impl;
+    if (!d.available || d.stream == nullptr) return nullptr;
+    if (d.micx_ready_event == nullptr) {
+        // DisableTiming: this event is a stream-ordering handover, never a
+        // measurement, and the timing variant costs a synchronising query the
+        // consumer would pay on every depletion step.
+        if (cudaEventCreateWithFlags(&d.micx_ready_event, cudaEventDisableTiming) !=
+            cudaSuccess) {
+            d.micx_ready_event = nullptr;
+            return nullptr;
+        }
+    }
+    // RE-RECORDED ON EVERY ASK.  The consumer wants "everything this backend has
+    // queued so far has finished", which is a moving target -- an event recorded
+    // once at creation would let a corrector read a block a later solve was
+    // still writing.  Recording is cheap; being wrong here is not.
+    if (cudaEventRecord(d.micx_ready_event, d.stream) != cudaSuccess) return nullptr;
+    return static_cast<void*>(d.micx_ready_event);
+}
+
+unsigned long long XsReconBackend::nodalJnetElidedBytes() {
+    return g_nodal_jnet_elided_bytes.load(std::memory_order_relaxed);
+}
+unsigned long long XsReconBackend::nodalJnetElisionHits() {
+    return g_nodal_jnet_elision_hits.load(std::memory_order_relaxed);
+}
+unsigned long long XsReconBackend::nodalJnetElisionTests() {
+    return g_nodal_jnet_elision_tests.load(std::memory_order_relaxed);
+}
+
 
 bool XsReconBackend::downloadFlatXsMicx(const fxs::FlatXsView& host, bool scalars,
                                         bool scatter) {

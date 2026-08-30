@@ -171,6 +171,23 @@ struct PredictorView {
     const double* phif   = nullptr; ///< [nxyz * ng], node-major (l * ng + ig)
     const double* mic[11] = {};     ///< [(iso * ng + ig) * nxyz + l], N_XS_SCALAR order
     double*       iden    = nullptr; ///< [niso * nxyz], in and out
+
+    /// WP15.1: the SAME eleven blocks as `mic`, as DEVICE addresses inside the
+    /// flat-XS backend's resident block, plus the event that orders this
+    /// backend's stream behind the solve that wrote them.
+    ///
+    /// WHY THIS EXISTS.  The `mic` pointers above are host arrays that the
+    /// flat-XS device solve downloaded from exactly this block; uploading them
+    /// again is a 21 MB round trip to fetch bytes the device already has.  When
+    /// `mic_device[0]` is non-null AND `mic_device_ready` is non-null the
+    /// backend takes the four slots it reads D2D instead.
+    ///
+    /// ALL OR NOTHING, AND THE CALLER OWNS THE GENERATION CHECK: XSSet fills
+    /// these only when the resident block's generation equals `micx_generation`
+    /// below.  A null pair is not an error, it is "use the host copy" -- which
+    /// is what a stub build, a declined solve, or a host-rebuilt _micx gives.
+    const double* mic_device[11]  = {};
+    void*         mic_device_ready = nullptr; ///< cudaEvent_t, or null
 };
 
 /// XSSet::CorrectorStep over every node, pcSubsteps == 1.
@@ -196,6 +213,10 @@ struct CorrectorView {
     const double* xskf_bos = nullptr; ///< [ng * nxyz]
     const double* xskf_eos = nullptr; ///< [ng * nxyz]
     const double* mic[11]  = {};      ///< EOS micro XS; BOS comes from the device snapshot
+    /// WP15.1: see PredictorView::mic_device -- same contract, same all-or-
+    /// nothing rule, same caller-owned generation check.
+    const double* mic_device[11]  = {};
+    void*         mic_device_ready = nullptr; ///< cudaEvent_t, or null
     const double* iden_bos = nullptr; ///< [niso * nxyz]
     double*       iden     = nullptr; ///< [niso * nxyz]: predictor inventory in, corrected out
     const int*    burn_bos = nullptr; ///< [nxyz]
@@ -248,6 +269,13 @@ public:
     [[nodiscard]] int                deviceOrdinal() const;
     /// Bytes of micro-XS H2D actually paid (the residency check's own receipt).
     [[nodiscard]] unsigned long long micxH2dBytes() const;
+
+    /// WP15.1: micro-XS bytes taken DEVICE-TO-DEVICE out of the flat-XS backend's
+    /// resident block instead of re-uploaded from the host.  The pair
+    /// (micxH2dBytes, micxD2dBytes) is the whole receipt: with the arm on and
+    /// the generations agreeing the first should be ~0 and the second should
+    /// carry what it used to.
+    [[nodiscard]] unsigned long long micxD2dBytes() const;
     /// Statepoints whose corrector reused the device BOS snapshot instead of a
     /// second 11-block upload.
     [[nodiscard]] unsigned long long bosReuses() const;

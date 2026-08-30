@@ -3209,6 +3209,45 @@ void XSSet::EnsureMicxHost(MicxNeed need) const {
     }
 }
 
+// WP15.1: offering the resident device block to the CRAM backend.
+//
+// The four micro-XS slots CRAM condenses are, byte for byte, four of the eleven
+// this flat-XS block holds -- and the host copy CRAM used to upload is the copy
+// this block was downloaded into.  device -> host -> device, 21 MB each way, on
+// every predictor and every corrector.  This hands over the address instead.
+//
+// THE GENERATION CHECK IS THE WHOLE SAFETY ARGUMENT.  `micxDeviceSlot` returns
+// an address, not an epoch; the block is the right one only while the backend's
+// resident generation equals ours.  When the host has rebuilt _micx since (a
+// rodded pass, a CPU fallback, Update()) the generations differ and this returns
+// false, which is the caller's signal to materialise and upload as before.
+//
+// ALL ELEVEN OR NONE: the view's contract is that mic_device[] parallels mic[],
+// and a half-filled table would let the backend take two slots from the device
+// and two from the host -- two epochs in one condensation.
+bool XSSet::FillCramMicDevice(const double** dev, void*& ready) {
+    for (int xt = 0; xt < static_cast<int>(N_XS_SCALAR); ++xt) dev[xt] = nullptr;
+    ready = nullptr;
+    if (!_xsrecon_backend || !_xsrecon_backend->available()) return false;
+    if (_xsrecon_backend->micxResidentGeneration() != _micx_generation) return false;
+    for (int xt = 0; xt < static_cast<int>(N_XS_SCALAR); ++xt) {
+        dev[xt] = _xsrecon_backend->micxDeviceSlot(xt);
+        if (dev[xt] == nullptr) {
+            for (int j = 0; j < static_cast<int>(N_XS_SCALAR); ++j) dev[j] = nullptr;
+            return false;
+        }
+    }
+    // Recorded LAST, on the backend's stream, so it stands behind every solve
+    // queued up to this moment.  Without it the consumer's stream would read the
+    // block while the flat-XS kernel may still be writing it.
+    ready = _xsrecon_backend->micxReadyEvent();
+    if (ready == nullptr) {
+        for (int j = 0; j < static_cast<int>(N_XS_SCALAR); ++j) dev[j] = nullptr;
+        return false;
+    }
+    return true;
+}
+
 bool XSSet::TryUpdateFlatXSGpu(const std::vector<int>& unrodded, bool any_rodded) {
     namespace fxs = flatxs;
     if (_g.ng() != xsrecon::NG || static_cast<int>(Isotope::niso) != xsrecon::NISO)
@@ -5306,12 +5345,6 @@ bool XSSet::PrepareCramLib(cram::LibView& lib) {
 bool XSSet::DepleteGpu(double dt, double power, bool xe_transient) {
     CramBackend& g = cram();
     if (!g.available()) return false;
-    // WP15.  The CRAM backend uploads four of these eleven HOST arrays (its own
-    // micx_generation gate decides when), so this is a host read even though the
-    // consumer is a device.  It is also the transfer WP15 could not remove
-    // without a CramBackend API change -- see the deferred item in
-    // docs/WP15_MICX_RESIDENCY_20260830_KO.md.
-    EnsureMicxHost(MicxNeed::Scalars);
     // DepleteNode's own first line: with no depletion data the host body is a
     // no-op, and a device arm that "succeeded" on it would skip a no-op while
     // pretending it ran.
@@ -5333,6 +5366,20 @@ bool XSSet::DepleteGpu(double dt, double power, bool xe_transient) {
     // backend uploads only the four slots the transition matrix and the Xe
     // equilibrium actually read; the list stays complete so a future reader of
     // a fifth slot is a compile-time edit here, not a silent wrong answer.
+    // WP15.1.  The device offer FIRST: when it takes, the backend reads the four
+    // slots D2D out of the flat-XS block and no host byte of _micx is touched --
+    // so the materialisation is skipped too, not merely the upload.  When it
+    // does not take, this is a host read like any other and the debt is paid.
+    void*      mic_ready = nullptr;
+    const bool mic_d2d   = FillCramMicDevice(v.mic_device, mic_ready);
+    v.mic_device_ready   = mic_ready;
+    if (!mic_d2d) EnsureMicxHost(MicxNeed::Scalars);
+
+    // ADDRESSES ONLY when mic_d2d is true: the eleven stay filled because the
+    // view's contract is that the list is complete, but nothing dereferences
+    // them on that path.  A future reader of v.mic that ignores mic_device would
+    // be reading one flat-XS epoch behind -- see CudaCramBackend::fillMic, which
+    // decides once, for all four, from mic_device[kSlot[0]].
     const double* mic_ptrs[N_XS_SCALAR] = {
         _micx.xstf.data(), _micx.xsdf.data(), _micx.xsaf.data(), _micx.xsff.data(),
         _micx.xsnf.data(), _micx.xskf.data(), _micx.xssf.data(), _micx.xsrf.data(),
@@ -5356,7 +5403,6 @@ bool XSSet::CorrectorStepGpu(double dt, double power, bool xe_transient,
     if (substeps != 1) return false;
     CramBackend& g = cram();
     if (!g.available()) return false;
-    EnsureMicxHost(MicxNeed::Scalars); // WP15: same host read as the predictor's
     if (depDecay.size() == 0) return false;
     if (_cram_bos_token == 0) return false; // this statepoint's predictor was host-side
 
@@ -5382,6 +5428,12 @@ bool XSSet::CorrectorStepGpu(double dt, double power, bool xe_transient,
     v.iden               = _iden.data();
     v.burn_bos           = _burn_bos.data();
     v.burn               = _burn.data();
+
+    // WP15.1: same offer, same fallback, same reason as the predictor's.
+    void*      mic_ready = nullptr;
+    const bool mic_d2d   = FillCramMicDevice(v.mic_device, mic_ready);
+    v.mic_device_ready   = mic_ready;
+    if (!mic_d2d) EnsureMicxHost(MicxNeed::Scalars);
 
     const double* mic_ptrs[N_XS_SCALAR] = {
         _micx.xstf.data(), _micx.xsdf.data(), _micx.xsaf.data(), _micx.xsff.data(),

@@ -74,6 +74,16 @@ bool XsReconBackend::micxScatterPending() const { return false; }
 
 unsigned long long XsReconBackend::micxResidentGeneration() const { return 0; }
 
+const double* XsReconBackend::micxDeviceSlot(int) const { return nullptr; }
+
+void* XsReconBackend::micxReadyEvent() { return nullptr; }
+
+unsigned long long XsReconBackend::nodalJnetElidedBytes() { return 0; }
+
+unsigned long long XsReconBackend::nodalJnetElisionHits() { return 0; }
+
+unsigned long long XsReconBackend::nodalJnetElisionTests() { return 0; }
+
 bool XsReconBackend::downloadFlatXsMicx(const flatxs::FlatXsView&, bool, bool) {
     return true;
 }

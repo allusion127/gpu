@@ -5672,16 +5672,29 @@ public:
         // because a feature that defers 384 downloads and then materialises 384
         // times has moved the copies, not removed them.  `nodal_const_*` is the
         // §2 census this work measured and did not change.
+        //
+        // WP15.1 ADDED THREE PAIRS.  `cram_micx_h2d_mb` against
+        // `cram_micx_d2d_mb` is the depletion round trip: with the arm on and
+        // the generations agreeing the first should be ~0 and the second should
+        // carry what it used to.  `nodal_jnet_*` is the BATCH arena's upload
+        // shadow, and its TESTS matter as much as its bytes -- 0 tests means
+        // the shadow was never consulted (a single-deck run never enters the
+        // arena at all), which reads very differently from consulted and always
+        // missed.  A hit rate of -1 is "never asked", not "never hit".
         if (rasberyGpuMicxResidentEnabled() ||
             XsReconBackend::micxResidentHits() > 0) {
             const unsigned long long hits  = XsReconBackend::micxResidentHits();
             const unsigned long long lazy  = XsReconBackend::micxLazyDownloads();
             const unsigned long long slice = XsReconBackend::micxSliceDownloads();
+            const unsigned long long jtest = XsReconBackend::nodalJnetElisionTests();
             std::cout << std::format(
-                "  [RASBERY][MICX] {{\"schema_version\":1,\"slot\":{},"
+                "  [RASBERY][MICX] {{\"schema_version\":2,\"slot\":{},"
                 "\"arm\":{},\"resident_hits\":{},\"lazy_downloads\":{},"
                 "\"slice_downloads\":{},\"materialised_per_hit\":{:.3f},"
                 "\"bytes_saved\":{},\"mb_saved\":{:.1f},"
+                "\"cram_micx_h2d_mb\":{:.1f},\"cram_micx_d2d_mb\":{:.1f},"
+                "\"nodal_jnet_elided_mb\":{:.1f},\"nodal_jnet_elision_tests\":{},"
+                "\"nodal_jnet_hit_rate\":{:.3f},"
                 "\"nodal_const_uploads\":{},\"nodal_const_mb\":{:.1f}}}\n",
                 cmfd_solver.batchSlot(), rasberyGpuMicxResidentEnabled() ? 1 : 0,
                 hits, lazy, slice,
@@ -5691,6 +5704,17 @@ public:
                 XsReconBackend::micxBytesSaved(),
                 static_cast<double>(XsReconBackend::micxBytesSaved()) /
                     (1024.0 * 1024.0),
+                static_cast<double>(cross_sections.cram().micxH2dBytes()) /
+                    (1024.0 * 1024.0),
+                static_cast<double>(cross_sections.cram().micxD2dBytes()) /
+                    (1024.0 * 1024.0),
+                static_cast<double>(XsReconBackend::nodalJnetElidedBytes()) /
+                    (1024.0 * 1024.0),
+                jtest,
+                jtest > 0
+                    ? static_cast<double>(XsReconBackend::nodalJnetElisionHits()) /
+                          static_cast<double>(jtest)
+                    : -1.0,
                 XsReconBackend::nodalConstUploads(),
                 static_cast<double>(XsReconBackend::nodalConstBytes()) /
                     (1024.0 * 1024.0));

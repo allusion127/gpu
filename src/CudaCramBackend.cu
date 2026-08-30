@@ -616,6 +616,8 @@ struct CramBackend::Impl {
     unsigned long long n_gs_iters   = 0;
     unsigned long long n_gs_solves  = 0;
     unsigned long long n_micx_bytes = 0;
+    /// WP15.1: bytes the four condensation slots came in DEVICE-TO-DEVICE.
+    unsigned long long n_micx_d2d_bytes = 0;
     unsigned long long n_bos_reuse  = 0;
     double             wall_ms      = 0.0;
 
@@ -733,6 +735,49 @@ struct CramBackend::Impl {
         return true;
     }
 
+    /// WP15.1: the four condensation slots, from wherever they already are.
+    ///
+    /// kSlot SEMANTICS ARE UNTOUCHED -- it still indexes the caller's ELEVEN-slot
+    /// array, and the four blocks this backend uploads are still exactly
+    /// {XSAF, XSFF, XS2N, XS3N}.  What changes is the SOURCE of those four: the
+    /// flat-XS backend's resident device block when the caller offered it (the
+    /// caller having already checked that its generation matches), the host
+    /// array otherwise.
+    ///
+    /// ALL FOUR OR NONE.  A mixed fill would put two epochs in one condensation,
+    /// and the caller's own generation check cannot see that; `mic_device[0]`
+    /// standing for all four is what makes the decision atomic here.
+    ///
+    /// THE EVENT IS NOT OPTIONAL WHEN THE D2D RUNS.  The two backends are on
+    /// different streams, so without the wait this stream could read the block
+    /// while the flat-XS kernel is still writing it -- a race that produces
+    /// finite, plausible, wrong inventories.  No event offered, no D2D.
+    bool fillMic(const double* const* host_mic, const double* const* dev_mic,
+                 void* ready, size_t nmic, const char* who) {
+        const bool d2d = dev_mic != nullptr && dev_mic[kSlot[0]] != nullptr &&
+                         ready != nullptr;
+        if (d2d) {
+            const cudaError_t we =
+                cudaStreamWaitEvent(stream, static_cast<cudaEvent_t>(ready), 0);
+            if (we != cudaSuccess) return fail("wait micx event", we);
+        }
+        for (int k = 0; k < 4; ++k) {
+            const size_t bytes = nmic * sizeof(double);
+            if (d2d) {
+                const cudaError_t rc = rasbery::xfer::memcpyAsync(
+                    "CudaCramBackend.cu:fillMic", "D2D mic", d_mic[k], dev_mic[kSlot[k]],
+                    bytes, cudaMemcpyDeviceToDevice, stream);
+                if (rc != cudaSuccess) return fail("D2D mic", rc);
+                n_micx_d2d_bytes += bytes;
+            } else {
+                const std::string name = std::string("H2D mic (") + who + ")";
+                if (!h2d(d_mic[k], host_mic[kSlot[k]], bytes, name.c_str())) return false;
+                n_micx_bytes += bytes;
+            }
+        }
+        return true;
+    }
+
     /// Fill the DevCtx fields that are the same for both entry points.
     void fillCommon(DevCtx& x, const cram::LibView& lib, int ng_in, int nxyz_in) {
         x.niso     = lib.niso;
@@ -811,6 +856,8 @@ unsigned long long CramBackend::gsSolves() const { return _impl->n_gs_solves; }
 double             CramBackend::wallMs() const { return _impl->wall_ms; }
 int                CramBackend::deviceOrdinal() const { return _impl->device; }
 unsigned long long CramBackend::micxH2dBytes() const { return _impl->n_micx_bytes; }
+
+unsigned long long CramBackend::micxD2dBytes() const { return _impl->n_micx_d2d_bytes; }
 unsigned long long CramBackend::bosReuses() const { return _impl->n_bos_reuse; }
 
 namespace {
@@ -897,12 +944,8 @@ bool CramBackend::predictor(const cram::LibView& lib, const cram::PredictorView&
     if (!s.h2d(s.d_iden_in, v.iden, nis * sizeof(double), "H2D iden")) return false;
 
     if (s.micx_resident != v.micx_generation) {
-        for (int k = 0; k < 4; ++k) {
-            if (!s.h2d(s.d_mic[k], v.mic[kSlot[k]], nmic * sizeof(double),
-                       "H2D mic (predictor)"))
-                return false;
-            s.n_micx_bytes += nmic * sizeof(double);
-        }
+        if (!s.fillMic(v.mic, v.mic_device, v.mic_device_ready, nmic, "predictor"))
+            return false;
         s.micx_resident = v.micx_generation;
     }
 
@@ -1008,12 +1051,8 @@ bool CramBackend::corrector(const cram::LibView& lib, const cram::CorrectorView&
         return false;
 
     if (s.micx_resident != v.micx_generation) {
-        for (int k = 0; k < 4; ++k) {
-            if (!s.h2d(s.d_mic[k], v.mic[kSlot[k]], nmic * sizeof(double),
-                       "H2D mic (corrector)"))
-                return false;
-            s.n_micx_bytes += nmic * sizeof(double);
-        }
+        if (!s.fillMic(v.mic, v.mic_device, v.mic_device_ready, nmic, "corrector"))
+            return false;
         s.micx_resident = v.micx_generation;
     }
     ++s.n_bos_reuse;

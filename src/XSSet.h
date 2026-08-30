@@ -179,6 +179,13 @@ private:
     /// True and the views filled when the device arm can run this deck at all.
     bool PrepareCramLib(cram::LibView& lib);
     bool DepleteGpu(double dt, double power, bool xe_transient);
+    /// WP15.1: fill a cram view's eleven-slot DEVICE micro-XS table from the
+    /// flat-XS backend's resident block, plus the ordering event.  Returns false
+    /// (and leaves the table all-null) when the block is not resident, its
+    /// generation does not match `_micx_generation`, or no event is available --
+    /// in which case the caller must materialise the host copy and let the
+    /// backend upload it.  All eleven or none: see the definition.
+    bool FillCramMicDevice(const double** dev, void*& ready);
     bool CorrectorStepGpu(double dt, double power, bool xe_transient,
                           bool density_average, bool xe_equilibrium_fix,
                           int substeps);

@@ -257,6 +257,36 @@ public:
     /// The micx/lmpx generation the resident device block holds (0 = none).
     [[nodiscard]] unsigned long long micxResidentGeneration() const;
 
+    // --- WP15.1: handing the resident block to another backend -------------
+    //
+    // The CRAM depletion backend uploads four of these eleven blocks from the
+    // HOST on every depletion step (CudaCramBackend.cu, `H2D mic`), and the
+    // host copy it reads came out of THIS device block at the last flat-XS
+    // solve.  device -> host -> device, 21 MB each way per step.  These two let
+    // it read the block where it already is.
+    //
+    // THE CALLER MUST CHECK THE GENERATION.  `micxDeviceSlot` hands out an
+    // address, not a promise about WHICH epoch is in it; a consumer keyed on
+    // XSSet::_micx_generation must compare that against
+    // micxResidentGeneration() and fall back to its H2D when they differ.
+
+    /// Device address of one of the eleven micro-XS slots inside the resident
+    /// block, or nullptr when nothing is resident (or the backend is a stub).
+    [[nodiscard]] const double* micxDeviceSlot(int xt) const;
+
+    /// A cudaEvent_t (as void*) recorded NOW on this backend's stream, which a
+    /// consumer's stream must wait on before reading what micxDeviceSlot
+    /// returned.  nullptr means no ordering handover is available and the
+    /// consumer must not do the D2D.
+    void* micxReadyEvent();
+
+    /// WP15.1 receipts for the batch nodal arena's jnet upload shadow.
+    /// `tests` is the denominator: 0 tests means the arm was never consulted,
+    /// which reads very differently from consulted-and-always-missed.
+    static unsigned long long nodalJnetElidedBytes();
+    static unsigned long long nodalJnetElisionHits();
+    static unsigned long long nodalJnetElisionTests();
+
     /// Issue the copies solveFlatXs deferred, into `host`'s live micx/lmpx
     /// pointers, and DRAIN -- the caller is about to dereference them.  The
     /// same copy list off the same offsets solveFlatXs would have used, so a

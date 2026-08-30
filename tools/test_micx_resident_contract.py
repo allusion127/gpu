@@ -50,6 +50,31 @@ M7  THE LAZY DOWNLOAD USES THE LEDGER WRAPPERS.  A raw cudaMemcpy* at the new
     site would leave 19 GB of moved-or-not-moved bytes outside
     [RASBERY][XFER][LEDGER], which is the instrument this work is measured with.
 
+WP15.1 added three more, all of them about handing one backend's device memory
+to another instead of routing it through the host:
+
+M8  THE CRAM D2D IS ORDERED AND ALL-OR-NOTHING.  The depletion backend reads the
+    four condensation slots out of the flat-XS backend's resident block; the two
+    live on different streams, so without the event it can read a block the
+    flat-XS kernel is still writing.  It must also take all four from the same
+    place -- a mixed fill puts two flat-XS epochs into one condensation, and no
+    generation check downstream can see that.  The offer side must check that
+    the resident block is THIS epoch, because micxDeviceSlot hands out an
+    address, not a generation.
+
+M9  THE BATCH ARENA'S jnet SHADOW IS COMMITTED AT THE DOWNLOAD, NOT THE UPLOAD,
+    and consulted only for LEGACY slots.  jnet has a device writer (kNodalJnet),
+    so the usual "what I last sent" shadow would be a false statement about
+    device content; what makes this one true is that the drive ends by
+    downloading that same buffer.  An adopted slot's jnet is the CMFD backend's
+    canonical buffer, which a device sweep can write between two nodal drives --
+    there the canonicalElides* predicate owns the decision.
+
+M10 THE BATCH ARM REACHES THE DEFERRAL THROUGH THE SAME solveFlatXs.  WP15's
+    batch claim rests on there being exactly ONE flat-XS solve in the tree: the
+    nodal arena is nodal-only, so the per-instance deferral covers 8x M8 for
+    free.  A micx path growing inside the arena would silently need its own.
+
 NEGATIVE CONTROLS.  Each check is run a second time against a MUTATED copy of
 the source that breaks exactly the property it tests, and the check must fail.
 A gate that cannot fail is not a gate.
@@ -69,6 +94,8 @@ XSSET = "src/XSSet.cpp"
 XSSET_H = "src/XSSet.h"
 XSR = "src/CudaXsReconBackend.cu"
 XSR_H = "src/CudaXsReconBackend.h"
+CRAM = "src/CudaCramBackend.cu"
+CRAM_H = "src/CudaCramBackend.h"
 STUB = "src/CudaXsReconBackendStub.cpp"
 DRIVER = "src/Driver.h"
 
@@ -79,6 +106,11 @@ RECEIPT_FIELDS = (
     "lazy_downloads",
     "slice_downloads",
     "bytes_saved",
+    # WP15.1
+    "cram_micx_h2d_mb",
+    "cram_micx_d2d_mb",
+    "nodal_jnet_elided_mb",
+    "nodal_jnet_elision_tests",
 )
 
 # Functions in XSSet.cpp that name the live block and legitimately do NOT
@@ -368,6 +400,128 @@ def check_m7_ledger_wrappers(src: dict[str, str]) -> list[str]:
     return problems
 
 
+def check_m8_cram_d2d(src: dict[str, str]) -> list[str]:
+    """WP15.1: CRAM reads the resident block instead of re-uploading a copy of it."""
+    problems: list[str] = []
+    cu = strip_comments(src[CRAM])
+    if "bool fillMic(" not in cu:
+        return ["M8: CudaCramBackend::fillMic is gone; the D2D path does not exist"]
+    if cu.count("fillMic(v.mic, v.mic_device, v.mic_device_ready") != 2:
+        problems.append(
+            "M8: the predictor and the corrector no longer BOTH go through "
+            "fillMic -- one of them is back to an unconditional H2D"
+        )
+    body = body_of(cu, "bool fillMic(", "\n    /// Fill the DevCtx")
+    if "cudaStreamWaitEvent" not in body:
+        problems.append(
+            "M8: fillMic does the D2D without waiting on the producer's event.  "
+            "The two backends are on different streams, so this reads a block "
+            "the flat-XS kernel may still be writing -- finite, plausible, wrong."
+        )
+    if "ready != nullptr" not in body:
+        problems.append(
+            "M8: fillMic no longer requires an ordering event before the D2D.  "
+            "No event, no D2D: the host copy is always the safe answer."
+        )
+    if "kSlot[0]" not in body:
+        problems.append(
+            "M8: the all-or-nothing decision is gone.  A mixed fill puts two "
+            "flat-XS epochs into one condensation and no generation check can "
+            "see it."
+        )
+    if "kSlot[k]" not in body:
+        problems.append(
+            "M8: fillMic no longer indexes the caller's eleven-slot table "
+            "through kSlot; the four blocks it uploads are no longer provably "
+            "{XSAF, XSFF, XS2N, XS3N}"
+        )
+    xs = strip_comments(src[XSSET])
+    offer = body_of(xs, "bool XSSet::FillCramMicDevice(", "\nbool XSSet::TryUpdateFlatXSGpu")
+    if not offer:
+        return problems + ["M8: XSSet::FillCramMicDevice is gone"]
+    if "micxResidentGeneration() != _micx_generation" not in offer:
+        problems.append(
+            "M8: the offer no longer checks that the resident block is THIS "
+            "epoch.  micxDeviceSlot hands out an address, not a generation; "
+            "without the check CRAM condenses one flat-XS epoch behind."
+        )
+    if "micxReadyEvent()" not in offer:
+        problems.append("M8: the offer no longer supplies the ordering event")
+    return problems
+
+
+def check_m9_jnet_shadow(src: dict[str, str]) -> list[str]:
+    """WP15.1: the batch nodal arena's jnet upload shadow."""
+    problems: list[str] = []
+    cu = strip_comments(src[XSR])
+    if "jnet_mirror" not in cu:
+        return ["M9: the NodalArena jnet shadow is gone"]
+    # Committed at the DOWNLOAD, which is the only event that makes it true.
+    if "sl.jnet_mirror.commit(sl.h_jnet" not in cu:
+        problems.append("M9: the jnet shadow is never committed")
+    if "downloaded_jnet" not in cu:
+        problems.append(
+            "M9: the shadow no longer records whether the D2H actually ran.  "
+            "An ELIDED download leaves h_jnet describing an older device state, "
+            "and committing that licenses an upload elision the device needs."
+        )
+    at = cu.find("sl.jnet_mirror.commit")
+    if at >= 0:
+        # The commit must stand AFTER launchBatch's drain, not between the
+        # queued D2H and it.  Anchor on the drain's own ledger site string.
+        drain = cu.find('"CudaXsReconBackend.cu:NodalArena::launchBatch", "drain"')
+        if drain < 0 or drain > at:
+            problems.append(
+                "M9: the shadow is committed before launchBatch's drain.  The "
+                "D2H has only been ISSUED at that point, so h_jnet is not yet "
+                "the device's jnet."
+            )
+    # Legacy slots only: an adopted jnet has a second device writer.
+    if "_jnet_mirror && canon.jnet == nullptr &&" not in cu:
+        problems.append(
+            "M9: the shadow is consulted for ADOPTED slots too.  Their v.jnet "
+            "is the CMFD backend's canonical buffer, which a device sweep can "
+            "write between two nodal drives -- the shadow would be a statement "
+            "about a buffer someone else has since changed."
+        )
+    # The per-slot reset audit has to cover it.
+    at_def = cu.find("bool nodalSlotIsReset(const Slot&")
+    reset = cu[at_def : at_def + 1800] if at_def >= 0 else ""
+    if "jnet_mirror" not in reset:
+        problems.append(
+            "M9: nodalSlotIsReset does not check the jnet shadow.  A shadow "
+            "inherited by the next tenant describes another deck's currents."
+        )
+    return problems
+
+
+def check_m10_batch_path_covered(src: dict[str, str]) -> list[str]:
+    """WP15.1: the batch arm reaches the deferral through the SAME solveFlatXs."""
+    problems: list[str] = []
+    cu = strip_comments(src[XSR])
+    start = cu.find("class NodalArena {")
+    if start < 0:
+        return ["M10: NodalArena is gone; the batch-coverage claim is void"]
+    stop = cu.find("\nbool nodalArenaWanted()", start)
+    arena = cu[start:stop] if stop > start else cu[start:]
+    if "micx" in arena or "flatxs" in arena:
+        problems.append(
+            "M10: the batch nodal arena has grown its own micx/flat-XS path.  "
+            "WP15's whole batch claim is that there is only ONE flat-XS solve "
+            "-- the per-instance solveFlatXs -- so the deferral covers the "
+            "batch arm for free.  A second path needs its own deferral."
+        )
+    # The two copy lists, and only two: solveFlatXs (eager) and the payer.
+    if cu.count('d.download("flatxs micx mic"') != 2:
+        problems.append(
+            "M10: expected exactly two call sites of the "
+            "micx download list (solveFlatXs's eager one and "
+            "downloadFlatXsMicx's lazy one).  A third is a third opinion about "
+            "what the block is."
+        )
+    return problems
+
+
 CHECKS = (
     ("M1", check_m1_not_an_arm_knob),
     ("M2", check_m2_every_reader_materialises),
@@ -377,6 +531,9 @@ CHECKS = (
     ("M5", check_m5_upload_alarms),
     ("M6", check_m6_receipt),
     ("M7", check_m7_ledger_wrappers),
+    ("M8", check_m8_cram_d2d),
+    ("M9", check_m9_jnet_shadow),
+    ("M10", check_m10_batch_path_covered),
 )
 
 NEGATIVE_CONTROLS = (
@@ -480,6 +637,53 @@ NEGATIVE_CONTROLS = (
         lambda t: t.replace('\\"slice_downloads\\":{}', '\\"slices\\":{}', 1),
     ),
     (
+        "M8",
+        "the CRAM D2D stops waiting on the producer's event",
+        CRAM,
+        lambda t: t.replace("cudaStreamWaitEvent(stream,", "cudaSuccess; (void)(", 1),
+    ),
+    (
+        "M8",
+        "the offer stops checking that the resident block is this epoch",
+        XSSET,
+        lambda t: t.replace(
+            "    if (_xsrecon_backend->micxResidentGeneration() != _micx_generation) return false;",
+            "    // generation check removed",
+            1,
+        ),
+    ),
+    (
+        "M9",
+        "the jnet shadow is consulted for adopted slots too",
+        XSR,
+        lambda t: t.replace(
+            "} else if (_jnet_mirror && canon.jnet == nullptr &&",
+            "} else if (_jnet_mirror &&",
+            1,
+        ),
+    ),
+    (
+        "M9",
+        "the slot reset audit stops covering the jnet shadow",
+        XSR,
+        lambda t: t.replace(
+            "        if (sl.jnet_mirror.valid() || sl.downloaded_jnet) return false;\n",
+            "",
+            1,
+        ),
+    ),
+    (
+        "M10",
+        "the batch nodal arena grows its own flat-XS micx path",
+        XSR,
+        lambda t: t.replace(
+            "    int acquireSlot(const ndl::NodalView& p) {",
+            "    void arena_flatxs_micx_download() {}\n"
+            "    int acquireSlot(const ndl::NodalView& p) {",
+            1,
+        ),
+    ),
+    (
         "M7",
         "the lazy download bypasses the ledger wrappers",
         XSR,
@@ -502,7 +706,7 @@ NEGATIVE_CONTROLS = (
 
 
 def main() -> int:
-    src = {p: read(p) for p in (XSSET, XSSET_H, XSR, XSR_H, STUB, DRIVER)}
+    src = {p: read(p) for p in (XSSET, XSSET_H, XSR, XSR_H, STUB, DRIVER, CRAM, CRAM_H)}
 
     problems: list[str] = []
     for _, check in CHECKS:
