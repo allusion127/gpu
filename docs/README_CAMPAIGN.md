@@ -1,6 +1,6 @@
 # GPU RASBERY 가속 캠페인 — 문서 색인
 
-**브랜치** `codex/exact-throughput-campaign` · **최신 팁** `914f6b3` → **v5 동결(본 커밋)**
+**브랜치** `codex/exact-throughput-campaign` · **최신 팁** `bd7a0d3`(WP18) · **v5 동결** `b903225` · **v6 후보** `d68de15`
 **대상** APR1400/KNGR CY1 PSAR 1주기(`kngr_238.json`, 35상태 자연 EOC, 1/4 노심 8,451 노드, NG=2)
 **기준기** MASTER (CPU) — 단일 27.2 s / W16 배치 217 case/h
 
@@ -16,20 +16,24 @@
 | **지금 얼마나 빠른가, 어디가 병목인가, 코드가 어떻게 생겼는가** | **[`GPU_RASBERY_PERFORMANCE_AND_ARCHITECTURE_REPORT_20260830_KO.md`](GPU_RASBERY_PERFORMANCE_AND_ARCHITECTURE_REPORT_20260830_KO.md)** ← **종합 보고** |
 | 무엇을 어떤 순서로 만들 것인가 (Task 0–28, Wave) | [`GPU_RASBERY_100_PERCENT_GPU_ASYNC_SCHEDULER_PLAN_REV7_1_KO.md`](GPU_RASBERY_100_PERCENT_GPU_ASYNC_SCHEDULER_PLAN_REV7_1_KO.md) |
 | 20×는 정말 가능한가, GPU 몇 장이 필요한가 | [`GPU_RASBERY_GA_EVALUATOR_PLAN_20260831_KO.md`](GPU_RASBERY_GA_EVALUATOR_PLAN_20260831_KO.md) §0.2, §4 |
-| 지금 무엇을 어떤 env로 돌려야 하는가 | **[`V5_FREEZE_20260830_KO.md`](V5_FREEZE_20260830_KO.md) §1** (v3 env는 [`V3_FREEZE_20260829_KO.md`](V3_FREEZE_20260829_KO.md) §2에 그대로 있다) |
+| **방금 무엇이 채택되고 무엇이 기각됐는가 (최신 실측)** | **[`PRICING_PROD_PHASE2_20260831_KO.md`](PRICING_PROD_PHASE2_20260831_KO.md)** ← **2단계 가격 평가(v5 이후)** |
+| 지금 무엇을 어떤 env로 돌려야 하는가 | **[`PRICING_PROD_PHASE2_20260831_KO.md`](PRICING_PROD_PHASE2_20260831_KO.md) §10** (동결 arm은 [`V5_FREEZE_20260830_KO.md`](V5_FREEZE_20260830_KO.md) §1, v3 env는 [`V3_FREEZE_20260829_KO.md`](V3_FREEZE_20260829_KO.md) §2에 그대로 있다) |
 | 답이 맞는지 어떻게 아는가 | 종합 보고 §5 + [`MASTER_vs_RASBERY_COMPARISON_20260824_KO.md`](MASTER_vs_RASBERY_COMPARISON_20260824_KO.md) |
 
-**한 줄 현황**: 단일덱 **11.19 s = MASTER 27.2 s 대비 2.43×**, 배치 **981.7 c/h =
-MASTER W16 217 c/h 대비 4.52×**(8×M8+MPS, GPU0, `--result light`) — **v5 동결 arm**
-(238 `1f36e75dc00ed2b4`/4377, 181 `1afab8adb152bb44`/4381, 2026-08-30, `b903225`).
-PROD 기준선 16.658 s에서 **−5.469 s(−32.8 %)**이고, 그 절반 이상이 캠페인이 손대지
-않았던 두 곳 — **결과 CSV 비동기화(WP12, −2.480 s)와 flat-XS CTA 커널(WP5, −0.913 s)**
-— 에서 나왔으며 **둘 다 B0**다. **B0 넷(`CMFD_FUSE=15` · `XE_TXN` · `RESULT_ASYNC` ·
-`FLATXS_CTA`)이 코드 기본값이 되었고**(`=0`이 off 스위치), N1 둘(`CRAM` · `PPR`)은
-여전히 명시 opt-in이다. 정확도는 v2 대비 **비열화**(반응도 1.847 pcm / CBC 15.334 ppm /
-AO 0.012 / BOC 핀 RMS 0.238 % · max 0.80 %). 다음 레버는 커널이 아니라 **host-side
-sync/전송**이다 — CTA 이후 GPU busy가 실 wall의 6.9 %, 단일덱 40.3 GB / ~110 K copy.
-→ **[`V5_FREEZE_20260830_KO.md`](V5_FREEZE_20260830_KO.md)** ·
+**한 줄 현황**: 단일덱 **9.81 s = MASTER 27.2 s 대비 2.77×**, 배치 **m64 1,246 c/h =
+MASTER W16 217 c/h 대비 5.7×**(8×M16+MPS auto, 128잡 매니페스트), 그리고 **같은 덱으로 잰
+KNGR×64 배치 2,016 c/h = 1.786 s/case** — 팁 `bd7a0d3`, 측정 arm은 `d68de15`의
+**v6 + `CMFD_BLOCK=64`**(238 `1f36e75dc00ed2b4`/4377, 2026-08-31).
+PROD 기준선 16.658 s에서 **−6.850 s(−41.1 %)**이고, **v5(11.189 s) 이후의 −1.381 s는 전부 B0다** —
+`OUTER_GRAPH`(그래프로 캡처한 WHILE 루프가 **h5diff 0으로 비트가 같았다**, 런북이 가정한 N1보다 강하다) ·
+`MICX_RESIDENT`(micx D2H 18.69 → 3.31 GB, **배치 +19.3 %**) · `WP15.1`(CRAM mic H2D **0 바이트**) ·
+`CMFD_BLOCK=64`(같은 일을 더 많은 더 작은 블록으로, `vector_blocks` 67 → 265).
+정확도는 v2 대비 **비열화 그대로**(반응도 1.847 pcm / CBC 15.334 ppm / AO 0.012 /
+BOC 핀 RMS 0.238 % · max 0.80 %). **병목의 이름이 다시 바뀌었다** — PCIe는 Gen4 x16의 25–35 %만 쓰고,
+배치 CPU 74 %는 실작업이 아니라 `cudaStreamSynchronize` 스핀이며, 배치는 폭 기아가 아니라
+**GPU 시간 바운드**다(WP18이 꼬리를 0으로 만들고도 c/h가 내려갔다). **남은 큰 레버는 A2 outer 감축 하나다.**
+→ **[`PRICING_PROD_PHASE2_20260831_KO.md`](PRICING_PROD_PHASE2_20260831_KO.md)** ·
+[`V5_FREEZE_20260830_KO.md`](V5_FREEZE_20260830_KO.md) ·
 [`PRICING_PROD_20260830_KO.md`](PRICING_PROD_20260830_KO.md)
 
 ---
@@ -49,6 +53,7 @@ sync/전송**이다 — CTA 이후 GPU busy가 실 wall의 6.9 %, 단일덱 40.3
 | 문서 | 줄 | 판정 |
 |---|---:|---|
 | **[`V5_FREEZE_20260830_KO.md`](V5_FREEZE_20260830_KO.md)** | — | **v5 동결(2026-08-30).** 두 호스트 게이트 표 6행, env 전문, 기본값이 된 넷과 되지 않은 둘의 이유, `case_key`가 갈리는 자리, 단일 11.189 s / 배치 981.7 c/h, 기각된 warm-start, 재현 절차(`gate_b_pin_rms.py` 포함), 아직 갚지 않은 확인 실행 1건. 매니페스트 `test/reference/validation_baseline_manifest_v5.json`(`frozen:true`) |
+| **[`PRICING_PROD_PHASE2_20260831_KO.md`](PRICING_PROD_PHASE2_20260831_KO.md)** | — | **238 2단계 가격 평가(2026-08-31, 블록 19–33)**: 채택 레버 사다리 **16.658 → 14.378 → 11.952 → 11.189 → 10.206 → 9.808 s**(단계별 등급 포함), v6 스택 구성요소별 가격표, 전송 원장(D2H −75 %, sync 호출 −40 %), **WP17 커널 점유율 인구조사**(상위 15 중 14가 2×SM 미만), **배치 진실표**(형상·덱 무게 1.92×·KNGR×64 2,016 c/h·MPS 1.98× vs 폭 1.92×·CPU 스핀 74→40 %), **기각·폐쇄 목록**(persistent `c_barrier` 0.788 µs NO-GO · rolling refill · WP9-D · claim 청크 · 8프로세스 초과 형상), 보고서가 열어 둔 구멍 8건, 다음 레버 넷. 후보 매니페스트 `test/reference/validation_baseline_manifest_v6_candidate.json` |
 | **[`PRICING_PROD_20260830_KO.md`](PRICING_PROD_20260830_KO.md)** | — | **238 PROD env 가격 평가(2026-08-30)**: PPR(WP6-F)·CRAM(Task 16)·FUSE(WP7-B)·XE_TXN(WP7-C) 기능별 등급·게이트·채택 판정, v4 전체 스택 **14.378 s = 1.89×**, v4 후보 env, 폐기된 수(arm-X env 아티팩트 · 181에서 채굴된 `0xadd` pin), **phase 분해 + nsys 커널 프로파일**(두 계기가 어긋난다), 다음 레버 셋, 교훈 |
 | **[`GPU_RASBERY_PERFORMANCE_AND_ARCHITECTURE_REPORT_20260830_KO.md`](GPU_RASBERY_PERFORMANCE_AND_ARCHITECTURE_REPORT_20260830_KO.md)** | 1,080 | **본 캠페인 종합**: 단계별 성능 사다리, nsys 커널/API/osrt 표, 케이스 비용 모델, 병목 원장, 게이트 체계, 결함 19건, 상한, 재현 명령 |
 | [`V3_FREEZE_20260829_KO.md`](V3_FREEZE_20260829_KO.md) | 307 | **v3 생산 arm 정의**, 구성요소별 게이트 등급, 계기 중립성, 동결 절차·롤백 |
@@ -135,6 +140,9 @@ sync/전송**이다 — CTA 이후 GPU busy가 실 wall의 6.9 %, 단일덱 40.3
 - **동일성 판정에 `cmp`를 쓰지 말 것** — HDF5 object header가 생성/수정 시각을 기록한다.
   판정은 `h5diff`(데이터셋 단위)로만.
 - **arm당 hot run ≥ 3회, warm-up 1회 제외, 교차 순서, median 보고.**
+- **단일덱 arm과 배치 arm은 이제 env가 다르다.** `RASBERY_GPU_CMFD_BLOCK=64`(배치 −0.3 %)와
+  `RASBERY_GPU_OUTER_SEGMENT_V2=1`(배치 −1.0 %)은 **단일덱 전용**이고,
+  `RASBERY_CUDA_SYNC_MODE=blocking`은 **배치 옵션**이다(단일덱에서는 +8.7 % 느리다).
 - **`RASBERY_XE_ANDERSON`은 모드 의존 기본값**(단일 ON / 배치 OFF)이다. 배치 arm에서
   켜려면 **반드시 명시적으로 export**하고, 빈 값은 OFF가 아니라 "요청 없음"이다.
 - **골든 데이터셋 수**: 단일 500(v1/v2 기록) / 644(로컬 트리 실측) / 배치 M64 708 /

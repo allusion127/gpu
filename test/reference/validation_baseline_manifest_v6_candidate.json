@@ -1,0 +1,261 @@
+{
+  "schema_version": 6,
+  "frozen": false,
+  "frozen_utc": "NOT_FROZEN_V6_CANDIDATE",
+  "supersedes": null,
+  "supersedes_note": "DELIBERATELY NULL. This file does NOT supersede validation_baseline_manifest_v5.json. v5 stays frozen:true and remains the authoritative baseline until a v6 freeze run replaces it. A consumer that needs a baseline must still read v5; this file exists so that the 2026-08-31 measurements have one canonical home before any freeze, not so that a gate can quote them.",
+  "status": "CANDIDATE, NOT A BASELINE. This file records the 238 phase-2 pricing measurement of 2026-08-31 (docs/PRICING_PROD_PHASE2_20260831_KO.md, source report pricing_388e8f2.md blocks 19-33) as the proposed v6 arm plus the single-deck-only CMFD_BLOCK knob. No freeze protocol was executed. The 181 cross-gate is outstanding for EVERY row added here, because 181 computation is currently suspended by user directive. Nothing here gates anything.",
+  "frozen_field_note": "MACHINE-CHECKABLE GUARD, inherited from v3/v4/v5. A consumer of this file must refuse it while \"frozen\" is false - and this file is designed to stay false until a real v6 freeze run, with a second host, replaces it.",
+
+  "why_v6": "v5 froze the arm at 11.189 s on 238 with the four B0 knobs promoted to code defaults. v6 adds four more measured wins, and the notable thing about all four is that they are B0: the trajectory digest 1f36e75dc00ed2b4 and the outer count 4377 do not move anywhere between b903225 and d68de15. OUTER_GRAPH captures the outer WHILE loop into a CUDA graph and was expected to be N1 (floating-point reassociation); 238 measured h5diff 0 over the full dataset and a literal-zero Gate A at every statepoint, so it is B0 in practice on this deck. MICX_RESIDENT keeps the micro-XS block resident on the device and collapses micx D2H from 18.69 GB to 3.31 GB, which is also the single largest batch win of the whole campaign (+19.3 pct). WP15.1 turns CRAM's mic upload into a device-to-device copy (cram_micx_h2d_mb 0.0). CMFD_BLOCK=64 is a pure launch-shape knob that turns the same work into more, better-occupying blocks (vector_blocks 67 -> 265, the first arm to clear 2x the SM count) and is worth -4.1 pct on a single deck while being flat in batch. Together: 9.808 s against MASTER's 27.2 s, 2.77x.",
+
+  "baseline_commit_sha": "d68de15",
+  "baseline_commit_note": "d68de15 (perf(WP17)) is the tree the 9.808 s number was measured on. The v6 stack itself was measured at 6bdfdc2 (10.206 s) and re-measured at cd3630c after WP15.1 (10.217 s); d68de15 adds only the CMFD_BLOCK knob, which is off by default. The branch tip at the time of writing is bd7a0d3 (perf(WP18)), which adds the rolling-refill scheduler substrate that was measured and NOT adopted - see rejected_and_closed.",
+  "prior_commits_in_the_chain": {
+    "27fa483": "OUTER_GRAPH and OUTER_SEGMENT_V2. Blocks 19: the graph arm is 10.876 s and bit-identical.",
+    "7af4099": "v5 freeze commit (four B0 defaults). Block 20 confirms that CRAM/PPR/PPR_GRAPH explicit plus defaults reproduces the full v5 trajectory exactly.",
+    "6bdfdc2": "MICX_RESIDENT. Blocks 21-22: the v6 stack lands at 10.206 s.",
+    "cd3630c": "WP15.1 - CRAM mic H2D->D2D, nodal jnet H2D shadow, MICX receipt schema 2. Block 23: 10.217 s.",
+    "8b3c62b": "WP16 - RASBERY_CUDA_SYNC_MODE. Block 28: a batch option, NOT part of this arm.",
+    "b903225": "the v5 measurement tree, for reference.",
+    "bd7a0d3": "WP18 rolling refill (branch tip). Measured, not adopted; the code is kept as scheduler substrate."
+  },
+
+  "branch": "codex/exact-throughput-campaign",
+  "compiler": "gcc13 host compiler on 238 (exact g++ path and version not captured in the 2026-08-31 session; see open_items.provenance_not_captured)",
+  "cuda_compiler": "nvcc 13.0 on 238 (exact path not captured; see open_items.provenance_not_captured)",
+  "release_flags": "Release, RASBERY_ENABLE_CUDA=ON, CMAKE_CUDA_ARCHITECTURES=120, HDF5_ROOT=codex/tools/gcc13 - the same flags as every earlier tree in this campaign. Each phase-2 worktree was built fresh and passed ctest 12/12. The per-TU --fmad=false on CudaXsReconBackend.cu must be re-verified through compile_commands.json on any rebuild.",
+
+  "gpu": {
+    "model": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "host": "238 GPU0",
+    "sm_count": 188,
+    "compute_capability": "12.0",
+    "cooperative_launch": "supported; max co-resident blocks 1128 (6 blocks/SM x 188 SMs), measured by tools/probe_gridsync_cost.cu",
+    "pcie": "PCIe Generation Max=4 Current=4 (the device supports Gen5; Host Max=4 caps it at the slot), Link Width Max=16x Current=16x. Full Gen4 x16, not degraded.",
+    "uuid": "not captured in the 2026-08-31 session",
+    "driver": "not captured in the 2026-08-31 session",
+    "cuda_runtime": "not captured in the 2026-08-31 session"
+  },
+
+  "benchmark_input": {
+    "deck": "kngr_238.json (APR1400/KNGR CY1 PSAR, 35-state natural EOC, quarter core 8451 nodes NG=2)",
+    "input_sha256": "ac6a28bae361dcd072abb742c1610bd05c03337b7a8a114cee488550231b51c7",
+    "env": "RASBERY_PPR_MODE=master RASBERY_PC_MODE=decart RASBERY_GPU=1 RASBERY_GPU_CMFD_SWEEP=1 RASBERY_GPU_CMFD_RESIDENT_SINGLE=1 RASBERY_GPU_NODAL=1 RASBERY_GPU_NODAL_FULL=1 RASBERY_GPU_XSRECON=1 RASBERY_GPU_FLATXS=1 RASBERY_GPU_OUTER=1 RASBERY_GPU_OUTER_SEGMENT_MAX=8 RASBERY_GPU_WIEL_FOLD=chunked RASBERY_GPU_XE=1 RASBERY_STAGED_FLUX_TOL=50 RASBERY_STAGED_XE_TOL=1000 RASBERY_STAGED_LOOSE_SETTLE=1 RASBERY_OMP_THREADS=12 RASBERY_GPU_CRAM=1 RASBERY_GPU_PPR=1 RASBERY_GPU_PPR_GRAPH=1 RASBERY_GPU_CMFD_FUSE=15 RASBERY_GPU_XE_TXN=1 RASBERY_RESULT_ASYNC=1 RASBERY_GPU_FLATXS_CTA=1 RASBERY_GPU_OUTER_GRAPH=1 RASBERY_GPU_MICX_RESIDENT=1 RASBERY_GPU_XFER_ELIDE=1 RASBERY_GPU_OUTER_SEGMENT_V2=1 RASBERY_GPU_CMFD_BLOCK=64",
+    "env_note": "SELF-DESCRIBING ON PURPOSE, exactly as v5's is. The last five knobs are the phase-2 additions. The four before them (CMFD_FUSE, XE_TXN, RESULT_ASYNC, FLATXS_CTA) are already code DEFAULTS since v5 and an env that omitted them would resolve identically - they stay written out because src/CaseKey.h digests the RAW exported string, so unset and \"1\" are different case_keys for the same arm.",
+    "env_note_single_vs_batch": "THIS ENV IS THE SINGLE-DECK ARM. Two of its knobs must be REMOVED for batch: RASBERY_GPU_CMFD_BLOCK=64 (batch 1176.1 c/h, -0.3 pct, flat) and RASBERY_GPU_OUTER_SEGMENT_V2=1 (batch 1167.8 vs 1179.1 c/h, -1.0 pct). RASBERY_CUDA_SYNC_MODE=blocking is the mirror image: a batch OPTION only, and 8.7 pct SLOWER on a single deck. This is the first arm in the campaign whose single-deck and batch envs genuinely differ, and that divergence is measured, not assumed.",
+    "env_note_absences": "RASBERY_XE_ANDERSON stays DELIBERATELY ABSENT (single-deck default ON). RASBERY_STATEPOINT_TELEMETRY and RASBERY_XFER_LEDGER stay ABSENT from any timing arm - the ledger is attached only to a companion single-deck run, never to the batch harness, because it distorts throughput.",
+    "env_measurement_rule": "A wall or digest measured outside this env is not a measurement of this arm."
+  },
+
+  "arm_components": {
+    "note": "v5's rows (CRAM, PPR, CMFD FUSE, XE TXN, RESULT_ASYNC, FLATXS_CTA) are carried forward unchanged and are not restated here - see validation_baseline_manifest_v5.json. Below are only the knobs v6 adds, plus the two that were measured in this session and deliberately left OUT of the arm.",
+
+    "outer_graph": {
+      "env": "RASBERY_GPU_OUTER_GRAPH=1",
+      "gate_class": "B0 - MEASURED, not assumed. The runbook entered this feature graded N1 (a graph-captured WHILE loop can reassociate); 238 measured stronger.",
+      "default": "OPT-IN. Not promoted: it has one host and one deck behind it.",
+      "claim": "the outer WHILE loop is captured into a CUDA graph and replayed, so the host stops observing the exit condition once per outer.",
+      "evidence_238": "block 19 at 27fa483, interleaved warm-up 1 + hot 3: v5 11.161 s -> 10.876 s (-0.285 s, -2.6 pct), digest 1f36e75dc00ed2b4 / 4377 unchanged. h5diff -c against the ungraphed arm: 0 differences over the FULL dataset (run directly, because a literal-zero Gate A is suggestive and h5diff is authoritative). Determinism h5diff C_r1 vs C_r2: 0.",
+      "receipt": "[RASBERY][OUTER_GPU] graph_arm:1, graph_segments:1255, graph_launches:1255, graph_iterations:2781, iterations_per_launch:2.215936, graph_instantiations:2, graph_warmup_misses:0.",
+      "what_it_actually_removed": "sync_exit_observation 4221 -> 325 (-92 pct), the exact site block 16's ledger named as 65 pct of all sync time; sync_hostfree_exit rises 147 -> 1255 (the work MOVES, it does not vanish). Ledger totals: sync_calls 9546 -> 5650 (-41 pct) but sync_ns 5.715 -> 5.687 s (-0.5 pct). The syncs it eliminates are the CHEAP ones - which is why a 41 pct call-count reduction buys only 2.6 pct of wall, and why stacking SEGMENT_V2 on top adds almost nothing.",
+      "batch": "genuinely engaged, not bypassed: graph_launches values of 19888 and 49456 observed across the jobs one persistent worker handled. The 0 entries are consistent with a cohort-cache-hit job reusing a prior capture. The graph_arm field itself was not captured by that pass's grep - recorded as unread rather than assumed."
+    },
+
+    "outer_segment_v2": {
+      "env": "RASBERY_GPU_OUTER_SEGMENT_V2=1",
+      "gate_class": "B0",
+      "default": "OPT-IN, and SINGLE-DECK ONLY in this arm.",
+      "claim": "the outer segment stops ending at every outer; discovery passes are separated from work passes.",
+      "evidence_238": "block 19 at 27fa483: 11.161 -> 11.135 s (-0.026 s, -0.2 pct). h5diff 0, cmp on the pin-power CSV CMP_IDENTICAL. Stacked on OUTER_GRAPH: 10.876 -> 10.873 s, i.e. nothing - the two features overlap in what they save.",
+      "receipt": "segment_v2_arm:1, segment_passes:5547, discovery_passes:1163, outers_per_segment:3.300905, v2_exit_syncs_elided:1108, v2_state_d2h_elided:1163, escapes:{none:1, flux_converged:1086, negative_flux:115, segment_budget:124}.",
+      "escape_note": "The escape breakdown is IDENTICAL across every arm in block 19. It is a property of the deck's own convergence, not of the segment implementation - it is receipt evidence that the feature engaged, not evidence that it changed anything.",
+      "batch_exclusion": "block 23 arm (c): 1167.8 c/h against the same build's 1179.1 without it, -1.0 pct. Excluded from the batch env.",
+      "refusal_premise_not_confirmed": "The premise that batch refuses SEGMENT_V2 by design was NOT confirmed. A 1-process, width-1, no-MPS probe ran it to completion: rc=0, contract_pass:true, refused:0, stop_reason:\"shutdown\". A refusal at 8-process/MPS scale is not ruled out, because that scale was not probed. Recorded as an open question, not as a resolved one in either direction."
+    },
+
+    "micx_resident": {
+      "env": "RASBERY_GPU_MICX_RESIDENT=1",
+      "gate_class": "B0",
+      "default": "OPT-IN.",
+      "claim": "the micro-XS block stays resident on the device instead of being downloaded whole; only the slices the host actually reads come back.",
+      "evidence_238": "block 21 at 6bdfdc2, interleaved warm-up 1 + hot 3: 11.410 s -> 10.716 s (-0.694 s), digest/outers identical, h5diff 0, cmp CSV CMP_IDENTICAL, and grep -c \"[ERROR][micx]\" = 0 in BOTH logs.",
+      "receipt_schema_1": "{resident_hits:384, lazy_downloads:0, slice_downloads:68, materialised_per_hit:0.177, bytes_saved:19536007680 (18.63 GB), nodal_const_uploads:9675, nodal_const_mb:3742.8}. lazy_downloads:0 means the old whole-block path was never taken as a fallback.",
+      "ledger": "flatxs micx mic D2H 3456 calls / 18.22 GB -> 612 calls / 3.23 GB; flatxs lmpx lmp D2H 0.467 -> 0.083 GB; micx D2H total over the two rows both arms printed: 18.69 -> 3.31 GB. solveFlatXs:drain sync 905.85 -> 124.64 ms.",
+      "ledger_gap": "the msm D2H row (~4.05 GB at the block 16 baseline) was NOT separately captured by this pass's grep. 18.69 + 4.05 = 22.74 GB is consistent with the commit message's 22.85 GB headline to within rounding, but that reconciliation was not measured in the same run and is recorded as an inference, not a measurement.",
+      "batch": "block 21b, 8xM8 + MPS 12 pct, 64-job manifest: 1163.7 c/h against 975.5 without it, +19.3 pct - the single largest batch-mode win of the campaign, larger than the entire block-17 shape sweep combined. 0 micx ERROR lines across all 8 process logs."
+    },
+
+    "cram_mic_d2d_wp15_1": {
+      "env": "none - this is a code change, not a knob",
+      "gate_class": "B0",
+      "claim": "CRAM's predictor/corrector mic upload becomes a device-to-device copy instead of crossing PCIe, and the MICX receipt gains schema 2.",
+      "evidence_238": "block 23, OLD 6bdfdc2 10.315 s vs NEW cd3630c 10.217 s (-0.098 s, -1.0 pct), digest/outers identical, h5diff 0, cmp CSV CMP_IDENTICAL, micx ERROR 0 in both. Batch 1172.4 -> 1179.1 c/h (+0.6 pct).",
+      "receipt_schema_2": "{schema_version:2, resident_hits:384, lazy_downloads:0, slice_downloads:34, bytes_saved:21191051520 (20.21 GB), cram_micx_h2d_mb:0.0, cram_micx_d2d_mb:1367.9, nodal_jnet_elided_mb:0.0, nodal_jnet_elision_tests:0, nodal_jnet_hit_rate:-1.000}.",
+      "ledger": "the CudaCramBackend.cu:h2d:H2D mic (predictor/corrector) rows are ABSENT from the ledger entirely - the sites no longer fire. In their place: fillMic:D2D mic 272 calls / 1.43 GB and predictor:mic_bos (D2D) 136 calls / 0.72 GB, and d2d_bytes rises 717 MB -> 2.15 GB.",
+      "not_engaged": "the nodal jnet H2D shadow/elision half of the same commit showed ZERO activity on this single deck (elided_mb 0.0, elision_tests 0, hit_rate -1.000, and no nodal-arena-jnet ledger row). Recorded as not engaged. The commit message is not treated as evidence that it works."
+    },
+
+    "xfer_elide": {
+      "env": "RASBERY_GPU_XFER_ELIDE=1",
+      "gate_class": "B0",
+      "default": "OPT-IN.",
+      "claim": "redundant host-to-device uploads at the 169 ledgered sites are skipped when the device copy is already current.",
+      "evidence_238": "priced in block 15 (pre-v6) and carried into the v6 stack. Its ledger signature is the H2D side, which is the smallest of the three effects in this stack: H2D 11.45 -> 11.08 GB across v6, then -> 9.65 GB once WP15.1's D2D move lands on top."
+    },
+
+    "cmfd_block": {
+      "env": "RASBERY_GPU_CMFD_BLOCK=64",
+      "gate_class": "B0 across the WHOLE sweep - this is a launch-shape knob and touches no physics.",
+      "default": "OPT-IN, SINGLE-DECK ONLY.",
+      "claim": "the CMFD/BiCG kernels launch with 64-thread blocks instead of 256, turning the same total work into more, smaller, better-occupying blocks.",
+      "evidence_238": "block 29a at d68de15, interleaved warm-up 1 + hot 3, five arms: 256 -> 10.228 s, 192 -> 10.067, 128 -> 9.836, 64 -> 9.808, 32 -> 9.825. digest/outers identical in all five; h5diff every arm vs blk256 = 0; cmp CSV on the extremes (256 vs 32) CMP_IDENTICAL.",
+      "occupancy": "[CMFD][GRAPH] node_blocks/vector_blocks go 34/67 -> 45/89 -> 67/133 -> 133/265 -> 265/529 as block_threads go 256 -> 32. vector_blocks first clears 1x SM at 128 threads (133) and 2x SM at 64 (265). That 2x-SM bar is exactly what block 27's kernel census said was missing.",
+      "why_not_32": "32 occupies more and is NOT faster (9.825 vs 9.808). More, smaller blocks eventually repay their better SM coverage in launch and grid-sync overhead; 64 is the knee on this deck.",
+      "batch_exclusion": "block 29d, 8xM8 + MPS 12 pct: 1176.1 c/h, -0.3 pct against the ~1180 reference. Flat. The batch bottleneck is not per-launch CMFD occupancy, so this knob stays out of the batch env."
+    },
+
+    "cuda_sync_mode_NOT_IN_ARM": {
+      "env": "RASBERY_CUDA_SYNC_MODE=blocking",
+      "gate_class": "B0 (h5diff 0 between auto and blocking on a single deck)",
+      "default": "auto. NOT part of this arm, in either mode.",
+      "why_recorded_here": "because it resolves an open question this campaign carried for two blocks, and because it is a real batch option someone will want. Batch 8xM8+MPS12: auto 1176.5 c/h at 72.8 pct CPU, blocking 1134.3 c/h (-3.6 pct) at 40.1 pct CPU, yield 1173.9 at 67.0 pct. All three [CUDA][SCHED] receipts confirm applied == requested with rc cudaSuccess, so the flag is not a no-op in any mode.",
+      "what_it_settles": "block 26 concluded that ~74 pct of batch CPU was real host work, on the strength of OMP_WAIT_POLICY=PASSIVE not changing it. That reading was WRONG: PASSIVE removes only OpenMP's own barrier spin, while cudaStreamSynchronize spins under cudaDeviceScheduleSpin, which is a separate device-schedule flag. Blocking drops CPU to 40.1 pct, so roughly 33 percentage points of that 74 was CUDA spin. perf and ncu are not installed on 238, so no intermediate settling measurement was possible.",
+      "single_deck_is_the_mirror_image": "auto 11.316 s vs blocking 12.296 s (+8.7 pct). A lone process has nothing to hand the freed cores to, so trading spin latency for a kernel-level wait/wake round trip is a straight loss.",
+      "why_not_adopted": "the bar was 'no c/h loss' and -3.6 pct does not clear it. Its value is what the freed CPU enables: 16xM8 goes 1035.3 -> 1159.5 c/h (+12.0 pct) under blocking, and 12xM8 +3.4 pct - which confirms CPU contention, not only MPS thread-share dilution, was part of why more concurrency lost. 8xM16 does not improve (-1.3 pct): its bottleneck is tail, not CPU."
+    },
+
+    "rolling_refill_NOT_IN_ARM": {
+      "env": "RASBERY_EVALUATOR_ROLLING=1 with --claim rolling",
+      "gate_class": "exact - cross_case_digest_mismatch = 0",
+      "default": "claim=auto. NOT adopted.",
+      "why_recorded_here": "because the mechanism works and the code is kept as scheduler substrate, and because its negative result is the most load-bearing finding of the session.",
+      "evidence_238": "block 30 at bd7a0d3, 128-job manifest: 8xM8 auto 1186.1 -> rolling 1158.3 c/h (-2.3 pct); 8xM16 auto 1246.2 -> rolling 1181.2 (-5.2 pct); 8xM16 rolling+blocking 1109.8 (-6.1 pct vs rolling alone). The expected band was 1500-1900 c/h.",
+      "receipt": "[RASBERY][REFILL][ROLLING] {session:1, arena_width:8, lanes:8, lanes_used:8, queue_capacity:32, admits:15, immediate_admits:8, wave_barriers_avoided:14, slot_idle_ms_total:0.99726, width_history:{p10:2, p50:8, p90:8, mean:6.13333, max:8}} and tail_idle_max_s = 0 in every rolling arm.",
+      "exactness": "all 64 distinct candidate cases produced BIT-IDENTICAL per-case light-result digests between the auto and rolling claim modes, matched by case_key across all 8 workers - far exceeding the required >=8-case check.",
+      "receipt_gap": "stale_tenant_refusals was not printed by this schema version. Not recorded as 0. The harness-level \"stale_tenants\":0 in the [MULTI_GPU][TOTAL] receipt is the closest confirmed zero-refusal signal available.",
+      "what_it_proves": "arena fill was never the constraint. The mechanism drives slot idle to ~1 ms and the wave tail to 0 and throughput still falls, so the remaining cost is GPU time per case, not how the job list is sliced. Block 31 measures that directly."
+    }
+  },
+
+  "per_host_results": {
+    "238": {
+      "role": "the performance host. Walls, cases-per-hour and adoption thresholds are decided here and nowhere else.",
+      "trajectory_digest": "1f36e75dc00ed2b4",
+      "outers_total": 4377,
+      "statepoints": 35,
+      "single_deck_wall_s": 9.808,
+      "single_deck_wall_note": "238 GPU0, d68de15, block 29a arm CMFD_BLOCK=64, median of 3 hot (9.948 / 9.808 / 9.794) with a 10.107 s warm-up excluded, interleaved against the other four block sizes. The v6 stack without this knob is 10.206 s (6bdfdc2, block 22) and 10.217 s (cd3630c, block 23).",
+      "speedup_vs_master": 2.77,
+      "walls_not_to_quote": "875.3 c/h for a batch with one worker under nsys (instrument overhead: the harness waits for all 8 to drain). 47.5 pct GPU utilisation from block 24's first attempt (perturbed by that same nsys worker; the clean dmon sample reads sm pct mean 96.2). 1333.5 c/h for block 33's 8xM16 arm (5 of 128 cases failed, and cases_per_hour is computed as jobs/wall*3600 regardless of completion count, so it is inflated relative to work actually done).",
+      "determinism": "h5diff 0 across every A/B pair of blocks 19, 21, 22, 23 and 29, plus an explicit C_r1 vs C_r2 repeat of the OUTER_GRAPH arm (0 differences). A repeat-against-itself of the exact v6+CMFD_BLOCK arm was not run; see open_items."
+    },
+    "181": {
+      "role": "the exactness host. NO wall or cases-per-hour figure measured on 181 is a performance claim.",
+      "trajectory_digest": "not measured for any phase-2 row",
+      "outers_total": null,
+      "single_deck_wall_s": null,
+      "cross_gate_status": "OUTSTANDING FOR EVERY ROW IN THIS FILE. OUTER_GRAPH, OUTER_SEGMENT_V2, MICX_RESIDENT, WP15.1 and CMFD_BLOCK have not been run on 181 at all.",
+      "why": "181 computation is currently SUSPENDED BY USER DIRECTIVE. This is not a scheduling slip and not an oversight; it is a standing instruction. It is recorded here because it is the single reason this manifest is a candidate rather than a freeze - the arm's performance is measured and its 238 exactness gates all pass; what is missing is the second witness.",
+      "what_181_would_have_to_show": "for each B0 row, h5diff 0 on 181's own arm (181's digest is 1afab8adb152bb44 / 4381 for the v5 arm - a DIFFERENT host contracts floating-point expressions differently, and a candidate must print the digest OF ITS OWN HOST). OUTER_GRAPH is the row that most needs it: its B0 grade was measured on one deck on one host, against a runbook that expected N1."
+    }
+  },
+
+  "golden_outputs": {
+    "trajectory_digest_238": "1f36e75dc00ed2b4",
+    "outers_total_238": 4377,
+    "trajectory_digest_note": "UNCHANGED FROM v5, and that is the whole point of this file. Every knob added in phase 2 is B0: the digest and the outer count do not move anywhere between b903225 (v5) and d68de15 (v6 + CMFD_BLOCK). The -1.381 s from 11.189 to 9.808 was bought without selling a single bit.",
+    "trajectory_digest_181": "not measured for this arm - see per_host_results.181",
+    "repeats": "3 hot, warm-up excluded, interleaved (238 blocks 19, 21, 22, 23, 29a)",
+    "repeat_walls_s_238": [9.948, 9.808, 9.794],
+    "warmup_wall_s_238": 10.107,
+    "dataset_count": 644,
+    "single_deck_h5_sha256": "not recorded; the identity gates were run as h5diff and cmp against a live sibling run rather than against a stored hash, which is the stronger comparison and the one the report carries"
+  },
+
+  "throughput_baselines": {
+    "single_deck_wall_s": 9.808,
+    "master_single_deck_wall_s": 27.2,
+    "single_deck_speedup_vs_master": 2.77,
+
+    "m64_cases_per_hour": 1246.2,
+    "m64_arm": "8 processes x M16 + MPS, claim=auto, GPU0 only, bd7a0d3, --result light, 128-job manifest built from benchmark/m64_manual with each candidate duplicated once under distinct output paths. wall_s 369.771, mean_width 5.882, width_fill 0.3676, tail_idle_max_s 358.6.",
+    "m64_cases_per_hour_8xM8": 1186.1,
+    "m64_8xM8_arm": "the same manifest at 8 x M8: wall_s 388.493, width_fill 0.4477, tail_idle_max_s 168.3. This is the shape that stays the default - 8xM16 leads by +5.1 pct but does not clear the +5 pct adoption bar cleanly and carries a tail_idle_max of 96 pct of its own wall.",
+    "master_w16_cases_per_hour": 217.0,
+    "m64_speedup_vs_master_w16": 5.7,
+    "m64_speedup_note": "1246.2 / 217 = 5.74. Both numerator and denominator are on the m64 set, which is the only reason the ratio is meaningful - see deck_weight.",
+
+    "deck_weight": "MEASURED, not assumed, from block 30's own per-case receipts (255 samples across all 8 workers of the 8xM8-auto arm): the m64_manual decks average 51.0 statepoints and 8415.5 outers per case, against KNGR's 35 and 4377. That is 1.46x by statepoint and 1.92x by outer. m64 batch cases-per-hour must NOT be divided into a KNGR single-deck wall.",
+
+    "kngr_x64_cases_per_hour": 2016.2,
+    "kngr_x64_arm": "the SAME deck as the single-deck benchmark, 64 times: 8xM8 + MPS auto, bd7a0d3, v6 env. wall_s 114.274, 1.786 s/case, all 128 receipt lines read outers:4377, nvidia-smi dmon sm pct mean 94.8 / p95 100 / 94.7 pct of samples >= 85.",
+    "batch_mode_overhead": "1.786 s/case against the ~1.2 s/case single-deck GPU-kernel-time reference = 1.49x, i.e. batch mode itself costs about +49 pct more time per case, measured on the IDENTICAL deck so it cannot be deck weight. Inverted: batch runs at 67 pct of the single-deck kernel-time ideal. The m64 gap (~2.55x) is close to deck weight 1.92x times batch overhead 1.49x = 2.86x - both factors are real, and neither of the two clean either/or branches proposed beforehand matched the measurement.",
+
+    "where_the_49_percent_comes_from": "PACKING WIDTH, NOT MPS. Block 32, all on the KNGR-x64 manifest: 1xM64 raw (no MPS) 1537.6 c/h vs 1xM8 raw (no MPS) 799.6 = width alone is 1.92x. 8xM8 with no MPS 1019.1 c/h vs 8xM8 with MPS 2016.2 = MPS is 1.98x FASTER, so MPS is the source of concurrency, not a source of overhead; removing it would make the per-case overhead worse, not better. Full sweep: 8xM8+MPS 2016.2 > 4xM16+MPS25 2001.2 > 2xM32+MPS50 1796.9 > 1xM64 raw 1537.6 > 8xM8 no-MPS 1019.1 > 1xM8 raw 799.6. All 5 arms 64/64 ok, 0 failed, 0 duplicates, 0 stale tenants, 0 isolation mismatches across 320 cases.",
+
+    "shape_sweep_128job": "8xM16 auto 1246.2 (bd7a0d3) / 1235.1 (cd3630c); 8xM8 auto 1186.1 / 1182.0; 8xM16 rolling 1181.2; 16xM8 blocking 1159.5; 8xM8 rolling 1158.3; 8xM16 rolling+blocking 1109.8; 16xM8 auto 1035.3; 16xM16 auto 1023.9; 8xM8 claim=4 978.0; 12xM8 blocking 976.3; 12xM8 auto 944.5; 8xM8 claim=2 840.3; 8xM8 claim=1 592.8.",
+    "shape_verdict": "nothing beyond 8 processes helps at any width tried, and no --claim chunk size helps at all. 8xM8 and 8xM16 with claim=auto are the shapes to use.",
+    "block_25_confound_and_its_correction": "the first concurrency sweep fed 12xM8 (96 slots) and 16xM8 (128 slots) from a 64-job pool, so width_fill could not arithmetically exceed 0.667 / 0.5. Redone on 128 jobs, width_fill RISES with more processes (0.4473 -> 0.4714 -> 0.5220) and throughput STILL falls - which is the first direct evidence that arena fill was never the constraint.",
+
+    "host_cpu": "batch 8xM8+MPS12: auto 72.8 pct total CPU, blocking 40.1 pct, yield 67.0 pct. Roughly 33 percentage points of the long-reported ~74 pct is cudaStreamSynchronize spin, not host work. See arm_components.cuda_sync_mode_NOT_IN_ARM.",
+    "pcie": "batch rx mean 8284.1 MB/s (32.4 pct of a ~25 GB/s practical Gen4 x16 ceiling), tx mean 6326.7 (24.7 pct); p95 reaches ~55 pct on rx and ~40 pct on tx. Not the bottleneck. cd3630c moves 18.3 pct LESS over PCIe than 6bdfdc2 while being marginally faster.",
+    "control_discrepancy": "the 677.6-vs-877.6 c/h same-day control gap recorded in v5 remains unattributed. Nothing in phase 2 addressed it, and it still makes every batch RATIO baseline-dependent."
+  },
+
+  "rejected_and_closed": {
+    "persistent_cooperative_cmfd_bicg": "PERMANENTLY CLOSED by the probe's own verdict. tools/probe_gridsync_cost.cu, compiled per its header instructions and run on the deck's ACTUAL CMFD shapes rather than hypothetical ones: c_barrier 0.7818 us at 34 blocks, 0.7884 at 67 (the gate value), 0.9504 at 209, against a gate threshold of 0.3840 us - 2.05x over, verdict NO-GO. The 1188- and 4224-block shapes that would matter for a batch-wide persistent kernel report supported:false, grid exceeds co-resident capacity: this device holds at most 1128 co-resident blocks (6/SM x 188), so those launches are impossible, not merely slow. The persistent-kernel spike was SKIPPED per the block's own conditional rule, not attempted and abandoned. Reopening requires a hardware or driver change that halves c_barrier.",
+    "rolling_refill_wp18": "NOT ADOPTED, code kept. -2.3 pct at M8, -5.2 pct at M16, -6.1 pct at M16 with blocking, against an expected 1500-1900 c/h band. Exact (0/64 cross-case digest mismatches) and mechanically correct (slot_idle ~1 ms, tail_idle 0, width p50 8). See arm_components.rolling_refill_NOT_IN_ARM.",
+    "wp9d_search_levers": "REJECTED against the doc's own bar (outers down >=10 pct AND Gate B inside the v2 envelope). boron_bracket is the only lever with a real non-regressing effect and it reduces outers by 1.76 pct (4377 -> 4300, bisect=3 confirms the bracket engaged, single 10.034 s vs base 10.172 s). carry_slope makes outers WORSE by 8.11 pct and trips its own doc-specified immediate-discard rule (trials 130 vs base ~120); all_together inherits that and lands at +15.8 pct. warm_boron is a confirmed no-op (no parent warm-start file, extrap=0, digest unchanged) and max_trials=12 never binds (the deck commits ~3.4 trials per statepoint). staged_margin=2 is +0.11 pct, noise. Gate A puts even boron_bracket OUTSIDE the screen on keff (2.27 pcm against a 1.905 limit); Gate B is over by 0.04 pcm and 0.025 ppm.",
+    "wp9d_open_defect": "OPEN. The batch arm 8xM16 + boron_bracket produced 5 SILENT case failures out of 128, all on one worker (proc6: candidate_0040/41/42/44, with 0044 listed twice, i.e. one retry that also failed), with no error text at the harness level beyond [MULTI_GPU][FAIL] gpu0 p6. The identical env at width 8 ran 128/128 clean, so it looks width/packing-specific rather than boron_bracket-specific, but an 8xM16-with-the-flag-off control was NOT run. Forensics continue as block 34. Do not quote that arm's 1333.5 c/h.",
+    "claim_chunk_sizes": "REJECTED. --claim 1/2/4 at 8xM8: 592.8 / 840.3 / 978.0 c/h (-49.8 / -28.9 / -17.2 pct against claim=auto's 1182.0). Small claims do eliminate tail_idle_max (0.0-8.1 s vs auto's 155-356 s) but the per-claim queue round-trip costs far more than the tail saves. claim=4 recovers some throughput and does NOT fix the tail either (190-192 s, the same magnitude as auto).",
+    "higher_concurrency_shapes": "REJECTED. 12xM8 944.5 (-20.1 pct), 16xM8 1035.3 (-12.4 pct), 16xM16 1023.9 (-13.4 pct) against the 128-job 8xM8 baseline. MPS per-process thread share shrinks 12 -> 8 -> 6 pct and that dilution costs more than better arena fill gains. Under blocking sync mode 16xM8 recovers to 1159.5 (+12.0 pct over its own auto figure) but still loses to 8xM8 by 1.9 pct.",
+    "8xM16_promotion": "NOT PROMOTED. 1235.1 c/h at cd3630c (+4.5 pct) and 1246.2 at bd7a0d3, against a +5 pct adoption bar, with tail_idle_max_s of 355.8-358.6 s against its own ~370 s wall - worse than 8xM8's tail in both absolute and relative terms.",
+    "cuda_sync_mode_default": "NOT DEFAULTED. -3.6 pct c/h in batch against a 'no c/h loss' bar, and +8.7 pct wall on a single deck. Batch option only.",
+    "segment_v2_and_cmfd_block_in_batch": "EXCLUDED FROM THE BATCH ENV. SEGMENT_V2 -1.0 pct, CMFD_BLOCK=64 -0.3 pct (flat). Both stay in the single-deck arm."
+  },
+
+  "master_agreement_at_candidate": {
+    "reactivity_pcm": 1.847,
+    "cbc_ppm": 15.334,
+    "ao_abs": 0.012,
+    "boc_pin_rms_pct": 0.238,
+    "boc_pin_max_pct": 0.8,
+    "measured_on": "238, 2026-08-31, block 19's OUTER_GRAPH arm against MASTER over 33 joined states, reproducing the v5 figures exactly",
+    "envelope_note": "IDENTICAL to the v5 freeze figures and to the v2-baseline-vs-MASTER envelope already on file (15.309 ppm / 1.905 pcm / 0.013 AO / 0.238 pct / 0.80 pct). This is expected: every knob added in phase 2 is B0, so none of them can move a comparison against MASTER at all. The agreement numbers are recorded to show they did not move, not as new evidence.",
+    "comparator": "tools/compare_master_rasbery.py for the summary metrics; tools/gate_b_pin_rms.py for the BOC pin RMS and max"
+  },
+
+  "reproduce": {
+    "build_238": "cmake -DCMAKE_BUILD_TYPE=Release -DRASBERY_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DHDF5_ROOT=<gcc13 prefix>; ctest must pass 12/12; verify the per-TU --fmad=false on CudaXsReconBackend.cu through compile_commands.json before quoting any number.",
+    "single_deck": "start from `env -i`, export benchmark_input.env verbatim, then RASBERY --rasi kngr_238.json --raso out.h5 --result full. Read [RASBERY][TRAJECTORY] for digest and outers, and check [PPR_GPU].host_fallbacks, [CRAM_GPU].host_fallbacks, [XE_GPU].host_fallbacks and grep -c \"[ERROR][micx]\" are all 0 before believing the wall.",
+    "protocol": "warm-up 1, hot 3, arms INTERLEAVED, median of the hot three.",
+    "b0_identity": "h5diff -r out_off.h5 out_on.h5 must print nothing and exit 0, AND cmp must report the two <stem>_pinpower.csv files identical. h5diff does not look at a CSV, so it alone would pass a run whose CSV came from a different statepoint.",
+    "gate_a": "tools/gate_a_compare.py --per-step against the v5 baseline.",
+    "gate_b_pin": "tools/gate_b_pin_rms.py must reproduce 0.238 pct RMS / 0.80 pct max to printed precision. 0.522 pct / 2.13 pct is the signature of the PPR arm being invalid rather than merely different.",
+    "ledger": "RASBERY_XFER_LEDGER=1 on a COMPANION single-deck run only. Never attach it to the batch harness - blocks 18, 21b and 23 all keep it off the throughput runs for that reason.",
+    "batch": "tools/run_multi_gpu_batch.py --gpus 0 --procs-per-gpu 8 --batch-width 8 --mps --result light, with the v6 deltas passed via --set and WITHOUT RASBERY_GPU_CMFD_BLOCK or RASBERY_GPU_OUTER_SEGMENT_V2.",
+    "gridsync_gate": "tools/probe_gridsync_cost.cu. If it prints verdict NO-GO, the persistent-kernel track does not open. It currently prints NO-GO.",
+    "harness_argv_note": "the harness's real per-process child argv is `--evaluator-jsonl - --batch-mode 8 --result light`. There is NO gpu0.pN.chunk substring in any child's command line - that string exists only in a job-queue file on disk. Two profiling passes (blocks 24 and 26) failed because they grepped for it. Wrap or select a worker with a first-to-claim lock file, not an argv pattern."
+  },
+
+  "threshold_file": "validation_thresholds_v3.json",
+  "threshold_file_note": "v6 introduces NO new thresholds and reuses v3's file, as v4 and v5 did.",
+
+  "v5_retention": "validation_baseline_manifest_v5.json is kept UNTOUCHED and frozen:true. It remains the authoritative baseline and the correct Gate A reference. This candidate does not supersede it and must not be treated as a freeze. validation_baseline_manifest_v3.json, _v4_candidate.json and validation_thresholds_v{1,2,3}.json are likewise untouched.",
+
+  "open_items": {
+    "cross_gate_181": "THE ONE THING THAT MAKES THIS A CANDIDATE. No phase-2 row has been measured on 181, because 181 computation is suspended by user directive. Until it resumes, OUTER_GRAPH's B0 grade in particular rests on a single host and a single deck, against a runbook that expected N1.",
+    "v6_self_determinism": "a repeat-against-itself h5diff of the exact v6 + CMFD_BLOCK=64 arm was not run. Every A/B pair in blocks 19-29 is h5diff 0 and the OUTER_GRAPH arm was explicitly run twice with 0 differences, but the fully stacked arm has not been compared to itself.",
+    "batch_cmfd_grid_sizes": "UNKNOWN and not guessed. The batch worker's nsys invocation omitted --cuda-graph-trace=node (only the single-deck run in block 27a had it), so the CMFD/BiCG family (colored_block_sweep, matvec_two_group, the reduce_* family, prepare_p_jacobi, update_*_jacobi) returns ZERO rows in the batch trace - that trace holds only 19 distinct kernel names. The leading explanation is that CMFD's sweep runs inside a captured graph (fuse_mask=15) and its internal launches fold into the replay node. A rerun with --cuda-graph-trace=node is required.",
+    "nodal_jnet_elision": "not engaged in any measured run (elided_mb 0.0, elision_tests 0, hit_rate -1.000).",
+    "micx_msm_row": "the msm D2H row was not separately captured, leaving an 18.69-vs-22.85 GB gap that is consistent with msm's ~4.05 GB but was not measured in the same run.",
+    "batch_bytes_per_case": "not measured. The batch runs used --result light with no ledger attached, so the ~38 -> ~2 GB/case expectation is unverified.",
+    "wp9d_ppm_offset": "the recurring max_ppm 15.334 (over the 15.309 reference by 0.025) in two WP9-D arms looks like shared baseline noise rather than a flag-specific regression, but no isolated zero-knob-vs-MASTER rerun confirmed that. The identical BOC pin rms/max across every arm, including one with a near-zero outer effect, points the same way.",
+    "segment_v2_batch_refusal": "the premise that batch refuses SEGMENT_V2 was probed only at 1 process / width 1, where it did NOT refuse. The 8-process MPS scale was not probed.",
+    "batch_graph_arm_field": "graph_launches was extracted reliably from batch logs (0, 19888, 49456, 51 across one worker's jobs, confirming OUTER_GRAPH is genuinely engaged in batch); the graph_arm field itself was not, and no value is asserted for it.",
+    "provenance_not_captured": "GPU uuid, driver version, CUDA runtime version and the exact g++/nvcc paths were not recorded in the 2026-08-31 session. Recorded as absent rather than guessed.",
+    "control_discrepancy": "inherited from v5 and untouched: the 677.6-vs-877.6 c/h same-day control gap remains unattributed.",
+    "next_levers": "Named by the instruments. (1) A2 outer reduction, W3.6 (flux-space Anderson plus interim-Xe) - batch is GPU-time-bound and m64 cases carry 8415 outers each; this is the only remaining large lever and it is A2, so it needs its own branch, invariant contract and explicit rollback. (2) Host statepoint-phase residency, W5+ Tasks 13-15 - block 27's under-filled grids and block 24's width_fill 0.45 point the same way: pack more independent work per launch. (3) Xe/CRAM kernel time in batch - kXeEvaluate 5313.5 ms at grid 48 over 15441 launches, kCorrector 4418.3 and kPredictor 4330.2 at grid 133, kXeCommitTxn 3890.3 at grid 48. (4) Multi-GPU dispatcher - GPU1 is idle, concurrency is throughput (MPS 1.98x, width 1.92x), and WP18's per-slot admit machinery already exists as the substrate."
+  }
+}
