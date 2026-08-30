@@ -45,6 +45,7 @@ question, never an arithmetic one, and this file pins each of them.
 from __future__ import annotations
 
 import py_compile
+import re
 import sys
 from pathlib import Path
 
@@ -255,6 +256,52 @@ want(OUTER_CU_CODE, "if (m.canonical_nodal_live) {", "CudaOuterGraph.cu",
 
 # THE READER LIST.  Each of these is a host consumer of Jnet and/or Phis; if one
 # is renamed or moved the mirror above has to be re-argued, not silently kept.
+#
+# QUOTED WHITESPACE-TOLERANTLY, AND THAT IS THE WHOLE OF THE FIX.  These
+# quotations were literal `in` tests, so `clang-format` wrapping a call across
+# two lines failed the contract -- which is what happened to the PPR reset once
+# it grew its outer_timing::Scope and the argument list no longer fit
+# (src/Driver.h:4965-4966).  A reflow is not a reader moving; it is the same
+# reader, printed differently, and a contract that cannot tell those apart is a
+# contract that gets edited every time the formatter runs -- i.e. one that stops
+# being read.  What the list actually pins is the TOKEN SEQUENCE, so that is
+# what is matched: every run of whitespace in the quotation stands for any run
+# of whitespace in the source, and nothing else is relaxed.  A renamed array, a
+# reordered argument or a dropped one still fails, which is the property the
+# exit mirror's safety argument rests on.
+
+
+def quoted(needle: str) -> re.Pattern[str]:
+    """`needle` as a regex whose inter-token whitespace is any whitespace."""
+    return re.compile(r"\s+".join(re.escape(tok) for tok in needle.split()))
+
+
+def quotes(code: str, needle: str) -> bool:
+    return quoted(needle).search(code) is not None
+
+
+# NEGATIVE CONTROLS, run here rather than trusted: a whitespace-tolerant matcher
+# that had been made too tolerant would pass this file forever without anyone
+# noticing, because every quotation below is present in some form.
+_PPR = ("pin_power_reconstruction.reset(1.0 / eigv, geometry.Jnet(), "
+        "geometry.Phif(), geometry.Phis());")
+_WRAPPED = ("pin_power_reconstruction.reset(1.0 / eigv, geometry.Jnet(),\n"
+            "                                               geometry.Phif(), geometry.Phis());")
+if not quotes(_WRAPPED, _PPR):
+    problems.append("negative control 1: the matcher does not tolerate a reflow, which "
+                    "is the one thing it was written to tolerate")
+if quotes(_PPR.replace("geometry.Phif()", "geometry.Phis()"), _PPR):
+    problems.append("negative control 2: the matcher accepted a CHANGED argument; it "
+                    "must relax whitespace and nothing else")
+if quotes(_PPR.replace("geometry.Jnet(), geometry.Phif()",
+                       "geometry.Phif(), geometry.Jnet()"), _PPR):
+    problems.append("negative control 3: the matcher accepted REORDERED arguments")
+if quotes("pin_power_reconstruction.reset(1.0/eigv, geometry.Jnet(), geometry.Phif(), "
+          "geometry.Phis());", _PPR):
+    problems.append("negative control 4: the matcher treated whitespace as OPTIONAL "
+                    "rather than as any-whitespace; `1.0/eigv` is a different spelling "
+                    "of the call and the list quotes the one the tree has")
+
 READERS = (
     (DRIVER_CODE,
      "pin_power_reconstruction.reset(1.0 / eigv, geometry.Jnet(), geometry.Phif(), "
@@ -275,7 +322,7 @@ READERS = (
      "Driver.h: the host upddhat reads Jnet on the line after the host nodal drive"),
 )
 for code, needle, why in READERS:
-    if needle not in code:
+    if not quotes(code, needle):
         problems.append("the Jnet/Phis reader list is out of date: " + why +
                         f" (looked for {needle!r})")
 
