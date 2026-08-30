@@ -10,6 +10,7 @@
 // not contract a*b+c where the host compiler did not.
 
 #include "CudaPprBackend.h"
+#include "PprReconstructionKernel.cuh"
 
 #include <cuda_runtime.h>
 
@@ -1031,6 +1032,53 @@ struct PprBackend::Impl {
     double* d_partials = nullptr;
     double* h_partials = nullptr; ///< pinned, 4 * nchunk
 
+    // --- WP6 stage D: the reconstruction's own block -----------------------
+    //
+    // SEPARATE FROM ensureShape's, because its shape is a different tuple
+    // (nxya, nz, kbc, kec, ndiv, npins, overlaps, form slots) and because the
+    // arm is opt-in: a run with RASBERY_GPU_PPR_RECON unset allocates none of
+    // it.  Freed by release() along with everything else, so a re-shape of the
+    // NODE mesh drops it too -- the coefficients it reads would be gone.
+    bool recon_shaped          = false;
+    bool recon_static_uploaded = false;
+    bool fmap_uploaded         = false;
+    int  r_nxya = 0, r_nz = 0, r_kbc = 0, r_kec = 0, r_ndiv = 0, r_npins = 0;
+    int  r_overlaps = 0, r_slots = 0;
+    unsigned long long recon_static_bytes = 0;
+    unsigned long long recon_shapes       = 0;
+    std::string        recon_refusal;
+    /// Did the LAST resetAndDrive leave device coefficients?  The reconstruction
+    /// reads `p`/`a`/`bt` as that call left them, so a statepoint that fell back
+    /// to the host must not reconstruct on the device from a stale set.
+    bool last_drive_ok = false;
+
+    int*           d_latol   = nullptr;
+    double*        d_vol     = nullptr;
+    double*        d_hz      = nullptr;
+    int*           d_pin_off = nullptr;
+    int*           d_ovl_di  = nullptr;
+    int*           d_ovl_dj  = nullptr;
+    double*        d_ovl_dxh = nullptr;
+    double*        d_ovl_dyh = nullptr;
+    double*        d_q_xq    = nullptr;
+    double*        d_q_yq    = nullptr;
+    double*        d_q_wt    = nullptr;
+    double*        d_q_leg   = nullptr;
+    double*        d_xskf    = nullptr;
+    double*        d_gmap    = nullptr;
+    double*        d_fmap    = nullptr;
+    int*           d_plane_lo    = nullptr;
+    int*           d_plane_hi    = nullptr;
+    double*        d_plane_alpha = nullptr;
+    double*        d_pin_power   = nullptr;
+    double*        d_pin_flux    = nullptr;
+    double*        d_norm_partial = nullptr;
+    double*        d_peak_partial = nullptr;
+    double*        d_radial_power = nullptr;
+    double*        d_radial_hz    = nullptr;
+    double*        d_scalars      = nullptr;
+    double*        h_scalars      = nullptr; ///< pinned, 4
+
     // WP6 stage B.  The Picard loop's device-side state, and its pinned mirror.
     // The mirror is written before the statepoint (reigv, the cap, the zeroed
     // sums) and read after it (the round count) -- one 64-byte transfer each
@@ -1079,11 +1127,45 @@ struct PprBackend::Impl {
     unsigned long long n_allocations     = 0;
     unsigned long long n_reallocations   = 0;
     unsigned long long n_shapes          = 0;
+    unsigned long long n_d2h_elided      = 0;
+    unsigned long long n_recon_statepoints    = 0;
+    unsigned long long n_pin_materializations = 0;
+    unsigned long long n_recon_repairs        = 0;
+    /// The last drive elided the coefficient D2H on the promise that the
+    /// device reconstruction would consume them.  Cleared by the reconstruction
+    /// that does; read by noteReconRepair() when one does not.
+    bool coeffs_device_only = false;
 
     cudaEvent_t ev_start = nullptr;
     cudaEvent_t ev_stop  = nullptr;
 
     ~Impl() { release(); }
+
+    void releaseRecon() {
+        auto f = [](void* p) { if (p) cudaFree(p); };
+        f(d_latol); f(d_vol); f(d_hz);
+        f(d_pin_off); f(d_ovl_di); f(d_ovl_dj); f(d_ovl_dxh); f(d_ovl_dyh);
+        f(d_q_xq); f(d_q_yq); f(d_q_wt); f(d_q_leg);
+        f(d_xskf); f(d_gmap); f(d_fmap);
+        f(d_plane_lo); f(d_plane_hi); f(d_plane_alpha);
+        f(d_pin_power); f(d_pin_flux);
+        f(d_norm_partial); f(d_peak_partial); f(d_radial_power); f(d_radial_hz);
+        f(d_scalars);
+        if (h_scalars) cudaFreeHost(h_scalars);
+        d_latol = nullptr; d_vol = nullptr; d_hz = nullptr;
+        d_pin_off = nullptr; d_ovl_di = nullptr; d_ovl_dj = nullptr;
+        d_ovl_dxh = nullptr; d_ovl_dyh = nullptr;
+        d_q_xq = d_q_yq = d_q_wt = d_q_leg = nullptr;
+        d_xskf = d_gmap = d_fmap = nullptr;
+        d_plane_lo = nullptr; d_plane_hi = nullptr; d_plane_alpha = nullptr;
+        d_pin_power = d_pin_flux = nullptr;
+        d_norm_partial = d_peak_partial = d_radial_power = d_radial_hz = nullptr;
+        d_scalars = nullptr; h_scalars = nullptr;
+        recon_shaped          = false;
+        recon_static_uploaded = false;
+        fmap_uploaded         = false;
+        recon_static_bytes    = 0;
+    }
 
     void releaseGraph() {
 #if RASBERY_HAS_PPR_WHILE
@@ -1107,6 +1189,7 @@ struct PprBackend::Impl {
         f(d_xsdf);   f(d_xsrf);    f(d_xsnf);   f(d_xssm);  f(d_chif); f(d_crdf);
         f(d_phic);   f(d_p);       f(d_a);      f(d_c);     f(d_q);    f(d_l);  f(d_bt);
         f(d_partials); f(d_loop);  f(d_mismatch);
+        releaseRecon();
         if (h_partials) cudaFreeHost(h_partials);
         if (h_loop) cudaFreeHost(h_loop);
         if (h_mismatch) cudaFreeHost(h_mismatch);
@@ -1124,6 +1207,16 @@ struct PprBackend::Impl {
         geometry_uploaded = false;
         chif_gen_seen = 0;
         crdf_gen_seen = 0;
+    }
+
+    /// THE ONLY cudaStreamSynchronize IN THIS FILE, and the only place
+    /// n_host_syncs moves.  Both entry points call it, so
+    /// host_syncs_per_statepoint stays the truth when stage D is on.
+    bool syncStream(const char* what) {
+        const cudaError_t rc = cudaStreamSynchronize(stream);
+        ++n_host_syncs;
+        if (rc != cudaSuccess) return fail(what, rc);
+        return true;
     }
 
     bool fail(const char* what, cudaError_t rc) {
@@ -1212,6 +1305,89 @@ struct PprBackend::Impl {
         ++n_allocations;
         return true;
     }
+
+    /// WP6 stage D.  `fmap` and the pin FLUX map are NOT part of the shape:
+    /// `print_opt.pin_flux` can turn on at one statepoint out of thirty-five,
+    /// and making that a re-shape would drop every buffer and every graph for a
+    /// print option.  They are allocated on first demand and kept.
+    bool ensureReconShape(const ppr::ReconGeomView& g, const ppr::ReconStepView& st) {
+        const int npina = g.npins * g.npins;
+        if (recon_shaped && r_nxya == g.nxya && r_nz == g.nz && r_kbc == g.kbc &&
+            r_kec == g.kec && r_ndiv == g.ndiv && r_npins == g.npins &&
+            r_overlaps == g.n_overlaps && r_slots == st.n_form_slots) {
+            return ensureReconFlux(g, st);
+        }
+        if (recon_shapes > 0) ++n_reallocations;
+        ++recon_shapes;
+        releaseRecon();
+        r_nxya = g.nxya; r_nz = g.nz; r_kbc = g.kbc; r_kec = g.kec;
+        r_ndiv = g.ndiv; r_npins = g.npins;
+        r_overlaps = g.n_overlaps; r_slots = st.n_form_slots;
+
+        const int    ndiv2 = g.ndiv * g.ndiv;
+        const size_t nn    = static_cast<size_t>(nxyz);
+        const size_t no    = static_cast<size_t>(g.n_overlaps);
+        const size_t nplan = static_cast<size_t>(g.nz) * g.nxya;
+        const size_t nmap  = nplan * npina;
+        const size_t nrad  = static_cast<size_t>(g.nxya) * npina;
+
+        struct Alloc { void** p; size_t bytes; const char* name; bool once; };
+        const Alloc allocs[] = {
+            {(void**)&d_latol,   static_cast<size_t>(g.nxya) * ndiv2 * sizeof(int), "latol", true},
+            {(void**)&d_vol,     nn * sizeof(double),                 "vol",     true},
+            {(void**)&d_hz,      static_cast<size_t>(g.nz) * sizeof(double), "hz", true},
+            {(void**)&d_pin_off, (static_cast<size_t>(npina) + 1) * sizeof(int), "pin_off", true},
+            {(void**)&d_ovl_di,  no * sizeof(int),                    "ovl_di",  true},
+            {(void**)&d_ovl_dj,  no * sizeof(int),                    "ovl_dj",  true},
+            {(void**)&d_ovl_dxh, no * sizeof(double),                 "ovl_dxh", true},
+            {(void**)&d_ovl_dyh, no * sizeof(double),                 "ovl_dyh", true},
+            {(void**)&d_q_xq,    no * 9 * sizeof(double),             "q_xq",    true},
+            {(void**)&d_q_yq,    no * 9 * sizeof(double),             "q_yq",    true},
+            {(void**)&d_q_wt,    no * 9 * sizeof(double),             "q_wt",    true},
+            {(void**)&d_q_leg,   no * 9 * 15 * sizeof(double),        "q_leg",   true},
+            {(void**)&d_gmap,    static_cast<size_t>(st.n_form_slots) * npina * sizeof(double),
+             "gmap", true},
+            {(void**)&d_xskf,    nn * ng * sizeof(double),            "xskf",    false},
+            {(void**)&d_plane_lo,    nplan * sizeof(int),             "plane_lo",    false},
+            {(void**)&d_plane_hi,    nplan * sizeof(int),             "plane_hi",    false},
+            {(void**)&d_plane_alpha, nplan * sizeof(double),          "plane_alpha", false},
+            {(void**)&d_pin_power,   nmap * sizeof(double),           "pin_power",   false},
+            {(void**)&d_norm_partial, static_cast<size_t>(2 * nchunk) * sizeof(double),
+             "norm_partial", false},
+            {(void**)&d_peak_partial, static_cast<size_t>(2 * nchunk) * sizeof(double),
+             "peak_partial", false},
+            {(void**)&d_radial_power, nrad * sizeof(double),          "radial_power", false},
+            {(void**)&d_radial_hz,    static_cast<size_t>(g.nxya) * sizeof(double),
+             "radial_hz", false},
+            {(void**)&d_scalars,      4 * sizeof(double),             "recon_scalars", false},
+        };
+        recon_static_bytes = 0;
+        for (const Alloc& a : allocs) {
+            const cudaError_t rc = cudaMalloc(a.p, a.bytes);
+            if (rc != cudaSuccess) return fail(a.name, rc);
+            ++n_allocations;
+            if (a.once) recon_static_bytes += a.bytes;
+        }
+        const cudaError_t rc = cudaMallocHost((void**)&h_scalars, 4 * sizeof(double));
+        if (rc != cudaSuccess) return fail("cudaMallocHost(recon_scalars)", rc);
+        ++n_allocations;
+        recon_shaped = true;
+        return ensureReconFlux(g, st);
+    }
+
+    bool ensureReconFlux(const ppr::ReconGeomView& g, const ppr::ReconStepView& st) {
+        if (!st.reconstruct_flux || d_fmap != nullptr) return true;
+        const int    npina = g.npins * g.npins;
+        const size_t nmap  = static_cast<size_t>(g.nz) * g.nxya * npina;
+        cudaError_t  rc    = cudaMalloc((void**)&d_fmap,
+                                        static_cast<size_t>(r_slots) * ng * npina * sizeof(double));
+        if (rc != cudaSuccess) return fail("fmap", rc);
+        ++n_allocations;
+        rc = cudaMalloc((void**)&d_pin_flux, nmap * ng * sizeof(double));
+        if (rc != cudaSuccess) return fail("pin_flux", rc);
+        ++n_allocations;
+        return true;
+    }
 };
 
 PprBackend::PprBackend() : _impl(new Impl) {
@@ -1279,6 +1455,16 @@ unsigned long long PprBackend::h2dBytesElided() const { return _impl->n_h2d_elid
 unsigned long long PprBackend::d2hBytes() const { return _impl->n_d2h_bytes; }
 unsigned long long PprBackend::canonicalStatepoints() const { return _impl->n_canonical_sp; }
 unsigned long long PprBackend::canonicalMismatch() const { return _impl->n_canonical_bad; }
+void PprBackend::noteReconRepair() {
+    if (_impl->coeffs_device_only) ++_impl->n_recon_repairs;
+    _impl->coeffs_device_only = false;
+}
+unsigned long long PprBackend::reconRepairs() const { return _impl->n_recon_repairs; }
+unsigned long long PprBackend::reconStatepoints() const { return _impl->n_recon_statepoints; }
+unsigned long long PprBackend::pinMaterializations() const {
+    return _impl->n_pin_materializations;
+}
+const std::string& PprBackend::reconRefusal() const { return _impl->recon_refusal; }
 unsigned long long PprBackend::allocations() const { return _impl->n_allocations; }
 unsigned long long PprBackend::reallocations() const { return _impl->n_reallocations; }
 
@@ -1287,6 +1473,10 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
                                int niter, int* iters) {
     Impl& s = *_impl;
     if (!s.enabled || s.failed) return false;
+    // Lowered FIRST, raised only on the success return: every early exit below
+    // therefore leaves the reconstruction arm refusing, which is what stops it
+    // reading coefficients this statepoint did not write.
+    s.last_drive_ok = false;
     if (geom.ng != 2) {
         s.status_text = "declined: ng != 2 (updateSource body is 2-group)";
         return false;
@@ -1303,12 +1493,6 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
         rc = cudaMemcpyAsync(d, h, bytes, cudaMemcpyHostToDevice, s.stream);
         if (rc != cudaSuccess) return s.fail(name, rc);
         s.n_h2d_bytes += bytes;
-        return true;
-    };
-    auto sync = [&](const char* name) -> bool {
-        rc = cudaStreamSynchronize(s.stream);
-        ++s.n_host_syncs;
-        if (rc != cudaSuccess) return s.fail(name, rc);
         return true;
     };
 
@@ -1486,7 +1670,7 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
                                  cudaMemcpyDeviceToHost, s.stream);
             if (rc != cudaSuccess) return s.fail("D2H corner partials", rc);
             s.n_d2h_bytes += static_cast<size_t>(4 * s.nchunk) * sizeof(double);
-            if (!sync("drive sync")) return false;
+            if (!s.syncStream("drive sync")) return false;
 
             double nw = 0.0, sw = 0.0, ne = 0.0, se = 0.0;
             for (int c = 0; c < s.nchunk; ++c) nw += s.h_partials[0 * s.nchunk + c];
@@ -1576,13 +1760,19 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
         s.n_d2h_bytes += bytes;
         return true;
     };
-    if (!d2h(step.p, s.d_p, nng * 15 * sizeof(double), "D2H p")) return false;
-    if (!d2h(step.a, s.d_a, nng * 8 * sizeof(double), "D2H a")) return false;
-    if (!d2h(step.c, s.d_c, nng * 15 * sizeof(double), "D2H c")) return false;
-    if (!d2h(step.bt, s.d_bt, nng * sizeof(double), "D2H bt")) return false;
-    if (!d2h(step.phic, s.d_phic, nng * 4 * sizeof(double), "D2H phic")) return false;
-    if (!d2h(step.q, s.d_q, nng * 15 * sizeof(double), "D2H q")) return false;
-    if (!d2h(step.l, s.d_l, nng * 9 * sizeof(double), "D2H l")) return false;
+    const size_t coeff_bytes = nng * (15 + 8 + 15 + 1 + 4 + 15 + 9) * sizeof(double);
+    s.coeffs_device_only = step.coefficients_stay_on_device;
+    if (!s.coeffs_device_only) {
+        if (!d2h(step.p, s.d_p, nng * 15 * sizeof(double), "D2H p")) return false;
+        if (!d2h(step.a, s.d_a, nng * 8 * sizeof(double), "D2H a")) return false;
+        if (!d2h(step.c, s.d_c, nng * 15 * sizeof(double), "D2H c")) return false;
+        if (!d2h(step.bt, s.d_bt, nng * sizeof(double), "D2H bt")) return false;
+        if (!d2h(step.phic, s.d_phic, nng * 4 * sizeof(double), "D2H phic")) return false;
+        if (!d2h(step.q, s.d_q, nng * 15 * sizeof(double), "D2H q")) return false;
+        if (!d2h(step.l, s.d_l, nng * 9 * sizeof(double), "D2H l")) return false;
+    } else {
+        s.n_d2h_elided += coeff_bytes;
+    }
     // The round count rides the same batch: on the device arms it is the only
     // way the host learns how many rounds ran, and it costs no extra sync.
     if (!d2h(s.h_loop, s.d_loop, sizeof(PprLoopState), "D2H loop state")) return false;
@@ -1592,7 +1782,7 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
         return false;
 
     cudaEventRecord(s.ev_stop, s.stream);
-    if (!sync("final sync")) return false;
+    if (!s.syncStream("final sync")) return false;
 
     float ms = 0.0f;
     if (cudaEventElapsedTime(&ms, s.ev_start, s.ev_stop) == cudaSuccess)
@@ -1605,6 +1795,191 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
     ++s.n_statepoints;
     s.n_iterations += static_cast<unsigned long long>(iters_done);
     if (iters) *iters = iters_done;
+    s.last_drive_ok = true;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// WP6 stage D: reconstructPinPower on the device
+// ---------------------------------------------------------------------------
+
+bool PprBackend::reconstructPinPower(const ppr::ReconGeomView& geom,
+                                     const ppr::ReconStepView& step) {
+    Impl& s = *_impl;
+    if (!s.enabled || s.failed) return false;
+    // ONLY AFTER A DEVICE DRIVE.  The kernels read `p`, `a` and `bt` as the
+    // previous call left them; a statepoint whose drive fell back to the host
+    // has host coefficients and device coefficients one statepoint stale, and
+    // reconstructing from the stale ones is the failure this guard exists for.
+    if (!s.last_drive_ok) {
+        s.recon_refusal = "previous drive did not run on the device";
+        return false;
+    }
+    if (!ppr::reconEnabledFromEnv()) {
+        s.recon_refusal = "off (RASBERY_GPU_PPR_RECON unset)";
+        return false;
+    }
+    if (!s.ensureReconShape(geom, step)) return false;
+
+    cudaError_t rc = cudaSuccess;
+    auto        h2d = [&](void* d, const void* h, size_t bytes, const char* name) -> bool {
+        rc = cudaMemcpyAsync(d, h, bytes, cudaMemcpyHostToDevice, s.stream);
+        if (rc != cudaSuccess) return s.fail(name, rc);
+        s.n_h2d_bytes += bytes;
+        return true;
+    };
+
+    const size_t nn    = static_cast<size_t>(s.nxyz);
+    const int    ndiv2 = geom.ndiv * geom.ndiv;
+    const int    npina = geom.npins * geom.npins;
+    const size_t nplan = static_cast<size_t>(geom.nz) * geom.nxya;
+    const size_t nmap  = nplan * npina;
+
+    if (!s.recon_static_uploaded) {
+        if (!h2d(s.d_latol, geom.latol,
+                 static_cast<size_t>(geom.nxya) * ndiv2 * sizeof(int), "H2D latol")) return false;
+        if (!h2d(s.d_vol, geom.vol, nn * sizeof(double), "H2D vol")) return false;
+        if (!h2d(s.d_hz, geom.hz, static_cast<size_t>(geom.nz) * sizeof(double), "H2D hz"))
+            return false;
+        const size_t no = static_cast<size_t>(geom.n_overlaps);
+        if (!h2d(s.d_pin_off, geom.pin_off, (static_cast<size_t>(npina) + 1) * sizeof(int),
+                 "H2D pin_off")) return false;
+        if (!h2d(s.d_ovl_di, geom.ovl_di, no * sizeof(int), "H2D ovl_di")) return false;
+        if (!h2d(s.d_ovl_dj, geom.ovl_dj, no * sizeof(int), "H2D ovl_dj")) return false;
+        if (!h2d(s.d_ovl_dxh, geom.ovl_dxh, no * sizeof(double), "H2D ovl_dxh")) return false;
+        if (!h2d(s.d_ovl_dyh, geom.ovl_dyh, no * sizeof(double), "H2D ovl_dyh")) return false;
+        if (!h2d(s.d_q_xq, geom.q_xq, no * 9 * sizeof(double), "H2D q_xq")) return false;
+        if (!h2d(s.d_q_yq, geom.q_yq, no * 9 * sizeof(double), "H2D q_yq")) return false;
+        if (!h2d(s.d_q_wt, geom.q_wt, no * 9 * sizeof(double), "H2D q_wt")) return false;
+        if (!h2d(s.d_q_leg, geom.q_leg, no * 9 * 15 * sizeof(double), "H2D q_leg")) return false;
+        if (!h2d(s.d_gmap, step.gmap,
+                 static_cast<size_t>(step.n_form_slots) * npina * sizeof(double), "H2D gmap"))
+            return false;
+        if (s.d_fmap != nullptr && step.fmap != nullptr &&
+            !h2d(s.d_fmap, step.fmap,
+                 static_cast<size_t>(step.n_form_slots) * s.ng * npina * sizeof(double),
+                 "H2D fmap"))
+            return false;
+        s.recon_static_uploaded = true;
+    } else {
+        // The table, the map and the registry are library/geometry data: after
+        // the first statepoint every byte of them is elided, for the life of the
+        // run and of the slot.
+        s.n_h2d_elided += s.recon_static_bytes;
+    }
+
+    if (!h2d(s.d_xskf, step.xskf, nn * s.ng * sizeof(double), "H2D xskf")) return false;
+    if (!h2d(s.d_plane_lo, step.plane_lo, nplan * sizeof(int), "H2D plane_lo")) return false;
+    if (!h2d(s.d_plane_hi, step.plane_hi, nplan * sizeof(int), "H2D plane_hi")) return false;
+    if (!h2d(s.d_plane_alpha, step.plane_alpha, nplan * sizeof(double), "H2D plane_alpha"))
+        return false;
+
+    ppr::ReconCtx r{};
+    r.ng               = s.ng;
+    r.nxyz             = s.nxyz;
+    r.nxy              = s.nxy;
+    r.nxya             = geom.nxya;
+    r.nz               = geom.nz;
+    r.kbc              = geom.kbc;
+    r.kec              = geom.kec;
+    r.ndiv             = geom.ndiv;
+    r.ndiv2            = ndiv2;
+    r.npins            = geom.npins;
+    r.npina            = npina;
+    r.nchunk           = s.nchunk;
+    r.reconstruct_flux = step.reconstruct_flux ? 1 : 0;
+    r.latol            = s.d_latol;
+    r.vol              = s.d_vol;
+    r.hz               = s.d_hz;
+    r.is_fuel          = s.d_is_fuel;
+    r.pin_off          = s.d_pin_off;
+    r.ovl_di           = s.d_ovl_di;
+    r.ovl_dj           = s.d_ovl_dj;
+    r.ovl_dxh          = s.d_ovl_dxh;
+    r.ovl_dyh          = s.d_ovl_dyh;
+    r.q_xq             = s.d_q_xq;
+    r.q_yq             = s.d_q_yq;
+    r.q_wt             = s.d_q_wt;
+    r.q_leg            = s.d_q_leg;
+    r.p                = s.d_p;
+    r.a                = s.d_a;
+    r.bt               = s.d_bt;
+    // The SAME flux the drive read -- borrowed or uploaded.  Reading it out of
+    // the DevCtx rather than re-deriving it is what keeps the normalisation's
+    // `_phif` and the expansion's the same array under either stage-C mode.
+    r.phif             = s.ctx.phif;
+    r.xskf             = s.d_xskf;
+    r.gmap             = s.d_gmap;
+    r.fmap             = step.reconstruct_flux ? s.d_fmap : nullptr;
+    r.plane_lo         = s.d_plane_lo;
+    r.plane_hi         = s.d_plane_hi;
+    r.plane_alpha      = s.d_plane_alpha;
+    r.pin_power        = s.d_pin_power;
+    r.pin_flux         = step.reconstruct_flux ? s.d_pin_flux : nullptr;
+    r.norm_partial     = s.d_norm_partial;
+    r.peak_partial     = s.d_peak_partial;
+    r.radial_power     = s.d_radial_power;
+    r.radial_hz        = s.d_radial_hz;
+    r.scalars          = s.d_scalars;
+
+    // The host's `std::fill_n(ppower, ..., 0.0)` over the WHOLE map, including
+    // the planes outside [kbc, kec) that no kernel below touches.  0.0 is
+    // all-zero bytes, so a memset is that fill exactly.
+    rc = cudaMemsetAsync(s.d_pin_power, 0, nmap * sizeof(double), s.stream);
+    if (rc != cudaSuccess) return s.fail("memset pin_power", rc);
+    if (step.reconstruct_flux) {
+        rc = cudaMemsetAsync(s.d_pin_flux, 0, nmap * s.ng * sizeof(double), s.stream);
+        if (rc != cudaSuccess) return s.fail("memset pin_flux", rc);
+    }
+
+    const int       threads = 128;
+    const long long npin_t  = static_cast<long long>(geom.kec - geom.kbc) * geom.nxya * npina;
+    const int       b_pin   = static_cast<int>((npin_t + threads - 1) / threads);
+    const int       b_ch    = (s.nchunk + threads - 1) / threads;
+    const int       b_asm   = (geom.nxya + threads - 1) / threads;
+    const long long nrad    = static_cast<long long>(geom.nxya) * npina;
+    const int       b_rad   = static_cast<int>((nrad + threads - 1) / threads);
+
+    ppr::kReconPins<<<b_pin, threads, 0, s.stream>>>(r);
+    ppr::kReconNormPartials<<<b_ch, threads, 0, s.stream>>>(r);
+    ppr::kReconNormFold<<<1, 1, 0, s.stream>>>(r);
+    ppr::kReconScale<<<b_pin, threads, 0, s.stream>>>(r);
+    ppr::kReconRadialHz<<<b_asm, threads, 0, s.stream>>>(r);
+    ppr::kReconRadial<<<b_rad, threads, 0, s.stream>>>(r);
+    ppr::kReconPeakPartials<<<b_ch, threads, 0, s.stream>>>(r);
+    ppr::kReconPeakFold<<<1, 1, 0, s.stream>>>(r);
+    if ((rc = cudaGetLastError()) != cudaSuccess) return s.fail("recon kernels", rc);
+
+    auto d2h = [&](void* h, const void* d, size_t bytes, const char* name) -> bool {
+        rc = cudaMemcpyAsync(h, d, bytes, cudaMemcpyDeviceToHost, s.stream);
+        if (rc != cudaSuccess) return s.fail(name, rc);
+        s.n_d2h_bytes += bytes;
+        return true;
+    };
+    if (!d2h(s.h_scalars, s.d_scalars, 4 * sizeof(double), "D2H recon scalars")) return false;
+    if (step.materialize_pin) {
+        if (!d2h(step.pin_power, s.d_pin_power, nmap * sizeof(double), "D2H pin_power"))
+            return false;
+        if (step.reconstruct_flux && step.pin_flux != nullptr &&
+            !d2h(step.pin_flux, s.d_pin_flux, nmap * s.ng * sizeof(double), "D2H pin_flux"))
+            return false;
+        ++s.n_pin_materializations;
+    } else {
+        // THE HOST ARRAY IS NOW STALE, AND THAT IS THE DESIGN.  Geometry's pin
+        // map has exactly one reader (IO.cpp, under print_opt.pin_info) and the
+        // caller passes that flag straight through; a statepoint that does not
+        // print does not pay 5.4 MB to leave a copy nobody opens.
+        s.n_d2h_elided += nmap * sizeof(double);
+        if (step.reconstruct_flux) s.n_d2h_elided += nmap * s.ng * sizeof(double);
+    }
+
+    if (!s.syncStream("recon sync")) return false;
+
+    if (step.frp != nullptr) *step.frp = s.h_scalars[1];
+    if (step.fqp != nullptr) *step.fqp = s.h_scalars[2];
+    ++s.n_recon_statepoints;
+    s.coeffs_device_only = false;
+    s.recon_refusal.clear();
     return true;
 }
 

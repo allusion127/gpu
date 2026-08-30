@@ -68,6 +68,10 @@ PPR::PPR(Geometry& g, XSSet& xs)
 
 bool PPR::resetAndDriveGpu(const double reigv, double* jnet, const double* phif,
                            double* phis, int niter) {
+    // Lowered before every decision below, so that the WP6 stage D
+    // reconstruction refuses on any statepoint whose drive did not put
+    // coefficients on the device -- including the ones that decline here.
+    _gpu_drove = false;
     if (_gpu == nullptr || !_gpu->available()) return false;
     // driveMaster is a different scheme (MASTER MM 6.1, a corner-point-balance
     // solve, not this Picard iteration).  The device arm reproduces the SENM
@@ -153,8 +157,267 @@ bool PPR::resetAndDriveGpu(const double reigv, double* jnet, const double* phif,
     step.l     = _l;
     step.bt    = _bt;
 
+    // WP6 stage D.  Decided HERE, before the drive, because the drive is what
+    // issues (or does not issue) the 9 MB coefficient download.
+    _last_niter                       = niter;
+    const bool plan                   = reconPlanned();
+    step.coefficients_stay_on_device  = plan;
+
     int iters = 0;
-    return _gpu->resetAndDrive(geom, step, niter, &iters);
+    _gpu_drove = _gpu->resetAndDrive(geom, step, niter, &iters);
+    _coeffs_device_only = plan && _gpu_drove;
+    return _gpu_drove;
+}
+
+bool PPR::reconPlanned() {
+    if (_gpu == nullptr || !_gpu->available()) return false;
+    if (!ppr::reconEnabledFromEnv()) return false;
+    if (_mode_master || _ng != 2) return false;
+    // The table and the registry are built here rather than lazily at the
+    // reconstruction, because "can this arm run" has to be answerable before
+    // the drive commits to eliding the download.
+    if (!_pin_quad_table) acquireQuadratureTable();
+    return buildReconStaging();
+}
+
+// ---------------------------------------------------------------------------
+// WP6 stage D: staging for the device reconstruction
+// ---------------------------------------------------------------------------
+
+bool PPR::buildReconStaging() {
+    if (_recon.declined) return false;
+    if (_recon.built) return true;
+    if (!_pin_quad_table) return false;
+
+    const int npins = _g.npins();
+    const int npina = npins * npins;
+    const int ng    = _ng;
+
+    if (static_cast<int>(_pin_quad_table->size()) != npina) {
+        _recon.declined = true;
+        _recon.reason   = "quadrature table size != npins^2";
+        return false;
+    }
+
+    // --- the quadrature table, flattened -----------------------------------
+    //
+    // SoA and not the host's vector-of-structs, because a kernel reading
+    // `qpts[q].leg[t]` through a 162-double stride would serialise on the
+    // stride; the VALUES are copied, not recomputed, so nothing here can move a
+    // bit of the table the host built.
+    _recon.pin_off.assign(static_cast<size_t>(npina) + 1, 0);
+    int total = 0;
+    for (int i = 0; i < npina; ++i) {
+        _recon.pin_off[static_cast<size_t>(i)] = total;
+        total += static_cast<int>((*_pin_quad_table)[static_cast<size_t>(i)].overlaps.size());
+    }
+    _recon.pin_off[static_cast<size_t>(npina)] = total;
+    _recon.n_overlaps                          = total;
+
+    _recon.ovl_di.assign(static_cast<size_t>(total), 0);
+    _recon.ovl_dj.assign(static_cast<size_t>(total), 0);
+    _recon.ovl_dxh.assign(static_cast<size_t>(total), 0.0);
+    _recon.ovl_dyh.assign(static_cast<size_t>(total), 0.0);
+    _recon.q_xq.assign(static_cast<size_t>(total) * 9, 0.0);
+    _recon.q_yq.assign(static_cast<size_t>(total) * 9, 0.0);
+    _recon.q_wt.assign(static_cast<size_t>(total) * 9, 0.0);
+    _recon.q_leg.assign(static_cast<size_t>(total) * 9 * 15, 0.0);
+
+    int o = 0;
+    for (int i = 0; i < npina; ++i) {
+        for (const auto& ovl : (*_pin_quad_table)[static_cast<size_t>(i)].overlaps) {
+            _recon.ovl_di[static_cast<size_t>(o)]  = ovl.di;
+            _recon.ovl_dj[static_cast<size_t>(o)]  = ovl.dj;
+            _recon.ovl_dxh[static_cast<size_t>(o)] = ovl.dx_h;
+            _recon.ovl_dyh[static_cast<size_t>(o)] = ovl.dy_h;
+            for (int q = 0; q < 9; ++q) {
+                const auto&  qp = ovl.qpts[q];
+                const size_t qi = static_cast<size_t>(o) * 9 + q;
+                _recon.q_xq[qi] = qp.xq;
+                _recon.q_yq[qi] = qp.yq;
+                _recon.q_wt[qi] = qp.wt;
+                for (int tt = 0; tt < 15; ++tt)
+                    _recon.q_leg[qi * 15 + tt] = qp.leg[tt];
+            }
+            ++o;
+        }
+    }
+
+    // --- the form-function registry ----------------------------------------
+    //
+    // EVERY reference depletion point of every model, once.  The host
+    // interpolates a fresh (fmap, gmap) pair per (plane, assembly) per
+    // statepoint out of exactly these; putting the endpoints on the device and
+    // sending three numbers per plane is the same arithmetic with 260x less
+    // traffic.
+    _recon.slot_of.clear();
+    _recon.gmap.clear();
+    _recon.fmap.clear();
+    _recon.slots = 0;
+    const auto& models = _xs.models();
+    for (size_t mi = 0; mi < models.size(); ++mi) {
+        const auto& model = models[mi];
+        const auto  it    = model._refr_dpts.find(0);
+        if (it == model._refr_dpts.end()) continue;
+        for (const auto& entry : it->second) {
+            const size_t di  = static_cast<size_t>(entry.second);
+            const auto   key = std::make_pair(mi, di);
+            if (_recon.slot_of.count(key) != 0) continue;
+            const auto& dpt = model.GetDepletionPoint(di);
+            if (static_cast<int>(dpt._gmap.size()) != npina ||
+                static_cast<int>(dpt._fmap.size()) != ng * npina) {
+                // A library whose pin map is not this geometry's is not a case
+                // the kernels can index; the host loop reads the same vectors
+                // and would be equally wrong, but it is not this arm's business
+                // to decide that -- it declines and lets the host run.
+                _recon.declined = true;
+                _recon.reason   = "form-function map size != npins^2";
+                return false;
+            }
+            _recon.slot_of[key] = _recon.slots++;
+            _recon.gmap.insert(_recon.gmap.end(), dpt._gmap.begin(), dpt._gmap.end());
+            _recon.fmap.insert(_recon.fmap.end(), dpt._fmap.begin(), dpt._fmap.end());
+        }
+    }
+    if (_recon.slots == 0) {
+        _recon.declined = true;
+        _recon.reason   = "no reference depletion points";
+        return false;
+    }
+
+    const size_t nplan = static_cast<size_t>(_g.nz()) * _g.nxya();
+    _recon.plane_lo.assign(nplan, -1);
+    _recon.plane_hi.assign(nplan, -1);
+    _recon.plane_alpha.assign(nplan, 0.0);
+    _recon.xskf.assign(static_cast<size_t>(_nxyz) * ng, 0.0);
+
+    _recon.built = true;
+    return true;
+}
+
+bool PPR::reconstructPinPowerGpu(bool use_quadrature, bool reconstruct_flux,
+                                 bool materialize_pin_map) {
+    if (_gpu == nullptr || !_gpu->available()) return false;
+    if (!_gpu_drove) return false;
+    if (!ppr::reconEnabledFromEnv()) return false;
+    // driveMaster's expansion and the pointwise `phig` sampling are different
+    // schemes; the kernels transcribe the SENM quadrature path only, so they
+    // decline rather than silently reconstructing by another method.
+    if (!use_quadrature || _mode_master || _ng != 2) return false;
+    if (!_pin_quad_table) acquireQuadratureTable();
+    if (!buildReconStaging()) return false;
+
+    const int ng    = _ng;
+    const int nxy   = _g.nxy();
+    const int nz    = _g.nz();
+    const int nxya  = _g.nxya();
+    const int ndiv  = _g.ndivxy();
+    const int ndiv2 = ndiv * ndiv;
+    const int kbc   = _g.kbc();
+    const int kec   = _g.kec();
+
+    for (int g = 0; g < ng; ++g)
+        for (int lk = 0; lk < _nxyz; ++lk)
+            _recon.xskf[static_cast<size_t>(g) * _nxyz + lk] = _xs.xskf(g, lk);
+
+    // The host's own bracketing lookup, per (plane, assembly), verbatim -- the
+    // map walk stays on the host because it is a std::map walk and because
+    // getting it wrong here is invisible.  What changes is that the RESULT is
+    // three numbers instead of two interpolated maps.
+    std::fill(_recon.plane_lo.begin(), _recon.plane_lo.end(), -1);
+    std::fill(_recon.plane_hi.begin(), _recon.plane_hi.end(), -1);
+    std::fill(_recon.plane_alpha.begin(), _recon.plane_alpha.end(), 0.0);
+
+    for (int k = kbc; k < kec; ++k) {
+        for (int la = 0; la < nxya; ++la) {
+            int ref_lk = -1;
+            for (int li = 0; li < ndiv2; ++li) {
+                const int l = _g.latol(li, la);
+                if (l >= 0) {
+                    const int lk_tmp = l + nxy * k;
+                    if (_g.IsFuel(lk_tmp)) {
+                        ref_lk = lk_tmp;
+                        break;
+                    }
+                }
+            }
+            if (ref_lk < 0) continue;
+
+            const size_t mi    = _xs.comp(ref_lk);
+            const auto&  model = _xs.models()[mi];
+            const int    burn  = _xs.burn(ref_lk);
+
+            const auto& refrMap = model._refr_dpts.at(0);
+            auto        hiIt    = refrMap.lower_bound(burn);
+            auto        loIt    = hiIt;
+
+            if (hiIt == refrMap.end()) {
+                loIt = std::prev(refrMap.end());
+                hiIt = loIt;
+            } else if (hiIt == refrMap.begin()) {
+                loIt = refrMap.begin();
+            } else {
+                loIt = std::prev(hiIt);
+            }
+
+            const auto& loDpt = model.GetDepletionPoint(loIt->second);
+            const auto& hiDpt = model.GetDepletionPoint(hiIt->second);
+
+            double alpha = 0.0;
+            if (loIt != hiIt && hiDpt.burnKey() != loDpt.burnKey())
+                alpha = static_cast<double>(burn - loDpt.burnKey()) /
+                        static_cast<double>(hiDpt.burnKey() - loDpt.burnKey());
+
+            const auto lo_it =
+                _recon.slot_of.find(std::make_pair(mi, static_cast<size_t>(loIt->second)));
+            const auto hi_it =
+                _recon.slot_of.find(std::make_pair(mi, static_cast<size_t>(hiIt->second)));
+            if (lo_it == _recon.slot_of.end() || hi_it == _recon.slot_of.end()) return false;
+
+            const size_t lka             = static_cast<size_t>(la) + static_cast<size_t>(nxya) * k;
+            _recon.plane_lo[lka]         = lo_it->second;
+            _recon.plane_hi[lka]         = hi_it->second;
+            _recon.plane_alpha[lka]      = alpha;
+        }
+    }
+
+    ppr::ReconGeomView geom;
+    geom.nxya       = nxya;
+    geom.nz         = nz;
+    geom.kbc        = kbc;
+    geom.kec        = kec;
+    geom.ndiv       = ndiv;
+    geom.npins      = _g.npins();
+    geom.latol      = &_g.latol(0, 0);
+    geom.vol        = &_g.vol(0);
+    geom.hz         = &_g.hz(0);
+    geom.n_overlaps = _recon.n_overlaps;
+    geom.pin_off    = _recon.pin_off.data();
+    geom.ovl_di     = _recon.ovl_di.data();
+    geom.ovl_dj     = _recon.ovl_dj.data();
+    geom.ovl_dxh    = _recon.ovl_dxh.data();
+    geom.ovl_dyh    = _recon.ovl_dyh.data();
+    geom.q_xq       = _recon.q_xq.data();
+    geom.q_yq       = _recon.q_yq.data();
+    geom.q_wt       = _recon.q_wt.data();
+    geom.q_leg      = _recon.q_leg.data();
+
+    ppr::ReconStepView step;
+    step.xskf             = _recon.xskf.data();
+    step.n_form_slots     = _recon.slots;
+    step.gmap             = _recon.gmap.data();
+    step.fmap             = _recon.fmap.data();
+    step.plane_lo         = _recon.plane_lo.data();
+    step.plane_hi         = _recon.plane_hi.data();
+    step.plane_alpha      = _recon.plane_alpha.data();
+    step.reconstruct_flux = reconstruct_flux;
+    step.materialize_pin  = materialize_pin_map;
+    step.pin_power        = _g.PinPower();
+    step.pin_flux         = reconstruct_flux ? _g.PinFlux() : nullptr;
+    step.frp              = &_g.frp();
+    step.fqp              = &_g.fqp();
+
+    return _gpu->reconstructPinPower(geom, step);
 }
 
 // WP8 stage 2.  Was `PPR::buildQuadratureTable()`, a member that filled a
@@ -880,11 +1143,32 @@ double PPR::jnetY(int lk, int g, double x, double y, bool xrev, bool yrev) {
     return jnetDir(YDIR, lk, g, x, y, xrev, yrev);
 }
 
-void PPR::reconstructPinPower(bool use_quadrature, bool reconstruct_flux) {
+void PPR::reconstructPinPower(bool use_quadrature, bool reconstruct_flux,
+                              bool materialize_pin_map) {
     // Take the cohort's quadrature table once (geometry-dependent, never
     // changes).  Lazily, exactly as before: a run that never reconstructs a pin
     // power still does not pay for the table.
     if (use_quadrature && !_pin_quad_table) acquireQuadratureTable();
+
+    // WP6 stage D.  Returns false having written nothing on every refusal --
+    // arm off, drive on the host, MASTER mode, a CUDA failure -- and then the
+    // loop below runs exactly as it always did.
+    if (reconstructPinPowerGpu(use_quadrature, reconstruct_flux, materialize_pin_map)) return;
+
+    // THE REPAIR, AND WHY IT IS NOT OPTIONAL.  The drive elided the coefficient
+    // download on the promise that this call would consume p/a/bt on the
+    // device.  It did not -- a CUDA failure, or a caller that asked for the
+    // pointwise mode -- so the host arrays hold the PREVIOUS statepoint's
+    // coefficients and the loop below would reconstruct last statepoint's pin
+    // power with this statepoint's normalisation.  Rebuilding them is exact and
+    // costs one host reset+drive; the receipt counts it, because a run that
+    // repairs often should not have elided.
+    if (_coeffs_device_only) {
+        _coeffs_device_only = false;
+        if (_gpu != nullptr) _gpu->noteReconRepair();
+        reset(_reigv, _jnet, _phif, _phis);
+        drive(_last_niter > 0 ? _last_niter : 100);
+    }
 
     const int ng    = _ng;
     const int nxy   = _g.nxy();

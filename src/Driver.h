@@ -4928,7 +4928,17 @@ public:
             // so use the precomputed 3x3 Gauss-Legendre pin-area integration.
             {
                 outer_timing::Scope ppr_recon_scope(sptelem::PH_PPR_RECON);
-                pin_power_reconstruction.reconstructPinPower(true, schedule.print_opt.pin_flux);
+                // WP6 stage D's third argument: WILL THE HOST READ THE PIN MAP.
+                // Geometry::PinPower() has exactly one reader -- IO.cpp's
+                // `if (d.print_opt.pin_info)` block -- so the flag that decides
+                // whether the map is written to HDF5 is the same flag that
+                // decides whether it has to leave the device.  Passing anything
+                // else here (a constant `true`, or a different predicate) would
+                // either ship 5.4 MB per statepoint for nobody or write a step
+                // out of a stale array; there is no third correct value.  The
+                // HOST path ignores it -- it computes in place.
+                pin_power_reconstruction.reconstructPinPower(
+                    true, schedule.print_opt.pin_flux, schedule.print_opt.pin_info);
             }
 
             // Output
@@ -5204,7 +5214,9 @@ public:
                     "\"graph_refusal\":\"{}\",\"canonical_mode\":\"{}\","
                     "\"canonical_statepoints\":{},\"canonical_mismatch\":{},"
                     "\"h2d_bytes\":{},\"h2d_bytes_elided\":{},\"d2h_bytes\":{},"
-                    "\"allocations\":{},\"reallocations\":{},"
+                    "\"recon_statepoints\":{},\"pin_materializations\":{},"
+                    "\"recon_repairs\":{},"
+                    "\"recon_refusal\":\"{}\",\"allocations\":{},\"reallocations\":{},"
                     "\"wall_ms\":{:.3f},\"status\":\"{}\"}}\n",
                     cmfd_solver.batchSlot(), g.statepoints(), g.deviceOrdinal(),
                     ppr_host_statepoints, g.iterations(),
@@ -5213,7 +5225,9 @@ public:
                     g.graphBuilds(), g.graphRefusal(),
                     ppr::canonicalModeName(ppr::canonicalModeFromEnv()),
                     g.canonicalStatepoints(), g.canonicalMismatch(), g.h2dBytes(),
-                    g.h2dBytesElided(), g.d2hBytes(), g.allocations(),
+                    g.h2dBytesElided(), g.d2hBytes(), g.reconStatepoints(),
+                    g.pinMaterializations(), g.reconRepairs(), g.reconRefusal(),
+                    g.allocations(),
                     g.reallocations(), g.wallMs(), g.status());
             }
         }

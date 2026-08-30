@@ -21,6 +21,10 @@ bool PprBackend::resetAndDrive(const ppr::GeomView&, const ppr::StepView&, int, 
     return false;
 }
 
+bool PprBackend::reconstructPinPower(const ppr::ReconGeomView&, const ppr::ReconStepView&) {
+    return false;
+}
+
 unsigned long long PprBackend::statepoints() const { return 0; }
 unsigned long long PprBackend::iterations() const { return 0; }
 double             PprBackend::wallMs() const { return 0.0; }
@@ -45,5 +49,13 @@ unsigned long long PprBackend::canonicalStatepoints() const { return 0; }
 unsigned long long PprBackend::canonicalMismatch() const { return 0; }
 unsigned long long PprBackend::allocations() const { return 0; }
 unsigned long long PprBackend::reallocations() const { return 0; }
+void               PprBackend::noteReconRepair() {}
+unsigned long long PprBackend::reconRepairs() const { return 0; }
+unsigned long long PprBackend::reconStatepoints() const { return 0; }
+unsigned long long PprBackend::pinMaterializations() const { return 0; }
+const std::string& PprBackend::reconRefusal() const {
+    static const std::string s = "built without CUDA (stub)";
+    return s;
+}
 
 } // namespace rasbery

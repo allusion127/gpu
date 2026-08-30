@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """GPU PPR contract (GA evaluator plan Sec 6.3 Task 10; bottleneck plan WP6).
 
-Twenty properties.  Not one of them is visible to a numerical comparison of two
+Twenty-seven properties.  Not one of them is visible to a numerical comparison of two
 runs, which is exactly why they are asserted here: every one of them is a rule
 that a passing kngr_238 A/B would keep passing right up until the day it
 mattered.
@@ -117,6 +117,51 @@ mattered.
      effect is not in the receipt cannot be priced on 238, and an unpriced
      stage does not get promoted.
 
+--- WP6 stage D: reconstructPinPower on the device --------------------------
+
+ 21. THE RECONSTRUCTION READS THE COEFFICIENTS THE DRIVE LEFT, AND ONLY THOSE.
+     The kernels take p/a/bt as the LAST resetAndDrive left them, so a
+     statepoint whose drive fell back to the host has device coefficients one
+     statepoint stale.  `last_drive_ok` is lowered before the first decision of
+     resetAndDrive and raised only on its success return, so every early exit
+     leaves the reconstruction refusing.
+
+ 22. THE HOST LOOP STAYS THE REFERENCE, AND THE ARM IS A GUARDED EARLY RETURN.
+     Anything else either runs the host loop on top of the device result or
+     drops it.  MASTER mode and the pointwise sampling are different schemes;
+     they decline rather than approximate.
+
+ 23. WHETHER THE PIN MAP LEAVES THE DEVICE IS WHETHER IO WILL WRITE IT.
+     Geometry::PinPower() has exactly one reader -- IO.cpp under
+     print_opt.pin_info -- and that same flag is what the Driver passes.  There
+     is no third correct value: a constant `true` ships 5.4 MB for nobody, and
+     anything narrower writes a step out of a stale array.
+
+ 24. THE NaN PADDING IS THE HOST'S BITS, NOT MERELY A NaN.  The map is written
+     to HDF5 and an h5diff between two arms compares payloads.
+
+ 25. THE ORDERS THAT MATTER ARE THE HOST'S, AND THE ONE THAT DOES NOT IS SAID
+     SO.  The normalisation fold is ascending over PPR.cpp's own 256-chunk
+     partition (its constant multiplies every pin power); the radial sum is
+     ascending in k.  The two peak reductions are `fmax`, which is exactly
+     associative and drops NaN the way std::max(a, NaN) does -- so THAT one may
+     be chunked, and the header says why.
+
+ 26. THE FORM FUNCTIONS ARE A REGISTRY, NOT A PER-STATEPOINT UPLOAD.  Every
+     reference depletion point goes up once; what travels per statepoint is
+     xskf and three per-(plane, assembly) arrays, and the test enumerates them.
+     The interpolation on the device is the host's expression in the host's
+     order.
+
+ 27. THE ELIDED COEFFICIENT DOWNLOAD HAS A REPAIR, AND THE REPAIR RUNS FIRST.
+     The seven arrays (9,059,472 B/statepoint) stay on the device only because
+     the drive was told a device reconstruction would consume them.  If it does
+     not -- a CUDA failure, or a caller asking for the pointwise mode -- the
+     host arrays hold the PREVIOUS statepoint's coefficients, and the host loop
+     would reconstruct last statepoint's pin power under this statepoint's
+     normalisation.  So reconstructPinPower rebuilds them before its own loop,
+     and the receipt counts every time it had to.
+
 Run with no arguments; the negative controls run every time (a contract test
 that has never been seen to fail is a comment).
 """
@@ -138,6 +183,9 @@ FILES = {
     "driver": SRC / "Driver.h",
     "geom": SRC / "Geometry.h",
     "while_h": SRC / "GpuOuterWhile.h",
+    "recon": SRC / "PprReconstructionKernel.cuh",
+    "io": SRC / "IO.cpp",
+    "pch": SRC / "pch.h",
     "cmake": ROOT / "CMakeLists.txt",
 }
 
@@ -172,6 +220,10 @@ def check(raw: dict[str, str]) -> list[str]:
     DRIVER_CODE = strip_comments(DRIVER_TEXT)
     GEOM_CODE = strip_comments(raw["geom"])
     WHILE_CODE = strip_comments(raw["while_h"])
+    RECON_TEXT = raw["recon"]
+    RECON_CODE = strip_comments(RECON_TEXT)
+    IO_CODE = strip_comments(raw["io"])
+    PCH_CODE = strip_comments(raw["pch"])
     CMAKE_TEXT = raw["cmake"]
 
     def want(text: str, needle: str, where: str, why: str) -> None:
@@ -407,8 +459,9 @@ def check(raw: dict[str, str]) -> list[str]:
         problems.append(f"CudaPprBackend.cu: {n_sync} cudaStreamSynchronize call sites -- there "
                         "must be exactly one, inside the helper that counts it, or "
                         "host_syncs_per_statepoint stops being the truth")
-    want(CU_CODE, "++s.n_host_syncs;", "CudaPprBackend.cu",
-         "every synchronise must be counted where it is issued")
+    want(CU_CODE, "++n_host_syncs;", "CudaPprBackend.cu",
+         "every synchronise must be counted where it is issued -- one helper, both entry "
+         "points, so stage D cannot add an uncounted one")
     want(CU_CODE, "enum class LoopArm : int { HostSync = 0, DeviceStream, DeviceGraph };",
          "CudaPprBackend.cu", "the three arms, named")
     want(CU_CODE, 'getenv("RASBERY_GPU_PPR_DEVICE_LOOP")', "CudaPprBackend.cu",
@@ -491,14 +544,20 @@ def check(raw: dict[str, str]) -> list[str]:
     want(CU_CODE, "if (n_shapes > 0) ++n_reallocations;", "CudaPprBackend.cu",
          "a re-shape is counted separately: `reallocations > 0` is how a run says it allocated "
          "inside the statepoint loop, which is the plan's trigger for CudaPprArena")
-    body = re.search(r"bool ensureShape\(const ppr::GeomView& g\) \{(.*?)\n    \}\n", CU_CODE, re.S)
-    if not body:
-        problems.append("CudaPprBackend.cu: ensureShape vanished")
-    else:
-        outside = CU_CODE.replace(body.group(1), "")
-        if "cudaMalloc" in outside:
-            problems.append("CudaPprBackend.cu: a cudaMalloc outside ensureShape -- per-slot "
-                            "allocation must happen once per SHAPE, not once per statepoint")
+    outside = CU_CODE
+    shapers = ("bool ensureShape(const ppr::GeomView& g) {",
+               "bool ensureReconShape(const ppr::ReconGeomView& g, const ppr::ReconStepView& st) {",
+               "bool ensureReconFlux(const ppr::ReconGeomView& g, const ppr::ReconStepView& st) {")
+    for head in shapers:
+        m2 = re.search(re.escape(head) + r"(.*?)\n    \}\n", CU_CODE, re.S)
+        if not m2:
+            problems.append(f"CudaPprBackend.cu: {head.split('(')[0]} vanished")
+        else:
+            outside = outside.replace(m2.group(1), "")
+    if "cudaMalloc" in outside:
+        problems.append("CudaPprBackend.cu: a cudaMalloc outside the three ensure*Shape "
+                        "bodies -- per-slot allocation must happen once per SHAPE, not once "
+                        "per statepoint")
 
     # --- 20. the receipt is schema 2 and carries every stage's number ---------
 
@@ -512,10 +571,139 @@ def check(raw: dict[str, str]) -> list[str]:
                   '\\"graph_launches\\":', '\\"graph_builds\\":', '\\"graph_refusal\\":',
                   '\\"canonical_mode\\":', '\\"canonical_statepoints\\":',
                   '\\"canonical_mismatch\\":', '\\"h2d_bytes\\":', '\\"h2d_bytes_elided\\":',
-                  '\\"d2h_bytes\\":', '\\"allocations\\":', '\\"reallocations\\":'):
+                  '\\"d2h_bytes\\":', '\\"allocations\\":', '\\"reallocations\\":',
+                  '\\"recon_statepoints\\":', '\\"pin_materializations\\":',
+                  '\\"recon_repairs\\":', '\\"recon_refusal\\":'):
         if field not in DRIVER_CODE:
             problems.append(f"Driver.h: the [RASBERY][PPR_GPU] receipt is missing {field} -- a "
                             "stage whose effect is not in the receipt cannot be priced on 238")
+
+    # --- 21. the reconstruction reads the coefficients the drive left --------
+
+    want(CU_CODE, "if (!s.last_drive_ok) {", "CudaPprBackend.cu",
+         "the reconstruction reads p/a/bt as the LAST drive left them; a statepoint whose "
+         "drive fell back to the host has device coefficients one statepoint stale, and "
+         "reconstructing from those is finite, plausible and wrong")
+    if CU_CODE.count("s.last_drive_ok = false;") != 1 or \
+            CU_CODE.count("s.last_drive_ok = true;") != 1:
+        problems.append("CudaPprBackend.cu: last_drive_ok must be lowered once (before any "
+                        "decision in resetAndDrive) and raised once (on the success return) -- "
+                        "any other shape lets an early exit leave it standing")
+    want(PPR_CPP_CODE, "_gpu_drove = false;", "PPR.cpp",
+         "PPR lowers its own copy before every decline, for the same reason")
+    want(PPR_CPP_CODE, "if (!_gpu_drove) return false;", "PPR.cpp",
+         "and the reconstruction refuses on it")
+
+    # --- 27. the elided coefficient download has a repair, and it runs first --
+
+    want(CU_CODE, "if (!s.coeffs_device_only) {", "CudaPprBackend.cu",
+         "the seven coefficient arrays come back unless the caller promised to consume them "
+         "on the device")
+    want(CU_CODE, "s.n_d2h_elided += coeff_bytes;", "CudaPprBackend.cu",
+         "and what is not sent is counted")
+    want(PPR_H_CODE, "bool _coeffs_device_only = false;", "PPR.h",
+         "the promise has to be remembered, or it cannot be kept")
+    repair = re.search(r"if \(_coeffs_device_only\) \{(.*?)\n    \}", PPR_CPP_CODE, re.S)
+    if not repair:
+        problems.append("PPR.cpp: no `if (_coeffs_device_only)` repair block -- an elided "
+                        "coefficient download with no repair reconstructs the PREVIOUS "
+                        "statepoint under this one's normalisation, and every value is finite")
+    else:
+        for call in ("reset(", "drive(", "noteReconRepair()"):
+            if call not in repair.group(1):
+                problems.append(f"PPR.cpp: the repair block does not call {call!r}")
+        if PPR_CPP_CODE.index("if (_coeffs_device_only) {") > PPR_CPP_CODE.index("std::fill_n(ppower,"):
+            problems.append("PPR.cpp: the repair must run BEFORE the host reconstruction loop "
+                            "reads _p/_a/_c/_bt")
+
+    # --- 22. the host loop stays the reference -------------------------------
+
+    want(HDR_CODE, 'getenv("RASBERY_GPU_PPR_RECON")', "CudaPprBackend.h",
+         "stage D is its own knob and defaults off")
+    if not re.search(r"if \(v == nullptr\) return false;", HDR_CODE):
+        problems.append("CudaPprBackend.h: reconEnabledFromEnv must return false when the "
+                        "variable is unset")
+    want(PPR_CPP_CODE,
+         "if (reconstructPinPowerGpu(use_quadrature, reconstruct_flux, materialize_pin_map)) return;",
+         "PPR.cpp",
+         "the device attempt must be a GUARDED early return: anything else runs the host loop "
+         "on top of the device result, or drops it")
+    want(PPR_CPP_CODE, "std::fill_n(ppower,", "PPR.cpp",
+         "the host reconstruction stays in the file as the reference; stage D is an arm, not "
+         "a replacement")
+    want(PPR_CPP_CODE, "if (!use_quadrature || _mode_master || _ng != 2) return false;",
+         "PPR.cpp",
+         "the kernels transcribe the SENM quadrature path only -- MASTER mode and the "
+         "pointwise sampling are different schemes and must decline, not approximate")
+
+    # --- 23. the materialize flag is IO's flag -------------------------------
+
+    want(DRIVER_CODE, "true, schedule.print_opt.pin_flux, schedule.print_opt.pin_info);",
+         "Driver.h",
+         "whether the pin map must leave the device is exactly whether IO will write it")
+    want(IO_CODE, "if (d.print_opt.pin_info) {", "IO.cpp",
+         "and that is still the only reader of Geometry::PinPower()")
+    want(CU_CODE, "if (step.materialize_pin) {", "CudaPprBackend.cu",
+         "the D2H is conditional on it")
+    want(CU_CODE, "s.n_d2h_elided += nmap * sizeof(double);", "CudaPprBackend.cu",
+         "and what is not sent is counted, or the saving is a claim")
+
+    # --- 24. the NaN padding is the host's bits ------------------------------
+
+    want(RECON_CODE, "__longlong_as_double(0x7ff8000000000000LL)",
+         "PprReconstructionKernel.cuh",
+         "the pin map is written to HDF5 and an h5diff of two arms compares PAYLOADS; "
+         "quiet_NaN() is this bit pattern and nan(\"\") is not required to be")
+    forbid(RECON_CODE, 'nan("")', "PprReconstructionKernel.cuh",
+           "a NaN whose payload is the device libm's is a diff against the host arm")
+    want(PPR_CPP_CODE, "std::numeric_limits<double>::quiet_NaN()", "PPR.cpp",
+         "the host reference still pads with quiet_NaN")
+
+    # --- 25. the orders that matter are the host's ---------------------------
+
+    want(RECON_CODE, "for (int c = 0; c < x.nchunk; ++c) nodal_power_sum += x.norm_partial[c];",
+         "PprReconstructionKernel.cuh",
+         "the normalisation fold is ascending over the same 256-chunk partition PPR.cpp uses; "
+         "the normalisation constant multiplies EVERY pin power, so moving it moves the whole "
+         "map")
+    want(RECON_CODE, "for (int k = x.kbc; k < x.kec; ++k) {", "PprReconstructionKernel.cuh",
+         "the radial sum accumulates over k ASCENDING, which is the host's loop order")
+    want(RECON_CODE, "fmax", "PprReconstructionKernel.cuh",
+         "the peaks use fmax, which drops NaN exactly as std::max(a, NaN) does")
+    host_rsq2 = re.search(r"rsq2\s*=\s*([0-9.]+)", PCH_CODE)
+    dev_rsq2 = re.search(r"kReconRsq2\s*=\s*([0-9.]+)", RECON_CODE)
+    if not host_rsq2 or not dev_rsq2:
+        problems.append("rsq2 missing from pch.h or PprReconstructionKernel.cuh")
+    elif host_rsq2.group(1) != dev_rsq2.group(1):
+        problems.append(f"rsq2 differs: pch.h {host_rsq2.group(1)} vs "
+                        f"PprReconstructionKernel.cuh {dev_rsq2.group(1)}")
+
+    # --- 26. the form functions are a registry, not an upload ----------------
+
+    want(PPR_CPP_CODE, "if (_recon.built) return true;", "PPR.cpp",
+         "the registry and the flattened table are built once per PPR object")
+    want(RECON_CODE, "const double gmap_val = g_lo + alpha * (g_hi - g_lo);",
+         "PprReconstructionKernel.cuh",
+         "the device interpolation must be the host's expression in the host's order")
+    want(PPR_CPP_CODE, "loDpt._gmap[gi] + alpha * (hiDpt._gmap[gi] - loDpt._gmap[gi])",
+         "PPR.cpp", "which is this one")
+    static_blk = re.search(r"if \(!s\.recon_static_uploaded\) \{(.*?)\n        s\.recon_static_uploaded = true;",
+                           CU_CODE, re.S)
+    if not static_blk:
+        problems.append("CudaPprBackend.cu: the once-only upload block vanished")
+    else:
+        for once in ("H2D gmap", "H2D q_leg", "H2D latol"):
+            if once not in static_blk.group(1):
+                problems.append(f"CudaPprBackend.cu: {once!r} is not inside the once-only "
+                                "upload block -- the registry and the quadrature table are "
+                                "library and geometry data, and re-sending them per statepoint "
+                                "is the cost this design exists to avoid")
+        after = CU_CODE[static_blk.end():]
+        recon_end = after.find("ppr::ReconCtx r{}")
+        per_sp = re.findall(r'"(H2D [a-z_]+)"', after[:recon_end if recon_end > 0 else 0])
+        if sorted(per_sp) != ["H2D plane_alpha", "H2D plane_hi", "H2D plane_lo", "H2D xskf"]:
+            problems.append("CudaPprBackend.cu: the per-statepoint reconstruction uploads must "
+                            f"be exactly xskf and the three plane arrays, found {per_sp}")
 
     return problems
 
@@ -585,6 +773,43 @@ CONTROLS: list[tuple[str, str, str, str]] = [
     ("an atomic reduction returns", "cu",
      "counts[static_cast<long long>(slot) * nchunk + c] = bad;",
      "atomicAdd(counts, bad);"),
+    ("recon runs without a device drive", "cu",
+     "if (!s.last_drive_ok) {", "if (false) {"),
+    ("last_drive_ok never lowered", "cu", "    s.last_drive_ok = false;\n", ""),
+    ("PPR forgets its own drive flag", "ppr_cpp",
+     "if (!_gpu_drove) return false;", ""),
+    ("recon defaults on", "hdr",
+     "        if (v == nullptr) return false;\n", "        if (v == nullptr) return true;\n"),
+    ("host reconstruction no longer the fallback", "ppr_cpp",
+     "if (reconstructPinPowerGpu(use_quadrature, reconstruct_flux, materialize_pin_map)) return;",
+     "reconstructPinPowerGpu(use_quadrature, reconstruct_flux, materialize_pin_map);"),
+    ("materialize hardcoded", "driver",
+     "true, schedule.print_opt.pin_flux, schedule.print_opt.pin_info);",
+     "true, schedule.print_opt.pin_flux, true);"),
+    ("device NaN payload", "recon",
+     "__longlong_as_double(0x7ff8000000000000LL)", 'nan("")'),
+    ("normalisation fold reversed", "recon",
+     "for (int c = 0; c < x.nchunk; ++c) nodal_power_sum += x.norm_partial[c];",
+     "for (int c = x.nchunk - 1; c >= 0; --c) nodal_power_sum += x.norm_partial[c];"),
+    ("rsq2 drifts", "recon",
+     "constexpr double kReconRsq2 = 0.707106781186;",
+     "constexpr double kReconRsq2 = 0.7071067811865476;"),
+    ("registry becomes a per-statepoint upload", "cu",
+     '        if (!h2d(s.d_gmap, step.gmap,\n                 static_cast<size_t>(step.n_form_slots) * npina * sizeof(double), "H2D gmap"))\n            return false;\n',
+     ""),
+    ("pin map always comes back", "cu",
+     "    if (step.materialize_pin) {", "    if (true) {"),
+    ("recon allocation moves into the statepoint path", "cu",
+     "    ppr::ReconCtx r{};",
+     "    { void* leak = nullptr; cudaMalloc(&leak, 8); }\n    ppr::ReconCtx r{};"),
+    ("coefficients elided unconditionally", "cu",
+     "if (!s.coeffs_device_only) {", "if (false) {"),
+    ("no repair after an elided download", "ppr_cpp",
+     "    if (_coeffs_device_only) {\n", "    if (false) {\n"),
+    ("repair after the host loop", "ppr_cpp",
+     "        if (_gpu != nullptr) _gpu->noteReconRepair();\n", ""),
+    ("receipt loses the repair count", "driver",
+     '\\"recon_repairs\\":{},', '\\"recon_repairsX\\":{},'),
 ]
 
 
@@ -614,7 +839,7 @@ def main() -> int:
         for c in controls:
             print(f"  ! {c}")
         return 1
-    print(f"PPR GPU contract: OK (20 properties, {len(CONTROLS)} negative controls)")
+    print(f"PPR GPU contract: OK (27 properties, {len(CONTROLS)} negative controls)")
     return 0
 
 

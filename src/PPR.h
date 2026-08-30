@@ -6,7 +6,10 @@
 #include "XSSet.h"
 #include "pch.h"
 #include <cmath>
+#include <map>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 // PPR coefficient macros
@@ -158,6 +161,82 @@ private:
     /// should upload once and never again.
     unsigned long long _crdf_generation = 1;
 
+    /// Did the LAST resetAndDriveGpu() actually drive on the device?  The
+    /// device reconstruction reads the coefficients that call left there, so a
+    /// statepoint that fell back to the host must not reconstruct from them.
+    bool _gpu_drove = false;
+
+    /// WP6 stage D.  The last drive left the seven coefficient arrays on the
+    /// device only, because a device reconstruction was planned.  If that
+    /// reconstruction does not happen, the host loop cannot read _p/_a/_c/_bt
+    /// -- they are one statepoint stale -- so reconstructPinPower rebuilds them
+    /// first.  The flag is the whole difference between an elided transfer and
+    /// a wrong pin map.
+    bool _coeffs_device_only = false;
+    /// The niter the last drive was given, so the repair can repeat it.
+    int  _last_niter = 0;
+
+    // --- WP6 stage D: what the device reconstruction needs staged ----------
+    //
+    // BUILT ONCE PER PPR OBJECT, and that is the whole reason the port is
+    // affordable.  The quadrature table is a pure function of (ndivxy, npins)
+    // and the form functions are LIBRARY data: every reference depletion point
+    // of every model goes up once, and what travels per statepoint is the
+    // per-(plane, assembly) bracketing triple -- 24 B * nz * nxya -- instead of
+    // the interpolated maps, which would be nz * nxya * (1 + ng) * npina
+    // doubles and cost more than the loop they replace.
+    struct ReconStaging {
+        bool built    = false;
+        bool declined = false; ///< a shape or a library this arm cannot serve
+        /// Why, for the receipt.  Set once, on the decision.
+        std::string reason;
+
+        // the flattened quadrature table
+        std::vector<int>    pin_off; ///< [npina + 1]
+        std::vector<int>    ovl_di, ovl_dj;
+        std::vector<double> ovl_dxh, ovl_dyh;
+        std::vector<double> q_xq, q_yq, q_wt; ///< [n_overlaps * 9]
+        std::vector<double> q_leg;            ///< [n_overlaps * 9 * 15]
+        int                 n_overlaps = 0;
+
+        // the form-function registry
+        int                 slots = 0;
+        std::vector<double> gmap; ///< [slots * npina]
+        std::vector<double> fmap; ///< [slots * ng * npina]
+        /// (model index, flat depletion-point index) -> slot.  A std::map and
+        /// not a hash: it is built once, read nz*nxya times per statepoint, and
+        /// an ordering is easier to audit than a hash of a pair.
+        std::map<std::pair<size_t, size_t>, int> slot_of;
+
+        // refilled every statepoint
+        std::vector<int>    plane_lo, plane_hi; ///< [nz * nxya], -1 = no fuel
+        std::vector<double> plane_alpha;
+        std::vector<double> xskf; ///< [ng * nxyz]
+    };
+    ReconStaging _recon;
+
+    /// Flatten the quadrature table and register every reference depletion
+    /// point.  Returns false -- once, permanently, with a reason -- when the
+    /// library and the geometry disagree about npins/ng, which is the one shape
+    /// the device kernels cannot be given.
+    bool buildReconStaging();
+
+    /// Will this statepoint's reconstruction run on the device?  Asked BEFORE
+    /// the drive, because that is when the coefficient D2H is decided.  Every
+    /// term is a property of the run or of the library, not of the statepoint,
+    /// so the answer cannot change between here and the reconstruction -- with
+    /// one exception, a CUDA failure inside it, which is what the repair path
+    /// in reconstructPinPower() exists for.
+    bool reconPlanned();
+
+    /// @brief WP6 stage D.  reconstructPinPower on the device.
+    ///
+    /// Returns false having written nothing when the arm is off
+    /// (RASBERY_GPU_PPR_RECON), the drive did not run on the device, the mode
+    /// is MASTER or pointwise, or any CUDA call fails.
+    bool reconstructPinPowerGpu(bool use_quadrature, bool reconstruct_flux,
+                                bool materialize_pin_map);
+
     /// @brief MASTER MM 6.1 reconstruction: fill _c with the 13-term Legendre
     /// coefficients (even terms from surfaces/currents, cross terms from the
     /// CPB corner solve).
@@ -252,6 +331,13 @@ public:
     /// @brief Reconstruct pin-wise flux and power from PPR coefficients
     /// @param use_quadrature true = 3x3 Gauss integration per pin, false = single center-point evaluation
     /// @param reconstruct_flux true = rebuild pin-wise flux with fmap/pphif, false = power only
-    void reconstructPinPower(bool use_quadrature = true, bool reconstruct_flux = false);
+    /// @param materialize_pin_map will the HOST read Geometry::PinPower() after
+    ///        this call?  It has exactly one reader (IO.cpp, under
+    ///        print_opt.pin_info), so a statepoint that does not print may leave
+    ///        the 5.4 MB map on the device -- WP6 stage D's whole saving.  The
+    ///        host path ignores this: it writes the array either way, because
+    ///        it computes in place.
+    void reconstructPinPower(bool use_quadrature = true, bool reconstruct_flux = false,
+                             bool materialize_pin_map = true);
 };
 } // namespace rasbery

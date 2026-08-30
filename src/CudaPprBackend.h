@@ -220,11 +220,100 @@ struct StepView {
     const double* dev_phis  = nullptr; ///< canonical Phis,  [ls*ng + ig]
     const double* dev_jnet  = nullptr; ///< canonical Jnet,  [ls*ng + ig]
 
+    /// WP6 stage D.  THE SEVEN COEFFICIENT ARRAYS HAVE ONE CONSUMER, and when
+    /// that consumer is about to run on the device they have no reason to come
+    /// back at all -- 9,059,472 B/statepoint at KNGR size, which is larger than
+    /// everything this arm uploads put together.
+    ///
+    /// THE CALLER OWNS THE REPAIR.  Setting this is a promise that the host
+    /// arrays will not be read before something rewrites them.  PPR keeps that
+    /// promise by re-running reset() + drive() on the host if the device
+    /// reconstruction it planned does not happen, and the receipt counts those
+    /// as `recon_repairs`.  A caller that sets this and then reads _p is not
+    /// wrong by a little.
+    bool coefficients_stay_on_device = false;
+
     /// Generations for the two inputs that do NOT move every statepoint.  The
     /// upload is issued when the value differs from the one the device copy was
     /// built from; 0 means "unknown", which always uploads.
     unsigned long long chif_generation = 0;
     unsigned long long crdf_generation = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Stage D: reconstructPinPower on the device
+// ---------------------------------------------------------------------------
+
+/// RASBERY_GPU_PPR_RECON, read once.  DEFAULT OFF.
+inline bool reconEnabledFromEnv() {
+    static const bool on = [] {
+        const char* v = std::getenv("RASBERY_GPU_PPR_RECON");
+        if (v == nullptr) return false;
+        const std::string s(v);
+        return !(s.empty() || s == "0" || s == "off" || s == "OFF" || s == "false" ||
+                 s == "FALSE");
+    }();
+    return on;
+}
+
+/// The reconstruction's geometry and its quadrature table, flattened.
+///
+/// UPLOADED ONCE.  Every field is a pure function of (ndivxy, npins) and the
+/// loading map -- `buildPinQuadratureTable` reads nothing else (PprQuadrature.h),
+/// and `latol` / `vol` / `hz` are fixed after Geometry stand-up.  A deck whose
+/// shape changed would re-shape the backend, which is counted.
+struct ReconGeomView {
+    int nxya = 0;
+    int nz   = 0;
+    int kbc  = 0;
+    int kec  = 0;
+    int ndiv = 0;   ///< Geometry::ndivxy
+    int npins = 0;
+
+    const int*    latol = nullptr; ///< [nxya * ndiv*ndiv], index la*ndiv2 + li
+    const double* vol   = nullptr; ///< [nxyz]
+    const double* hz    = nullptr; ///< [nz]
+
+    int           n_overlaps = 0;
+    const int*    pin_off    = nullptr; ///< [npins*npins + 1]
+    const int*    ovl_di     = nullptr; ///< [n_overlaps]
+    const int*    ovl_dj     = nullptr;
+    const double* ovl_dxh    = nullptr;
+    const double* ovl_dyh    = nullptr;
+    const double* q_xq       = nullptr; ///< [n_overlaps * 9]
+    const double* q_yq       = nullptr;
+    const double* q_wt       = nullptr;
+    const double* q_leg      = nullptr; ///< [n_overlaps * 9 * 15]
+};
+
+/// What changes at a statepoint, plus the host destinations.
+///
+/// THE FORM FUNCTIONS ARE A FIXED REGISTRY.  `gmap`/`fmap` hold EVERY reference
+/// depletion point of every model, uploaded once, and what moves per statepoint
+/// is the per-(plane, assembly) bracketing triple.  `plane_lo < 0` means the
+/// host's "no fuel node in this (k, la)", i.e. the plane it skips entirely.
+struct ReconStepView {
+    const double* xskf = nullptr; ///< [ng * nxyz]
+
+    int           n_form_slots = 0;
+    const double* gmap         = nullptr; ///< [n_form_slots * npina]
+    const double* fmap         = nullptr; ///< [n_form_slots * ng * npina], may be null
+
+    const int*    plane_lo    = nullptr; ///< [nz * nxya]
+    const int*    plane_hi    = nullptr;
+    const double* plane_alpha = nullptr;
+
+    bool reconstruct_flux = false;
+    /// Will the HOST read the pin map after this call?  False (a statepoint
+    /// whose `pin_info` is off) means the map stays on the device and only the
+    /// two peaking factors come back -- which is the point of the port, because
+    /// the map is 5.4 MB and Fq/FdH are 16 B.
+    bool materialize_pin = true;
+
+    double* pin_power = nullptr; ///< [nxya * nz * npina], host
+    double* pin_flux  = nullptr; ///< [nxya * nz * ng * npina], host, may be null
+    double* frp       = nullptr; ///< Geometry::frp()
+    double* fqp       = nullptr; ///< Geometry::fqp()
 };
 
 } // namespace ppr
@@ -250,6 +339,20 @@ public:
     /// corner-balance iterations actually executed.
     bool resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& step,
                        int niter, int* iters);
+
+    /// PPR::reconstructPinPower on the device (WP6 stage D, RASBERY_GPU_PPR_RECON).
+    ///
+    /// Only legal immediately after a resetAndDrive() that returned true: it
+    /// reads the coefficient arrays THAT call left on the device.  Returns false
+    /// -- having written nothing -- when the arm is off, the previous drive did
+    /// not run on the device, the shapes do not line up, or any CUDA call
+    /// fails; the caller then runs the untouched host loop.
+    bool reconstructPinPower(const ppr::ReconGeomView& geom, const ppr::ReconStepView& step);
+
+    /// The caller could not honour `coefficients_stay_on_device` -- it is
+    /// about to rebuild the host coefficients itself.  Counts the repair and
+    /// clears the promise.
+    void noteReconRepair();
 
     /// Receipt counters.
     [[nodiscard]] unsigned long long statepoints() const;
@@ -287,6 +390,21 @@ public:
     /// rather than shipping the difference as physics.
     [[nodiscard]] unsigned long long canonicalStatepoints() const;
     [[nodiscard]] unsigned long long canonicalMismatch() const;
+
+    /// Statepoints where the coefficient D2H was elided and the device
+    /// reconstruction then did NOT run, so the host had to recompute the
+    /// coefficients before its own loop could read them.  Non-zero is not a
+    /// wrong answer -- the repair is exact -- but it is a wasted drive, and a
+    /// run that reports many of them elided a transfer it should not have.
+    [[nodiscard]] unsigned long long reconRepairs() const;
+
+    /// Statepoints whose reconstruction ran on the device, and how many of
+    /// those had to send the pin map back.  `recon_statepoints -
+    /// pin_materializations` is the number of times 5.4 MB stayed where it was.
+    [[nodiscard]] unsigned long long reconStatepoints() const;
+    [[nodiscard]] unsigned long long pinMaterializations() const;
+    /// Why the reconstruction arm declined, "" when it did not.
+    [[nodiscard]] const std::string& reconRefusal() const;
 
     /// Every cudaMalloc this instance has made, and how many of them were a
     /// RE-shape (the second and later ensureShape).  Stage E's observable:
