@@ -163,10 +163,32 @@ if "if (staged_tol && polishing) {" not in loop or "++ctx.telemetry.staged_relap
 # tolerance samples noise.  The cap is what stops the loosening reaching the
 # digits the search reads.
 cap = region(SOLVE, "const double loose_keff_tol =", ";\n", "search tolerance cap")
-if "search_tol / STAGED_SEARCH_MARGIN" not in cap or "std::min" not in cap:
+if "search_tol / staged_search_margin" not in cap or "std::min" not in cap:
     fail("the loose keff tolerance is not capped below search_tol when a search is running")
 if not re.search(r"constexpr double STAGED_SEARCH_MARGIN = [1-9]", SOLVE):
     fail("STAGED_SEARCH_MARGIN is missing or not a positive literal")
+# WP9-D stage D (candidate D3) made the margin the sweepable thing it always
+# had to be, and the ONE property that matters is that the knob can only
+# REPLACE the built-in: unset, `stagedMargin` answers with the literal above and
+# the divisor is the number this tree has always used.  A margin resolved any
+# other way -- a second getenv here, an atof at the use site -- would be a
+# second reading of the knob that could disagree with the receipt's.
+margin = region(SOLVE, "const double staged_search_margin =", ";\n",
+                "staged search margin")
+if "ctx.search_policy.stagedMargin(STAGED_SEARCH_MARGIN)" not in margin:
+    fail("the staged search margin is not resolved through SearchPolicy::stagedMargin "
+         "with the built-in constant as its fallback")
+if "getenv" in margin or "atof" in margin:
+    fail("SolveLoop reads RASBERY_SEARCH_STAGED_MARGIN itself; the knob has exactly one "
+         "reader (Scheduler.h processSearchPolicy) and everything else takes the value")
+SCHEDULER_SRC = (ROOT / "src" / "Scheduler.h").read_text(encoding="utf-8-sig")
+if "return staged_margin > 0.0 ? staged_margin : built_in;" not in SCHEDULER_SRC:
+    fail("SearchPolicy::stagedMargin no longer falls back to the built-in margin, so an "
+         "unset RASBERY_SEARCH_STAGED_MARGIN would change the loose tolerance")
+if "p.staged_margin = (m >= 1.0) ? m : 0.0;" not in SCHEDULER_SRC:
+    fail("RASBERY_SEARCH_STAGED_MARGIN is not clamped to off below 1.0; a margin under 1 "
+         "would let the loose stage sample k_eff looser than the search tolerance, which "
+         "is the noise the cap exists to keep out")
 
 # ----------------------------------------- 7. the settle knob is subordinate
 # RASBERY_STAGED_LOOSE_SETTLE may only skip the gate in the LOOSE stage.  With

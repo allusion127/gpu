@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -59,6 +60,196 @@ struct SearchMemory {
     double rod_secant_x      = 1.0;
     double rod_secant_dkdx   = 0.0;
 };
+
+// ===========================================================================
+// WP9-D stage D -- THE SEARCH'S TRIAL-REDUCTION LEVERS
+// ===========================================================================
+//
+// WP9-D shipped the INSTRUMENT (3df4ea7) and deliberately changed nothing.  The
+// bottleneck plan charges 15.3 % of a case's outers to the boron search over
+// 137 committed trials, but "137 trials" is one number standing for four
+// different problems -- a bootstrap probe, a slope carried across a statepoint
+// boundary, a two-sample secant, and a bisection inside a bracket that is not
+// narrowing -- and the candidate table (docs/WP9_WP10_FLOOR_RECEIPTS_
+// WARMSTART_20260831_KO.md Sec 2.4) says which lever can apply depends on which
+// of the four the 238 distribution turns out to be made of.
+//
+// So these are the levers, each behind its OWN flag, each DEFAULT OFF, and none
+// of them fused to another.  A single RASBERY_SEARCH_FAST would have made the
+// A/B unable to say which lever paid, and the doc's revert conditions are
+// stated PER CANDIDATE ("probe+carry 대비 trials 증가 시 즉시 폐기"), so a fused
+// knob could not be reverted either.  Nothing below runs when its flag is
+// unset: every one is a value that is false, zero, or the built-in constant,
+// and the expression it guards is the expression this tree already had.
+//
+//   RASBERY_SEARCH_CARRY_SLOPE    D1, gate N1.  The boron slope carried across
+//                                 a statepoint boundary is corrected to this
+//                                 statepoint's burnup by linear extrapolation
+//                                 IN EFPD through the two most recently
+//                                 measured slopes.  MEASURED, NOT MODELLED: no
+//                                 boron-worth correlation is invented here, the
+//                                 run's own two previous slopes are the whole
+//                                 of the model, and every guard failure falls
+//                                 back to the plain carry this tree already
+//                                 does.
+//   RASBERY_SEARCH_WARM_BORON     D2's pure-solver half, gate N1.  WP10.2
+//                                 already applies a parent's boron with
+//                                 SetBoron, so a deck naming no
+//                                 `search_boron_ppm` already starts there.  A
+//                                 deck that DOES name one overrides the parent
+//                                 -- and for a GA child that is backwards: the
+//                                 deck's number is a campaign-wide default, the
+//                                 parent's is a measurement on a neighbouring
+//                                 core.  This flag lets the measurement win,
+//                                 ONCE, on the first search of the run.  Later
+//                                 statepoints start from the PREVIOUS
+//                                 statepoint's converged boron and nothing
+//                                 beats that (doc Sec 4.2).
+//   RASBERY_SEARCH_BORON_BRACKET  Gate N1.  Boron gets the sign-change bracket
+//                                 and the bisection fallback RODCRIT has had
+//                                 since the CY02 collapse: a secant proposal
+//                                 that leaves a known bracket is replaced by
+//                                 the midpoint.  It bounds the pathological
+//                                 tail that D5 is about, using the SAME code
+//                                 rather than a second copy that could disagree
+//                                 about an endpoint.
+//   RASBERY_SEARCH_MAX_TRIALS     D5, gate N1.  A per-SolveLoop committed-trial
+//                                 cap BELOW the deck's `max_search_iter`.  On
+//                                 the cap the loop takes the SAME exit the
+//                                 deck's own limit takes (SEARCH_EXHAUSTED), so
+//                                 the deterministic best-fallback re-converges
+//                                 the best observed point at PRODUCTION
+//                                 tolerance and `search_exit_status` says the
+//                                 statepoint did not converge.  ACCEPTANCE IS
+//                                 THEREFORE UNCHANGED BY CONSTRUCTION: a
+//                                 statepoint whose exit is not CONVERGED was
+//                                 already ineligible, which is the doc's
+//                                 requirement on D5.
+//   RASBERY_SEARCH_STAGED_MARGIN  D3, gate A2.  The one lever that already
+//                                 existed, made movable.  Under staging
+//                                 SolveLoop already converges a search TRIAL
+//                                 only to `search_tol / 4`; the 4 was a literal
+//                                 nobody could sweep.  It is INERT unless
+//                                 staging is on -- with a single stage there is
+//                                 no loose tolerance for it to scale -- so it
+//                                 cannot by itself make a strict run something
+//                                 else, and it rides A2's existing fidelity
+//                                 detection rather than inventing a sixth
+//                                 policy word.
+//
+// EVERY ONE OF THEM IS IN trajectory::kArmEnv (Driver.h), so the trajectory
+// receipt carries the raw value and the WP10.1 case key folds it -- no cached
+// answer can be served across a policy change, and no A/B can silently differ
+// in two knobs at once.
+struct SearchPolicy {
+    bool   carry_slope   = false; ///< RASBERY_SEARCH_CARRY_SLOPE
+    bool   warm_boron    = false; ///< RASBERY_SEARCH_WARM_BORON
+    bool   boron_bracket = false; ///< RASBERY_SEARCH_BORON_BRACKET
+    int    max_trials    = 0;     ///< RASBERY_SEARCH_MAX_TRIALS, 0 = no cap
+    double staged_margin = 0.0;   ///< RASBERY_SEARCH_STAGED_MARGIN, 0 = built-in
+
+    [[nodiscard]] bool any() const {
+        return carry_slope || warm_boron || boron_bracket || max_trials > 0 ||
+               staged_margin > 0.0;
+    }
+    /// The staged search-sample margin, `built_in` when the knob is unset.  ONE
+    /// spelling, so the receipt and SolveLoop cannot form two opinions about
+    /// what the run was asked for.
+    [[nodiscard]] double stagedMargin(double built_in) const {
+        return staged_margin > 0.0 ? staged_margin : built_in;
+    }
+    /// The effective per-SolveLoop trial cap.  Never ABOVE the deck's own
+    /// limit: this knob may only take trials away, never grant them.
+    [[nodiscard]] int trialCap(int deck_limit) const {
+        return (max_trials > 0 && max_trials < deck_limit) ? max_trials : deck_limit;
+    }
+};
+
+/// ONE truthiness spelling for every boolean knob above, and it is the spelling
+/// CaseFidelity.h already uses for RASBERY_STAGED_LOOSE_SETTLE.  A second
+/// spelling is how `RASBERY_SEARCH_WARM_BORON=0` turns a feature ON.
+inline bool searchFlagEnabled(const char* value) {
+    if (value == nullptr) return false;
+    const std::string s(value);
+    return !(s.empty() || s == "0" || s == "off" || s == "OFF" || s == "false" ||
+             s == "FALSE");
+}
+
+/// Read ONCE.  These are environment facts, and re-reading them per case would
+/// let a mid-run setenv split a wave -- the same argument processCaseFidelity()
+/// makes.  The case key is stamped from this same value, so a key and a solve
+/// cannot disagree about the policy.
+inline const SearchPolicy& processSearchPolicy() {
+    static const SearchPolicy value = [] {
+        SearchPolicy p;
+        p.carry_slope   = searchFlagEnabled(std::getenv("RASBERY_SEARCH_CARRY_SLOPE"));
+        p.warm_boron    = searchFlagEnabled(std::getenv("RASBERY_SEARCH_WARM_BORON"));
+        p.boron_bracket = searchFlagEnabled(std::getenv("RASBERY_SEARCH_BORON_BRACKET"));
+        const char* trials = std::getenv("RASBERY_SEARCH_MAX_TRIALS");
+        p.max_trials       = (trials != nullptr) ? std::max(0, std::atoi(trials)) : 0;
+        const char*  margin = std::getenv("RASBERY_SEARCH_STAGED_MARGIN");
+        const double m      = (margin != nullptr) ? std::atof(margin) : 0.0;
+        // A margin below 1 would let the loose stage sample k_eff LOOSER than
+        // the search tolerance itself, which is exactly the noise the cap
+        // exists to keep out.  Refused by clamping to off rather than honoured.
+        p.staged_margin = (m >= 1.0) ? m : 0.0;
+        return p;
+    }();
+    return value;
+}
+
+/// D1's cross-statepoint slope history, and the parent boron D2 hands over.
+///
+/// NOT IN SearchMemory, deliberately.  SearchMemory is mirrored field for field
+/// into DeviceSearchState and tools/test_gpu_physics_interface_contract.py pins
+/// the count; this is host-side POLICY state that no device kernel reads.  It
+/// also must not survive a batch-slot refill, for the same reason a carried
+/// slope must not -- it is a different deck's boron worth -- and living in the
+/// Driver's SolverContext gives it exactly that lifetime.
+struct SearchCarry {
+    bool   has_last       = false; ///< one measured slope is available
+    double last_slope     = 0.0;
+    double last_efpd      = 0.0;
+    bool   has_prev       = false; ///< two are, so a trend exists
+    double prev_slope     = 0.0;
+    double prev_efpd      = 0.0;
+    double armed_efpd     = 0.0;   ///< efpd of the statepoint now measuring
+    bool   has_warm_boron = false; ///< WP10.2 handed a parent's boron over
+    double warm_boron     = 0.0;
+};
+
+/// D1.  The carried slope corrected to `efpd_now` by a linear fit through the
+/// two most recently measured slopes, or `memory_slope` unchanged when the
+/// correction cannot be justified.  `used_extrapolation` reports which happened,
+/// because "the flag was on" and "the flag did something" are different runs and
+/// the 238 A/B has to be able to tell them apart.
+inline double carriedBoronSlope(const SearchCarry& carry, double memory_slope,
+                                double efpd_now, bool& used_extrapolation) {
+    used_extrapolation = false;
+    if (!carry.has_prev || !carry.has_last)
+        return memory_slope;
+    const double defpd = carry.last_efpd - carry.prev_efpd;
+    if (!(defpd > 0.0))
+        return memory_slope;
+    const double trend     = (carry.last_slope - carry.prev_slope) / defpd;
+    const double predicted = carry.last_slope + trend * (efpd_now - carry.last_efpd);
+    // THREE GUARDS, and each is a failure the doc names for D1 ("보정이 틀리면
+    // 첫 trial이 더 멀어진다").  A non-finite result is the arithmetic saying
+    // two points cannot speak here; a sign flip would send the first trial the
+    // wrong way outright; a magnitude more than a factor of two from the
+    // measured slope is an extrapolation past what two points support.  On any
+    // of them the plain carry stands -- which is this tree's existing
+    // behaviour, so a guard that trips costs nothing at all.
+    if (!std::isfinite(predicted))
+        return memory_slope;
+    if (predicted * carry.last_slope <= 0.0)
+        return memory_slope;
+    const double ratio = std::abs(predicted) / std::abs(carry.last_slope);
+    if (!(ratio >= 0.5 && ratio <= 2.0))
+        return memory_slope;
+    used_extrapolation = true;
+    return predicted;
+}
 
 inline constexpr int    kMaxEigenIter     = 200;
 inline constexpr int    kMaxSearchIter    = 300;
@@ -253,6 +444,13 @@ struct Schedule {
     long long search_n_carry      = 0;  ///< first steps taken on a CARRIED slope
     long long search_n_probe      = 0;  ///< bootstrap/probe steps (no slope yet)
     long long search_n_bisect     = 0;  ///< bisections inside a sign-change bracket
+    /// WP9-D stage D, D1 only.  Carry steps whose slope was the EXTRAPOLATED
+    /// one rather than the slope SearchMemory was holding.  `carry` counts the
+    /// steps the lever could have moved; this counts the ones it did, and the
+    /// difference is how often the three guards refused -- a flag that is on
+    /// and a flag that is doing something are different runs.  Zero with
+    /// RASBERY_SEARCH_CARRY_SLOPE unset, and never read by the search.
+    long long search_n_extrap     = 0;
     double    search_first_x      = 0.0; ///< the initial guess this statepoint started from
     double    search_last_dx      = 0.0; ///< |x_new - x_old| of the LAST committed step
 
@@ -267,6 +465,7 @@ struct Schedule {
         search_n_carry     = 0;
         search_n_probe     = 0;
         search_n_bisect    = 0;
+        search_n_extrap    = 0;
         search_first_x     = 0.0;
         search_last_dx     = 0.0;
     }
@@ -371,13 +570,43 @@ struct Schedule {
         geometry.fuel_temp_rise_scale() = fuel_temp_rise_scale;
     }
 
-    void StartCriticalSearch(SearchMemory& memory, double current_bppm, double rod_max_step) {
+    void StartCriticalSearch(SearchMemory& memory, double current_bppm, double rod_max_step,
+                             const SearchPolicy& policy, SearchCarry& carry,
+                             double efpd_now) {
         if (search_initialized || !hasCriticalSearch())
             return;
         search_initialized = true;
 
         if (searchType == SearchType::BORON) {
-            search_current_x = (search_boron_ppm > 0.0) ? search_boron_ppm : std::max(0.0, current_bppm);
+            // WP9-D D1.  Fold the slope this statepoint INHERITS into the carry
+            // history before anything reads it.  The pair pushed is (the slope
+            // SearchMemory is holding, the efpd of the statepoint that measured
+            // it) -- `armed_efpd` is the abscissa handed over by the previous
+            // call, and it is what makes the trend a trend in BURNUP rather
+            // than in statepoint index, which is the correction the doc asks
+            // for.  A statepoint that took no secant step pushes the same slope
+            // again, the trend flattens to zero, and the correction degrades to
+            // exactly the plain carry.
+            if (policy.carry_slope) {
+                if (memory.has_boron_secant) {
+                    carry.prev_slope = carry.last_slope;
+                    carry.prev_efpd  = carry.last_efpd;
+                    carry.has_prev   = carry.has_last;
+                    carry.last_slope = memory.boron_secant_dkdx;
+                    carry.last_efpd  = carry.armed_efpd;
+                    carry.has_last   = true;
+                }
+                carry.armed_efpd = efpd_now;
+            }
+            // WP9-D D2's solver half: the parent's boron, ONCE.  Consumed on
+            // use, so only the FIRST search of the run can take it.
+            const bool take_warm = policy.warm_boron && carry.has_warm_boron;
+            if (take_warm) {
+                carry.has_warm_boron = false;
+                search_current_x     = std::max(0.0, carry.warm_boron);
+            } else {
+                search_current_x = (search_boron_ppm > 0.0) ? search_boron_ppm : std::max(0.0, current_bppm);
+            }
         } else {
             search_seeded_from_previous_step = memory.has_rod_secant;
             search_current_x                 = std::clamp(memory.has_rod_secant ? memory.rod_secant_x : 1.0,
@@ -434,7 +663,19 @@ struct Schedule {
     }
 
     void UpdateRodBracket(double k_residual) {
-        if (searchType != SearchType::RODCRIT || !search_has_prev)
+        if (searchType != SearchType::RODCRIT)
+            return;
+        UpdateSearchBracket(k_residual);
+    }
+
+    /// The bracket maintenance itself, with no opinion about WHICH search is
+    /// running.  RODCRIT has used it since the CY02 collapse; WP9-D's
+    /// RASBERY_SEARCH_BORON_BRACKET lets the boron search use the SAME code
+    /// rather than a second copy of it that could disagree about an endpoint.
+    /// The `searchType` test stays in UpdateRodBracket, so every existing
+    /// caller keeps its existing behaviour with no second predicate.
+    void UpdateSearchBracket(double k_residual) {
+        if (!search_has_prev)
             return;
 
         const double prev_residual = search_prev_eigv - target_keff;
@@ -502,6 +743,12 @@ struct Schedule {
         bool        enforce_rod_clamp = false;   // clamp to [0, rod_max_step] and detect a stuck point
         double      rod_max_step      = 0.0;
         bool        use_bracket       = false;   // fall back to bisection inside a known sign-change bracket
+        // WP9-D stage D.  Both default to "the tree's existing behaviour": an
+        // override nobody set is the slope SearchMemory holds, and a span floor
+        // nobody set is `bracket_min_span`.
+        bool        carry_override    = false;   // use carry_slope, not *secant_dkdx, on the carry step
+        double      carry_slope       = 0.0;     // D1's burnup-corrected slope
+        double      bracket_span_min  = 0.0;     // 0 = bracket_min_span; the boron arm needs ppm resolution
     };
 
     // Shared secant / carry-secant / probe / bracket logic for both critical searches.
@@ -509,8 +756,13 @@ struct Schedule {
                              const SecantSearchParams& params, double& next_x,
                              std::string& method, bool& rod_bracket_not_found) {
         if (!search_has_prev) {
-            if (params.carry_available && std::abs(*params.secant_dkdx) >= min_secant_denom) {
-                next_x = search_current_x - search_relaxation * k_residual / *params.secant_dkdx;
+            // WP9-D D1.  With the flag unset `carry_override` is false and this
+            // is a copy of the same double the expression below always read, so
+            // the arithmetic is bit for bit the one this tree had.
+            const double carried =
+                params.carry_override ? params.carry_slope : *params.secant_dkdx;
+            if (params.carry_available && std::abs(carried) >= min_secant_denom) {
+                next_x = search_current_x - search_relaxation * k_residual / carried;
                 if (params.clamp_carry)
                     next_x = std::clamp(next_x, search_current_x - 1.0, search_current_x + 1.0);
                 method = "carry-secant";
@@ -551,14 +803,21 @@ struct Schedule {
             if (params.use_bracket && search_has_bracket) {
                 const double lo = search_bracket_lo_x;
                 const double hi = search_bracket_hi_x;
+                // The span below which a bracket is resolution rather than a
+                // root.  `bracket_min_span` is a ROD-STEP quantity (1e-6), so
+                // the boron arm hands its own floor in ppm; an unset override
+                // is the rod value and therefore the existing behaviour.
+                const double span_min = (params.bracket_span_min > 0.0)
+                                            ? params.bracket_span_min
+                                            : bracket_min_span;
                 if (!secant_ok || next_x < lo || next_x > hi) {
                     const double mid = 0.5 * (lo + hi);
                     // Only bisect while the midpoint is a genuinely new point.  Once the
                     // bracket has narrowed to the rod-position resolution the remaining
                     // k_eff spread is cusping noise, not a resolvable root, and bisecting
                     // further just re-proposes the point we are standing on.
-                    if (hi - lo > bracket_min_span &&
-                        std::abs(mid - search_current_x) > bracket_min_span) {
+                    if (hi - lo > span_min &&
+                        std::abs(mid - search_current_x) > span_min) {
                         method    = secant_ok ? "bisection(secant-left-bracket)"
                                               : "bisection(secant-failed)";
                         next_x    = mid;
@@ -579,10 +838,12 @@ struct Schedule {
     }
 
     bool ProposeNextSearchPoint(double eigv, SearchMemory& memory,
-                                double rod_max_step, double& next_x,
+                                double rod_max_step, const SearchPolicy& policy,
+                                const SearchCarry& carry, double& next_x,
                                 std::string& method, bool& rod_bracket_not_found) {
         rod_bracket_not_found   = false;
         const double k_residual = searchResidual(eigv);
+        bool         extrapolated = false;
 
         SecantSearchParams params;
         if (searchType == SearchType::RODCRIT) {
@@ -601,6 +862,24 @@ struct Schedule {
             params.carry_available = memory.has_boron_secant;
             params.probe           = search_boron_probe;
             params.probe_method    = "bootstrap";
+            // WP9-D D1.  The correction is computed here, where the abscissa
+            // is, and handed in as a VALUE: AdvanceSecantSearch must not learn
+            // about statepoints, and SearchMemory must not learn about the
+            // corrected slope -- writing it back would corrupt the very history
+            // the next correction is fitted to.
+            if (policy.carry_slope) {
+                params.carry_slope    = carriedBoronSlope(carry, memory.boron_secant_dkdx,
+                                                          carry.armed_efpd, extrapolated);
+                params.carry_override = true;
+            }
+            // WP9-D.  The bracket the boron search never had.  The span floor
+            // is the deck's own boron tolerance where that is coarser than the
+            // rod-step one, because a boron bracket narrower than the search's
+            // ppm resolution is resolution, not a root.
+            if (policy.boron_bracket) {
+                params.use_bracket      = true;
+                params.bracket_span_min = std::max(bracket_min_span, tolerance_boron);
+            }
         }
         // ONE call site, and the tally below is why the two arms were folded
         // into one: a classification that had to be repeated per arm is a
@@ -608,6 +887,10 @@ struct Schedule {
         const bool proposed = AdvanceSecantSearch(eigv, k_residual, params, next_x, method,
                                                   rod_bracket_not_found);
         TallyProposal(proposed, method);
+        // Counted only where the corrected slope was the one the step was
+        // actually taken on: a carry that the guards refused, or a proposal
+        // that never reached the carry branch, is not a use of the lever.
+        if (extrapolated && proposed && method == "carry-secant") ++search_n_extrap;
         return proposed;
     }
 

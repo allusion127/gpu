@@ -422,6 +422,7 @@ def render(rows: list[dict], stream=sys.stdout) -> None:
             stream.write(
                 f"{row['name']:>16}  search     method  probe {int(row.get('srch_probe') or 0):5d}"
                 f"  carry {int(row.get('srch_carry_secant') or 0):5d}"
+                f"  (extrap {int(row.get('srch_extrap') or 0):4d})"
                 f"  secant {int(row.get('srch_secant') or 0):5d}"
                 f"  bisect {int(row.get('srch_bisect') or 0):5d}"
                 f"  iterations {int(row.get('srch_iterations') or 0):5d}\n")

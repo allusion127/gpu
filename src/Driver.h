@@ -269,6 +269,11 @@ struct Counters {
     long long search_carry         = 0;  ///< first steps on a slope CARRIED from before
     long long search_probe         = 0;  ///< bootstrap steps: no slope was available
     long long search_bisect        = 0;
+    /// WP9-D stage D.  Carry steps taken on the burnup-EXTRAPOLATED slope
+    /// (RASBERY_SEARCH_CARRY_SLOPE).  `search_carry` counts the steps the lever
+    /// could have moved and this counts the ones it did; the difference is how
+    /// often the correction's guards refused.  Zero with the knob unset.
+    long long search_extrap        = 0;
     long long search_iterations    = 0;  ///< Schedule::search_iteration at the close
     long long th_updates           = 0;
     long long flux_limit_retries   = 0;  ///< flux limit-cycle events ([WARN][flux])
@@ -397,6 +402,7 @@ struct Counters {
         search_carry         += step.search_carry;
         search_probe         += step.search_probe;
         search_bisect        += step.search_bisect;
+        search_extrap        += step.search_extrap;
         search_iterations    += step.search_iterations;
         th_updates           += step.th_updates;
         flux_limit_retries   += step.flux_limit_retries;
@@ -559,6 +565,18 @@ inline constexpr const char* kArmEnv[] = {
     "RASBERY_STAGED_FLUX_TOL",
     "RASBERY_STAGED_XE_TOL",
     "RASBERY_STAGED_LOOSE_SETTLE",
+    // WP9-D stage D.  Five search-policy levers (Scheduler.h SearchPolicy).
+    // Four of them move the PROPOSALS, which moves the trial sequence, which
+    // moves the iteration; the fifth scales the loose-stage sample tolerance.
+    // All five therefore belong here on the list's own terms, and being here is
+    // also what folds them into the WP10.1 case key -- a cached answer produced
+    // under one search policy must never be served to a request made under
+    // another.
+    "RASBERY_SEARCH_CARRY_SLOPE",
+    "RASBERY_SEARCH_WARM_BORON",
+    "RASBERY_SEARCH_BORON_BRACKET",
+    "RASBERY_SEARCH_MAX_TRIALS",
+    "RASBERY_SEARCH_STAGED_MARGIN",
     "RASBERY_GA_FEEDBACK_PASSES",
     "RASBERY_ALLOW_SCREENING",
 };
@@ -1217,6 +1235,18 @@ private:
         /// (processCaseFidelity()), so a Driver nobody configured behaves
         /// exactly as this tree did before.
         CaseFidelity fidelity = processCaseFidelity();
+        /// WP9-D stage D.  HOW THIS RUN'S CRITICAL SEARCH PROPOSES.  Resolved
+        /// once from the environment (Scheduler.h processSearchPolicy) and
+        /// carried here for the same reason `fidelity` is: SolveLoop is static,
+        /// so a policy that is not on the context is a policy that has to be a
+        /// static inside it -- and that is the latch WP10.3 spent a commit
+        /// removing.  Default-constructed it is the process environment, and
+        /// with every knob unset every field is the built-in default.
+        SearchPolicy search_policy = processSearchPolicy();
+        /// D1's cross-statepoint slope history and D2's parent boron.  Driver
+        /// lifetime, never shared: a carried boron worth belongs to one core,
+        /// and a slot refill must not inherit a neighbour's.
+        SearchCarry  search_carry{};
     };
 
 
@@ -3150,7 +3180,9 @@ private:
                 // per-trial cost of a statepoint look cheaper by one.
                 outer_timing::Scope apply_scope(sptelem::PH_SEARCH_APPLY);
                 schedule.StartCriticalSearch(ctx.search_memory, ctx.geometry.bppm(0),
-                                             ctx.cross_sections.rod_max_step());
+                                             ctx.cross_sections.rod_max_step(),
+                                             ctx.search_policy, ctx.search_carry,
+                                             ctx.efpd);
                 if (schedule.searchType == SearchType::BORON)
                     ctx.cross_sections.SetBoron(schedule.search_current_x);
                 else {
@@ -3244,8 +3276,17 @@ private:
         // search reads.  With no search there is no such consumer and the
         // multiplier stands as given.
         constexpr double STAGED_SEARCH_MARGIN = 4.0;
+        // WP9-D stage D, candidate D3 (gate A2).  The margin was a literal
+        // nobody could sweep, and it is the one number that decides how much of
+        // the loosening a search TRIAL is allowed to keep.  The knob may only
+        // replace it: unset, `stagedMargin` answers with the built-in and the
+        // expression below is the one this tree had, to the bit.  It is inert
+        // without staging, because with a single stage `polishing` is true
+        // throughout and no loose tolerance is ever read.
+        const double staged_search_margin =
+            ctx.search_policy.stagedMargin(STAGED_SEARCH_MARGIN);
         const double loose_keff_tol =
-            has_search ? std::min(keff_tol * staged_flux_mult, search_tol / STAGED_SEARCH_MARGIN)
+            has_search ? std::min(keff_tol * staged_flux_mult, search_tol / staged_search_margin)
                        : keff_tol * staged_flux_mult;
         const double loose_flux_tol = std::max(loose_keff_tol, flux_tol * staged_flux_mult);
         const double loose_xe_tol   = XE_EQUILIBRIUM_TOLERANCE * staged_xe_mult;
@@ -4014,6 +4055,12 @@ private:
                 if (schedule.searchType == SearchType::RODCRIT) {
                     schedule.rod_step = schedule.search_current_x;
                     schedule.UpdateRodBracket(k_residual);
+                } else if (ctx.search_policy.boron_bracket) {
+                    // WP9-D stage D.  The boron search gets the sign-change
+                    // bracket RODCRIT has, and only behind its own flag: the
+                    // bracket is what turns a wandering secant into a bounded
+                    // one, and it is the fallback the trial cap lands on.
+                    schedule.UpdateSearchBracket(k_residual);
                 }
                 search_converged = std::abs(k_residual) < search_tol;
             }
@@ -4100,7 +4147,16 @@ private:
                                              th_count, th_dop, eigv);
             }
             if (has_search && !search_converged) {
-                if (schedule.search_iteration >= schedule.max_search_iter) {
+                // WP9-D stage D, candidate D5 (gate N1).  The cap may only take
+                // trials away (trialCap never returns more than the deck's own
+                // limit), and it exits through the deck limit's OWN path -- so
+                // the deterministic best-fallback below re-converges the best
+                // observed point at PRODUCTION tolerance and search_exit_status
+                // publishes that the statepoint did not converge.  Acceptance
+                // is therefore unchanged by construction.  With the knob unset
+                // trialCap answers `max_search_iter` and this is the same test.
+                if (schedule.search_iteration >=
+                    ctx.search_policy.trialCap(schedule.max_search_iter)) {
                     // The best-observed point is re-applied deterministically after the loop
                     // (see the fallback block below), so there is nothing to salvage here.
                     exit_reason = SolveExit::SEARCH_EXHAUSTED;
@@ -4119,6 +4175,7 @@ private:
                     bool        bracket_not_found = false;
                     if (!schedule.ProposeNextSearchPoint(eigv, ctx.search_memory,
                                                          ctx.cross_sections.rod_max_step(),
+                                                         ctx.search_policy, ctx.search_carry,
                                                          next_x, method, bracket_not_found)) {
                         exit_reason = SolveExit::NO_PROPOSAL;
                         break;
@@ -4618,6 +4675,17 @@ public:
         std::string      warm_save_reason;
         bool             warm_saved       = false;
         long long        warm_initial_outers = 0;
+        // WP9-D stage D.  Run totals of the search classification, folded
+        // UNCONDITIONALLY for exactly the reason `warm_initial_outers` is: the
+        // wall-timing arm runs with RASBERY_STATEPOINT_TELEMETRY unset (plan
+        // Sec 6.4 keeps the timing arm and the telemetry arm apart), and a
+        // lever whose before/after can only be read on the OTHER arm is a lever
+        // nobody can price.  Nine integer adds per statepoint; read by one
+        // receipt and by nothing in the solve.
+        struct SearchLedger {
+            long long trials = 0, proposals = 0, refused = 0, probe = 0, carry = 0;
+            long long extrap = 0, secant = 0, bisect = 0, outers = 0;
+        } sp_search{};
         warmstate::State warm{};
         if (!_warm_start_from.empty()) {
             warm_status = "cold_fallback";
@@ -4650,6 +4718,16 @@ public:
                     // The boron seed reaches the search through the same door
                     // the deck's does: StartCriticalSearch reads bppm(0).
                     cross_sections.SetBoron(parent.boron);
+                    // WP9-D stage D, candidate D2's solver half.  The door
+                    // above is the only one a deck that names no
+                    // `search_boron_ppm` needs; a deck that DOES name one
+                    // overrides the parent, and RASBERY_SEARCH_WARM_BORON is
+                    // what lets the measurement beat the campaign default.
+                    // Gated on the flag so an unset knob stores nothing.
+                    if (ctx.search_policy.warm_boron) {
+                        ctx.search_carry.has_warm_boron = true;
+                        ctx.search_carry.warm_boron     = parent.boron;
+                    }
                     eigv        = parent.keff;
                     warm_status = "applied";
                     warm        = parent;
@@ -5012,6 +5090,20 @@ public:
             // measured on the wall-timing run it is supposed to shorten.
             warm_initial_outers += ctx.telemetry.outers_by_cause[sptelem::CAUSE_INITIAL];
 
+            // WP9-D stage D: the same argument, for the search.  The Schedule
+            // owns the classification (that is where `method` is decided) and
+            // ctx.telemetry owns the committed-trial count, so the ledger reads
+            // each from its owner rather than re-deriving either.
+            sp_search.trials    += ctx.telemetry.search_trials;
+            sp_search.proposals += schedule.search_n_proposals;
+            sp_search.refused   += schedule.search_n_refused;
+            sp_search.probe     += schedule.search_n_probe;
+            sp_search.carry     += schedule.search_n_carry;
+            sp_search.extrap    += schedule.search_n_extrap;
+            sp_search.secant    += schedule.search_n_secant;
+            sp_search.bisect    += schedule.search_n_bisect;
+            sp_search.outers    += ctx.telemetry.outers_by_cause[sptelem::CAUSE_SEARCH];
+
             // The BOC state, for a child.  FIRST STATEPOINT ONLY: every later
             // one already starts from the previous statepoint's converged flux,
             // which is the best warm start there is, so 34 more files would
@@ -5101,6 +5193,7 @@ public:
                 ctx.telemetry.search_carry      = schedule.search_n_carry;
                 ctx.telemetry.search_probe      = schedule.search_n_probe;
                 ctx.telemetry.search_bisect     = schedule.search_n_bisect;
+                ctx.telemetry.search_extrap     = schedule.search_n_extrap;
                 ctx.telemetry.search_iterations = schedule.search_iteration;
                 ctx.telemetry.wall          = step_seconds;
                 ctx.telemetry.io_wall       = step_io_seconds;
@@ -5152,6 +5245,7 @@ public:
                     "\"d2h_bytes\":{},\"d2h_calls\":{}}},"
                     "\"search\":{{\"trials\":{},\"proposals\":{},\"refused\":{},"
                     "\"secant\":{},\"carry_secant\":{},\"probe\":{},\"bisect\":{},"
+                    "\"extrap\":{},"
                     "\"iterations\":{},\"exit\":{},\"tol\":{:.3e},\"dk\":{:.6e},"
                     "\"x_first\":{:.6f},\"x_final\":{:.6f},\"dx_last\":{:.6f}}}}}\n",
                     sp_job_id, sp_slot, step_number, efpd, total_outer, c.outers(),
@@ -5183,6 +5277,7 @@ public:
                     c.floor_d2h_bytes, c.floor_d2h_calls,
                     c.search_trials, c.search_proposals, c.search_refused,
                     c.search_secant, c.search_carry, c.search_probe, c.search_bisect,
+                    c.search_extrap,
                     c.search_iterations, schedule.search_exit_status,
                     schedule.search_exit_tol, schedule.search_exit_dk,
                     schedule.search_first_x, schedule.search_current_x,
@@ -5336,6 +5431,44 @@ public:
                 jsonString(warm_reason.empty() ? warm_save_reason : warm_reason));
         }
 
+        // WP9-D stage D receipt.  Printed ONLY when at least one lever is
+        // armed: with every knob unset nothing here runs and this build's log
+        // is the log of a build that does not have the feature, which is what
+        // feature-off identity has to mean for a receipt as well as a result.
+        //
+        // WHAT IT IS FOR.  The adoption bar is "total outers down 10 % or more
+        // with Gate B inside the v2 envelope", and the doc's revert conditions
+        // are stated per candidate against the CLASSIFICATION, not against the
+        // wall: D1 is discarded if `trials` rises against `probe+carry`, D3 if
+        // `staged_relapses` reaches the same order as `trials`.  So the line
+        // carries the arm AND the distribution it produced, on the same line,
+        // for both the telemetry arm and the wall arm.
+        //
+        // `gate` is A2 exactly when a knob that relaxes a CONVERGENCE CRITERION
+        // is set, and RASBERY_SEARCH_STAGED_MARGIN is the only one that does.
+        // The other four move the starting point and the trial sequence -- the
+        // final acceptance test is untouched production tolerance -- so they
+        // are N1, and saying so here is what stops an N1 arm being filed as an
+        // A2 one.  Note that the margin is itself inert without staging, so an
+        // A2 gate word here without RASBERY_STAGED_FLUX_TOL in the arm env
+        // means a knob that did nothing.
+        if (ctx.search_policy.any()) {
+            const rasbery::SearchPolicy& sp = ctx.search_policy;
+            std::cout << std::format(
+                "  [RASBERY][SEARCH_POLICY] {{\"schema_version\":1,\"slot\":{},"
+                "\"gate\":\"{}\",\"carry_slope\":{},\"warm_boron\":{},"
+                "\"boron_bracket\":{},\"max_trials\":{},\"staged_margin\":{:.4f},"
+                "\"trials\":{},\"proposals\":{},\"refused\":{},\"probe\":{},"
+                "\"carry_secant\":{},\"extrap\":{},\"secant\":{},\"bisect\":{},"
+                "\"search_outers\":{},\"outers\":{},\"statepoints\":{}}}\n",
+                cmfd_solver.batchSlot(), sp.staged_margin > 0.0 ? "A2" : "N1",
+                sp.carry_slope, sp.warm_boron, sp.boron_bracket, sp.max_trials,
+                sp.stagedMargin(0.0), sp_search.trials, sp_search.proposals,
+                sp_search.refused, sp_search.probe, sp_search.carry, sp_search.extrap,
+                sp_search.secant, sp_search.bisect, sp_search.outers,
+                sp_traj.outers, sp_traj.statepoints);
+        }
+
         const double total_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - driver_start).count();
         std::cout << std::format("  [TIMING] IO write={:.3f} s\n", total_io_seconds);
         std::cout << std::format("  TOTAL DRIVER TIME={:10.3f} s\n", total_seconds);
@@ -5385,6 +5518,7 @@ public:
                 "\"d2h_bytes\":{},\"d2h_calls\":{}}},"
                 "\"search\":{{\"trials\":{},\"proposals\":{},\"refused\":{},"
                 "\"secant\":{},\"carry_secant\":{},\"probe\":{},\"bisect\":{},"
+                "\"extrap\":{},"
                 "\"iterations\":{}}}}}\n",
                 sp_job_id, sp_slot, static_cast<int>(scheduler.schedule().size()),
                 c.outers_driver, c.outers(), c.outers_by_cause[sptelem::CAUSE_INITIAL],
@@ -5418,6 +5552,7 @@ public:
                 c.floor_d2h_bytes, c.floor_d2h_calls,
                 c.search_trials, c.search_proposals, c.search_refused,
                 c.search_secant, c.search_carry, c.search_probe, c.search_bisect,
+                c.search_extrap,
                 c.search_iterations));
             // The summary is the last line this deck emits, so flush here: an
             // abnormal exit then loses at most the lines of the decks still

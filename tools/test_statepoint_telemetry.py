@@ -345,7 +345,7 @@ if drive.count("ctx.telemetry.armFloor(") != 1:
 # ---------------------------------------------------------------------------
 SCHEDULER = (ROOT / "src" / "Scheduler.h").read_text(encoding="utf-8-sig")
 SEARCH_FIELDS = ("trials", "proposals", "refused", "secant", "carry_secant", "probe",
-                 "bisect", "iterations")
+                 "bisect", "extrap", "iterations")
 for name, block in (("per-statepoint", step_block), ("summary", summary_block)):
     search_obj = json_object(block, "search")
     for field in SEARCH_FIELDS:
@@ -371,6 +371,7 @@ if "const bool proposed = AdvanceSecantSearch(" not in SCHEDULER:
 # what the search does next -- no condition, no arithmetic feeding next_x.
 WP9D_FIELDS = ("search_n_proposals", "search_n_refused", "search_n_secant",
                "search_n_carry", "search_n_probe", "search_n_bisect",
+               "search_n_extrap",
                "search_first_x", "search_last_dx")
 CONDITION = re.compile(r"\b(if|while|for|return|assert)\b[^;]*")
 
