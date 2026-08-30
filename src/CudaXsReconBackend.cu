@@ -6,6 +6,7 @@
 #include "FlatXsKernel.h"
 #include "GpuCanonicalState.h"
 #include "GpuCaptureArbiter.h"
+#include "GpuDeviceBlockPool.h"
 #include "GpuGraphSplice.h"
 #include "NodalKernel.h"
 #include "XeFormMask.h"
@@ -1233,11 +1234,11 @@ private:
         const std::size_t o_idirlr  = take_int(ns * ndl::NLR);
         const std::size_t o_sgnlr   = take_int(ns * ndl::NLR);
 
-        cudaError_t rc = cudaMalloc(reinterpret_cast<void**>(&_dbl), off * sizeof(double));
+        cudaError_t rc = rasbery::gpu::deviceBlockAllocOnce(reinterpret_cast<void**>(&_dbl), off * sizeof(double));
         if (rc != cudaSuccess) { fail("cudaMalloc(nodal arena doubles)", rc); return; }
-        rc = cudaMalloc(reinterpret_cast<void**>(&_idx), ioff * sizeof(int));
+        rc = rasbery::gpu::deviceBlockAllocOnce(reinterpret_cast<void**>(&_idx), ioff * sizeof(int));
         if (rc != cudaSuccess) { fail("cudaMalloc(nodal arena ints)", rc); return; }
-        rc = cudaMalloc(reinterpret_cast<void**>(&_d_active), S * sizeof(std::uint32_t));
+        rc = rasbery::gpu::deviceBlockAllocOnce(reinterpret_cast<void**>(&_d_active), S * sizeof(std::uint32_t));
         if (rc != cudaSuccess) { fail("cudaMalloc(nodal arena mask)", rc); return; }
         rc = cudaMallocHost(reinterpret_cast<void**>(&_h_active), S * sizeof(std::uint32_t));
         if (rc != cudaSuccess) { fail("cudaMallocHost(nodal arena mask)", rc); return; }
@@ -1247,7 +1248,7 @@ private:
         std::memset(_h_reigv, 0, S * sizeof(double));
         rc = cudaMemset(_d_active, 0, S * sizeof(std::uint32_t));
         if (rc != cudaSuccess) { fail("cudaMemset(nodal arena mask)", rc); return; }
-        rc = cudaMalloc(reinterpret_cast<void**>(&_d_slot_map), S * sizeof(int));
+        rc = rasbery::gpu::deviceBlockAllocOnce(reinterpret_cast<void**>(&_d_slot_map), S * sizeof(int));
         if (rc != cudaSuccess) { fail("cudaMalloc(nodal arena slot map)", rc); return; }
         rc = cudaMallocHost(reinterpret_cast<void**>(&_h_slot_map), S * sizeof(int));
         if (rc != cudaSuccess) { fail("cudaMallocHost(nodal arena slot map)", rc); return; }
@@ -1256,7 +1257,7 @@ private:
                              _d_slot_map, _h_slot_map, S * sizeof(int),
                              cudaMemcpyHostToDevice);
         if (rc != cudaSuccess) { fail("cudaMemcpy(nodal arena slot map)", rc); return; }
-        rc = cudaMalloc(reinterpret_cast<void**>(&_d_views), S * sizeof(ndl::NodalView));
+        rc = rasbery::gpu::deviceBlockAllocOnce(reinterpret_cast<void**>(&_d_views), S * sizeof(ndl::NodalView));
         if (rc != cudaSuccess) { fail("cudaMalloc(nodal arena view table)", rc); return; }
         rc = cudaMallocHost(reinterpret_cast<void**>(&_h_views), S * sizeof(ndl::NodalView));
         if (rc != cudaSuccess) { fail("cudaMallocHost(nodal arena view table)", rc); return; }
@@ -2371,18 +2372,18 @@ struct XsReconBackend::Impl {
             nodal_slot = -1;
         }
         xeRelease();
-        if (dev_block) cudaFree(dev_block);
-        if (dev_fuel) cudaFree(dev_fuel);
-        if (dev_scalars) cudaFree(dev_scalars);
-        if (dev_dep) cudaFree(dev_dep);
-        if (dev_ref) cudaFree(dev_ref);
-        if (dev_pernode) cudaFree(dev_pernode);
-        if (dev_nodes) cudaFree(dev_nodes);
-        if (dev_off) cudaFree(dev_off);
-        if (dev_cnt) cudaFree(dev_cnt);
-        if (dev_sdid) cudaFree(dev_sdid);
-        if (dev_sx) cudaFree(dev_sx);
-        if (dev_sscale) cudaFree(dev_sscale);
+        if (dev_block) rasbery::gpu::deviceBlockFree(dev_block);
+        if (dev_fuel) rasbery::gpu::deviceBlockFree(dev_fuel);
+        if (dev_scalars) rasbery::gpu::deviceBlockFree(dev_scalars);
+        if (dev_dep) rasbery::gpu::deviceBlockFree(dev_dep);
+        if (dev_ref) rasbery::gpu::deviceBlockFree(dev_ref);
+        if (dev_pernode) rasbery::gpu::deviceBlockFree(dev_pernode);
+        if (dev_nodes) rasbery::gpu::deviceBlockFree(dev_nodes);
+        if (dev_off) rasbery::gpu::deviceBlockFree(dev_off);
+        if (dev_cnt) rasbery::gpu::deviceBlockFree(dev_cnt);
+        if (dev_sdid) rasbery::gpu::deviceBlockFree(dev_sdid);
+        if (dev_sx) rasbery::gpu::deviceBlockFree(dev_sx);
+        if (dev_sscale) rasbery::gpu::deviceBlockFree(dev_sscale);
         // THE CACHE, NOT THE SELECTION.  `nodal_graph` / `nodal_graph_src` are
         // aliases into nodal_graphs since Rev.7.1 Task 10 part 4, so destroying
         // them here would free one entry twice and leak the rest.
@@ -2393,8 +2394,8 @@ struct XsReconBackend::Impl {
         // resources for the same reason they are: this destructor is the only
         // place that knows the backend is going away.
         if (nodal_done_event != nullptr) cudaEventDestroy(nodal_done_event);
-        if (ndev_dbl) cudaFree(ndev_dbl);
-        if (ndev_int) cudaFree(ndev_int);
+        if (ndev_dbl) rasbery::gpu::deviceBlockFree(ndev_dbl);
+        if (ndev_int) rasbery::gpu::deviceBlockFree(ndev_int);
         if (stream) cudaStreamDestroy(stream);
     }
 
@@ -2410,10 +2411,16 @@ struct XsReconBackend::Impl {
         // kernels; a geometry change invalidates both.
         xeRelease();
         rasbery::AllocWindow _alloc_window("xsrecon.instance.regrow");
-        if (dev_block) { cudaFree(dev_block); dev_block = nullptr; }
-        if (dev_fuel) { cudaFree(dev_fuel); dev_fuel = nullptr; }
-        if (dev_ref) { cudaFree(dev_ref); dev_ref = nullptr; }
-        if (dev_pernode) { cudaFree(dev_pernode); dev_pernode = nullptr; }
+        // WP10.6.  A REBUILD is a live region freed and re-laid-out under a
+        // shape change; a first stand-up is not one.  The distinction is the
+        // whole question the VRAM sawtooth raised -- "is the arena torn down
+        // per generation?" -- and it is now a counter in the MEM receipt
+        // instead of an inference from a board-level memory trace.
+        if (dev_block != nullptr) rasbery::gpu::blockpool::noteArenaRebuild();
+        if (dev_block) { rasbery::gpu::deviceBlockFree(dev_block); dev_block = nullptr; }
+        if (dev_fuel) { rasbery::gpu::deviceBlockFree(dev_fuel); dev_fuel = nullptr; }
+        if (dev_ref) { rasbery::gpu::deviceBlockFree(dev_ref); dev_ref = nullptr; }
+        if (dev_pernode) { rasbery::gpu::deviceBlockFree(dev_pernode); dev_pernode = nullptr; }
         resident_micx_generation  = 0;
         resident_state_generation = 0;
         resident_ref_generation   = 0;
@@ -2450,23 +2457,23 @@ struct XsReconBackend::Impl {
         off_phif = off; off += static_cast<std::size_t>(xsr::NG) * nx;
         block_doubles = off;
 
-        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&dev_block),
+        RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&dev_block),
                                           block_doubles * sizeof(double)), status);
-        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&dev_fuel),
+        RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&dev_fuel),
                                           static_cast<std::size_t>(nxyz) * sizeof(int)), status);
         return true;
     }
 
     void xeRelease() {
         rasbery::AllocWindow _alloc_window("xsrecon.xe.release");
-        if (xe_hist) { cudaFree(xe_hist); xe_hist = nullptr; }
-        if (xe_processed) { cudaFree(xe_processed); xe_processed = nullptr; }
-        if (xe_partials) { cudaFree(xe_partials); xe_partials = nullptr; }
-        if (xe_dots) { cudaFree(xe_dots); xe_dots = nullptr; }
-        if (xe_pairs) { cudaFree(xe_pairs); xe_pairs = nullptr; }
-        if (xe_flags) { cudaFree(xe_flags); xe_flags = nullptr; }
-        if (xe_bits) { cudaFree(xe_bits); xe_bits = nullptr; }
-        if (xe_ctl) { cudaFree(xe_ctl); xe_ctl = nullptr; }
+        if (xe_hist) { rasbery::gpu::deviceBlockFree(xe_hist); xe_hist = nullptr; }
+        if (xe_processed) { rasbery::gpu::deviceBlockFree(xe_processed); xe_processed = nullptr; }
+        if (xe_partials) { rasbery::gpu::deviceBlockFree(xe_partials); xe_partials = nullptr; }
+        if (xe_dots) { rasbery::gpu::deviceBlockFree(xe_dots); xe_dots = nullptr; }
+        if (xe_pairs) { rasbery::gpu::deviceBlockFree(xe_pairs); xe_pairs = nullptr; }
+        if (xe_flags) { rasbery::gpu::deviceBlockFree(xe_flags); xe_flags = nullptr; }
+        if (xe_bits) { rasbery::gpu::deviceBlockFree(xe_bits); xe_bits = nullptr; }
+        if (xe_ctl) { rasbery::gpu::deviceBlockFree(xe_ctl); xe_ctl = nullptr; }
         xe_hist_fuel = 0;
         xe_parts     = 0;
     }
@@ -2484,17 +2491,17 @@ struct XsReconBackend::Impl {
         if (xe_parts > n_fuel) xe_parts = n_fuel; // empty partitions are pure waste
         if (xe_parts < 1) xe_parts = 1;
 
-        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&xe_hist),
+        RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&xe_hist),
                                           3 * static_cast<std::size_t>(xek::XE_TRIPLE_COUNT) *
                                               nf * sizeof(double)),
                                status);
-        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&xe_processed), nf), status);
+        RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&xe_processed), nf), status);
         RASBERY_CUDA_TRY_ALLOC(
-            cudaMalloc(reinterpret_cast<void**>(&xe_partials),
+            rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&xe_partials),
                        static_cast<std::size_t>(xek::XE_DOT_COUNT) *
                            static_cast<std::size_t>(xe_parts) * sizeof(double)),
             status);
-        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&xe_dots),
+        RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&xe_dots),
                                           xek::XE_DOT_COUNT * sizeof(double)),
                                status);
         // 3*XE_DOT_COUNT for the legacy arm's per-call upload, then TWO more
@@ -2502,19 +2509,19 @@ struct XsReconBackend::Impl {
         // ONCE here instead of twice per step.  Separate storage on purpose: the
         // legacy arm still writes its own region every call, and a shared one
         // would make the transaction's tables depend on who ran last.
-        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&xe_pairs),
+        RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&xe_pairs),
                                           (3 * xek::XE_DOT_COUNT +
                                            2 * XE_TXN_LAYOUT_INTS) * sizeof(int)),
                                status);
-        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&xe_flags), sizeof(int)),
+        RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&xe_flags), sizeof(int)),
                                status);
         // THREE, not two.  The transaction needs its own commit counter: slot 0
         // still carries the residual the control kernel reads and slot 1 the
         // candidate's trust-region max, and both are live when the commit runs.
-        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&xe_bits),
+        RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&xe_bits),
                                           3 * sizeof(unsigned long long)),
                                status);
-        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&xe_ctl),
+        RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&xe_ctl),
                                           sizeof(xek::XeTxnControl)),
                                status);
         // Only the transaction reads them, and only the transaction should pay
@@ -2631,7 +2638,7 @@ struct XsReconBackend::Impl {
         // two per-call copies were pure API-call overhead (nsys: memcpy CALL
         // COUNT, not payload, dominates the timeline).
         if (dev_dep == nullptr) {
-            RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&dev_dep),
+            RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&dev_dep),
                                               2 * xsr::NISO * sizeof(double)),
                                    status);
             RASBERY_CUDA_TRY(rasbery::xfer::memcpyAsync("CudaXsReconBackend.cu:xeEnsure", "dep_i135",
@@ -2841,7 +2848,7 @@ XsReconBackend::XsReconBackend() : _impl(std::make_unique<Impl>()) {
         }
     }
     rasbery::AllocWindow _scalars_window("xsrecon.scalars");
-    if (cudaMalloc(reinterpret_cast<void**>(&_impl->dev_scalars),
+    if (rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&_impl->dev_scalars),
                    2 * sizeof(unsigned long long)) != cudaSuccess) {
         _impl->status = "scalar buffer allocation failed";
         return;
@@ -3432,9 +3439,9 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
             for (int t = 0; t < fxs::N_ACTIVE; ++t) { e.off_mic[t] = off; off += shape.mic_slot; }
             e.off_msm = off; off += shape.msm;
             e.off_knots = off; off += shape.n_knots;
-            RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&e.block),
+            RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAllocOnce(reinterpret_cast<void**>(&e.block),
                                               off * sizeof(double)), d.status);
-            RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&e.deltas),
+            RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAllocOnce(reinterpret_cast<void**>(&e.deltas),
                                               shape.n_deltas * sizeof(fxs::DeltaMeta)), d.status);
             // Synchronous copies under the mutex: nothing can race a
             // half-uploaded table, and this happens once per process.
@@ -3486,7 +3493,7 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
         d.off_ref_msm = off; off += msm;
         for (int t = 0; t < fxs::N_ACTIVE; ++t) { d.off_ref_lmp[t] = off; off += lmp; }
         d.off_ref_lsm = off; off += ssm;
-        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.dev_ref),
+        RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&d.dev_ref),
                                           off * sizeof(double)), d.status);
         d.resident_ref_generation = 0;
     }
@@ -3563,7 +3570,7 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     }
 
     if (d.dev_pernode == nullptr) {
-        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.dev_pernode),
+        RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&d.dev_pernode),
                                           3 * nx * sizeof(double)), d.status);
         // A fresh allocation holds nothing the shadows describe.
         d.mir_wvfr.invalidate();
@@ -3584,15 +3591,16 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     const std::size_t n_nodes = static_cast<std::size_t>(host.n_nodes);
     if (n_nodes > d.nodes_cap) {
         rasbery::AllocWindow _alloc_window("xsrecon.nodes.regrow");
-        if (d.dev_nodes) cudaFree(d.dev_nodes);
-        if (d.dev_off) cudaFree(d.dev_off);
-        if (d.dev_cnt) cudaFree(d.dev_cnt);
+        if (d.dev_nodes != nullptr) rasbery::gpu::blockpool::noteArenaRebuild();
+        if (d.dev_nodes) rasbery::gpu::deviceBlockFree(d.dev_nodes);
+        if (d.dev_off) rasbery::gpu::deviceBlockFree(d.dev_off);
+        if (d.dev_cnt) rasbery::gpu::deviceBlockFree(d.dev_cnt);
         d.dev_nodes = d.dev_off = d.dev_cnt = nullptr;
-        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.dev_nodes),
+        RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&d.dev_nodes),
                                           n_nodes * sizeof(int)), d.status);
-        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.dev_off),
+        RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&d.dev_off),
                                           n_nodes * sizeof(int)), d.status);
-        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.dev_cnt),
+        RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&d.dev_cnt),
                                           n_nodes * sizeof(int)), d.status);
         d.nodes_cap = n_nodes;
         d.invalidateNodeMirrors();
@@ -3603,15 +3611,16 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
                      static_cast<std::size_t>(host.node_cnt[host.n_nodes - 1]);
     if (stream_len > d.stream_cap) {
         rasbery::AllocWindow _alloc_window("xsrecon.stream.regrow");
-        if (d.dev_sdid) cudaFree(d.dev_sdid);
-        if (d.dev_sx) cudaFree(d.dev_sx);
-        if (d.dev_sscale) cudaFree(d.dev_sscale);
+        if (d.dev_sdid != nullptr) rasbery::gpu::blockpool::noteArenaRebuild();
+        if (d.dev_sdid) rasbery::gpu::deviceBlockFree(d.dev_sdid);
+        if (d.dev_sx) rasbery::gpu::deviceBlockFree(d.dev_sx);
+        if (d.dev_sscale) rasbery::gpu::deviceBlockFree(d.dev_sscale);
         d.dev_sdid = nullptr; d.dev_sx = d.dev_sscale = nullptr;
-        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.dev_sdid),
+        RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&d.dev_sdid),
                                           stream_len * sizeof(int)), d.status);
-        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.dev_sx),
+        RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&d.dev_sx),
                                           stream_len * sizeof(double)), d.status);
-        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.dev_sscale),
+        RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&d.dev_sscale),
                                           stream_len * sizeof(double)), d.status);
         d.stream_cap = stream_len;
         d.invalidateStreamMirrors();
@@ -3985,8 +3994,8 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     if (d.ndev_dbl == nullptr || d.nodal_nsurf != host.nsurf) {
         d.dropNodalGraph(); // baked ndev_dbl-relative pointers
         rasbery::AllocWindow _alloc_window("nodal.instance.regrow");
-        if (d.ndev_dbl) { cudaFree(d.ndev_dbl); d.ndev_dbl = nullptr; }
-        if (d.ndev_int) { cudaFree(d.ndev_int); d.ndev_int = nullptr; }
+        if (d.ndev_dbl) { rasbery::gpu::deviceBlockFree(d.ndev_dbl); d.ndev_dbl = nullptr; }
+        if (d.ndev_int) { rasbery::gpu::deviceBlockFree(d.ndev_int); d.ndev_int = nullptr; }
         d.nodal_geom_uploaded       = false;
         d.resident_const_generation = 0;
         d.resident_chif_generation  = 0;
@@ -4004,7 +4013,7 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         d.n_off_work = off;
         off += 3 * ndg0 + 2 * nx * ndl::NDIR * ndl::NG2 + 4 * nx * ndl::NG2 +
                3 * ndg0;
-        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.ndev_dbl),
+        RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&d.ndev_dbl),
                                           off * sizeof(double)), d.status);
         std::size_t ioff = 0;
         d.n_ioff_lktosfc = ioff; ioff += nx * ndl::NDIR * ndl::NLR;
@@ -4012,7 +4021,7 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         d.n_ioff_lklr = ioff; ioff += ns * ndl::NLR;
         d.n_ioff_idirlr = ioff; ioff += ns * ndl::NLR;
         d.n_ioff_sgnlr = ioff; ioff += ns * ndl::NLR;
-        RASBERY_CUDA_TRY_ALLOC(cudaMalloc(reinterpret_cast<void**>(&d.ndev_int),
+        RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&d.ndev_int),
                                           ioff * sizeof(int)), d.status);
     }
     const std::size_t ndg = nx * ndl::NDIR * ndl::NG;

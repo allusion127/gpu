@@ -44,10 +44,20 @@ WHAT IS MEASURED RATHER THAN ASSERTED.
                           throughput decays 0.5 % per generation ends 10 % down
                           and every individual step looks like noise -- which is
                           exactly what a slow leak looks like from inside.
-  VRAM                    nvidia-smi, sampled between generations.  A LEAK IS A
-                          SLOPE, not a level: warm plateau is expected and high,
-                          so the test is MB per generation over the second half
-                          of the run, after the caches have stopped growing.
+  VRAM                    THE PROCESS'S OWN device footprint, sampled between
+                          generations: `[EVALUATOR][MEM] vram_mb` first, then
+                          nvidia-smi's per-compute-app row for this pid, and a
+                          board total only as a last resort and only ever
+                          LABELLED as one.  WP10.6: the 238 soak reported a
+                          298 MB <-> 47,000 MB "sawtooth" that was an
+                          eight-process MPS batch on the OTHER board, sampled
+                          because `--gpu` defaulted to 0 while the child ran
+                          under CUDA_VISIBLE_DEVICES=1.  A board-scoped sample
+                          with other tenants on it is now reported and NOT
+                          convicted.  A LEAK IS A SLOPE, not a level: warm
+                          plateau is expected and high, so the test is MB per
+                          generation over the second half of the run, after the
+                          caches have stopped growing.
   host RSS                /proc/<pid>/status VmRSS, same rule.  Unavailable off
                           Linux, and the report says `null` rather than 0 --
                           "not measured" and "measured zero" are different
@@ -174,29 +184,104 @@ def receipts_of(text: str, tag: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def sample_vram_mb(gpu: str) -> float | None:
-    """Used VRAM on *gpu*, MB, or None when nvidia-smi cannot say.
+def sampled_gpu(env: "dict[str, str]", requested: str) -> str:
+    """The board the CHILD is on, which is not always the one --gpu names.
+
+    WP10.6.  The 238 20-generation soak was launched with `CUDA_VISIBLE_DEVICES=1`
+    in the environment and no `--gpu` flag.  `env.setdefault` therefore left the
+    child on GPU1 -- correctly -- and the sampler went on querying
+    `nvidia-smi -i 0`, because that is what `--gpu` still defaulted to.  GPU0 was
+    running an eight-process MPS batch at the time, so the VRAM trace the report
+    published (298 MB <-> 47,000 MB, "a sawtooth") was a faithful measurement of
+    somebody else's work.  `CUDA_VISIBLE_DEVICES` wins here: nvidia-smi's `-i`
+    is a board index and ignores it, so the translation has to be done once,
+    explicitly, rather than assumed to be the identity.
+    """
+    visible = env.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if not visible:
+        return str(requested)
+    first = visible.split(",")[0].strip()
+    return first or str(requested)
+
+
+class VramSample:
+    """A VRAM reading, and WHOSE it is.
+
+    `scope` is the whole point.  A board reading with other tenants on it is not
+    this process's footprint, and a leak gate that cannot tell the two apart
+    reports the neighbours' allocations as its own growth -- which is exactly
+    the finding WP10.6 had to withdraw.
+    """
+
+    __slots__ = ("used_mb", "scope", "foreign_pids", "board_mb")
+
+    def __init__(self, used_mb: float | None, scope: str,
+                 foreign_pids: "list[int]", board_mb: float | None) -> None:
+        self.used_mb = used_mb
+        self.scope = scope                  # "process" | "board" | "none"
+        self.foreign_pids = foreign_pids
+        self.board_mb = board_mb
+
+
+def _nvidia_smi(args: "list[str]") -> "list[str] | None":
+    try:
+        out = subprocess.run(  # noqa: S603
+            ["nvidia-smi", *args], capture_output=True, text=True,
+            timeout=20, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip().splitlines()
+
+
+def sample_vram(gpu: str, pid: int | None) -> VramSample:
+    """This process's device memory on *gpu*, MB, and every other tenant's pid.
 
     None rather than 0.0 on every failure path.  A soak that reported 0 MB
     because nvidia-smi was missing would report a perfectly flat VRAM trace and
     pass its leak check for the one reason that proves nothing.
     """
-    try:
-        out = subprocess.run(  # noqa: S603
-            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits",
-             "-i", str(gpu)],
-            capture_output=True, text=True, timeout=20, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if out.returncode != 0:
-        return None
-    line = out.stdout.strip().splitlines()
-    if not line:
-        return None
-    try:
-        return float(line[0].strip())
-    except ValueError:
-        return None
+    board = None
+    rows = _nvidia_smi(["--query-gpu=memory.used", "--format=csv,noheader,nounits",
+                        "-i", str(gpu)])
+    if rows:
+        try:
+            board = float(rows[0].strip())
+        except ValueError:
+            board = None
+
+    mine: float | None = None
+    foreign: list[int] = []
+    apps = _nvidia_smi(["--query-compute-apps=pid,used_gpu_memory",
+                        "--format=csv,noheader,nounits", "-i", str(gpu)])
+    if apps is not None:
+        for row in apps:
+            parts = [f.strip() for f in row.split(",")]
+            if len(parts) < 2:
+                continue
+            try:
+                row_pid, row_mb = int(parts[0]), float(parts[1])
+            except ValueError:
+                continue
+            if pid is not None and row_pid == pid:
+                mine = (mine or 0.0) + row_mb
+            else:
+                foreign.append(row_pid)
+        if mine is not None:
+            return VramSample(mine, "process", foreign, board)
+        # The child is on the board but the driver did not list it (MPS routes
+        # every client's memory through the server process, and some drivers
+        # report nothing for a compute app at all).  Say "board", loudly,
+        # rather than silently offering a board number as a process number.
+    if board is None:
+        return VramSample(None, "none", foreign, None)
+    return VramSample(board, "board", foreign, board)
+
+
+def sample_vram_mb(gpu: str, pid: int | None = None) -> float | None:
+    """Back-compatible scalar, used by the contract test's negative controls."""
+    return sample_vram(gpu, pid).used_mb
 
 
 def sample_rss_mb(pid: int | None) -> float | None:
@@ -321,6 +406,19 @@ def _mb(byte_delta: float) -> float:
     return byte_delta / (1024.0 * 1024.0)
 
 
+def _paired(first: dict, last: dict, key: str) -> "tuple[float, float] | None":
+    """(first, last) for a numeric receipt field, or None when either is absent.
+
+    None rather than 0.0 for a missing field: an older binary that never printed
+    the field and a run where the field really was zero are different facts, and
+    only one of them is evidence.
+    """
+    head, tail = first.get(key), last.get(key)
+    if isinstance(head, (int, float)) and isinstance(tail, (int, float)):
+        return float(head), float(tail)
+    return None
+
+
 def attribute_rss_growth(generations: "Sequence[GenerationResult]",
                          rss_growth_mb: float | None = None) -> list[str]:
     """Name the container -- and say whether it is big enough to be the cause.
@@ -417,6 +515,43 @@ def attribute_rss_growth(generations: "Sequence[GenerationResult]",
     if not (explains or too_small or unpriced):
         notes.append("and every container [EVALUATOR][MEM] can see was FLAT across the "
                      "run -- not one counter or byte total moved")
+    # WP10.6.  THE ALLOCATOR, ASKED DIRECTLY.  The 238 soak ended on "look at
+    # the allocator next" because the receipt could not look at it.  It can now:
+    # `malloc_retained_mb` is what glibc has taken from the kernel and no case
+    # is using, i.e. free lists a per-thread arena will hand to the next case
+    # and will never hand back to the OS.  Retention that tracks the growth is a
+    # HIGH-WATER MARK, which converges; a leak does not, and the two need
+    # opposite repairs.  Saying which one it is here is the difference between a
+    # finding and a hand-off.
+    retained = _paired(first, last, "malloc_retained_mb")
+    if retained is not None:
+        head, tail = retained
+        share = None
+        if rss_growth_mb and rss_growth_mb > 0.0:
+            share = (tail - head) / rss_growth_mb
+        if share is not None and share >= ATTRIBUTION_SHARE:
+            notes.append(
+                f"and malloc_retained_mb went {head:.1f} -> {tail:.1f} MB, "
+                f"{share:.0%} of the {rss_growth_mb:.1f} MB gained: this is ALLOCATOR "
+                "RETENTION, not a leak -- glibc is holding free lists at the "
+                "concurrent-case high-water mark. Compare the second-half slope; a "
+                "high-water mark flattens and a leak does not")
+        else:
+            notes.append(f"and malloc_retained_mb went {head:.1f} -> {tail:.1f} MB, "
+                         "which does NOT account for the growth")
+    elif last.get("malloc_readable") is False:
+        notes.append("and malloc_retained_mb is unreadable on this C library, so "
+                     "allocator retention could not be ruled in or out from the receipt")
+    # The device half, for the same reason: a receipt that reports its own VRAM
+    # cannot be contaminated by a neighbour on the board.
+    device = _paired(first, last, "vram_mb")
+    if device is not None:
+        head, tail = device
+        rebuilds = last.get("arena_rebuilds")
+        notes.append(f"and the process's OWN device footprint went {head:.1f} -> "
+                     f"{tail:.1f} MB with arena_rebuilds="
+                     f"{rebuilds if rebuilds is not None else 'absent'} "
+                     "(0 means the arena was stood up once and never rebuilt)")
     if not explains:
         notes.append("so nothing [EVALUATOR][MEM] can see accounts for the growth: look "
                      "at the allocator (compare rss_peak_mb with rss_mb -- a large gap "
@@ -439,6 +574,12 @@ class GenerationResult:
     wall_s: float = 0.0
     cases_per_hour: float = 0.0
     vram_mb: float | None = None
+    #: WP10.6.  "process", "board" or "none".  A board reading is NOT this
+    #: process's footprint and is labelled so no later reader can mistake one
+    #: for the other, which is how a neighbour's 47 GB became a soak finding.
+    vram_scope: str = "none"
+    vram_foreign: int = 0
+    vram_board_mb: float | None = None
     rss_mb: float | None = None
     poisoned: int = 0
     promotions: int = 0
@@ -587,14 +728,18 @@ def render_markdown(report: dict) -> str:
     lines.append("")
     lines.append("## Throughput and growth")
     lines.append("")
-    lines.append("| gen | cases | ok | failed | wall s | c/h | VRAM MB | RSS MB |")
-    lines.append("|---|---|---|---|---|---|---|---|")
+    # WP10.6.  The SCOPE column is not decoration.  A board reading and a
+    # process reading in the same column with no label is how eight MPS clients
+    # on another board became a soak finding about this evaluator.
+    lines.append("| gen | cases | ok | failed | wall s | c/h | VRAM MB | scope | RSS MB |")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
     for gen in report["per_generation"]:
         vram = "-" if gen["vram_mb"] is None else format(gen["vram_mb"], ".0f")
         rss = "-" if gen["rss_mb"] is None else format(gen["rss_mb"], ".0f")
         lines.append(
             f"| {gen['index']} | {gen['cases']} | {gen['ok']} | {gen['failed']} | "
-            f"{gen['wall_s']:.2f} | {gen['cases_per_hour']:.1f} | {vram} | {rss} |")
+            f"{gen['wall_s']:.2f} | {gen['cases_per_hour']:.1f} | {vram} | "
+            f"{gen.get('vram_scope', '?')} | {rss} |")
     lines.append("")
     drift = report["throughput"]
     lines.append(f"- c/h median {drift['median']:.1f}, "
@@ -722,6 +867,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         env[key] = value
     env.setdefault("CUDA_VISIBLE_DEVICES", args.gpu)
     gpu_full = env.get("RASBERY_GPU_FULL") not in (None, "", "0")
+    # The board the CHILD will be on -- see sampled_gpu().  Resolved AFTER the
+    # setdefault above, because the setdefault is what decides it.
+    vram_gpu = sampled_gpu(env, args.gpu)
 
     session = EvaluatorSession(command=command, env=env, cwd=str(ROOT),
                                log_path=workdir / "log" / "soak.log",
@@ -778,10 +926,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         # VRAM/RSS BETWEEN generations, not during: a sample taken mid-wave
         # measures where the wave happened to be, and the question is what is
         # left behind when it is over.
-        result.vram_mb = sample_vram_mb(args.gpu)
+        vram = sample_vram(vram_gpu, session.pid)
+        result.vram_mb = vram.used_mb
+        result.vram_scope = vram.scope
+        result.vram_foreign = len(vram.foreign_pids)
+        result.vram_board_mb = vram.board_mb
         result.rss_mb = sample_rss_mb(session.pid)
         mem_receipts = receipts_of(outcome.text, "[RASBERY][EVALUATOR][MEM]")
         result.mem = mem_receipts[-1] if mem_receipts else None
+        # WP10.6.  THE PROCESS'S OWN NUMBER WINS for VRAM, which is the opposite
+        # of the RSS rule three lines down, and deliberately so.  RSS is read
+        # from outside because an outside reading cannot be wrong in the same
+        # direction as the thing it measures.  VRAM's outside reading is the one
+        # that WAS wrong: `nvidia-smi` answers for a board, and a board can have
+        # eight other tenants on it.  `[EVALUATOR][MEM] vram_mb` is what this
+        # process holds, by its own accounting, and nothing else can move it.
+        if isinstance(result.mem, dict):
+            reported = result.mem.get("vram_mb")
+            if isinstance(reported, (int, float)) and reported >= 0:
+                result.vram_mb = float(reported)
+                result.vram_scope = "receipt"
         # FALL BACK TO THE PROCESS'S OWN RSS, and only then.  /proc/<pid>/status
         # is the primary because it is an OUTSIDE measurement and cannot be
         # wrong in the same direction as the thing it is measuring; where there
@@ -910,15 +1074,44 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"generation {gen.index}: {gen.cases_per_hour:.1f} c/h is "
                     f"{drift:.2%} off the median {median:.1f}, budget {args.drift:.1%}")
 
+    # WP10.6.  A VRAM SLOPE IS ONLY THIS PROCESS'S SLOPE WHEN THE SAMPLE WAS
+    # THIS PROCESS'S.  Where the reading is board-scoped and other compute apps
+    # were on the board, the trace is the board's and the slope is not evidence
+    # about this process at all -- so it is reported, named, and NOT convicted.
+    # This is the 238 finding, in the form that would have prevented it: the
+    # sawtooth was eight MPS clients on the other board, and no amount of
+    # arithmetic on that series was ever going to be about the evaluator.
+    vram_scopes = {g.vram_scope for g in generations}
+    contaminated = [g for g in generations
+                    if g.vram_scope == "board" and g.vram_foreign > 0]
+    if contaminated:
+        problems.append(
+            f"{len(contaminated)} of {len(generations)} VRAM samples were BOARD-scoped "
+            f"with up to {max(g.vram_foreign for g in contaminated)} other compute "
+            f"process(es) on the board: that trace is the board's, not this "
+            f"process's, and no slope taken from it is evidence about this "
+            f"evaluator. Run the soak on an idle board, or use a build whose "
+            f"[EVALUATOR][MEM] receipt carries vram_mb.")
+
     growth = {}
     for what, series, limit in (
             ("vram", [g.vram_mb for g in generations], args.vram_leak_mb),
             ("rss", [g.rss_mb for g in generations], args.rss_leak_mb)):
+        if what == "vram" and contaminated:
+            growth[what] = dict(growth_slopes(series, args.warmup_generations),
+                                limit_mb_per_generation=limit, samples=series,
+                                scopes=sorted(vram_scopes),
+                                gated=False,
+                                gate_skipped_because="board-scoped with other tenants")
+            continue
         slopes = growth_slopes(series, args.warmup_generations)
         slope = slopes["slope_mb_per_generation"]
         growth[what] = dict(slopes,
                             limit_mb_per_generation=limit,
-                            samples=series)
+                            samples=series,
+                            gated=True)
+        if what == "vram":
+            growth[what]["scopes"] = sorted(vram_scopes)
         if slope is not None and slope > limit:
             raw = slopes["slope_raw_mb_per_generation"]
             post = slopes["slope_post_warmup_mb_per_generation"]
@@ -956,6 +1149,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "returncode": session.returncode,
         "wall_s": wall,
         "gpu_full": gpu_full,
+        "gpu_sampled": vram_gpu,
+        "gpu_requested": args.gpu,
+        "vram_scopes": sorted(vram_scopes),
         "zero_receipts": zero_values,
         "not_asserted": not_asserted,
         "throughput": {
@@ -969,7 +1165,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "per_generation": [
             {"index": g.index, "cases": g.cases, "ok": g.ok, "failed": g.failed,
              "wall_s": g.wall_s, "cases_per_hour": g.cases_per_hour,
-             "vram_mb": g.vram_mb, "rss_mb": g.rss_mb, "screens": g.screens,
+             "vram_mb": g.vram_mb, "vram_scope": g.vram_scope,
+             "vram_foreign_procs": g.vram_foreign, "vram_board_mb": g.vram_board_mb,
+             "rss_mb": g.rss_mb, "screens": g.screens,
              "promotions": g.promotions, "poisoned": g.poisoned, "alive": g.alive,
              "mem": g.mem}
             for g in generations],

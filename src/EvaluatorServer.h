@@ -96,6 +96,8 @@
 #include "CohortContext.h"
 #include "CudaXsReconBackend.h"
 #include "Driver.h"
+#include "GpuDeviceBlockPool.h"
+#include "GpuCaptureArbiter.h"
 #include "HostPinRegistry.h"
 #include "IoWriter.h"
 #include "RunContract.h"
@@ -119,6 +121,12 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+// WP10.6.  mallinfo2() lives here on glibc.  <cstdlib> above has already
+// pulled <features.h> in, so __GLIBC__ is decided by the time this is read.
+#if defined(__GLIBC__)
+    #include <malloc.h>
+#endif
 
 #ifdef _OPENMP
     #include <omp.h>
@@ -397,6 +405,24 @@ private:
     double              _max      = 0.0;
 };
 
+/// WP19.1.  IS THIS DEATH THE CAPTURE RACE'S SILENT FACE?
+///
+/// The loud face of the stand-up race (WP19) named itself: a cudaError_t in the
+/// 900 block, printed with the API that refused.  The silent face does not.  A
+/// graph built while a sibling lane was capturing can come back INSTANTIATED
+/// and wrong -- a body whose uploads were elided against shadows the discarded
+/// first attempt committed -- and the first thing that notices is BICGCMFD's
+/// non-finite guard, four frames and one graph replay away from the cause.
+///
+/// So the string is the signal, and it is deliberately the exact text
+/// CudaBICGBackend.cu:solveCommon and BICGCMFD.cpp throw.  A substring match on
+/// a message this tree owns is not a heuristic about CUDA; it is a match on our
+/// own thrown text, and tools/test_capture_standup_isolation_contract.py holds
+/// the two spellings against each other so a rename cannot silently unhook it.
+inline bool captureRaceCorruptionSuspect(const std::string& failure) {
+    return failure.find("non-finite") != std::string::npos;
+}
+
 /// Everything the process receipt reports, accumulated across waves.
 struct Summary {
     long long cases        = 0;
@@ -434,6 +460,8 @@ struct Summary {
     /// has to do across two lines that may not both be present.
     std::uint64_t rss_bytes_last  = 0;
     std::uint64_t rss_bytes_first = 0;
+    /// WP10.6.  The same, for the DEVICE footprint this process holds.
+    std::uint64_t device_bytes_last = 0;
 };
 
 namespace detail {
@@ -543,6 +571,47 @@ inline std::uint64_t peakResidentBytes() {
 
 inline double toMiB(std::uint64_t bytes) {
     return static_cast<double>(bytes) / (1024.0 * 1024.0);
+}
+
+/// WP10.6.  Bytes the C library is holding that no case is using.
+///
+/// The 238 soak grew 3,563.8 MB and every container the receipt could see had
+/// moved by 0.005 MB, so the report handed off with "look at the allocator
+/// next".  This IS the allocator, asked directly.  `arena` + `hblkhd` is what
+/// glibc has taken from the kernel; `uordblks` is what callers currently hold;
+/// the difference is retention -- free lists a per-thread arena will hand back
+/// to the next case and will not hand back to the OS.  A soak that sees RSS
+/// climb while THIS number climbs with it has found a high-water mark, not a
+/// leak, and the two need opposite repairs.
+///
+/// `{0, 0, false}` where the C library cannot answer, and the receipt says
+/// `malloc_readable:false` rather than printing a zero that would read as
+/// "the allocator is holding nothing".
+struct MallocRetention {
+    std::uint64_t taken_bytes  = 0;
+    std::uint64_t in_use_bytes = 0;
+    bool          readable     = false;
+};
+
+inline MallocRetention mallocRetention() {
+#if defined(__GLIBC__) && defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 33)
+    // mallinfo2, NOT mallinfo: the fields of the older struct are `int`, and an
+    // evaluator holding 4.5 GB overflows them silently.  A wrapped counter is
+    // worse than no counter, because it is believable.
+    const struct mallinfo2 info = mallinfo2();
+    MallocRetention out;
+    out.taken_bytes  = static_cast<std::uint64_t>(info.arena) +
+                       static_cast<std::uint64_t>(info.hblkhd);
+    out.in_use_bytes = static_cast<std::uint64_t>(info.uordblks);
+    out.readable     = true;
+    return out;
+#else
+    return MallocRetention{};
+#endif
+#else
+    return MallocRetention{};
+#endif
 }
 
 /// `<output>` with `.iso<n>` spliced before the extension.
@@ -1251,6 +1320,10 @@ public:
             << ",\"isolation_checks\":" << _summary.isolation_checks
             << ",\"isolation_mismatches\":" << _summary.isolation_mismatches
             << ",\"isolation_adjacent\":" << _summary.isolation_adjacent
+            << ",\"capture_race_case_retries\":"
+            << _capture_race_case_retries.load(std::memory_order_relaxed)
+            << ",\"capture_race_case_recovered\":"
+            << _capture_race_case_recovered.load(std::memory_order_relaxed)
             << ",\"stop_reason\":\"" << stopReasonName(_summary.stop) << "\"}"
             << std::endl;
         out.unsetf(std::ios::floatfield);
@@ -1406,6 +1479,16 @@ private:
         std::vector<double>      seconds(static_cast<std::size_t>(njobs), 0.0);
         std::vector<double>      teardown(static_cast<std::size_t>(njobs), 0.0);
         std::vector<int>         lanes(static_cast<std::size_t>(njobs), 0);
+        // WP19.1.  ONE FLAG PER LANE, WRITTEN ONLY BY THAT LANE.
+        //
+        // The stand-up race is first-case-only by construction: the WHILE graph
+        // caches and the PPR graph are per-slot and process-lived, so the ONE
+        // case that can be building a graph while a sibling stands up is the
+        // first case a lane takes.  A `char` per host thread, touched by that
+        // thread alone, is therefore the whole bookkeeping -- no atomics, and
+        // nothing on the steady path.
+        std::vector<char> lane_first(
+            static_cast<std::size_t>(std::max(1, host_threads)), 1);
 
 #ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic, 1) num_threads(host_threads)
@@ -1429,6 +1512,23 @@ private:
                        receipts[static_cast<std::size_t>(i)],
                        seconds[static_cast<std::size_t>(i)],
                        teardown[static_cast<std::size_t>(i)]);
+            const std::size_t li = static_cast<std::size_t>(lane) < lane_first.size()
+                                       ? static_cast<std::size_t>(lane)
+                                       : 0u;
+            const bool lane_first_case = lane_first[li] != 0;
+            lane_first[li] = 0;
+            retryAfterCaptureRace(wave.wave_id, i, lane, lane_first_case,
+                                  jobs.inputs[static_cast<std::size_t>(i)],
+                                  jobs.outputs[static_cast<std::size_t>(i)],
+                                  jobs.modes[static_cast<std::size_t>(i)],
+                                  jobs.warm_from[static_cast<std::size_t>(i)],
+                                  jobs.warm_save[static_cast<std::size_t>(i)],
+                                  jobs.fidelity[static_cast<std::size_t>(i)],
+                                  status[static_cast<std::size_t>(i)],
+                                  failure[static_cast<std::size_t>(i)],
+                                  receipts[static_cast<std::size_t>(i)],
+                                  seconds[static_cast<std::size_t>(i)],
+                                  teardown[static_cast<std::size_t>(i)]);
             refill::ledger().jobFinished(i);
         }
         refill::ledger().end();
@@ -1567,6 +1667,19 @@ private:
         if (_summary.rss_bytes_first == 0) _summary.rss_bytes_first = rss;
         _summary.rss_bytes_last = rss;
 
+        // WP10.6.  DEVICE bytes, measured from INSIDE the process.
+        //
+        // The 238 soak's VRAM trace sawtoothed between 298 MB and 47,000 MB and
+        // neither number was this process: `nvidia-smi` answers for a BOARD,
+        // and that board had eight other tenants on it.  A footprint the
+        // process reports for itself cannot be contaminated by a neighbour, and
+        // it is the only VRAM number a 10k-generation gate can be built on.
+        const rasbery::gpu::blockpool::Stats dev  = rasbery::gpu::blockpool::snapshot();
+        const std::uint64_t dev_bytes = dev.bytes_live + dev.bytes_pooled;
+        const std::uint64_t dev_prev  = _summary.device_bytes_last;
+        _summary.device_bytes_last = dev_bytes;
+        const detail::MallocRetention mall = detail::mallocRetention();
+
         const XsLibraryCacheStats xslib   = XsLibraryCacheSnapshot();
         const cohort::Stats       cohorts = cohort::snapshot();
         const long long           live    = detail::liveCases().load(std::memory_order_relaxed);
@@ -1587,6 +1700,43 @@ private:
                      : detail::toMiB(rss) - detail::toMiB(_summary.rss_bytes_first))
              << ",\"rss_peak_mb\":" << detail::toMiB(peak)
              << ",\"rss_readable\":" << (rss > 0 ? "true" : "false")
+             // WP10.6.  THE PROCESS'S OWN DEVICE FOOTPRINT, and the four
+             // counters that say what moved it.  `vram_mb` is in-use plus
+             // parked -- what this process is holding on the device, not what
+             // the board is holding for everybody -- and `vram_delta_mb` is
+             // signed for the same reason `rss_delta_mb` is: a generation that
+             // gives memory back is a fact an unsigned delta would hide.
+             << ",\"vram_mb\":" << detail::toMiB(dev_bytes)
+             << ",\"vram_delta_mb\":"
+             << (dev_prev == 0 && dev_bytes == 0
+                     ? 0.0
+                     : detail::toMiB(dev_bytes) - detail::toMiB(dev_prev))
+             << ",\"vram_live_mb\":" << detail::toMiB(dev.bytes_live)
+             << ",\"vram_pooled_mb\":" << detail::toMiB(dev.bytes_pooled)
+             << ",\"vram_high_water_mb\":" << detail::toMiB(dev.bytes_high_water)
+             // cudaMalloc / cudaFree calls that reached the DRIVER, cumulative.
+             // A steady state that still allocates is a steady state paying a
+             // synchronising API call per case for a block it already owns.
+             << ",\"device_allocs\":" << dev.device_allocs
+             << ",\"device_frees\":" << dev.device_frees
+             << ",\"device_pool_hits\":" << dev.pool_hits
+             << ",\"device_pool_parks\":" << dev.pool_parks
+             << ",\"device_blocks_live\":" << dev.blocks_live
+             // MUST be 0 in steady state.  This is the number that answers the
+             // question the VRAM sawtooth raised -- "is the arena torn down and
+             // rebuilt per generation?" -- from inside, instead of by inference
+             // from a board-level memory trace.
+             << ",\"arena_rebuilds\":" << dev.arena_rebuilds
+             << ",\"arena_persist\":"
+             << (rasbery::gpu::blockpool::enabled() ? "true" : "false")
+             // WP10.6.  The allocator, asked directly.  See mallocRetention().
+             << ",\"malloc_taken_mb\":" << detail::toMiB(mall.taken_bytes)
+             << ",\"malloc_in_use_mb\":" << detail::toMiB(mall.in_use_bytes)
+             << ",\"malloc_retained_mb\":"
+             << detail::toMiB(mall.taken_bytes > mall.in_use_bytes
+                                  ? mall.taken_bytes - mall.in_use_bytes
+                                  : 0)
+             << ",\"malloc_readable\":" << (mall.readable ? "true" : "false")
              // MUST be 0.  A Driver that outlived its case leaks everything a
              // case owns and nothing else in any receipt would say so.
              << ",\"live_cases\":" << live
@@ -1761,6 +1911,9 @@ private:
         RollingJob job;
         bool       immediate = true;
         double     waited_ms = 0.0;
+        // WP19.1: the same first-case rule as the wave path, and here it needs
+        // no vector at all -- the lane IS this call frame.
+        bool       lane_first = true;
         while (_queue.pop(job, immediate, waited_ms)) {
             const auto epoch = refill::rollingLedger().admit(
                 lane, immediate, waited_ms, static_cast<int>(_queue.inflight()));
@@ -1771,6 +1924,12 @@ private:
             double              teardown = 0.0;
             runOneCase(job.deck, job.output, job.mode, job.warm_from, job.warm_save,
                        job.fidelity, status, failure, receipt, seconds, teardown);
+            const bool lane_first_case = lane_first;
+            lane_first                 = false;
+            retryAfterCaptureRace(_roll.session, job.index, lane, lane_first_case,
+                                  job.deck, job.output, job.mode, job.warm_from,
+                                  job.warm_save, job.fidelity, status, failure, receipt,
+                                  seconds, teardown);
             // Order matters and is the tenancy rule: the ledger is told the
             // tenancy ended BEFORE the output is released, so no other lane can
             // take the output while this one still counts as holding it.
@@ -1987,6 +2146,90 @@ private:
         reportMemory(wave.wave_id);
     }
 
+    /// WP19.1.  THE LOUD PATH FOR THE STAND-UP RACE'S SILENT FACE.
+    ///
+    /// WHAT IT IS FOR.  WP19 closed the race that announced itself
+    /// (cudaErrorStreamCapture*, "slot":-1, ~15.7 s).  The 238 evidence run of
+    /// 2026-08-30 then produced the same shape with no CUDA error at all: one
+    /// case of 128, ~18.4 s, "CUDA BiCGSTAB detected a non-finite value",
+    /// always the FIRST case a lane took, a different deck every rerun, every
+    /// deck bit-identical single-shot.  The cause is fixed where it lives
+    /// (CudaOuterGraph.cu's capture-race retry no longer re-records a body
+    /// whose enqueue helpers have already committed their upload shadows), and
+    /// this is the belt beside that brace: if a lane's FIRST case still dies
+    /// non-finite, say so with the arbiter's stand-up provenance on the line,
+    /// and run the case once more from a clean slot.
+    ///
+    /// WHY EXACTLY ONE, AND ONLY THE FIRST CASE.  The corrupting window is the
+    /// graph BUILD, and the caches that build feeds are per-slot and
+    /// process-lived: a lane's second case replays a graph the first case
+    /// instantiated, so a second case dying non-finite is physics, not a race,
+    /// and retrying it would launder a real answer into a lucky one.  A retry
+    /// that fails is reported exactly as the first failure would have been.
+    ///
+    /// THE SLOT IS CLEAN BY CONSTRUCTION: runOneCase scopes the Driver, so the
+    /// arena slot is released, whole-struct reset and audited between the two
+    /// runs -- the same door a refill goes through.
+    void retryAfterCaptureRace(long long wave_id, int index, int lane,
+                               bool lane_first_case, const std::string& deck,
+                               const std::string& output, ResultMode mode,
+                               const std::string& warm_from, const std::string& warm_save,
+                               const CaseFidelity& fidelity, int& status,
+                               std::string& failure, Driver::CaseReceipt& receipt,
+                               double& seconds, double& teardown_ms) {
+        if (status == 0 || !lane_first_case || !captureRaceCorruptionSuspect(failure))
+            return;
+        _capture_race_case_retries.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::ostringstream line;
+            line << "[RASBERY][EVALUATOR][CAPTURE_RACE] {\"wave_id\":" << wave_id
+                 << ",\"case\":" << index << ",\"lane\":" << lane
+                 << ",\"deck\":" << detail::quoted(deck)
+                 << ",\"lane_first_case\":true,\"error\":" << detail::quoted(failure)
+                 << ",\"action\":\"retry_once_clean_slot\","
+                 << rasbery::captureArbiterProvenance() << "}";
+            // BOTH streams, for the same reason the [ERROR] line takes both:
+            // `_out` may be a pipe a controller owns, and a race that fired must
+            // reach a human reading the log even when nobody reads the protocol.
+            {
+                std::lock_guard<std::mutex> lock(_out_mutex);
+                _out << line.str() << std::endl;
+            }
+            std::cerr << line.str() << std::endl;
+        }
+        int                 retry_status   = 0;
+        std::string         retry_failure;
+        Driver::CaseReceipt retry_receipt;
+        double              retry_seconds  = 0.0;
+        double              retry_teardown = 0.0;
+        runOneCase(deck, output, mode, warm_from, warm_save, fidelity, retry_status,
+                   retry_failure, retry_receipt, retry_seconds, retry_teardown);
+        if (retry_status == 0)
+            _capture_race_case_recovered.fetch_add(1, std::memory_order_relaxed);
+        // The retry's answer REPLACES the first, whichever way it went: a case
+        // that survived is an ok case with its own digest, and a case that died
+        // twice is reported with the second death's message so the receipt
+        // describes the run that actually produced the output file.
+        status      = retry_status;
+        failure     = retry_failure;
+        receipt     = retry_receipt;
+        seconds    += retry_seconds;
+        teardown_ms = retry_teardown;
+        std::ostringstream line;
+        line << "[RASBERY][EVALUATOR][CAPTURE_RACE][RESULT] {\"wave_id\":" << wave_id
+             << ",\"case\":" << index << ",\"lane\":" << lane
+             << ",\"deck\":" << detail::quoted(deck)
+             << ",\"recovered\":" << (retry_status == 0 ? "true" : "false")
+             << ",\"error\":"
+             << (retry_failure.empty() ? std::string("null") : detail::quoted(retry_failure))
+             << ',' << rasbery::captureArbiterProvenance() << "}";
+        {
+            std::lock_guard<std::mutex> lock(_out_mutex);
+            _out << line.str() << std::endl;
+        }
+        std::cerr << line.str() << std::endl;
+    }
+
     /// Build a Driver, drive it, destroy it -- and time the destruction apart
     /// from the drive.
     ///
@@ -2151,6 +2394,13 @@ private:
             std::cerr << err.str() << std::endl;
         }
     }
+
+    /// WP19.1.  Cases that hit the loud path, and cases the one retry saved.
+    /// Atomic because the wave path runs its lanes under `omp parallel for`;
+    /// they move at most once per lane per wave, so the counter is never on a
+    /// path that repeats.
+    std::atomic<long long>                _capture_race_case_retries{0};
+    std::atomic<long long>                _capture_race_case_recovered{0};
 
     Options                               _options;
     std::ostream&                         _out;

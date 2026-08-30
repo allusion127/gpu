@@ -26,6 +26,7 @@
 // line and leaves the arena unavailable.  It does NOT retry with fewer slots.
 
 #include "GpuCaptureArbiter.h"
+#include "GpuDeviceBlockPool.h"
 #include "GpuPhysicsArena.h"
 #include "XferLedger.h"
 
@@ -183,6 +184,19 @@ bool GpuPhysicsArena::reserve(const ArenaDims& dims) {
     d.base = static_cast<unsigned char*>(raw);
     if (d.base == nullptr) return abort_reserve("pool returned a null block");
 
+    // WP10.6.  The arena is the single largest device block this process owns,
+    // so a `vram_mb` that could not see it would be a footprint number missing
+    // its dominant term.  Registered as NOT poolable: the block is taken once
+    // for the process and handed back only at shutdown, which is the property
+    // the receipt's `arena_rebuilds` exists to keep honest.
+    rasbery::gpu::blockpool::noteAllocated(d.base, d.offsets.total_bytes,
+                                           /*poolable=*/false);
+    {
+        // Second and later stand-ups only.  The first is not a rebuild.
+        static int standups = 0;
+        if (++standups > 1) rasbery::gpu::blockpool::noteArenaRebuild();
+    }
+
     // Every region offset is a multiple of 256, so the whole layout is only
     // 256-aligned if the BASE is.  cudaMallocFromPoolAsync gives at least 256
     // in practice; refusing rather than assuming means a driver that ever gives
@@ -213,6 +227,11 @@ void GpuPhysicsArena::release() {
     rasbery::AllocWindow _alloc_window("physics.arena.release");
     Impl& d = *_impl;
     if (d.base != nullptr) {
+        // Deregister before the driver call so `bytes_live` never counts a
+        // block the process has already given back.  `give()` returns false
+        // here by construction -- the arena is registered as not poolable --
+        // so the free below is unconditional, exactly as it was.
+        (void)rasbery::gpu::blockpool::give(d.base);
         cudaFreeAsync(d.base, d.setup);
         rasbery::xfer::streamSync("GpuPhysicsArenaCuda.cu:release", "setup", d.setup);
         d.base = nullptr;
