@@ -354,6 +354,37 @@ inline std::string envPayload(const Provenance& p) {
 
 inline std::string envDigest(const Provenance& p) { return Sha256::hexOf(envPayload(p)); }
 
+/// WHICH knobs were set, by NAME, comma-joined in kArmEnv order.
+///
+/// WHY A DIGEST WAS NOT ENOUGH.  `env_digest` answers "is the env half the
+/// same" and, when the answer is no, nothing else -- which on host 181
+/// (kngr_238.json, 2026-08-30) left the reading of the failure open between two
+/// very different stories: the solver folds a value the tool does not model
+/// (a code defect), or the two simply ran under different environments (a
+/// harness fact, and the far likelier one, since the tool reads the env of
+/// whatever shell invoked it while the run under comparison carried the
+/// production arm).  Those need opposite responses and the receipt could not
+/// tell them apart.
+///
+/// This separates them in one line.  Two runs whose `env_set` DIFFERS were
+/// configured differently -- an arm on in one and off in the other -- and the
+/// key is doing its job.  Two runs whose `env_set` MATCHES while `env_digest`
+/// does not have the same knobs set to different VALUES, which is the case
+/// worth reading code over.
+///
+/// NAMES ONLY, NEVER VALUES: the values are whatever a launcher exported, they
+/// are what `env_digest` is for, and a receipt is not the place to publish
+/// them.  `~` (unset or empty) is the state that is left out.
+inline std::string envSetToken(const Provenance& p) {
+    std::string out;
+    for (const auto& [name, value] : p.env) {
+        if (value.empty()) continue;
+        if (!out.empty()) out += ',';
+        out += name;
+    }
+    return out;
+}
+
 /// The full payload.  Line-oriented and readable on purpose: when two runs
 /// disagree about a key, the answer has to be visible in a diff.
 inline std::string payloadOf(const Provenance& p) {

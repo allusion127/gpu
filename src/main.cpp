@@ -796,9 +796,39 @@ int main(int argc, char* argv[]) {
     // RASBERY_PHYSICS_FIDELITY.  Now the flag that causes it is the flag that
     // reports it, and an operator cannot run a coarse deck and forget to say so
     // -- which was the entire hole in the L3coarse lane.
-    rasbery::CaseFidelity run_fidelity = rasbery::processCaseFidelity();
-    run_fidelity.statepoint_grid =
-        rasbery::spgrid::isFullGrid(statepoint_grid) ? std::string() : statepoint_grid;
+    //
+    // WP10.1 FOLLOW-UP -- ONE BUILDER, NOT TWO.  This used to be
+    // `processCaseFidelity()` copied and then written into by hand:
+    //
+    //     run_fidelity.statepoint_grid =
+    //         spgrid::isFullGrid(statepoint_grid) ? "" : statepoint_grid;
+    //
+    // which is a second spelling of resolveCaseFidelity's own grid clause
+    // (CaseFidelity.h).  The two agreed, line for line -- and the whole point
+    // of the case key is that the single-shot CLI and the evaluator describe
+    // the same run with the same digest, so `they agree today` is not the
+    // property to rely on.  Both paths reach Driver::setCaseFidelity through
+    // resolveCaseFidelity now, with the request built here, so a future change
+    // to how a grid resolves cannot reach one path and miss the other.
+    //
+    // THERE IS NO --fidelity FLAG, deliberately, so the request declares no
+    // WORD: a fidelity the CLI could declare and not honour is the mixing plan
+    // Sec 6.2 forbids, and with `fidelity` empty resolveCaseFidelity's
+    // declaration clauses are all skipped and the result is the process default
+    // plus the grid.  Byte for byte what the two lines above produced.
+    rasbery::CaseFidelity run_fidelity;
+    {
+        rasbery::FidelityRequest cli_fidelity_request;
+        cli_fidelity_request.has_grid        = true;
+        cli_fidelity_request.statepoint_grid = statepoint_grid;
+        std::string cli_fidelity_error;
+        if (!rasbery::resolveCaseFidelity(cli_fidelity_request,
+                                          rasbery::processCaseFidelity(), run_fidelity,
+                                          cli_fidelity_error)) {
+            std::cerr << cli_fidelity_error << std::endl;
+            return 2;
+        }
+    }
     const rasbery::PhysicsFidelity fidelity = run_fidelity.solved();
     const bool screening          = rasbery::fidelityIsScreening(fidelity);
     const bool allow_screening    = [] {

@@ -4979,14 +4979,16 @@ public:
         _case_receipt.promoted_from       = _fidelity.promoted_from;
         _case_receipt.acceptance_eligible = _fidelity.acceptanceEligible();
         std::cout << std::format(
-            "  [RASBERY][CASE] {{\"schema_version\":3,\"case_key\":\"{}\",\"key_schema\":\"{}\","
+            "  [RASBERY][CASE] {{\"schema_version\":4,\"case_key\":\"{}\",\"key_schema\":\"{}\","
             "\"core_op\":\"{}\",\"deck_digest\":\"{}\",\"env_digest\":\"{}\","
+            "\"env_set\":\"{}\","
             "\"xslib_digest\":\"{}\",\"xslib_policy\":\"{}\",\"warm_start_token\":\"{}\","
             "\"code_sha\":\"{}\",\"fidelity\":\"{}\",\"policy\":\"{}\","
             "\"result_mode\":\"{}\",\"warm_start\":\"{}\",\"statepoint_grid\":\"{}\","
             "\"acceptance_eligible\":{},\"fidelity_declared\":{},\"promoted_from\":{}}}\n",
             case_key, casekey::kSchema, input_output.deck_key_core_op(),
             input_output.deck_key_digest(), case_env_digest,
+            casekey::envSetToken(case_provenance),
             casekey::tokenOrTilde(case_provenance.xslib_digest),
             XsLibraryDigestPolicyName(),
             jsonString(casekey::tokenOrTilde(case_provenance.warm_start)),

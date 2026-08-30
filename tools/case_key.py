@@ -309,6 +309,20 @@ def env_digest(env) -> str:
     return hashlib.sha256(env_payload(env).encode("utf-8")).hexdigest()
 
 
+def env_set(env) -> str:
+    """src/CaseKey.h envSetToken(): WHICH knobs are set, by name, in ARM_ENV order.
+
+    `env_digest` says whether the env half matches; when it does not, this says
+    whether the two runs were CONFIGURED differently (an arm on in one and off
+    in the other -- the key doing its job) or set the same knobs to different
+    VALUES (the case worth reading code over).  Host 181's WP10.1 failure could
+    not be read either way, and the two need opposite responses.
+
+    Names only, never values -- that is what env_digest is for.
+    """
+    return ",".join(name for name in ARM_ENV if env.get(name, ""))
+
+
 def payload_of(deck_digest: str, fidelity: str, policy: str,
                env, xslib_digest: str, warm_start: str) -> str:
     lines = [SCHEMA,
@@ -366,6 +380,7 @@ def case_key(deck: Path, env=None, xslib: bool = True, warm_start: str = "") -> 
         "fidelity": fidelity,
         "policy": policy,
         "env_digest": env_digest(env),
+        "env_set": env_set(env),
         # THE PAYLOAD'S SPELLING, not the raw string.  src/CaseKey.h digests
         # `tokenOrTilde(xslib_digest)` and the [RASBERY][CASE] receipt prints
         # the same token, so a component whose empty case printed as `""` here
@@ -388,7 +403,7 @@ def case_key(deck: Path, env=None, xslib: bool = True, warm_start: str = "") -> 
 # names.  ORDER IS THE PAYLOAD'S, so reading a diff top to bottom reads the key
 # left to right.
 COMPONENT_FIELDS = ("case_key", "key_schema", "core_op", "deck_digest",
-                    "env_digest", "xslib_digest", "xslib_policy",
+                    "env_digest", "env_set", "xslib_digest", "xslib_policy",
                     "warm_start_token", "code_sha", "fidelity", "policy")
 
 

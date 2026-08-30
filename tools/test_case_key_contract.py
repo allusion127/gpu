@@ -72,6 +72,8 @@ RUNCONTRACT_H = (ROOT / "src" / "RunContract.h").read_text(encoding="utf-8-sig")
 IO_CPP = (ROOT / "src" / "IO.cpp").read_text(encoding="utf-8-sig")
 BLR_H = (ROOT / "include" / "chiffon" / "BatchLightResult.h").read_text(encoding="utf-8-sig")
 EVAL_H = (ROOT / "src" / "EvaluatorServer.h").read_text(encoding="utf-8-sig")
+MAIN_CPP = (ROOT / "src" / "main.cpp").read_text(encoding="utf-8-sig")
+CASEFIDELITY_H = (ROOT / "src" / "CaseFidelity.h").read_text(encoding="utf-8-sig")
 
 FAILED: list[str] = []
 
@@ -435,6 +437,142 @@ def xslib_contract() -> None:
             fail("--no-xslib does not announce itself in xslib_source")
 
 
+def one_builder_contract() -> None:
+    """WP10.1 FOLLOW-UP: THE THREE PATHS MUST NOT BE THREE BUILDERS.
+
+    The 181 gate (2026-08-30) found the plain single-run CLI's `case_key`
+    disagreeing with tools/case_key.py on kngr_238.json while the evaluator's
+    key for the same deck matched the tool exactly.  Both C++ paths already
+    reach ONE emitter -- Driver::Drive computes caseKeyProvenance and prints
+    [RASBERY][CASE] from a single site, pinned above -- so no COMPONENT is
+    computed by different code.  What the two call sites can still differ in is
+    the INPUTS they hand the Driver, and of the four (deck path, warm start,
+    CaseFidelity, process env) exactly one had two spellings:
+
+        main.cpp   run_fidelity = processCaseFidelity();
+                   run_fidelity.statepoint_grid = isFullGrid(g) ? "" : g;
+
+        EvaluatorServer.h   resolveCaseFidelity(request, processCaseFidelity(), ...)
+
+    The two agreed line for line, which is not the property to rely on for a
+    key whose entire job is that two paths describing the same run produce the
+    same digest.  This holds the single-builder rule.
+    """
+    if "resolveCaseFidelity(" not in MAIN_CPP:
+        fail("src/main.cpp no longer resolves its CaseFidelity through "
+             "resolveCaseFidelity().  The single-shot CLI and the evaluator must "
+             "reach Driver::setCaseFidelity through ONE function, or a change to "
+             "how a fidelity resolves can reach one path and miss the other -- "
+             "which is exactly the class of defect the 181 case_key gate found")
+    if "resolveCaseFidelity(" not in EVAL_H:
+        fail("src/EvaluatorServer.h no longer resolves its CaseFidelity through "
+             "resolveCaseFidelity()")
+    # The hand-assembly, by its shape: a CaseFidelity whose statepoint_grid is
+    # written into after construction is a second spelling of the resolver's own
+    # grid clause.  Comments are stripped first, because the fix's own comment
+    # QUOTES the two lines it replaced; and the FidelityRequest's fields carry
+    # the same names, which is the point -- they are the input to the one
+    # builder, not a second one.
+    def _hand_assembly(text: str) -> list:
+        code = chr(10).join(line.split("//")[0] for line in text.splitlines())
+        return [t for t in (".statepoint_grid =", ".staged_flux_mult =",
+                            ".staged_xe_mult =", ".loose_settle =")
+                if re.search(r"(?<!_request)" + re.escape(t), code)]
+
+    for token in _hand_assembly(MAIN_CPP):
+        fail(f"src/main.cpp writes {token.strip()} into a CaseFidelity by hand.  "
+             f"Every fidelity input goes through a FidelityRequest and "
+             f"resolveCaseFidelity, so the CLI cannot resolve a grid (or a staged "
+             f"multiplier) by a rule the evaluator does not use")
+    # ...and the request it builds must actually carry the grid, or the flag
+    # would parse, warn, and then be dropped.
+    if "cli_fidelity_request.statepoint_grid = statepoint_grid;" not in MAIN_CPP:
+        fail("src/main.cpp does not put --statepoint-grid into the FidelityRequest; "
+             "the flag would be validated and then ignored, and the receipt would "
+             "report `full` for a coarse run")
+    if "cli_fidelity_request.has_grid" not in MAIN_CPP:
+        fail("src/main.cpp's FidelityRequest never sets has_grid, so "
+             "resolveCaseFidelity skips the grid clause entirely")
+    # THE CLI DECLARES NO FIDELITY WORD.  There is no --fidelity flag by design:
+    # a word the CLI could declare and not honour is the mixing plan Sec 6.2
+    # forbids.  If one is ever added it must go through the same request.
+    if "cli_fidelity_request.fidelity" in MAIN_CPP and "--fidelity" not in MAIN_CPP:
+        fail("src/main.cpp sets a fidelity WORD on the CLI request with no flag to "
+             "have produced it; the request must describe what the operator asked for")
+    # A refusal from the resolver must fail the run, not be logged and ignored.
+    at = MAIN_CPP.find("resolveCaseFidelity(")
+    tail = MAIN_CPP[at:at + 700] if at >= 0 else ""
+    if "return 2;" not in tail:
+        fail("src/main.cpp does not exit on a resolveCaseFidelity refusal.  The "
+             "alternative is a case that runs at one fidelity while its receipt -- and "
+             "its case_key -- claim another, which is what the resolver refuses FOR")
+
+    # ONE EMITTER, still.  Restated here because the single-builder rule above is
+    # only worth anything while the components are computed in one place.
+    if DRIVER_H.count("casekey::Provenance caseKeyProvenance(") != 1:
+        fail("Driver.h has more than one caseKeyProvenance; the two call sites could "
+             "then assemble different provenances from the same inputs")
+    for path, name in ((MAIN_CPP, "src/main.cpp"), (EVAL_H, "src/EvaluatorServer.h")):
+        if "caseKeyProvenance" in path or "casekey::keyOf" in path:
+            fail(f"{name} computes a case key of its own instead of reading the one "
+                 f"Driver::Drive published; two producers of one fact is the defect "
+                 f"this whole contract exists to prevent")
+
+    # env_set comes from the header's own spelling, like env_digest.
+    if "casekey::envSetToken(" not in DRIVER_H:
+        fail("Driver.h does not take env_set from casekey::envSetToken; a second "
+             "spelling of `which knobs are set` is a second answer")
+    if "inline std::string envSetToken(" not in CASEKEY_H:
+        fail("CaseKey.h lost envSetToken; the live gate cannot tell an env divergence "
+             "that is CONFIGURATION from one that is a folded VALUE, which is the "
+             "reading the 181 finding was left open on")
+    # It must be NAMES only.  A receipt that published the values would leak
+    # whatever a launcher exported and would duplicate env_digest's job.
+    fn = CASEKEY_H[CASEKEY_H.index("inline std::string envSetToken("):]
+    fn = fn[:fn.index(chr(10) + "}")]
+    if "out += value" in fn or "+= tokenOrTilde(value)" in fn:
+        fail("envSetToken publishes the env VALUES.  Names only: the values are what "
+             "env_digest is for, and a receipt is not the place to print them")
+    if "if (value.empty()) continue;" not in fn:
+        fail("envSetToken does not skip unset knobs, so it says nothing about WHICH "
+             "are set and cannot separate a configuration difference from a value one")
+
+    # THE TOOL PUBLISHES WHAT IT CLAIMS TO.  COMPONENT_FIELDS is the list the
+    # live gate walks; a name on it that case_key() does not return makes the
+    # comparison raise mid-diff instead of reporting, which is how a component
+    # goes unread again.
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        probe = write(tmp, "probe.json", deck([[1, 2], [2, 1]]))
+        produced = case_key.case_key(probe, env={}, xslib=False)
+        for field in case_key.COMPONENT_FIELDS:
+            if field not in produced:
+                fail(f"tools/case_key.py lists {field!r} in COMPONENT_FIELDS and does "
+                     f"not return it; the live --compare would raise on the first deck "
+                     f"instead of naming the component")
+
+    # ---------------------------------------------------------------- controls
+    # Every check above, run against text broken the way it exists to catch.
+    controls = []
+    if "resolveCaseFidelity(" in MAIN_CPP.replace("resolveCaseFidelity(", "xxx("):
+        controls.append("the single-builder check reads a stripped main.cpp as still "
+                        "calling resolveCaseFidelity")
+    broken = MAIN_CPP.replace("cli_fidelity_request.statepoint_grid = statepoint_grid;",
+                              "run_fidelity.statepoint_grid = statepoint_grid;")
+    if ".statepoint_grid =" not in _hand_assembly(broken):
+        controls.append("the hand-assembly check cannot see a CaseFidelity written "
+                        "into by hand")
+    probe_fn = ('inline std::string envSetToken(const Provenance& p) {\n'
+                '    std::string out;\n'
+                '    for (const auto& [name, value] : p.env) { out += tokenOrTilde(value); }\n'
+                '    return out;\n}')
+    body = probe_fn[probe_fn.index("{"):]
+    if "+= tokenOrTilde(value)" not in body:
+        controls.append("the names-only check cannot see a value-publishing envSetToken")
+    for message in controls:
+        fail("NEGATIVE CONTROL FAILED: " + message)
+
+
 def receipt_component_contract() -> None:
     """The solver publishes every component the tool publishes.
 
@@ -443,7 +581,7 @@ def receipt_component_contract() -> None:
     """
     site = DRIVER_H.index('"  [RASBERY][CASE] {{')
     block = DRIVER_H[site:DRIVER_H.index(");", site)]
-    if '\\"schema_version\\":3' not in block:
+    if '\\"schema_version\\":4' not in block:
         fail("the [RASBERY][CASE] receipt did not bump schema_version when it "
              "gained the component fields; a reader cannot tell the two apart")
     for field in case_key.COMPONENT_FIELDS:
@@ -835,6 +973,36 @@ def compare(log: Path, deck_path: Path) -> int:
               + " -- rebuild before reading a component verdict from it")
     for line in problems:
         print(f"  FAIL {line}")
+
+    # WHAT KIND OF DIVERGENCE THIS IS.  `env_digest` differing has two very
+    # different causes and they need opposite responses, which is why host 181's
+    # WP10.1 finding could not be closed from the numbers it had: the solver
+    # folds a value the tool does not model (read code), or the two ran under
+    # different environments (fix the harness).  env_set separates them by name.
+    if any(line.startswith("env_digest:") for line in problems):
+        solver_set = set(filter(None, str(found.get("env_set", "")).split(",")))
+        tool_set = set(filter(None, mine["env_set"].split(",")))
+        if "env_set" not in found:
+            print("  NOTE this receipt predates env_set, so which env vars differ "
+                  "cannot be read from it -- rebuild and re-run before concluding "
+                  "anything about env_digest")
+        elif solver_set != tool_set:
+            print("  ENV DIVERGENCE IS CONFIGURATION, NOT CODE.  The two runs did not "
+                  "have the same knobs set, so the keys SHOULD differ:")
+            for name in sorted(solver_set - tool_set):
+                print(f"    set in the run, unset for the tool: {name}")
+            for name in sorted(tool_set - solver_set):
+                print(f"    set for the tool, unset in the run: {name}")
+            print("  Re-run tools/case_key.py in the run's own environment before "
+                  "reading this as a solver defect.")
+        else:
+            print("  ENV DIVERGENCE IS A VALUE, NOT A CONFIGURATION.  The same knobs "
+                  "are set on both sides and the folded values differ -- this is the "
+                  "case that IS a code question: src/Driver.h armEnvValue() re-spells "
+                  "the three RASBERY_STAGED_* knobs from the case's CaseFidelity "
+                  "whenever it differs from processCaseFidelity(), and "
+                  "tools/case_key.py reads them raw.")
+
     print("case key live contract:", "FAIL" if problems else "PASS")
     return 1 if problems else 0
 
@@ -848,6 +1016,7 @@ def main(argv: list[str]) -> int:
         return compare(Path(args.compare[0]), Path(args.compare[1]))
 
     source_contract()
+    one_builder_contract()
     receipt_component_contract()
     behaviour_contract()
     xslib_contract()
