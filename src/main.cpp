@@ -1064,6 +1064,10 @@ int main(int argc, char* argv[]) {
         std::cout << "[RASBERY][GPU_FULL] {";
         rasbery::gpufull::appendReceiptFields(std::cout);
         std::cout << "}" << std::endl;
+        // WP1 follow-up: `contract_pass:false` IS the failure, not a note about
+        // one.  Every Driver has joined, so the counters are final and the
+        // first-violation text is safe to read.  See gpufull::enforceExitCode.
+        exit_code = rasbery::gpufull::enforceExitCode(std::cout, exit_code);
         if (rasbery::rasberyGpuXsReconEnabled())
             std::cout << "[RASBERY][XSRECON][GPU] {\"nodes_solved\":"
                       << rasbery::rasberyGpuXsReconNodes() << "}" << std::endl;
@@ -1312,6 +1316,10 @@ int main(int argc, char* argv[]) {
         std::cout << "[RASBERY][GPU_FULL] {";
         rasbery::gpufull::appendReceiptFields(std::cout);
         std::cout << "}" << std::endl;
+        // WP1 follow-up: `contract_pass:false` IS the failure, not a note about
+        // one.  Every Driver has joined, so the counters are final and the
+        // first-violation text is safe to read.  See gpufull::enforceExitCode.
+        exit_code = rasbery::gpufull::enforceExitCode(std::cout, exit_code);
         // Rev.7.1 Task 20.  Printed HERE, after the arena has been released, so
         // the tenancy counters it carries are final: releaseSlot runs in the
         // Driver destructors (all joined) and the arena teardown above is the
@@ -1447,6 +1455,8 @@ int main(int argc, char* argv[]) {
     std::cout << "[RASBERY][GPU_FULL] {";
     rasbery::gpufull::appendReceiptFields(std::cout);
     std::cout << "}" << std::endl;
+    // See the batch arm above: the run-level half of the fail-closed gate.
+    exit_code = rasbery::gpufull::enforceExitCode(std::cout, exit_code);
 
     if (rasbery::rasberyGpuXsReconEnabled())
         std::cout << "[RASBERY][XSRECON][GPU] {\"nodes_solved\":"

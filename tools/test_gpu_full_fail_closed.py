@@ -38,7 +38,26 @@ WHAT THIS TEST HOLDS.
      never engaged" must not look like "the arm was off" -- the same G0 rule the
      XSRECON/XE/NODAL/OUTER_GPU receipts already exist for.
 
-  5. THE GATE IS NOT IN Driver.h's kArmEnv.  It cannot move a trajectory: it
+  5. THE ALLOWANCE LIST IS EXHAUSTIVE AND ARGUED.  Every refusal reason that can
+     reach an outer seam is EITHER on kGpuFullAllowedOuterRefusals with a
+     written rationale, OR reaches a guard that fails the case.  There is no
+     third state.  The reasons that were considered and refused -- `batch_mode`
+     above all -- are pinned as NOT allowed, because that is the entry a future
+     reader is most likely to add for the wrong reason.
+
+  6. NO SEAM IS COUNT-ONLY.  On host 181 at 8919331 the outer seam counted 71
+     host outer bodies, printed `contract_pass:false`, and exited 0.  A seam
+     that cannot unwind where it stands now DEFERS -- it latches and the caller
+     raises at a point it declares safe -- so "cannot throw here" no longer
+     means "does not fail".  Every DEFER site must have a RAISE_PENDING that
+     can reach it.
+
+  7. `contract_pass:false` IMPLIES A NONZERO EXIT whenever the gate is on.  The
+     per-case throw is the primary mechanism and keeps the rest of a batch
+     running; gpufull::enforceExitCode is the backstop that makes the RUN fail,
+     and all three of main.cpp's branches must apply it.
+
+  8. THE GATE IS NOT IN Driver.h's kArmEnv.  It cannot move a trajectory: it
      converts a fallback into a failure, so a run that COMPLETES under it took
      the path it would have taken without it.  Same reasoning the list already
      records for RASBERY_GPU_PPR.  Listing it would say it could.
@@ -108,8 +127,43 @@ note_body = header[header.find("inline void note("):]
 note_body = note_body[:note_body.find("\n}")]
 check("throw Violation" in note_body,
       "gpufull::note() does not throw under the gate; it would only count")
-check("if (required())" in note_body,
+check("if (!required()) return;" in note_body,
       "gpufull::note() throws unconditionally; the default must stay fail-open")
+# ... and everything that allocates must sit BEHIND that early return, or the
+# default path stops being one relaxed increment on a path already about to run
+# a whole CPU physics body.
+if "if (!required()) return;" in note_body and "recordFirstViolation" in note_body:
+    check(note_body.index("if (!required()) return;") <
+          note_body.index("recordFirstViolation"),
+          "gpufull::note() builds the violation text before the gate check; with "
+          "RASBERY_GPU_FULL unset the default fallback path would allocate a string "
+          "per fallback")
+
+# The DEFERRING seam: counts, latches, and does NOT throw where it stands.
+defer_body = header[header.find("inline void noteDeferred("):]
+defer_body = defer_body[:defer_body.find(chr(10) + "}")]
+check("count(which)" in defer_body,
+      "gpufull::noteDeferred() does not count; a deferred violation still has to move "
+      "the receipt in case the raise point is never reached")
+check("throw" not in defer_body,
+      "gpufull::noteDeferred() throws.  It exists for the ONE seam that cannot unwind "
+      "where it stands -- the CMFD enqueue hook inside a live segment and a possibly "
+      "open graph capture")
+check("slot.armed" in defer_body,
+      "gpufull::noteDeferred() latches nothing; raisePending() would have nothing to "
+      "raise and the seam would be count-only again")
+check("thread_local" in header,
+      "the deferred-violation slot is not thread-local.  In --batch-mode a process-wide "
+      "latch fails whichever worker reaches the next safe point first, which is a "
+      "different deck with a clean record (plan Sec 6.3 item 4)")
+
+raise_body = header[header.find("inline void raisePending()"):]
+raise_body = raise_body[:raise_body.find(chr(10) + "}")]
+check("if (!slot.armed) return;" in raise_body,
+      "gpufull::raisePending() does not short-circuit when nothing is latched; it is "
+      "called per segment on a path that is almost always clean")
+check("throw violation" in raise_body,
+      "gpufull::raisePending() does not throw; the deferral would never become a failure")
 
 # --------------------------------------------------------------- the seams ---
 # (file, anchor, expected subsystem).  The anchor is a line that exists in the
@@ -150,19 +204,38 @@ SEAM_TOKENS = [
     ("src/Driver.h", "gpu::noteOuterSegmentRefusal(gpu_outer_why);", "Outer", 2),
 ]
 
-WINDOW = 6  # lines either side of the anchor the guard may sit in
+WINDOW = 8  # lines either side of the anchor the guard may sit in
+# 8 and not 6: every guard now carries a written reason -- which allowance the
+# refusal was matched against, or why it defers -- and the comment that carries
+# it is longer than the three lines the first version needed.  The rule this
+# encodes is `the guard is adjacent to the seam`, not `within six lines`; what
+# it refuses is a guard that drifted to another branch, and eight lines of
+# comment does not reach one.
+
+
+# The spellings that FAIL A CASE for a fallback.  RASBERY_GPU_FULL_COUNT is
+# deliberately NOT here: it only counts, which is the WP1 gap host 181 found.
+FAILING_MACROS = ("RASBERY_GPU_FULL_GUARD", "RASBERY_GPU_FULL_GUARD_IF",
+                  "RASBERY_GPU_FULL_GUARD_ALLOWED", "RASBERY_GPU_FULL_DEFER_ALLOWED")
+_MACRO_RE = re.compile(r"RASBERY_GPU_FULL_(GUARD_ALLOWED|DEFER_ALLOWED|GUARD_IF|GUARD)\(")
 
 
 def guard_names(window: str, subsystem: str) -> bool:
-    """Does *window* invoke the guard macro FOR *subsystem*?
+    """Does *window* invoke a case-failing guard macro FOR *subsystem*?
 
-    Both spellings are accepted, and only for the subsystem asked about:
+    Every spelling is accepted, and only for the subsystem asked about:
         RASBERY_GPU_FULL_GUARD(Nodal, ...)
         RASBERY_GPU_FULL_GUARD_IF(<predicate>, Nodal, ...)
+        RASBERY_GPU_FULL_GUARD_ALLOWED(Outer, ...)   -- reason-aware, throws
+        RASBERY_GPU_FULL_DEFER_ALLOWED(Outer, ...)   -- reason-aware, latches
+
+    The last two consult kGpuFullAllowedOuterRefusals and fail for every reason
+    that is not on it; the allowance section below proves that fall-through, so
+    accepting them here does not weaken the seam scan.
     """
-    for match in re.finditer(rf"{GUARD}(_IF)?\(", window):
+    for match in _MACRO_RE.finditer(window):
         tail = window[match.end():]
-        if match.group(1):  # _IF: the subsystem is the second argument
+        if match.group(1) == "GUARD_IF":  # the subsystem is the second argument
             if re.match(rf"[^;]*?,\s*{subsystem}\s*,", tail, re.S):
                 return True
         elif re.match(rf"\s*{subsystem}\s*,", tail):
@@ -234,23 +307,22 @@ check(not guarded("  if (!TryDriveGpu())\n"
                   "if (!TryDriveGpu())", "Nodal"),
       "negative control failed: a guard naming the wrong subsystem satisfies the nodal seam")
 
-# ---------------------------------------------------- the count-only escape ---
-# gpufull::count() does not throw.  Exactly one site is allowed to use it, and
-# it needs a written reason; anything else is a seam quietly opting out.
-COUNT_ONLY_ALLOWED = {
-    ("src/Driver.h", "Outer"):
-        "the CMFD enqueue hook runs INSIDE a live device outer segment, where a throw "
-        "would unwind past a stream (and possibly a graph capture) that nothing is "
-        "written to clean up",
-}
+# ------------------------------------------------- NO SEAM IS COUNT-ONLY -----
+# THIS IS THE HOST-181 DEFECT, AS A RULE.  At 8919331 exactly one seam used the
+# count-only escape -- the CMFD enqueue hook, which genuinely cannot throw where
+# it stands -- and the consequence was 71 host outer bodies, `contract_pass:false`
+# and exit 0.  "Cannot unwind here" is a real constraint; "therefore the case
+# survives" was never a consequence of it.  The seam DEFERS now: it latches and
+# the caller raises at a point it declares safe.  So the escape has no legitimate
+# user left, and any reappearance is a seam quietly opting out again.
 for rel, text in sources.items():
     for i, line in enumerate(text.splitlines(), 1):
         if "RASBERY_GPU_FULL_COUNT(" in line:
-            which = re.search(r"RASBERY_GPU_FULL_COUNT\(\s*(\w+)", line)
-            key = (rel, which.group(1) if which else "?")
-            check(key in COUNT_ONLY_ALLOWED,
-                  f"{rel}:{i} uses the count-only escape for {key[1]}, which is not on the "
-                  f"allowlist; a seam that cannot throw needs a written reason here")
+            check(False,
+                  f"{rel}:{i} uses the count-only escape.  No seam may: a seam that "
+                  f"cannot unwind where it stands uses RASBERY_GPU_FULL_DEFER_ALLOWED "
+                  f"and its caller raises at the next safe point, so the case still "
+                  f"fails (this is exactly the gap host 181 found at 8919331)")
 
 # ---------------------------------------------------------- per-case failure --
 main = sources.get("src/main.cpp", "")
@@ -305,6 +377,193 @@ solver = read("src/BICGSolver.cpp")
 check('throw std::runtime_error("RASBERY_GPU requested but unavailable: "' in solver,
       "src/BICGSolver.cpp no longer refuses to construct when RASBERY_GPU is set and the "
       "CUDA backend is unavailable; the one already-fail-closed arm became fail-open")
+
+
+# ===========================================================================
+# THE ALLOWANCE LIST (plan Sec 6.3 item 5)
+# ===========================================================================
+#
+# EVERY REFUSAL REASON THAT CAN REACH AN OUTER SEAM IS EITHER ON THE LIST WITH A
+# WRITTEN RATIONALE, OR FAILS THE CASE.  There is no third state, and the third
+# state is exactly what host 181 measured at 8919331: 71 refusals that were
+# neither argued for nor fatal.
+bicg_h  = read("src/BICGCMFD.h")
+outer_h = read("src/CudaOuterGraph.h")
+
+NL = chr(10)
+
+
+def enum_reasons(text: str, fn: str) -> list:
+    """The reason STRINGS a name() function can return, in declaration order."""
+    at = text.find(fn)
+    if at < 0:
+        return []
+    body = text[at:]
+    end = body.find(NL + "}")
+    body = body[:end] if end > 0 else body[:4000]
+    return re.findall(r'return\s+"([a-z0-9_]+)"\s*;', body)
+
+
+check("kGpuFullAllowedOuterRefusals" in header,
+      "src/GpuFullContract.h declares no kGpuFullAllowedOuterRefusals; the outer seam "
+      "would be back to `every refusal is fatal` or `no refusal is`, and neither is true "
+      "(plan Sec 6.3 item 5 asks for the list to be MANAGED, not assumed)")
+
+list_block = header[header.find("inline constexpr AllowedRefusal kGpuFullAllowedOuterRefusals"):]
+list_block = list_block[:list_block.find("};") + 2]
+ALLOWED = re.findall(r'\{"([a-z0-9_]+)",', list_block)
+
+check(ALLOWED == ["wielandt_warmup"],
+      "the outer allowance list is " + repr(ALLOWED) + ".  Adding or removing an entry "
+      "is a contract change and must be argued in the header comment AND here: the only "
+      "reason that qualifies today is the Rayleigh warm-up, which has no device "
+      "implementation to decline and which the CMFD seam already excludes by "
+      "construction (the Cmfd guard sits inside `if (!cap && canEnqueueDrive())`)")
+
+# Each entry carries a rationale, and one that says something.
+for reason in ALLOWED:
+    tail = list_block[list_block.find('"' + reason + '"') + len(reason) + 2:]
+    rationale = "".join(re.findall(r'"([^"]*)"', tail[:tail.find("}")]))
+    check(len(rationale) >= 80,
+          "the allowance for " + repr(reason) + " carries no real rationale (" +
+          repr(rationale) + ").  An entry on this list is a documented exception to plan "
+          "Sec 6.3 item 3; if it cannot be argued in a sentence it is not an exception, "
+          "it is a hole")
+
+# THE REASONS CONSIDERED AND REFUSED.  Pinned by name, because these are the
+# entries a future reader is most likely to add for the wrong reason.
+REFUSED_CANDIDATES = {
+    "batch_mode":
+        "since Task 18-lite the predicate is `batch_width > arena_slots`, i.e. no seat "
+        "on the device for this deck -- the pre-arm gate skips the arm and SolveLoop "
+        "runs its HOST outer body for the whole solve.  That is plan Sec 6.3 item 3, "
+        "not an exemption from it",
+    "sweep_arm_off":     "an arm that was asked for and is not there (item 1)",
+    "no_cuda_solver":    "an arm that was asked for and is not there (item 1)",
+    "not_two_group":     "an arm that was asked for and is not there (item 1)",
+    "stage_prep_failed": "a CUDA-side decline (item 2)",
+    "geometry_mismatch": "the arena holds another deck's shape; the host outer runs",
+    "launch_failed":     "a CUDA call inside the segment failed (item 2)",
+    "no_residency":      "the arm was configured and never handed its buffers (item 1)",
+}
+for reason, why in REFUSED_CANDIDATES.items():
+    check(reason not in ALLOWED,
+          repr(reason) + " was added to kGpuFullAllowedOuterRefusals.  It does not "
+          "qualify: " + why)
+
+# EXHAUSTIVE OVER BOTH LADDERS THAT REACH A SEAM.  The hostfree and graph
+# ladders are deliberately NOT here: they choose between two DEVICE arms, and
+# where one of them does lead to host numerics (`sweep_wont_enqueue`) the host
+# body is entered through the enqueue seam, which asks BICGCMFD for the finer
+# reason and decides there.
+ENQUEUE_REASONS = enum_reasons(bicg_h, "enqueueRefusalName(EnqueueRefusal r)")
+SEGMENT_REASONS = enum_reasons(outer_h, "outerRefusalName(OuterSegmentRefusal r)")
+check(len(ENQUEUE_REASONS) >= 6,
+      "could not read BICGCMFD::enqueueRefusalName's reasons out of src/BICGCMFD.h (got "
+      + repr(ENQUEUE_REASONS) + "); this scan cannot claim to be exhaustive")
+check(len(SEGMENT_REASONS) >= 13,
+      "could not read outerRefusalName's reasons out of src/CudaOuterGraph.h (got "
+      + repr(SEGMENT_REASONS) + "); this scan cannot claim to be exhaustive")
+check("wielandt_warmup" in ENQUEUE_REASONS,
+      "BICGCMFD::EnqueueRefusal no longer spells `wielandt_warmup`, but the allowance "
+      "list still matches on that string -- the allowance would silently stop applying "
+      "and every warm-up would fail the case")
+for reason in ALLOWED:
+    check(reason in ENQUEUE_REASONS or reason in SEGMENT_REASONS,
+          "the allowance list admits " + repr(reason) + ", which no outer refusal ladder "
+          "can produce.  A dead allowance is a hole waiting for a rename to fall into")
+
+# The DISPATCH is what makes "not on the list" mean "fails the case".  Read it,
+# so the exhaustiveness above is a property of the code and not of this file.
+fail_body = header[header.find("inline void noteAllowedOrFail("):]
+fail_body = fail_body[:fail_body.find(NL + "}")]
+check("allowedOuterRefusalIndex(why)" in fail_body and "note(which, where, why)" in fail_body,
+      "gpufull::noteAllowedOrFail does not fall through to note() for a reason that is "
+      "not on the allowance list; `not allowed` would stop meaning `fails`")
+defer_dispatch = header[header.find("inline void noteAllowedOrDefer("):]
+defer_dispatch = defer_dispatch[:defer_dispatch.find(NL + "}")]
+check("allowedOuterRefusalIndex(why)" in defer_dispatch and
+      "noteDeferred(which, where, why)" in defer_dispatch,
+      "gpufull::noteAllowedOrDefer does not fall through to noteDeferred() for a reason "
+      "that is not on the allowance list")
+check("which == Subsystem::Outer" in fail_body and
+      "which == Subsystem::Outer" in defer_dispatch,
+      "the allowance list is consulted for subsystems other than Outer.  It is the OUTER "
+      "seam's list; one shared by seams that never agreed on it is a way to exempt a "
+      "seam by accident")
+check("count(Subsystem::Outer)" not in fail_body,
+      "gpufull::noteAllowedOrFail counts directly instead of delegating to note(); a "
+      "later edit could then drop the throw and this scan would not notice")
+
+# NEGATIVE CONTROLS for the list reader itself: it must SEE an entry that is
+# there.  A parser that returns [] for everything would pass every check above.
+_probe = re.findall(r'\{"([a-z0-9_]+)",',
+                    '{"wielandt_warmup", "r"},\n    {"batch_mode", "r"},')
+check(_probe == ["wielandt_warmup", "batch_mode"],
+      "negative control failed: the allowance-list reader does not see a two-entry list, "
+      "so `batch_mode is not on the list` above proves nothing")
+
+# --------------------------------------- the deferred seam has a raiser -------
+# A DEFER WITH NO RAISE IS A COUNT, which is the 181 defect wearing a new name.
+defers = occurrences(driver, "RASBERY_GPU_FULL_DEFER_ALLOWED(")
+raises = occurrences(driver, "RASBERY_GPU_FULL_RAISE_PENDING();")
+check(defers >= 1,
+      "src/Driver.h no longer defers anywhere.  If the enqueue seam learned to throw in "
+      "place, say so here; if it went back to counting, that is the 181 defect")
+check(raises >= 4,
+      "src/Driver.h has " + str(defers) + " deferring seam(s) and only " + str(raises) +
+      " RASBERY_GPU_FULL_RAISE_PENDING() call(s).  Both loops (ReconvergeFlux and "
+      "SolveLoop) must raise on BOTH runSegment paths -- the delegated branch and the "
+      "refusal branch -- or a latched violation rides to the end of the run and the case "
+      "that caused it finishes clean")
+_rf_at = driver.find("void ReconvergeFlux")
+_sl_at = driver.find("void SolveLoop")
+check(_rf_at >= 0 and _sl_at > _rf_at,
+      "src/Driver.h: ReconvergeFlux/SolveLoop are not both present in that order; the "
+      "per-loop raise-site scan cannot run")
+if _rf_at >= 0 and _sl_at > _rf_at:
+    for name, body in (("ReconvergeFlux", driver[_rf_at:_sl_at]),
+                       ("SolveLoop", driver[_sl_at:])):
+        check(body.count("RASBERY_GPU_FULL_RAISE_PENDING();") >= 2,
+              "src/Driver.h: " + name + " raises the deferred violation fewer than "
+              "twice.  The delegated branch and the refusal branch are two different "
+              "returns from runSegment and both are safe points -- the segment is over, "
+              "its stream is drained and any capture is closed")
+
+# ------------------------------- contract_pass:false => nonzero exit ----------
+# THE POINT OF THE WHOLE GATE.  On host 181 the receipt said contract_pass:false
+# and the process exited 0.
+check("inline int enforceExitCode(" in header,
+      "src/GpuFullContract.h has no enforceExitCode; `contract_pass:false` would go back "
+      "to being a receipt field nobody consumes")
+enforce = header[header.find("inline int enforceExitCode("):]
+enforce = enforce[:enforce.find(NL + "}")]
+check("if (!required() || contractPass()) return exit_code;" in enforce,
+      "gpufull::enforceExitCode does not short-circuit on `gate off OR contract passed`; "
+      "with the gate off a fallback must stay a fallback -- the host body is the "
+      "reference path and a benchmark that crashes teaches nothing")
+check("[RASBERY][FAIL]" in enforce,
+      "gpufull::enforceExitCode fails the run without emitting [RASBERY][FAIL]; the "
+      "harness greps for that tag, and a silent nonzero exit is worse than none")
+check("firstViolation()" in enforce,
+      "gpufull::enforceExitCode does not name the first violation; the whole 181 "
+      "investigation existed because `contract_pass:false` named no site")
+check(main.count("gpufull::enforceExitCode(std::cout, exit_code)") == 3,
+      "src/main.cpp applies the run-level gate " +
+      str(main.count("gpufull::enforceExitCode(std::cout, exit_code)")) +
+      " times; all THREE branches -- evaluator, batch and serial -- must, the way each "
+      "already prints the [RASBERY][GPU_FULL] receipt")
+check(main.count("exit_code = rasbery::gpufull::enforceExitCode") == 3,
+      "src/main.cpp calls enforceExitCode without assigning its result; the run would "
+      "print the failure and still exit 0, which is the defect verbatim")
+
+# The receipt gained the two fields a reader needs in order to act on it.
+for _field in ("allowed_refusals", "first_violation"):
+    check(_field in receipt,
+          "the GPU_FULL receipt omits " + _field + ".  `allowed_refusals` is how an "
+          "allowance that fires ten thousand times becomes visible instead of being "
+          "subtracted silently; `first_violation` is the site the 181 receipt could not "
+          "name")
 
 if failures:
     for problem in failures:

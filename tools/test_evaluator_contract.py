@@ -622,8 +622,7 @@ control("check_receipt_parity misses the two shutdown blocks diverging",
         check_receipt_parity, MAIN.replace(
             '        std::cout << "[RASBERY][GPU_FULL] {";\n'
             "        rasbery::gpufull::appendReceiptFields(std::cout);\n"
-            '        std::cout << "}" << std::endl;\n'
-            "        if (rasbery::rasberyGpuXsReconEnabled())", "        if (rasbery::rasberyGpuXsReconEnabled())", 1))
+            '        std::cout << "}" << std::endl;\n', "", 1))
 control("check_isolation_check misses a digest comparison replaced by a keff one",
         check_isolation_check,
         SERVER.replace("recheck.digest != receipts[u0].digest", "false"))

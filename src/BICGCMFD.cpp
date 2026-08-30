@@ -625,16 +625,25 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
 // Rev.7.1 Task 10 part 2: the drive as a stream-ordered enqueue
 // ---------------------------------------------------------------------------
 
-bool BICGCMFD::canEnqueueDrive() const {
+BICGCMFD::EnqueueRefusal BICGCMFD::enqueueRefusal() const {
     // The SAME gate drive() applies, minus the one-shot form-probe capture,
     // which is a property of the call and not of the run.  Spelled once, here,
     // so the segment cannot arm an arm drive() would not have taken.
+    //
+    // WP1 follow-up: it returns the REASON rather than a boolean, because the
+    // outer segment's fail-closed guard has to tell the Rayleigh warm-up (host
+    // by design -- see drive() and the WIELANDT_WARMUP_SWEEPS note) apart from
+    // an arm that was asked for and is simply not there.  canEnqueueDrive() is
+    // `== None`, so there is still exactly one predicate.
     static const bool sweep_dev = [] {
         const char* v = std::getenv("RASBERY_GPU_CMFD_SWEEP");
         return v != nullptr && std::string(v) != "0";
     }();
-    return sweep_dev && _ls != nullptr && _ls->usingCuda() && _g.ng() == 2 &&
-           _wiel_sweep >= WIELANDT_WARMUP_SWEEPS;
+    if (!sweep_dev) return EnqueueRefusal::SweepArmOff;
+    if (_ls == nullptr || !_ls->usingCuda()) return EnqueueRefusal::NoCudaSolver;
+    if (_g.ng() != 2) return EnqueueRefusal::NotTwoGroup;
+    if (_wiel_sweep < WIELANDT_WARMUP_SWEEPS) return EnqueueRefusal::WielandtWarmup;
+    return EnqueueRefusal::None;
 }
 
 bool BICGCMFD::enqueueDrive(double& eigv, double* flux, double& errl2,
@@ -645,13 +654,22 @@ bool BICGCMFD::enqueueDrive(double& eigv, double* flux, double& errl2,
     // exactly as setls() left it, because the caller's fallback is the blocking
     // drive() -- which reads `_device_assembly_pending` to decide whether the
     // operator is the arena's or the host's.
-    if (!canEnqueueDrive()) return false;
+    //
+    // WP1 follow-up: both refusal points RECORD why, so the caller that already
+    // paid for this call reads the reason that actually decided instead of
+    // re-asking a ladder whose per-drive state may have moved.
+    _enqueue_refusal = enqueueRefusal();
+    if (_enqueue_refusal != EnqueueRefusal::None) return false;
 
     const bool use_device_assembly = _device_assembly_pending;
     _device_assembly_pending       = false;
 
     SweepPrep p;
-    if (!prepareDeviceSweeps(flux, p)) return false;
+    if (!prepareDeviceSweeps(flux, p)) {
+        // NOT a designed host region: the gate said yes and the staging refused.
+        _enqueue_refusal = EnqueueRefusal::StagePrepFailed;
+        return false;
+    }
 
     const double reigv  = 1. / eigv;
     const double reigvs = (_eshift != 0.0) ? 1. / (eigv + _eshift) : 0.0;

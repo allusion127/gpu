@@ -1477,15 +1477,30 @@ private:
         // and dhat mirrors this outer issued.  They are the same stream for a
         // single deck and different ones in a batch, and draining a stream
         // twice is free.
-        // WP1 (plan Sec 6.3).  COUNT-ONLY, and this is the one site allowed to
-        // be: it runs INSIDE a live device outer segment, and a throw here would
-        // unwind past the segment's stream -- and, on the WHILE arm, past an
-        // open graph capture -- with nothing written to clean either up.  So the
-        // blocking host drive still happens and `contract_pass` goes false; the
-        // segment's own [OUTER_GPU] refusal ladder says why on the NEXT outer,
-        // where the seam CAN refuse.  tools/test_gpu_full_fail_closed.py holds
-        // the allowlist this entry is on.
-        RASBERY_GPU_FULL_COUNT(Outer);
+        // WP1 (plan Sec 6.3), and the WP1 FOLLOW-UP that gave it teeth.
+        //
+        // WHY IT STILL CANNOT THROW HERE.  This runs INSIDE a live device outer
+        // segment, and a throw would unwind past the segment's stream -- and, on
+        // the WHILE arm, past an open graph capture -- with nothing written to
+        // clean either up.
+        //
+        // WHAT CHANGED.  "Cannot throw here" used to mean "counts and the case
+        // runs anyway", which on host 181 was 71 host outer bodies, a
+        // `contract_pass:false` receipt, and exit 0.  It now means DEFERRED: the
+        // violation is latched and raised the moment runSegment() returns, where
+        // unwinding is safe.  And the decision is made on the REASON rather than
+        // on the fact of a refusal, because one of the reasons -- the Rayleigh
+        // warm-up -- is host BY DESIGN and is already excluded by the CMFD seam
+        // (see kGpuFullAllowedOuterRefusals for the evidence and for the reasons
+        // that were considered and refused).
+        //
+        // THE REASON COMES FROM THE CALL THAT ACTUALLY DECIDED, not from
+        // re-asking the ladder: enqueueDrive() records it at both of its refusal
+        // points, so a per-drive state that moved in between cannot make the
+        // receipt name a reason that did not apply.
+        RASBERY_GPU_FULL_DEFER_ALLOWED(
+            Outer, "Driver::outerSweepEnqueueHook",
+            BICGCMFD::enqueueRefusalName(h.ctx->cmfd_solver.lastEnqueueRefusal()));
         h.ctx->cmfd_solver.syncSweepStream();
         gpu::rasberySyncSegmentStream(stream);
         h.ctx->cmfd_solver.drive(*h.eigv, h.ctx->geometry.PhifMutable(), *h.residual);
@@ -2253,10 +2268,13 @@ private:
         if (gpu_outer_enabled && !gpu_outer_armed) {
             gpu::noteOuterSegmentRefusal(gpu_outer_why);
             // WP1 (plan Sec 6.3).  The segment never armed, so this whole loop
-            // is the host outer body.  `gpu_outer_enabled` is the arm's own
-            // predicate, so a FeatureOff run never reaches here.
-            RASBERY_GPU_FULL_GUARD(Outer, "Driver: outer segment pre-arm",
-                                   gpu::outerRefusalName(gpu_outer_why));
+            // is the host outer body; `gpu_outer_enabled` is the arm's own
+            // predicate, so a FeatureOff run never reaches here.  The reason is
+            // matched against kGpuFullAllowedOuterRefusals, which no
+            // OuterSegmentRefusal is on -- `batch_mode` least of all; the
+            // header says why each candidate was refused.
+            RASBERY_GPU_FULL_GUARD_ALLOWED(Outer, "Driver: outer segment pre-arm",
+                                           gpu::outerRefusalName(gpu_outer_why));
         }
 
         for (int i = 0; i < max_iter; ++i) {
@@ -2282,6 +2300,13 @@ private:
                 gpu::OuterSegmentResume seg{};
                 if (gpu::rasberyOuterSegment(gpu_outer_claim.query())
                         .runSegment(s, rasberyBatchWidth(), gpu_outer_rods, false, seg)) {
+                    // WP1 follow-up: THE SEGMENT IS OVER -- its stream is
+                    // drained and any graph capture is closed -- so this is the
+                    // first point at which the enqueue seam's DEFERRED violation
+                    // can be thrown without leaving CUDA state nothing is
+                    // written to clean up.  A no-op unless one was latched,
+                    // which is every call with the gate off.
+                    RASBERY_GPU_FULL_RAISE_PENDING();
                     eigv        = seg.eigv;
                     residual    = seg.residual;
                     prev_inner  = seg.prev_inner;
@@ -2333,6 +2358,10 @@ private:
                 // outer.  Re-arming would pay a failed launch, a warning line and
                 // a refusal count per outer for the rest of the re-convergence
                 // and still run the host body every time.
+                // Same safe point as the delegated branch: the segment has
+                // returned, so a deferred violation from one of its outers is
+                // raised here, BEFORE any of this loop's own bookkeeping.
+                RASBERY_GPU_FULL_RAISE_PENDING();
                 gpu_outer_armed = false;
                 // WP1 (plan Sec 6.3).  A launch or hook failure inside an armed
                 // segment; the refusal is already counted in [OUTER_GPU], but
@@ -3645,10 +3674,13 @@ private:
         if (gpu_outer_enabled && !gpu_outer_armed) {
             gpu::noteOuterSegmentRefusal(gpu_outer_why);
             // WP1 (plan Sec 6.3).  The segment never armed, so this whole loop
-            // is the host outer body.  `gpu_outer_enabled` is the arm's own
-            // predicate, so a FeatureOff run never reaches here.
-            RASBERY_GPU_FULL_GUARD(Outer, "Driver: outer segment pre-arm",
-                                   gpu::outerRefusalName(gpu_outer_why));
+            // is the host outer body; `gpu_outer_enabled` is the arm's own
+            // predicate, so a FeatureOff run never reaches here.  The reason is
+            // matched against kGpuFullAllowedOuterRefusals, which no
+            // OuterSegmentRefusal is on -- `batch_mode` least of all; the
+            // header says why each candidate was refused.
+            RASBERY_GPU_FULL_GUARD_ALLOWED(Outer, "Driver: outer segment pre-arm",
+                                           gpu::outerRefusalName(gpu_outer_why));
         }
 
         for (int iout = 0; iout < max_iter; ++iout) {
@@ -3742,6 +3774,13 @@ private:
                 gpu::OuterSegmentResume seg{};
                 if (gpu::rasberyOuterSegment(gpu_outer_claim.query())
                         .runSegment(s, rasberyBatchWidth(), gpu_outer_rods, false, seg)) {
+                    // WP1 follow-up: THE SEGMENT IS OVER -- its stream is
+                    // drained and any graph capture is closed -- so this is the
+                    // first point at which the enqueue seam's DEFERRED violation
+                    // can be thrown without leaving CUDA state nothing is
+                    // written to clean up.  A no-op unless one was latched,
+                    // which is every call with the gate off.
+                    RASBERY_GPU_FULL_RAISE_PENDING();
                     eigv           = seg.eigv;
                     residual       = seg.residual;
                     prev_inner     = seg.prev_inner;
@@ -3765,6 +3804,8 @@ private:
                     // A launch or hook failure.  Every ELIGIBILITY refusal was
                     // decided once above the loop, so this recurs; stop paying
                     // for it and let the host body below be the whole outer.
+                    // Same safe point on the refusal path: see ReconvergeFlux.
+                    RASBERY_GPU_FULL_RAISE_PENDING();
                     gpu_outer_armed = false;
                     // WP1 (plan Sec 6.3), same seam as ReconvergeFlux's.
                     RASBERY_GPU_FULL_GUARD(Outer, "Driver::SolveLoop",

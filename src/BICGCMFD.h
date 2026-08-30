@@ -13,6 +13,46 @@ namespace rasbery {
  */
 
 class BICGCMFD : public CMFD {
+public:
+    // -------------------------------------------------------------------
+    // WP1 follow-up (plan Sec 6.3): WHY a drive could not be enqueued
+    // -------------------------------------------------------------------
+    //
+    // canEnqueueDrive() answers `will it`, and for the fail-closed gate that is
+    // not enough: the outer segment's enqueue hook falls back to the BLOCKING
+    // drive() when it is false, and drive() then runs the pristine host
+    // BiCGSTAB loop -- CPU numerics.  Under RASBERY_GPU_FULL that must fail the
+    // case, EXCEPT for the one reason that is host BY DESIGN and has no device
+    // implementation to decline: the Rayleigh warm-up.  A single boolean cannot
+    // tell those apart, so the gate is handed the reason instead.
+    //
+    // WHY THE LADDER LIVES HERE AND canEnqueueDrive() DELEGATES TO IT.  Two
+    // spellings of one predicate is how a segment arms an arm drive() would not
+    // have taken; the enum IS the predicate now, and `will it` is `== None`.
+    enum class EnqueueRefusal : int {
+        None = 0,
+        SweepArmOff,     ///< RASBERY_GPU_CMFD_SWEEP unset or 0
+        NoCudaSolver,    ///< no BICGSolver, or it is not the CUDA one
+        NotTwoGroup,     ///< _g.ng() != 2; the device sweep serves 2 groups
+        WielandtWarmup,  ///< _wiel_sweep < WIELANDT_WARMUP_SWEEPS
+        StagePrepFailed, ///< the gate said yes and prepareDeviceSweeps refused
+        Count
+    };
+
+    static const char* enqueueRefusalName(EnqueueRefusal r) {
+        switch (r) {
+            case EnqueueRefusal::None:            return "none";
+            case EnqueueRefusal::SweepArmOff:     return "sweep_arm_off";
+            case EnqueueRefusal::NoCudaSolver:    return "no_cuda_solver";
+            case EnqueueRefusal::NotTwoGroup:     return "not_two_group";
+            case EnqueueRefusal::WielandtWarmup:  return "wielandt_warmup";
+            case EnqueueRefusal::StagePrepFailed: return "stage_prep_failed";
+            case EnqueueRefusal::Count:           break;
+        }
+        return "?";
+    }
+
+
 protected:
     /// @brief BICG solver object
     std::unique_ptr<BICGSolver> _ls;
@@ -34,6 +74,10 @@ protected:
     bool _last_drive_device_flux = false;
     /// Bumped by upddtil(), the only writer of _dtil.
     unsigned long long _dtil_generation = 1;
+    /// WP1 follow-up: why the last enqueueDrive() refused.  See
+    /// EnqueueRefusal; `None` until the first refusal, which is also what a run
+    /// that never called enqueueDrive() reports.
+    EnqueueRefusal _enqueue_refusal = EnqueueRefusal::None;
 
     /// @brief Nodal object
     std::unique_ptr<Nodal> _nodal;
@@ -196,9 +240,20 @@ public:
     // into a device kernel so the normal path publishes the segment's probe
     // without a readback at all.
 
+    /// The ladder, ranked so the first reason a reader would ask about is the
+    /// one reported.  Pure: it runs nothing and consumes nothing.
+    [[nodiscard]] EnqueueRefusal enqueueRefusal() const;
+
     /// Would drive() take the device-resident sweep right now?  Same predicate,
     /// asked without running anything, so the segment can choose its arm.
-    [[nodiscard]] bool canEnqueueDrive() const;
+    [[nodiscard]] bool canEnqueueDrive() const {
+        return enqueueRefusal() == EnqueueRefusal::None;
+    }
+
+    /// Why the LAST enqueueDrive() returned false.  Set at both of its refusal
+    /// points, so a caller that already paid for the call does not re-ask the
+    /// ladder and get a different answer than the one that decided.
+    [[nodiscard]] EnqueueRefusal lastEnqueueRefusal() const { return _enqueue_refusal; }
 
     /// Enqueue one drive on the arena's stream and return.  Nothing is drained
     /// and nothing is observed; @p probe names the device addresses the sweep
