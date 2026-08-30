@@ -133,7 +133,7 @@ capture가 거절되면 (`stage: cudaGetErrorString`) `graph_refusal`에 이름�
 `device_stream`이 launch를 늘리는 것은 사실이고 감출 것이 아니다. drive가 133.60 ms /
 statepoint / 23.31 라운드 = 커널 하나당 약 716 µs이므로 launch overhead(약 5 µs)는
 그 앞에서 3 % 미만이고, 없앤 것은 **23.31번의 직렬화**다. 그 교환이 실제로 이득인지는
-§7.4의 wall이 답한다 — `device_graph`가 존재하는 이유가 그 launch 900개이고,
+§7.5의 wall이 답한다 — `device_graph`가 존재하는 이유가 그 launch 900개이고,
 `graph_launches`가 그것을 인쇄한다.
 
 ---
