@@ -427,6 +427,43 @@ namespace fxs = rasbery::flatxs;
 
 std::atomic<unsigned long long> g_flatxs_nodes_solved{0};
 
+// --- WP15: the micx/lmpx residency receipt ([RASBERY][MICX]) --------------
+//
+// PROCESS-WIDE, for the same reason g_nodal_drives is: the number a reader
+// wants is what the RUN did, and the receipt outlives any one backend.
+//
+//   resident_hits   solveFlatXs calls that left the 59.5 MB block on the device
+//   lazy_downloads  full materialisations (scalars + scatter) a host reader asked for
+//   slice_downloads scalar-only materialisations (9 mic + 9 lmp, msm left behind)
+//   deferred/downloaded bytes -- their difference is what never crossed PCIe
+std::atomic<unsigned long long> g_micx_resident_hits{0};
+std::atomic<unsigned long long> g_micx_lazy_downloads{0};
+std::atomic<unsigned long long> g_micx_slice_downloads{0};
+std::atomic<unsigned long long> g_micx_deferred_bytes{0};
+std::atomic<unsigned long long> g_micx_downloaded_bytes{0};
+
+/// WP15 §2: the nodal coefficient upload, counted where it is issued.
+///
+/// It is NOT elided by this work and the census says why (docs/WP15): the nine
+/// arrays are HOST arithmetic (Nodal::updateConstant) and the device kernel that
+/// would replace it is N1, not B0.  What this pair buys is the measurement --
+/// `nodal_const_uploads / 9` is the number of times `_const_generation` actually
+/// advanced, and the WP15 claim that it tracks the Xe device step 1:1 stands or
+/// falls on it.
+std::atomic<unsigned long long> g_nodal_const_uploads{0};
+std::atomic<unsigned long long> g_nodal_const_bytes{0};
+
+/// Bytes of one flat-XS micx/lmpx result block: 9 (lmp + mic) + lsm + msm.
+inline unsigned long long flatxsMicxBlockBytes(std::size_t nx) {
+    const std::size_t mic = static_cast<std::size_t>(xsr::NISO) * xsr::NG * nx;
+    const std::size_t lmp = static_cast<std::size_t>(xsr::NG) * nx;
+    const std::size_t msm = static_cast<std::size_t>(xsr::NISO) * xsr::NG * xsr::NG * nx;
+    const std::size_t ssm = static_cast<std::size_t>(xsr::NG) * xsr::NG * nx;
+    return static_cast<unsigned long long>(
+               (static_cast<std::size_t>(fxs::N_ACTIVE) * (lmp + mic) + ssm + msm)) *
+           sizeof(double);
+}
+
 // One thread per target node; the shared body does the rest.  StaticForms
 // folds the mined mask at compile time (this TU builds with --fmad=false, so
 // only the explicit fma() arms fuse).
@@ -1948,6 +1985,25 @@ struct XsReconBackend::Impl {
     unsigned long long resident_state_generation = 0; // _xs/_iden host==device
     bool               fuel_uploaded             = false;
 
+    // --- WP15: micx/lmpx residency (RASBERY_GPU_MICX_RESIDENT) ------------
+    //
+    // TRUE MEANS THE DEVICE IS AUTHORITATIVE for that half of the flat-XS
+    // result: solveFlatXs computed it and did NOT download it, so the host
+    // arrays still hold the previous epoch's values.  The two halves are
+    // tracked apart because they have different readers -- every depletion /
+    // Xe / CRAM consumer reads the eleven SCALAR slots and none of them reads
+    // the scatter block, so a scalar-only materialisation is 49.0 MB instead
+    // of 59.5 MB and is still the whole truth for those readers.
+    //
+    // The invariant that makes this safe is stated once, here, and enforced on
+    // the XSSet side: WHILE EITHER FLAG IS TRUE NO HOST CODE READS OR WRITES
+    // _micx / _lmpx.  Every host reader goes through XSSet::EnsureMicxHost,
+    // which clears the flag by downloading; every host writer is downstream of
+    // one.  A host write into a stale array would be lost at the next
+    // materialisation, and that is the only way this can be wrong.
+    bool micx_scalars_pending = false; // 9 mic + 9 lmp live only on the device
+    bool micx_scatter_pending = false; // msm + lsm live only on the device
+
     // --- flat-XS extension (RASBERY_GPU_FLATXS) ---------------------------
     double*            dev_ref = nullptr; // [9 mic | msm | 9 lmp | lsm]
     std::size_t        off_ref_mic[fxs::N_ACTIVE] = {};
@@ -2439,6 +2495,17 @@ struct XsReconBackend::Impl {
         // _micx and _lmpx move together (both are outputs of the same host-side
         // rebuild paths), so one generation covers both.
         if (micx_generation != resident_micx_generation) {
+            // WP15: the same unreachable-by-construction guard solveFlatXs
+            // carries, for the same reason -- this upload would overwrite a
+            // device block whose values no host reader has collected yet.
+            if (micx_scalars_pending || micx_scatter_pending) {
+                std::cerr << "[RASBERY][ERROR][micx] xsrecon micx upload with a "
+                             "download still outstanding: a host reader of "
+                             "_micx/_lmpx does not go through "
+                             "XSSet::EnsureMicxHost.\n";
+                micx_scalars_pending = false;
+                micx_scatter_pending = false;
+            }
             for (int xt = 0; xt < xsr::NXS; ++xt)
                 if (!upload("xsrecon micx mic", host.mic[xt], off_mic[xt], mic))
                     return false;
@@ -3376,6 +3443,21 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     // solve.  On mismatch upload ALL 11 slots (the kernel writes only the
     // ACTIVE 9, but the xsrecon condense loop reads every slot later).
     if (micx_generation != d.resident_micx_generation) {
+        // WP15 guard.  UNREACHABLE BY CONSTRUCTION and checked anyway: a
+        // generation mismatch means the host rebuilt _micx, a host rebuild
+        // means a host write, and a host write means XSSet::EnsureMicxHost
+        // already paid the debt.  If it did not, the upload below is about to
+        // overwrite device values nobody ever read with host values nobody
+        // refreshed, and the run's physics is wrong from here.  Say so, loudly,
+        // rather than let a silent wrong answer out.
+        if (d.micx_scalars_pending || d.micx_scatter_pending) {
+            std::cerr << "[RASBERY][ERROR][micx] flat-XS micx upload with a "
+                         "download still outstanding: a host reader of _micx/_lmpx "
+                         "does not go through XSSet::EnsureMicxHost.  Re-run with "
+                         "RASBERY_GPU_MICX_RESIDENT unset and report this.\n";
+            d.micx_scalars_pending = false;
+            d.micx_scatter_pending = false;
+        }
         for (int xt = 0; xt < xsr::NXS; ++xt)
             if (!d.upload("flatxs micx mic", host.mic_all[xt], d.off_mic[xt], mic))
                 return false;
@@ -3531,7 +3613,33 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     // full micx export, CPU fallback arms); the full-deck A/B is the gate for
     // any deck class this is enabled on.  Default off.
     static const bool skip_micx_dl = envFlagEnabled("RASBERY_FLATXS_SKIP_MICX_DL");
-    if (!skip_micx_dl) {
+    // WP15 (RASBERY_GPU_MICX_RESIDENT): the twenty copies below are 59.5 MB of
+    // this call's 61.5 MB -- 85 % of the run's whole D2H side (WP13 §4.4) --
+    // and almost none of it is read by the host before the NEXT solve
+    // overwrites it.  The consumers are on the device: the xsrecon/Xe solve and
+    // the nodal drive read the same `dev_block` these copies came out of, and
+    // the residency line at the end of this function is what tells them so.
+    //
+    // SO THE DOWNLOAD BECOMES LAZY, NOT UNSAFE.  It is not skipped: it is owed,
+    // and the pending flags are the debt.  XSSet::EnsureMicxHost pays it on the
+    // first host access of the epoch (a depletion snapshot, a rodded node, a
+    // result write, a CPU fallback) and pays it exactly once.  What the flag
+    // removes is the 315-of-384 calls whose block no host reader ever looked at.
+    //
+    // DIFFERENT FROM RASBERY_FLATXS_SKIP_MICX_DL, which is the same bytes with
+    // no debt and no payer: it is correct only on decks whose host never reads
+    // _micx at all, which is why it stays an experiment and this does not.
+    //
+    // NOT DEFERRED WHEN `mark_micx_resident` IS FALSE, and that is not caution,
+    // it is the debt's precondition.  false means rodded nodes are about to
+    // rewrite host columns, so the caller drops the device residency
+    // (`resident_micx_generation = 0` below) and the NEXT solve re-uploads the
+    // block FROM THE HOST.  A debt outstanding across that upload would be paid
+    // with the bytes that upload just overwrote -- the previous epoch's.  With
+    // the download taken here there is no debt to carry.
+    static const bool micx_resident_arm = rasberyGpuMicxResidentEnabled();
+    const bool        micx_resident     = micx_resident_arm && mark_micx_resident;
+    if (!skip_micx_dl && !micx_resident) {
         for (int t = 0; t < fxs::N_ACTIVE; ++t) {
             if (!d.download("flatxs lmpx lmp", host.lmp[t], d.off_lmp[ACTIVE_XT9[t]],
                             lmp))
@@ -3542,6 +3650,15 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
         }
         if (!d.download("flatxs lmpx lsm", host.lsm, d.off_lmp_ssm, ssm)) return false;
         if (!d.download("flatxs micx msm", host.msm, d.off_mic_ssm, msm)) return false;
+    } else if (!skip_micx_dl) {
+        // The kernel has already written the block; the debt is recorded BEFORE
+        // the drain below so a caller that inspects the backend between the
+        // launch and its own next statement cannot see a solve with no debt.
+        d.micx_scalars_pending = true;
+        d.micx_scatter_pending = true;
+        g_micx_resident_hits.fetch_add(1, std::memory_order_relaxed);
+        g_micx_deferred_bytes.fetch_add(flatxsMicxBlockBytes(nx),
+                                        std::memory_order_relaxed);
     }
     for (int xt = 0; xt < xsr::NXS; ++xt)
         if (!d.download("flatxs macro xs", host.xs[xt], d.off_xs[xt], lmp)) return false;
@@ -3566,6 +3683,103 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     g_flatxs_nodes_solved.fetch_add(static_cast<unsigned long long>(host.n_nodes),
                                     std::memory_order_relaxed);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// WP15: paying the deferred micx/lmpx download
+// ---------------------------------------------------------------------------
+
+bool XsReconBackend::micxScalarsPending() const {
+    return _impl->micx_scalars_pending;
+}
+
+bool XsReconBackend::micxScatterPending() const {
+    return _impl->micx_scatter_pending;
+}
+
+unsigned long long XsReconBackend::micxResidentGeneration() const {
+    return _impl->resident_micx_generation;
+}
+
+bool XsReconBackend::downloadFlatXsMicx(const fxs::FlatXsView& host, bool scalars,
+                                        bool scatter) {
+    Impl& d = *_impl;
+    if (!d.available) return false;
+    const bool want_scalars = scalars && d.micx_scalars_pending;
+    const bool want_scatter = scatter && d.micx_scatter_pending;
+    // IDEMPOTENT AND CHEAP WHEN THERE IS NOTHING OWED.  Every host reader calls
+    // its way through here; the common case must cost a branch, not a sync.
+    if (!want_scalars && !want_scatter) return true;
+    if (d.nxyz <= 0 || d.dev_block == nullptr) return false;
+
+    const std::size_t nx  = static_cast<std::size_t>(d.nxyz);
+    const std::size_t mic = static_cast<std::size_t>(xsr::NISO) * xsr::NG * nx;
+    const std::size_t lmp = static_cast<std::size_t>(xsr::NG) * nx;
+    const std::size_t msm = static_cast<std::size_t>(xsr::NISO) * xsr::NG * xsr::NG * nx;
+    const std::size_t ssm = static_cast<std::size_t>(xsr::NG) * xsr::NG * nx;
+
+    // THE SAME COPIES solveFlatXs would have issued, into the same pointers,
+    // off the same offsets -- so a materialised host array is bit-for-bit the
+    // array the flag-off arm downloaded eagerly.  That identity is the whole
+    // B0 claim, and it is why this is a second CALL SITE of one copy list and
+    // not a second copy list.
+    unsigned long long moved = 0;
+    if (want_scalars) {
+        for (int t = 0; t < fxs::N_ACTIVE; ++t) {
+            if (!d.download("flatxs lmpx lmp", host.lmp[t], d.off_lmp[ACTIVE_XT9[t]],
+                            lmp))
+                return false;
+            if (!d.download("flatxs micx mic", host.mic[t], d.off_mic[ACTIVE_XT9[t]],
+                            mic))
+                return false;
+        }
+        moved += static_cast<unsigned long long>(fxs::N_ACTIVE) * (lmp + mic) *
+                 sizeof(double);
+    }
+    if (want_scatter) {
+        if (!d.download("flatxs lmpx lsm", host.lsm, d.off_lmp_ssm, ssm)) return false;
+        if (!d.download("flatxs micx msm", host.msm, d.off_mic_ssm, msm)) return false;
+        moved += static_cast<unsigned long long>(ssm + msm) * sizeof(double);
+    }
+    // The caller is a HOST READER: it is about to dereference these arrays, so
+    // the copies have to have landed, not merely been issued.  Same drain
+    // solveFlatXs takes, taken here instead -- which is the other half of the
+    // saving, because the 315 calls that never materialise never take it.
+    RASBERY_CUDA_TRY(xfer::streamSync("CudaXsReconBackend.cu:downloadFlatXsMicx",
+                                      "micx drain", d.stream),
+                     d.status);
+    if (want_scalars) d.micx_scalars_pending = false;
+    if (want_scatter) d.micx_scatter_pending = false;
+    g_micx_downloaded_bytes.fetch_add(moved, std::memory_order_relaxed);
+    if (want_scalars && want_scatter)
+        g_micx_lazy_downloads.fetch_add(1, std::memory_order_relaxed);
+    else
+        g_micx_slice_downloads.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+unsigned long long XsReconBackend::micxResidentHits() {
+    return g_micx_resident_hits.load(std::memory_order_relaxed);
+}
+unsigned long long XsReconBackend::micxLazyDownloads() {
+    return g_micx_lazy_downloads.load(std::memory_order_relaxed);
+}
+unsigned long long XsReconBackend::micxSliceDownloads() {
+    return g_micx_slice_downloads.load(std::memory_order_relaxed);
+}
+unsigned long long XsReconBackend::micxBytesSaved() {
+    const unsigned long long deferred = g_micx_deferred_bytes.load(std::memory_order_relaxed);
+    const unsigned long long paid = g_micx_downloaded_bytes.load(std::memory_order_relaxed);
+    // Saturating: `paid` can exceed `deferred` only if a materialisation ran
+    // against a debt this counter never saw, and a negative saving printed as a
+    // huge unsigned number would read as a win.
+    return deferred > paid ? deferred - paid : 0ULL;
+}
+unsigned long long XsReconBackend::nodalConstUploads() {
+    return g_nodal_const_uploads.load(std::memory_order_relaxed);
+}
+unsigned long long XsReconBackend::nodalConstBytes() {
+    return g_nodal_const_bytes.load(std::memory_order_relaxed);
 }
 
 bool XsReconBackend::solveNodal(const ndl::NodalView& host,
@@ -3735,6 +3949,22 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
                                     ndg * sizeof(double), cudaMemcpyHostToDevice,
                                     d.stream),
                 d.status);
+        // WP15 §2.  NOT ELIDED, and the census says why.  These nine arrays are
+        // recomputed on the HOST by Nodal::updateConstant every time xsrf/xsdf
+        // move, and what moves them ~1,075 times in a 4,377-outer run is the Xe
+        // device step writing macro xs (1,117 of those).  So the traffic is the
+        // tail of a device->host->device round trip, not an upload with a
+        // resident copy to compare against: a byte-exact mirror would test 9
+        // arrays that the gate above has already said changed.  Removing it
+        // means computing the coefficients on the device
+        // (src/CudaNodalConstantKernel.h, Rev.7.1 Task 4) -- which is N1, not
+        // B0, because CUDA's exp differs from glibc's by 1 ulp on 3.34 % of the
+        // arguments this body evaluates.  The counters below are what makes the
+        // "1,075 tracks the 1,117 Xe steps" claim checkable on the next run.
+        g_nodal_const_uploads.fetch_add(9, std::memory_order_relaxed);
+        g_nodal_const_bytes.fetch_add(
+            9ULL * static_cast<unsigned long long>(ndg) * sizeof(double),
+            std::memory_order_relaxed);
         d.resident_const_generation = const_generation;
     }
 
@@ -4601,6 +4831,23 @@ bool rasberyGpuXsReconEnabled() {
 
 bool rasberyGpuFlatXsEnabled() {
     static const bool on = envFlagEnabled("RASBERY_GPU_FLATXS");
+    return on;
+}
+
+bool rasberyGpuMicxResidentEnabled() {
+    // WP15.  envFlagEnabled -- ABSENT MEANS OFF, and it stays that way until the
+    // 238 runbook in docs/WP15_MICX_RESIDENCY_20260830_KO.md has been run.
+    //
+    // DELIBERATELY NOT IN trajectory::kArmEnv.  The arm changes WHEN a download
+    // happens, never WHICH bytes it moves: every host reader sees the same array
+    // contents it would have seen with the eager download, because it is the
+    // same copy list off the same device offsets, taken before the read instead
+    // of after the solve.  A knob that cannot move the trajectory has no place
+    // in the case key -- putting it there makes two identical runs two cache
+    // entries.  If an A/B ever shows a digest difference, the knob is not the
+    // bug: a host reader that skipped EnsureMicxHost is, and the guards in
+    // solveFlatXs/stage will have said so first.
+    static const bool on = envFlagEnabled("RASBERY_GPU_MICX_RESIDENT");
     return on;
 }
 

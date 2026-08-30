@@ -286,6 +286,10 @@ struct DepletionWorkspace {
 } // namespace rasbery
 
 void XSSet::unpackXS(const Chiffon::CrossSection& xs, size_t l, size_t ngrp, size_t nxyz, size_t niso_count) {
+    // WP15: a host WRITER.  The debt has to be paid before the write, not
+    // after -- a materialisation that landed on top of these columns would
+    // replace them with the device's previous-epoch values.
+    EnsureMicxHost(MicxNeed::All);
     auto lmpx = ScalarXS(_lmpx);
     auto micx = ScalarXS(_micx);
 
@@ -1377,6 +1381,7 @@ void XSSet::Initialize(const std::string& xs_path) {
 
 // Reconstruct: rmcx = lmpx + sum(micx_i * iden_i), then derive D and removal.
 void XSSet::Reconstruct() {
+    EnsureMicxHost(MicxNeed::All); // WP15: reads every scalar slot and the scatter block
     const int    nxyz = _g.nxyz();
     const int    ng   = _g.ng();
     const size_t niso = Isotope::niso;
@@ -1486,6 +1491,9 @@ void XSSet::Reconstruct() {
 }
 
 void XSSet::ReconstructNode(size_t l) {
+    // WP15.  Called from inside OpenMP loops over nodes; see EnsureMicxHost for
+    // why that is safe and why it costs one atomic load when nothing is owed.
+    EnsureMicxHost(MicxNeed::All);
     const int    ng   = _g.ng();
     const int    nxyz = _g.nxyz();
     const size_t niso = Isotope::niso;
@@ -2011,6 +2019,7 @@ bool XSSet::UsesRodXS(int l) const {
 
 void XSSet::ApplyBranchDeltaIdToNode(int l, int did, double x, double scale) {
     if (did < 0 || scale == 0.0) return;
+    EnsureMicxHost(MicxNeed::All); // WP15: accumulates INTO _lmpx/_micx, scatter included
 
     const int    nxyz = _g.nxyz();
     const int    ng   = _g.ng();
@@ -2665,6 +2674,7 @@ void XSSet::RefreshLightIsotopes(int l) {
 // destination stride is nxyz*8B, so the former per-delta read-modify-write touched a distinct
 // cache line per element), then scatter back and rebuild this node's macroscopic XS in one pass.
 void XSSet::UpdateUnroddedNodeXS(int l) {
+    EnsureMicxHost(MicxNeed::All); // WP15: the host arm's writer, scatter included
     const int    nxyz = _g.nxyz();
     const int    ng   = _g.ng();
     const size_t niso = Isotope::niso;
@@ -2880,6 +2890,13 @@ void XSSet::UpdateUnroddedNodeXS(int l) {
 // and node-list fields stay null; BuildFlatXsStream's caller wires them.
 flatxs::FlatXsView XSSet::MakeFlatXsHostView() {
     namespace fxs = flatxs;
+    // WP15.  NO EnsureMicxHost HERE, AND IT WOULD BE A LOOP IF THERE WERE ONE:
+    // this is the view EnsureMicxHost itself builds to name the download's
+    // destinations.  Nothing in this function dereferences `_micx`/`_lmpx` --
+    // it takes eleven addresses -- and both of its callers know what they are
+    // doing with them: the device solve writes THROUGH them, and the host
+    // stream builder (BuildFlatXsStream) reads only `ref_*` and the coefficient
+    // tables, never the live block.  See flatxsProbeMicElement.
     static_assert(fxs::N_ACTIVE == N_ACTIVE_XT, "ACTIVE_XT list drifted");
 
     fxs::FlatXsView v{};
@@ -3129,6 +3146,69 @@ void XSSet::BuildFlatXsStream(const std::vector<int>& nodes) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WP15: paying for the deferred micx/lmpx download
+// ---------------------------------------------------------------------------
+//
+// THE ONE PLACE THE DEBT IS SETTLED.  Everything else in this file that reads or
+// writes `_micx`/`_lmpx` calls this first; the contract test enumerates them and
+// fails on a new one that does not.  Two properties make the call sites cheap
+// enough to put everywhere, including per-node bodies inside OpenMP loops:
+//
+//   * with the arm off (or nothing owed) it is two relaxed atomic loads and a
+//     return -- no lock, no CUDA call, no branch the optimiser cannot hoist;
+//   * with something owed the FIRST thread in pays and every other thread finds
+//     the flags already clear, so a 8,451-node parallel loop takes one download,
+//     not 8,451 and not one per thread.
+//
+// WHY THE CRITICAL SECTION IS NOT OPTIONAL.  The paying thread writes the whole
+// of `_micx`; a sibling thread that read a stale flag would be writing its own
+// node's columns into the buffer that download is landing in.  Every thread
+// therefore passes through the section before it touches the arrays, and the
+// acquire/release pair is what makes the download's writes visible to the
+// threads that skipped it.
+void XSSet::EnsureMicxHost(MicxNeed need) const {
+    const bool want_scatter = (need == MicxNeed::All);
+    if (!_micx_device_scalars.load(std::memory_order_acquire) &&
+        !(want_scatter && _micx_device_scatter.load(std::memory_order_acquire)))
+        return;
+
+    // const because every cross-section consumer is; the mutation is a cache
+    // refill, and the values it lands are the ones a flag-off run had already.
+    XSSet& self = const_cast<XSSet&>(*this);
+    bool   failed = false;
+#ifdef _OPENMP
+#pragma omp critical(rasbery_micx_materialise)
+#endif
+    {
+        const bool s = _micx_device_scalars.load(std::memory_order_acquire);
+        const bool m = want_scatter && _micx_device_scatter.load(std::memory_order_acquire);
+        if (s || m) {
+            const flatxs::FlatXsView v = self.MakeFlatXsHostView();
+            if (self._xsrecon_backend &&
+                self._xsrecon_backend->downloadFlatXsMicx(v, s, m)) {
+                if (s) self._micx_device_scalars.store(false, std::memory_order_release);
+                if (m) self._micx_device_scatter.store(false, std::memory_order_release);
+            } else {
+                failed = true;
+            }
+        }
+    }
+    if (failed) {
+        // NOT FAIL-OPEN, and this is the one seam in the arm where that is the
+        // right answer.  Fail-open means "run the host body instead" -- but the
+        // host body would run on the cross sections of the PREVIOUS flat-XS
+        // epoch, because the current ones are on a device that just refused to
+        // hand them over.  Every number downstream would be plausible and
+        // wrong.  A run that cannot read its own cross sections has to stop.
+        std::cerr << "[RASBERY][FAIL][micx] the deferred micx/lmpx download did not "
+                     "complete; _micx/_lmpx still hold the previous flat-XS epoch "
+                     "and no result computed from here would be meaningful.  "
+                     "Re-run with RASBERY_GPU_MICX_RESIDENT unset.\n";
+        std::abort();
+    }
+}
+
 bool XSSet::TryUpdateFlatXSGpu(const std::vector<int>& unrodded, bool any_rodded) {
     namespace fxs = flatxs;
     if (_g.ng() != xsrecon::NG || static_cast<int>(Isotope::niso) != xsrecon::NISO)
@@ -3199,9 +3279,22 @@ bool XSSet::TryUpdateFlatXSGpu(const std::vector<int>& unrodded, bool any_rodded
     // UNCONDITIONALLY: a refusal that had already run part of the download
     // would otherwise leave a write unannounced.
     noteMacroXsWrite();
-    return _xsrecon_backend->solveFlatXs(v, MakeFlatXsLibShape(), _micx_generation,
-                                         _micx_generation + 1, _ref_generation,
-                                         _hoststate_generation, !any_rodded);
+    if (!_xsrecon_backend->solveFlatXs(v, MakeFlatXsLibShape(), _micx_generation,
+                                       _micx_generation + 1, _ref_generation,
+                                       _hoststate_generation, !any_rodded))
+        return false;
+
+    // WP15.  THE DEBT IS READ BACK FROM THE BACKEND, not assumed from the flag.
+    // The backend declines to defer in cases this side does not enumerate (the
+    // SKIP_MICX_DL experiment, `any_rodded`, a future one), and a host that
+    // believed a download had been deferred when it had not would materialise
+    // a block nobody owed -- harmless -- while a host that believed the reverse
+    // would read the previous epoch's cross sections.  Asking is one load.
+    _micx_device_scalars.store(_xsrecon_backend->micxScalarsPending(),
+                               std::memory_order_release);
+    _micx_device_scatter.store(_xsrecon_backend->micxScatterPending(),
+                               std::memory_order_release);
+    return true;
 }
 
 void XSSet::UpdateFlatXS(const XSUpdateOptions& options) {
@@ -4165,6 +4258,21 @@ bool XSSet::PrepareXeDeviceCall(double power, double relax, xsrecon::BatchView& 
         dep_xe135[static_cast<size_t>(j)] = depTrans(iXe135, static_cast<size_t>(j));
     }
 
+    // WP15.  NO EnsureMicxHost HERE, AND THAT IS THE POINT OF THE FEATURE.  The
+    // pointers below are handed to the SAME device block the flat-XS solve left
+    // its results in: XsReconBackend::stage() uploads them only when
+    // `micx_generation` differs from the resident copy's, and after a deferred
+    // solve those two agree by construction (solveFlatXs advanced the residency
+    // to `micx_generation_next`, which is what UpdateFlatXS then bumps
+    // `_micx_generation` to).  So no byte of `_micx`/`_lmpx` is read here.
+    //
+    // If that ever stops holding, stage()'s own guard says so on stderr rather
+    // than uploading the previous epoch -- and the check below is the cheap
+    // half of the same statement, made where the caller can still act on it.
+    if (micxDeviceResident() &&
+        _xsrecon_backend->micxResidentGeneration() != _micx_generation)
+        EnsureMicxHost(MicxNeed::All);
+
     for (int xt = 0; xt < xsrecon::NXS; ++xt) {
         const auto t = static_cast<XSTYPE>(xt);
         view.mic[xt] = _micx[t].data();
@@ -4402,6 +4510,11 @@ double XSSet::UpdateEquilibriumXenon(double power, double relax) {
     static const char* dump_path = std::getenv("RASBERY_XSRECON_DUMP");
     static bool        dump_done = false;
     const bool         dump_this = (dump_path != nullptr && !dump_done);
+    // WP15.  Everything from here is the HOST Xe loop -- reached only when both
+    // device arms above declined -- and it condenses the eleven scalar micro-XS
+    // slots node by node.  The dump below writes the whole XSArraySet, scatter
+    // included, so the strong form is what is asked for.
+    EnsureMicxHost(MicxNeed::All);
     if (dump_this) {
         dump_done = true;
         xsreconDumpArrays((std::string(dump_path) + ".in").c_str(), _g, _micx,
@@ -4599,6 +4712,7 @@ double XSSet::EvaluateEquilibriumXenon(double power, std::vector<double>& iodine
         return 0.0;
 
     xsphase::Scope eqxe_scope(xsphase::tallies().eqxe, static_cast<std::uint64_t>(nf));
+    EnsureMicxHost(MicxNeed::Scalars); // WP15: condenses the eleven scalar slots
 
     const int    ng          = _g.ng();
     const int    nxyz        = _g.nxyz();
@@ -4716,6 +4830,9 @@ void XSSet::DepleteNode(DepletionWorkspace& ws, size_t l,
                         const double* abs_flux, size_t ngrp, double dt, bool xe_transient) {
     using namespace Isotope;
     if (depDecay.size() == 0) return;
+    // WP15: the host depletion body, called from inside Deplete's OpenMP loop.
+    // Scalars only -- the transition matrix reads no scatter.
+    EnsureMicxHost(MicxNeed::Scalars);
 
     const size_t nxyz_val = static_cast<size_t>(_g.nxyz());
 
@@ -4857,6 +4974,9 @@ void XSSet::DecayIsotopeDensityFlat(
 }
 
 void XSSet::PredictorStep(double dt, double power, bool xe_transient) {
+    // WP15: snapshots all eleven scalar slots into _micx_bos below, so the debt
+    // is due here whether the depletion itself runs on the device or the host.
+    EnsureMicxHost(MicxNeed::Scalars);
     const int    nxyz            = _g.nxyz();
     const int    ng              = _g.ng();
     const size_t niso            = Isotope::niso;
@@ -4948,6 +5068,7 @@ void XSSet::CorrectorStep(double dt, double power, bool xe_transient) {
                               "loop runs");
 
     if (!corrector_on_device) {
+        EnsureMicxHost(MicxNeed::Scalars); // WP15: eos_ptrs below read the live block
 #pragma omp parallel if (nxyz > OMP_THRESHOLD)
     {
         static thread_local DepletionWorkspace  ws_tls;
@@ -5185,6 +5306,12 @@ bool XSSet::PrepareCramLib(cram::LibView& lib) {
 bool XSSet::DepleteGpu(double dt, double power, bool xe_transient) {
     CramBackend& g = cram();
     if (!g.available()) return false;
+    // WP15.  The CRAM backend uploads four of these eleven HOST arrays (its own
+    // micx_generation gate decides when), so this is a host read even though the
+    // consumer is a device.  It is also the transfer WP15 could not remove
+    // without a CramBackend API change -- see the deferred item in
+    // docs/WP15_MICX_RESIDENCY_20260830_KO.md.
+    EnsureMicxHost(MicxNeed::Scalars);
     // DepleteNode's own first line: with no depletion data the host body is a
     // no-op, and a device arm that "succeeded" on it would skip a no-op while
     // pretending it ran.
@@ -5229,6 +5356,7 @@ bool XSSet::CorrectorStepGpu(double dt, double power, bool xe_transient,
     if (substeps != 1) return false;
     CramBackend& g = cram();
     if (!g.available()) return false;
+    EnsureMicxHost(MicxNeed::Scalars); // WP15: same host read as the predictor's
     if (depDecay.size() == 0) return false;
     if (_cram_bos_token == 0) return false; // this statepoint's predictor was host-side
 

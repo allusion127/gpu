@@ -231,6 +231,55 @@ public:
                      unsigned long long ref_generation,
                      unsigned long long state_generation, bool mark_micx_resident);
 
+    // --- WP15: the deferred micx/lmpx download (RASBERY_GPU_MICX_RESIDENT) --
+    //
+    // With the arm on, solveFlatXs computes the micx/lmpx block and LEAVES IT
+    // ON THE DEVICE -- 59.5 MB of its 61.5 MB per-call download, and 85 % of the
+    // run's whole D2H side (docs/WP13 §4.4).  The download is not skipped, it is
+    // OWED: these three say what is owed and pay it.
+    //
+    // THE CONTRACT THE CALLER MUST KEEP.  While either flag is true no host code
+    // may read or write the arrays the view points at.  XSSet::EnsureMicxHost is
+    // the single payer and every host reader goes through it; solveFlatXs and
+    // stage() carry a loud guard for the case where one does not.
+    //
+    // THE TWO HALVES ARE TRACKED APART because they have different readers: the
+    // depletion / Xe / CRAM consumers read the eleven scalar slots and none of
+    // them reads the scatter block, so `downloadFlatXsMicx(v, true, false)` is a
+    // 49.0 MB answer that is complete for them.
+
+    /// True when the 9 mic + 9 lmp active slots live only on the device.
+    [[nodiscard]] bool micxScalarsPending() const;
+
+    /// True when msm + lsm live only on the device.
+    [[nodiscard]] bool micxScatterPending() const;
+
+    /// The micx/lmpx generation the resident device block holds (0 = none).
+    [[nodiscard]] unsigned long long micxResidentGeneration() const;
+
+    /// Issue the copies solveFlatXs deferred, into `host`'s live micx/lmpx
+    /// pointers, and DRAIN -- the caller is about to dereference them.  The
+    /// same copy list off the same offsets solveFlatXs would have used, so a
+    /// materialised array is bit-for-bit the eagerly downloaded one.
+    /// Idempotent: with nothing owed (or nothing requested) it returns true
+    /// having moved no bytes and taken no synchronisation.
+    bool downloadFlatXsMicx(const flatxs::FlatXsView& host, bool scalars, bool scatter);
+
+    /// WP15 receipts, process-wide over every instance.  `micxResidentHits` is
+    /// the G0 validity check: 0 with the arm on means the flag never reached a
+    /// solve and any saving quoted from this run is void.
+    static unsigned long long micxResidentHits();
+    static unsigned long long micxLazyDownloads();
+    static unsigned long long micxSliceDownloads();
+    static unsigned long long micxBytesSaved();
+
+    /// WP15 §2 census: nodal coefficient H2D copies and their bytes.  Nothing
+    /// elides them (see the note at the upload site); they are counted so the
+    /// claim that `_const_generation` advances once per Xe device step can be
+    /// checked rather than argued.
+    static unsigned long long nodalConstUploads();
+    static unsigned long long nodalConstBytes();
+
     /// Total fuel nodes processed on the device by this process (all
     /// instances).  Zero means the device path never ran, whatever the flag
     /// said -- the G0 validity receipt.
@@ -455,6 +504,13 @@ bool rasberyGpuXsReconEnabled();
 
 /// RASBERY_GPU_FLATXS, read once per process.  Stub builds return false.
 bool rasberyGpuFlatXsEnabled();
+
+/// RASBERY_GPU_MICX_RESIDENT, read once per process: WP15's deferred
+/// micx/lmpx download.  Default OFF until the 238 runbook in
+/// docs/WP15_MICX_RESIDENCY_20260830_KO.md has been run.  It is a B0 arm and it
+/// is NOT in trajectory::kArmEnv -- it changes when a copy happens, never which
+/// bytes it moves.  Stub builds return false.
+bool rasberyGpuMicxResidentEnabled();
 
 /// RASBERY_GPU_FLATXS_CTA, read once per process: WP5 stage B's CTA-per-node
 /// flat-XS kernel.  DEFAULT ON since the v5 freeze (RASBERY_GPU_FLATXS_CTA=0 is

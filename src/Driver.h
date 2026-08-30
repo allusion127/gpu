@@ -5645,6 +5645,43 @@ public:
             }
         }
 
+        // WP15 receipt -- the micx/lmpx residency (RASBERY_GPU_MICX_RESIDENT).
+        //
+        // PRINTED ONLY WHEN THE ARM WAS ASKED FOR OR ACTUALLY FIRED, so a
+        // flag-off log is the log of a build without this feature.  That is what
+        // "feature-off identity" has to mean for a receipt as well as a result.
+        //
+        // `resident_hits` IS THE G0 CHECK: the arm on with 0 hits means the flag
+        // never reached a flat-XS solve and any saving quoted from this run is
+        // void.  `lazy_downloads + slice_downloads` is what the host actually
+        // asked for back -- their ratio to `resident_hits` is the measurement,
+        // because a feature that defers 384 downloads and then materialises 384
+        // times has moved the copies, not removed them.  `nodal_const_*` is the
+        // §2 census this work measured and did not change.
+        if (rasberyGpuMicxResidentEnabled() ||
+            XsReconBackend::micxResidentHits() > 0) {
+            const unsigned long long hits  = XsReconBackend::micxResidentHits();
+            const unsigned long long lazy  = XsReconBackend::micxLazyDownloads();
+            const unsigned long long slice = XsReconBackend::micxSliceDownloads();
+            std::cout << std::format(
+                "  [RASBERY][MICX] {{\"schema_version\":1,\"slot\":{},"
+                "\"arm\":{},\"resident_hits\":{},\"lazy_downloads\":{},"
+                "\"slice_downloads\":{},\"materialised_per_hit\":{:.3f},"
+                "\"bytes_saved\":{},\"mb_saved\":{:.1f},"
+                "\"nodal_const_uploads\":{},\"nodal_const_mb\":{:.1f}}}\n",
+                cmfd_solver.batchSlot(), rasberyGpuMicxResidentEnabled() ? 1 : 0,
+                hits, lazy, slice,
+                hits > 0 ? static_cast<double>(lazy + slice) /
+                               static_cast<double>(hits)
+                         : 0.0,
+                XsReconBackend::micxBytesSaved(),
+                static_cast<double>(XsReconBackend::micxBytesSaved()) /
+                    (1024.0 * 1024.0),
+                XsReconBackend::nodalConstUploads(),
+                static_cast<double>(XsReconBackend::nodalConstBytes()) /
+                    (1024.0 * 1024.0));
+        }
+
         // WP10.2 receipt.  Printed ONLY when a warm start was asked for or
         // saved: with both halves off nothing here runs and the log is the log
         // of a build without this feature, which is what "feature-off identity"

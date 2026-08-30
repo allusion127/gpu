@@ -139,6 +139,20 @@ private:
     unsigned long long              _micx_generation = 1;
     bool                            _xsrecon_pinned  = false;
 
+    // WP15.  "The device holds micx/lmpx values this host copy does not."
+    //
+    // ATOMIC, and mutable, for one reason each.  Atomic because the readers are
+    // per-node functions called from inside OpenMP loops (ReconstructNode,
+    // UpdateUnroddedNodeXS) and the payer flips the flag while the other
+    // threads are still testing it -- a plain bool there is a data race whether
+    // or not the machine notices.  Mutable because EnsureMicxHost is const:
+    // every consumer of a cross section is.
+    //
+    // TWO FLAGS, NOT ONE, because the scatter block is 10.5 MB of the 59.5 and
+    // the depletion / Xe / CRAM readers never touch it.  See MicxNeed.
+    mutable std::atomic<bool> _micx_device_scalars{false};
+    mutable std::atomic<bool> _micx_device_scatter{false};
+
     // CRAM depletion device backend (RASBERY_GPU_CRAM, default off).  GA
     // evaluator plan Task 16.  Created on first use like _xsrecon_backend, and
     // owned here for the same reason: one XSSet, one Driver, one batch slot.
@@ -704,6 +718,48 @@ public:
         return _hoststate_generation;
     }
 
+    // --- WP15: micx/lmpx residency (RASBERY_GPU_MICX_RESIDENT) -------------
+    //
+    // With the arm on, a flat-XS device solve leaves its micx/lmpx result ON
+    // THE DEVICE and owes the host a download.  EnsureMicxHost is the SINGLE
+    // payer of that debt and every host reader and writer of `_micx`/`_lmpx`
+    // calls it first.  That sentence is the whole safety argument, and
+    // tools/test_micx_resident_contract.py is what keeps it true.
+    //
+    // WITH THE ARM OFF NOTHING IS EVER OWED, `_micx_device_scalars` and
+    // `_micx_device_scatter` are never set, and every call here is one relaxed
+    // atomic load -- so the OFF arm is the code that shipped and the A/B
+    // measures the deferral, not the bookkeeping.
+
+    /// How much of the block the caller is about to look at.
+    ///
+    ///   Scalars  the eleven scalar slots only -- what depletion, the Xe
+    ///            algebra, the CRAM condensation and the result export read.
+    ///            Leaves the 10.5 MB scatter block on the device.
+    ///   All      those plus `_micx.xssm` / `_lmpx.xssm`.  What the
+    ///            reconstruction and every host branch-delta path need.
+    ///
+    /// WHEN IN DOUBT PASS `All`.  Under-declaring is the one error this type
+    /// cannot catch, and over-declaring costs 10.5 MB, not a wrong answer.
+    enum class MicxNeed { Scalars, All };
+
+    /// Bring `_micx`/`_lmpx` back from the device if a solve left them there.
+    ///
+    /// A no-op (one atomic load) unless the arm is on AND a solve deferred.
+    /// const because every reader is: the arrays it refreshes are caches of a
+    /// device block, and refreshing a cache does not change what the object
+    /// means.  Safe to call from inside an OpenMP region -- the download runs
+    /// under a critical section and the flag is atomic, so the first thread in
+    /// pays and the rest see the debt already settled.
+    void EnsureMicxHost(MicxNeed need = MicxNeed::All) const;
+
+    /// True while any part of the block is device-only.  For receipts and for
+    /// the device paths that must NOT materialise (they read the same block).
+    [[nodiscard]] bool micxDeviceResident() const {
+        return _micx_device_scalars.load(std::memory_order_acquire) ||
+               _micx_device_scatter.load(std::memory_order_acquire);
+    }
+
     /// "Have the host bytes of _xs.xsrf / _xs.xsdf moved since you last asked?"
     ///
     /// The ONLY sound gate for Nodal::updateConstant's node sweep: those two
@@ -724,7 +780,13 @@ public:
     }
 
     // Microscopic XS accessors: [(iso, group), node]
+    //
+    // WP15: these two are the VALUE readers of the live block -- IO's
+    // node-monitor dump and NodeSpectralIndex reach `_micx` through them and
+    // through nothing else -- so the debt is paid here rather than at each call
+    // site.  A scalar read needs no scatter block; micxssm does.
     [[nodiscard]] double micx(Chiffon::XSTYPE xt, size_t iso, int ig, int l) const {
+        EnsureMicxHost(MicxNeed::Scalars);
         const size_t elem = (iso * static_cast<size_t>(_g.ng()) + static_cast<size_t>(ig)) * static_cast<size_t>(_g.nxyz()) + static_cast<size_t>(l);
         return _micx[xt][elem];
     }
@@ -733,6 +795,7 @@ public:
         return _ref_micx[xt][elem];
     }
     [[nodiscard]] double micxssm(size_t iso, int igs, int ige, int l) const {
+        EnsureMicxHost(MicxNeed::All);
         const size_t elem = (iso * static_cast<size_t>(_g.ng()) * static_cast<size_t>(_g.ng()) +
                              static_cast<size_t>(igs) * static_cast<size_t>(_g.ng()) + static_cast<size_t>(ige)) *
                                 static_cast<size_t>(_g.nxyz()) +

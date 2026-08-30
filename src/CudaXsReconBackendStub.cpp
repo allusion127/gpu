@@ -64,6 +64,32 @@ unsigned long long XsReconBackend::xeEvaluations() { return 0; }
 
 unsigned long long XsReconBackend::xeCommits() { return 0; }
 
+// WP15.  A stub build has no device block, so nothing is ever owed: the two
+// predicates are false, the payer is a no-op that succeeds (its callers treat
+// false as "the device could not hand the block back", which is not the case
+// here), and every receipt is zero.
+bool XsReconBackend::micxScalarsPending() const { return false; }
+
+bool XsReconBackend::micxScatterPending() const { return false; }
+
+unsigned long long XsReconBackend::micxResidentGeneration() const { return 0; }
+
+bool XsReconBackend::downloadFlatXsMicx(const flatxs::FlatXsView&, bool, bool) {
+    return true;
+}
+
+unsigned long long XsReconBackend::micxResidentHits() { return 0; }
+
+unsigned long long XsReconBackend::micxLazyDownloads() { return 0; }
+
+unsigned long long XsReconBackend::micxSliceDownloads() { return 0; }
+
+unsigned long long XsReconBackend::micxBytesSaved() { return 0; }
+
+unsigned long long XsReconBackend::nodalConstUploads() { return 0; }
+
+unsigned long long XsReconBackend::nodalConstBytes() { return 0; }
+
 unsigned long long XsReconBackend::nodesSolved() { return 0; }
 
 unsigned long long XsReconBackend::flatXsNodesSolved() { return 0; }
@@ -113,6 +139,8 @@ unsigned long long XsReconBackend::canonicalDownloadsElided() const { return 0; 
 bool rasberyGpuXsReconEnabled() { return false; }
 
 bool rasberyGpuFlatXsEnabled() { return false; }
+
+bool rasberyGpuMicxResidentEnabled() { return false; }
 
 bool rasberyGpuFlatXsCtaEnabled() { return false; }
 
