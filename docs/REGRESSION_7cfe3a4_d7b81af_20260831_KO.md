@@ -9,6 +9,7 @@
 | 결론 | **원인 후보 1개, 커밋 `71092e2` (WP7-C).** 나머지 22개 코드 커밋은 flag-off 경로에서 무해함이 소스로 확인됨 |
 | 수정 | 본 커밋. `src/XeAndersonReference.cpp`는 `7cfe3a4`와 **byte identical**로 복원, 채굴 채널을 분리 |
 | 확인 | 238에서 아래 §4 runbook. **§3의 한 줄 진단이 bisect보다 먼저다** |
+| **종결** | **2026-08-30, 238.** §8.4.2의 81 지점 env-only 스윕이 `XE_HOST_FORMS_DEFAULT = 0xac0`(det=P2, g0=g1=proj=P1)을 측정했고, 그 값으로 못박은 `cc0c609`는 **모든 플래그 off에서 `7cfe3a4`와 같다** — digest `22b9a3187bfb4beb` / outers `4566` / `h5diff` `0/644`. `RASBERY_GPU_XE_TXN=1`은 별개이며 **여전히 N1**(§8.4.3) |
 
 ---
 
@@ -621,7 +622,7 @@ proj     = gamma[0] * p + gamma[1] * q;
 
 | 파일:줄 | 변경 |
 | --- | --- |
-| `src/XeKernel.h:191-266` | `XE_HOST_FORMS_DEFAULT` — 네 사이트 × `{XE_SITE_NONE, P1, P2}`, **device의 `XE_TXN_*_BIT` 비트 위치와 `XE_SITE_*` 인코딩을 그대로 재사용**. `static_assert`로 algebra 채널(비트 5..12) 밖으로 못 나가게 못박음. 잠정값 `0xaa0`(네 사이트 모두 P1) — **측정이 아니라 예측**이며 §8.4의 스윕이 확정한다 |
+| `src/XeKernel.h:191-266` | `XE_HOST_FORMS_DEFAULT` — 네 사이트 × `{XE_SITE_NONE, P1, P2}`, **device의 `XE_TXN_*_BIT` 비트 위치와 `XE_SITE_*` 인코딩을 그대로 재사용**. `static_assert`로 algebra 채널(비트 5..12) 밖으로 못 나가게 못박음. **확정값 `0xac0`(det=P2, g0=g1=proj=P1)** — §8.4.2의 238 스윕이 측정했다. 본문에 남아 있던 `0xaa0`(네 사이트 모두 P1)은 예측이었고 틀렸다 |
 | `src/XeFormMask.h:53-79` | `xeHostFormMask()` 선언. 채굴하지 않는 세 번째 함수인 이유(= `XeFormAudit.h`의 논지: production 호출부에 도달할 수 있는 fixture는 없다) |
 | `src/XeFormMiner.cpp:96-147` | 해석기 정의. `RASBERY_XE_HOST_FORMS`를 **한 번** 읽어 함수-지역 `static`에 캐시, `XE_ALGEBRA_FORMS`로 trim, receipt 한 줄: `[RASBERY][FORMS] {"mask":"XE_HOST_FORMS","value":"0x...","source":"...","build_default":"0x...","det":n,"g0":n,"g1":n,"proj":n}`. 채굴은 하지 않으므로 device Xe arm을 건드리지 않는 실행은 이 줄을 찍지 않는다 |
 | `src/Driver.h:2811-2902` | 네 사이트를 `xe::xeSiteSub` / `xe::xeSiteAdd` + `xe::xeSiteState(host_forms, ...)`로 재작성. 1열 창의 `proj`는 device와 동일하게 `xsrecon::xsrMul(gamma[j], p)` — 사이트는 아니지만 `pred2 = gg - proj`에 먹히므로 배리어가 필요하다 |
@@ -629,7 +630,7 @@ proj     = gamma[0] * p + gamma[1] * q;
 | `src/Driver.h:591-598` | `kArmEnv`에 `RASBERY_XE_HOST_FORMS` 추가 — 궤적을 옮기는 knob이므로 WP10.1 case key에 접혀야 한다(스윕 지점끼리 캐시가 섞이면 스윕 자체가 무의미) |
 | `src/XeFormAudit.{h,cpp}` | audit이 **두 mask를 모두** 본다. 불일치 시 "두 algebra 채널이 다른 값이다 → `RASBERY_XE_FORMS`의 5..12를 `0x...`로 맞춰라" 또는 "같은 값인데 다르다 → 두 body가 서로의 철자가 아니다"를 구분해 출력 |
 | `src/XeGpuReceipt.h` | `forms_audit_host_mask` 필드 + receipt key |
-| `tools/test_xe_host_forms_contract.py` | **신규.** 48 검사 / 음성대조 11 |
+| `tools/test_xe_host_forms_contract.py` | **신규.** 52 검사 / 음성대조 13 (본 커밋에서 M3a/M3b + 음성대조 2 추가 — default 값 자체를 못박는다) |
 | `tools/test_xe_split_arm_sequence_contract.py` §F | **규칙이 역전됐다.** "네 식이 문자 그대로 남아 있다" → "네 식이 배리어를 통과한다" |
 | `tools/test_xe_gpu_contract.py`, `tools/test_xe_txn_contract.py` | 두 arm이 더 이상 같은 철자가 아니라는 사실을 명시적으로 인코딩. 인용문(`XeAlgebraReference.cpp`)은 **손대지 않았고**, 이제 순수 host arm을 인용하는 것으로 규칙이 옮겨졌다 |
 
@@ -645,6 +646,9 @@ proj     = gamma[0] * p + gamma[1] * q;
 **정확한 다중집합**으로 잠근다 — 새 항이 하나라도 생기면 실패한다.
 
 ### 8.4 238 스윕 런북 — 81 조합에서 `XE_HOST_FORMS_DEFAULT` 확정
+
+> **실행 완료 (238, 2026-08-30). 결과는 §8.4.2.** 아래는 실행된 절차 그대로이며,
+> 재현·재측정용으로 남긴다.
 
 환경은 §4.1 그대로, `RASBERY_GPU_XE_TXN`은 unset, §8.1과 같은 GPU 하나.
 **빌드는 한 번만 한다**: 스윕이 바꾸는 것은 env 하나뿐이어야 하며, 지점마다
@@ -673,7 +677,7 @@ grep 22b9a3187bfb4beb sweep_summary.txt      # -> outers 4566 이어야 한다
 루프 순서를 `1 0 2`로 둔 이유: `1`(P1)이 gcc `convert_mult_to_fma`의 통상적인
 선택이고 현재의 잠정 default이므로, 맞았다면 **첫 번째 실행에서 끝난다**.
 
-확정 후:
+확정 후 (**1·3·4는 완료 — §8.4.2. 1의 못박기는 본 커밋, 2는 못박은 바이너리로 238에서 한 번 더 돌려 `source":"build_default"`를 확인하는 것이 남았다**):
 
 1. 이긴 조합으로 `src/XeKernel.h`의 `XE_HOST_FORMS_DEFAULT`를 다시 못박는다
    (`XE_SITE_*` 이름으로 쓴다 — 16진수는 receipt가 찍어 준다).
@@ -692,11 +696,66 @@ grep 22b9a3187bfb4beb sweep_summary.txt      # -> outers 4566 이어야 한다
 
 #### 8.4.1 81이 아니라 16으로 줄여도 되는가
 
-된다 — 단, 줄이는 근거는 "이진일 것"이 아니라 **`XE_SITE_P2`가 gcc에서 관측된 적이
+**결과적으로 줄이면 안 됐다.** 이긴 지점 `0xac0`의 det가 `XE_SITE_P2`이므로 16회 축소판(각 사이트 `1 0`)은 정답을 **포함하지 않는다**. 아래는 축소를 검토했던 당시의 논거이고, 기록으로 남긴다 — 줄이는 근거는 "이진일 것"이 아니라 **`XE_SITE_P2`가 gcc에서 관측된 적이
 없다**는 것뿐이므로, 81회에서 답이 안 나올 때 P2를 다시 켤 수 있게 위 루프를 그대로
 둔다. 16회 축소판은 각 루프를 `1 0`으로 바꾸면 된다. 한 지점이 단일 kngr_238
 1회이므로 81회는 하룻밤 작업이고, 이 캠페인에서 "재빌드 없는 env 스윕"이 이 정도로
 싼 경우는 드물다.
+
+#### 8.4.2 스윕 결과 (238, 2026-08-30) — **`0xac0`으로 확정**
+
+조건: arm X, `RASBERY_GPU_XE_TXN` **unset**, GPU 1개, `cc0c609` **단일 빌드**,
+바뀐 것은 `RASBERY_XE_HOST_FORMS` 하나뿐(env-only). 81 지점 전수.
+
+| mask | `[det,g0,g1,proj]` | digest | outers | 판정 |
+| --- | --- | --- | --- | --- |
+| `0xaa0` | `[1,1,1,1]` = 네 사이트 P1 | `e1660d1f4652b49a` | 4576 | 예측값 — **틀렸다** |
+| **`0xac0`** | **`[2,1,1,1]` = det P2, 나머지 P1** | **`22b9a3187bfb4beb`** | **4566** | **`7cfe3a4` 재현. 81 중 55번째 지점** |
+| 그 외 79 지점 | — | 위 둘 중 어느 것도 아님 | — | mask는 **살아 있다**(§8.4-4의 대조 통과) |
+
+`h5diff -c results_7cfe3a4.h5 results_0xac0.h5 | tail -3` → **0/644**.
+
+수신증(env override로 이긴 지점을 찍었을 때):
+
+```json
+{"mask":"XE_HOST_FORMS","value":"0xac0","source":"env","build_default":"0xaa0",
+ "det":2,"g0":1,"g1":1,"proj":1}
+```
+
+`build_default`가 `0xaa0`으로 찍혀 있다는 것이 바로 **못박기가 아직 안 됐다**는
+증거였고, 본 커밋이 그것을 `0xac0`으로 옮긴다. 못박은 뒤 arm X를 env **없이**
+돌리면 같은 줄이 `"value":"0xac0","source":"build_default","build_default":"0xac0"`로
+나와야 한다 — `source`가 `env`로 남아 있으면 못박기가 안 된 것이다.
+
+**왜 det만 P2인가.** 나머지 세 식(`c*p - b*q`, `a*q - b*p`, `g0*p + g1*q`)에서는
+gcc가 통상대로 **첫 곱**을 접는다. `det = a*c - b*b`만 접을 수 있는 곱이
+**빼는 쪽**이고, gcc는 여기서 `a*c`에 대한 fma가 아니라 `b*b`에 대한 **fnma**를
+택한다. 즉 예측 `0xaa0`은 "첫 곱을 접는다"는 규칙 자체는 맞았고, 그 규칙이
+뺄셈에서 어느 피연산자를 가리키는지에서 틀렸다.
+
+#### 8.4.3 종결 판정
+
+**회귀 종결.** `7cfe3a4` == `cc0c609` + 본 커밋의 못박기, **모든 플래그 off**에서
+digest `22b9a3187bfb4beb` / outers `4566` / `h5diff` **0/644**. §8.1이 연 질문
+("flag-off 궤적이 콜그래프의 함수였다")은 §8.3의 배리어로 닫혔고, 남아 있던 자유
+변수 하나(어느 형태로 고정할 것인가)는 §8.4.2의 스윕이 측정으로 닫았다. 앞으로
+`SolveLoop` 근처의 편집은 이 궤적을 옮길 수 없다 — 옮긴다면 그것은 배리어가
+뚫렸다는 뜻이고, `tools/test_xe_host_forms_contract.py`의 S1/S2가 먼저 잡는다.
+
+**`RASBERY_GPU_XE_TXN=1`은 여전히 N1이다.** 본 커밋이 확정한 것은 **host**
+철자뿐이다. device transaction이 같은 대수를 계산한다는 것은 아직 증명되지
+않았고, 그 증명은 `0xac0` 아래에서 `RASBERY_XE_FORMS_AUDIT=1`로 한다:
+`[RASBERY][XE_GPU]`의 `forms_audit_mask`의 algebra 채널이 `forms_audit_host_mask`
+(= `0xac0`)와 **같고** `forms_audit_mismatch == 0`일 때에만 B0을 말할 수 있다.
+다르면 `RASBERY_XE_FORMS`로 비트 5..12를 host mask에 맞춘다 — 그 문장은 audit이
+직접 로그에 찍는다.
+
+**상시 규칙 (본 절이 남기는 것).** `XE_HOST_FORMS_DEFAULT`는 **측정으로만**
+움직인다. 값을 바꾸려면 (1) 같은 81 지점 env-only 스윕을 **단일 빌드**로 다시
+돌리고, (2) `src/XeKernel.h`와 `tools/test_xe_host_forms_contract.py`의 `PINNED_SITES`
+/ `PINNED_MASK`를 **같은 커밋에서 함께** 옮기며, (3) 새 digest/outers를 이 표에
+한 줄로 추가한다. 한쪽만 움직이면 계약이 FAIL하고, 그것이 의도다 — 조용히 바뀐
+default가 바로 이 문서가 존재하는 이유다.
 
 ### 8.5 `RASBERY_NEVER_INLINE` — **유지한다**
 
@@ -721,6 +780,12 @@ grep 22b9a3187bfb4beb sweep_summary.txt      # -> outers 4566 이어야 한다
 2. S3/S4/S5: 네 사이트가 `xeSite*` + `host_forms`로 쓰여 있고, 1열 `proj`가
    배리어를 통과하며, mask는 함수-지역 `static`에 **한 번만** 해석된다.
 3. M1..M15: `XE_HOST_FORMS_DEFAULT`가 네 필드 × 세 상태이고 algebra 채널 안에 있으며,
+   그리고 **M3a/M3b**: 그 값이 §8.4.2가 측정한 `0xac0`(det=P2, g0=g1=proj=P1)
+   **바로 그것**이라는 것 — 상태와 `XE_TXN_*_BIT` 자리를 둘 다 헤더에서 읽어
+   접으므로 비트 자리가 움직여도 잡힌다. 음성 대조 2개가 default를 `0xaa0`으로
+   되돌리거나 det 비트를 옮겨 보고, 규칙이 **FAIL하지 않으면** 그것이 실패다.
+   `tools/test_xe_host_forms_contract.py`도 함께 고치지 않고 default만 옮기면
+   커밋이 통과하지 못한다 — 그것이 §8.4.3의 상시 규칙을 기계가 집행하는 방식이다;
    `xeHostFormMask()`가 `XeFormMask.h`에 선언·`XeFormMiner.cpp`에 정의되고 **절대
    채굴하지 않으며**, env는 `src/` 전체에서 **읽는 곳이 하나**이고, 값은
    `XE_ALGEBRA_FORMS`로 trim되며, receipt가 네 사이트를 각각의 필드로 찍고, knob이

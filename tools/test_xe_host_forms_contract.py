@@ -380,6 +380,65 @@ check(all(state in ("NONE", "P1", "P2") for state, _ in FIELDS) and len(FIELDS) 
       "M3 every field is one of the three XE_SITE_* states",
       "got %s" % FIELDS)
 
+# --- The pin itself. -------------------------------------------------------
+# M2/M3 say the default is WELL FORMED; they would pass just as happily on a
+# default that had silently drifted back to a guess.  What follows says WHICH
+# well-formed value it is, and it is the one 238 measured on 2026-08-30 (81
+# points, one build, env-only sweep, arm X with RASBERY_GPU_XE_TXN unset):
+#
+#     0xaa0  [1,1,1,1]  e1660d1f4652b49a / 4576 outers   <- the prediction
+#     0xac0  [2,1,1,1]  22b9a3187bfb4beb / 4566 outers   <- 7cfe3a4, point 55/81
+#
+# The det site is the odd one out because its fusable multiply is the
+# SUBTRAHEND of `a * c - b * b`: gcc takes the fnma on b*b, not the fma on a*c.
+PINNED_SITES = {"DET": "P2", "G0": "P1", "G1": "P1", "PROJ": "P1"}
+PINNED_MASK = 0xac0
+
+STATE_VALUE = {"NONE": 0, "P1": 1, "P2": 2}
+
+
+def default_sites(kernel_code):
+    """{site: state} out of the XE_HOST_FORMS_DEFAULT initializer, or {}."""
+    decl = re.search(
+        r"constexpr\s+unsigned\s+long\s+long\s+XE_HOST_FORMS_DEFAULT\s*=(.*?);",
+        kernel_code, re.S)
+    if decl is None:
+        return {}
+    return {site: state for state, site in re.findall(
+        r"XE_SITE_([A-Z0-9]+)\s*\)?\s*<<\s*XE_TXN_([A-Z0-9]+)_BIT", decl.group(1))}
+
+
+def default_mask(kernel_code):
+    """The initializer folded into a number, with the SHIFTS read from the
+    header too -- so a moved XE_TXN_*_BIT is caught here and not only by the
+    device-side contract."""
+    sites = default_sites(kernel_code)
+    if sorted(sites) != ["DET", "G0", "G1", "PROJ"]:
+        return None
+    value = 0
+    for site, state in sites.items():
+        bit = re.search(r"XE_TXN_%s_BIT\s*=\s*(\d+)" % site, kernel_code)
+        if bit is None or state not in STATE_VALUE:
+            return None
+        value |= STATE_VALUE[state] << int(bit.group(1))
+    return value
+
+
+SITES_NOW = default_sites(KERNEL_CODE)
+check(SITES_NOW == PINNED_SITES,
+      "M3a the default is the 238-MEASURED pin: det=P2, g0=P1, g1=P1, proj=P1",
+      "got %s; if 238 re-measured, re-run the 81-point sweep and move BOTH "
+      "this pin and src/XeKernel.h together -- a default that moves alone is "
+      "the regression this whole file exists to stop" % SITES_NOW)
+
+MASK_NOW = default_mask(KERNEL_CODE)
+check(MASK_NOW == PINNED_MASK,
+      "M3b the initializer folds to 0x%x -- the value the receipt must print "
+      "as build_default" % PINNED_MASK,
+      "got %s; the states and the BIT positions are both read from the header, "
+      "so this also fails if XE_TXN_*_BIT moved under a correct-looking "
+      "initializer" % (MASK_NOW if MASK_NOW is None else "0x%x" % MASK_NOW))
+
 check(squash("static_assert((XE_HOST_FORMS_DEFAULT & ~XE_ALGEBRA_FORMS) == 0ull,")
       in squash(KERNEL_CODE),
       "M4 a static_assert keeps the default inside the algebra channel",
@@ -595,6 +654,16 @@ NEGATIVES = [
     ("the audit forgets the host mask",
      lambda: "xeHostFormMask()" in strip_comments_and_strings(
          AUDIT_CPP.replace("xeHostFormMask()", "xeFormMask()"))),
+
+    ("the default silently drifts back to the 0xaa0 prediction",
+     lambda: default_sites(strip_comments_and_strings(KERNEL.replace(
+         "XE_SITE_P2) << XE_TXN_DET_BIT", "XE_SITE_P1) << XE_TXN_DET_BIT", 1)))
+     == PINNED_SITES),
+
+    ("the default keeps its four states but a site's BIT moves",
+     lambda: default_mask(strip_comments_and_strings(KERNEL.replace(
+         "constexpr int XE_TXN_DET_BIT   = 5;",
+         "constexpr int XE_TXN_DET_BIT   = 6;", 1))) == PINNED_MASK),
 
     ("the pure host arm gets barriered too",
      lambda: (lambda d: all(s in squash(body_of(strip_comments_and_strings(d), HOST_SIG))

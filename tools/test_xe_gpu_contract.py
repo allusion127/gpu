@@ -184,9 +184,11 @@ for const in (
 # not a choice, and barriering it would move the baseline instead of holding
 # it.  What must still be equal is the VALUE, and that is what
 # XE_HOST_FORMS_DEFAULT is pinned to deliver -- by the 238 sweep, because no
-# fixture can reach a production call site (src/XeFormAudit.h).  See
-# docs/REGRESSION_7cfe3a4_d7b81af_20260831_KO.md section 8 and
-# tools/test_xe_host_forms_contract.py.
+# fixture can reach a production call site (src/XeFormAudit.h).  The sweep ran
+# on 2026-08-30 and the answer is 0xac0 (det=P2, g0=g1=proj=P1): 22b9a3187bfb4beb
+# / 4566 outers, the 7cfe3a4 value.  See
+# docs/REGRESSION_7cfe3a4_d7b81af_20260831_KO.md sections 8.4.2-8.4.3, and
+# tools/test_xe_host_forms_contract.py M3a/M3b, which own the pin.
 for expr in (
     "det = a * c - b * b",
     "gamma[0] = (c * p - b * q) / det",

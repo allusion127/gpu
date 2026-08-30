@@ -236,26 +236,33 @@ constexpr unsigned XE_SITE_P2   = 2u;
 /// XeAlgebraReference.cpp, with that TU's operand provenance" -- which is
 /// exactly the question `src/XeFormAudit.h` documents as the wrong one.  There
 /// is no fixture that can reach the production call site.  So the value is
-/// PINNED BY MEASUREMENT INSTEAD: the 238 runner sweeps the 81 combinations
-/// with RASBERY_XE_HOST_FORMS and keeps the one whose `[RASBERY][TRAJECTORY]`
+/// PINNED BY MEASUREMENT INSTEAD: the 238 runner swept the 81 combinations
+/// with RASBERY_XE_HOST_FORMS and kept the one whose `[RASBERY][TRAJECTORY]`
 /// digest is 22b9a3187bfb4beb / 4566 outers.  See §8.4 of the regression doc
-/// for the loop.
+/// for the loop and §8.4.2 for the outcome.
 ///
-///     PROVISIONAL: 0xaa0 -- all four sites XE_SITE_P1.
+///     MEASURED on 238, gcc 14.3 -O3 -ffp-contract=fast, 2026-08-30:
+///     0xac0 -- det = XE_SITE_P2 (b*b is the multiply gcc fuses into
+///     `a * c - b * b`, as an fnma), g0 = g1 = proj = XE_SITE_P1.
 ///
-/// That is gcc's usual `convert_mult_to_fma` outcome (the pass reaches the
-/// FIRST multiply feeding the add and fuses it), and it is a PREDICTION, not a
-/// measurement.  It is written here rather than left at zero because zero is
-/// also a guess and a wrong non-zero guess announces itself in the sweep,
-/// where an all-none default would look like "the sweep was never run".  The
-/// moment 238 reports the winning combination this line is re-pinned to it and
-/// the receipt's `source` field says `build_default` again.
+/// The earlier value 0xaa0 -- all four sites XE_SITE_P1 -- was a PREDICTION,
+/// gcc's usual `convert_mult_to_fma` outcome (the pass reaches the FIRST
+/// multiply feeding the add and fuses it).  The sweep says it is right for
+/// three sites and wrong for the fourth: at the det site the fusable multiply
+/// is the SUBTRAHEND, and gcc takes the fnma rather than the fma.  0xaa0 gives
+/// digest e1660d1f4652b49a / 4576 outers; 0xac0 gives 22b9a3187bfb4beb / 4566,
+/// which is `7cfe3a4`.  The winner was point 55 of the 81, and the control --
+/// any other value of RASBERY_XE_HOST_FORMS -- moves the digest, so the mask
+/// is live and not a decoration.  It moves only by MEASUREMENT: a new value
+/// needs a fresh 81-point single-build sweep, and it must move together with
+/// tools/test_xe_host_forms_contract.py's PINNED_SITES / PINNED_MASK, which
+/// FAIL if this line drifts alone.
 ///
 /// Bits outside XE_ALGEBRA_FORMS are not representable in this mask: the
 /// resolver masks them off.  The dot and the candidate are DEVICE sites and
 /// keep being decided by XE_FORMS.
 constexpr unsigned long long XE_HOST_FORMS_DEFAULT =
-    (static_cast<unsigned long long>(XE_SITE_P1) << XE_TXN_DET_BIT) |
+    (static_cast<unsigned long long>(XE_SITE_P2) << XE_TXN_DET_BIT) |
     (static_cast<unsigned long long>(XE_SITE_P1) << XE_TXN_G0_BIT) |
     (static_cast<unsigned long long>(XE_SITE_P1) << XE_TXN_G1_BIT) |
     (static_cast<unsigned long long>(XE_SITE_P1) << XE_TXN_PROJ_BIT);
