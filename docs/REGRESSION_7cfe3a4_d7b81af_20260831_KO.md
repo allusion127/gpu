@@ -567,3 +567,206 @@ grep -h 'XE_GPU'      run_txn.log
   둘 다 이미 있었다).
 - §6.3의 "비트 5 이상을 소비하는 live-arm 코드는 없다"는 **유효하다.**
   이번 판정은 그것을 뒤집지 않고, 그 음성 판정이 남긴 공백을 메운다.
+
+---
+
+## 8. 재정정 (2026-08-31, 두 번째): §7의 처방은 **동전 던지기**였다 — 원인은 배리어 없는 host FP
+
+### 8.1 238이 새로 준 관측 (arm X, `RASBERY_GPU_XE_TXN` unset, GPU1)
+
+| 트리 | digest | outers | 판정 |
+| --- | --- | --- | --- |
+| `048c6c1` (§7의 수정 — `TryAndersonXeStepGpuTxn`에 `RASBERY_NEVER_INLINE`) | `c1a5d9116df9edb3` | 4601 | **drifted** |
+| 같은 트리에서 **그 토큰 하나만 제거** (= `d85984e` 상태) | `22b9a3187bfb4beb` | 4566 | clean (= `7cfe3a4`) |
+| `47161ed` | — | — | clean |
+| `47161ed` + `71092e2` | — | — | drifted |
+| `d7b81af` / `8919331` / `32ac308` | `c1a5d9116df9edb3` | 4601 | drifted |
+| hunk B (kernel-side, `Driver.h` 포함) | — | — | drifted |
+
+§7.7의 판정표는 (1)이 `22b9a3187bfb4beb`이면 B0 복구, (2)가
+`c1a5d9116df9edb3`이면 인라이닝이 원인 확정이라고 적었다. **238이 준 것은 정확히
+그 반대**다: 속성을 붙인 쪽이 4601, 뗀 쪽이 4566.
+
+### 8.2 판정 — class는 §7이 맞고, 처방이 틀렸다
+
+`RASBERY_NEVER_INLINE`은 이 arm 주변의 인라이닝 문맥을 **바꾸는 것 중 하나**다.
+그러므로 그것으로 문맥을 고정할 수 없다. 위 여섯 줄은 하나의 문장으로 요약된다:
+
+> **flag-off 궤적은 split device Xe arm 주변에서 gcc의 인라이닝/코드생성 문맥이
+> 바뀔 때마다 뒤집힌다.**
+
+그리고 뒤집히는 이유는 `src/Driver.h`의 네 식이 **배리어 없는 host 부동소수
+연산**이었다는 것 하나뿐이다 (수정 전 기준 `:2808-2814`):
+
+```cpp
+det      = a * c - b * b;
+gamma[0] = (c * p - b * q) / det;
+gamma[1] = (a * q - b * p) / det;
+proj     = gamma[0] * p + gamma[1] * q;
+```
+
+각각 두 개의 곱이 하나의 덧셈으로 들어가는 모양이고, 빌드는
+`-O3 -ffp-contract=fast`, 단일 TU(`src/main.cpp` → `Driver.h`), LTO 없음이다.
+이 조건에서 gcc의 `convert_mult_to_fma`는 **어느 곱을 덧셈에 접을지를 호출부마다
+다시 결정한다**. 즉 flag-off 궤적은 산술의 함수가 아니라 **콜그래프의 함수**였다.
+`d85984e`가 깨끗했던 것은 고쳐서가 아니라 **운이 좋아 `7cfe3a4`와 같은 형태로
+떨어졌기 때문**이며, SolveLoop 근처의 다음 편집이 다시 굴렸을 것이다.
+
+§7.3("남는 것은 main.cpp TU의 콜그래프 질량")은 **철회하지 않는다.** 그것은 이
+현상의 *기전*이고, 8.2는 그 기전이 왜 *결과*를 바꿀 수 있었는지 — 결정권이 gcc에게
+있었다는 것 — 를 말한다. 바뀐 것은 **처방**이다: 문맥을 고정하는 대신 **결정 자체를
+없앤다.**
+
+### 8.3 수정 (본 커밋)
+
+| 파일:줄 | 변경 |
+| --- | --- |
+| `src/XeKernel.h:191-266` | `XE_HOST_FORMS_DEFAULT` — 네 사이트 × `{XE_SITE_NONE, P1, P2}`, **device의 `XE_TXN_*_BIT` 비트 위치와 `XE_SITE_*` 인코딩을 그대로 재사용**. `static_assert`로 algebra 채널(비트 5..12) 밖으로 못 나가게 못박음. 잠정값 `0xaa0`(네 사이트 모두 P1) — **측정이 아니라 예측**이며 §8.4의 스윕이 확정한다 |
+| `src/XeFormMask.h:53-79` | `xeHostFormMask()` 선언. 채굴하지 않는 세 번째 함수인 이유(= `XeFormAudit.h`의 논지: production 호출부에 도달할 수 있는 fixture는 없다) |
+| `src/XeFormMiner.cpp:96-147` | 해석기 정의. `RASBERY_XE_HOST_FORMS`를 **한 번** 읽어 함수-지역 `static`에 캐시, `XE_ALGEBRA_FORMS`로 trim, receipt 한 줄: `[RASBERY][FORMS] {"mask":"XE_HOST_FORMS","value":"0x...","source":"...","build_default":"0x...","det":n,"g0":n,"g1":n,"proj":n}`. 채굴은 하지 않으므로 device Xe arm을 건드리지 않는 실행은 이 줄을 찍지 않는다 |
+| `src/Driver.h:2811-2902` | 네 사이트를 `xe::xeSiteSub` / `xe::xeSiteAdd` + `xe::xeSiteState(host_forms, ...)`로 재작성. 1열 창의 `proj`는 device와 동일하게 `xsrecon::xsrMul(gamma[j], p)` — 사이트는 아니지만 `pred2 = gg - proj`에 먹히므로 배리어가 필요하다 |
+| `src/Driver.h:17` | `#include "XeFormMask.h"` |
+| `src/Driver.h:591-598` | `kArmEnv`에 `RASBERY_XE_HOST_FORMS` 추가 — 궤적을 옮기는 knob이므로 WP10.1 case key에 접혀야 한다(스윕 지점끼리 캐시가 섞이면 스윕 자체가 무의미) |
+| `src/XeFormAudit.{h,cpp}` | audit이 **두 mask를 모두** 본다. 불일치 시 "두 algebra 채널이 다른 값이다 → `RASBERY_XE_FORMS`의 5..12를 `0x...`로 맞춰라" 또는 "같은 값인데 다르다 → 두 body가 서로의 철자가 아니다"를 구분해 출력 |
+| `src/XeGpuReceipt.h` | `forms_audit_host_mask` 필드 + receipt key |
+| `tools/test_xe_host_forms_contract.py` | **신규.** 48 검사 / 음성대조 11 |
+| `tools/test_xe_split_arm_sequence_contract.py` §F | **규칙이 역전됐다.** "네 식이 문자 그대로 남아 있다" → "네 식이 배리어를 통과한다" |
+| `tools/test_xe_gpu_contract.py`, `tools/test_xe_txn_contract.py` | 두 arm이 더 이상 같은 철자가 아니라는 사실을 명시적으로 인코딩. 인용문(`XeAlgebraReference.cpp`)은 **손대지 않았고**, 이제 순수 host arm을 인용하는 것으로 규칙이 옮겨졌다 |
+
+`xsrMul`(`src/XsReconKernel.h:83`)은 gcc에서 `asm volatile("" : "+x"(p))`를 달고
+있으므로, 그 결과를 다시 곱셈으로 되돌려 접을 수 있는 문맥은 없다. `xeSiteSub` /
+`xeSiteAdd`의 **세 상태 전부**가 `xsrFma`/`xsrMul`로만 쓰여 있으므로
+(`src/XeKernel.h:649-666`), 어떤 상태를 고르든 결과는 인라이닝과 무관하다.
+
+경로에 남은 부동소수 연산은 넷뿐이며 전부 **접힐 덧셈이 없다**:
+`XE_ANDERSON_MIN_GRAM * a * c`, `XE_ANDERSON_MIN_GRAM * gg`,
+`max_step * picard`(곱 사슬 → 비교), `gg - proj`(뺄셈 하나, 그리고 `proj`는 이제
+배리어 출력). `tools/test_xe_host_forms_contract.py`의 S1/S2가 이 목록을
+**정확한 다중집합**으로 잠근다 — 새 항이 하나라도 생기면 실패한다.
+
+### 8.4 238 스윕 런북 — 81 조합에서 `XE_HOST_FORMS_DEFAULT` 확정
+
+환경은 §4.1 그대로, `RASBERY_GPU_XE_TXN`은 unset, §8.1과 같은 GPU 하나.
+**빌드는 한 번만 한다**: 스윕이 바꾸는 것은 env 하나뿐이어야 하며, 지점마다
+재빌드하면 이 커밋이 없애려는 바로 그 변수(콜그래프)를 다시 들여오게 된다.
+
+```bash
+git checkout <이 커밋>
+# 빌드: 캠페인 표준 (WSL micromamba CUDA 12.6, 238 = sm120), 한 번만
+
+# 81 조합.  det/g0/g1/proj 각각 0=NONE, 1=P1(첫 곱을 fma), 2=P2(둘째 곱을 fma).
+# mask = det<<5 | g0<<7 | g1<<9 | proj<<11   (device XE_TXN_*_BIT과 같은 자리)
+for d in 1 0 2; do for g0 in 1 0 2; do for g1 in 1 0 2; do for pj in 1 0 2; do
+  M=$(( (d<<5) | (g0<<7) | (g1<<9) | (pj<<11) ))
+  H=$(printf '0x%x' "$M")
+  RASBERY_XE_HOST_FORMS=$H <arm X env> ./RASBERY <kngr_238 deck> > "sweep_$H.log" 2>&1
+  T=$(grep -h 'RASBERY..TRAJECTORY' "sweep_$H.log" | head -1)
+  D=$(printf '%s' "$T" | sed -n 's/.*"digest":"\([0-9a-f]*\)".*/\1/p')
+  O=$(printf '%s' "$T" | sed -n 's/.*"outers":\([0-9]*\).*/\1/p')
+  printf '%-6s [%d%d%d%d]  %s  %s\n' "$H" "$d" "$g0" "$g1" "$pj" "$D" "$O"
+done; done; done; done | tee sweep_summary.txt
+
+# 찾는 줄
+grep 22b9a3187bfb4beb sweep_summary.txt      # -> outers 4566 이어야 한다
+```
+
+루프 순서를 `1 0 2`로 둔 이유: `1`(P1)이 gcc `convert_mult_to_fma`의 통상적인
+선택이고 현재의 잠정 default이므로, 맞았다면 **첫 번째 실행에서 끝난다**.
+
+확정 후:
+
+1. 이긴 조합으로 `src/XeKernel.h`의 `XE_HOST_FORMS_DEFAULT`를 다시 못박는다
+   (`XE_SITE_*` 이름으로 쓴다 — 16진수는 receipt가 찍어 준다).
+2. env override **없이** 한 번 더 돌려 `[RASBERY][FORMS] {"mask":"XE_HOST_FORMS",
+   ...,"source":"build_default",...}`와 digest `22b9a3187bfb4beb` / outers `4566`을
+   같은 로그에서 확인한다. `source`가 `env`로 남아 있으면 못박기가 안 된 것이다.
+3. `h5diff -c results_47161ed.h5 results_fix.h5 | tail -3` → `0/644`.
+4. 대조: `RASBERY_XE_HOST_FORMS`를 이긴 값 이외의 아무 값으로 주면 digest가
+   **움직여야 한다**. 안 움직이면 mask가 소비되지 않고 있다는 뜻이고, 그때는
+   `[FORMS]` receipt의 네 자리(`det`/`g0`/`g1`/`proj`)를 먼저 읽는다.
+5. 그 다음에야 `RASBERY_GPU_XE_TXN=1` + `RASBERY_XE_FORMS_AUDIT=1`로 B0을 노린다.
+   `[RASBERY][XE_GPU]`의 `forms_audit_mask`의 algebra 채널이
+   `forms_audit_host_mask`와 같아야 하고, `forms_audit_mismatch`가 0이어야 한다.
+   다르면 `RASBERY_XE_FORMS`로 bits 5..12를 host mask에 맞춘다 — 그 문장은 이제
+   audit이 직접 로그에 찍어 준다.
+
+#### 8.4.1 81이 아니라 16으로 줄여도 되는가
+
+된다 — 단, 줄이는 근거는 "이진일 것"이 아니라 **`XE_SITE_P2`가 gcc에서 관측된 적이
+없다**는 것뿐이므로, 81회에서 답이 안 나올 때 P2를 다시 켤 수 있게 위 루프를 그대로
+둔다. 16회 축소판은 각 루프를 `1 0`으로 바꾸면 된다. 한 지점이 단일 kngr_238
+1회이므로 81회는 하룻밤 작업이고, 이 캠페인에서 "재빌드 없는 env 스윕"이 이 정도로
+싼 경우는 드물다.
+
+### 8.5 `RASBERY_NEVER_INLINE` — **유지한다**
+
+지운다는 선택지가 있었고, 유지한다. 이유는 셋이다.
+
+1. **이제 무해함이 증명된다.** 경로 전체가 배리어를 통과하므로 이 속성이 인라이닝을
+   어떻게 바꾸든 flag-off 궤적의 *값*에는 도달할 수 없다. §8.1에서 이 속성이 궤적을
+   옮길 수 있었던 것은 오직 네 식이 배리어 없이 있었기 때문이다.
+2. **여전히 사고 있는 것이 있다.** default-off arm ~110줄이 `SolveLoop`에 접히지
+   않는다는 성질 자체는 명령어 풋프린트에 대한 정당한 성질이고, `cold`가 dispatch
+   분기를 unlikely로 남긴다.
+3. **한 번에 하나씩.** §8.4의 스윕은 단일 변수 실험이다. 같은 커밋에서 속성까지
+   떼면, 스윕이 답을 못 찾았을 때 "배리어가 부족한가, 속성이 문제였나"를 다시
+   가를 수 없다. 속성 제거는 스윕이 끝난 뒤의 별도 A/B 후보로 남긴다.
+
+### 8.6 새 계약 테스트가 잠그는 규칙
+
+1. **S1/S2 스캔**: `TryAndersonXeStepGpu`와 `TryAndersonXeStepGpuTxn` 안의 double에
+   대한 모든 이항 `*`/`+`/`-`를 연산자 단위로 열거하고, 각각이 이유가 적힌 허용
+   다중집합의 원소여야 한다. **개수까지 정확히** 비교하므로 `a * c`가 이미 허용
+   목록에 있어도 `det = a * c - b * b`를 되살리면 잡힌다.
+2. S3/S4/S5: 네 사이트가 `xeSite*` + `host_forms`로 쓰여 있고, 1열 `proj`가
+   배리어를 통과하며, mask는 함수-지역 `static`에 **한 번만** 해석된다.
+3. M1..M15: `XE_HOST_FORMS_DEFAULT`가 네 필드 × 세 상태이고 algebra 채널 안에 있으며,
+   `xeHostFormMask()`가 `XeFormMask.h`에 선언·`XeFormMiner.cpp`에 정의되고 **절대
+   채굴하지 않으며**, env는 `src/` 전체에서 **읽는 곳이 하나**이고, 값은
+   `XE_ALGEBRA_FORMS`로 trim되며, receipt가 네 사이트를 각각의 필드로 찍고, knob이
+   `kArmEnv`에 있다.
+4. A1..A4: audit이 device mask와 host mask를 **둘 다** 보고, tally와 receipt가 둘 다
+   싣는다.
+5. N1/N2: **순수 host arm(`TryAndersonXeStep`)은 배리어를 달지 않는다.** 그것은
+   기준선의 *정의*이지 선택이 아니며, 배리어를 달면 arm-off 기준선이 움직인다.
+
+```bash
+python tools/test_xe_host_forms_contract.py
+python tools/test_xe_split_arm_sequence_contract.py
+python tools/test_xe_forms_default_contract.py
+python tools/test_xe_forms_shipped_split_contract.py
+python tools/test_xe_forms_audit_contract.py
+python tools/test_xe_gpu_contract.py
+python tools/test_xe_txn_contract.py
+python tools/test_xe_anderson.py
+python tools/test_case_key_contract.py
+python tools/test_enum_alias_contract.py
+python tools/test_dependent_template_contract.py
+python tools/test_telemetry_neutrality.py
+```
+
+### 8.7 캠페인 상시 규칙 (이 사건이 남기는 것)
+
+1. **궤적을 결정하는 경로 위의 host 부동소수 식은 전부 배리어를 통과해야 한다.**
+   "덧셈 하나에 곱 둘"이 보이면 그것은 사이트이고, `-ffp-contract=fast`에서
+   컴파일러가 결정권을 갖는다. 곱 사슬·나눗셈·비교는 사이트가 아니다.
+2. **`SolveLoop` 근처의 새 static·새 sibling·새 속성은 attribute만으로 안전하지
+   않다.** `8919331`의 audit 훅이 중립이었던 것은 callee가 다른 TU에 있어서였고,
+   `048c6c1`의 `noinline`이 중립이 아니었던 것은 그 아래 산술이 배리어 없이 있어서다.
+   중립성의 근거는 "불투명한 호출"이 아니라 **"결정할 것이 남아 있지 않다"**여야 한다.
+3. **기준선을 *재현*해야 하는 경로에만 적용한다.** 기준선 *자체*(순수 host arm)는
+   raw로 둔다. 배리어를 다는 것은 기준선을 고정하는 것이 아니라 옮기는 것이다.
+4. **채굴은 다른 TU의 인용문을 답한다.** production 호출부의 철자는 채굴로 알 수
+   없고(`src/XeFormAudit.h`), 그러므로 그런 상수는 **상수 + 스윕**으로 못박는다.
+   채굴값은 스윕의 첫 추측으로 쓴다.
+
+### 8.8 §7.6·§7.7에 대한 정정
+
+- §7.6의 수정(`RASBERY_NEVER_INLINE`)은 **원인을 제거하지 못했다.** 유지 여부는
+  §8.5. 표 자체는 그대로 두되, 그 커밋이 B0을 복구했다는 §7.7 (1)의 기대는
+  **238이 반증했다**(4601).
+- §7.7 (2)의 대조 실험 — 속성만 제거한 빌드 — 은 실행되었고 `22b9a3187bfb4beb` /
+  `4566`을 냈다. 즉 §7.7 판정표의 두 칸이 서로 자리를 바꾼 결과가 나왔으며, 그것이
+  §8.2의 근거다.
+- §7.5의 hunk-bisect 표는 유효하다. hunk B가 drifted였던 것도 8.2의 한 사례다:
+  그 hunk는 `Driver.h`를 건드렸고, 그것으로 충분했다.

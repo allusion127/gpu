@@ -26,6 +26,7 @@
 #include "XeFormMask.h"
 #include "GpuFormMask.h"
 
+#include <cstdlib>
 #include <iostream>
 
 namespace rasbery::xe {
@@ -90,6 +91,59 @@ unsigned long long xeShippedFormMask() {
     // the channel the caller is not allowed to see removed.  See XeFormMask.h
     // for why the removal is here and not left to each kernel body.
     return xeFormMask() & XE_SHIPPED_FORMS;
+}
+
+unsigned long long xeHostFormMask() {
+    // NO MINING HERE, AND THAT IS THE POINT.  This mask describes how
+    // Driver.h's own normal equations are spelled; a fixture in another
+    // translation unit cannot measure that (src/XeFormAudit.h), so the value is
+    // a build constant plus an override and the MEASUREMENT is the 238 sweep.
+    //
+    // Resolved once and cached, like every other knob on this path: the four
+    // sites read it on every Anderson step and a getenv per step would be both
+    // a cost and a second opinion (a setenv mid-run would give two halves of
+    // one solve two different contraction contracts).
+    static const unsigned long long mask = [] {
+        unsigned long long value  = XE_HOST_FORMS_DEFAULT;
+        const char*        source = "build_default";
+        const char*        raw    = std::getenv("RASBERY_XE_HOST_FORMS");
+        if (raw != nullptr) {
+            unsigned long long parsed = 0;
+            if (gpu::parseFormMask(raw, parsed)) {
+                value  = parsed;
+                source = "env";
+            } else {
+                std::cerr << "[RASBERY][WARN][FORMS] RASBERY_XE_HOST_FORMS=\"" << raw
+                          << "\" is not a number; ignoring the override.  A malformed "
+                             "override must not silently pass for a valid one.\n";
+                source = "env_rejected";
+            }
+        }
+        // THE SHIPPED CHANNEL IS UNREACHABLE FROM HERE.  A typo that set bit 3
+        // would otherwise change how the CANDIDATE loop contracts on the
+        // device, from a knob whose name says "host".
+        const unsigned long long kept = value & XE_ALGEBRA_FORMS;
+        if (kept != value) {
+            std::cerr << "[RASBERY][WARN][FORMS] RASBERY_XE_HOST_FORMS=0x" << std::hex
+                      << value << " carries bits outside the algebra channel 0x"
+                      << XE_ALGEBRA_FORMS << "; using 0x" << kept << std::dec
+                      << ".  The dot and the candidate are device sites and are "
+                         "decided by RASBERY_XE_FORMS, not by this knob.\n";
+            source = "env_trimmed";
+        }
+        // The four per-site digits, spelled out.  A sweep over 81 combinations
+        // reads THESE; the hex is for the campaign log.
+        std::cerr << "[RASBERY][FORMS] {\"mask\":\"XE_HOST_FORMS\",\"value\":\"0x"
+                  << std::hex << kept << "\",\"source\":\"" << source
+                  << "\",\"build_default\":\"0x" << XE_HOST_FORMS_DEFAULT << std::dec
+                  << "\",\"det\":" << xeSiteState(kept, XE_TXN_DET_BIT)
+                  << ",\"g0\":" << xeSiteState(kept, XE_TXN_G0_BIT)
+                  << ",\"g1\":" << xeSiteState(kept, XE_TXN_G1_BIT)
+                  << ",\"proj\":" << xeSiteState(kept, XE_TXN_PROJ_BIT)
+                  << "}" << std::endl;
+        return kept;
+    }();
+    return mask;
 }
 
 } // namespace rasbery::xe

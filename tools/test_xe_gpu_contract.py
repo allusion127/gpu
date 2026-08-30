@@ -164,18 +164,47 @@ for const in (
         f"both arms use {const} rather than a restated literal",
     )
 
-# The normal equations, spelled the same way.  These four expressions ARE the
-# algebra; a transcription slip in the copy is not something a converged answer
-# would show, because a wrong gamma still produces a candidate that the trust
-# region will usually accept.
+# The normal equations.  These four expressions ARE the algebra; a
+# transcription slip in the copy is not something a converged answer would
+# show, because a wrong gamma still produces a candidate that the trust region
+# will usually accept.
+#
+# THE TWO ARMS NO LONGER SPELL THEM THE SAME WAY, AND THAT IS THE FIX RATHER
+# THAN A DRIFT (238, 2026-08-31).  The device arm's copy used to be raw C, and
+# because src/Driver.h is one translation unit built -O3 -ffp-contract=fast
+# with no LTO, which multiply gcc folded into each add was re-decided for every
+# inlining context that block landed in.  So the flag-off trajectory was a
+# function of the call graph: 048c6c1's `RASBERY_NEVER_INLINE` -- a token that
+# touched no expression -- moved it from 22b9a3187bfb4beb / 4566 outers to
+# c1a5d9116df9edb3 / 4601.  The device arm's four sites now go through
+# xe::xeSiteSub / xe::xeSiteAdd under RASBERY_XE_HOST_FORMS, which are
+# barriered on gcc, so no inlining decision can reach them.
+#
+# The PURE HOST arm keeps the raw spelling: it is the frozen MASTER reference,
+# not a choice, and barriering it would move the baseline instead of holding
+# it.  What must still be equal is the VALUE, and that is what
+# XE_HOST_FORMS_DEFAULT is pinned to deliver -- by the 238 sweep, because no
+# fixture can reach a production call site (src/XeFormAudit.h).  See
+# docs/REGRESSION_7cfe3a4_d7b81af_20260831_KO.md section 8 and
+# tools/test_xe_host_forms_contract.py.
 for expr in (
     "det = a * c - b * b",
     "gamma[0] = (c * p - b * q) / det",
     "gamma[1] = (a * q - b * p) / det",
-    "pred2 = gg - proj",
 ):
-    check(expr in host_arm and expr in gpu_arm,
-          f"both arms compute `{expr}` identically")
+    check(expr in host_arm,
+          f"the pure host arm still computes `{expr}` raw -- it is the reference")
+
+for bit in ("XE_TXN_DET_BIT", "XE_TXN_G0_BIT", "XE_TXN_G1_BIT", "XE_TXN_PROJ_BIT"):
+    check(f"xe::xeSiteState(host_forms, xe::{bit})" in gpu_arm,
+          f"the device arm's `{bit}` site is selected by the host form mask")
+
+check(gpu_arm.count("xe::xeSiteSub(") == 3 and gpu_arm.count("xe::xeSiteAdd(") == 1,
+      "the device arm has exactly three subtraction sites and one addition site")
+
+check("pred2 = gg - proj" in host_arm and "pred2 = gg - proj" in gpu_arm,
+      "both arms compute `pred2 = gg - proj` identically -- one subtraction, "
+      "and on the device arm `proj` is a barrier output so nothing can fuse it")
 
 # Arming, and the counters that hang off it.
 check(

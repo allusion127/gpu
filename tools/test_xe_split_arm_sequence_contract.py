@@ -38,7 +38,10 @@ WHAT IS PINNED
      when the save happens;
   E. that none of the transaction's machinery (the fused history kernel, the
      device solve, the device gate) is reachable from the split arm;
-  F. the four normal-equation expressions, character for character.
+  F. the four normal-equation expressions BARRIERED -- routed through
+     xe::xeSiteSub/xeSiteAdd under a cached RASBERY_XE_HOST_FORMS, which is the
+     INVERSE of what this file pinned before 2026-08-31 and the reason is in
+     section F itself.
 
 Pure source reading: no compiler, no device, no run.
 """
@@ -356,31 +359,72 @@ for entry in ["xeEvaluate", "xeDots", "xeCandidate", "xeCommit"]:
 
 
 # ---------------------------------------------------------------------------
-# F.  The four normal-equation expressions, character for character
+# F.  The four normal-equation expressions, BARRIERED
 # ---------------------------------------------------------------------------
 #
-# These four are the split arm's UNBARRIERED host arithmetic -- no xsrMul, no
-# xsrFma, no asm barrier -- so what g++ contracts in them is decided by the
-# function they end up inlined into.  That is why B1/A2 exist; pinning the text
-# is what makes "the body below is untouched" a check rather than a claim.
+# THIS RULE IS THE INVERSE OF THE ONE IT REPLACES, and the inversion is the
+# whole lesson of 048c6c1.  Until 2026-08-31 this section pinned the four
+# expressions as raw C -- `const double det = a * c - b * b;` -- on the theory
+# that the baseline was whatever gcc did to them and that re-spelling them
+# would move it.  238 then produced the inverted A/B: 048c6c1, whose only
+# content was RASBERY_NEVER_INLINE on the default-off arm, gave
+# c1a5d9116df9edb3 / 4601 outers where the SAME TREE with that one token
+# removed gave 22b9a3187bfb4beb / 4566.  The attribute was supposed to protect
+# the baseline and it moved it.
+#
+# The reason is that "whatever gcc did to them" is not one thing.  At -O3
+# -ffp-contract=fast, in one TU with no LTO, which multiply of each pair is
+# folded into the add is re-decided for every inlining context this block lands
+# in -- so the raw spelling made the flag-off trajectory a function of the call
+# graph, and every edit near SolveLoop was a re-roll.  Pinning the TEXT could
+# never pin the RESULT.
+#
+# So the four sites now go through xe::xeSiteSub / xe::xeSiteAdd under
+# RASBERY_XE_HOST_FORMS, whose three states are all written with xsr::xsrFma
+# and xsr::xsrMul (asm-volatile barrier on gcc).  What is pinned here is that
+# shape.  tools/test_xe_host_forms_contract.py owns the stronger property --
+# that NO unbarriered double arithmetic is left anywhere on the path.
 
 FOUR = [
-    "const double det = a * c - b * b;",
-    "gamma[0] = (c * p - b * q) / det;",
-    "gamma[1] = (a * q - b * p) / det;",
-    "proj     = gamma[0] * p + gamma[1] * q;",
+    "const double det = xe::xeSiteSub("
+    "a, c, b, b, xe::xeSiteState(host_forms, xe::XE_TXN_DET_BIT));",
+    "gamma[0] = xe::xeSiteSub("
+    "c, p, b, q, xe::xeSiteState(host_forms, xe::XE_TXN_G0_BIT)) / det;",
+    "gamma[1] = xe::xeSiteSub("
+    "a, q, b, p, xe::xeSiteState(host_forms, xe::XE_TXN_G1_BIT)) / det;",
+    "proj = xe::xeSiteAdd("
+    "gamma[0], p, gamma[1], q, xe::xeSiteState(host_forms, xe::XE_TXN_PROJ_BIT));",
 ]
 
 SPLIT_SQUASHED = squash(SPLIT_BODY)
 for expr in FOUR:
     check(squash(expr) in SPLIT_SQUASHED,
-          "F1 the split arm still spells `%s` verbatim" % expr.strip(),
-          "re-spelling it with std::fma or xsrMul pins a different rounding and "
-          "moves the baseline the B0 gate is measured against")
+          "F1 the split arm spells `%s` through the barrier helpers" % expr.strip(),
+          "an unbarriered `a * c - b * b` here makes the flag-off trajectory a "
+          "function of gcc's inlining context (048c6c1, the inverted A/B)")
+
+check(squash("static const unsigned long long host_forms = xe::xeHostFormMask();")
+      in SPLIT_SQUASHED,
+      "F2 the host form mask is resolved once, into a cached static, before the "
+      "first site",
+      "a getenv per Anderson step is both a cost and a second opinion -- a "
+      "mid-run setenv would give two halves of one solve two contracts")
 
 check("XE_ANDERSON_MIN_GRAM * a * c" in SPLIT_BODY,
-      "F2 the conditioning floor is still `XE_ANDERSON_MIN_GRAM * a * c`",
-      "a multiply chain with no add: not a site, and none is mined for it")
+      "F3 the conditioning floor is still `XE_ANDERSON_MIN_GRAM * a * c`",
+      "a multiply chain with no add cannot be contracted on either compiler: "
+      "not a site, and the device arm spells it the same way")
+
+check(squash("proj = xsrecon::xsrMul(gamma[j], p);") in SPLIT_SQUASHED,
+      "F4 the one-column projection is `xsrecon::xsrMul(gamma[j], p)`",
+      "one multiply is not a SITE, but it feeds `pred2 = gg - proj` -- exactly "
+      "the shape -ffp-contract=fast fuses -- so it still has to be barriered")
+
+check(len(re.findall(r"\bxe::xeSiteSub\s*\(", SPLIT_BODY)) == 3 and
+      len(re.findall(r"\bxe::xeSiteAdd\s*\(", SPLIT_BODY)) == 1,
+      "F5 exactly three xeSiteSub sites and one xeSiteAdd site",
+      "found %d sub / %d add" % (len(re.findall(r"\bxe::xeSiteSub\s*\(", SPLIT_BODY)),
+                                 len(re.findall(r"\bxe::xeSiteAdd\s*\(", SPLIT_BODY))))
 
 
 # ---------------------------------------------------------------------------
@@ -482,10 +526,27 @@ NEGATIVES = [
          "        xe::XeTxnControl out{};\n"
          "        if (xs.XeGpuTransaction(power, req, out)) return true;"))),
 
-    ("one of the four expressions is re-spelled",
-     lambda: squash("const double det = a * c - b * b;") in
-     squash(split_of(mutate("const double det = a * c - b * b;",
-                            "const double det = std::fma(a, c, -(b * b));")))),
+    ("one of the four sites loses its mask and goes back to a fixed form",
+     lambda: squash(FOUR[0]) in squash(split_of(mutate(
+         "xe::xeSiteState(host_forms, xe::XE_TXN_DET_BIT)", "0u")))),
+
+    ("the det site is written back out as unbarriered C",
+     lambda: squash(FOUR[0]) in squash(split_of(mutate(
+         "xe::xeSiteSub(\n                a, c, b, b, "
+         "xe::xeSiteState(host_forms, xe::XE_TXN_DET_BIT))",
+         "a * c - b * b")))),
+
+    ("the host mask is resolved per step instead of once",
+     lambda: squash("static const unsigned long long host_forms = "
+                    "xe::xeHostFormMask();") in
+     squash(split_of(mutate(
+         "static const unsigned long long host_forms = xe::xeHostFormMask();",
+         "const unsigned long long host_forms = xe::xeHostFormMask();")))),
+
+    ("the one-column projection loses its barrier",
+     lambda: squash("proj = xsrecon::xsrMul(gamma[j], p);") in
+     squash(split_of(mutate("proj     = xsrecon::xsrMul(gamma[j], p);",
+                            "proj     = gamma[j] * p;")))),
 
     ("the fused history kernel escapes the transaction",
      lambda: (lambda code: len(re.findall(r"\bkXeHistory\s*<<<", code)) == 1 and
@@ -525,4 +586,5 @@ print("PASS  tools/test_xe_split_arm_sequence_contract.py  (%d checks, %d negati
       % (CHECKS, len(NEGATIVES)))
 print("  the split arm is compiled where it was compiled: the transaction arm is")
 print("  RASBERY_NEVER_INLINE, the dispatch is two statements, and the history")
-print("  sequence and column indices are the pre-71092e2 ones.")
+print("  sequence and column indices are the pre-71092e2 ones -- and the four")
+print("  normal-equation sites no longer let gcc decide their rounding.")

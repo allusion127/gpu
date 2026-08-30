@@ -367,10 +367,25 @@ check(
 
 
 # ---------------------------------------------------------------------------
-# 9. THE QUOTATION STILL QUOTES.
+# 9. THE QUOTATION STILL QUOTES -- AND WHAT IT QUOTES MOVED (238, 2026-08-31).
 #
-# XeAndersonReference.cpp is worth exactly nothing once it stops saying what
-# Driver.h says.  Compare the four expressions, whitespace-normalised.
+# XeAlgebraReference.cpp is worth exactly nothing once it stops saying what
+# Driver.h says.  Until 2026-08-31 it said what BOTH Anderson arms said, because
+# both spelled the normal equations as raw C.  The split device arm no longer
+# does: 048c6c1 showed that raw spelling made the flag-off trajectory a function
+# of gcc's inlining context (22b9a3187bfb4beb / 4566 became c1a5d9116df9edb3 /
+# 4601 for a token that touched no expression), so its four sites now go through
+# xe::xeSiteSub / xe::xeSiteAdd under RASBERY_XE_HOST_FORMS.
+#
+# WHAT THAT DOES TO THE MINING, STATED PLAINLY.  The algebra channel (bits
+# 5..12 of XE_FORMS) used to be scored against a quotation of the arm that
+# SHIPPED.  It is now scored against a quotation of the PURE HOST arm, which
+# still spells them raw and is the frozen MASTER reference.  So the mined
+# algebra bits are no longer a contract for the split arm -- they are the best
+# available PREDICTION of what gcc would have chosen, which is exactly what a
+# sweep over XE_HOST_FORMS wants as its first guess.  What the device
+# transaction must reproduce is the HOST MASK, and the audit
+# (RASBERY_XE_FORMS_AUDIT=1) is what says whether it does.
 # ---------------------------------------------------------------------------
 ALGEBRA_EXPRESSIONS = (
     "const double det = a * c - b * b;",
@@ -383,8 +398,21 @@ ALGEBRA_EXPRESSIONS = (
 for expr in ALGEBRA_EXPRESSIONS:
     check(squash(expr) in squash(REFERENCE),
           "the reference still quotes `%s`" % expr.strip())
-    check(squash(expr) in squash(GPU_ARM),
-          "the production device arm still contains `%s`" % expr.strip())
+    check(squash(expr) in squash(HOST_ARM),
+          "the PURE HOST arm -- what the reference now quotes -- still contains "
+          "`%s`" % expr.strip())
+
+# And the split arm's counterpart, spelled through the barrier helpers.  Both
+# halves are checked so "the two arms parted company" cannot be satisfied by
+# either of them simply losing the algebra.
+for bit in ("XE_TXN_DET_BIT", "XE_TXN_G0_BIT", "XE_TXN_G1_BIT", "XE_TXN_PROJ_BIT"):
+    check(squash("xe::xeSiteState(host_forms, xe::%s)" % bit) in squash(GPU_ARM),
+          "the split device arm's %s site is chosen by the host form mask" % bit)
+check(squash("proj = xsrecon::xsrMul(gamma[j], p);") in squash(GPU_ARM),
+      "the split device arm's one-column projection is barriered")
+check("host_forms" not in HOST_ARM,
+      "the PURE HOST arm never reads the host form mask -- it IS the reference, "
+      "and a reference that could be re-spelled by an env var is not one")
 
 # The conditioning tests, which the mask can also move through `det`.
 for expr in ("det > XE_ANDERSON_MIN_GRAM * a * c", "a > XE_ANDERSON_MIN_GRAM * gg"):

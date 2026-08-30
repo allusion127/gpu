@@ -14,6 +14,7 @@
 #include "WarmState.h"
 #include "XSTiming.h"
 #include "XeFormAudit.h"
+#include "XeFormMask.h"
 #include "XeGpuReceipt.h"
 #include "XeKernel.h"
 #include "XsLibrary.h"
@@ -587,6 +588,14 @@ inline constexpr const char* kArmEnv[] = {
     "RASBERY_GPU_WIEL_FOLD",
     "RASBERY_CMFD_OUTER_FORMS",
     "RASBERY_XE_FORMS",
+    // The host spelling of the Anderson normal equations (XeFormMask.h,
+    // XE_HOST_FORMS_DEFAULT).  It belongs here more plainly than any other
+    // knob on the list: it selects the rounding of four expressions on the
+    // RASBERY_GPU_XE arm's own critical path, so two runs that disagree about
+    // it are two different trajectories -- and the 238 sweep that pins its
+    // default varies exactly this string.  A case key that did not fold it
+    // would serve one sweep point's answer to another's request.
+    "RASBERY_XE_HOST_FORMS",
     "RASBERY_XE_MODE",
     "RASBERY_XE_ANDERSON",
     "RASBERY_XE_ANDERSON_MAX_STEP",
@@ -2799,18 +2808,72 @@ private:
         double       gamma[XE_ANDERSON_DEPTH] = {};
         double       proj                     = 0.0; // sum_j gamma_j <dG_j, g_k>
         bool         solved                   = false;
+        // ===================================================================
+        // WHY THESE FOUR EXPRESSIONS ARE NO LONGER SPELLED `a * c - b * b`
+        // ===================================================================
+        //
+        // THE INVERTED A/B, 238, 2026-08-31.  `048c6c1` marked the default-off
+        // transaction arm RASBERY_NEVER_INLINE so it could not be folded into
+        // SolveLoop, and the FLAG-OFF trajectory moved AGAIN -- to
+        // c1a5d9116df9edb3 / 4601 outers, where the same tree with only that
+        // token removed gives 22b9a3187bfb4beb / 4566, the `7cfe3a4` value.
+        // The attribute did not restore the baseline; `d85984e` had landed on
+        // it by luck.
+        //
+        // The class named in docs/REGRESSION_7cfe3a4_d7b81af_20260831_KO.md §7
+        // was right and its remedy was a coin toss.  These four expressions
+        // were UNBARRIERED host arithmetic in a single translation unit at
+        // -O3 -ffp-contract=fast with no LTO, so which of each pair's two
+        // multiplies gcc folds into the add is a decision it re-makes for
+        // every inlining context this block lands in.  ANY edit near SolveLoop
+        // -- a new sibling, an attribute, a header, a static -- re-rolls it.
+        // No attribute can fix that, because the attribute is itself one of
+        // the things that re-rolls it.
+        //
+        // So the decision is REMOVED rather than steered.  Each site now goes
+        // through xe::xeSiteSub / xe::xeSiteAdd -- the same bodies the device
+        // arm runs, whose three states are all written with xsr::xsrFma and
+        // xsr::xsrMul, and xsrMul carries an `asm volatile` barrier on gcc so
+        // no surrounding context can re-fuse it.  Every FP operation on this
+        // path is now either barriered or unfusable (a division, a compare, or
+        // a multiply chain with no add), and INLINING CANNOT CHANGE THE
+        // RESULT.  The arm's trajectory is a property of `host_forms` and of
+        // nothing else about the call graph.
+        //
+        // WHICH combination reproduces 22b9a3187bfb4beb is a MEASUREMENT, not
+        // a derivation: XE_HOST_FORMS_DEFAULT carries the current pin and the
+        // 238 sweep over RASBERY_XE_HOST_FORMS is what set it (§8.4 of the
+        // regression doc).  The mask is NOT xeFormMask(): that one is mined
+        // against a quotation in another translation unit and answers the
+        // DEVICE's question -- src/XeFormAudit.h is the whole argument for why
+        // the two are separate numbers.
+        //
+        // Read once, cached, exactly like the `audit` bool below: a getenv per
+        // Anderson step would be both a cost and a second opinion.
+        static const unsigned long long host_forms = xe::xeHostFormMask();
         if (aa.ncol == XE_ANDERSON_DEPTH) {
             const double a   = dots[xe::XE_DOT_A];
             const double b   = dots[xe::XE_DOT_B];
             const double c   = dots[xe::XE_DOT_C];
             const double p   = dots[xe::XE_DOT_P];
             const double q   = dots[xe::XE_DOT_Q];
-            const double det = a * c - b * b;
+            const double det = xe::xeSiteSub(
+                a, c, b, b, xe::xeSiteState(host_forms, xe::XE_TXN_DET_BIT));
+            // NOT A SITE: a multiply chain with no add cannot be contracted on
+            // either compiler, and the device arm spells it the same way.
             if (a > 0.0 && c > 0.0 && std::isfinite(det) && std::isfinite(p) &&
                 std::isfinite(q) && det > XE_ANDERSON_MIN_GRAM * a * c) {
-                gamma[0] = (c * p - b * q) / det;
-                gamma[1] = (a * q - b * p) / det;
-                proj     = gamma[0] * p + gamma[1] * q;
+                gamma[0] = xe::xeSiteSub(
+                               c, p, b, q,
+                               xe::xeSiteState(host_forms, xe::XE_TXN_G0_BIT)) /
+                           det;
+                gamma[1] = xe::xeSiteSub(
+                               a, q, b, p,
+                               xe::xeSiteState(host_forms, xe::XE_TXN_G1_BIT)) /
+                           det;
+                proj     = xe::xeSiteAdd(
+                    gamma[0], p, gamma[1], q,
+                    xe::xeSiteState(host_forms, xe::XE_TXN_PROJ_BIT));
                 solved   = true;
             }
         }
@@ -2826,7 +2889,14 @@ private:
                 for (double& gj : gamma)
                     gj = 0.0;
                 gamma[j] = p / a;
-                proj     = gamma[j] * p;
+                // ONE multiply, no add -- so no site, and none is mined for it.
+                // It is still BARRIERED, and that is not decoration: `pred2`
+                // below is `gg - proj`, and an unbarriered product feeding a
+                // subtraction is precisely the shape -ffp-contract=fast fuses.
+                // xsrMul is what stops `gg - gamma[j] * p` from becoming an
+                // fnma in some inlining contexts and not others.  The device
+                // arm spells this same line xsr::xsrMul(gj, p).
+                proj     = xsrecon::xsrMul(gamma[j], p);
                 solved   = true;
             }
         }

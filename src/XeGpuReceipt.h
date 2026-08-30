@@ -96,6 +96,18 @@ struct XeGpuTally {
     /// would MINE the mask in a run that never touched the device Xe arm, and
     /// add a [RASBERY][FORMS] line to a log whose feature was off.
     std::atomic<unsigned long long> forms_audit_mask{0};
+    /// The mask the PRODUCTION BLOCK was spelled under -- Driver.h's own
+    /// RASBERY_XE_HOST_FORMS, bits 5..12.  Written by the audit and by nothing
+    /// else, for the same reason as the line above.
+    ///
+    /// WHY BOTH NUMBERS ARE IN THE RECEIPT.  Before the host sites were
+    /// barriered there was only one mask to name, because the host's spelling
+    /// was whatever gcc decided that build and was not a value anyone could
+    /// write down.  It is one now, so `forms_audit_mismatch: 0` has a readable
+    /// precondition: the algebra channel of `forms_audit_mask` must equal
+    /// `forms_audit_host_mask`, and a receipt where those two differ says
+    /// which knob to move rather than only that TXN=1 is N1.
+    std::atomic<unsigned long long> forms_audit_host_mask{0};
 };
 
 /// The GRADE of the RASBERY_GPU_XE_TXN arm, in the receipt that reports it.
@@ -169,6 +181,15 @@ inline void appendXeGpuReceiptFields(std::ostream& os) {
     if (audits > 0) {
         const std::ios_base::fmtflags saved = os.flags();
         os << "0x" << std::hex << t.forms_audit_mask.load(std::memory_order_relaxed);
+        os.flags(saved);
+    } else {
+        os << '~';
+    }
+    os << "\",\"forms_audit_host_mask\":\"";
+    if (audits > 0) {
+        const std::ios_base::fmtflags saved = os.flags();
+        os << "0x" << std::hex
+           << t.forms_audit_host_mask.load(std::memory_order_relaxed);
         os.flags(saved);
     } else {
         os << '~';

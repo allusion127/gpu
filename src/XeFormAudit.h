@@ -50,6 +50,31 @@
 // The same argument, one level up, is why src/XeAlgebraReference.cpp exists.
 // This file is that argument applied to the measurement instead of to the
 // reference.
+//
+// ---------------------------------------------------------------------------
+// WHAT CHANGED WHEN THE HOST SITES WERE BARRIERED (238, 2026-08-31)
+// ---------------------------------------------------------------------------
+//
+// The paragraph above says the production spelling "is only reachable inside
+// the production inline".  That was true of a spelling gcc chose; it is no
+// longer true of the spelling this tree ships.  The four host expressions in
+// Driver.h::TryAndersonXeStepGpu now go through xe::xeSiteSub / xe::xeSiteAdd
+// under RASBERY_XE_HOST_FORMS (XeFormMask.h::xeHostFormMask), for the reason
+// docs/REGRESSION_7cfe3a4_d7b81af_20260831_KO.md section 8 gives: with them
+// unbarriered, ANY change of inlining context around that arm re-rolled the
+// flag-off trajectory, and 048c6c1's noinline attribute re-rolled it the wrong
+// way.
+//
+// So this audit now compares TWO WRITTEN-DOWN SPELLINGS at the run's own
+// operands -- the device's `xeFormMask()` against the host's
+// `xeHostFormMask()` -- and B0 for RASBERY_GPU_XE_TXN=1 has a stateable
+// precondition for the first time: the algebra channels must be the same
+// number (`forms_audit_mask & XE_ALGEBRA_FORMS == forms_audit_host_mask` in
+// the receipt) and `forms_audit_mismatch` must be zero on a real deck.  A
+// mismatch now names which of the two it is.  What is NOT weakened: the audit
+// still lives in its own translation unit, because CSE between the production
+// block and the recomputation would still be a false negative -- barriered
+// operands do not stop gcc from reusing an identical barriered result.
 
 namespace rasbery::xe {
 

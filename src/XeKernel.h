@@ -188,6 +188,82 @@ constexpr unsigned XE_SITE_NONE = 0u;
 constexpr unsigned XE_SITE_P1   = 1u;
 constexpr unsigned XE_SITE_P2   = 2u;
 
+/// THE HOST MASK -- the same four sites, the same two-bit fields, the same
+/// XE_SITE_* encoding, applied to `Driver.h::TryAndersonXeStepGpu`'s OWN copy
+/// of the normal equations rather than to the device's.
+///
+/// ---------------------------------------------------------------------------
+/// WHY A HOST MASK EXISTS AT ALL -- THE INVERTED A/B, 238, 2026-08-31
+/// ---------------------------------------------------------------------------
+///
+/// `048c6c1` put RASBERY_NEVER_INLINE on TryAndersonXeStepGpuTxn to stop a
+/// default-off arm from being folded into SolveLoop, and on 238 the flag-off
+/// trajectory MOVED AGAIN, the other way: digest c1a5d9116df9edb3 / 4601
+/// outers, where the same tree with only that token removed gives
+/// 22b9a3187bfb4beb / 4566 -- the `7cfe3a4` value.  Every other observation
+/// points the same way (47161ed clean, 47161ed+71092e2 drifted, d7b81af and
+/// 8919331 and 32ac308 drifted, the kernel-side hunk drifted).
+///
+/// So the class in `docs/REGRESSION_7cfe3a4_d7b81af_20260831_KO.md` §7 was
+/// right and its REMEDY was a coin: the flag-off trajectory flips with ANY
+/// change of gcc's inlining and codegen context around this arm, because the
+/// four expressions
+///
+///     det      = a * c - b * b;
+///     gamma[0] = (c * p - b * q) / det;
+///     gamma[1] = (a * q - b * p) / det;
+///     proj     = gamma[0] * p + gamma[1] * q;
+///
+/// were UNBARRIERED host arithmetic compiled at -O3 -ffp-contract=fast in a
+/// single translation unit with no LTO, and which multiply gcc folds into each
+/// add is a decision it re-makes per inlining context.  `d85984e` did not fix
+/// anything; it landed on the `7cfe3a4` form by luck, and the next edit near
+/// SolveLoop would have moved it off again.
+///
+/// The fix is not another attribute.  It is to REMOVE THE DECISION: every one
+/// of the four sites now goes through xeSiteSub/xeSiteAdd, whose three states
+/// are all written with xsr::xsrFma and xsr::xsrMul -- and xsrMul carries an
+/// `asm volatile` barrier on gcc, so no surrounding context can re-fuse it.
+/// Once the whole path is barriered, inlining cannot change the result, and
+/// the arm's trajectory becomes a property of THIS CONSTANT instead of a
+/// property of the call graph.
+///
+/// ---------------------------------------------------------------------------
+/// WHY IT IS A CONSTANT AND NOT MINED
+/// ---------------------------------------------------------------------------
+///
+/// Mining answers "what does gcc do to a QUOTATION of these expressions, in
+/// XeAlgebraReference.cpp, with that TU's operand provenance" -- which is
+/// exactly the question `src/XeFormAudit.h` documents as the wrong one.  There
+/// is no fixture that can reach the production call site.  So the value is
+/// PINNED BY MEASUREMENT INSTEAD: the 238 runner sweeps the 81 combinations
+/// with RASBERY_XE_HOST_FORMS and keeps the one whose `[RASBERY][TRAJECTORY]`
+/// digest is 22b9a3187bfb4beb / 4566 outers.  See §8.4 of the regression doc
+/// for the loop.
+///
+///     PROVISIONAL: 0xaa0 -- all four sites XE_SITE_P1.
+///
+/// That is gcc's usual `convert_mult_to_fma` outcome (the pass reaches the
+/// FIRST multiply feeding the add and fuses it), and it is a PREDICTION, not a
+/// measurement.  It is written here rather than left at zero because zero is
+/// also a guess and a wrong non-zero guess announces itself in the sweep,
+/// where an all-none default would look like "the sweep was never run".  The
+/// moment 238 reports the winning combination this line is re-pinned to it and
+/// the receipt's `source` field says `build_default` again.
+///
+/// Bits outside XE_ALGEBRA_FORMS are not representable in this mask: the
+/// resolver masks them off.  The dot and the candidate are DEVICE sites and
+/// keep being decided by XE_FORMS.
+constexpr unsigned long long XE_HOST_FORMS_DEFAULT =
+    (static_cast<unsigned long long>(XE_SITE_P1) << XE_TXN_DET_BIT) |
+    (static_cast<unsigned long long>(XE_SITE_P1) << XE_TXN_G0_BIT) |
+    (static_cast<unsigned long long>(XE_SITE_P1) << XE_TXN_G1_BIT) |
+    (static_cast<unsigned long long>(XE_SITE_P1) << XE_TXN_PROJ_BIT);
+
+static_assert((XE_HOST_FORMS_DEFAULT & ~XE_ALGEBRA_FORMS) == 0ull,
+              "the host form mask lives in the algebra channel, bits 5..12; a bit "
+              "outside it would be a dot/candidate decision made by the wrong knob");
+
 /// The number of contiguous partitions the device inner product is cut into.
 /// FIXED -- it depends on no launch parameter, no occupancy, no device -- which
 /// is what makes the reduction reproducible run to run.  Overridable with

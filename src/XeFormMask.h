@@ -48,4 +48,31 @@ unsigned long long xeFormMask();
 /// which bits each arm actually ran under.
 unsigned long long xeShippedFormMask();
 
+/// THE MASK THE HOST'S OWN NORMAL EQUATIONS ARE SPELLED UNDER --
+/// `Driver.h::TryAndersonXeStepGpu`, bits 5..12, XE_SITE_* encoding.
+///
+/// A THIRD FUNCTION AND NOT A THIRD READING OF THE SAME NUMBER.  xeFormMask()
+/// answers "how does the DEVICE spell the algebra", and its value is MINED --
+/// it is a measurement of this build machine scored against a quotation in
+/// another translation unit.  This one answers "how does the HOST spell the
+/// algebra", and there is no fixture that can measure it: the production call
+/// site is only reachable inside the production inline, which is the whole
+/// argument of src/XeFormAudit.h.  So this is a build constant
+/// (XE_HOST_FORMS_DEFAULT) with an environment override, and nothing else; it
+/// never mines, so a run that never touches the device Xe arm never pays for
+/// it and never prints a line about it.
+///
+/// Resolved once, on first call.  One receipt line then:
+///
+///     [RASBERY][FORMS] {"mask":"XE_HOST_FORMS","value":"0x...","source":"...",
+///                       "build_default":"0x...","det":n,"g0":n,"g1":n,"proj":n}
+///
+/// The four per-site digits are printed because a sweep over 81 combinations
+/// reads them, not the hex: a log line that only said `0x6a0` would have to be
+/// decoded by hand at every step of the sweep.
+///
+/// Bits outside XE_ALGEBRA_FORMS are masked off: a typo in the override may not
+/// reach into the shipped dot/candidate channel.
+unsigned long long xeHostFormMask();
+
 } // namespace rasbery::xe
