@@ -11,6 +11,7 @@
 // being attributable to the one place the header documents.
 
 #include "CudaCramBackend.h"
+#include "GpuCaptureArbiter.h"
 #include "XferLedger.h"
 
 #include <cuda_runtime.h>
@@ -624,6 +625,12 @@ struct CramBackend::Impl {
     ~Impl() { release(); }
 
     void release() {
+        // WP19.  Same rule, same reason, same defect as CudaPprBackend.cu:
+        // a deck's teardown frees device memory, unregisters pinned host
+        // memory and destroys a stream on ITS OWN thread while fifteen
+        // sibling lanes are running -- one of which may have a graph
+        // capture open.  See GpuCaptureArbiter.h.
+        rasbery::AllocWindow _alloc_window("cram.release");
         auto f = [](void* p) { if (p) cudaFree(p); };
         f(d_dep_decay); f(d_dep_trans); f(d_row_ptr); f(d_col_idx);
         f(d_dfac); f(d_vol);
@@ -683,6 +690,13 @@ struct CramBackend::Impl {
         // hence this backend) already exists.
         cudaGetDevice(&device);
 
+        // WP19.  Everything from here to the end of this function --
+        // cudaStreamCreate, two cudaEventCreate, twenty cudaMalloc and a
+        // cudaMallocHost -- is "potentially unsafe" during a capture, and
+        // it runs on the FIRST depletion step of every deck.  With
+        // RASBERY_GPU_CRAM=1 in the production arm this is the second
+        // instance of the CudaPprBackend.cu gap, found by the same scan.
+        rasbery::AllocWindow _alloc_window("cram.shape.standup");
         cudaError_t rc = cudaStreamCreate(&stream);
         if (rc != cudaSuccess) return fail("cudaStreamCreate", rc);
         if ((rc = cudaEventCreate(&ev_start)) != cudaSuccess) return fail("cudaEventCreate", rc);

@@ -75,6 +75,7 @@
 #include <vector>
 
 #include "CudaOuterGraph.h"
+#include "GpuCaptureArbiter.h"
 
 namespace rasbery {
 namespace gpu {
@@ -176,6 +177,10 @@ struct OuterWhileCache {
 
     void release() {
         clear();
+        // WP19.  Stream destruction is as unsafe inside a sibling's capture as
+        // stream creation is, and a cache release happens on a deck's teardown
+        // -- concurrently with every other lane by construction.
+        rasbery::AllocWindow _alloc_window("outer.while.cache.release");
         if (root_stream != nullptr) cudaStreamDestroy(root_stream);
         root_stream = nullptr;
     }

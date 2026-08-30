@@ -211,6 +211,14 @@ enum class Refusal : int {
     NonPositiveIter, ///< the caller passed niter <= 0
     ShapeAllocFail,  ///< ensureShape could not stand the buffers up
     CudaFailure,     ///< any cudaError_t on the statepoint's own path
+    /// WP19.  A graph build refused with one of CUDA's capture-concurrency
+    /// codes and was rebuilt once with the capture arbiter held.  It is the
+    /// one rung that is NOT necessarily a fallback: the retry usually works,
+    /// and then only `refusals[CaptureRaceRetry]` moves while `refusal` stays
+    /// `none`.  A run whose count is non-zero saw the race and survived it; a
+    /// run whose count is non-zero AND whose refusal is `capture_race_retry`
+    /// lost the retry too and fell back to the stream arm.
+    CaptureRaceRetry,
     Count
 };
 
@@ -223,6 +231,7 @@ inline const char* refusalName(Refusal r) {
         case Refusal::NonPositiveIter: return "non_positive_iter";
         case Refusal::ShapeAllocFail:  return "shape_alloc_fail";
         case Refusal::CudaFailure:     return "cuda_failure";
+        case Refusal::CaptureRaceRetry: return "capture_race_retry";
         case Refusal::Count:           break;
     }
     return "?";

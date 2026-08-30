@@ -53,6 +53,24 @@
 // contract violation -- counted and traced), case (b) does not lock either.
 // So the arbiter can only ever wait for a DIFFERENT thread.
 //
+// WP19, AND THE GAP THAT WAS STILL OPEN.  The rule above was enforced at four
+// of the five capture sites in this tree.  src/CudaPprBackend.cu's WHILE build
+// -- the arm `RASBERY_GPU_PPR=1 RASBERY_GPU_PPR_GRAPH=1` turns on, i.e. the
+// production v6 arm -- took NO window at all: that TU did not even include this
+// header, and its stand-up (cudaStreamCreate, cudaEventCreate, 25 cudaMalloc,
+// 3 cudaMallocHost, and the reconstruction's 23 more) ran unguarded on the
+// FIRST statepoint of every deck.  With 16 host Drivers per process the first
+// deck to reach its PPR capture and the first deck to reach its PPR stand-up
+// are different threads a few milliseconds apart, which is why the death was
+// intermittent, non-positional, and always on a lane's FIRST case.
+//
+// The measured signature: 2-5 of 128 cases dead in ~15.7 s with
+//
+//   "error":"cudaGetLastError(): operation not permitted when stream is
+//    capturing"                                (cudaErrorStreamCaptureUnsupported)
+//
+// and `"slot":-1` -- no arena slot yet, i.e. stand-up, not solve.
+//
 // LAYERING.  Header-only and CUDA-free, exactly like HostPinRegistry.h: the
 // plain C++ TUs that allocate through the pin hooks must keep compiling in the
 // no-CUDA stub build, and the counters must be one process-wide set no matter
@@ -93,6 +111,15 @@ struct CaptureArbiterStats {
     /// counted before the arbiter serialises them, so it stays non-zero after
     /// the fix and keeps the receipt honest about the race still existing.
     std::atomic<unsigned long long> alloc_overlapped{0};
+    /// WP19.  A graph build that came back with one of the capture-illegal
+    /// codes ANYWAY, and was rebuilt once with the arbiter held.  It is the
+    /// receipt term that says "the race happened and the case survived it";
+    /// 0 is the number a fixed tree prints.
+    std::atomic<unsigned long long> capture_race_retry{0};
+    /// The retry that ALSO came back capture-illegal.  A case only ever gets
+    /// one retry, so this is the count of cases that fell back to the
+    /// non-capturing arm rather than dying -- and it must be loud.
+    std::atomic<unsigned long long> capture_race_unrecovered{0};
 };
 
 inline CaptureArbiterStats& captureArbiterStats() {
@@ -177,6 +204,55 @@ inline int& allocDepthRef() {
 }
 
 inline bool threadIsCapturing() { return captureDepthRef() > 0; }
+
+// --- WP19: the capture-illegal error class, spelled without CUDA ------------
+//
+// This header is deliberately CUDA-free (see LAYERING above), so the codes are
+// written as numbers.  They are the contiguous cudaError_t block CUDA 11.0
+// introduced for stream capture and has not moved since:
+//
+//   900 cudaErrorStreamCaptureUnsupported  "operation not permitted when
+//                                           stream is capturing"   <-- WP19
+//   901 cudaErrorStreamCaptureInvalidated  "operation failed due to a previous
+//                                           error during capture"
+//   902 cudaErrorStreamCaptureMerge
+//   903 cudaErrorStreamCaptureUnmatched
+//   904 cudaErrorStreamCaptureUnjoined
+//   905 cudaErrorStreamCaptureIsolation
+//   906 cudaErrorStreamCaptureImplicit
+//   907 cudaErrorCapturedEvent
+//   908 cudaErrorStreamCaptureWrongThread
+//
+// Every one of them says "somebody else's capture, or this one, was in the way"
+// and NONE of them says "the arithmetic is wrong" -- which is exactly the
+// property a retry is allowed to lean on.  static_assert in the CUDA TUs pins
+// the numbers to the enum; see CudaPprBackend.cu.
+inline constexpr int kCaptureErrFirst = 900;
+inline constexpr int kCaptureErrLast  = 908;
+
+/// Is this cudaError_t a capture-concurrency refusal rather than a real fault?
+inline bool captureIllegal(int cuda_error) {
+    return cuda_error >= kCaptureErrFirst && cuda_error <= kCaptureErrLast;
+}
+
+/// One capture-illegal build was retried under the arbiter.  Counted here so
+/// the term is process-wide and every capture site reports into one number.
+inline void noteCaptureRaceRetry() {
+    captureArbiterStats().capture_race_retry.fetch_add(1, std::memory_order_relaxed);
+}
+
+/// The retry lost too.  LOUD, on stderr, with the site that lost -- a silent
+/// fallback is what WP19 exists to remove.
+inline void noteCaptureRaceUnrecovered(const char* tag, int cuda_error,
+                                       const char* what) {
+    captureArbiterStats().capture_race_unrecovered.fetch_add(1,
+                                                             std::memory_order_relaxed);
+    std::ostringstream line;
+    line << "[RASBERY][CUDA][CAPTURE_RACE][ERROR] {\"tag\":\"" << (tag ? tag : "")
+         << "\",\"cuda_error\":" << cuda_error << ",\"what\":\""
+         << (what ? what : "") << "\",\"retried\":1,\"recovered\":0}";
+    std::cerr << line.str() << std::endl;
+}
 
 /// Exclusive window: while this is alive, no thread may enter an AllocWindow.
 class CaptureWindow {
@@ -289,7 +365,9 @@ inline std::string captureArbiterReceipt(const char* tag) {
          << "\"alloc_blocked\":" << s.alloc_blocked.load() << ','
          << "\"alloc_wait_us\":" << s.alloc_wait_us.load() << ','
          << "\"alloc_in_capture\":" << s.alloc_in_capture.load() << ','
-         << "\"captures_unwound\":" << s.captures_unwound.load() << '}';
+         << "\"captures_unwound\":" << s.captures_unwound.load() << ','
+         << "\"capture_race_retry\":" << s.capture_race_retry.load() << ','
+         << "\"capture_race_unrecovered\":" << s.capture_race_unrecovered.load() << '}';
     return line.str();
 }
 

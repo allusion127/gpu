@@ -173,17 +173,26 @@ class ScopedStreamCapture {
     ScopedStreamCapture(cudaStream_t stream, const char* tag)
         : _stream(stream), _window(stream, tag) {}
 
-    /// DIAGNOSTIC ONLY.  RASBERY_GPU_CAPTURE_MODE=global asks CUDA to police
-    /// the rule this class enforces: under cudaStreamCaptureModeGlobal every
-    /// unsafe API in EVERY thread fails, loudly and at its own call site,
-    /// instead of silently invalidating somebody else's capture.  It is not a
-    /// mode to run in -- a refused allocation is a dead deck -- but it is the
-    /// mode that turns "somebody violated the rule" into a named line.
+    /// WP19: GLOBAL IS GONE, AND ITS REMOVAL IS THE FIRST HALF OF THE FIX.
+    ///
+    /// It used to be reachable as RASBERY_GPU_CAPTURE_MODE=global, on the
+    /// theory that "CUDA policing the rule" was a diagnostic.  It is not a
+    /// diagnostic in a batch: cudaStreamCaptureModeGlobal makes every unsafe
+    /// API in every UNRELATED thread fail with
+    ///
+    ///     operation not permitted when stream is capturing
+    ///
+    /// which is not a report of the defect, it IS the defect -- one lane's
+    /// capture killing a sibling lane's stand-up, with the sibling holding the
+    /// corpse.  The mode is chosen per site now and never globally: ThreadLocal
+    /// where the capture is a leaf (only the capturing thread is constrained),
+    /// Relaxed where a conditional-node build has to touch a second stream
+    /// inside the window.  Neither can make another lane's call illegal.
+    /// tools/test_capture_arbiter_contract.py holds the absence against the
+    /// source, so this cannot come back as an env flag.
     static cudaStreamCaptureMode captureMode() {
         static const cudaStreamCaptureMode mode = [] {
             const char* v = std::getenv("RASBERY_GPU_CAPTURE_MODE");
-            if (v != nullptr && std::string(v) == "global")
-                return cudaStreamCaptureModeGlobal;
             if (v != nullptr && std::string(v) == "relaxed")
                 return cudaStreamCaptureModeRelaxed;
             return cudaStreamCaptureModeThreadLocal;
@@ -6226,6 +6235,13 @@ public:
         // The arena outlives every deck, so this only runs at process teardown;
         // it is here so the pair is owned by the object that created it rather
         // than leaked on the strength of that.
+        //
+        // WP19 takes the window anyway rather than claiming an exemption: "the
+        // arena outlives every deck" is a fact about THIS tree, and the arbiter
+        // costs an uncontended shared lock once.  The immortal mutex in
+        // GpuCaptureArbiter.h is what makes this safe during static
+        // destruction.
+        rasbery::AllocWindow _alloc_window("cmfd.arena.events.release");
         for (cudaEvent_t e : seg_ev_in)
             if (e != nullptr) cudaEventDestroy(e);
         for (cudaEvent_t e : seg_ev_out)
@@ -6638,15 +6654,21 @@ bool CudaBatchArena::enqueueSweeps(int m, double* out_phi, const CmfdSweepIO& io
         }
         cudaEvent_t& ein  = a.seg_ev_in[static_cast<size_t>(m)];
         cudaEvent_t& eout = a.seg_ev_out[static_cast<size_t>(m)];
-        if (ein == nullptr &&
-            cudaEventCreateWithFlags(&ein, cudaEventDisableTiming) != cudaSuccess) {
-            cudaGetLastError();
-            return false;
-        }
-        if (eout == nullptr &&
-            cudaEventCreateWithFlags(&eout, cudaEventDisableTiming) != cudaSuccess) {
-            cudaGetLastError();
-            return false;
+        // WP19.  Created lazily, per slot, on the slot's FIRST segment join --
+        // which is a lane's stand-up by another name, and was the last
+        // unguarded pair on this path.
+        if (ein == nullptr || eout == nullptr) {
+            rasbery::AllocWindow _alloc_window("cmfd.segment.events");
+            if (ein == nullptr &&
+                cudaEventCreateWithFlags(&ein, cudaEventDisableTiming) != cudaSuccess) {
+                cudaGetLastError();
+                return false;
+            }
+            if (eout == nullptr &&
+                cudaEventCreateWithFlags(&eout, cudaEventDisableTiming) != cudaSuccess) {
+                cudaGetLastError();
+                return false;
+            }
         }
         // RECORDED BEFORE THE WAIT IS ENQUEUED, which is what makes the join
         // acyclic: the event describes work the caller has ALREADY submitted, so

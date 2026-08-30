@@ -963,6 +963,11 @@ EVALUATOR_READY = re.compile(r"\[RASBERY\]\[EVALUATOR\]\[READY\]\s*(\{.*\})")
 EVALUATOR_WAVE_RECEIPT = re.compile(r"\[RASBERY\]\[EVALUATOR\]\[WAVE\]\s*(\{.*\})")
 EVALUATOR_CASE_RECEIPT = re.compile(r"\[RASBERY\]\[EVALUATOR\]\[CASE\]\s*(\{.*\})")
 EVALUATOR_REFUSED = re.compile(r"\[RASBERY\]\[EVALUATOR\]\[REFUSED\]\s*(\{.*\})")
+# WP19.  The line EvaluatorServer prints for a case that DIED, with the message
+# on it.  Parsed on its own rather than lifted out of the [CASE] receipt because
+# a case that dies before the fold closes may print a receipt this dispatcher
+# cannot parse -- and the whole point of the line is that it survives that.
+EVALUATOR_CASE_ERROR = re.compile(r"\[RASBERY\]\[EVALUATOR\]\[ERROR\]\s*(\{.*\})")
 # `[EVALUATOR] {` with WHITESPACE after the tag -- the once-per-process receipt.
 # The wave/case/refused tags are each followed by `[`, so this cannot match one.
 EVALUATOR_PROCESS = re.compile(r"\[RASBERY\]\[EVALUATOR\]\s+(\{.*\})")
@@ -974,6 +979,32 @@ def _json_or_none(text: str) -> dict | None:
     except ValueError:
         return None
     return value if isinstance(value, dict) else None
+
+
+def collect_case_errors(result: "WorkerResult", text: str) -> None:
+    """WP19.  Lift every [EVALUATOR][ERROR] line out of a child's output.
+
+    CALLED WHEREVER `fail_lines` IS COUNTED, and for the same reason: this is
+    the dispatcher's one pass over raw child text, so a message that exists at
+    all is caught here whether or not the case's [CASE] receipt parsed, whether
+    or not the child then died, and whether the text came from a wave, a
+    rolling session or the shutdown epilogue.
+
+    An error already recorded is not recorded twice -- a wave's text is scanned
+    once by the streaming reader and once again at the end -- so the FAIL line
+    reports five dead cases as five lines and not as ten.
+    """
+    for match in EVALUATOR_CASE_ERROR.finditer(text):
+        record = _json_or_none(match.group(1))
+        if record is None:
+            entry = "unparseable [EVALUATOR][ERROR]: " + match.group(1)[:200]
+        else:
+            entry = "%s: %s" % (
+                record.get("deck") or record.get("output") or "?",
+                record.get("error") or "no message",
+            )
+        if entry not in result.failed_case_errors:
+            result.failed_case_errors.append(entry)
 
 
 @dataclass
@@ -1323,6 +1354,17 @@ class WorkerResult:
     #: Decks whose [EVALUATOR][CASE] receipt said `failed`, plus the ones no
     #: receipt ever mentioned once the single re-queue was spent.
     failed_cases: list[str] = field(default_factory=list)
+    #: WP19.  "<deck>: <message>" for every case that died with a message.
+    #:
+    #: THE DEFECT THIS CLOSES.  `failed_cases` is a list of NAMES, and it was
+    #: the only thing the dispatcher kept out of a failed [CASE] receipt.  A
+    #: run that lost five decks to the capture race therefore printed five deck
+    #: names and no error text ANYWHERE in the harness log -- the message
+    #: ("cudaGetLastError(): operation not permitted when stream is capturing")
+    #: existed, in the child's receipt, in a per-worker log file nobody opens
+    #: until they already know what to look for.  These strings go into the
+    #: problems list, which is what reaches [MULTI_GPU][FAIL].
+    failed_case_errors: list[str] = field(default_factory=list)
 
     @property
     def fidelities(self) -> dict[str, int]:
@@ -1635,6 +1677,7 @@ def _run_rolling_worker(
     result.processes = session.starts
     result.restarts = session.restarts
     result.fail_lines += len(FAIL_LINE.findall(text))
+    collect_case_errors(result, text)
 
     audit_text = session.preamble + text
     plan = LaunchPlan(
@@ -2010,6 +2053,7 @@ def run_worker(
         result.waves += 1
         result.jobs += end - start
         result.fail_lines += len(FAIL_LINE.findall(text))
+        collect_case_errors(result, text)
         # Same audit the single-GPU harness applies: a run whose physics-mode
         # receipt is not full-exact, or that fell back off a captured graph, is
         # not an acceptance measurement however fast it was.
@@ -2082,6 +2126,7 @@ def run_worker(
         if session.returncode not in (0, None) and result.returncode == 0:
             result.returncode = session.returncode
         result.fail_lines += len(FAIL_LINE.findall(epilogue))
+        collect_case_errors(result, epilogue)
         for match in REFILL_RECEIPT.finditer(epilogue):
             try:
                 result.refill_receipts.append(json.loads(match.group(1)))
@@ -2098,6 +2143,17 @@ def run_worker(
                 "gpu%s p%d: %d case(s) did not produce a result: %s"
                 % (gpu, proc, len(result.failed_cases),
                    ", ".join(result.failed_cases[:8]))
+            )
+        # WP19.  THE MESSAGE, NOT JUST THE NAME.  One problem line per dead
+        # case, carrying what the child actually said, so [MULTI_GPU][FAIL]
+        # names the defect instead of naming eight decks.  A case that died
+        # with no message still gets a line -- see EvaluatorServer::reportCase.
+        for detail in result.failed_case_errors[:16]:
+            result.problems.append("gpu%s p%d: case died: %s" % (gpu, proc, detail))
+        if len(result.failed_case_errors) > 16:
+            result.problems.append(
+                "gpu%s p%d: and %d more case death(s); see %s"
+                % (gpu, proc, len(result.failed_case_errors) - 16, workdir)
             )
 
     result.wall_s = time.monotonic() - started
@@ -2727,8 +2783,20 @@ def parser() -> argparse.ArgumentParser:
         "exit, so a mismatch against test/reference/batch_reference_env_238.json is "
         "visible before a seven-minute run",
     )
-    p.add_argument("--workdir", default="multi_gpu_run",
-                   help="where chunk manifests, per-chunk logs and the MPS pipe/log land")
+    # WP19.  DEFAULT IS A RUN, NOT A DIRECTORY.
+    #
+    # `multi_gpu_run` was a FIXED path, so run N+1 wrote its chunk manifests,
+    # its per-chunk logs, its evaluator logs and its queue.json on top of run
+    # N's.  Three reruns of a flaky 128-case campaign therefore left exactly one
+    # run's evidence -- and it was the run that had already been explained.
+    # Diagnosing an intermittent defect requires the runs you have already done,
+    # so the default is now a timestamped subdirectory and reruns cannot
+    # collide.  --workdir still takes an explicit path verbatim, which is what a
+    # resumed queue needs (see --resume: it reads <workdir>/queue.json).
+    p.add_argument("--workdir", default=None,
+                   help="where chunk manifests, per-chunk logs and the MPS pipe/log land "
+                        "(default: multi_gpu_run/run_<UTC timestamp>, printed at start; "
+                        "pass an explicit path to resume an earlier run's queue)")
     p.add_argument(
         "--cwd",
         help="run each RASBERY process here. A deck's cross-section file and its "
@@ -3010,8 +3078,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     # OPERATOR's: tools/test_harness_env_parity.py keeps both harnesses from
     # granting it to themselves.
 
-    workdir = Path(args.workdir)
+    # WP19.  The default is resolved HERE and not in add_argument, so the
+    # timestamp is the run's and not the parser's, and so `--workdir X` is still
+    # taken exactly as written.
+    if args.workdir:
+        workdir = Path(args.workdir)
+    else:
+        workdir = Path("multi_gpu_run") / time.strftime("run_%Y%m%dT%H%M%SZ",
+                                                        time.gmtime())
     workdir.mkdir(parents=True, exist_ok=True)
+    # PRINTED, ALWAYS.  A run whose logs are somewhere the operator has to guess
+    # is a run whose logs do not exist.
+    print("[RASBERY][MULTI_GPU][WORKDIR] "
+          + json.dumps({"workdir": str(workdir.resolve()),
+                        "explicit": bool(args.workdir)}, separators=(",", ":")))
     cwd = Path(args.cwd).resolve() if args.cwd else None
     if cwd is not None and not cwd.is_dir():
         print(f"error: --cwd is not a directory: {cwd}", file=sys.stderr)
@@ -3341,6 +3421,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "evaluator_totals": r.evaluator_totals,
                     "fatal_waves": r.fatal_waves,
                     "failed_cases": r.failed_cases,
+                    "failed_case_errors": r.failed_case_errors,
                     "jobs": r.jobs,
                     "wall_s": round(r.wall_s, 3),
                     "cases_per_hour": round(r.cases_per_hour, 1),
@@ -3489,6 +3570,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "evaluator_restarts": sum(r.restarts for r in results),
                 "fatal_waves": sum(len(r.fatal_waves) for r in results),
                 "failed_cases": sum(len(r.failed_cases) for r in results),
+                "failed_case_errors": [e for r in results
+                                      for e in r.failed_case_errors],
                 "batch_width": args.batch_width,
                 "jobs": total_jobs,
                 "wall_s": round(wall, 3),

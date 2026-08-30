@@ -2115,6 +2115,41 @@ private:
              << ",\"error\":"
              << (failure.empty() ? std::string("null") : detail::quoted(failure)) << "}";
         _out << line.str() << std::endl;
+
+        // WP19.  A DEAD CASE IS NOT A FIELD OF A RECEIPT.
+        //
+        // The [CASE] line above has carried `"error"` since WP8, and that is
+        // exactly why the capture race was invisible for a campaign: the
+        // dispatcher parsed the receipt, took `deck` and `status` out of it and
+        // threw the error text away, and the harness log for a run that lost
+        // five cases contained no error text at all -- only five deck names on
+        // a "did not produce a result" line.  So the failure gets its OWN line,
+        // at its own severity, with the case id and the message on it, and the
+        // dispatcher lifts THIS into the [MULTI_GPU][FAIL] text
+        // (tools/run_multi_gpu_batch.py, EVALUATOR_CASE_ERROR).
+        //
+        // Printed for every non-zero status, including one whose exception left
+        // no message: "failed, and nothing said why" is itself the report.
+        if (status != 0) {
+            std::ostringstream err;
+            err << "[RASBERY][EVALUATOR][ERROR] {\"wave_id\":" << wave_id
+                << ",\"case\":" << index
+                << ",\"deck\":" << detail::quoted(deck)
+                << ",\"output\":" << detail::quoted(output)
+                << ",\"lane\":" << lane
+                << ",\"slot\":" << receipt.slot
+                << ",\"exit_code\":" << status
+                << ",\"error\":"
+                << (failure.empty() ? detail::quoted("no message (the case died "
+                                                     "without an exception)")
+                                    : detail::quoted(failure))
+                << "}";
+            _out << err.str() << std::endl;
+            // stderr as well, unconditionally: _out can be a pipe a controller
+            // owns, and a case death must reach a human reading the log even
+            // when nobody is reading the protocol.
+            std::cerr << err.str() << std::endl;
+        }
     }
 
     Options                               _options;

@@ -104,8 +104,10 @@ bool nodalXsMirrorEnabled() {
 /// graph capture is open, and `--batch-mode` runs them on one deck's Driver
 /// thread while another deck is capturing the shared arena's graph.  The window
 /// is what keeps the two apart; see GpuCaptureArbiter.h for the failure it
-/// prevents, and tools/test_gpu_capture_arbiter_contract.py for the source rule
-/// that keeps this file using it.
+/// prevents, and tools/test_gpu_capture_arbiter_contract.py plus
+/// tools/test_capture_arbiter_contract.py for the source rules that keep this
+/// file using it.  (The second is WP19's: the first checks four named sources
+/// and therefore never noticed that two whole backends had no window at all.)
 #define RASBERY_CUDA_TRY_ALLOC(expr, sink)                                   \
     do {                                                                     \
         rasbery::AllocWindow _alloc_window(#expr);                           \
@@ -2191,6 +2193,12 @@ struct XsReconBackend::Impl {
 
     [[nodiscard]] bool ensureNodalEvent() {
         if (nodal_done_event != nullptr) return true;
+        // WP19.  Once per instance, on the first drive -- i.e. stand-up, which
+        // is precisely when a sibling lane is capturing.  Event creation is on
+        // CUDA's "potentially unsafe during capture" list like every allocation
+        // around it; RASBERY_CUDA_TRY_ALLOC covers the mallocs in this file and
+        // this is the one call that is not one.
+        rasbery::AllocWindow _alloc_window("nodal.event.create");
         if (cudaEventCreateWithFlags(&nodal_done_event, cudaEventDisableTiming) !=
             cudaSuccess) {
             cudaGetLastError();
@@ -2820,10 +2828,17 @@ XsReconBackend::XsReconBackend() : _impl(std::make_unique<Impl>()) {
                         (e == cudaSuccess ? "count 0" : cudaGetErrorString(e));
         return;
     }
-    const cudaError_t se = cudaStreamCreateWithFlags(&_impl->stream, cudaStreamNonBlocking);
-    if (se != cudaSuccess) {
-        _impl->status = std::string("stream: ") + cudaGetErrorString(se);
-        return;
+    // WP19.  The backend's own stream, created on the constructor's thread --
+    // i.e. once per deck, at stand-up, concurrently with fifteen siblings.
+    // The cudaMalloc four lines down already took a window; this did not.
+    {
+        rasbery::AllocWindow _stream_window("xsrecon.stream.create");
+        const cudaError_t se =
+            cudaStreamCreateWithFlags(&_impl->stream, cudaStreamNonBlocking);
+        if (se != cudaSuccess) {
+            _impl->status = std::string("stream: ") + cudaGetErrorString(se);
+            return;
+        }
     }
     rasbery::AllocWindow _scalars_window("xsrecon.scalars");
     if (cudaMalloc(reinterpret_cast<void**>(&_impl->dev_scalars),
@@ -3783,6 +3798,9 @@ void* XsReconBackend::micxReadyEvent() {
         // DisableTiming: this event is a stream-ordering handover, never a
         // measurement, and the timing variant costs a synchronising query the
         // consumer would pay on every depletion step.
+        //
+        // WP19: once per instance, on the first ask, which is stand-up.
+        rasbery::AllocWindow _alloc_window("xsrecon.micx_ready.event");
         if (cudaEventCreateWithFlags(&d.micx_ready_event, cudaEventDisableTiming) !=
             cudaSuccess) {
             d.micx_ready_event = nullptr;

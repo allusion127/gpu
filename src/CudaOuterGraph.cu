@@ -1874,10 +1874,14 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
         // and reused for every outer after it.  cudaEventDisableTiming because
         // nothing measures it: it exists to carry a dependency, and the timing
         // variant costs a device-side timestamp per record.
-        if (m.nodal_handover_ev == nullptr &&
-            (rc = cudaEventCreateWithFlags(&m.nodal_handover_ev, cudaEventDisableTiming)) !=
-                cudaSuccess)
-            return launchFailed("create the nodal handover event", rc);
+        if (m.nodal_handover_ev == nullptr) {
+            // WP19.  Created once, on the first host-free segment -- stand-up,
+            // which is the window a sibling lane's capture is open in.
+            rasbery::AllocWindow _alloc_window("outer.handover.event");
+            if ((rc = cudaEventCreateWithFlags(&m.nodal_handover_ev,
+                                               cudaEventDisableTiming)) != cudaSuccess)
+                return launchFailed("create the nodal handover event", rc);
+        }
         if (m.d_sweep_accum != nullptr &&
             (rc = cudaMemsetAsync(m.d_sweep_accum + slot, 0,
                                   sizeof(*m.d_sweep_accum), m.stream)) != cudaSuccess)
@@ -2848,11 +2852,17 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
             // and never executes anything: the root graph is LAUNCHED on the
             // segment stream, and which stream a node was captured on decides
             // topology, not where it runs.
-            if (m.while_cache.root_stream == nullptr &&
-                (rc = cudaStreamCreateWithFlags(&m.while_cache.root_stream,
-                                                cudaStreamNonBlocking)) != cudaSuccess) {
-                launchFailed("create the WHILE root stream", rc);
-                return -1;
+            if (m.while_cache.root_stream == nullptr) {
+                // WP19.  The last unguarded stand-up call on the WHILE path,
+                // and the one immediately in front of the capture below: it
+                // runs once, on the first segment of the run, on whichever
+                // lane got there first.
+                rasbery::AllocWindow _alloc_window("outer.while.root_stream");
+                if ((rc = cudaStreamCreateWithFlags(&m.while_cache.root_stream,
+                                                    cudaStreamNonBlocking)) != cudaSuccess) {
+                    launchFailed("create the WHILE root stream", rc);
+                    return -1;
+                }
             }
             // Before the capture, not after: the splice reads this flag on the
             // sweep and nodal drive launch sites, both of which are inside the
@@ -2871,6 +2881,28 @@ bool CudaOuterSegment::runSegment(const OuterSegmentScalars& scalars, int batch_
                                      m.d_halt, slot, &stage,
                                      [&](cudaStream_t) { return runOneOuter(1u); },
                                      &root, &exec);
+            }
+            // WP19.  A capture-concurrency code is a statement about the other
+            // lanes, not about this graph, so it is worth exactly one rebuild
+            // with the process quiet -- and the sticky error has to be cleared
+            // first or the retry inherits it.  A second refusal is a real one
+            // and falls through to the named refusal below, loudly.
+            if (rasbery::captureIllegal(static_cast<int>(rc))) {
+                cudaGetLastError();
+                rasbery::noteCaptureRaceRetry();
+                root = nullptr;
+                exec = nullptr;
+                {
+                    rasbery::CaptureWindow window(m.stream, "outer.while.retry");
+                    rc = buildOuterWhile(m.while_cache.root_stream, m.stream, m.d_segments,
+                                         m.d_halt, slot, &stage,
+                                         [&](cudaStream_t) { return runOneOuter(1u); },
+                                         &root, &exec);
+                }
+                if (rasbery::captureIllegal(static_cast<int>(rc)))
+                    rasbery::noteCaptureRaceUnrecovered("outer.while",
+                                                        static_cast<int>(rc),
+                                                        cudaGetErrorString(rc));
             }
             if (rc != cudaSuccess) {
                 std::fprintf(stderr,

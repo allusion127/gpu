@@ -10,6 +10,7 @@
 // not contract a*b+c where the host compiler did not.
 
 #include "CudaPprBackend.h"
+#include "GpuCaptureArbiter.h"
 #include "PprReconstructionKernel.cuh"
 #include "XferLedger.h"
 
@@ -23,6 +24,16 @@
 #include <vector>
 
 namespace rasbery {
+
+// WP19.  GpuCaptureArbiter.h spells the capture-illegal error class as numbers
+// because it must compile in the no-CUDA stub build.  This is the one TU that
+// can check the numbers against the enum, so it does -- if a future toolkit
+// renumbers the block, the build stops here instead of the retry quietly
+// deciding that nothing is ever retryable.
+static_assert(static_cast<int>(cudaErrorStreamCaptureUnsupported) == kCaptureErrFirst,
+              "GpuCaptureArbiter.h kCaptureErrFirst no longer matches CUDA");
+static_assert(static_cast<int>(cudaErrorStreamCaptureWrongThread) == kCaptureErrLast,
+              "GpuCaptureArbiter.h kCaptureErrLast no longer matches CUDA");
 
 namespace {
 
@@ -1420,6 +1431,10 @@ struct PprBackend::Impl {
     ~Impl() { release(); }
 
     void releaseRecon() {
+        // WP19.  Every free here is "potentially unsafe" in CUDA's capture
+        // vocabulary and a re-shape runs it mid-run, on one lane's thread,
+        // while another lane may be capturing.  See GpuCaptureArbiter.h.
+        rasbery::AllocWindow _alloc_window("ppr.recon.release");
         auto f = [](void* p) { if (p) cudaFree(p); };
         f(d_latol); f(d_vol); f(d_hz);
         f(d_pin_off); f(d_ovl_di); f(d_ovl_dj); f(d_ovl_dxh); f(d_ovl_dyh);
@@ -1447,6 +1462,7 @@ struct PprBackend::Impl {
 
     void releaseGraph() {
 #if RASBERY_HAS_PPR_WHILE
+        rasbery::AllocWindow _alloc_window("ppr.graph.release");
         if (graph_exec != nullptr) cudaGraphExecDestroy(graph_exec);
         if (graph_root != nullptr) cudaGraphDestroy(graph_root);
         graph_exec  = nullptr;
@@ -1457,6 +1473,11 @@ struct PprBackend::Impl {
 
     void release() {
         releaseGraph();
+        // WP19.  Held across the whole teardown -- including releaseRecon()'s
+        // own nested window, which the arbiter's thread-local depth counter
+        // makes free.  A deck's teardown is exactly as unsafe to run inside a
+        // sibling's capture as its stand-up is.
+        rasbery::AllocWindow _alloc_window("ppr.release");
 #if RASBERY_HAS_PPR_WHILE
         if (graph_root_stream != nullptr) cudaStreamDestroy(graph_root_stream);
         graph_root_stream = nullptr;
@@ -1525,6 +1546,14 @@ struct PprBackend::Impl {
         if (n_shapes > 0) ++n_reallocations;
         ++n_shapes;
         release();
+        // WP19, AND THIS IS THE ONE THAT KILLED THE BATCH.  Everything below --
+        // cudaStreamCreate, two cudaEventCreate, 25 cudaMalloc, 3
+        // cudaMallocHost -- is a "potentially unsafe" API, and it runs on the
+        // FIRST statepoint of every deck, i.e. exactly when a sibling lane that
+        // started a few milliseconds earlier is capturing its CMFD/outer/PPR
+        // graph.  ThreadLocal capture does not stop a sibling thread; the
+        // arbiter does.  See GpuCaptureArbiter.h.
+        rasbery::AllocWindow _alloc_window("ppr.shape.standup");
         ng     = g.ng;
         nxyz   = g.nxyz;
         nxy    = g.nxy;
@@ -1608,6 +1637,9 @@ struct PprBackend::Impl {
         if (recon_shapes > 0) ++n_reallocations;
         ++recon_shapes;
         releaseRecon();
+        // WP19.  Same rule as ensureShape: 23 cudaMalloc and a cudaMallocHost,
+        // on a lane's thread, at a moment another lane chooses.
+        rasbery::AllocWindow _alloc_window("ppr.recon.standup");
         r_nxya = g.nxya; r_nz = g.nz; r_kbc = g.kbc; r_kec = g.kec;
         r_ndiv = g.ndiv; r_npins = g.npins;
         r_overlaps = g.n_overlaps; r_slots = st.n_form_slots;
@@ -1665,6 +1697,10 @@ struct PprBackend::Impl {
 
     bool ensureReconFlux(const ppr::ReconGeomView& g, const ppr::ReconStepView& st) {
         if (!st.reconstruct_flux || d_fmap != nullptr) return true;
+        // WP19.  Late and rare -- `print_opt.pin_flux` at one statepoint out of
+        // thirty-five -- which makes it the WORST kind of unguarded allocation:
+        // one that fires deep into a run, when every lane is capturing.
+        rasbery::AllocWindow _alloc_window("ppr.recon.flux");
         const int    npina = g.npins * g.npins;
         const size_t nmap  = static_cast<size_t>(g.nz) * g.nxya * npina;
         cudaError_t  rc    = cudaMalloc((void**)&d_fmap,
@@ -2103,19 +2139,62 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
             if (s.graph_valid && std::memcmp(&s.graph_ctx, &x, sizeof(DevCtx)) != 0)
                 s.releaseGraph();
             if (!s.graph_valid) {
-                if (s.graph_root_stream == nullptr &&
-                    (rc = cudaStreamCreate(&s.graph_root_stream)) != cudaSuccess)
-                    return s.fail("cudaStreamCreate(graph root)", rc);
+                if (s.graph_root_stream == nullptr) {
+                    // WP19.  Stream creation is a stand-up call like any other
+                    // and it happens once, on the first statepoint -- the same
+                    // window the PPR buffers are allocated in.
+                    rasbery::AllocWindow _alloc_window("ppr.graph.root_stream");
+                    if ((rc = cudaStreamCreate(&s.graph_root_stream)) != cudaSuccess)
+                        return s.fail("cudaStreamCreate(graph root)", rc);
+                }
                 const char* stage = "?";
                 cudaGraph_t root  = nullptr;
                 cudaGraphExec_t exec = nullptr;
-                const cudaError_t brc = buildPprWhile(
-                    s.graph_root_stream, s.stream, s.d_loop, &stage,
-                    [&](cudaStream_t bs) {
-                        enqueue_round(bs, true);
-                        return cudaGetLastError() == cudaSuccess;
-                    },
-                    &root, &exec);
+                // WP19, THE GAP ITSELF.  This was the ONE capture in the tree
+                // outside the arbiter: two BeginCaptures (root, and
+                // BeginCaptureToGraph on the segment stream) with nothing
+                // holding the process quiet around them, in the arm the
+                // production v6 env turns on.  The window below is what every
+                // other capture site has had since Rev.7.1 Task 18d.
+                auto build = [&]() {
+                    rasbery::CaptureWindow _capture_window(s.stream, "ppr.while");
+                    return buildPprWhile(
+                        s.graph_root_stream, s.stream, s.d_loop, &stage,
+                        [&](cudaStream_t bs) {
+                            enqueue_round(bs, true);
+                            return cudaGetLastError() == cudaSuccess;
+                        },
+                        &root, &exec);
+                };
+                cudaError_t brc = build();
+                // THE RETRY, AND WHY IT IS ONE AND NOT A LOOP.  A capture-
+                // illegal code says another thread was in the window, not that
+                // this graph is unbuildable, so the same build under a quiet
+                // process is a different experiment -- worth exactly one run.
+                // A second failure is not a race any more and is reported as
+                // such rather than retried into a hang.  cudaGetLastError()
+                // between the two clears the sticky error the first attempt
+                // left, or the retry inherits the corpse.
+                if (rasbery::captureIllegal(static_cast<int>(brc))) {
+                    // `refusals[CaptureRaceRetry]` is the COUNTER the receipt
+                    // reports; `last_refusal` is why the LAST statepoint fell
+                    // back, and a retry that worked did not fall back -- so the
+                    // rung is counted and the ladder's tip is put back.
+                    const ppr::Refusal prev = s.last_refusal;
+                    cudaGetLastError();
+                    rasbery::noteCaptureRaceRetry();
+                    s.noteRefusal(ppr::Refusal::CaptureRaceRetry);
+                    root = nullptr;
+                    exec = nullptr;
+                    brc  = build();
+                    if (brc == cudaSuccess) {
+                        s.last_refusal = prev;
+                    } else if (rasbery::captureIllegal(static_cast<int>(brc))) {
+                        rasbery::noteCaptureRaceUnrecovered("ppr.while",
+                                                            static_cast<int>(brc),
+                                                            cudaGetErrorString(brc));
+                    }
+                }
                 if (brc == cudaSuccess) {
                     s.graph_root  = root;
                     s.graph_exec  = exec;
