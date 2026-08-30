@@ -74,6 +74,11 @@ struct ReconCtx {
     int npina;
     int nchunk;
     int reconstruct_flux; ///< 1 = also fill pin flux with fmap
+    /// WP6 stage F.  1 = RASBERY_PPR_MODE=master: the intranodal shape is the
+    /// 13-term Legendre interpolant already in `c`, so the expansion is a
+    /// 15-term dot product with the pre-computed products and p/a/bt are not
+    /// read at all.  It is PPR.cpp's own branch inside the overlap loop.
+    int mode_master;
 
     // --- geometry, uploaded once ---
     const int*           latol;   ///< [nxya * ndiv2], index la*ndiv2 + li
@@ -96,6 +101,7 @@ struct ReconCtx {
     const double* p;    ///< [nxyz * ng * 15]
     const double* a;    ///< [nxyz * ng * 8]
     const double* bt;   ///< [nxyz * ng]
+    const double* c;    ///< [nxyz * ng * 15], MASTER mode's interpolant
     const double* phif; ///< [nxyz * ng]  (borrowed or uploaded)
     const double* xskf; ///< [ng * nxyz]
 
@@ -168,6 +174,26 @@ __global__ void kReconPins(ReconCtx x) {
         const double* q_leg = &x.q_leg[static_cast<long long>(o) * 9 * 15];
 
         for (int g = 0; g < x.ng; ++g) {
+            if (x.mode_master) {
+                // PPR.cpp's MASTER branch, statement for statement.  NO `exp`
+                // anywhere in it, so unlike the SENM path below this is a plain
+                // reduction in the host's order on the host's operands -- class
+                // B0 given its input, and its input is the N1 corner fluxes the
+                // device CPB solve produced.
+                const double* c_base = &x.c[(lk * 15 * x.ng) + (g * 15)];
+                double        integ  = 0.0;
+                for (int qq = 0; qq < 9; ++qq) {
+                    const double* leg   = &q_leg[qq * 15];
+                    double        cflux = 0.0;
+                    for (int tt = 0; tt < 15; ++tt) cflux += c_base[tt] * leg[tt];
+                    integ += q_wt[qq] * cflux;
+                }
+                const double flux_contrib = integ * dx_h * dy_h * area_coeff;
+                hom_flux[g] += flux_contrib;
+                power_integral += flux_contrib * x.xskf[g * x.nxyz + lk];
+                continue;
+            }
+
             const double  bt     = x.bt[lk * x.ng + g];
             const double* p_base = &x.p[(lk * 15 * x.ng) + (g * 15)];
             const double* a_base = &x.a[(lk * 8 * x.ng) + (g * 8)];

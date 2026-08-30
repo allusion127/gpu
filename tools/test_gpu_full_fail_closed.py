@@ -129,15 +129,26 @@ check("throw Violation" in note_body,
       "gpufull::note() does not throw under the gate; it would only count")
 check("if (!required()) return;" in note_body,
       "gpufull::note() throws unconditionally; the default must stay fail-open")
-# ... and everything that allocates must sit BEHIND that early return, or the
-# default path stops being one relaxed increment on a path already about to run
-# a whole CPU physics body.
-if "if (!required()) return;" in note_body and "recordFirstViolation" in note_body:
-    check(note_body.index("if (!required()) return;") <
-          note_body.index("recordFirstViolation"),
-          "gpufull::note() builds the violation text before the gate check; with "
-          "RASBERY_GPU_FULL unset the default fallback path would allocate a string "
-          "per fallback")
+# ... and nothing may allocate PER FALLBACK.  `first_violation` is named with
+# the gate OFF as well as on -- `contract_pass:false` is printed either way, and
+# a null beside it is a receipt that says a seam fired and refuses to say which
+# -- so the no-allocation rule moved from "behind the gate" to "behind the
+# armed flag": the FIRST fallback of a run builds one string, every one after it
+# reads one atomic and returns.
+check("nameFirstFallback(which, where, why);" in note_body,
+      "gpufull::note() does not name the first fallback; with the gate off the receipt "
+      "prints contract_pass:false beside first_violation:null, which is the reading that "
+      "cost the PPR campaign a release")
+check("recordFirstViolation" not in note_body,
+      "gpufull::note() builds the violation text itself; there must be ONE writer of the "
+      "first-fallback slot (nameFirstFallback) or the gate-on and gate-off paths can "
+      "record different things")
+name_body = header[header.find("inline void nameFirstFallback("):]
+name_body = name_body[:name_body.find(chr(10) + "}")]
+check("firstViolationArmed().load" in name_body and
+      name_body.index("firstViolationArmed().load") < name_body.index("recordFirstViolation"),
+      "gpufull::nameFirstFallback() builds the text before testing the armed flag; the "
+      "default fallback path would then allocate a string per fallback")
 
 # The DEFERRING seam: counts, latches, and does NOT throw where it stands.
 defer_body = header[header.find("inline void noteDeferred("):]

@@ -4,14 +4,14 @@
 
 | 항목 | 값 |
 |---|---|
-| 대상 | `RASBERY_GPU_PPR` arm의 Picard 종료 판정, 입력 업로드, 핀 재구성, per-slot 할당 |
-| 상위 계획 | `docs/GPU_RASBERY_BOTTLENECK_PARALLEL_ACCELERATION_IMPLEMENTATION_PLAN_20260830_KO.md` §WP6 단계 B·C·D·E |
+| 대상 | `RASBERY_GPU_PPR` arm의 Picard 종료 판정, 입력 업로드, 핀 재구성, per-slot 할당, **그리고 production 재구성 모드(`RASBERY_PPR_MODE=master`)의 device 이식** |
+| 상위 계획 | `docs/GPU_RASBERY_BOTTLENECK_PARALLEL_ACCELERATION_IMPLEMENTATION_PLAN_20260830_KO.md` §WP6 단계 B·C·D·E·**F** |
 | 선행 | 단계 A 완료 (238): `PPR_GPU` ON×2 결정론, Gate A **0.0000 / 35 statepoint 전부**, receipt `host_fallbacks 0` · `iterations 816` · `host_iterations 0` |
-| 게이트 등급 | 단계 B **B0 (현 device arm 대비)** — fold의 association이 host fold와 동일 / 단계 C **B0 조건부**, 조건은 borrow의 건전성이고 그것은 `verify` 모드가 측정한다 / 단계 D **N1**, 원천은 `exp` 하나이고 나머지 순서는 전부 host의 것이다 / 전체는 host arm 대비 여전히 **N1**(`c502856`이 건너간 선) |
+| 게이트 등급 | 단계 B **B0 (현 device arm 대비)** — fold의 association이 host fold와 동일 / 단계 C **B0 조건부**, 조건은 borrow의 건전성이고 그것은 `verify` 모드가 측정한다 / 단계 D **N1**, 원천은 `exp` 하나이고 나머지 순서는 전부 host의 것이다 / 전체는 host arm 대비 여전히 **N1**(`c502856`이 건너간 선) / 단계 F **N1, 원천이 하나이고 그것은 CPB sweep의 Gauss-Seidel → Jacobi 전환이다**(§10.2) — 나머지(짝수항, 교차항, 재구성 분기)는 전부 host 표현·host 순서이고 재구성 master 분기에는 `exp`가 아예 없다 |
 | 플래그 | `RASBERY_GPU_PPR=1`(기본 0) 안에서 `RASBERY_GPU_PPR_DEVICE_LOOP`(기본 **1**), `RASBERY_GPU_PPR_GRAPH`(기본 0), `RASBERY_GPU_PPR_CANONICAL`(기본 `off`; `1`=borrow, `verify`=borrow+대조), `RASBERY_GPU_PPR_RECON`(기본 0) |
-| receipt | `[RASBERY][PPR_GPU]` **schema_version 2** — `loop_arm`, `host_syncs`, `host_syncs_per_statepoint`, `graph_launches`, `graph_builds`, `graph_refusal`, `canonical_mode`, `canonical_statepoints`, `canonical_mismatch`, `h2d_bytes`, `h2d_bytes_elided`, `d2h_bytes`, `recon_statepoints`, `pin_materializations`, `recon_repairs`, `recon_refusal`, `allocations`, `reallocations` |
-| 계약 테스트 | `tools/test_ppr_gpu_contract.py` — 27 property, **negative control 38종** |
-| 소스 | `src/CudaPprBackend.{h,cu}`, `src/CudaPprBackendStub.cpp`, `src/PprReconstructionKernel.cuh`(신규), `src/PPR.{h,cpp}`, `src/Driver.h`(PPR 블록·receipt) |
+| receipt | `[RASBERY][PPR_GPU]` **schema_version 2** — `loop_arm`, `host_syncs`, `host_syncs_per_statepoint`, `graph_launches`, `graph_builds`, `graph_refusal`, `canonical_mode`, `canonical_statepoints`, `canonical_mismatch`, `h2d_bytes`, `h2d_bytes_elided`, `d2h_bytes`, `recon_statepoints`, `pin_materializations`, `recon_repairs`, `recon_refusal`, `allocations`, `reallocations`, **`refusal`**, **`refusals`** |
+| 계약 테스트 | `tools/test_ppr_gpu_contract.py` — 27 property, **negative control 38종** · `tools/test_ppr_gpu_master_mode_contract.py`(신규) — 8 property group, **negative control 22종** |
+| 소스 | `src/CudaPprBackend.{h,cu}`, `src/CudaPprBackendStub.cpp`, `src/PprReconstructionKernel.cuh`, `src/PPR.{h,cpp}`, `src/Driver.h`(PPR 블록·receipt), `src/GpuFullContract.h`(first_violation) |
 | 기준 덱 | KNGR, `nxyz = 8,451`, `nsurf = 26,692`, `NG = 2`, 집합체 88(쿼터), 핀 16×16 |
 | 로컬에서 한 것 | 순수 python 계약(27 property + 음성대조 38), MSVC `/Zs`로 `src/PPR.cpp`·`src/CudaPprBackendStub.cpp`·`Driver.h`를 include하는 TU, 그리고 `CudaPprBackend.cu`(+`PprReconstructionKernel.cuh`)를 `tools/check_cuda_syntax.py`의 재작성 규칙 + graph/conditional shim으로 **`CUDART_VERSION` 12060·13000 양쪽** 문법 검사. **nvcc는 없다 — 238 컴파일이 첫 관문이다.** |
 
@@ -562,10 +562,12 @@ runner가 재는 **현행 PPR-ON wall**이 기준선이다(PPR-OFF가 아니다 
 ## 9. 남은 구멍
 
 1. **XS 블록이 여전히 매 statepoint 올라간다** (676,080 B). §3.3.
-2. **`pointwise` 재구성(`use_quadrature=false`)과 `RASBERY_PPR_MODE=master`는 이식하지
-   않았다.** 둘 다 다른 스킴이고, arm은 근사하지 않고 거절한다 — 다만 계수 D2H를 이미
-   생략한 statepoint에서 거절하면 §4.5의 수리가 돌고 그것은 낭비다. production arm은
-   quadrature이므로 실제로는 일어나지 않아야 하며, `recon_repairs`가 그것을 확인한다.
+2. **`pointwise` 재구성(`use_quadrature=false`)은 여전히 이식하지 않았다.** 다른 스킴이고,
+   arm은 근사하지 않고 거절한다 — 다만 계수 D2H를 이미 생략한 statepoint에서 거절하면
+   §4.5의 수리가 돌고 그것은 낭비다. production arm은 quadrature이므로 실제로는 일어나지
+   않아야 하며, `recon_repairs`가 그것을 확인한다. **`RASBERY_PPR_MODE=master`는 §10에서
+   이식했다** — 이 항목이 "arm은 거절한다"로 남아 있던 동안 production 전 statepoint가
+   host에서 돌았다.
 3. **`device_stream`은 launch를 900개로 늘린다.** `device_graph`가 그것을 1개로 만들지만
    capture 주장을 하나 더 얹는다. 어느 쪽이 이득인지는 §7.3/§7.5의 실측이 정한다.
 4. **핀 맵을 안 내리면 `Geometry::PinPower()`는 낡은 채로 남는다.** 오늘 그것을 읽는
@@ -574,3 +576,165 @@ runner가 재는 **현행 PPR-ON wall**이 기준선이다(PPR-OFF가 아니다 
    Driver의 인자를 함께 붙잡는 이유다.
 5. **nvcc가 이 파일들을 본 적이 없다.** 로컬 문법 검사는 shim 위에서 한 것이고,
    `__shared__`·launch configuration·레지스터 압력은 검사되지 않았다.
+
+---
+
+## 10. 단계 F — `RASBERY_PPR_MODE=master`가 device에서 돈다
+
+### 10.1 무엇이 잘못돼 있었나
+
+`PPR::resetAndDriveGpu`의 세 번째 줄이 이랬다.
+
+```cpp
+// driveMaster is a different scheme (MASTER MM 6.1, ...).  The device arm
+// reproduces the SENM path only, so it declines rather than silently changing method.
+if (_mode_master) return false;
+```
+
+문장 자체는 맞다. 문제는 **`RASBERY_PPR_MODE=master`가 production configuration**이라는
+것이다 — Gate B pin RMS를 **0.238 % / 0.80 %** 로 만드는 것이 이 모드이고, 기본 모드는
+0.522 % / 2.13 % 다. 그래서 production arm은 `RASBERY_GPU_PPR=1`을 켠 채로 35 statepoint
+전부를 host에서 돌렸고, 수신증이 말한 것은 `host_fallbacks:35` 한 줄뿐이었다. 그 숫자는
+"CUDA 장치가 없다" · "이 덱은 2군이 아니다" · "이 캠페인이 실제로 쓰는 모드는 이식된 적이
+없다"를 **똑같이** 읽는다.
+
+238 실측(73f8627, GPU0, KNGR cycle-1)이 원인을 하나로 좁혔다.
+
+| 환경 | `host_fallbacks` | `iterations` |
+|---|---|---|
+| production env − `RASBERY_PPR_MODE` | 0 | 816 |
+| production env − `RASBERY_PC_MODE` (즉 master만) | 35 | 0 |
+| `RASBERY_PC_MODE=decart` 단독 | 0 | 816 |
+
+`RASBERY_PC_MODE=decart`는 **PPR과 무관하다**. 그것을 읽는 곳은 `src/XSSet.cpp:4817`
+(DeCART2D Eq. (6.20) predictor-corrector)와 `src/CudaCramBackend.h:184` 뿐이고, PPR 경로에는
+등장하지 않는다. 방아쇠는 `_mode_master` 하나다.
+
+### 10.2 두 스킴은 정말로 다르다 — 그리고 어디까지 같은가
+
+| | SENM (기본) | MASTER (`_mode_master`) |
+|---|---|---|
+| `drive` | Picard 반복: source sweep 3회(`updateFused` = particular `p` + homogeneous `a` + projection `c`) 후 `updateCorner` | 반복 없음. MM §6.1의 13항 Legendre 보간을 `c`에 직접 쓴다 |
+| 코너 | Picard의 부산물 | **corner-point-balance 선형계**(Eq. 6.7/6.8)를 Gauss-Seidel로 푼다 |
+| 종료 판정 | 연료 코너합 4개의 `RelativeChange < 1e-5` | 코너 상대변화의 **최대값** `< 1e-5` |
+| 쓰는 배열 | `p`, `a`, `c`, `bt`, `phic`, `q`, `l` | `c`, `phic`만 (그리고 `reset()`이 쓰는 `bt`/`q`/`l`) |
+| 캡 | `niter` | `std::max(niter, 200)` |
+| 지수함수 | `exp` 12회/(pin, overlap, group) | **없다** |
+
+`PPR::reset()`에는 모드 분기가 **없다**. 그래서 device도 `kBuckling → kCornerInit → kFit →
+kAxialLeakage → kUpdateSource` 전부를 그대로 돌린 다음 `kMasterEven`이 `kFit`이 쓴 15칸을
+덮어쓴다. 이것을 줄이면 host와 **다른 초기 반복자**에서 출발하게 된다.
+
+이식은 커널 다섯 개다.
+
+| 커널 | 대응 | 등급 |
+|---|---|---|
+| `kMasterEven` | driveMaster 1단계 (Eq. 6.2 + Eq. 6.6의 앞 8개) | **B0** — (node, group) 원소별, host 표현·host 순서 |
+| `kMasterCpb<kGuarded>` | 2단계 sweep | **N1** — 아래 |
+| `kMasterCommit<kGuarded>` | 2단계 commit + chunk별 max | B0 — `max`는 정확히 결합적이다 |
+| `kMasterFoldAndCheck` | 2단계 종료 판정 | B0 — driveMaster의 판정식·허용오차 그대로 |
+| `kMasterCross` | 3단계 (Eq. 6.6의 뒤 4개) | **B0** — 입력이 주어지면 |
+
+**N1의 원천은 하나다.** driveMaster의 CPB sweep은 Gauss-Seidel이다 — `_phic`를 제자리에서
+쓰고, 뒤 노드가 그것을 읽는다. 그것은 메쉬 전체에 걸친 직렬 의존이고 커널이 될 수 없다.
+device는 같은 balance를 **Jacobi**로 돈다(`phic` 읽고 `phic_next` 쓰고 commit).
+
+- 두 반복은 **같은 선형계의 같은 고정점**으로 수렴한다. 각 코너의 balance는 노드당 대각
+  `4w`, 비대각 `2w`이므로 Jacobi 스펙트럴 반경은 1/2, Gauss-Seidel은 1/4로 유계다.
+- 다른 것은 **어디서 멈추는가**뿐이다. 같은 `1e-5` 상대변화 판정에서 정지 시 고정점까지의
+  거리가 각각 약 `1e-5`와 `0.33e-5`, 즉 코너 flux 상대차 **~1e-5**.
+- Gate B 봉투(0.238 % = 2.4e-3)보다 **두 자릿수 아래**다.
+
+`kMasterCpb`가 `x.phic`를 직접 쓰면 그것은 N1이 아니라 **race**다(이웃 스레드가 같은 배열을
+읽는다). 결과는 유한하고 그럴듯하며 launch 순서에 의존한다 — `test_ppr_gpu_master_mode_contract.py`
+의 음성대조 "the sweep writes the current iterate (the in-place race)"가 그것을 거절한다.
+
+### 10.3 재구성 master 분기는 B0다
+
+MASTER 모드의 핀 전개는 `sum_t c[t] * leg[t]` — 15항 내적이고 `exp`가 없다. 그래서
+`PprReconstructionKernel.cuh`의 `if (x.mode_master)` 분기는 host 루프를 host 순서로 옮긴
+것이고, TU가 `--fmad=false`로 컴파일되므로 **B0**이다. master 핀 맵이 host와 다른 이유는
+그것을 만든 코너 flux가 N1이라는 것 하나뿐이다.
+
+`p`와 `a`는 master 모드에서 **어느 arm도 쓰지 않는다**(driveMaster에 particular/homogeneous
+분해가 없고 `reset()`도 건드리지 않는다). 그래서 master D2H는 7배열이 아니라 5배열이다 —
+device 버퍼의 미초기화 내용으로 host 배열을 덮어쓰는 것은 포트가 발명한 차이다.
+
+### 10.4 거절 사다리 — 왜 이것이 같은 커밋에 있나
+
+이 결함이 캠페인 하나를 버틴 이유는 **수신증이 이유를 말하지 않았기 때문**이다. 그래서
+`ppr::Refusal`을 `BICGCMFD::EnqueueRefusal`과 같은 모양으로 넣었다.
+
+| rung | 언제 |
+|---|---|
+| `arm_off` | `RASBERY_GPU_PPR` 미설정, CUDA 장치 없음, stub 빌드 |
+| `backend_disabled` | 앞선 CUDA 실패가 이 인스턴스를 내려놓았다 |
+| `not_two_group` | `ng != 2` |
+| `non_positive_iter` | `niter <= 0` |
+| `shape_alloc_fail` | `ensureShape`가 버퍼를 세우지 못했다 |
+| `cuda_failure` | statepoint 경로의 모든 `cudaError_t` (`fail()` 한 곳이 쓴다) |
+
+- `PPR::resetAndDriveGpu`의 거절은 backend에 **도달하지 않으므로** `noteHostFallback()`이
+  host 쪽에서 rung을 남긴다. 그러지 않으면 가장 흔한 두 이유가 `none`으로 보고된다.
+- 수신증에 `"refusal"`(마지막 이유)과 `"refusals"`(전체 집계, 한 번도 안 떨어졌으면 `{}`)가
+  추가됐다.
+- `RASBERY_GPU_FULL` seam에 넘기는 `why`가 **고정 문장에서 사다리의 이름으로** 바뀌었다.
+  `first_violation`이 일곱 가지 이유 전부에 대해 "the device PPR arm declined"를 인쇄하던
+  것이 그 결함의 다른 얼굴이다.
+- `gpufull::note()`가 **게이트와 무관하게** 첫 fallback의 site/reason을 기록한다
+  (`nameFirstFallback`). `contract_pass:false`는 게이트와 무관하게 인쇄되므로, 그 옆의
+  `first_violation:null`은 "어떤 arm이 안 붙었나"를 수신증만으로는 답할 수 없게 만들었다.
+  첫 fallback만 문자열을 만들고 그 뒤는 atomic 한 번이므로 기본 경로 비용은 그대로다.
+
+### 10.5 238 runbook — 단계 F
+
+**production single env** 그대로에 `RASBERY_GPU_PPR=1`만 얹는다.
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+OUT=$PWD/wp6f
+
+env -i PATH=$PATH HOME=$HOME CUDA_VISIBLE_DEVICES=0 \
+  RASBERY_PPR_MODE=master RASBERY_PC_MODE=decart \
+  RASBERY_GPU=1 RASBERY_GPU_CMFD_SWEEP=1 RASBERY_GPU_CMFD_RESIDENT_SINGLE=1 \
+  RASBERY_GPU_NODAL=1 RASBERY_GPU_NODAL_FULL=1 RASBERY_GPU_XSRECON=1 \
+  RASBERY_GPU_FLATXS=1 RASBERY_GPU_OUTER=1 RASBERY_GPU_OUTER_SEGMENT_MAX=8 \
+  RASBERY_GPU_WIEL_FOLD=chunked RASBERY_GPU_XE=1 \
+  RASBERY_STAGED_FLUX_TOL=50 RASBERY_STAGED_XE_TOL=1000 RASBERY_STAGED_LOOSE_SETTLE=1 \
+  RASBERY_OMP_THREADS=12 \
+  <binary> <deck> ...                       # -> $OUT/f_off.h5, f_off.log   (PPR arm off)
+
+# 같은 줄에 RASBERY_GPU_PPR=1 을 추가해서 두 번
+#   -> $OUT/f_on1.h5, f_on1.log
+#   -> $OUT/f_on2.h5
+```
+
+합격 조건 — **전부**:
+
+1. `[RASBERY][PPR_GPU]`가 **`"host_fallbacks":0`** 이고 **`"refusal":"none"`**,
+   **`"refusals":{}`**. 하나라도 아니면 이름이 붙어 있으니 그 이름을 읽고 멈춘다.
+2. **`"iterations"`가 0이 아니다**. master CPB는 Jacobi이므로 SENM의 816과 같을 이유가
+   없다 — `host_iterations`(`RASBERY_STATEPOINT_TELEMETRY`로 얻는다)와 **같은 자릿수**면
+   된다. 두 값이 모두 0이면 루프가 안 돈 것이고, device 쪽만 cap(=200×35=7000)에 붙어
+   있으면 수렴하지 않은 것이다.
+3. `h5diff -c f_off.h5 f_on1.h5` 에서 **`pin_power` / `fqp` / `frp` 이외 전 데이터셋 0 차이**
+   (`pin_flux`는 `print_opt.pin_flux`가 켜진 statepoint에서만). trajectory digest 동일.
+4. **ON×2 결정론**: `h5diff f_on1.h5 f_on2.h5` = 0 차이, 전 데이터셋. Jacobi는 결정론적이다
+   (출력당 스레드 하나, atomic 없음, 고정 분할) — 여기서 차이가 나면 §10.2의 race다.
+5. **Gate B가 인쇄 자릿수까지 재현된다: pin RMS 0.238 %, max 0.80 %.** 기본 모드의
+   0.522 % / 2.13 %가 나오면 device가 master 플래그 아래에서 SENM을 돌린 것이다 — 이것이
+   "거절이 사라졌다"만 확인했을 때 통과했을 실패다.
+6. `"reallocations":0`, `"allocations"`는 slot당 고정(단계 F가 `phic_next`/`mrel` 2개를
+   더한다).
+7. 단계 D까지 함께 보려면 `RASBERY_GPU_PPR_RECON=1`을 추가한다 — `recon_statepoints`가
+   35, `recon_repairs` 0, `recon_refusal` 빈 문자열이어야 한다. master 재구성 분기는 B0
+   이므로 §10.3대로 (3)의 pin 차이가 `RECON=0`일 때와 **같은 자릿수**여야 한다.
+
+`RASBERY_GPU_FULL=1`로 한 번 더 돌리면 (1)이 다른 방식으로 확인된다: fallback이 하나라도
+있으면 그 케이스가 실패하고 `first_violation`이 **site와 rung 이름**을 담는다.
+
+### 10.6 되돌리기
+
+`RASBERY_GPU_PPR=0`(기본값). 단계 F만 되돌릴 스위치는 **없다** — master는 이제 arm의
+일부이고, 모드별 스위치를 두는 것은 "production 모드만 조용히 host로 간다"를 다시 만드는
+일이다.

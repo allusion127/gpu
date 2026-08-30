@@ -340,17 +340,33 @@ inline void count(Subsystem which) {
     detail::counter(which).fetch_add(1, std::memory_order_relaxed);
 }
 
+/// NAME THE FIRST FALLBACK, GATE OR NO GATE.
+///
+/// WHY THIS IS NOT BEHIND `required()`.  `contract_pass` is computed from the
+/// fallback counters and printed whether or not the gate is on -- so a gate-OFF
+/// run reports `contract_pass:false` and, until this, `first_violation:null`
+/// beside it.  That pairing is what sent a reader chasing
+/// `ppr_fallbacks:35` with nothing to chase: the receipt said a seam had fired
+/// and refused to say which, and the reason (RASBERY_PPR_MODE=master was never
+/// ported to the device) sat one string away from being printed.
+///
+/// THE DEFAULT PATH IS STILL CHEAP.  The armed flag is read FIRST, so only the
+/// very first fallback of a run builds a string; every one after it is one
+/// acquire load on a path that was already about to run a whole CPU physics
+/// body.
+inline void nameFirstFallback(Subsystem which, const char* where, const char* why) {
+    if (detail::firstViolationArmed().load(std::memory_order_acquire)) return;
+    detail::recordFirstViolation(std::string("subsystem=") + subsystemName(which) +
+                                 " site=" + (where != nullptr ? where : "?") +
+                                 " reason=" + (why != nullptr ? why : "?"));
+}
+
 /// COUNT, THEN REFUSE IF THE GATE IS ON.  Call this at the moment the host body
 /// is about to run because the device would not.
 inline void note(Subsystem which, const char* where, const char* why) {
     count(which);
-    // DEFAULT PATH STAYS ONE RELAXED INCREMENT.  Everything below allocates, so
-    // it is behind the gate; with RASBERY_GPU_FULL unset this function is what
-    // it always was.
+    nameFirstFallback(which, where, why);
     if (!required()) return;
-    detail::recordFirstViolation(std::string("subsystem=") + subsystemName(which) +
-                                 " site=" + (where != nullptr ? where : "?") +
-                                 " reason=" + (why != nullptr ? why : "?"));
     throw Violation(which, where, why);
 }
 
@@ -362,11 +378,8 @@ inline void note(Subsystem which, const char* where, const char* why) {
 /// safe, via raisePending().
 inline void noteDeferred(Subsystem which, const char* where, const char* why) {
     count(which);
+    nameFirstFallback(which, where, why);
     if (!required()) return;
-    detail::recordFirstViolation(std::string("subsystem=") + subsystemName(which) +
-                                 " site=" + (where != nullptr ? where : "?") +
-                                 " reason=" + (why != nullptr ? why : "?") +
-                                 " (deferred to the segment boundary)");
     detail::DeferredSlot& slot = detail::deferred();
     // THE FIRST ONE NAMES THE CASE.  A segment can refuse several outers before
     // it returns, and the reason a reader wants is the one that started it.
@@ -465,6 +478,11 @@ inline void appendReceiptFields(std::ostream& out) {
     // whole story and the run still exited 0; now the run fails, and the line
     // that says so has to name the site or the next reader repeats the 181
     // investigation from scratch.
+    //
+    // AND IT IS FILLED WITH THE GATE OFF TOO (nameFirstFallback).  A gate-off
+    // run prints `contract_pass:false` for exactly the same reason a gate-on
+    // one does; a null beside it made the commonest reading of this receipt --
+    // "which arm did not engage?" -- unanswerable from the receipt.
     out << ",\"first_violation\":";
     if (firstViolation() != nullptr)
         out << "\"" << firstViolation() << "\"";

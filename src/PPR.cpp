@@ -72,12 +72,26 @@ bool PPR::resetAndDriveGpu(const double reigv, double* jnet, const double* phif,
     // reconstruction refuses on any statepoint whose drive did not put
     // coefficients on the device -- including the ones that decline here.
     _gpu_drove = false;
-    if (_gpu == nullptr || !_gpu->available()) return false;
-    // driveMaster is a different scheme (MASTER MM 6.1, a corner-point-balance
-    // solve, not this Picard iteration).  The device arm reproduces the SENM
-    // path only, so it declines rather than silently changing method.
-    if (_mode_master) return false;
-    if (_g.ng() != 2) return false;
+    if (_gpu == nullptr) return false;
+    // WP6 stage F.  EVERY REFUSAL ON THIS SIDE NAMES ITSELF TOO.  These
+    // statepoints never reach PprBackend::resetAndDrive, so a ladder kept only
+    // inside the backend would report "none" for the two commonest reasons a
+    // production run falls back -- which is exactly how
+    // `if (_mode_master) return false;` survived a whole campaign printing
+    // nothing but `host_fallbacks:35`.
+    if (!_gpu->available()) {
+        _gpu->noteHostFallback(ppr::Refusal::ArmOff);
+        return false;
+    }
+    if (_g.ng() != 2) {
+        _gpu->noteHostFallback(ppr::Refusal::NotTwoGroup);
+        return false;
+    }
+    // RASBERY_PPR_MODE=master USED TO REFUSE HERE.  It no longer does: the
+    // MASTER MM 6.1 scheme -- the interpolant, the corner-point-balance solve
+    // and the cross terms -- is ported (CudaPprBackend.cu, "WP6 stage F"), and
+    // the mode travels in StepView so the backend selects the body rather than
+    // declining the statepoint.
 
     // The pointer/scalar half of reset(), verbatim: everything downstream
     // (reconstructPinPower, phig, getPhis) reads these.
@@ -140,6 +154,7 @@ bool PPR::resetAndDriveGpu(const double reigv, double* jnet, const double* phif,
     // moves every statepoint and is uploaded every statepoint.
     step.chif_generation = _xs.refGeneration();
     step.crdf_generation = _crdf_generation;
+    step.mode_master     = _mode_master;
     // The borrowed nodal set, if the caller offered one this statepoint.  The
     // completeness test is repeated here rather than trusted: a partial set
     // would pair a device jnet with an uploaded phif.
@@ -163,8 +178,14 @@ bool PPR::resetAndDriveGpu(const double reigv, double* jnet, const double* phif,
     const bool plan                   = reconPlanned();
     step.coefficients_stay_on_device  = plan;
 
+    // PPR::drive's own floor for the MASTER cap, applied at the seam so both
+    // arms iterate against the same bound: `driveMaster(std::max(niter, 200))`.
+    // The device arm would otherwise stop 100 rounds earlier than the host it
+    // is being compared against.
+    const int gpu_niter = _mode_master ? std::max(niter, 200) : niter;
+
     int iters = 0;
-    _gpu_drove = _gpu->resetAndDrive(geom, step, niter, &iters);
+    _gpu_drove = _gpu->resetAndDrive(geom, step, gpu_niter, &iters);
     _coeffs_device_only = plan && _gpu_drove;
     return _gpu_drove;
 }
@@ -172,7 +193,7 @@ bool PPR::resetAndDriveGpu(const double reigv, double* jnet, const double* phif,
 bool PPR::reconPlanned() {
     if (_gpu == nullptr || !_gpu->available()) return false;
     if (!ppr::reconEnabledFromEnv()) return false;
-    if (_mode_master || _ng != 2) return false;
+    if (_ng != 2) return false;
     // The table and the registry are built here rather than lazily at the
     // reconstruction, because "can this arm run" has to be answerable before
     // the drive commits to eliding the download.
@@ -300,10 +321,13 @@ bool PPR::reconstructPinPowerGpu(bool use_quadrature, bool reconstruct_flux,
     if (_gpu == nullptr || !_gpu->available()) return false;
     if (!_gpu_drove) return false;
     if (!ppr::reconEnabledFromEnv()) return false;
-    // driveMaster's expansion and the pointwise `phig` sampling are different
-    // schemes; the kernels transcribe the SENM quadrature path only, so they
-    // decline rather than silently reconstructing by another method.
-    if (!use_quadrature || _mode_master || _ng != 2) return false;
+    // The pointwise `phig` sampling is a different scheme -- the kernels
+    // transcribe the QUADRATURE path only -- so it declines rather than
+    // silently reconstructing by another method.  MASTER mode is no longer in
+    // this list: its expansion (a 15-term dot product of `c` with the
+    // pre-computed Legendre products, no `exp`) is ported alongside the SENM
+    // one in PprReconstructionKernel.cuh.
+    if (!use_quadrature || _ng != 2) return false;
     if (!_pin_quad_table) acquireQuadratureTable();
     if (!buildReconStaging()) return false;
 
@@ -410,6 +434,7 @@ bool PPR::reconstructPinPowerGpu(bool use_quadrature, bool reconstruct_flux,
     step.plane_lo         = _recon.plane_lo.data();
     step.plane_hi         = _recon.plane_hi.data();
     step.plane_alpha      = _recon.plane_alpha.data();
+    step.mode_master      = _mode_master;
     step.reconstruct_flux = reconstruct_flux;
     step.materialize_pin  = materialize_pin_map;
     step.pin_power        = _g.PinPower();
@@ -887,6 +912,11 @@ void PPR::driveMaster(int niter) {
                 }
             }
         }
+        // The device arm reports PprBackend::iterations(); the host has to
+        // report its own or the "did the two schemes stop in the same place?"
+        // comparison has only one side.  Counted for the same reason drive()
+        // counts, and read only through hostIterations().
+        ++_host_iters;
         if (maxrel < kCornerFluxTolerance) break;
     }
 

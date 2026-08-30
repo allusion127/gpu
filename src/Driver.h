@@ -5160,8 +5160,8 @@ public:
             }();
             // GA evaluator plan Sec 6.3 Task 10.  RASBERY_GPU_PPR=1 runs
             // reset()+drive() as one device sequence; anything else -- arm off,
-            // no CUDA, ng != 2, RASBERY_PPR_MODE=master, a CUDA failure --
-            // returns false having touched nothing, and the two host calls run
+            // no CUDA, ng != 2, a CUDA failure -- returns false having
+            // touched nothing (naming which, in the receipt), and the two host calls run
             // exactly as they did before.  The fused device call is charged to
             // ppr_drive, so `ppr_reset + ppr_drive` is the like-for-like
             // comparison between the two arms and `ppr_reset == 0` is how the
@@ -5204,17 +5204,24 @@ public:
                     geometry.Phis(), ppr_iters);
             }
             // WP1 (plan Sec 6.3).  THE PPR FAIL-OPEN SEAM.  Every reason
-            // resetAndDriveGpu can decline -- arm off, no CUDA, ng != 2,
-            // RASBERY_PPR_MODE=master, a CUDA failure -- lands below, and the
-            // two host calls there are the CPU pin-power reconstruction.  The
-            // guard is conditioned on the arm so an unset RASBERY_GPU_PPR
-            // promises nothing.
+            // resetAndDriveGpu can decline -- arm off, no CUDA, ng != 2, a
+            // CUDA failure -- lands below, and the two host calls there are the
+            // CPU pin-power reconstruction.  The guard is conditioned on the
+            // arm so an unset RASBERY_GPU_PPR promises nothing.
+            //
+            // WP6 stage F.  THE GUARD IS HANDED THE LADDER'S OWN NAME, not a
+            // fixed sentence.  `first_violation` used to read "the device PPR
+            // arm declined" for every one of the seven reasons, which is the
+            // same defect as `host_fallbacks:35` with no reason beside it: it
+            // told a reader that something refused and never which one.  The
+            // string is the enum's own name(), so GpuFullContract's receipt and
+            // the [RASBERY][PPR_GPU] ladder cannot drift apart.
             if (!ppr_on_device) {
                 ++ppr_host_statepoints;
                 RASBERY_GPU_FULL_GUARD_IF(
                     rasbery::gpufull::armRequested("RASBERY_GPU_PPR"), Ppr,
                     "Driver: statepoint PPR",
-                    "the device PPR arm declined; the host reset+drive runs");
+                    pin_power_reconstruction.gpu().lastRefusalName());
                 {
                     outer_timing::Scope ppr_reset_scope(sptelem::PH_PPR_RESET);
                     pin_power_reconstruction.reset(1.0 / eigv, geometry.Jnet(),
@@ -5523,6 +5530,16 @@ public:
                 // says whether the borrow was SOUND, and `allocations` /
                 // `reallocations` are stage E's "once per slot, not once
                 // per statepoint".
+                //
+                // WP6 stage F added `refusal` and `refusals`.  A receipt that
+                // prints `host_fallbacks:35` and nothing else cannot tell a
+                // deck this build does not serve from a MODE this build did
+                // not port, and the campaign paid for that: RASBERY_PPR_MODE
+                // =master refused every statepoint of every production run and
+                // the number looked exactly like "no CUDA device".  `refusal`
+                // is the last reason, `refusals` the whole tally, both from
+                // ppr::refusalName -- the same strings the RASBERY_GPU_FULL
+                // seam reports as `first_violation`.
                 std::cout << std::format(
                     "  [RASBERY][PPR_GPU] {{\"schema_version\":2,\"slot\":{},"
                     "\"statepoints\":{},\"device\":{},\"host_fallbacks\":{},"
@@ -5536,6 +5553,7 @@ public:
                     "\"recon_statepoints\":{},\"pin_materializations\":{},"
                     "\"recon_repairs\":{},"
                     "\"recon_refusal\":\"{}\",\"allocations\":{},\"reallocations\":{},"
+                    "\"refusal\":\"{}\",\"refusals\":{},"
                     "\"wall_ms\":{:.3f},\"status\":\"{}\"}}\n",
                     cmfd_solver.batchSlot(), g.statepoints(), g.deviceOrdinal(),
                     ppr_host_statepoints, g.iterations(),
@@ -5547,7 +5565,8 @@ public:
                     g.h2dBytesElided(), g.d2hBytes(), g.reconStatepoints(),
                     g.pinMaterializations(), g.reconRepairs(), g.reconRefusal(),
                     g.allocations(),
-                    g.reallocations(), g.wallMs(), g.status());
+                    g.reallocations(), g.lastRefusalName(), g.refusalJson(),
+                    g.wallMs(), g.status());
             }
         }
 

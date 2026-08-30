@@ -61,9 +61,63 @@
 // There is no process-wide state here at all: that is the slot-0 bug class this
 // design refuses to re-enter.
 //
-// FAIL OPEN.  Any CUDA failure, an unsupported deck (ng != 2), or
-// RASBERY_PPR_MODE=master makes the entry point return false and the caller runs
-// the untouched host reset+drive.  The receipt counts those as host_fallbacks.
+// FAIL OPEN, AND SAY WHY.  Any CUDA failure or an unsupported deck (ng != 2)
+// makes the entry point return false and the caller runs the untouched host
+// reset+drive.  The receipt counts those as host_fallbacks AND names them:
+// `ppr::Refusal` below is the ladder, mirroring BICGCMFD's EnqueueRefusal, and
+// the [RASBERY][PPR_GPU] line carries `refusal` (the last one) plus `refusals`
+// (the whole tally).  A fallback with no stated reason is the defect that let
+// the master-mode refusal below run unnoticed for a whole campaign.
+//
+// ===========================================================================
+// WP6 STAGE F -- RASBERY_PPR_MODE=master RUNS ON THE DEVICE
+// ===========================================================================
+//
+// WHAT WAS WRONG.  Until this stage `PPR::resetAndDriveGpu` opened with
+// `if (_mode_master) return false;`.  MASTER mode is what the production
+// campaign runs (it is what gives Gate B pin RMS 0.238 % against the default
+// mode's 0.522 %), so the arm declined on 35 statepoints out of 35 and the
+// receipt said only `host_fallbacks:35` -- a number that looks the same whether
+// the arm is refusing a deck or refusing the entire campaign.
+//
+// WHAT THE TWO SCHEMES ARE.  They are genuinely different reconstructions, not
+// two spellings of one:
+//
+//   SENM   (default)  a semi-analytic expansion.  `drive` is a Picard iteration
+//                     -- three source sweeps (updateFused: particular p,
+//                     homogeneous a, projected c) then updateCorner -- with a
+//                     global break on the four fuel-only corner-flux SUMS.
+//   MASTER (this)     MASTER 4.0 MM Sec 6.1.  `driveMaster` writes a 13-term
+//                     Legendre interpolant straight into `c`: nine even-parity
+//                     terms from the surface fluxes, the reduced outward
+//                     currents (2D/h) and the node average (Eq. 6.6), and four
+//                     cross terms from corner fluxes that solve the
+//                     corner-point-balance system (Eq. 6.7/6.8).  `p`, `a` and
+//                     `bt` are never read; there is no source iteration.
+//
+// So the port is three new kernels plus a different loop body, not a flag.
+//
+// CLASS N1, AND EXACTLY WHERE.  The host's CPB solve is GAUSS-SEIDEL: it writes
+// `phic` in place while later nodes read it, which is a serial dependence over
+// every node of the mesh and cannot be a kernel.  The device runs the same
+// balance as JACOBI (read the previous iterate, write the next) with the same
+// 1e-5 relative-change break and the same iteration cap.  Both iterations are
+// contractions on the SAME diagonally dominant system -- each corner's balance
+// has diagonal 4w against off-diagonal 2w per node, so the Jacobi spectral
+// radius is bounded by 1/2 and the Gauss-Seidel one by 1/4 -- and both converge
+// to the SAME fixed point.  What differs is where each stops relative to it:
+// ~1e-5 relative on the corner fluxes, which is four orders below the Gate B
+// pin-power envelope.  Everything else in the master arm is the host's
+// expression in the host's order on the host's operands: kMasterEven and
+// kMasterCross are elementwise, the max-fold is over the same deterministic
+// partition, and `max` does not depend on association.
+//
+// THE MASTER RECONSTRUCTION, BY CONTRAST, IS B0.  MASTER mode's pin expansion
+// is `sum_t c[t] * leg[t]` -- a 15-term dot product with no `exp` at all -- so
+// PprReconstructionKernel.cuh's master branch is the host's loop, in the host's
+// order, with no transcendental and with --fmad=false on the TU.  The only
+// reason a master pin map differs from the host's is the N1 corner fluxes it
+// was built from.
 //
 // ===========================================================================
 // WP6 (bottleneck plan 20260830 Sec WP6) -- WHAT STAGES B/C/E CHANGED
@@ -136,6 +190,43 @@
 namespace rasbery {
 
 namespace ppr {
+
+/// WHY A STATEPOINT RAN ON THE HOST.  The BICGCMFD::EnqueueRefusal ladder, for
+/// the PPR seam, and for the same reason that one exists: `host_fallbacks:35`
+/// is a symptom, and a seam that only counts cannot tell "this build has no
+/// CUDA" from "this deck is not two-group" from "the production reconstruction
+/// mode was never ported".  The campaign spent a release on the third of those
+/// while the receipt printed the first two's number.
+///
+/// EXHAUSTIVE BY CONSTRUCTION.  Every `return false` on the way into the device
+/// -- in PPR::resetAndDriveGpu and in PprBackend::resetAndDrive -- sets one of
+/// these before it returns, and tools/test_ppr_gpu_master_mode_contract.py
+/// holds that against the source.  `None` is the value of a run that never
+/// fell back.
+enum class Refusal : int {
+    None = 0,        ///< no fallback has happened
+    ArmOff,          ///< RASBERY_GPU_PPR unset, no CUDA device, or a stub build
+    BackendDisabled, ///< an earlier CUDA failure released this instance
+    NotTwoGroup,     ///< ng != 2; the source body serves two groups
+    NonPositiveIter, ///< the caller passed niter <= 0
+    ShapeAllocFail,  ///< ensureShape could not stand the buffers up
+    CudaFailure,     ///< any cudaError_t on the statepoint's own path
+    Count
+};
+
+inline const char* refusalName(Refusal r) {
+    switch (r) {
+        case Refusal::None:            return "none";
+        case Refusal::ArmOff:          return "arm_off";
+        case Refusal::BackendDisabled: return "backend_disabled";
+        case Refusal::NotTwoGroup:     return "not_two_group";
+        case Refusal::NonPositiveIter: return "non_positive_iter";
+        case Refusal::ShapeAllocFail:  return "shape_alloc_fail";
+        case Refusal::CudaFailure:     return "cuda_failure";
+        case Refusal::Count:           break;
+    }
+    return "?";
+}
 
 /// Stage C.  How much of the borrow the caller is asking for.
 enum class CanonicalMode : int {
@@ -238,6 +329,15 @@ struct StepView {
     /// built from; 0 means "unknown", which always uploads.
     unsigned long long chif_generation = 0;
     unsigned long long crdf_generation = 0;
+
+    /// WP6 stage F.  RASBERY_PPR_MODE=master -- run MASTER MM Sec 6.1's
+    /// interpolant + corner-point-balance solve instead of the SENM Picard
+    /// iteration.  It selects a DIFFERENT loop body, not a flag inside one, and
+    /// the `reset()` half (buckling, corner init, SENM fit, axial leakage,
+    /// source expansion) is launched identically in both -- because the host
+    /// runs reset() identically in both, and driveMaster consumes the corner
+    /// flux reset() seeded.
+    bool mode_master = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -303,6 +403,11 @@ struct ReconStepView {
     const int*    plane_hi    = nullptr;
     const double* plane_alpha = nullptr;
 
+    /// WP6 stage F.  MASTER mode's pin expansion is a 15-term dot product of
+    /// `c` with the pre-computed Legendre products -- no `p`, no `a`, no `bt`,
+    /// no `exp`.  It is the same branch PPR.cpp takes inside the overlap loop.
+    bool mode_master = false;
+
     bool reconstruct_flux = false;
     /// Will the HOST read the pin map after this call?  False (a statepoint
     /// whose `pin_info` is off) means the map stays on the device and only the
@@ -353,6 +458,22 @@ public:
     /// about to rebuild the host coefficients itself.  Counts the repair and
     /// clears the promise.
     void noteReconRepair();
+
+    /// THE CALLER DECLINED BEFORE THE BACKEND WAS ASKED.  PPR::resetAndDriveGpu
+    /// can refuse on its own (the arm is off, the deck is not two-group) and
+    /// those statepoints never reach resetAndDrive(); recording the reason here
+    /// is what keeps the ladder in the receipt exhaustive rather than "the
+    /// reasons the backend happened to see".  Safe on a disabled or stub
+    /// backend: it moves counters and nothing else.
+    void noteHostFallback(ppr::Refusal reason);
+
+    /// The reason the LAST fallback gave, and the whole tally.  `refusalJson`
+    /// is a `{"name":count,...}` object with an entry for every reason that has
+    /// fired at least once, i.e. `{}` on a run that never fell back.
+    [[nodiscard]] ppr::Refusal       lastRefusal() const;
+    [[nodiscard]] const char*        lastRefusalName() const;
+    [[nodiscard]] unsigned long long refusalCount(ppr::Refusal reason) const;
+    [[nodiscard]] std::string        refusalJson() const;
 
     /// Receipt counters.
     [[nodiscard]] unsigned long long statepoints() const;

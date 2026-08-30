@@ -119,6 +119,19 @@ struct DevCtx {
     double* l;
     double* bt;
 
+    /// WP6 stage F, MASTER mode only.  The CPB solve is Jacobi on the device --
+    /// the host's Gauss-Seidel writes `phic` in place while later nodes read
+    /// it, which is a serial dependence over the whole mesh -- so it needs the
+    /// NEXT iterate to write into, and a per-(node, group) relative-change
+    /// scratch for the break test.  Allocated with everything else and left
+    /// untouched by the SENM arm, whose corner update is already a pure
+    /// scatter-free read of `c`.
+    double* phic_next;
+    double* mrel;
+    /// 1 = the master body was enqueued.  Carried in the ctx (and therefore in
+    /// the graph key) so a capture cannot be replayed under the other scheme.
+    int mode_master;
+
     /// Read-only alias of `c`.  updateCorner and updateSource only read the
     /// fitting coefficients, and they read them from OTHER nodes -- 64 scattered
     /// loads per thread in updateCorner.  Reading them through a
@@ -197,6 +210,23 @@ __device__ inline double dJnet(const DevCtx& x, int dir, int lr, int lk, int g) 
 __device__ inline double getPhisD(const DevCtx& x, int lr, int dir, int lk, int g) {
     if (lk < 0 || lk >= x.nxyz) return 0.0;
     return x.phis[dSfc(x, lr, dir, lk) * x.ng + g];
+}
+
+/// PPR::getJoutRed -- the outward net current at surface (lr, dir) of node lk,
+/// reduced by 2D/h, which is the current unit of MASTER MM Eq. 6.6/6.8.  Host
+/// expression, host order, host guards (out of mesh and D <= 0 both give 0.0).
+__device__ inline double getJoutRedD(const DevCtx& x, int lr, int dir, int lk, int g) {
+    if (lk < 0 || lk >= x.nxyz) return 0.0;
+    const double D = dXsdf(x, g, lk);
+    if (D <= 0.0) return 0.0;
+    const double h   = dHmesh(x, dir, lk);
+    const double jn  = x.jnet[dSfc(x, lr, dir, lk) * x.ng + g];
+    const double sgn = (lr == kRIGHT) ? 1.0 : -1.0;
+    return sgn * jn * h / (2.0 * D);
+}
+
+__device__ inline double* phicNextPtr(const DevCtx& x, int lk, int g) {
+    return &x.phic_next[(lk * 4 * x.ng) + g * 4];
 }
 
 /// PPR::buildStencil.
@@ -752,6 +782,230 @@ __global__ void kCornerFoldAndCheck(DevCtx x) {
 }
 
 // ---------------------------------------------------------------------------
+// WP6 stage F: RASBERY_PPR_MODE=master -- MASTER 4.0 MM section 6.1
+// ---------------------------------------------------------------------------
+//
+// PPR::driveMaster, in three kernels and one loop body.  The scheme is NOT the
+// SENM Picard iteration above and shares nothing with it but `reset()`: no
+// particular/homogeneous split, no source sweeps, no exponentials.  A 13-term
+// Legendre interpolant lands straight in `c`, its nine even-parity terms read
+// off the nodal solution and its four cross terms read off corner fluxes that
+// solve the corner-point-balance system.
+//
+// THE ONE PLACE THE DEVICE CANNOT BE THE HOST.  driveMaster's CPB sweep is
+// GAUSS-SEIDEL: node lk's corner reads `_phic` of the 2x2 block around that
+// corner while nodes below lk in the same sweep have already overwritten
+// theirs.  That is a serial dependence over the whole mesh.  The device runs
+// the same balance as JACOBI -- read `phic`, write `phic_next`, commit -- with
+// the SAME 1e-5 relative-change break, the SAME cap, and the same skip for a
+// corner whose 2x2 block contributes no weight.  Both are contractions on one
+// diagonally dominant system (per node: diagonal 4w, off-diagonal 2w) and reach
+// the SAME fixed point; they stop at different distances from it, ~1e-5
+// relative on the corner fluxes.  That is the whole of this arm's N1, and it is
+// four orders below the Gate B pin-power envelope.
+
+/// driveMaster step 1: the even-parity coefficients (MM Eq. 6.2 and the first
+/// eight of Eq. 6.6).  Elementwise in (node, group) -- B0.
+__global__ void kMasterEven(DevCtx x) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= x.nxyz * x.ng) return;
+    const int lk = t / x.ng;
+    const int g  = t % x.ng;
+
+    // PPR.cpp's `constexpr double r10 / r14`, and they are written as the same
+    // quotients rather than as decimal literals: 1/14 is not representable and
+    // 0.07142857142857142 is a different double from the one the host divides.
+    const double r10 = 1.0 / 10.0;
+    const double r14 = 1.0 / 14.0;
+
+    double* c = cPtr(x, lk, g);
+
+    const double pb  = x.phif[lk * x.ng + g];
+    const double pxr = dPhis(x, kXDIR, kRIGHT, lk, g), pxl = dPhis(x, kXDIR, kLEFT, lk, g);
+    const double pyr = dPhis(x, kYDIR, kRIGHT, lk, g), pyl = dPhis(x, kYDIR, kLEFT, lk, g);
+    const double jxr = getJoutRedD(x, kRIGHT, kXDIR, lk, g);
+    const double jxl = getJoutRedD(x, kLEFT, kXDIR, lk, g);
+    const double jyr = getJoutRedD(x, kRIGHT, kYDIR, lk, g);
+    const double jyl = getJoutRedD(x, kLEFT, kYDIR, lk, g);
+
+    c[triIdx(0, 0)] = pb;
+    c[triIdx(1, 0)] = r10 * (6.0 * (pxr - pxl) + (jxr - jxl));
+    c[triIdx(2, 0)] = r14 * (10.0 * (pxr + pxl) + (jxr + jxl) - 20.0 * pb);
+    c[triIdx(3, 0)] = -r10 * ((pxr - pxl) + (jxr - jxl));
+    c[triIdx(4, 0)] = -r14 * (3.0 * (pxr + pxl) + (jxr + jxl) - 6.0 * pb);
+    c[triIdx(0, 1)] = r10 * (6.0 * (pyr - pyl) + (jyr - jyl));
+    c[triIdx(0, 2)] = r14 * (10.0 * (pyr + pyl) + (jyr + jyl) - 20.0 * pb);
+    c[triIdx(0, 3)] = -r10 * ((pyr - pyl) + (jyr - jyl));
+    c[triIdx(0, 4)] = -r14 * (3.0 * (pyr + pyl) + (jyr + jyl) - 6.0 * pb);
+    c[triIdx(1, 3)] = 0.0;
+    c[triIdx(3, 1)] = 0.0;
+    c[triIdx(1, 1)] = 0.0;
+    c[triIdx(1, 2)] = 0.0;
+    c[triIdx(2, 1)] = 0.0;
+    c[triIdx(2, 2)] = 0.0;
+}
+
+/// driveMaster step 2, the sweep: one thread per (node, group), all four of its
+/// corner copies, reading the PREVIOUS iterate and writing the next.  The
+/// per-thread relative change goes to `mrel` so the break test can be a
+/// reduction rather than a shared accumulator.
+template <bool kGuarded>
+__global__ void kMasterCpb(DevCtx x) {
+    if (kGuarded && pprHalted(x)) return;
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= x.nxyz * x.ng) return;
+    const int lk = t / x.ng;
+    const int g  = t % x.ng;
+
+    int  idx[3][3];
+    bool xrev[3][3], yrev[3][3];
+    buildStencilD(x, lk, idx, xrev, yrev);
+
+    const double* phic_in  = phicPtr(x, lk, g);
+    double*       phic_out = phicNextPtr(x, lk, g);
+
+    double node_max = 0.0;
+
+    for (int j = 0; j < 2; j++) {
+        for (int i = 0; i < 2; i++) {
+            const int dir = j * 2 + i;
+            double    num = 0.0;
+            double    den = 0.0;
+
+            for (int dj = 0; dj < 2; dj++) {
+                for (int di = 0; di < 2; di++) {
+                    const int m = idx[i + di][j + dj];
+                    if (m < 0 || m >= x.nxyz) continue;
+
+                    const bool xr = xrev[i + di][j + dj];
+                    const bool yr = yrev[i + di][j + dj];
+
+                    const int out_x = ((di == 0) ? kRIGHT : kLEFT) ^ (xr ? 1 : 0);
+                    const int out_y = ((dj == 0) ? kRIGHT : kLEFT) ^ (yr ? 1 : 0);
+
+                    const double pox = getPhisD(x, out_x, kXDIR, m, g);
+                    const double pix = getPhisD(x, out_x ^ 1, kXDIR, m, g);
+                    const double poy = getPhisD(x, out_y, kYDIR, m, g);
+                    const double piy = getPhisD(x, out_y ^ 1, kYDIR, m, g);
+                    const double jox = getJoutRedD(x, out_x, kXDIR, m, g);
+                    const double joy = getJoutRedD(x, out_y, kYDIR, m, g);
+                    const double pbm = x.phif[m * x.ng + g];
+
+                    const int    icl   = ((di == 0) ? 1 : 0) ^ (xr ? 1 : 0);
+                    const int    jcl   = ((dj == 0) ? 1 : 0) ^ (yr ? 1 : 0);
+                    const int    adj1  = jcl * 2 + (1 - icl);
+                    const int    adj2  = (1 - jcl) * 2 + icl;
+                    const double fadj1 = x.phic[(m * 4 * x.ng) + (g * 4) + adj1];
+                    const double fadj2 = x.phic[(m * 4 * x.ng) + (g * 4) + adj2];
+
+                    const double w = dXsdf(x, g, m) / dHmesh(x, kXDIR, m);
+                    num += w * (5.0 * (pox + poy) + (pix + piy) + jox + joy -
+                                6.0 * pbm - fadj1 - fadj2);
+                    den += 4.0 * w;
+                }
+            }
+
+            const double fold = phic_in[dir];
+            if (den <= 0.0) {
+                // The host `continue`s: the corner keeps its value and takes no
+                // part in the break test.  Copying it forward is that, exactly,
+                // and leaving `node_max` alone is the other half -- writing a
+                // relativeChange of a value against itself would report 1.0 for
+                // an untouched zero corner and hold the loop open forever.
+                phic_out[dir] = fold;
+                continue;
+            }
+
+            const double fnew = num / den;
+            if (fold != 0.0) node_max = fmax(node_max, fabs((fnew - fold) / fold));
+            phic_out[dir] = fnew;
+        }
+    }
+
+    x.mrel[lk * x.ng + g] = node_max;
+}
+
+/// driveMaster step 2, the commit: `phic_next` becomes `phic`, and the same
+/// deterministic partition the corner sums use folds `mrel` into one max per
+/// chunk.  Both in one pass because both walk the same node range, and a
+/// separate copy kernel would read 4x the traffic for nothing.
+///
+/// THE PARTITION DOES NOT MOVE THIS ANSWER.  `max` is exactly associative and
+/// commutative in floating point -- unlike the SENM corner SUMS, which is why
+/// that reduction is pinned to the host's 256-chunk association and this one
+/// would give the same bits under any.
+template <bool kGuarded>
+__global__ void kMasterCommit(DevCtx x) {
+    if (kGuarded && pprHalted(x)) return;
+    const int nchunk = x.nchunk;
+    const int c      = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nchunk) return;
+
+    const int lb = detChunkBegin(x.nxyz, nchunk, c);
+    const int le = detChunkBegin(x.nxyz, nchunk, c + 1);
+
+    double m = 0.0;
+    for (int lk = lb; lk < le; ++lk) {
+        for (int g = 0; g < x.ng; ++g) {
+            double*       dst = phicPtr(x, lk, g);
+            const double* src = phicNextPtr(x, lk, g);
+            dst[0] = src[0];
+            dst[1] = src[1];
+            dst[2] = src[2];
+            dst[3] = src[3];
+            m = fmax(m, x.mrel[lk * x.ng + g]);
+        }
+    }
+    x.partials[c] = m;
+}
+
+/// driveMaster step 2, the break test: PPR.cpp's `if (maxrel <
+/// kCornerFluxTolerance) break;` after the sweep, on the device, so the loop
+/// needs no per-round synchronise.  Same shape as kCornerFoldAndCheck -- one
+/// thread, ascending chunks, `iters` counted only while the flag is down, a
+/// `__threadfence()` before raising it.
+__global__ void kMasterFoldAndCheck(DevCtx x) {
+    if (pprHalted(x)) return;
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+
+    double maxrel = 0.0;
+    for (int c = 0; c < x.nchunk; ++c) maxrel = fmax(maxrel, x.partials[c]);
+
+    PprLoopState* st = x.loop;
+    st->cur[0]       = maxrel;
+    st->iters        = st->iters + 1;
+
+    if (maxrel < kCornerFluxTolerance) {
+        __threadfence();
+        st->converged = 1;
+    }
+}
+
+/// driveMaster step 3: the four cross terms from the converged corners (the
+/// last four of MM Eq. 6.6).  MM axes put xi=+1 east and eta=+1 south, so
+/// phi1=SE, phi2=SW, phi3=NW, phi4=NE.  Elementwise -- B0 given its input.
+__global__ void kMasterCross(DevCtx x) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= x.nxyz * x.ng) return;
+    const int lk = t / x.ng;
+    const int g  = t % x.ng;
+
+    double*       c    = cPtr(x, lk, g);
+    const double* phic = phicPtr(x, lk, g);
+
+    const double f1 = phic[kSE], f2 = phic[kSW], f3 = phic[kNW], f4 = phic[kNE];
+    const double pxr = dPhis(x, kXDIR, kRIGHT, lk, g), pxl = dPhis(x, kXDIR, kLEFT, lk, g);
+    const double pyr = dPhis(x, kYDIR, kRIGHT, lk, g), pyl = dPhis(x, kYDIR, kLEFT, lk, g);
+    const double aflux = x.phif[lk * x.ng + g];
+
+    c[triIdx(1, 1)] = 0.25 * (f1 - f2 + f3 - f4);
+    c[triIdx(1, 2)] = 0.25 * (f1 - f2 - f3 + f4 - 2.0 * (pxr - pxl));
+    c[triIdx(2, 1)] = 0.25 * (f1 + f2 - f3 - f4 - 2.0 * (pyr - pyl));
+    c[triIdx(2, 2)] =
+        0.25 * (f1 + f2 + f3 + f4 - 2.0 * (pxr + pxl + pyr + pyl) + 4.0 * aflux);
+}
+
+// ---------------------------------------------------------------------------
 // WP6 stage C: the borrow, checked rather than asserted
 // ---------------------------------------------------------------------------
 
@@ -1029,6 +1283,14 @@ struct PprBackend::Impl {
     double* d_l    = nullptr;
     double* d_bt   = nullptr;
 
+    // WP6 stage F.  MASTER mode's Jacobi CPB needs the next iterate and a
+    // per-(node, group) relative-change scratch.  Allocated unconditionally --
+    // 5 * nxyz * ng doubles, 0.7 MB at KNGR size -- because ensureShape is
+    // reached before the mode is known and making the shape depend on the mode
+    // would turn a mode switch into a re-shape of every buffer and every graph.
+    double* d_phic_next = nullptr;
+    double* d_mrel      = nullptr;
+
     double* d_partials = nullptr;
     double* h_partials = nullptr; ///< pinned, 4 * nchunk
 
@@ -1131,6 +1393,21 @@ struct PprBackend::Impl {
     unsigned long long n_recon_statepoints    = 0;
     unsigned long long n_pin_materializations = 0;
     unsigned long long n_recon_repairs        = 0;
+
+    /// WP6 stage F.  The refusal ladder: why the LAST statepoint fell back, and
+    /// how many times each reason has.  Written by noteRefusal() at every
+    /// `return false` on the way into the device, including the ones
+    /// PPR::resetAndDriveGpu takes before this class is ever asked.
+    ppr::Refusal       last_refusal = ppr::Refusal::None;
+    unsigned long long n_refusals[static_cast<int>(ppr::Refusal::Count)] = {};
+
+    void noteRefusal(ppr::Refusal r) {
+        const int i = static_cast<int>(r);
+        if (i < 0 || i >= static_cast<int>(ppr::Refusal::Count)) return;
+        last_refusal = r;
+        ++n_refusals[i];
+    }
+
     /// The last drive elided the coefficient D2H on the promise that the
     /// device reconstruction would consume them.  Cleared by the reconstruction
     /// that does; read by noteReconRepair() when one does not.
@@ -1188,6 +1465,7 @@ struct PprBackend::Impl {
         f(d_phif);   f(d_phis);    f(d_jnet);
         f(d_xsdf);   f(d_xsrf);    f(d_xsnf);   f(d_xssm);  f(d_chif); f(d_crdf);
         f(d_phic);   f(d_p);       f(d_a);      f(d_c);     f(d_q);    f(d_l);  f(d_bt);
+        f(d_phic_next); f(d_mrel);
         f(d_partials); f(d_loop);  f(d_mismatch);
         releaseRecon();
         if (h_partials) cudaFreeHost(h_partials);
@@ -1200,6 +1478,7 @@ struct PprBackend::Impl {
         d_phif = d_phis = d_jnet = nullptr;
         d_xsdf = d_xsrf = d_xsnf = d_xssm = d_chif = d_crdf = nullptr;
         d_phic = d_p = d_a = d_c = d_q = d_l = d_bt = nullptr;
+        d_phic_next = nullptr; d_mrel = nullptr;
         d_partials = nullptr; h_partials = nullptr;
         d_loop = nullptr; h_loop = nullptr;
         d_mismatch = nullptr; h_mismatch = nullptr;
@@ -1221,6 +1500,11 @@ struct PprBackend::Impl {
 
     bool fail(const char* what, cudaError_t rc) {
         failed      = true;
+        // EVERY CUDA failure is one rung of the ladder, and it is set HERE
+        // rather than at the dozens of `if (!h2d(...)) return false;` call
+        // sites -- one writer, so the reason cannot be forgotten at a seam
+        // somebody adds later.
+        noteRefusal(ppr::Refusal::CudaFailure);
         status_text = std::string("disabled after CUDA failure in ") + what + ": " +
                       cudaGetErrorString(rc);
         std::fprintf(stderr, "[RASBERY][PPR_GPU][WARN] %s -- falling back to host PPR\n",
@@ -1283,6 +1567,8 @@ struct PprBackend::Impl {
             {(void**)&d_q,       nng * 15 * sizeof(double),           "q"},
             {(void**)&d_l,       nng * 9 * sizeof(double),            "l"},
             {(void**)&d_bt,      nng * sizeof(double),                "bt"},
+            {(void**)&d_phic_next, nng * 4 * sizeof(double),          "phic_next"},
+            {(void**)&d_mrel,    nng * sizeof(double),                "mrel"},
             {(void**)&d_partials, static_cast<size_t>(4 * nchunk) * sizeof(double), "partials"},
             {(void**)&d_loop,    sizeof(PprLoopState),                "loop_state"},
             {(void**)&d_mismatch,
@@ -1468,21 +1754,79 @@ const std::string& PprBackend::reconRefusal() const { return _impl->recon_refusa
 unsigned long long PprBackend::allocations() const { return _impl->n_allocations; }
 unsigned long long PprBackend::reallocations() const { return _impl->n_reallocations; }
 
+// --- WP6 stage F: the refusal ladder ---------------------------------------
+
+void PprBackend::noteHostFallback(ppr::Refusal reason) { _impl->noteRefusal(reason); }
+
+ppr::Refusal PprBackend::lastRefusal() const { return _impl->last_refusal; }
+
+const char* PprBackend::lastRefusalName() const {
+    return ppr::refusalName(_impl->last_refusal);
+}
+
+unsigned long long PprBackend::refusalCount(ppr::Refusal reason) const {
+    const int i = static_cast<int>(reason);
+    if (i < 0 || i >= static_cast<int>(ppr::Refusal::Count)) return 0;
+    return _impl->n_refusals[i];
+}
+
+std::string PprBackend::refusalJson() const {
+    // ONLY THE RUNGS THAT FIRED.  A fixed seven-key object would put six zeros
+    // in every receipt and make the one number that matters harder to find;
+    // `{}` is the shape of a run that never fell back, which is the shape the
+    // campaign is trying to reach.
+    std::string out = "{";
+    bool        first = true;
+    for (int i = 1; i < static_cast<int>(ppr::Refusal::Count); ++i) {
+        if (_impl->n_refusals[i] == 0) continue;
+        if (!first) out += ",";
+        first = false;
+        out += "\"";
+        out += ppr::refusalName(static_cast<ppr::Refusal>(i));
+        out += "\":";
+        out += std::to_string(_impl->n_refusals[i]);
+    }
+    out += "}";
+    return out;
+}
+
 
 bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& step,
                                int niter, int* iters) {
     Impl& s = *_impl;
-    if (!s.enabled || s.failed) return false;
+    // THE LADDER IS EXHAUSTIVE.  Every `return false` from here to the success
+    // return names its rung, either directly or through fail(), so
+    // `host_fallbacks:35` in the receipt is always accompanied by which of the
+    // seven reasons produced it.
+    if (!s.enabled) {
+        s.noteRefusal(ppr::Refusal::ArmOff);
+        return false;
+    }
+    if (s.failed) {
+        s.noteRefusal(ppr::Refusal::BackendDisabled);
+        return false;
+    }
     // Lowered FIRST, raised only on the success return: every early exit below
     // therefore leaves the reconstruction arm refusing, which is what stops it
     // reading coefficients this statepoint did not write.
     s.last_drive_ok = false;
     if (geom.ng != 2) {
         s.status_text = "declined: ng != 2 (updateSource body is 2-group)";
+        s.noteRefusal(ppr::Refusal::NotTwoGroup);
         return false;
     }
-    if (niter <= 0) return false;
-    if (!s.ensureShape(geom)) return false;
+    if (niter <= 0) {
+        s.noteRefusal(ppr::Refusal::NonPositiveIter);
+        return false;
+    }
+    if (!s.ensureShape(geom)) {
+        // ensureShape's own failures go through fail(), which already recorded
+        // CudaFailure; this rung is the one it cannot reach -- a shape that
+        // stood nothing up without a cudaError_t to blame.
+        if (s.last_refusal != ppr::Refusal::CudaFailure)
+            s.noteRefusal(ppr::Refusal::ShapeAllocFail);
+        return false;
+    }
 
     const size_t nn  = static_cast<size_t>(geom.nxyz);
     const size_t nng = nn * geom.ng;
@@ -1514,6 +1858,12 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
                           step.dev_jnet != nullptr;
     const bool borrow = step.canonical != ppr::CanonicalMode::Off && have_set;
     const bool verify = borrow && step.canonical == ppr::CanonicalMode::Verify;
+
+    // WP6 stage F.  WHICH SCHEME, decided ONCE and read by everything below:
+    // the reset half's tail (kMasterEven), the round body, the post-loop cross
+    // terms and the D2H list.  A per-kernel branch would be four chances to
+    // disagree about what this statepoint is.
+    const bool master = step.mode_master;
 
     const size_t nodal_bytes = (nng + 2 * nsg) * sizeof(double);
     if (!borrow || verify) {
@@ -1595,6 +1945,9 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
     x.q         = s.d_q;
     x.l         = s.d_l;
     x.bt        = s.d_bt;
+    x.phic_next = s.d_phic_next;
+    x.mrel      = s.d_mrel;
+    x.mode_master = step.mode_master ? 1 : 0;
     x.c_ro      = s.d_c;
 
     // 128, not 256: the whole grid is nxyz*ng = ~17k threads, so at 256 the
@@ -1630,6 +1983,12 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
     kAxialLeakage<<<blocks_ng, threads, 0, s.stream>>>(x);
     kUpdateSource<false><<<blocks_n, threads, 0, s.stream>>>(x);
 
+    // MASTER mode still runs the WHOLE of reset() -- PPR::reset has no mode
+    // branch, and driveMaster consumes the corner flux kCornerInit seeds --
+    // then overwrites every one of the 15 `c` slots kFit just wrote.  Doing
+    // less would be a different starting iterate than the host's.
+    if (master) kMasterEven<<<blocks_ng, threads, 0, s.stream>>>(x);
+
     if ((rc = cudaGetLastError()) != cudaSuccess) return s.fail("reset kernels", rc);
 
     // --- drive(niter) -------------------------------------------------------
@@ -1638,7 +1997,23 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
     // differ only in WHO decides to run it again: the host after a synchronise,
     // the enqueue count with the device flag making the surplus rounds no-ops,
     // or the WHILE's predicate.
+    //
+    // WP6 stage F.  MASTER mode's round is a DIFFERENT body -- the CPB sweep,
+    // its commit and its max-fold -- selected by `master` above and never
+    // inside a kernel, so neither scheme pays for the other's branch and a
+    // captured graph can only ever replay the one it was captured for.
     auto enqueue_round = [&](cudaStream_t st, bool guarded) {
+        if (master) {
+            if (guarded) {
+                kMasterCpb<true><<<blocks_ng, threads, 0, st>>>(x);
+                kMasterCommit<true><<<blocks_ch, threads, 0, st>>>(x);
+                kMasterFoldAndCheck<<<1, 1, 0, st>>>(x);
+            } else {
+                kMasterCpb<false><<<blocks_ng, threads, 0, st>>>(x);
+                kMasterCommit<false><<<blocks_ch, threads, 0, st>>>(x);
+            }
+            return;
+        }
         if (guarded) {
             for (int f = 0; f < kSourceSweepsPerIteration; ++f) {
                 kUpdateFused<true><<<blocks_ng, threads, 0, st>>>(x);
@@ -1659,7 +2034,27 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
 
     int iters_done = 0;
 
-    if (s.arm == LoopArm::HostSync) {
+    if (s.arm == LoopArm::HostSync && master) {
+        // The A/B control for the master arm: the same round, with the host
+        // folding the per-chunk maxima and applying driveMaster's own test.
+        for (int citer = 0; citer < niter; ++citer) {
+            enqueue_round(s.stream, false);
+
+            rc = cudaMemcpyAsync(s.h_partials, s.d_partials,
+                                 static_cast<size_t>(s.nchunk) * sizeof(double),
+                                 cudaMemcpyDeviceToHost, s.stream);
+            if (rc != cudaSuccess) return s.fail("D2H master partials", rc);
+            s.n_d2h_bytes += static_cast<size_t>(s.nchunk) * sizeof(double);
+            if (!s.syncStream("master drive sync")) return false;
+
+            double maxrel = 0.0;
+            for (int c = 0; c < s.nchunk; ++c)
+                maxrel = (s.h_partials[c] > maxrel) ? s.h_partials[c] : maxrel;
+
+            iters_done = citer + 1;
+            if (maxrel < kCornerFluxTolerance) break;
+        }
+    } else if (s.arm == LoopArm::HostSync) {
         // c502856, verbatim: the host folds the partials and applies the test.
         double prev_nw = 0.0, prev_sw = 0.0, prev_ne = 0.0, prev_se = 0.0;
         for (int citer = 0; citer < niter; ++citer) {
@@ -1745,6 +2140,14 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
         if ((rc = cudaGetLastError()) != cudaSuccess) return s.fail("drive kernels", rc);
     }
 
+    // driveMaster step 3, OUTSIDE the loop and therefore unguarded: it must run
+    // on the converged corners whether the break fired at round 3 or the cap
+    // was reached, which is exactly what the host does after its `break`.
+    if (master) {
+        kMasterCross<<<blocks_ng, threads, 0, s.stream>>>(x);
+        if ((rc = cudaGetLastError()) != cudaSuccess) return s.fail("master cross terms", rc);
+    }
+
     // Only what the host reconstruction reads comes back; phic follows so the
     // host arrays describe one consistent state if anything ever inspects them.
     //
@@ -1760,11 +2163,20 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
         s.n_d2h_bytes += bytes;
         return true;
     };
-    const size_t coeff_bytes = nng * (15 + 8 + 15 + 1 + 4 + 15 + 9) * sizeof(double);
+    // MASTER mode NEVER WRITES p OR a, on either arm: driveMaster has no
+    // particular/homogeneous split and reset() does not touch them.  The host
+    // arrays therefore hold whatever Geometry stood up, and the device buffers
+    // hold nothing at all -- copying them back would replace one with the
+    // other and both are equally unread.  So the master D2H is five arrays,
+    // not seven, and that is the host's own state, not an optimisation.
+    const size_t coeff_terms = master ? (15 + 1 + 4 + 15 + 9) : (15 + 8 + 15 + 1 + 4 + 15 + 9);
+    const size_t coeff_bytes = nng * coeff_terms * sizeof(double);
     s.coeffs_device_only = step.coefficients_stay_on_device;
     if (!s.coeffs_device_only) {
-        if (!d2h(step.p, s.d_p, nng * 15 * sizeof(double), "D2H p")) return false;
-        if (!d2h(step.a, s.d_a, nng * 8 * sizeof(double), "D2H a")) return false;
+        if (!master) {
+            if (!d2h(step.p, s.d_p, nng * 15 * sizeof(double), "D2H p")) return false;
+            if (!d2h(step.a, s.d_a, nng * 8 * sizeof(double), "D2H a")) return false;
+        }
         if (!d2h(step.c, s.d_c, nng * 15 * sizeof(double), "D2H c")) return false;
         if (!d2h(step.bt, s.d_bt, nng * sizeof(double), "D2H bt")) return false;
         if (!d2h(step.phic, s.d_phic, nng * 4 * sizeof(double), "D2H phic")) return false;
@@ -1806,7 +2218,14 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
 bool PprBackend::reconstructPinPower(const ppr::ReconGeomView& geom,
                                      const ppr::ReconStepView& step) {
     Impl& s = *_impl;
-    if (!s.enabled || s.failed) return false;
+    if (!s.enabled) {
+        s.recon_refusal = "off (RASBERY_GPU_PPR unset)";
+        return false;
+    }
+    if (s.failed) {
+        s.recon_refusal = "backend disabled after an earlier CUDA failure";
+        return false;
+    }
     // ONLY AFTER A DEVICE DRIVE.  The kernels read `p`, `a` and `bt` as the
     // previous call left them; a statepoint whose drive fell back to the host
     // has host coefficients and device coefficients one statepoint stale, and
@@ -1819,7 +2238,11 @@ bool PprBackend::reconstructPinPower(const ppr::ReconGeomView& geom,
         s.recon_refusal = "off (RASBERY_GPU_PPR_RECON unset)";
         return false;
     }
-    if (!s.ensureReconShape(geom, step)) return false;
+    if (!s.ensureReconShape(geom, step)) {
+        if (s.recon_refusal.empty())
+            s.recon_refusal = "reconstruction buffers could not be stood up";
+        return false;
+    }
 
     cudaError_t rc = cudaSuccess;
     auto        h2d = [&](void* d, const void* h, size_t bytes, const char* name) -> bool {
@@ -1888,6 +2311,11 @@ bool PprBackend::reconstructPinPower(const ppr::ReconGeomView& geom,
     r.npina            = npina;
     r.nchunk           = s.nchunk;
     r.reconstruct_flux = step.reconstruct_flux ? 1 : 0;
+    // WP6 stage F.  MASTER mode reads `c` where SENM reads p/a/bt, and reads
+    // nothing else differently -- same overlaps, same quadrature, same
+    // normalisation, same peaks.
+    r.mode_master      = step.mode_master ? 1 : 0;
+    r.c                = s.d_c;
     r.latol            = s.d_latol;
     r.vol              = s.d_vol;
     r.hz               = s.d_hz;

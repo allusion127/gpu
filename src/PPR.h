@@ -233,7 +233,8 @@ private:
     ///
     /// Returns false having written nothing when the arm is off
     /// (RASBERY_GPU_PPR_RECON), the drive did not run on the device, the mode
-    /// is MASTER or pointwise, or any CUDA call fails.
+    /// is pointwise, or any CUDA call fails.  MASTER mode IS served: its
+    /// expansion is the same quadrature over a 15-term dot product of `c`.
     bool reconstructPinPowerGpu(bool use_quadrature, bool reconstruct_flux,
                                 bool materialize_pin_map);
 
@@ -290,12 +291,27 @@ public:
     /// @brief reset() + drive(niter) on the device (RASBERY_GPU_PPR).
     ///
     /// Returns false -- having touched nothing -- when the arm is off, the
-    /// build has no CUDA, the deck is not 2-group, RASBERY_PPR_MODE=master is
-    /// selected, or any CUDA call fails.  The caller must then run reset() and
-    /// drive() exactly as before.  On success the host coefficient arrays
+    /// build has no CUDA, the deck is not 2-group, or any CUDA call fails.
+    /// EVERY ONE OF THOSE NAMES ITSELF on the way out, through
+    /// PprBackend::noteHostFallback / the backend's own ladder, so the
+    /// [RASBERY][PPR_GPU] receipt carries `refusal` and `refusals` beside
+    /// `host_fallbacks`.  The caller must then run reset() and drive() exactly
+    /// as before.  On success the host coefficient arrays
     /// reconstructPinPower() reads (_p, _a, _c, _bt, and _phic/_q/_l for
     /// completeness) hold the device result and the nodal pointers are set the
     /// same way reset() sets them.
+    ///
+    /// WP6 STAGE F: RASBERY_PPR_MODE=master IS SERVED.  It used to be the first
+    /// refusal in the function, which meant the arm declined every statepoint
+    /// of the production configuration -- master mode is what gives Gate B pin
+    /// RMS 0.238 % against the default mode's 0.522 % -- while the receipt said
+    /// only `host_fallbacks:35`.  The mode now travels in ppr::StepView and the
+    /// backend selects the MASTER MM 6.1 body (interpolant + corner-point
+    /// balance) instead of the SENM Picard one.  The device CPB solve is
+    /// JACOBI where the host's is Gauss-Seidel -- the host writes _phic in
+    /// place while later nodes read it, which is a serial dependence over the
+    /// whole mesh -- so the arm is class N1 there and nowhere else in the
+    /// master path; see CudaPprBackend.h for the contraction argument.
     bool resetAndDriveGpu(double reigv, double* jnet, const double* phif,
                           double* phis, int niter);
 

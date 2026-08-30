@@ -128,8 +128,10 @@ mattered.
 
  22. THE HOST LOOP STAYS THE REFERENCE, AND THE ARM IS A GUARDED EARLY RETURN.
      Anything else either runs the host loop on top of the device result or
-     drops it.  MASTER mode and the pointwise sampling are different schemes;
-     they decline rather than approximate.
+     drops it.  The POINTWISE sampling is a different scheme and declines
+     rather than approximating.  MASTER mode used to be on that list and is
+     not any more -- WP6 stage F ported it, and
+     tools/test_ppr_gpu_master_mode_contract.py is where that is held.
 
  23. WHETHER THE PIN MAP LEAVES THE DEVICE IS WHETHER IO WILL WRITE IT.
      Geometry::PinPower() has exactly one reader -- IO.cpp under
@@ -631,10 +633,11 @@ def check(raw: dict[str, str]) -> list[str]:
     want(PPR_CPP_CODE, "std::fill_n(ppower,", "PPR.cpp",
          "the host reconstruction stays in the file as the reference; stage D is an arm, not "
          "a replacement")
-    want(PPR_CPP_CODE, "if (!use_quadrature || _mode_master || _ng != 2) return false;",
+    want(PPR_CPP_CODE, "if (!use_quadrature || _ng != 2) return false;",
          "PPR.cpp",
-         "the kernels transcribe the SENM quadrature path only -- MASTER mode and the "
-         "pointwise sampling are different schemes and must decline, not approximate")
+         "the kernels transcribe the QUADRATURE path only -- the pointwise sampling is a "
+         "different scheme and must decline, not approximate.  MASTER mode is served (WP6 "
+         "stage F): its expansion is the same quadrature over a 15-term dot product of _c")
 
     # --- 23. the materialize flag is IO's flag -------------------------------
 
