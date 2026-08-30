@@ -8,18 +8,23 @@
 | 측정 커밋 | `73f8627`(기준선·CRAM·FUSE·pinned TXN) · `926497d`(v3 freeze) · `388e8f2` · `7cfe3a4` · **`91004f7`**(PPR master-mode device port, no-pin TXN, 스택) |
 | 덱 | `kngr_238.json` (APR1400/KNGR CY1 PSAR, 35상태 자연 EOC, 1/4 노심 8,451 노드, NG=2), 단일덱, `--batch-mode` 없음 |
 | 프로토콜 | arm당 **warm-up 1 + hot 3, median 보고**, 교차 순서. 예외는 본문에 그 자리에서 명시한다 |
-| 원천 | 238 러너 보고 `pricing_388e8f2.md` (블록 0–8 + 2b/3b/4b/5b/5c). 블록 9(v4 전체 스택)는 **미완** |
+| 원천 | 238 러너 보고 `pricing_388e8f2.md` (블록 0–9b + 2b/3b/4b/5b/5c) |
 | 기준기 | MASTER (CPU) 단일 27.2 s |
 
 ---
 
 ## 0. 한 줄 요약
 
-**PROD env 아래에서 세 기능이 값을 냈고 하나는 공짜였다.** 스택(`CRAM=1` + `CMFD_FUSE=15` + `PPR=1`)이
-같은 커밋 기준선 16.585 s를 **14.631 s**로 내렸다(−1.954 s, −11.8 %, MASTER 27.2 s 대비 **1.86×**).
+**PROD env 아래에서 네 기능이 전부 값을 냈다.** v4 전체 스택
+(`CRAM=1` + `CMFD_FUSE=15` + `PPR=1` + `PPR_GRAPH=1` + `XE_TXN=1`)이 같은 커밋 기준선 16.658 s를
+**14.378 s**로 내렸다(**−2.280 s, −13.7 %, MASTER 27.2 s 대비 1.89×**) — 캠페인 전체에서 가장 좋은
+단일덱 PROD wall이다.
 PPR은 91004f7 이전까지 production에서 **한 번도 돌지 않았고**(`host_fallbacks:35/35`), CRAM은 궤적을
 움직이지만 Gate A/B를 통과했으며, FUSE는 전 mask B0이고, XE_TXN의 B0는 238에서 **직접 감사로** 세웠다
-(`forms_audit_mismatch 0/693`). 그리고 이번 패스가 남긴 가장 비싼 교훈은 숫자가 아니라 절차다 —
+(`forms_audit_mismatch 0/693`)이며 전체 스택 아래에서도 h5diff 0으로 재확인되었다.
+그리고 **다음 병목은 이 캠페인이 손댄 어느 것도 아니다** — nsys가 `kernelFlatXs` 하나에 GPU 커널
+시간의 **58.9 %**를 귀속시켰고, 호스트 쪽에서는 `result_write`가 **19.9 %**를 가져간다(§7.3).
+이번 패스가 남긴 가장 비싼 교훈은 숫자가 아니라 절차다 —
 **매니페스트 env 밖에서 잰 수는 측정이 아니고, 한 기계에서 채굴한 pin은 다른 기계로 옮겨지지 않는다.**
 
 ---
@@ -76,7 +81,8 @@ Gate B 0.522 %/2.13 %). **아래 어떤 판정에도 arm-X 수를 쓰지 않는�
 | **GPU CRAM** (Task 16) | `RASBERY_GPU_CRAM=1` | **N1** (궤적 이동) | 16.729 | **16.043** | **−0.686** | `1f36e75dc00ed2b4` / **4377** | Gate A PASS · Gate B PASS · 결정론 PASS | **채택 후보** |
 | **CMFD FUSE** (WP7-B) | `RASBERY_GPU_CMFD_FUSE=15` | **B0** (전 mask) | 16.724 | **16.328** | **−0.396** | `0d15abf29d222a02` / 4382 | B0 6/6 mask · 채택 문턱 0.2 s 통과 | **채택 후보 (mask 15)** |
 | **Xe TXN** (WP7-C, `91004f7`) | `RASBERY_GPU_XE_TXN=1` | **B0** | 16.791 | 16.652 | −0.139 (단발, 노이즈 안) | `0d15abf29d222a02` / 4382 | `forms_audit_mismatch` **0/693** | **B0 확립 · wall 중립** |
-| **스택** | 위 셋 동시 | N1 (CRAM이 지배) | 16.585 | **14.631** | **−1.954 (−11.8 %)** | `1f36e75dc00ed2b4` / 4377 | Gate B pin 0.238 %/0.80 % | **v4 후보** |
+| **스택 (CRAM+FUSE15+PPR)** | 위 셋 동시 | N1 (CRAM이 지배) | 16.585 | 14.631 | −1.954 (−11.8 %) | `1f36e75dc00ed2b4` / 4377 | Gate B pin 0.238 %/0.80 % | 중간 단계 (블록 8) |
+| **v4 전체 스택** | 위 넷 + `_PPR_GRAPH=1` | N1 (CRAM이 지배) | **16.658** | **14.378** | **−2.280 (−13.7 %)** | `1f36e75dc00ed2b4` / 4377 | Gate B pin 0.238 %/0.80 % · (e) vs (d) h5diff **0** | **v4 후보 · 1.89×** |
 
 > **PPR OFF(16.885 s)는 단발 실행이다** — 블록 7에서 OFF arm만 hot 1회였다. −1.861 s는 median 대
 > 단발의 차이이므로, 반복된 기준선(블록 1의 16.772 median)에 대면 −1.75 s다. 어느 쪽이든 노이즈
@@ -325,7 +331,9 @@ mask의 대수 채널이 host의 것과 정확히 일치하고, **693개 Anderso
 
 ---
 
-## 7. 스택 — v4 후보의 실측 (블록 8, `91004f7`)
+## 7. 스택 — v4 후보의 실측 (블록 8·9·9b, `91004f7`)
+
+### 7.1 블록 8: CRAM + FUSE=15 + PPR (중간 단계)
 
 교차 순서 a→b→c ×3, warm-up 1 + hot 3.
 
@@ -343,13 +351,93 @@ mask의 대수 채널이 host의 것과 정확히 일치하고, **693개 Anderso
 - (c)의 Gate B pin RMS = **0.238 % / 0.80 %** — 스택 상태에서도 production 기준을 정확히 재현.
 - (c)의 `[PPR_GPU]` `host_fallbacks:0/35`, `refusal:"none"`; `[CRAM_GPU]` `host_fallbacks:0`.
 
-**스택 wall: 16.585 → 16.008 (−0.577) → 14.631 s (−1.954 s, −11.8 %).
-MASTER 27.2 s 대비 1.86×.**
+**중간 스택 wall: 16.585 → 16.008 (−0.577) → 14.631 s (−1.954 s, −11.8 %).**
+블록 9가 여기에 GRAPH와 TXN을 얹어 **14.378 s(1.89×)**로 마무리한다.
 
-> **주의 — 이 14.631 s arm에는 `RASBERY_GPU_PPR_GRAPH=1`도 `RASBERY_GPU_XE_TXN=1`도 없다.**
-> 둘은 §3.3·§6에서 **따로** 가격이 매겨졌다(GRAPH는 PPR 위에 −0.18 s, TXN은 B0·wall 중립).
-> §8의 v4 후보 env는 그 둘을 포함하므로 **아직 통째로 측정된 적이 없다** — 블록 9가 그것을
-> 재기로 되어 있었고 **미완**이다. 만들어진 후보 매니페스트는 이 사실을 명시한다.
+이 arm에는 `RASBERY_GPU_PPR_GRAPH=1`도 `RASBERY_GPU_XE_TXN=1`도 없다. 블록 9가 그 둘을 얹어
+v4 env를 통째로 측정한다.
+
+### 7.2 블록 9: v4 env 전체 — **14.378 s**
+
+교차 순서, warm-up 1 + hot 3.
+
+| arm | warm | hot1 | hot2 | hot3 | **median (s)** | digest | outers |
+|---|---:|---:|---:|---:|---:|---|---:|
+| (a) base | 16.895 | 16.823 | 16.658 | 16.471 | **16.658** | `0d15abf29d222a02` | 4382 |
+| (d) `CRAM`+`FUSE=15`+`PPR`+`GRAPH` | 14.809 | 14.732 | 14.502 | 14.515 | **14.515** | `1f36e75dc00ed2b4` | **4377** |
+| **(e) (d) + `XE_TXN=1` = v4 후보** | 14.647 | 14.630 | **14.378** | 14.364 | **14.378** | `1f36e75dc00ed2b4` | **4377** |
+
+- **(e) vs (d) h5diff = 0 차이, 전 데이터셋** — **TXN의 B0는 전체 스택 아래에서도 성립한다.**
+- (d)의 digest가 CRAM 서명 그대로 = FUSE·PPR·GRAPH가 궤적에 아무것도 더하지 않는다.
+- (e) Gate B pin RMS **0.238 % / 0.80 %** — production 기준 정확 일치.
+- (e) 수신증: `[PPR_GPU]` `host_fallbacks:0/35`, `refusal:"none"`, **`loop_arm:"device_graph"`**(GRAPH
+  arm이 실제로 잡혔다) · `[CRAM_GPU]` `host_fallbacks:0` · `[XE_GPU]` `host_fallbacks:0`,
+  **`txn_steps:1117 = xe_device_steps`**(모든 Xe 스텝이 TXN을 통과, fallback 없음).
+
+**v4 후보 wall: 14.378 s median, base 16.658 s 대비 −2.280 s(−13.7 %). MASTER 27.2 s 대비 1.89×.**
+캠페인 전체에서 가장 좋은 단일덱 PROD wall이다.
+
+### 7.3 블록 9b: (e)의 phase 분해 — 그리고 두 계기가 서로 다른 답을 준다
+
+(e)에 `RASBERY_STATEPOINT_TELEMETRY=1`만 더한 1회 실행. digest/outers 불변
+(`1f36e75dc00ed2b4`/4377) → **계기 중립성 게이트 유지**. 이 실행 자신의 wall은 14.744 s로
+untelemetered median 14.378 s보다 약간 높다(telemetry의 알려진 I/O 경합 비용).
+
+`[RASBERY][SPTELEM][SUMMARY]`의 `phase_wall` 중
+`updpsi/setls/drive/updjnet/nodal/cusping/upddhat`는 **전부 0**이다 — `RASBERY_GPU_OUTER=1`이면
+host outer body가 실행되지 않으므로 **그 시간은 없는 것이 아니라 host 쪽에서 따로 계측되지
+않는 것**이다. 아래 백분율의 분모는 바이너리 자신의 회계 `total_seconds = 14.563 s`.
+
+| phase | wall (s) | % |
+|---|---:|---:|
+| **CMFD + nodal (잔여 — device-resident, host 타이머 없음)** | **4.957** | **34.0 %** |
+| host I/O (`io_wall` + `result_add`, 사실상 전부 `result_write`) | **2.894** | **19.9 %** |
+| xsrecon/flatxs (`nested_wall`) | 1.915 | 13.2 % |
+| CRAM (`depl_predictor` + `depl_corrector`) | 1.606 | 11.0 % |
+| startup (`init_seconds` + `library_seconds`) | 0.922 | 6.3 % |
+| search (`search_propose` + `search_apply`) | 0.768 | 5.3 % |
+| TH (`th_update`) | 0.700 | 4.8 % |
+| Xe (`xe_step`) | 0.534 | 3.7 % |
+| PPR (`ppr_reset` + `ppr_drive` + `ppr_recon`) | 0.266 | **1.8 %** |
+
+CMFD 관련 규모: **18,627 sweeps / 74,508 BiCG iteration**.
+**outer 단가: 3.327 ms/outer(300.6 outers/s)** — untelemetered 14.378 s로는 3.285 ms/outer.
+
+**이 캠페인이 개별로 최적화하고 게이트한 모든 phase(PPR 1.8 %, Xe 3.7 %, CRAM 11.0 %)가 이제
+손대지 않은 CMFD/nodal 코어보다 작다.**
+
+#### nsys 커널 프로파일 — 위의 결론을 뒤집는다
+
+`nsys profile --stats=true`를 (e)에 걸었다(`.nsys-rep`/`.sqlite`는 **238에 보관**, 통계 텍스트만
+여기 옮긴다). 프로파일링 오버헤드는 실재한다 — 이 실행은 23.014 s로 untelemetered median 대비
+**+60 %**다. 따라서 아래는 **상대 신호**이지 초 단위 대응이 아니다.
+
+| 커널 그룹 | GPU 커널 시간 비중 | 합계 (ms) |
+|---|---:|---:|
+| **`kernelFlatXs`** (xsrecon/flatxs) | **58.9 %** | 950.4 |
+| Xe/TXN 커널 (`kXeCommitTxn`·`kXeEvaluate`·`kXeDotStage1/2`·`kXeCandidateTxn`·`kXeHistory`·`kXeAndersonSolve/Gate`) | 20.8 % | 335.6 |
+| CRAM (`kPredictor`+`kCorrector`) | 14.8 % | 238.5 |
+| CMFD/outer 커널 (`k_cmfd_upd_dhat/jnet/psi`, `k_outer_transition/refresh/publish`, `cmfd_sweep_gate_patch/verdict`, `k_cmfd_outer_convergence`) | **~5.1 %** | 82.2 |
+| nodal + PPR device 커널 (`kFit`·`kCornerInit`·`kBuckling`·`kAxialLeakage`·`kUpdateSource`·`kMasterEven`·`kMasterCross`) | **<0.2 %** | ~1.2 |
+
+**두 계기가 반대 방향을 가리킨다. 둘 다 적는다.**
+SPTELEM의 host 타이머는 최대 버킷(34 %)을 "CMFD+nodal 잔여"에 귀속시켰지만, 직접 커널 프로파일은
+CMFD/outer + nodal/PPR device 커널을 **합쳐서 6 % 미만**으로 본다 — 즉 **빠르고 이미 효율적이다.**
+실제 GPU 시간의 지배자는 **`kernelFlatXs` 하나로 58.9 %**이고, 이는 Xe/TXN(20.8 %)과
+CRAM(14.8 %)을 **합친 35.6 %보다도 크다**.
+따라서 위 표의 "CMFD+nodal 34 %"는 **CMFD/nodal 연산 자체가 아니라 귀속되지 않은 host 측
+대기·오버헤드**(sync stall, 스케줄링, memcpy 큐잉)로 읽어야 한다. 두 관점이 다른 것을 재기
+때문에(host 관측 gap vs GPU 커널 점유 시간) 정확한 대조에는 untelemetered 실행의 matched trace가
+필요하며, 이는 측정 전용 패스의 범위를 넘는다. **더 깨끗한 이야기를 위해 한쪽을 고르지 않는다.**
+
+#### CUDA API·전송 — 세 번째 표적
+
+- **`cudaStreamSynchronize`가 API 시간의 66.8 %** (6.19 s, 9,477 호출, 평균 653 µs/호출) —
+  위에서 합산한 GPU 커널 시간 전체(~1.61 s)보다 **큰 host 대기**다.
+- `cudaMemcpyAsync` 24.5 % (2.27 s, **110,078 호출** — 작은 전송의 매우 높은 호출 수).
+- **PCIe 전송 총량: D2H 28.6 GB(55,183 copy) + H2D 11.7 GB(54,918 copy) = 단일덱 1회에 40.3 GB.**
+  D2H 하나가 copy 시간의 67.8 %(1.02 s). PPR의 `h2d_bytes_elided` 회계와 같은 정신으로
+  ~110 K개 소형 전송을 묶거나 없앨 수 있는지가 별도의 표적이다.
 
 ---
 
@@ -370,11 +458,15 @@ RASBERY_GPU_XE_TXN=1
 
 | 항목 | 값 | 비고 |
 |---|---|---|
-| 측정 커밋 | `91004f7` | |
+| 측정 커밋 | `91004f7` | 블록 9 arm (e), 교차 순서 warm-up 1 + hot 3 |
 | digest | `1f36e75dc00ed2b4` | CRAM 서명 |
 | outers | **4377** | v3 4382에서 −5 |
-| 단일덱 wall | **14.631 s** | MASTER 27.2 s 대비 **1.86×** |
+| 단일덱 wall | **14.378 s** | 같은 교차의 base 16.658 s에서 **−2.280 s(−13.7 %)**, MASTER 27.2 s 대비 **1.89×** |
 | 등급 | **N1** (CRAM이 지배; PPR/FUSE/TXN은 각각 B0) | |
+| 계측 | `loop_arm:"device_graph"` · `txn_steps 1117 = xe_device_steps` · 전 서브시스템 `host_fallbacks:0` | env가 선언한 arm이 실제로 잡혔다는 증거 |
+
+**이 env 전체가 하나의 arm으로 측정되었다**(블록 9). 부분 스택 14.631 s(블록 8)는 중간 단계로만
+인용한다.
 
 **`181 cross-gate pending` 플래그가 붙는 항목 셋:**
 
@@ -390,17 +482,33 @@ RASBERY_GPU_XE_TXN=1
 
 ---
 
-## 9. 다음 병목 후보 (측정으로 열린 것)
+## 9. 다음 레버 (§7.3의 두 계기가 함께 지목하는 것)
 
-| # | 후보 | 근거 | 크기 추정 |
+**세 개가 남았고, 이 캠페인이 최적화한 것은 그 안에 없다.**
+
+| # | 레버 | 근거 | 계기 | 크기 |
+|---|---|---|---|---|
+| **1** | **`result_write` 비동기화 — WP12 (진행 중)** | host I/O가 `total_seconds`의 **19.9 %(2.894 s)**이고 `io_wall`은 사실상 전부 `result_write`다. **CRAM·search·TH·PPR·Xe를 전부 합친 것보다 크다** | SPTELEM | **대** |
+| **2** | **CMFD/nodal 코어 — outer 수** | host 타이머 기준 최대 버킷 **34.0 %(4.957 s)**, 18,627 sweep / 74,508 BiCG, **3.33 ms/outer × 4377**. 커널을 더 빠르게 하는 것보다 **outer를 덜 도는 것**이 레버다(A2, `docs/A2_OUTER_REDUCTION_20260829_KO.md`, outer −61.6 % 스캔 기록) | SPTELEM | **대** |
+| **3** | **`kernelFlatXs` (xsrecon/flatxs)** | **GPU 커널 시간의 58.9 %(950.4 ms)** — Xe/TXN(20.8 %)과 CRAM(14.8 %)을 합친 것보다 크다. host 타이머로는 13.2 %(1.915 s)로만 보인다. WP5의 CTA-per-node 커널이 이미 트리에 있고 **기본값 OFF·미가격**이다 | **nsys** | **대** |
+
+**단, #2와 #3은 서로 다른 계기가 지목한 것이고 두 계기는 어긋난다**(§7.3). nsys는 CMFD/outer +
+nodal/PPR device 커널을 **합쳐 6 % 미만**으로 보며, 그렇다면 34 %는 CMFD 연산이 아니라 **귀속되지
+않은 host 대기**다 — 그리고 그 해석을 뒷받침하는 독립 증거가 있다: `cudaStreamSynchronize`가 API
+시간의 **66.8 %(6.19 s, 9,477 호출)**이고, 이는 합산 GPU 커널 시간(~1.61 s)보다 크다.
+**어느 쪽에 손대기 전에 untelemetered 실행의 matched trace가 필요하다.**
+
+**부차 후보:**
+
+| # | 후보 | 근거 | 크기 |
 |---|---|---|---|
-| **1** | **CRAM BOS micx residency** | `bos_reuse:34` = statepoint 수. BOS 버퍼가 resident로 남지 않고 statepoint마다 40.2 MB를 재전송한다(총 1,367.9 MB) | CRAM `wall_ms` 234 ms 안에서의 전송분 |
-| **2** | **outer/CMFD 루프 자체** | 14.631 s / **4377 outer = ~3.3 ms/outer**. PPR 루프가 106 ms까지 내려온 지금, 남은 14.6 s를 지배하는 것은 outer 루프다 | 지배적 |
-| **3** | **A2 — outer 수 감소** | 위의 직접적 귀결. 커널을 더 빠르게 하는 것보다 **outer를 덜 도는 것**이 이제 더 큰 레버다 (`docs/A2_OUTER_REDUCTION_20260829_KO.md`) | outer −61.6 % 스캔 기록 있음 |
-| **4** | 배치 tail / `width_fill` | 8×M8+MPS의 `width_fill` 0.41 — 단일 wall이 내려가면 배치 tail의 상대 지분이 오른다 | 배치 878 c/h 축 |
-| **5** | `7cfe3a4`가 이웃보다 0.4 s 빠른 건 | 블록 1: `7cfe3a4` 16.373 vs `926497d`/`388e8f2`/`73f8627` 16.76–16.79. `388e8f2`가 `73f8627` 쪽에 앉으므로, 실재한다면 `926497d`↔`7cfe3a4` 사이다 | **낮은 우선순위** — 0.4 s(~2.4 %)는 전 블록에서 관측된 통상 jitter 폭과 같은 크기 |
+| 4 | **PCIe 전송 40.3 GB / 110 K copy** | D2H 28.6 GB(55,183) + H2D 11.7 GB(54,918), 단일덱 1회. D2H가 copy 시간의 67.8 %. 소형 전송 병합/제거 여지 | 중 |
+| 5 | **CRAM BOS micx residency** | `bos_reuse:34` = statepoint 수. BOS 버퍼가 resident로 남지 않고 statepoint마다 ~40.2 MB를 재전송한다(총 1,367.9 MB). #4의 한 부분집합이다 | 중 |
+| 6 | 배치 tail / `width_fill` | 8×M8+MPS의 `width_fill` 0.41 — 단일 wall이 내려갈수록 배치 tail의 상대 지분이 오른다. 기준 878 c/h | 중(배치 축) |
+| 7 | `7cfe3a4`가 이웃보다 0.4 s 빠른 것 | 블록 1: `7cfe3a4` 16.373 vs `926497d`/`388e8f2`/`73f8627` 16.76–16.79. 실재한다면 `926497d`↔`7cfe3a4` 사이다 | **낮음** — 0.4 s(~2.4 %)는 통상 jitter와 같은 크기 |
 
-**PPR은 더 이상 후보가 아니다** — device 루프가 106 ms이면 14.6 s의 0.7 %다.
+**PPR·Xe·CRAM은 더 이상 1차 후보가 아니다** — host 타이머로 각각 **1.8 % / 3.7 % / 11.0 %**이고,
+PPR device 루프는 106 ms로 전체의 0.7 %다.
 
 ---
 
@@ -448,3 +556,5 @@ site와 rung을 동반해야 한다**(`91004f7`이 둘 다 고쳤다).
 | 블록 4의 base 21.004 s, `FUSE=2` 19.232 s | warm-up 없는 cold-start 이상치 (§5.1) |
 | 블록 2의 `canonical_mismatch`/`recon_repairs`/`graph_launches` | device 경로가 돌지 않아 자명하게 0 (§3.1) |
 | 181의 wall·c/h 전부 | 181은 정확도 전용 호스트다. 성능 주장을 내지 않는다 |
+| 블록 9b의 14.744 s (telemetry 켠 실행) · 23.014 s (nsys 감싼 실행) | 계기 오버헤드가 실린 wall이다. wall 판정은 untelemetered 14.378 s median으로만 한다 |
+| 블록 9b nsys의 절대 ms 값 | +60 % 오버헤드 아래의 측정이므로 **상대 비중 신호**로만 쓴다 |
