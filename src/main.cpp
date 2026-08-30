@@ -1146,6 +1146,9 @@ int main(int argc, char* argv[]) {
         // xslib and arena_releases fields are final.
         server.reportProcess(std::cout);
         rasbery::iowriter::reportSummary(std::cout);
+        // WP12: the other half of io_wall -- the pin-power CSV serialisation,
+        // and whether it ran on the solver thread or the writer thread.
+        rasbery::iowriter::reportResultIo(std::cout);
         return exit_code;
     }
 
@@ -1417,6 +1420,9 @@ int main(int argc, char* argv[]) {
         // waits -- so the signals here are enqueue_block_ms (what the Drivers
         // still pay) and writer_busy_ms (whether the writer is the new floor).
         rasbery::iowriter::reportSummary(std::cout);
+        // WP12: the other half of io_wall -- the pin-power CSV serialisation,
+        // and whether it ran on the solver thread or the writer thread.
+        rasbery::iowriter::reportResultIo(std::cout);
         return exit_code;
     }
 
@@ -1532,5 +1538,6 @@ int main(int argc, char* argv[]) {
                                   since_start(drive_end),
                               static_cast<int>(rasbery_inputs.size()));
     rasbery::iowriter::reportSummary(std::cout);
+    rasbery::iowriter::reportResultIo(std::cout);
     return exit_code;
 }

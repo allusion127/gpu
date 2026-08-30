@@ -10,6 +10,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include "CompatFormat.h"
 #include <fstream>
@@ -1415,6 +1416,155 @@ void IO::AddResult(Geometry& g, double keff,
 }
 // HDF5 result output
 
+// ---------------------------------------------------------------------------
+// WP12: the pin-power CSV of one statepoint, as a VALUE.
+//
+// WHY A TYPE AND NOT A LAMBDA.  The CSV is the expensive half of the result
+// path -- Driver.h prices it at ~119 MB per `--result full` case, formatted one
+// double at a time through `ostream <<` -- and it used to run on the solver
+// thread inside PH_RESULT_WRITE.  To let the writer thread run it instead, the
+// emitter must not name a single thing the solver still owns: Geometry, XSSet,
+// Schedule and IO's own `_pin_power_csv_*` members are all mutated the instant
+// WriteStepToResult returns.  So every number it needs is COPIED into this
+// struct, and the struct is what the closure captures.  A reviewer can check
+// that claim by reading the field list: there is no reference and no pointer.
+//
+// The emitter body is the pre-WP12 block verbatim, with exactly two
+// substitutions -- `g.hz(k)` -> `hz[k]` and `g.ijtola(ia, ja)` ->
+// `ijtola[ja * nxa + ia]`, both of which are lookups into copies of the same
+// tables.  Same manipulators, same order, same `<<` calls, therefore same
+// bytes; that is what makes the gate B0.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct PinPowerCsvRecord {
+    std::filesystem::path path;
+    /// Decided by the SOLVER, at record time, from `_pin_power_csv_started` --
+    /// never re-derived here.  The writer thread must not have an opinion about
+    /// whether this is the first block of the run.
+    bool                append = false;
+    int                 step   = 0;
+    double              efpd   = 0.0;
+    int                 nz = 0, nxya = 0, npins = 0, npina = 0;
+    int                 nxa = 0, nya = 0, kbc = 0, kec = 0;
+    std::vector<double> hz;        ///< [nz]
+    std::vector<int>    ijtola;    ///< [nya * nxa], -1 where there is no assembly
+    std::vector<double> pin_data;  ///< [nz * nxya * npina]
+
+    /// Resident footprint, for the writer queue's byte bound.
+    [[nodiscard]] std::size_t bytes() const {
+        return pin_data.size() * sizeof(double) + hz.size() * sizeof(double) +
+               ijtola.size() * sizeof(int);
+    }
+
+    void Emit() const;
+};
+
+void PinPowerCsvRecord::Emit() const {
+    const auto started = std::chrono::steady_clock::now();
+
+    // Byte accounting by file size, not by counting `<<` calls: it costs two
+    // stats and it cannot drift from what actually landed.  A trunc block
+    // starts from zero by definition; an append block starts from what is
+    // already there.
+    std::uintmax_t before = 0;
+    if (append) {
+        std::error_code ec;
+        const std::uintmax_t sized = std::filesystem::file_size(path, ec);
+        if (!ec) before = sized;
+    }
+
+    {
+        std::ofstream csv(path, append ? std::ios::app : std::ios::trunc);
+        if (!csv)
+            throw std::runtime_error("IO: failed to open pin-power CSV: " + path.string());
+        csv << std::setprecision(6);
+        if (append) csv << '\n';
+
+        std::vector<double> zavg(static_cast<size_t>(nxya) * npina, std::numeric_limits<double>::quiet_NaN());
+        std::vector<double> zsum(static_cast<size_t>(nxya), 0.0);
+        for (int k = kbc; k < kec; ++k) {
+            const double hz_k = hz[k];
+            for (int la = 0; la < nxya; ++la) {
+                const size_t src = (static_cast<size_t>(k) * nxya + la) * npina;
+                if (std::isnan(pin_data[src])) continue;
+                if (zsum[la] == 0.0) {
+                    for (int pi = 0; pi < npina; ++pi)
+                        zavg[static_cast<size_t>(la) * npina + pi] = 0.0;
+                }
+                zsum[la] += hz_k;
+                for (int pi = 0; pi < npina; ++pi)
+                    zavg[static_cast<size_t>(la) * npina + pi] += pin_data[src + pi] * hz_k;
+            }
+        }
+        for (int la = 0; la < nxya; ++la) {
+            if (zsum[la] <= 0.0) continue;
+            const double inv_hz = 1.0 / zsum[la];
+            for (int pi = 0; pi < npina; ++pi)
+                zavg[static_cast<size_t>(la) * npina + pi] *= inv_hz;
+        }
+
+        csv << std::format("Pin Power (Z-averaged) -- Step {} (EFPD={:.2f})\n", step, efpd);
+        for (int ja = 0; ja < nya; ++ja) {
+            for (int py = 0; py < npins; ++py) {
+                bool first_col = true;
+                for (int ia = 0; ia < nxa; ++ia) {
+                    const int la = ijtola[static_cast<size_t>(ja) * nxa + ia];
+                    for (int px = 0; px < npins; ++px) {
+                        if (!first_col) csv << ',';
+                        first_col = false;
+                        if (la < 0 || la >= nxya) continue;
+                        const int    pi  = py * npins + px;
+                        const double val = zavg[static_cast<size_t>(la) * npina + pi];
+                        if (!std::isnan(val)) csv << val;
+                    }
+                }
+                csv << '\n';
+            }
+        }
+        csv << '\n';
+
+        for (int k = kbc; k < kec; ++k) {
+            const size_t src = static_cast<size_t>(k) * nxya * npina;
+            csv << std::format("Pin Power k={} (hz={:.4f}) -- Step {} (EFPD={:.2f})\n",
+                               k, hz[k], step, efpd);
+            for (int ja = 0; ja < nya; ++ja) {
+                for (int py = 0; py < npins; ++py) {
+                    bool first_col = true;
+                    for (int ia = 0; ia < nxa; ++ia) {
+                        const int la = ijtola[static_cast<size_t>(ja) * nxa + ia];
+                        for (int px = 0; px < npins; ++px) {
+                            if (!first_col) csv << ',';
+                            first_col = false;
+                            if (la < 0 || la >= nxya) continue;
+                            const int    pi  = py * npins + px;
+                            const double val = pin_data[src + static_cast<size_t>(la) * npina + pi];
+                            if (!std::isnan(val)) csv << val;
+                        }
+                    }
+                    csv << '\n';
+                }
+            }
+            csv << '\n';
+        }
+    }
+
+    std::error_code      after_ec;
+    const std::uintmax_t after = std::filesystem::file_size(path, after_ec);
+    auto&                tally = rasbery::iowriter::resultIoCounters();
+    if (!after_ec && after >= before)
+        tally.bytes.fetch_add(static_cast<std::uint64_t>(after - before),
+                                 std::memory_order_relaxed);
+    tally.records.fetch_add(1, std::memory_order_relaxed);
+    tally.writer_ns.fetch_add(
+        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - started)
+                                       .count()),
+        std::memory_order_relaxed);
+}
+
+}  // namespace
+
 /// @brief Create the result HDF5 file and write the geometry group.
 void IO::OpenResult(const std::string& filepath) {
     _result_path                     = filepath;
@@ -1686,79 +1836,45 @@ void IO::WriteStepToResult(Geometry& g, const XSSet& xs, int schedule_index) {
             step_grp.createDataSet<double>("pin_flux", flux_space).write_raw(flux_data.data());
         }
 
-        std::ofstream csv(_pin_power_csv_path,
-                          _pin_power_csv_started ? std::ios::app : std::ios::trunc);
-        if (!csv)
-            throw std::runtime_error("IO: failed to open pin-power CSV: " + _pin_power_csv_path.string());
-        csv << std::setprecision(6);
-        if (_pin_power_csv_started) csv << '\n';
+        // WP12.  Snapshot, then emit -- the two halves that used to be one.
+        // Building the record is a memcpy of numbers the solver already has;
+        // Emit() is the ~15 MB of text formatting that used to sit here on the
+        // solver thread, and is what the gate moves.
+        PinPowerCsvRecord csv_record;
+        csv_record.path   = _pin_power_csv_path;
+        csv_record.append = _pin_power_csv_started;
+        csv_record.step   = d.step;
+        csv_record.efpd   = d.efpd;
+        csv_record.nz     = nz;
+        csv_record.nxya   = nxya;
+        csv_record.npins  = npins;
+        csv_record.npina  = npina;
+        csv_record.nxa    = nxa;
+        csv_record.nya    = nya;
+        csv_record.kbc    = kbc;
+        csv_record.kec    = kec;
+        csv_record.hz.resize(static_cast<size_t>(nz));
+        for (int k = 0; k < nz; ++k)
+            csv_record.hz[static_cast<size_t>(k)] = g.hz(k);
+        csv_record.ijtola.resize(static_cast<size_t>(nya) * nxa);
+        for (int ja = 0; ja < nya; ++ja)
+            for (int ia = 0; ia < nxa; ++ia)
+                csv_record.ijtola[static_cast<size_t>(ja) * nxa + ia] = g.ijtola(ia, ja);
+        // MOVED, not copied: `pin_data` has no reader left -- the HDF5
+        // write_raw above already took its own copy into the batch.
+        csv_record.pin_data = std::move(pin_data);
+
+        // The flag advances HERE in both modes, because it is the SOLVER's
+        // question ("has this run written a block yet?") and the answer must be
+        // the same whether or not the emitter has run yet.
         _pin_power_csv_started = true;
 
-        std::vector<double> zavg(static_cast<size_t>(nxya) * npina, std::numeric_limits<double>::quiet_NaN());
-        std::vector<double> zsum(static_cast<size_t>(nxya), 0.0);
-        for (int k = kbc; k < kec; ++k) {
-            const double hz_k = g.hz(k);
-            for (int la = 0; la < nxya; ++la) {
-                const size_t src = (static_cast<size_t>(k) * nxya + la) * npina;
-                if (std::isnan(pin_data[src])) continue;
-                if (zsum[la] == 0.0) {
-                    for (int pi = 0; pi < npina; ++pi)
-                        zavg[static_cast<size_t>(la) * npina + pi] = 0.0;
-                }
-                zsum[la] += hz_k;
-                for (int pi = 0; pi < npina; ++pi)
-                    zavg[static_cast<size_t>(la) * npina + pi] += pin_data[src + pi] * hz_k;
-            }
-        }
-        for (int la = 0; la < nxya; ++la) {
-            if (zsum[la] <= 0.0) continue;
-            const double inv_hz = 1.0 / zsum[la];
-            for (int pi = 0; pi < npina; ++pi)
-                zavg[static_cast<size_t>(la) * npina + pi] *= inv_hz;
-        }
-
-        csv << std::format("Pin Power (Z-averaged) -- Step {} (EFPD={:.2f})\n", d.step, d.efpd);
-        for (int ja = 0; ja < nya; ++ja) {
-            for (int py = 0; py < npins; ++py) {
-                bool first_col = true;
-                for (int ia = 0; ia < nxa; ++ia) {
-                    const int la = g.ijtola(ia, ja);
-                    for (int px = 0; px < npins; ++px) {
-                        if (!first_col) csv << ',';
-                        first_col = false;
-                        if (la < 0 || la >= nxya) continue;
-                        const int    pi  = py * npins + px;
-                        const double val = zavg[static_cast<size_t>(la) * npina + pi];
-                        if (!std::isnan(val)) csv << val;
-                    }
-                }
-                csv << '\n';
-            }
-        }
-        csv << '\n';
-
-        for (int k = kbc; k < kec; ++k) {
-            const size_t src = static_cast<size_t>(k) * nxya * npina;
-            csv << std::format("Pin Power k={} (hz={:.4f}) -- Step {} (EFPD={:.2f})\n",
-                               k, g.hz(k), d.step, d.efpd);
-            for (int ja = 0; ja < nya; ++ja) {
-                for (int py = 0; py < npins; ++py) {
-                    bool first_col = true;
-                    for (int ia = 0; ia < nxa; ++ia) {
-                        const int la = g.ijtola(ia, ja);
-                        for (int px = 0; px < npins; ++px) {
-                            if (!first_col) csv << ',';
-                            first_col = false;
-                            if (la < 0 || la >= nxya) continue;
-                            const int    pi  = py * npins + px;
-                            const double val = pin_data[src + static_cast<size_t>(la) * npina + pi];
-                            if (!std::isnan(val)) csv << val;
-                        }
-                    }
-                    csv << '\n';
-                }
-            }
-            csv << '\n';
+        if (iowriter::resultAsyncEnabled()) {
+            const std::size_t csv_bytes = csv_record.bytes();
+            rec.pushSideTask(
+                [record = std::move(csv_record)]() { record.Emit(); }, csv_bytes);
+        } else {
+            csv_record.Emit();
         }
     }
 

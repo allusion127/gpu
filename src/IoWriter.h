@@ -173,6 +173,54 @@ inline std::size_t queueByteLimit() {
 }
 
 // ---------------------------------------------------------------------------
+// WP12: the result-serialisation gate (RASBERY_RESULT_ASYNC).
+//
+// THE HALF THE WRITER THREAD NEVER TOOK.  Everything above moved the HDF5 write
+// off the solver thread, and it did.  What it did not move is the OTHER file
+// the result path produces: IO::WriteStepToResult formats the pin-power CSV --
+// ~119 MB per `--result full` case (Driver.h's own figure for what `pin-off`
+// drops) -- with `ostream <<`, one double at a time, on the solver thread,
+// inside the PH_RESULT_WRITE scope.  That is not an HDF5 call, so no amount of
+// writer-thread adoption touched it, and on the v4 candidate single run it is
+// essentially all of io_wall (2.89 s of 14.56 s).
+//
+// THE GATE MOVES THAT SERIALISATION, NOT THE OUTPUT.  With it on, the statepoint
+// records a SIDE TASK into its own batch: a closure over a by-value snapshot of
+// the numbers the CSV is made of (pin powers, hz, the assembly index map, the
+// step scalars).  The writer thread runs it -- before the batch's HDF5 ops and
+// OUTSIDE Chiffon::Hdf5Guard, because a std::ofstream has no business holding
+// the HDF5 lock for the length of a 15 MB text format -- while the solver is
+// already on the next statepoint.  The bytes are produced by the same code in
+// the same order from the same values, so the file is byte-identical; only the
+// thread and the moment differ.
+//
+//   RASBERY_RESULT_ASYNC unset/0  -> sync   (default; the pre-WP12 path)
+//   RASBERY_RESULT_ASYNC=1        -> async  (needs the writer thread)
+//
+// Feature-off is not a second code path: the snapshot is never built, the task
+// is never formed, and the emitter runs inline exactly where it used to.
+// ---------------------------------------------------------------------------
+inline bool resultAsyncRequested() {
+    static const bool requested = [] {
+        const char* value = std::getenv("RASBERY_RESULT_ASYNC");
+        if (value == nullptr || *value == '\0') return false;
+        std::string v(value);
+        std::transform(v.begin(), v.end(), v.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return v == "1" || v == "true" || v == "on" || v == "yes";
+    }();
+    return requested;
+}
+
+/// Async is reachable only on the writer thread.  Under
+/// `RASBERY_IO_WRITER=inline` there is no other thread to hand a task to, and
+/// spawning one here would be a thread the goldens were never frozen on -- so
+/// the request degrades to sync and the receipt says `sync`.
+inline bool resultAsyncEnabled() { return resultAsyncRequested() && mode() == Mode::Thread; }
+
+inline const char* resultIoModeName() { return resultAsyncEnabled() ? "async" : "sync"; }
+
+// ---------------------------------------------------------------------------
 // Receipt counters.  Same shape as HostPinCounters: plain atomics, published
 // once at teardown, never read on a hot path.
 // ---------------------------------------------------------------------------
@@ -193,6 +241,22 @@ struct Counters {
 
 inline Counters& counters() {
     static Counters c;
+    return c;
+}
+
+/// WP12 result-I/O counters.  Deliberately NOT folded into Counters: those
+/// describe the HDF5 queue, these describe one serialisation whose cost exists
+/// in both modes.  `writer_ns` is measured around the emitter wherever it runs,
+/// so `sync` and `async` report the same quantity on different threads and the
+/// A/B is a subtraction rather than a comparison of two different numbers.
+struct ResultIoCounters {
+    std::atomic<std::uint64_t> records{0};    ///< result records serialised
+    std::atomic<std::uint64_t> bytes{0};      ///< bytes those records appended to disk
+    std::atomic<std::uint64_t> writer_ns{0};  ///< time inside the emitter, wherever it ran
+};
+
+inline ResultIoCounters& resultIoCounters() {
+    static ResultIoCounters c;
     return c;
 }
 
@@ -260,6 +324,10 @@ inline HighFive::File& fileOf(ReplayCtx& ctx) {
 struct Batch {
     std::shared_ptr<FileSession> session;
     std::vector<Op>              ops;
+    /// WP12 side tasks: work that belongs to this statepoint's output but is
+    /// NOT HDF5 (the pin-power CSV).  Held apart from `ops` because they take
+    /// no ReplayCtx, need no handle slot, and must run outside Hdf5Guard.
+    std::vector<std::function<void()>> tasks;
     std::size_t                  bytes = 0;
     /// True for the batch that carries the file's open op.  Every other batch
     /// requires the file to be open already, and says so before it touches it.
@@ -284,6 +352,24 @@ inline void poison(FileSession& session, const std::string& what) {
 /// Group/DataSet destructors re-enter the runtime too.
 inline void replay(Batch& batch) {
     const auto started = std::chrono::steady_clock::now();
+
+    // WP12 side tasks FIRST, and OUTSIDE the guard.  They write a different
+    // file through a plain std::ofstream, so holding the process-global HDF5
+    // lock across their (long) formatting would hand back to the other 63 decks
+    // exactly the serialisation this file exists to remove.  Ordering against
+    // the HDF5 ops is free: they are different files.  Ordering among
+    // THEMSELVES is what matters (the CSV is appended per statepoint) and it is
+    // the queue's FIFO, which one Driver thread fed in program order.
+    if (!batch.tasks.empty()) {
+        try {
+            for (std::function<void()>& task : batch.tasks) task();
+        } catch (const std::exception& error) {
+            poison(*batch.session, std::string("result side task: ") + error.what());
+        } catch (...) {
+            poison(*batch.session, "result side task: unknown exception");
+        }
+        batch.tasks.clear();
+    }
 
     // A POISONED SESSION IS ABSORBING.  Once a file's open -- or any earlier
     // batch for it -- has failed, every later batch is SKIPPED rather than
@@ -662,7 +748,7 @@ public:
     }
 
     void submit() {
-        if (_inline || _batch.ops.empty()) {
+        if (_inline || (_batch.ops.empty() && _batch.tasks.empty())) {
             resetBatch();
             return;
         }
@@ -693,6 +779,20 @@ public:
     template <class F>
     void push(F&& op, std::size_t bytes = 0) {
         _batch.ops.emplace_back(std::forward<F>(op));
+        _batch.bytes += bytes;
+    }
+    /// WP12.  Hand the writer thread a piece of non-HDF5 serialisation for this
+    /// batch.  `task` MUST own everything it touches -- it runs after the
+    /// solver has moved on, so a reference to Geometry, XSSet, Schedule or any
+    /// IO member is a data race by construction.  In inline mode there is no
+    /// other thread, so it runs here and now, which is the pre-WP12 call.
+    template <class F>
+    void pushSideTask(F&& task, std::size_t bytes = 0) {
+        if (_inline) {
+            task();
+            return;
+        }
+        _batch.tasks.emplace_back(std::forward<F>(task));
         _batch.bytes += bytes;
     }
     int nextGroupSlot() { return _group_slots++; }
@@ -857,6 +957,21 @@ inline void reportSummary(std::ostream& os) {
        << ",\"writer_busy_ms\":" << static_cast<double>(c.writer_ns.load()) / 1.0e6
        << ",\"failures\":" << c.failures.load()
        << ",\"skipped\":" << c.skipped.load() << "}" << std::endl;
+}
+
+/// WP12 receipt.  `solver_blocked_ms` and `queue_max_depth` are read from the
+/// writer queue's own counters rather than kept twice: a result record rides the
+/// same bounded queue as the HDF5 batches, so the time a solver spent waiting
+/// for room and the high-water depth ARE those numbers -- a second pair would
+/// only be a second chance to disagree.
+inline void reportResultIo(std::ostream& os) {
+    const ResultIoCounters& r = resultIoCounters();
+    os << "[RASBERY][RESULT_IO] {\"mode\":\"" << resultIoModeName()
+       << "\",\"records\":" << r.records.load()
+       << ",\"bytes\":" << r.bytes.load()
+       << ",\"writer_wall_ms\":" << static_cast<double>(r.writer_ns.load()) / 1.0e6
+       << ",\"solver_blocked_ms\":" << static_cast<double>(counters().block_ns.load()) / 1.0e6
+       << ",\"queue_max_depth\":" << counters().max_depth.load() << "}" << std::endl;
 }
 
 /// Drain the queue, join the writer, flush the line sink.  Called explicitly
