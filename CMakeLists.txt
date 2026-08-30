@@ -61,6 +61,7 @@ if (RASBERY_ENABLE_CUDA)
             "${CMAKE_CURRENT_SOURCE_DIR}/src/GpuPhysicsBackendStub.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaPprBackendStub.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaCramBackendStub.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaHostScheduleStub.cpp"
     )
     list(APPEND RASBERY_SOURCES
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaBICGBackend.cu"
@@ -71,6 +72,10 @@ if (RASBERY_ENABLE_CUDA)
             "${CMAKE_CURRENT_SOURCE_DIR}/src/GpuPhysicsBackendCuda.cu"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaPprBackend.cu"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaCramBackend.cu"
+            # WP16 host-spin.  One cudaSetDeviceFlags, no kernels, no bit-exact
+            # flags to scope: this TU must create nothing, because it runs before
+            # the primary context exists (src/CudaHostSchedule.h).
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaHostSchedule.cu"
     )
     # Task 9 composes the Task 4/5 phase kernels, whose contract is bit-identical
     # reproduction of the host loops: nvcc must not contract a*b+c into an fma

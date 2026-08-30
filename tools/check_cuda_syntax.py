@@ -76,6 +76,19 @@ inline cudaError_t cudaStreamDestroy(cudaStream_t) { return cudaSuccess; }
 inline cudaError_t cudaStreamSynchronize(cudaStream_t) { return cudaSuccess; }
 inline cudaError_t cudaGetDevice(int* d) { *d = 0; return cudaSuccess; }
 inline cudaError_t cudaSetDevice(int) { return cudaSuccess; }
+inline cudaError_t cudaSetDeviceFlags(unsigned) { return cudaSuccess; }
+inline cudaError_t cudaGetDeviceFlags(unsigned* f) { *f = 0; return cudaSuccess; }
+inline const char* cudaGetErrorName(cudaError_t) { return ""; }
+// WP16 host-spin (src/CudaHostSchedule.cu).  The four schedule bits and their
+// mask, with the toolkit's values, so the switch over them type-checks AND
+// keeps its four distinct cases here the way nvcc will see them.
+enum : unsigned {
+    cudaDeviceScheduleAuto         = 0x00u,
+    cudaDeviceScheduleSpin         = 0x01u,
+    cudaDeviceScheduleYield        = 0x02u,
+    cudaDeviceScheduleBlockingSync = 0x04u,
+    cudaDeviceScheduleMask         = 0x07u,
+};
 
 struct CUevent_st;
 using cudaEvent_t = CUevent_st*;

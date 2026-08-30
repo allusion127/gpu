@@ -89,6 +89,38 @@ from run_single_gpu_batch import (  # noqa: E402
 )
 from exact_audit import DECLARABLE_FIDELITIES, receipt_policy  # noqa: E402
 
+# WP16 host-spin: TWO KNOBS THAT ARE DELIBERATELY NOT IN DEFAULT_ENV.
+#
+#   RASBERY_CUDA_SYNC_MODE = auto | spin | yield | blocking
+#       How the host thread waits inside cudaStreamSynchronize.  CUDA's default
+#       (`auto`) SPINS while the number of contexts is below the core count,
+#       which is exactly the 8-process-on-24-CPU shape the 238 batch runs, and
+#       is why that batch shows ~79 % host CPU while ~92 % of process time is
+#       inside a synchronise.  `blocking` parks the thread instead, giving the
+#       core back at the cost of a wake-up latency per fence.
+#       Applied by src/CudaHostSchedule.cu, before the CUDA context exists.
+#
+#   RASBERY_OMP_WAIT = active | passive
+#       Pass-through to OMP_WAIT_POLICY (and GOMP_SPINCOUNT=0 for passive),
+#       exported by src/main.cpp's OpenMP re-exec so libgomp sees it in the
+#       second image.  DEFAULT_ENV already states PASSIVE/0 directly, so this
+#       is how the ACTIVE arm is taken without editing the harness default.
+#
+# NEITHER BELONGS IN DEFAULT_ENV.  DEFAULT_ENV is the 238 reference line, key
+# for key (test/reference/batch_reference_env_238.json), and the reference sets
+# neither; adding a key the reference never had is exactly the silent deviation
+# RASBERY_PPR_MODE=master was.  Both are ordinary `--set KEY=VALUE` overrides:
+# `--set` is `action="append"` and parse_overrides() accepts any [A-Za-z0-9_]
+# key, so no per-key plumbing exists or is needed, and every resolved value is
+# already printed per process in the [RASBERY][MULTI_GPU][ENV] receipt.
+#
+#   ... --mps --procs-per-gpu 8 --batch-width 8 #       --set RASBERY_CUDA_SYNC_MODE=blocking --set RASBERY_OMP_WAIT=passive
+#
+# The child's own [RASBERY][CUDA][SCHED] receipt is what closes the loop: it
+# reports what was requested AND what the driver actually applied, so an arm
+# that asked too late (a context already created -> cudaErrorSetOnActiveProcess)
+# is not silently tabulated as a `blocking` row.
+
 REFILL_RECEIPT = re.compile(r"\[RASBERY\]\[REFILL\]\s*(\{.*\})")
 OCCUPANCY_RECEIPT = re.compile(r"\[RASBERY\]\[CUDA\]\[BATCH_OCCUPANCY\]\s*(\{.*\})")
 FAIL_LINE = re.compile(r"\[RASBERY\]\[FAIL\]")
@@ -2336,7 +2368,15 @@ def parser() -> argparse.ArgumentParser:
         "restart namespace are relative to the deck directory, so a manifest of "
         "relative inputs needs this; absolute manifests do not",
     )
-    p.add_argument("--set", dest="set_values", action="append", default=[], metavar="KEY=VALUE")
+    p.add_argument(
+        "--set", dest="set_values", action="append", default=[], metavar="KEY=VALUE",
+        help="export one key into every child's environment, on top of DEFAULT_ENV. "
+             "Repeatable, and any key is accepted -- this is how the WP16 host-wait "
+             "arms are taken (--set RASBERY_CUDA_SYNC_MODE=auto|spin|yield|blocking, "
+             "--set RASBERY_OMP_WAIT=active|passive), neither of which is a "
+             "DEFAULT_ENV key because the 238 reference line sets neither. Every "
+             "resolved value is printed per process in [RASBERY][MULTI_GPU][ENV]",
+    )
     p.add_argument(
         "--fidelity", "--expect-fidelity", dest="fidelity",
         choices=DECLARABLE_FIDELITIES,

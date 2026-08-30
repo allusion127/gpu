@@ -4,6 +4,7 @@
 
 #include "BatchRefill.h"
 #include "CaseFidelity.h"
+#include "CudaHostSchedule.h"
 #include "CudaXsReconBackend.h"
 #include "Driver.h"
 #include "EvaluatorServer.h"
@@ -112,6 +113,29 @@ void rasberySetEnv(const char* key, const char* value, bool overwrite = false) {
 #else
     setenv(key, value, overwrite ? 1 : 0);
 #endif
+}
+
+/// ASCII lowercase, for the env knobs whose values are words rather than paths.
+std::string rasberyLowerAscii(const char* value) {
+    std::string lowered = (value != nullptr) ? value : "";
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return lowered;
+}
+
+/// WP16 host-spin.  `RASBERY_OMP_WAIT = active | passive`, resolved to one of
+/// "active" / "passive" / "" (unset or unrecognised, i.e. the default).
+///
+/// Unrecognised is deliberately the DEFAULT and not an error: this is read
+/// before plog exists, in an image that is about to replace itself, and a typo
+/// that aborted a 1,280-deck wave at startup would be a worse failure than a
+/// row that the [CUDA][SCHED] receipt marks `omp_wait_source:"invalid"`.
+std::string rasberyResolvedOmpWait() {
+    const char* raw = std::getenv("RASBERY_OMP_WAIT");
+    if (raw == nullptr || *raw == '\0') return {};
+    const std::string wait = rasberyLowerAscii(raw);
+    if (wait == "active" || wait == "passive") return wait;
+    return {};
 }
 
 bool rasberySetEnvIfNeeded(const char* key, const char* value, bool overwrite = false) {
@@ -303,9 +327,36 @@ void rasberyPrepareOpenMPStartup(char* argv[]) {
             rasberySetEnv("RASBERY_STARTUP_CPUS", std::to_string(startup_cpus).c_str(), true);
     }
 
-    bool changed = false;
-    changed |= rasberySetEnvIfNeeded("OMP_WAIT_POLICY", "PASSIVE");
-    changed |= rasberySetEnvIfNeeded("GOMP_SPINCOUNT", "0");
+    // WP16 host-spin.  THIS IS THE HOOK, and it has to be here rather than
+    // anywhere later: libgomp reads OMP_WAIT_POLICY / GOMP_SPINCOUNT in a
+    // library constructor, before main() is entered, so the only way to change
+    // them for the RUNNING OpenMP runtime is to change them for a process that
+    // has not started one yet -- which is what the execvp below is for.  An
+    // operator's `--set RASBERY_OMP_WAIT=active` therefore reaches libgomp in
+    // the SECOND image, and `changed` is what decides that there is one.
+    //
+    // The unset arm is byte for byte what it was before this knob existed:
+    // PASSIVE / 0, non-overwriting, so an operator-exported policy still wins.
+    bool              changed   = false;
+    const std::string omp_wait  = rasberyResolvedOmpWait();
+    if (omp_wait == "active") {
+        changed |= rasberySetEnvIfNeeded("OMP_WAIT_POLICY", "ACTIVE", true);
+        // GOMP_SPINCOUNT=0 would make ACTIVE a lie -- libgomp's spin count
+        // beats the policy word, and 0 is "do not spin".  Removing the key is
+        // not the same as setting a big number: with the key absent and the
+        // policy ACTIVE, libgomp spins indefinitely, which is the arm this
+        // knob exists to measure against PASSIVE.
+        if (std::getenv("GOMP_SPINCOUNT") != nullptr) {
+            unsetenv("GOMP_SPINCOUNT");
+            changed = true;
+        }
+    } else if (omp_wait == "passive") {
+        changed |= rasberySetEnvIfNeeded("OMP_WAIT_POLICY", "PASSIVE", true);
+        changed |= rasberySetEnvIfNeeded("GOMP_SPINCOUNT", "0", true);
+    } else {
+        changed |= rasberySetEnvIfNeeded("OMP_WAIT_POLICY", "PASSIVE");
+        changed |= rasberySetEnvIfNeeded("GOMP_SPINCOUNT", "0");
+    }
     changed |= rasberySetEnvIfNeeded("OMP_NUM_THREADS", "8", true);
     changed |= rasberySetEnvIfNeeded("OMP_PROC_BIND", "TRUE", true);
     changed |= rasberySetEnvIfNeeded("OMP_PLACES", "cores", true);
@@ -326,8 +377,20 @@ void rasberyPrepareOpenMPStartup(char* argv[]) {
         execvp(argv[0], argv);
     }
 #else
-    rasberySetEnv("OMP_WAIT_POLICY", "PASSIVE");
-    rasberySetEnv("GOMP_SPINCOUNT", "0");
+    // No execvp here (and none needed: MSVC's OpenMP is not libgomp), but the
+    // same three arms, so a Windows developer reading a receipt sees the same
+    // words the 238 host prints.
+    const std::string omp_wait = rasberyResolvedOmpWait();
+    if (omp_wait == "active") {
+        rasberySetEnv("OMP_WAIT_POLICY", "ACTIVE", true);
+        rasberySetEnv("GOMP_SPINCOUNT", "", true); // _putenv_s with "" deletes
+    } else if (omp_wait == "passive") {
+        rasberySetEnv("OMP_WAIT_POLICY", "PASSIVE", true);
+        rasberySetEnv("GOMP_SPINCOUNT", "0", true);
+    } else {
+        rasberySetEnv("OMP_WAIT_POLICY", "PASSIVE");
+        rasberySetEnv("GOMP_SPINCOUNT", "0");
+    }
     rasberySetEnv("OMP_NUM_THREADS", "8", true);
     rasberySetEnv("OMP_PROC_BIND", "TRUE", true);
     rasberySetEnv("OMP_PLACES", "cores", true);
@@ -340,6 +403,54 @@ int main(int argc, char* argv[]) {
     namespace fs = std::filesystem;
 
     rasberyPrepareOpenMPStartup(argv);
+
+    // WP16 host-spin.  THE FIRST STATEMENT AFTER THE RE-EXEC, and that is the
+    // contract, not a preference.  cudaSetDeviceFlags is only honoured while
+    // this process has no CUDA context, nothing in this tree calls
+    // cudaSetDevice explicitly, and the context is therefore created lazily by
+    // whichever backend's first runtime call wins the race during Drive().  So
+    // "before the first CUDA context creation" has exactly one provable
+    // location: here, above everything (src/CudaHostSchedule.h).  Reordering
+    // this below any backend stand-up silently turns the knob into a no-op
+    // that still prints a receipt -- which is why the contract test
+    // (tools/test_cuda_sched_contract.py) checks the ORDER and not the call.
+    //
+    // B0: the schedule decides how a thread waits for a fence, not what the
+    // fence guards.  No operand, no launch order, no stream is touched.
+    const rasbery::CudaHostScheduleReceipt cuda_sched = rasbery::ApplyCudaHostSchedule();
+    {
+        // One line for both host-wait knobs, because they are one experiment:
+        // the CPU that cudaStreamSynchronize burns and the CPU that libgomp's
+        // barriers burn are the same 24 cores, and a row that names only one of
+        // them cannot be compared with a row that names only the other.
+        //
+        // The OMP fields are read back from the ENVIRONMENT rather than from
+        // what rasberyPrepareOpenMPStartup() decided, deliberately: after the
+        // re-exec this image did not decide anything, and what libgomp actually
+        // saw is what is in the environment now.
+        const char*       raw_wait  = std::getenv("RASBERY_OMP_WAIT");
+        const std::string omp_wait  = rasberyLowerAscii(raw_wait);
+        const char*       policy    = std::getenv("OMP_WAIT_POLICY");
+        const char*       spincount = std::getenv("GOMP_SPINCOUNT");
+        const char*       wait_source =
+            (raw_wait == nullptr || *raw_wait == '\0') ? "default"
+            : (omp_wait == "active" || omp_wait == "passive") ? "env"
+                                                              : "invalid";
+        std::cout << "[RASBERY][CUDA][SCHED] {\"mode\":\"" << cuda_sched.mode
+                  << "\",\"source\":\"" << cuda_sched.source
+                  << "\",\"requested\":\"" << cuda_sched.requested
+                  << "\",\"applied\":\"" << cuda_sched.applied
+                  << "\",\"rc\":\"" << cuda_sched.rc
+                  << "\",\"omp_wait\":\"" << (omp_wait.empty() ? "unset" : omp_wait)
+                  << "\",\"omp_wait_source\":\"" << wait_source
+                  << "\",\"omp_wait_policy\":\"" << (policy != nullptr ? policy : "unset")
+                  << "\",\"gomp_spincount\":\""
+                  << (spincount != nullptr ? spincount : "unset") << "\"";
+        if (!cuda_sched.note.empty())
+            std::cout << ",\"note\":\"" << cuda_sched.note << "\"";
+        std::cout << "}" << std::endl;
+    }
+
     // Process cost ledger (GA evaluator plan Sec 2.2, Task C).  A persistent
     // evaluator amortises everything measured here over the whole population;
     // today every case pays all of it.
