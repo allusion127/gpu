@@ -1,6 +1,6 @@
 # GPU RASBERY 가속 캠페인 — 문서 색인
 
-**브랜치** `codex/exact-throughput-campaign` · **최신 팁** `c502856`
+**브랜치** `codex/exact-throughput-campaign` · **최신 팁** `91004f7`
 **대상** APR1400/KNGR CY1 PSAR 1주기(`kngr_238.json`, 35상태 자연 EOC, 1/4 노심 8,451 노드, NG=2)
 **기준기** MASTER (CPU) — 단일 27.2 s / W16 배치 217 case/h
 
@@ -19,9 +19,12 @@
 | 지금 무엇을 어떤 env로 돌려야 하는가 | [`V3_FREEZE_20260829_KO.md`](V3_FREEZE_20260829_KO.md) §2 |
 | 답이 맞는지 어떻게 아는가 | 종합 보고 §5 + [`MASTER_vs_RASBERY_COMPARISON_20260824_KO.md`](MASTER_vs_RASBERY_COMPARISON_20260824_KO.md) |
 
-**한 줄 현황**: 단일덱 **16.9 s = MASTER 1.61×** (v2 55.4 s에서 3.28×), 배치 M64
-**518–534 c/h** (scalar-only 577.6 = MASTER W16 **2.66×**), 정확도는 v2 대비 **비열화**
-(반응도 1.847 pcm / CBC 15.334 ppm / AO 0.012 / BOC 핀 RMS 0.238 %).
+**한 줄 현황**: 단일덱 **14.63 s = MASTER 27.2 s 대비 1.86×** — 238 PROD env 실측
+후보 arm(`CRAM=1` + `CMFD_FUSE=15` + `PPR=1`, 2026-08-30, `91004f7`), 같은 커밋
+기준선 16.585 s에서 −1.954 s(−11.8 %). 동결된 v3 기준선은 여전히 **16.77 s = 1.62×**이다.
+배치는 **878 c/h = MASTER W16 217 c/h 대비 4.04×**(8×M8+MPS, WP4 실측 — **이번 패스에서
+재측정하지 않았다**). 정확도는 v2 대비 **비열화**(반응도 1.847 pcm / CBC 15.334 ppm /
+AO 0.012 / BOC 핀 RMS 0.238 %). → **[`PRICING_PROD_20260830_KO.md`](PRICING_PROD_20260830_KO.md)**
 
 ---
 
@@ -39,6 +42,7 @@
 
 | 문서 | 줄 | 판정 |
 |---|---:|---|
+| **[`PRICING_PROD_20260830_KO.md`](PRICING_PROD_20260830_KO.md)** | — | **238 PROD env 가격 평가(2026-08-30)**: PPR(WP6-F)·CRAM(Task 16)·FUSE(WP7-B)·XE_TXN(WP7-C) 기능별 등급·게이트·채택 판정, 스택 **14.631 s = 1.86×**, v4 후보 env, 폐기된 수(arm-X env 아티팩트 · 181에서 채굴된 `0xadd` pin), 다음 병목 후보, 교훈 |
 | **[`GPU_RASBERY_PERFORMANCE_AND_ARCHITECTURE_REPORT_20260830_KO.md`](GPU_RASBERY_PERFORMANCE_AND_ARCHITECTURE_REPORT_20260830_KO.md)** | 1,080 | **본 캠페인 종합**: 단계별 성능 사다리, nsys 커널/API/osrt 표, 케이스 비용 모델, 병목 원장, 게이트 체계, 결함 19건, 상한, 재현 명령 |
 | [`V3_FREEZE_20260829_KO.md`](V3_FREEZE_20260829_KO.md) | 307 | **v3 생산 arm 정의**, 구성요소별 게이트 등급, 계기 중립성, 동결 절차·롤백 |
 | [`A2_OUTER_REDUCTION_20260829_KO.md`](A2_OUTER_REDUCTION_20260829_KO.md) | 291 | **A2 = 최대 단일 레버.** 승수 스캔 14 arm, outer −61.6 %, Task 13a **NO-GO**, Gate B 프로토콜 |

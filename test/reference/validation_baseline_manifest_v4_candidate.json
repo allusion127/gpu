@@ -1,0 +1,131 @@
+{
+  "schema_version": 4,
+  "frozen": false,
+  "frozen_utc": "NOT_FROZEN_V4_CANDIDATE",
+  "supersedes": "validation_baseline_manifest_v3.json",
+  "status": "CANDIDATE, NOT A BASELINE. This file records the 238 PROD pricing measurement of 2026-08-30 (docs/PRICING_PROD_20260830_KO.md, source report pricing_388e8f2.md blocks 0-8 + 2b/3b/4b/5b/5c) as the proposed v4 arm. It is NOT the outcome of a v4 freeze run: no freeze protocol was executed, the 181 cross-gate is outstanding for three of the five added knobs, and the full v4 env below has never been measured as a single arm (see measured_arm_note). Nothing here gates anything.",
+  "frozen_field_note": "MACHINE-CHECKABLE GUARD. Any consumer of this file must refuse it while \"frozen\" is false - and this file is designed to stay false until a real v4 freeze run replaces it. The candidate exists so that the measured numbers have one canonical home before the freeze, not so that a gate can quote them.",
+  "why_v4": "v3 froze the production arm as it stood: outer body on the device, chunked Wielandt fold, device Xe Anderson, A2 staged tolerance. v4 adds the four features priced on 238 on 2026-08-30 - GPU CRAM depletion (N1, the only one that moves the trajectory), CMFD kernel fusion mask 15 (B0), the GPU PPR device loop now that master mode reaches the device (B0 outside pin-derived datasets), and the Xe transaction arm (B0, established by forms audit rather than inferred). Only CRAM changes what the code converges to; the other three are bit-identical riders and were shown to stack without moving the trajectory further.",
+  "baseline_commit_sha": "91004f7",
+  "baseline_commit_note": "fix(WP6-F): the mode the campaign actually runs was the one the arm refused. This commit is REQUIRED for the PPR row: every earlier commit refuses the device PPR loop under RASBERY_PPR_MODE=master at src/PPR.cpp:79 and reports host_fallbacks:35/35.",
+  "branch": "codex/exact-throughput-campaign",
+  "compiler": "gcc13 host compiler (238 toolchain; the exact g++ path and version are recorded by the freeze run, not by this candidate)",
+  "cuda_compiler": "nvcc 13.0 (238; exact path recorded at freeze)",
+  "release_flags": "Release, RASBERY_ENABLE_CUDA=ON, CMAKE_CUDA_ARCHITECTURES=120, HDF5_ROOT=codex/tools/gcc13 - same flags as the build_388e8f2 / build_926497d trees. The per-TU --fmad=false on CudaXsReconBackend.cu must be re-verified through compile_commands.json at freeze, exactly as v2 and v3 require.",
+  "gpu": {
+    "model": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "uuid": "TBD_V4_FREEZE",
+    "driver": "TBD_V4_FREEZE",
+    "cuda_runtime": "TBD_V4_FREEZE",
+    "host": "238 GPU0"
+  },
+  "benchmark_input": {
+    "deck": "kngr_238.json (APR1400/KNGR CY1 PSAR, 35-state natural EOC, quarter core 8451 nodes NG=2)",
+    "input_sha256": "ac6a28bae361dcd072abb742c1610bd05c03337b7a8a114cee488550231b51c7",
+    "env": "RASBERY_PPR_MODE=master RASBERY_PC_MODE=decart RASBERY_GPU=1 RASBERY_GPU_CMFD_SWEEP=1 RASBERY_GPU_CMFD_RESIDENT_SINGLE=1 RASBERY_GPU_NODAL=1 RASBERY_GPU_NODAL_FULL=1 RASBERY_GPU_XSRECON=1 RASBERY_GPU_FLATXS=1 RASBERY_GPU_OUTER=1 RASBERY_GPU_OUTER_SEGMENT_MAX=8 RASBERY_GPU_WIEL_FOLD=chunked RASBERY_GPU_XE=1 RASBERY_STAGED_FLUX_TOL=50 RASBERY_STAGED_XE_TOL=1000 RASBERY_STAGED_LOOSE_SETTLE=1 RASBERY_OMP_THREADS=12 RASBERY_GPU_CRAM=1 RASBERY_GPU_CMFD_FUSE=15 RASBERY_GPU_PPR=1 RASBERY_GPU_PPR_GRAPH=1 RASBERY_GPU_XE_TXN=1",
+    "env_note": "v3's env verbatim plus five knobs. RASBERY_XE_ANDERSON stays DELIBERATELY ABSENT (single-deck default ON) and RASBERY_STATEPOINT_TELEMETRY stays absent from the timing repeats, exactly as in v3. RASBERY_XE_FORMS is DELIBERATELY ABSENT and must stay so: the value 0xadd that reproduced B0 on host 181 was mined on 181, and pinning it on 238 overrides 238's own correctly-mined shipped bits and moves the trajectory to 4374 outers even with the TXN feature off. Every run must start from env -i and print [RASBERY][TRAJECTORY] so its arm is provable from its own log.",
+    "env_measurement_rule": "A wall or digest measured outside this env is not a measurement of this arm. The 2026-08-30 pass produced a whole block of 'PPR is expensive' numbers (23.98 s / 4566 outers / digest 22b9a3187bfb4beb) whose only cause was a shell missing RASBERY_PC_MODE, RASBERY_PPR_MODE and RASBERY_OMP_THREADS."
+  },
+  "arm_components": {
+    "note": "v3's five rows are carried forward unchanged and are not restated here; see validation_baseline_manifest_v3.json. Below are only the rows v4 ADDS, each with its gate class, the single env that turns it off, and its 238 evidence. Rollback is per row and needs no rebuild.",
+    "gpu_cram_depletion": {
+      "env": "RASBERY_GPU_CRAM=1",
+      "gate_class": "N1 (trajectory-moving by design)",
+      "claim": "the Bateman depletion predictor/corrector runs on the device; the isotope inventory it writes is read by the next statepoint, so keff / critical boron / AO move from the first statepoint onward. This is the one component of v4 that changes the answer, and it is why v4's digest and outer count differ from v3's.",
+      "extra_gate": "[RASBERY][CRAM_GPU].host_fallbacks == 0 (the device path must actually engage; a fail-open run prices nothing), statepoints == predictor_calls == corrector_calls",
+      "evidence": "238 2026-08-30 block 3 + 3b: off 16.729 s / 0d15abf29d222a02 / 4382 vs on 16.043 s / 1f36e75dc00ed2b4 / 4377 (-0.686 s). h5diff 419 differences (summary tm_avg/tm_max/tf_max/xe_ao/xe_avg, 34 each, plus others). Gate A max|dkeff| 0.0653 pcm / max|dppm| 0.0038 / max|dAO| 0.0001 / max pin rel 0.0211 pct - all inside the A2 screen. Gate B 15.334 ppm / 1.847 pcm / 0.012 AO / pin 0.238 pct / 0.80 pct. Determinism h5diff 0 across three hot replicates. Receipt: gs_iters_mean 2.384, micx_h2d_mb 1367.9 (run total over 34 statepoints, ~40.2 MB/statepoint), bos_reuse 34.",
+      "cross_gate_181": "PENDING. 181 at 8919331 passed G0 (kPredictor/kCorrector REG 68, STACK 5008/5040 B, LOCAL 0), G1 (arm-off identity x2), G2 (on x2 byte-identical, host_fallbacks 0) and G4 (4-deck batch, one CRAM_GPU line per slot, no slot-0 bug). G2's nuclide-density comparator was NOT run (kngr_238.json emits no isotope_density datasets) and G5 (kngr3/CY01/CY02 trimmed decks) was SKIPPED (those decks do not exist on 181)."
+    },
+    "cmfd_kernel_fusion": {
+      "env": "RASBERY_GPU_CMFD_FUSE=15",
+      "gate_class": "B0",
+      "claim": "the four fusible CMFD graph kernels are fused; the arithmetic and its association are unchanged, so every mask is bit-identical to mask 0. The receipt is [RASBERY][CMFD][GRAPH] carrying \"fuse_mask\":N - there is no separate [CMFD][FUSE] line.",
+      "extra_gate": "digest identical across masks {0,1,2,4,8,15}; adoption threshold is median >= 0.2 s below base under warm-up 1 + hot 3, interleaved",
+      "evidence": "238 2026-08-30 block 4 (all six masks digest 0d15abf29d222a02 / 4382) + block 4b interleaved: base 16.724 s, FUSE=4 16.541 s (-0.183, MISSES the 0.2 s threshold), FUSE=15 16.328 s (-0.396, CLEARS it). Mask 15 adopted as the candidate default; mask 4 is not.",
+      "cross_gate_181": "CONFIRMED at 8919331. All six masks digest 1d897e3f77204799, h5diff 0 lines vs mask 0, and the [CMFD][GRAPH] outer/sweep node counts (90/98, 82/90, 86/94, 90/97, 90/98, 78/85) match the 238 census table exactly - the census is config-derived, not host-timing-derived."
+    },
+    "gpu_ppr_device_loop": {
+      "env": "RASBERY_GPU_PPR=1 RASBERY_GPU_PPR_GRAPH=1",
+      "gate_class": "B0 outside pin-derived datasets (pin_power / summary fqp / summary frp are N1, pin-derived only)",
+      "claim": "the PPR Picard loop, its termination test, the canonical borrow and the pin-power reconstruction all run on the device, INCLUDING under RASBERY_PPR_MODE=master, which is the mode production actually runs. The master CPB is Jacobi where the host's is Gauss-Seidel: same diagonally-dominant system, same fixed point, different stopping place, corner flux relative difference ~1e-5.",
+      "extra_gate": "host_fallbacks == 0 AND refusal == \"none\" AND refusals == {} in every ON receipt; iterations != 0 and not at the 200x35 cap; reallocations == 0; Gate B pin RMS must reproduce to printed precision (0.238 pct / 0.80 pct). 0.522 pct / 2.13 pct means the device ran SENM under the master flag and the arm is invalid.",
+      "evidence": "238 2026-08-30 block 7 at 91004f7: OFF 16.885 s (single run) vs ON 15.206 s vs ON+GRAPH 15.024 s (-1.861 s, -11.0 pct), digest 0d15abf29d222a02 / 4382 unchanged in every arm, host_fallbacks 0/35, iterations 766, refusal none, allocations 28 (26 baseline + phic_next/mrel), reallocations 0. h5diff OFF vs ON = 37 differences confined to steps/0028..0035/pin_power + summary/fqp + summary/frp. ON x2 h5diff 0. RECON=1 gives the same 37, recon_repairs 0, pin_materializations 35. RASBERY_GPU_FULL=1 cross-check: all subsystems 0 fallbacks, contract_pass true. All 7 runbook (docs/WP6_PPR_DEVICE_LOOP_20260831_KO.md s10.5) conditions PASS. PPR loop wall_ms 144-149 ms (stream) -> 106-107 ms (graph).",
+      "prior_refusal_note": "Before 91004f7 this arm was worth exactly nothing in production: src/PPR.cpp:79 carried `if (_mode_master) return false;` and every ON arm under the PROD env reported host_fallbacks:35/35 with statepoints:0 and iterations:0, while [GPU_FULL] printed contract_pass:false next to first_violation:null. The refusal had no name, so it survived a whole campaign.",
+      "cross_gate_181": "PENDING. The 181 gate pass is at 8919331, which predates 91004f7 and therefore never exercised the master-mode device path at all."
+    },
+    "xe_transaction": {
+      "env": "RASBERY_GPU_XE_TXN=1",
+      "gate_class": "B0",
+      "claim": "the Anderson accept/reject control moves into two device kernels with a fused history update, cutting host_syncs_per_step from ~3.6 to exactly 1.0 while consuming the identical algebra. The device mask's algebra channel (bits 5..12) is COMPOSED from the host's XE_HOST_FORMS rather than mined, so the two arms provably share the same expressions.",
+      "extra_gate": "forms_audit_mask & XE_ALGEBRA_FORMS (0xfe0) == forms_audit_host_mask == 0xac0 AND forms_audit_mismatch == 0. The audit call site is on the TXN=0 host path (src/XeFormAudit.h), so RASBERY_XE_FORMS_AUDIT=1 must be run with RASBERY_GPU_XE_TXN=0; running it with TXN=1 yields forms_audits:0, a no-op.",
+      "evidence": "238 2026-08-30 blocks 5, 5b, 5c at 91004f7 with NO pin: TXN=0 16.791 s and TXN=1 16.652 s both at digest 0d15abf29d222a02 / 4382, h5diff between them 0 differences, and both byte-identical to the 73f8627 PROD-off run across trees. FORMS resolution: mined 0xd2d, host 0xac0, resolved 0xacd, source build_default_composed (0xd2d & 0x1f) | 0xac0 = 0xacd. forms_audit: 693 audits, 0 mismatches, mask 0xacd, host mask 0xac0, digest/outers unchanged.",
+      "retired_pin_note": "RASBERY_XE_FORMS=0xadd is RETIRED and must never be set on 238. It was composed on host 181 from 181's own mined 0xd3d; 238 mines 0xd2d for the same shipped bits (0xD vs 0x1D in the low 5). Those bits feed the always-on device dot-product / candidate-loop forms, which sit OUTSIDE the TXN feature gate, so the pin moved the trajectory to digest 3ceb8713b5d73f8f / 4374 outers under TXN=0 as well as TXN=1 (410 h5diff differences vs PROD). A mask mined on one machine is not a portable literal.",
+      "cross_gate_181": "PENDING and currently FAILING at 8919331: on 181 the unpinned TXN=0 vs TXN=1 digests differ (1d897e3f77204799 vs 7f32414a742623b9, 854 h5diff lines, 1195 vs 1190 Xe steps), and B0 was only restored there by pinning RASBERY_XE_FORMS=0xadd. 8919331 predates the composition fix d25efe6, so 181 must be re-measured on a tree containing it before this row can be called cross-gated."
+    }
+  },
+  "adopted_defaults": {
+    "unchanged_from_v3": "v4 changes NO code default. All five added knobs are reached through the environment and unset returns the v3 trajectory exactly (0d15abf29d222a02 / 4382), which blocks 1, 5 and 8 confirm by h5diff.",
+    "receipt_fields": "v3's list plus [RASBERY][CRAM_GPU], [RASBERY][PPR_GPU] (schema_version 2, refusal + refusals ladder), [RASBERY][CMFD][GRAPH] (fuse_mask), [RASBERY][XE_GPU] (txn_steps, host_syncs_per_step, d2h_bytes_per_step, forms_audit_*), and [RASBERY][FORMS] (three lines per run - the THIRD is the composed resolution; the first is the pre-composition shipped-only mining result and must not be quoted as the arm)"
+  },
+  "golden_outputs": {
+    "single_deck_h5_sha256": "TBD_V4_FREEZE",
+    "trajectory_digest": "1f36e75dc00ed2b4",
+    "trajectory_digest_note": "Measured on 238 at 91004f7, block 8 arm (c). This is CRAM's own signature: FUSE and PPR ride on top without moving it further, which blocks 4/4b and 7 establish independently. A candidate claiming to reproduce the v4 arm must print this digest.",
+    "repeats": "3 hot, warm-up excluded, interleaved a->b->c x3 (block 8)",
+    "repeat_walls_s": [14.732, 14.631, 14.481],
+    "determinism": "PASS for each component measured separately (CRAM h5diff 0 across three hot replicates, PPR ON x2 h5diff 0 full dataset, FUSE digest-identical across masks). NOT separately re-run for the stacked arm - the v4 freeze must do so.",
+    "dataset_count": "644 (238 tree; the same count the 2026-08-30 h5diff comparisons ran over)",
+    "outers_total": 4377,
+    "outers_note": "v3 arm measures 4382 under the identical env; CRAM's device predictor/corrector accounts for the 5-outer difference. 14.631 s / 4377 outers = ~3.34 ms per outer, which is now the dominant term."
+  },
+  "measured_arm_note": "IMPORTANT - THE FULL v4 ENV HAS NOT BEEN MEASURED AS ONE ARM. The 14.631 s / 1f36e75dc00ed2b4 / 4377 figures come from block 8 arm (c), whose env is PROD + RASBERY_GPU_CRAM=1 + RASBERY_GPU_CMFD_FUSE=15 + RASBERY_GPU_PPR=1. It carries NEITHER RASBERY_GPU_PPR_GRAPH=1 NOR RASBERY_GPU_XE_TXN=1. Those two were priced separately - GRAPH is worth a further -0.18 s on top of plain PPR ON (block 7: 15.206 -> 15.024) and TXN is B0 and wall-neutral (block 5) - so the digest is expected to hold and the wall is expected to improve slightly, but neither has been measured in this combination. Block 9 of the source report was to run exactly this and is marked IN PROGRESS / incomplete. Treat 14.631 s as a floor-bound for the v4 env, not as its measurement.",
+  "instrumentation_neutrality": {
+    "claim": "RASBERY_STATEPOINT_TELEMETRY changes wall time and I/O contention only. It must not change the iteration.",
+    "gate": "tools/test_telemetry_neutrality.py --compare OFF.log TELEMETRY.log on the v4 arm: same env, same digest, telemetry differing",
+    "result_238": "TBD_V4_FREEZE (not exercised in the 2026-08-30 pricing pass)",
+    "result_181_20260830": "PASS at 8919331 for the 181 arm (digest 1d897e3f77204799, statepoints 35, outers 4616 in both; only the telemetry field differs)"
+  },
+  "master_comparison_data_version": "kngr_mas_sum.txt + mas_ppi_{boc,0060..0420} (MASTER 4.0 KNGQ01, campaign 2026-08-22..24); comparator tools/compare_master_rasbery.py",
+  "master_agreement_at_freeze": {
+    "reactivity_pcm": 1.847,
+    "cbc_ppm": 15.334,
+    "ao_abs": 0.012,
+    "boc_pin_rms_pct": 0.238,
+    "boc_pin_max_pct": 0.80,
+    "fqp_abs": 0.071,
+    "frp_abs": 0.017,
+    "measured_on": "238, 2026-08-30, block 3b, CRAM ON at 73f8627 vs MASTER over 33 joined states; the stacked arm (c) of block 8 reproduces the BOC pin figures 0.238 pct / 0.80 pct exactly",
+    "envelope_note": "Identical in magnitude to the v2-baseline-vs-MASTER envelope already on file (15.309 ppm / 1.905 pcm / 0.013 AO / 0.238 pct / 0.80 pct). CRAM does not measurably add to the code's existing disagreement with MASTER. These are CANDIDATE numbers: a v4 freeze run must reproduce them before they become the reference any later Gate B is taken against."
+  },
+  "anderson_health_at_freeze": {
+    "aa_proposed": 693,
+    "aa_accepted": "TBD_V4_FREEZE",
+    "aa_rejected": "TBD_V4_FREEZE",
+    "aa_history_resets": "TBD_V4_FREEZE",
+    "acceptance_rate_pct": "TBD_V4_FREEZE (v2: 95.01; the N1 gate is +-10 pp)",
+    "aa_proposed_source": "[RASBERY][XE_GPU].anderson_proposed from the block 5c forms-audit run (PROD + TXN=0 + RASBERY_XE_FORMS_AUDIT=1, no pin, 91004f7); it equals forms_audits, i.e. every proposed step was audited and none mismatched",
+    "source": "[RASBERY][SPTELEM][SUMMARY] and [RASBERY][XE_GPU] counters; requires RASBERY_STATEPOINT_TELEMETRY=1, which must be run SEPARATELY from the timing repeats (telemetry perturbs I/O contention, not the iteration)"
+  },
+  "throughput_baselines": {
+    "single_deck_wall_s": 14.631,
+    "single_deck_wall_note": "238 GPU0, 91004f7, block 8 arm (c), median of 3 hot with warm-up excluded, interleaved. 27.2 / 14.631 = 1.86x MASTER. Same-commit base arm in the same interleave measured 16.585 s, so the stack is worth -1.954 s (-11.8 pct).",
+    "master_single_deck_wall_s": 27.2,
+    "m64_exact_cases_per_hour": "UNCHANGED FROM THE WP4 MEASUREMENT - 878 c/h at 8x M8 + MPS (docs/W4_L5_MULTIPROC_PER_GPU_20260901_KO.md s4.8), = 4.04x MASTER W16. Batch was NOT re-measured in this pricing pass; every number here is single-deck.",
+    "master_w16_cases_per_hour": 217.0
+  },
+  "cross_gate_181_summary": {
+    "policy": "181 is an exactness-only host: no wall or cases-per-hour figure measured there is a performance claim. Its role is to show that a B0/N1 claim holds on a second machine and a second toolchain.",
+    "pending": ["gpu_cram_depletion", "gpu_ppr_device_loop", "xe_transaction"],
+    "cleared": ["cmfd_kernel_fusion"],
+    "note": "The 181 pass on file is at 8919331 (report gates_8919331.md plus a 73f8627 follow-up section). It predates both d25efe6 (XE_FORMS composition) and 91004f7 (PPR master mode on the device), so two of the three pending rows cannot be judged from it at all and the third (XE_TXN) fails there for a reason the composition fix is expected to close. A v4 freeze must not be taken while these are open."
+  },
+  "open_items": {
+    "cram_bos_residency": "bos_reuse:34 equals the statepoint count: the beginning-of-step micx buffer is re-uploaded every statepoint (~40.2 MB x 34 = 1367.9 MB total) rather than kept resident. Real residency opportunity, not fixed in the measure-only pass.",
+    "outer_loop_dominance": "14.631 s over 4377 outers is ~3.34 ms/outer. With the PPR device loop down to 106 ms, the outer/CMFD loop is what the remaining wall is. Outer-count reduction (A2) and the batch tail are the levers, not further per-kernel work on PPR.",
+    "commit_7cfe3a4_gap": "7cfe3a4 measures 16.373 s against 16.76-16.79 s for 926497d / 388e8f2 / 73f8627 under the identical PROD env. 388e8f2 sits with the later group, so if the ~0.4 s (~2.4 pct) gap is real it isolates to something between 926497d and 7cfe3a4. It is the same size as run-to-run jitter seen throughout the session and no commit shows a >=2 s regression, so this is LOW PRIORITY and did not trigger bisection."
+  },
+  "threshold_file": "validation_thresholds_v3.json",
+  "threshold_file_sha256": "TBD_V4_FREEZE (sha256 of the threshold file in force, recorded in the campaign report at each gate evaluation)",
+  "threshold_file_note": "v4 introduces NO new thresholds and deliberately reuses v3's file. A v4 threshold file, if one is ever needed, is a freeze-time decision.",
+  "v3_retention": "validation_baseline_manifest_v3.json and validation_thresholds_v3.json are kept UNTOUCHED. v3 remains the correct Gate A reference for every run whose env is v3's, which is every run that does not opt in to the five knobs above. Note that v3 itself is still a SKELETON with frozen:false and TBD_V3_FREEZE placeholders: this candidate records what 238 measured, and it does not and cannot promote v3."
+}
