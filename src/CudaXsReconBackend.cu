@@ -597,6 +597,18 @@ std::atomic<unsigned long long> g_nodal_batches{0};        // batches launched
 std::atomic<unsigned long long> g_nodal_batch_drives{0};   // sum of participants
 std::atomic<unsigned long long> g_nodal_batch_graph_launches{0};
 std::atomic<unsigned long long> g_nodal_batch_graph_fallbacks{0};
+/// WP19.2.  ADOPTIONS THAT ENTERED THE LOST-ADOPTION WINDOW.
+///
+/// Bumped by adoptCanonical() when it finds `_views_dirty` ALREADY FALSE and
+/// the entry it is about to overwrite DIFFERENT from the one it is writing --
+/// i.e. the exact interleaving in which an unlocked adoption could be lost: a
+/// sibling lane's refreshViews() had read `_canon[]`, pushed the table and
+/// cleared the flag while this thread's write was still in flight.  Under the
+/// lock added below the adoption can no longer be lost, so this counter
+/// MEASURES how often the window is entered rather than counting corruptions:
+/// a nonzero value on this tree is expected and harmless, and the same nonzero
+/// value on a tree WITHOUT the lock is the defect.
+std::atomic<unsigned long long> g_nodal_adopt_races{0};
 
 // --- Rev.7.1 Task 8 compaction receipt (Sec 9.3) --------------------------
 //
@@ -1551,7 +1563,18 @@ private:
     /// nine constants, the geometry and the XS block stay the arena's own.  That
     /// is what makes the stride question disappear: the canonical pointer is
     /// absolute, so its layout no longer has to match the arena's.
+    /// WP19.2: UNDER `_mutex`, and NOT called with it already held.
+    ///
+    /// The caller is launchBatch(), which drive() invokes only after
+    /// `lock.unlock()` (see the launch claim in drive()), so this is a fresh
+    /// acquisition and not a recursive one on a non-recursive mutex.  What it
+    /// buys: `_canon[]` and `_views_dirty` are read, and the flag cleared, in
+    /// the same critical section a concurrent adoptCanonical() writes them in
+    /// -- so an adoption can no longer land between this loop and the clear and
+    /// be forgotten, and the device view table can no longer be built out of a
+    /// half-written entry.
     bool refreshViews() {
+        std::lock_guard<std::mutex> lock(_mutex);
         if (!_views_dirty) return true;
         for (int m = 0; m < _slots; ++m) {
             ndl::NodalView v = ndl::nodalSlotView(_base, m);
@@ -1586,6 +1609,32 @@ public:
                       << std::endl;
             return;
         }
+        // WP19.2, AND THIS IS THE WHOLE PATCH.  These two writes were the only
+        // touches of `_canon[]`/`_views_dirty` outside `_mutex` in the class.
+        // adoptCanonical runs on a DRIVING thread (XsReconBackend::
+        // adoptCanonicalBuffers and the per-drive forward above) while a
+        // SIBLING lane is inside launchBatch() calling refreshViews() -- a
+        // stand-up-vs-drive race with two faces.
+        //
+        // LOST ADOPTION: refreshViews reads the old `_canon[slot]`, pushes the
+        // table and clears `_views_dirty`, and this thread's `true` is
+        // overwritten by that clear.  The slot keeps the ARENA's own
+        // flux/jnet/phis while the host believes it adopted the canonical ones,
+        // so the nodal kernel and the CMFD side read two different buffers and
+        // the flux goes non-finite with NO CUDA ERROR ANYWHERE -- the silent
+        // face WP19.1 went looking for.
+        //
+        // TORN READ: refreshViews takes `c.flux` from the new set and `c.jnet`
+        // from the old, which is a pointer pair from two different outers --
+        // exactly the partial set the coherence check above refuses when it can
+        // SEE it, reintroduced by concurrency.  A view pointer swapped
+        // mid-read is also a plausible SIGSEGV.
+        std::lock_guard<std::mutex> lock(_mutex);
+        const gpu::CanonicalSlotBuffers& was = _canon[static_cast<std::size_t>(slot)];
+        if (!_views_dirty &&
+            (was.flux != buffers.flux || was.jnet != buffers.jnet ||
+             was.phis != buffers.phis))
+            g_nodal_adopt_races.fetch_add(1, std::memory_order_relaxed);
         _canon[static_cast<std::size_t>(slot)] = buffers;
         _views_dirty                           = true;
     }
@@ -2065,6 +2114,14 @@ struct NodalReceipt {
         }
         comp << "]}";
         std::cout << comp.str() << std::endl;
+
+        // WP19.2.  ITS OWN TAG, not a field on [NODAL][BATCH]: the adoption race
+        // is a correctness receipt and the batch line is a throughput one, and
+        // a soak that greps for the first must not have to parse the second.
+        // Printed unconditionally, so `0` is a statement and not an absence.
+        std::cout << "[RASBERY][NODAL_ARENA] {\"adopt_races_detected\":"
+                  << g_nodal_adopt_races.load(std::memory_order_relaxed)
+                  << ",\"canon_locked\":1}" << std::endl;
 
         const int slots = g_nodal_batch_slots.load(std::memory_order_relaxed);
         if (slots <= 0) return;
