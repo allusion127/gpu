@@ -148,6 +148,22 @@ for key in removed_keys:
           "test/reference/batch_reference_env_238.json under harness_removed -- read it "
           "before re-adding the key")
 
+# The inner solve's budget is the SOLVER's default, not the harness's.
+#
+# RASBERY_BICG_NMAX / RASBERY_BICG_EPS became arm knobs with the A2 S2
+# prerequisite (src/Driver.h trajectory::kArmEnv), which means they now fork the
+# case key.  A harness that quietly exported either one would be measuring a
+# different inner solve from the 238 reference line -- which exports neither, so
+# every stored throughput figure on this branch is a `_nmaxbicg = 3` /
+# `_epsbicg = 0.1` figure (src/BICGCMFD.cpp:74-81).  The S2 sweep passes them
+# with `--set`, deliberately and visibly.
+for key in ("RASBERY_BICG_NMAX", "RASBERY_BICG_EPS"):
+    check(key not in control and key not in single,
+          f"the harness set {key}. It is an arm knob and the reference line does "
+          "not export it, so a harness default here would silently re-measure "
+          "every stored c/h number against a different inner-solve budget -- and "
+          "fork the case key while doing it. Pass it with --set for an S2 arm")
+
 check(control.get("RASBERY_BATCH_WAIT_US") == "auto"
       and control.get("RASBERY_BATCH_WAIT_MAX_US") == "2000",
       "the batch rendezvous must run the bounded adaptive linger the reference runs, not "

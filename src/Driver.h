@@ -735,6 +735,39 @@ inline constexpr const char* kArmEnv[] = {
     "RASBERY_SEARCH_STAGED_MARGIN",
     "RASBERY_GA_FEEDBACK_PASSES",
     "RASBERY_ALLOW_SCREENING",
+    // A2 outer-reduction design, S2 prerequisite
+    // (docs/A2_OUTER_REDUCTION_DESIGN_20260902_KO.md Sec 2 and Sec 5 item 6).
+    // THE INNER SOLVE'S BUDGET, and the one entry on this list that is here to
+    // close a defect rather than to declare a feature.
+    //
+    // Both are read in the BICGCMFD constructor (src/BICGCMFD.cpp:74-81) into
+    // `_nmaxbicg` (default 3) and `_epsbicg` (default 0.1).  `_nmaxbicg` is the
+    // number of BiCGSTAB iterations every CMFD sweep runs after the
+    // unconditional first one -- on the device it is the CAPTURED graph's
+    // unroll, so it is not merely how long the inner solve tries but how
+    // converged the flux the outer's `residual` is measured on actually is.
+    // `_epsbicg` is that loop's relative exit.  A run at nmax 2 and a run at
+    // nmax 4 take different outer trajectories: this tree has the measurement
+    // (`_nmaxbicg` 6 -> 4 moved i-SMR outers by +6 %).
+    //
+    // THE DEFECT.  Until this entry existed, neither name was on this list, so
+    // src/CaseKey.h's env half digested the same bytes for both runs and the
+    // WP10.1 cache would serve one inner budget's answer to the other's
+    // request -- and the S2 nmax A/B would have been scored against a cached
+    // answer produced at a different nmax.  Conservative in the safe direction
+    // from here on: an unset knob (`~`) and an explicit `3` are two payloads and
+    // two keys for what resolves to one arm, which is a cache MISS and never a
+    // wrong hit.
+    //
+    // CONSEQUENCE, STATED WHERE THE LIST IS.  Adding a name to this array
+    // appends a line to every case key's env payload, so EVERY case key in the
+    // campaign moves once, whether or not either knob is exported.  The
+    // trajectory `digest` is unaffected (it folds no environment at all) and the
+    // trajectory receipt's own `env` object simply gains two more `null` fields.
+    // test/reference/validation_baseline_manifest_v5.json records the same fact
+    // under `arm_env_additions`.
+    "RASBERY_BICG_NMAX",
+    "RASBERY_BICG_EPS",
 };
 
 /// FNV-1a, one 64-bit word at a time.  Chosen because it is eight lines, has no

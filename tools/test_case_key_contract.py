@@ -100,6 +100,29 @@ def source_contract() -> None:
              f"(C++ {len(cpp_env)} entries, tool {len(case_key.ARM_ENV)})")
     if len(cpp_env) < 20 or "RASBERY_GPU" not in cpp_env:
         fail(f"the kArmEnv parse looks wrong: {cpp_env[:4]}...")
+    # 1b. The INNER SOLVE'S BUDGET.  Asserted by name, the way
+    #     test_cram_gpu_contract.py asserts RASBERY_GPU_CRAM's presence and
+    #     test_ppr_gpu_contract.py asserts RASBERY_GPU_PPR's absence -- because
+    #     the absence of these two WAS the defect, and an absence nobody asserts
+    #     is an absence that comes back.  src/BICGCMFD.cpp reads both in the
+    #     constructor into _nmaxbicg / _epsbicg; _nmaxbicg is the captured
+    #     device graph's inner unroll, so two runs that differ in it converge
+    #     the flux to different depths, publish different `residual`s to the
+    #     outer test, and take different outer trajectories (measured in this
+    #     tree: 6 -> 4 moved i-SMR outers by +6 %).  Without them on the list the
+    #     env half of the key digests the same bytes for both runs and the WP10.1
+    #     cache serves one inner budget's answer to the other's request.
+    for name in ("RASBERY_BICG_NMAX", "RASBERY_BICG_EPS"):
+        if name not in cpp_env:
+            fail(f"{name} is not in kArmEnv; it moves the outer trajectory "
+                 "(src/BICGCMFD.cpp reads it into the inner solve's budget), so "
+                 "two runs with different inner budgets would share one case key")
+    bicg_src = (ROOT / "src" / "BICGCMFD.cpp").read_text(encoding="utf-8-sig")
+    for name in ("RASBERY_BICG_NMAX", "RASBERY_BICG_EPS"):
+        if f'std::getenv("{name}")' not in bicg_src:
+            fail(f"{name} is on the arm list but src/BICGCMFD.cpp no longer reads "
+                 "it; a key that folds a knob the solver ignores is a key that "
+                 "reports physics that is not there")
     if "ARM_ENV = _read_arm_env()" not in (ROOT / "tools" / "case_key.py").read_text(
             encoding="utf-8"):
         fail("case_key.py carries its own copy of the arm-knob list again")
@@ -677,6 +700,19 @@ def behaviour_contract() -> None:
                  "physics would share one cache entry")
         if key_of(base) == key_of(base, env=CLEAN_ENV | {"RASBERY_STAGED_FLUX_TOL": "4"}):
             fail("the staged-tolerance A2 fidelity does not reach the key")
+        # The inner solve's budget.  The A2 S2 sweep is `RASBERY_BICG_NMAX` in
+        # {2, 4} against the default 3; if the two arms shared a key, the sweep
+        # would be scored against a cached answer from the other arm.
+        for name, value in (("RASBERY_BICG_NMAX", "4"), ("RASBERY_BICG_EPS", "0.01")):
+            if key_of(base) == key_of(base, env=CLEAN_ENV | {name: value}):
+                fail(f"{name} does not reach the key; two runs with different "
+                     "inner-solve budgets would share one cache entry")
+        # ...and the two are distinguishable from each other, not folded into one
+        # "some inner knob moved" bit.
+        if (key_of(base, env=CLEAN_ENV | {"RASBERY_BICG_NMAX": "4"})
+                == key_of(base, env=CLEAN_ENV | {"RASBERY_BICG_EPS": "4"})):
+            fail("the two inner-solve knobs are interchangeable in the key; the "
+                 "payload is not keyed by NAME")
         if key_of(base) == key_of(base, warm_start="parent:abc"):
             fail("warm-start provenance does not reach the key; a warm start can "
                  "pick a root (GA evaluator plan Sec 5.4)")
