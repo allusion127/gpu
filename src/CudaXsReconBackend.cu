@@ -7,6 +7,7 @@
 #include "GpuCanonicalState.h"
 #include "GpuCaptureArbiter.h"
 #include "GpuDeviceBlockPool.h"
+#include "GpuFp32Arm.h" // WP20: RASBERY_GPU_FP32, the device-wide narrow arm
 #include "GpuGraphSplice.h"
 #include "NodalKernel.h"
 #include "XeFormMask.h"
@@ -3684,13 +3685,31 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     // write the same bytes (FlatXsCtaKernel.cuh, the B0 argument at the top),
     // so nothing downstream of this line -- the downloads, the residency
     // bookkeeping, the counters -- knows or needs to know which one ran.
+    //
+    // WP20 ADDS A PRECISION AXIS TO THIS SAME DISPATCH, and deliberately does
+    // not add a second dispatch point.  `narrow` is the device-wide FP32 arm
+    // (src/GpuFp32Arm.h) resolved once into a cached bool for the same reason
+    // `cta` is: the workspace width is a compile-time property of the kernel,
+    // so it must be decided before the launch and may not wobble between two
+    // calls of one run.  The FP32 workspace exists only on the CTA arm -- the
+    // thread-per-node reference keeps its 7,388 B of LOCAL memory in double --
+    // so an FP32 request that lands on the reference arm is a DEMOTION, and it
+    // is counted as one rather than silently ignored.
     static const bool cta = rasberyGpuFlatXsCtaEnabled();
+    static const bool narrow = rasbery::fp32::routes(rasbery::fp32::Backend::FlatXs);
     if (cta) {
-        fxs::flatxsCtaLaunch(v, rasberyGpuFlatXsCtaThreads(), d.stream);
+        fxs::flatxsCtaLaunch(v, rasberyGpuFlatXsCtaThreads(), d.stream, narrow);
+        if (narrow)
+            // The shared workspace is 919 elements per CTA and there is one CTA
+            // per node: this is the footprint delta of THIS launch, in the same
+            // units the [RASBERY][XFER] ledger counts.
+            rasbery::fp32::noteBytesSaved(static_cast<std::size_t>(host.n_nodes) *
+                                          sizeof(fxs::CtaWorkspaceF32));
     } else {
         const int block = 128;
         const int grid  = (host.n_nodes + block - 1) / block;
         kernelFlatXs<<<grid, block, 0, d.stream>>>(v);
+        if (narrow) rasbery::fp32::noteDemotion(rasbery::fp32::Backend::FlatXs);
     }
     RASBERY_CUDA_TRY(cudaGetLastError(), d.status);
 
@@ -3933,6 +3952,22 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     // very end, and only when this drive actually deferred.
     d.nodal_drain_deferred = false;
     if (!d.available || host.nxyz <= 0 || host.nsurf <= 0) return false;
+
+    // WP20.  THE NODAL ARM IS DEFERRED, AND THIS IS WHERE IT SAYS SO.  With
+    // RASBERY_GPU_FP32 on, this drive still runs every kernel in FP64, so the
+    // end-of-run [RASBERY][FP32] receipt reports `nodal:"deferred"` and counts
+    // one demotion per drive.  Without this line a reader could only learn that
+    // nodal stayed wide by reading src/GpuFp32Arm.h's `converted()` table --
+    // and a wall-clock A/B nobody could attribute is exactly the failure this
+    // receipt exists to prevent.  Why it is deferred rather than done: NodalView
+    // is thirty double* fields, four of which (xsrf/xsnf/xssm/chif) are SHARED
+    // with the flat-XS and CMFD device block, and the kernel set is captured
+    // into a graph cached under a key with no precision in it.  A narrow arm is
+    // therefore a parallel view, a parallel block, a narrowing pass on the
+    // shared inputs and a wider key -- a work package, not a template
+    // parameter.  See docs/WP20_GPU_FP32_20260831_KO.md Sec 7.
+    if (rasbery::fp32::armed())
+        rasbery::fp32::noteDemotion(rasbery::fp32::Backend::Nodal);
 
     // ---- multi-instance batch arena ---------------------------------------
     // Engaged only for --batch-mode M>1 with the FULL pipeline; see

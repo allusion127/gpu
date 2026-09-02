@@ -144,6 +144,47 @@ struct CtaWorkspace {
     double iden[NISO];          ///< node densities after RefreshLightIsotopes
 };
 
+/// WP20's NARROWED TWIN of the workspace above (RASBERY_GPU_FP32, default OFF).
+///
+/// Same five arrays, sized from the SAME expressions -- the contract test
+/// asserts the two structs field-for-field, so the isotope registry cannot move
+/// under one of them and not the other -- and half the bytes: **3,676 B/CTA
+/// against 7,352**.
+///
+/// WHAT THIS BUYS, precisely.  It is NOT a transfer saving: the node's inputs
+/// still arrive as doubles in global memory and its outputs still leave as
+/// doubles (`v.lmp`, `v.mic`, `v.xs`, `v.iden` are unchanged).  It is a
+/// SHARED-MEMORY OCCUPANCY saving, and the arithmetic is worth doing HONESTLY
+/// because the tempting version of it is wrong.  At 7,352 B/CTA a 100 KiB
+/// shared budget seats floor(102400/7352) = 13 blocks per SM; at 3,676 it seats
+/// 27.  It does NOT get 27: at T=128 that would be 108 warps and the SM caps at
+/// 64 (2,048 threads), so the resident count goes 13 -> 16 and shared stops
+/// being the binding constraint at all.  **+23 % blocks, not +108 %.**  The
+/// second saving is the one with no such ceiling: the shared BANK TRAFFIC
+/// itself halves, and the Horner accumulation reads and writes `w.bm` once per
+/// delta entry per element, which is the innermost loop of the whole kernel.
+/// Anybody quoting a 2x from this comment has read the first sentence of the
+/// arithmetic and not the second.
+///
+/// WHY IT IS A2 AND NOT B0, said out loud because the FP64 twin above carries a
+/// bit-identity argument and a reader will arrive here expecting one.  Every
+/// floating-point operation is still executed on the same operands in the same
+/// per-value order -- structural properties (P1)/(P3) are untouched, and the
+/// same contract test still holds them.  What changes is the ROUNDING of the
+/// accumulator between operations: `dst[e] = scale*val + dst[e]` now rounds to
+/// float after each delta entry instead of to double.  A node's delta stream is
+/// short (`node_cnt`, single digits on the KNGR deck), so the accumulated
+/// rounding is a few ULPs of float on a cross-section -- but a few ULPs of
+/// float is ~1e-7 relative, and it enters the trajectory through the macro XS,
+/// which is why this arm is gated and measured rather than adopted.
+struct CtaWorkspaceF32 {
+    float bl[N_ACTIVE * NG];   ///< lmpx scalars   [t*NG + ig]
+    float bls[NLSM];           ///< lmpx scatter   [igs*NG + ige]
+    float bm[N_ACTIVE * NMIC]; ///< micx scalars   [t*NMIC + iso*NG + ig]
+    float bms[NMSM];           ///< micx scatter   [iso*NG*NG + igs*NG + ige]
+    float iden[NISO];          ///< node densities after RefreshLightIsotopes
+};
+
 /// Ordinal-space extents.  These name the loop bounds used by (P1) so the
 /// gather / apply / scatter phases cannot drift apart.
 constexpr int Q_LMP = N_ACTIVE * NG;   // 18
@@ -153,9 +194,17 @@ constexpr int Q_MSM = NMSM;            // 156
 
 /// One CTA, one unrodded node.  `T` is blockDim.x as a compile-time constant
 /// so the strides fold; it is a PERFORMANCE parameter only (see P1).
-template <int T, class POL>
+/// WP20 made the workspace a TEMPLATE PARAMETER rather than editing `double` to
+/// `float` in the body: the FP64 and FP32 arms are then compiled from ONE text,
+/// so the narrow arm cannot drift away from the reference under maintenance,
+/// and every structural property the contract test checks (the lane-owned
+/// ordinal loops, the FormBit census, the barrier placement) is checked once and
+/// holds for both.  Every operand crossing the workspace boundary converts
+/// implicitly -- double in, float stored; float out, double arithmetic -- which
+/// is exactly the "narrow the STATE, keep the OPERATIONS" split the arm claims.
+template <int T, class POL, class WS>
 __device__ inline void flatxsSolveNodeCta(const FlatXsView& v, int i,
-                                          const POL& pol, CtaWorkspace& w) {
+                                          const POL& pol, WS& w) {
     const int nxyz = v.nxyz;
     const int l    = v.nodes[i];
     const int tid  = static_cast<int>(threadIdx.x);
@@ -296,10 +345,13 @@ __device__ inline void flatxsSolveNodeCta(const FlatXsView& v, int i,
         xsrecon::T_XSNF, xsrecon::T_XSKF, xsrecon::T_XSSF,
         xsrecon::T_FYLD, xsrecon::T_XS2N, xsrecon::T_XS3N};
     for (int q = tid; q < Q_LMP; q += T) {
-        const int     t  = q / NG;
-        const int     ig = q - t * NG;
-        const double* mt = w.bm + t * NMIC;
-        double        val = w.bl[q];
+        const int   t  = q / NG;
+        const int   ig = q - t * NG;
+        // `auto`, not `const double*`: this is the one place the body names the
+        // workspace's ELEMENT type, and WP20 made that type a parameter.  The
+        // arithmetic below is still double either way -- `mt[...]` promotes.
+        const auto* mt = w.bm + t * NMIC;
+        double      val = w.bl[q];
         for (int iso = 0; iso < NISO; ++iso)
             val = pol.ma(F_MACRO_SCAL, mt[iso * NG + ig], w.iden[iso], val);
         v.xs[active_xt[t]][ig * nxyz + l] = val;
@@ -341,6 +393,22 @@ __global__ void __launch_bounds__(T) kernelFlatXsCta(FlatXsView v) {
     flatxsSolveNodeCta<T>(v, i, StaticForms{}, w);
 }
 
+/// WP20's narrow twin (RASBERY_GPU_FP32).  Static __shared__ (3,676 B/CTA).
+///
+/// TEXTUALLY IDENTICAL to kernelFlatXsCta except for the workspace type, and
+/// that is the point: the body it calls is the same instantiated template, so
+/// the two arms cannot diverge in anything but precision.  It is a SEPARATE
+/// __global__ rather than a runtime branch because the shared allocation is a
+/// compile-time property of the kernel -- a branch would have to reserve the
+/// wide workspace and would save nothing at all.
+template <int T>
+__global__ void __launch_bounds__(T) kernelFlatXsCtaF32(FlatXsView v) {
+    __shared__ CtaWorkspaceF32 w;
+    const int i = static_cast<int>(blockIdx.x);
+    if (i >= v.n_nodes) return;
+    flatxsSolveNodeCta<T>(v, i, StaticForms{}, w);
+}
+
 /// Block sizes the arm accepts.  The list is a PERFORMANCE ladder, not a
 /// numerics one (P1): every entry produces the same bytes.  Anything else the
 /// caller asks for is clamped to CTA_THREADS_DEFAULT.
@@ -348,9 +416,28 @@ constexpr int CTA_THREADS_DEFAULT = 128;
 
 /// Launch helper: the one place the block-size ladder is spelled, so the
 /// production backend and the replay gate cannot pick different ladders.
-inline void flatxsCtaLaunch(const FlatXsView& v, int threads, cudaStream_t stream) {
+/// `narrow` selects WP20's FP32 workspace.  DEFAULTED TO FALSE so every caller
+/// that predates the arm -- the replay gate included -- keeps launching exactly
+/// the kernel it launched before, which is what the feature-off byte-identity
+/// claim rests on.  The ladder is the same on both arms, deliberately: block
+/// size stays a performance parameter (P1) and precision stays a numerics one,
+/// and mixing the two would make an A/B unattributable.
+inline void flatxsCtaLaunch(const FlatXsView& v, int threads, cudaStream_t stream,
+                            bool narrow = false) {
     const int grid = v.n_nodes;
     if (grid <= 0) return;
+    if (narrow) {
+        switch (threads) {
+            case 64:  kernelFlatXsCtaF32<64><<<grid, 64, 0, stream>>>(v); break;
+            case 256: kernelFlatXsCtaF32<256><<<grid, 256, 0, stream>>>(v); break;
+            case 128:
+            default:
+                kernelFlatXsCtaF32<CTA_THREADS_DEFAULT>
+                    <<<grid, CTA_THREADS_DEFAULT, 0, stream>>>(v);
+                break;
+        }
+        return;
+    }
     switch (threads) {
         case 64:  kernelFlatXsCta<64><<<grid, 64, 0, stream>>>(v); break;
         case 256: kernelFlatXsCta<256><<<grid, 256, 0, stream>>>(v); break;

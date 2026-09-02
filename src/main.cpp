@@ -8,6 +8,7 @@
 #include "CudaXsReconBackend.h"
 #include "Driver.h"
 #include "EvaluatorServer.h"
+#include "GpuFp32Arm.h"
 #include "GpuFullContract.h"
 #include "RunContract.h"
 #include "XferLedger.h"
@@ -1210,6 +1211,15 @@ int main(int argc, char* argv[]) {
         // one.  Every Driver has joined, so the counters are final and the
         // first-violation text is safe to read.  See gpufull::enforceExitCode.
         exit_code = rasbery::gpufull::enforceExitCode(std::cout, exit_code);
+        // WP20.  THE PRECISION ARM, PRINTED WHETHER OR NOT IT IS ON.  Every
+        // count below -- nodes_solved, device_updates, the XFER byte totals --
+        // means a different thing under FP32 than under FP64, so the arm has to
+        // be readable from the same log that carries them, and an OFF run has
+        // to say so out loud rather than by omission (the same G0 rule
+        // [RASBERY][GPU_FULL] above exists for).  See src/GpuFp32Arm.h.
+        std::cout << "[RASBERY][FP32] {";
+        rasbery::fp32::appendReceiptFields(std::cout);
+        std::cout << "}" << std::endl;
         if (rasbery::rasberyGpuXsReconEnabled())
             std::cout << "[RASBERY][XSRECON][GPU] {\"nodes_solved\":"
                       << rasbery::rasberyGpuXsReconNodes() << "}" << std::endl;
@@ -1474,6 +1484,15 @@ int main(int argc, char* argv[]) {
         // one.  Every Driver has joined, so the counters are final and the
         // first-violation text is safe to read.  See gpufull::enforceExitCode.
         exit_code = rasbery::gpufull::enforceExitCode(std::cout, exit_code);
+        // WP20.  THE PRECISION ARM, PRINTED WHETHER OR NOT IT IS ON.  Every
+        // count below -- nodes_solved, device_updates, the XFER byte totals --
+        // means a different thing under FP32 than under FP64, so the arm has to
+        // be readable from the same log that carries them, and an OFF run has
+        // to say so out loud rather than by omission (the same G0 rule
+        // [RASBERY][GPU_FULL] above exists for).  See src/GpuFp32Arm.h.
+        std::cout << "[RASBERY][FP32] {";
+        rasbery::fp32::appendReceiptFields(std::cout);
+        std::cout << "}" << std::endl;
         // Rev.7.1 Task 20.  Printed HERE, after the arena has been released, so
         // the tenancy counters it carries are final: releaseSlot runs in the
         // Driver destructors (all joined) and the arena teardown above is the
@@ -1623,6 +1642,11 @@ int main(int argc, char* argv[]) {
     std::cout << "}" << std::endl;
     // See the batch arm above: the run-level half of the fail-closed gate.
     exit_code = rasbery::gpufull::enforceExitCode(std::cout, exit_code);
+    // See the batch arm above: WP20's precision receipt, same fields, printed
+    // whether or not the arm is on.
+    std::cout << "[RASBERY][FP32] {";
+    rasbery::fp32::appendReceiptFields(std::cout);
+    std::cout << "}" << std::endl;
 
     if (rasbery::rasberyGpuXsReconEnabled())
         std::cout << "[RASBERY][XSRECON][GPU] {\"nodes_solved\":"

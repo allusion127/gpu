@@ -6,6 +6,7 @@
 #include "CudaXsReconBackend.h" // rasberyHostPinningEnabled(): header-only gate
 #include "Geometry.h"
 #include "GpuCaptureArbiter.h"
+#include "GpuFp32Arm.h"      // WP20: RASBERY_GPU_FP32, the device-wide narrow arm
 #include "GpuFullContract.h" // F9: the seam tally the three fallback fields read
 #include "GpuGraphSplice.h"
 #include "XferLedger.h"
@@ -369,8 +370,19 @@ bool envFlagEnabled(const char* name) {
 /// Mixed-precision inner BiCGSTAB (see the FP32 section below).  Read ONCE and
 /// cached: the choice fixes the captured graph topology, so it must not be able
 /// to change between two outers of the same run.
+///
+/// WP20: TWO SPELLINGS, ONE PATH.  RASBERY_GPU_CMFD_FP32 is the historical
+/// per-backend knob and stays exactly what it was; RASBERY_GPU_FP32 is the
+/// device-wide arm (src/GpuFp32Arm.h), and CMFD is one of the two backends it
+/// actually routes.  They are OR-ed here rather than at the launch sites, so
+/// there is still ONE cached gate, ONE captured topology decision, and no
+/// launch-time predicate that could disagree with the graph it is inside.
+/// `rasbery::fp32::routes()` also folds in the arm's sticky non-finite latch,
+/// which is why the OR is evaluated once and frozen: latching after the fact is
+/// `fp32_latched_off`'s job, and it drops the cached graphs when it fires.
 bool cmfdFp32InnerEnabled() {
-    static const bool enabled = envFlagEnabled("RASBERY_GPU_CMFD_FP32");
+    static const bool enabled = envFlagEnabled("RASBERY_GPU_CMFD_FP32") ||
+                                rasbery::fp32::routes(rasbery::fp32::Backend::Cmfd);
     return enabled;
 }
 
@@ -3965,6 +3977,25 @@ public:
                 allocate(reinterpret_cast<void**>(&t_f), vec_f_bytes);
                 allocate(reinterpret_cast<void**>(&y_f), vec_f_bytes);
                 allocate(reinterpret_cast<void**>(&z_f), vec_f_bytes);
+                // WP20 `bytes_saved_est`.  A FOOTPRINT DELTA, not a traffic
+                // integral, and the receipt's field name says `_est` for that
+                // reason: it is the number of bytes the eight Krylov vectors,
+                // the two operator mirrors and dinv would have occupied in
+                // double MINUS what they occupy in float, counted once per
+                // arena stand-up.  The traffic saving is this figure times the
+                // number of times the inner loop sweeps the working set, which
+                // only a profile can say -- so the receipt reports the half it
+                // can prove and docs/WP20_GPU_FP32_20260831_KO.md Sec 4 does the
+                // multiplication with the measured iteration counts.
+                //
+                // The two float MIRRORS are counted as a saving even though
+                // they are additive to the double diag/cc they mirror: what
+                // they replace is the double operand stream the inner matvec
+                // and the colour sweeps used to read, and that stream is read
+                // far more often than the mirrors are written (once per outer).
+                rasbery::fp32::noteBytesSaved(
+                    8u * vec_f_bytes +
+                    (2u * S * matrix_count + S * coupling_count) * sizeof(float));
             }
             allocate(reinterpret_cast<void**>(&sweep_halt), S * sizeof(std::uint32_t));
             allocate(reinterpret_cast<void**>(&device_assembly_active),
@@ -5823,6 +5854,13 @@ public:
     void latchFp32Off() {
         if (fp32_latched_off) return;
         fp32_latched_off = true;
+        // WP20: tell the device-wide arm too, so the end-of-run
+        // [RASBERY][FP32] receipt reports `cmfd:"latched"` rather than
+        // `cmfd:"fp32"`.  Still env-independent -- latchOff() reads no
+        // environment, it only counts and prints.  Its own loud line is the
+        // arm-level twin of the [RASBERY][CUDA][FP32_FALLBACK] line below;
+        // both fire, because the two receipts are read by different tools.
+        rasbery::fp32::latchOff(rasbery::fp32::Backend::Cmfd, "nonfinite");
         // Precision is part of every cache key, so a latched fallback could in
         // principle just miss; dropping the FP32 instantiations outright is
         // what makes "the run FINISHED in fp64" a property of the process

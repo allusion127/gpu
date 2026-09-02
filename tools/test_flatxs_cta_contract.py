@@ -317,8 +317,13 @@ check(
     "all five ordinal-space phases are present and lane-owned "
     "(gather 4 + apply 4 + scatter 4 + macro 2, plus the iden/XSRF walks)",
 )
+# WP20 appended a third template parameter (the workspace type, so the FP32 and
+# FP64 arms compile from one body).  The check is on the BLOCK SIZE being a
+# template parameter and on it coming FIRST, which is what makes the strides
+# fold; it must not also pin the arity, or every later parameter becomes a
+# contract change.  `template <int T, class POL` is therefore a prefix match.
 check(
-    "int T" in CTA and "template <int T, class POL>" in CTA,
+    "int T" in CTA and "template <int T, class POL" in CTA,
     "the block size is a TEMPLATE parameter, so the stride is a compile-time "
     "constant and the ladder cannot silently disagree with blockDim",
 )

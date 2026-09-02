@@ -600,6 +600,17 @@ inline constexpr const char* kArmEnv[] = {
     "RASBERY_GPU_CMFD_SWEEP",
     "RASBERY_GPU_CMFD_RESIDENT_SINGLE",
     "RASBERY_GPU_CMFD_FP32",
+    // WP20.  The device-wide single-precision arm and its two extensions
+    // (src/GpuFp32Arm.h).  These belong here on the list's own terms and more
+    // plainly than anything else on it: they select the ROUNDING of every
+    // device kernel in the iteration, which is the most trajectory-moving thing
+    // a knob in this binary can do.  Gate class A2 -- validated by Gate A
+    // against the FP64 trajectory and Gate B against MASTER, never by the
+    // bit-golden gate.  Being here is also what folds them into the WP10.1 case
+    // key, so an FP64 answer can never be served to an FP32 request.
+    "RASBERY_GPU_FP32",
+    "RASBERY_GPU_FP32_STRICT",
+    "RASBERY_GPU_FP32_CRAM",
     "RASBERY_GPU_NODAL",
     "RASBERY_GPU_NODAL_FULL",
     "RASBERY_GPU_XSRECON",

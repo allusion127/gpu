@@ -189,8 +189,14 @@ if "for (int sweep = 0; sweep < unroll; ++sweep)" not in sweeps:
 # The host-side uploads of diag/cc are likewise upstream of the launch that
 # replays enqueue_outer; assert both upload sites still exist so the dominance
 # argument keeps naming real code.
+# WP20 note: issueSweepUploads grew a `slot_budget` parameter after this file was
+# written, and the check went stale silently -- it named a signature no longer in
+# the tree, so the dominance argument stopped naming real code.  Both sites are
+# now matched on the NAME plus its opening parenthesis, which is what the
+# argument actually needs (the site exists and is upstream), and cannot rot again
+# when a parameter is added.
 for site in ("void issueUploads(const int* active_slots, int count)",
-             "void issueSweepUploads(const int* active_slots, int count)"):
+             "void issueSweepUploads(const int* active_slots, int count,"):
     if site not in CUDA:
         fail(f"missing operator upload site {site}")
 if "_f32" in body_after("void issueUploads(const int* active_slots, int count)"):
@@ -253,18 +259,35 @@ if "reduce_dot_stage1<<<" not in outer:
 # ---------------------------------------------------------------------------
 # 5. The non-finite fallback: env-independent, counted, graph-invalidating.
 # ---------------------------------------------------------------------------
+# WP20 note: the fallback body moved out of drain() into absorb() when the
+# stream-ordered enqueue path stopped synchronising here (Rev.7.1 Task 10 part
+# 2).  drain() is now "absorb() plus the sync", so the checks follow the body and
+# a separate check holds the delegation -- otherwise this file would be asserting
+# against a function that no longer contains the code it names.
 drain = body_after("void drain(const int* active_slots, int count)")
-if "++telemetry.fp32_fallbacks;" not in drain:
-    fail("drain() does not count an FP32 fallback")
-if "if (fp32_failed) latchFp32Off();" not in drain:
-    fail("drain() does not latch the arena back to FP64 after an FP32 failure")
-if "nonfinite && fp32_was_active" not in drain:
+if "absorb(active_slots, count);" not in drain:
+    fail("drain() no longer delegates the absorb half; the fallback checks below "
+         "would be scanning the wrong body")
+absorb = body_after("void absorb(const int* active_slots, int count)")
+if "++telemetry.fp32_fallbacks;" not in absorb:
+    fail("absorb() does not count an FP32 fallback")
+if "if (fp32_failed) latchFp32Off();" not in absorb:
+    fail("absorb() does not latch the arena back to FP64 after an FP32 failure")
+if "nonfinite && fp32_was_active" not in absorb:
     fail("the fallback is not conditioned on the FP32 path having been active")
 latch = body_after("void latchFp32Off()")
 if "fp32_latched_off = true;" not in latch:
     fail("latchFp32Off does not set the sticky latch")
-if latch.count("cudaGraphExecDestroy") != 2:
-    fail("latchFp32Off does not drop BOTH cached graphs")
+# WP20 note: the two inline cudaGraphExecDestroy calls became destroyGraphCaches(),
+# which drops the plain-solve AND the sweep graph caches (and every keyed
+# instantiation in them, which the old pair could not).  The property is "both
+# caches are dropped", so it is checked through the function that does it.
+if "destroyGraphCaches();" not in latch:
+    fail("latchFp32Off does not drop the cached graphs")
+caches = body_after("void destroyGraphCaches()")
+if caches.count("cudaGraphExecDestroy") != 2 or "outer_graphs.clear();" not in caches \
+        or "sweep_graphs.clear();" not in caches:
+    fail("destroyGraphCaches does not drop BOTH cached graph sets")
 if "std::getenv" in latch or "envFlag" in latch:
     fail("the fallback must be env-independent")
 if "atomicOr(flags + m, static_cast<std::uint32_t>(NONFINITE_DETECTED));" not in step:
@@ -274,9 +297,18 @@ if step.count("return;") < 2:
 launch_outer = body_after("void launch_outer(int nmax)")
 if "graph_precision != precisionTag()" not in launch_outer:
     fail("the plain-solve graph is not invalidated when the precision changes")
+# WP20 note: the sweep cache became per-bucket and the scalar
+# `sweep_graph_precision` became a FIELD OF THE KEY (SweepGraphCapacity::precision),
+# consulted through serves().  Same property, better enforced -- a keyed cache
+# cannot serve a mismatched entry at all, where the scalar could only invalidate
+# the one entry it remembered -- so the check follows the key.
 launch_sweeps = body_after("void launch_sweeps(int nmax, int unroll)")
-if "sweep_graph_precision != precisionTag()" not in launch_sweeps:
-    fail("the sweep graph is not invalidated when the precision changes")
+if "serves(nmax, unroll, precisionTag(), lanes)" not in launch_sweeps:
+    fail("the sweep graph cache is not keyed on the precision")
+if "int precision" not in body_after("struct SweepGraphCapacity", text=CUDA_H):
+    fail("SweepGraphCapacity does not carry the precision in its key")
+if "precision == want_precision" not in CUDA_H:
+    fail("SweepGraphCapacity::serves does not compare the precision exactly")
 
 # ---------------------------------------------------------------------------
 # 6. Telemetry and the [PHYSICS_MODE] receipt.
