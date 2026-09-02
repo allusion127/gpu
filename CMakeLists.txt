@@ -350,6 +350,28 @@ if (RASBERY_ENABLE_TESTS)
 
     add_test(NAME canonical_state COMMAND rasbery_canonical_state)
 
+    # WP21-C2: ONE BODY, TWO LAYOUTS, THE SAME BITS.  src/NodalKernel.h reads
+    # its private arrays through the view's strides so the SAME text can serve
+    # the host's node-major arrays (Nodal.cpp's production arrays, the
+    # RASBERY_NODAL_DUMP capture, the replay tools) and the device's
+    # node-innermost ones.  That the two are the same computation is an
+    # EQUIVALENCE BETWEEN TWO RUNS, not a source property -- and it needs no
+    # GPU, no nvcc and no capture, so it is checked here on every build.  The
+    # sabotage arm swaps two strides and requires the comparison to FAIL, so a
+    # gate that had quietly stopped comparing anything cannot pass.
+    add_executable(rasbery_nodal_layout_equivalence
+            "${CMAKE_CURRENT_SOURCE_DIR}/test/nodal_layout_equivalence.cpp")
+    target_compile_features(rasbery_nodal_layout_equivalence PRIVATE cxx_std_20)
+    target_include_directories(rasbery_nodal_layout_equivalence PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+    add_test(NAME nodal_layout_equivalence
+            COMMAND rasbery_nodal_layout_equivalence)
+    add_test(NAME nodal_layout_equivalence_negative
+            COMMAND rasbery_nodal_layout_equivalence)
+    set_tests_properties(nodal_layout_equivalence_negative PROPERTIES
+            ENVIRONMENT "RASBERY_NODAL_LAYOUT_SABOTAGE=1")
+
     # Device outer segment state machine (Rev.7.1 Task 9).  The escape ranking,
     # the budget-vs-convergence precedence and the kPhaseTransitions consistency
     # are properties of a SEQUENCE of outers, which no single-outer replay and no

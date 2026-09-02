@@ -236,6 +236,88 @@ struct NodalViewT {
     int           nsurf;
 
     // =======================================================================
+    // WP21-C2: THE LAYOUT OF THE PRIVATE ARRAYS, CARRIED AS DATA
+    // =======================================================================
+    //
+    // THE PROBLEM.  `kNodalJnet<0>` measures **16.7 sectors per request** on
+    // its loads (238 ncu, block 39) -- the worst load in the tree, against an
+    // ideal of 2.  Threads are surfaces, `lk` is gathered from `lklr`, and the
+    // nine updateConstant products plus the twelve working arrays are all
+    // NODE-MAJOR: `arr[(lk*NDIR + idir)*NG + ig]`.  Consecutive `lk` are 48 B
+    // apart, so each lane pulls its own sectors.  Node-innermost --
+    // `arr[(idir*NG + ig)*nxyz + lk]` -- makes that 8 B and the model says 2.
+    //
+    // WHY THE STRIDES ARE DATA AND NOT A COMPILE-TIME CONSTANT.  This header is
+    // a SHARED HOST/DEVICE BODY with three live host consumers whose arrays are
+    // node-major and must stay so: `Nodal::MakeView()` hands it the very
+    // `_eta1 ... _dsncff6` that `Nodal.cpp`'s own CPU phase functions (the
+    // production fallback) and `nodalDumpState` read and write; the host replay
+    // gate `test/nodal_replay.cpp` runs this body over a RASBERY_NODAL_DUMP
+    // capture written in that layout; and `test/nodal_device_replay.cu` uploads
+    // that same capture raw.  A compile-time flip would give every one of them
+    // a body that reads its own arrays in the wrong order -- finite, plausible,
+    // wrong, and silent.
+    //
+    // So the layout travels IN THE VIEW, and the DEFAULTS BELOW ARE TODAY'S
+    // NODE-MAJOR VALUES.  `NodalView v{}` -- which is how every host builder in
+    // the tree makes one -- gets exactly the addresses it got before this WP,
+    // character for character in the index arithmetic's VALUE.  Only the device
+    // production view calls `nodalNodeInnermostView()`, and only after the
+    // backend has packed the uploaded constants to match.
+    //
+    // COST.  Three IMADs instead of a folded constant, per index, in a kernel
+    // that is latency-bound on exactly these loads.  A branch would cost more
+    // and would not vectorise; a template parameter would double every kernel
+    // instantiation in a 5,900-line TU.  This is the cheapest form that keeps
+    // ONE BODY.
+    //
+    // THE FOUR CLASSES.  Every private array in this view is one of them:
+    //
+    //   ndg   per-(node, dir, group)  -- the nine constants, trlcff0/1/2,
+    //                                    dsncff2/4/6            (15 arrays)
+    //   dg2   per-(node, dir) 2x2     -- mu, tau                  (2 arrays)
+    //   ng2   per-node 2x2            -- matM, matMI, matMs, matMf(4 arrays)
+    //   hm    per-(node, dir)         -- hmesh                    (1 array)
+    //
+    // WHAT IS DELIBERATELY NOT HERE.  `flux` / `jnet` / `phis` keep
+    // `[lk*NG + ig]` and `[ls*NG + ig]`: they are THE CANONICAL STATE
+    // (src/GpuCanonicalState.h) and in shared mode those pointers ARE the CMFD
+    // backend's buffers -- which is exactly why WP21-A left CMFD's `phi`/`src`
+    // at `[2l+ig]`.  Moving one side would make two backends read one set of
+    // bytes with two maps.  `lklr` / `idirlr` / `sgnlr` keep `[ls*NLR + side]`
+    // (surface-indexed geometry, 4 -> 2 sectors, a few % of the kernel's
+    // loads).  `xsrf` / `xsnf` / `xssm` / `chif` are ALREADY node-innermost.
+    // tools/test_nodal_soa_contract.py holds all three exclusions.
+    int ndg_node = NDIR * NG; ///< `lk` stride of a per-(node,dir,group) array
+    int ndg_dir  = NG;        ///< `idir` stride
+    int ndg_grp  = 1;         ///< `ig` stride
+    int dg2_node = NDIR * NG2; ///< `lk` stride of a per-(node,dir) 2x2
+    int dg2_dir  = NG2;        ///< `idir` stride
+    int dg2_elem = 1;          ///< `j*NG + i` stride
+    int ng2_node = NG2;        ///< `lk` stride of a per-node 2x2
+    int ng2_elem = 1;          ///< `j*NG + i` stride
+    int hm_node  = NDIR;       ///< `lk` stride of hmesh
+    int hm_dir   = 1;          ///< `idir` stride of hmesh
+
+    /// THE FOUR ACCESSORS EVERY PRIVATE-ARRAY INDEX IN THIS HEADER GOES
+    /// THROUGH.  Nothing below spells `(lk*NDIR + idir)*NG + ig` inline any
+    /// more, and tools/test_nodal_soa_contract.py refuses a re-spelling: an
+    /// index that bypassed the view would read the node-major address out of a
+    /// node-innermost array and get a finite, plausible, wrong cross section.
+    RASBERY_XSR_HD int ndg(int lk, int idir, int ig) const {
+        return lk * ndg_node + idir * ndg_dir + ig * ndg_grp;
+    }
+    RASBERY_XSR_HD int dg2(int lk, int idir, int e) const {
+        return lk * dg2_node + idir * dg2_dir + e * dg2_elem;
+    }
+    RASBERY_XSR_HD int ng2(int lk, int e) const {
+        return lk * ng2_node + e * ng2_elem;
+    }
+    RASBERY_XSR_HD int hm(int lk, int idir) const {
+        return lk * hm_node + idir * hm_dir;
+    }
+
+    // =======================================================================
     // Rev.7.1 Task 10 part 3: THE SEGMENT'S HALT, CARRIED INTO THE NODAL DRIVE
     // =======================================================================
     //
@@ -319,6 +401,22 @@ RASBERY_XSR_HD inline NodalViewT<ValueT> nodalWideShell(const NodalView& h) {
     v.nsurf      = h.nsurf;
     v.halt       = h.halt;
     v.halt_slot  = h.halt_slot;
+    // WP21-C2: THE LAYOUT IS NOT NARROWED.  The FP32 twin holds the same
+    // elements in the same order at half the width, so the ten strides are
+    // copied verbatim.  Leaving them at the struct's node-major defaults would
+    // give the narrow arm a different map for the same permutation -- which is
+    // why they are enumerated here with the rest of the non-narrowed half and
+    // counted by the contract test.
+    v.ndg_node   = h.ndg_node;
+    v.ndg_dir    = h.ndg_dir;
+    v.ndg_grp    = h.ndg_grp;
+    v.dg2_node   = h.dg2_node;
+    v.dg2_dir    = h.dg2_dir;
+    v.dg2_elem   = h.dg2_elem;
+    v.ng2_node   = h.ng2_node;
+    v.ng2_elem   = h.ng2_elem;
+    v.hm_node    = h.hm_node;
+    v.hm_dir     = h.hm_dir;
     return v;
 }
 
@@ -385,14 +483,58 @@ RASBERY_XSR_HD inline NodalViewT<ValueT> nodalSlotView(NodalViewT<ValueT> v, int
     return v;
 }
 
+/// WP21-C2: THE ONE PLACE THE DEVICE LAYOUT IS CHOSEN.
+///
+/// Returns `v` with the four private-array classes switched to NODE-INNERMOST:
+/// `ndg` becomes `(idir*NG + ig)*nxyz + lk`, `dg2` becomes
+/// `(idir*NG2 + e)*nxyz + lk`, `ng2` becomes `e*nxyz + lk`, `hmesh` becomes
+/// `idir*nxyz + lk`.  The ARRAY SIZES are unchanged -- this is a permutation of
+/// the same element count, so every allocation, every slot rebase
+/// (`nodalSlotView`, which strides by element COUNT) and every byte total in
+/// the transfer ledger is untouched.
+///
+/// CALLED AFTER `nxyz` IS SET, and the caller must have packed anything it
+/// UPLOADED into the same order.  A view whose strides say node-innermost over
+/// bytes that are still node-major is the exact failure this tree fears: no
+/// error, finite numbers, wrong ones.  The backend's pack helpers and
+/// tools/test_nodal_soa_contract.py are the two things holding that pairing.
+template <class ValueT>
+RASBERY_XSR_HD inline NodalViewT<ValueT> nodalNodeInnermostView(NodalViewT<ValueT> v) {
+    const int nx = v.nxyz;
+    v.ndg_node   = 1;
+    v.ndg_dir    = NG * nx;
+    v.ndg_grp    = nx;
+    v.dg2_node   = 1;
+    v.dg2_dir    = NG2 * nx;
+    v.dg2_elem   = nx;
+    v.ng2_node   = 1;
+    v.ng2_elem   = nx;
+    v.hm_node    = 1;
+    v.hm_dir     = nx;
+    return v;
+}
+
+/// True when `v` carries the node-innermost layout.  One predicate, so the
+/// receipt and the pack helpers cannot disagree with the kernels.
+template <class ValueT>
+RASBERY_XSR_HD inline bool nodalIsNodeInnermost(const NodalViewT<ValueT>& v) {
+    return v.ndg_node == 1;
+}
+
 // Accessor helpers mirroring the Nodal.cpp macros.  They return `double` on
 // BOTH arms: a float load widens here and every arithmetic site downstream is
 // the double it always was.
-template <class VT> RASBERY_XSR_HD inline double nvTrl0(const NodalViewT<VT>& v, int ig, int lkd) { return v.trlcff0[lkd * NG + ig]; }
-template <class VT> RASBERY_XSR_HD inline double nvMatM(const NodalViewT<VT>& v, int i, int j, int lk) { return v.matM[lk * NG2 + j * NG + i]; }
-template <class VT> RASBERY_XSR_HD inline double nvMatMI(const NodalViewT<VT>& v, int i, int j, int lk) { return v.matMI[lk * NG2 + j * NG + i]; }
-template <class VT> RASBERY_XSR_HD inline double nvMu(const NodalViewT<VT>& v, int i, int j, int lkd) { return v.mu[lkd * NG2 + j * NG + i]; }
-template <class VT> RASBERY_XSR_HD inline double nvTau(const NodalViewT<VT>& v, int i, int j, int lkd) { return v.tau[lkd * NG2 + j * NG + i]; }
+//
+// WP21-C2 CHANGED THE (node, dir) HELPERS' SIGNATURE from `lkd` to
+// `(lk, idir)`, and that is not cosmetic: `lkd = lk*NDIR + idir` is itself an
+// AoS address, and under a node-innermost layout `lk` and `idir` carry
+// DIFFERENT strides, so the pair cannot be recovered from the product without
+// a division.  Passing the pair is what lets one body serve both layouts.
+template <class VT> RASBERY_XSR_HD inline double nvTrl0(const NodalViewT<VT>& v, int ig, int lk, int idir) { return v.trlcff0[v.ndg(lk, idir, ig)]; }
+template <class VT> RASBERY_XSR_HD inline double nvMatM(const NodalViewT<VT>& v, int i, int j, int lk) { return v.matM[v.ng2(lk, j * NG + i)]; }
+template <class VT> RASBERY_XSR_HD inline double nvMatMI(const NodalViewT<VT>& v, int i, int j, int lk) { return v.matMI[v.ng2(lk, j * NG + i)]; }
+template <class VT> RASBERY_XSR_HD inline double nvMu(const NodalViewT<VT>& v, int i, int j, int lk, int idir) { return v.mu[v.dg2(lk, idir, j * NG + i)]; }
+template <class VT> RASBERY_XSR_HD inline double nvTau(const NodalViewT<VT>& v, int i, int j, int lk, int idir) { return v.tau[v.dg2(lk, idir, j * NG + i)]; }
 
 // ---------------------------------------------------------------------------
 // Phase caltrlcff0 (per node): products, divides and adds only -- no
@@ -407,18 +549,17 @@ template <class VT> RASBERY_XSR_HD inline double nvTau(const NodalViewT<VT>& v, 
 // ---------------------------------------------------------------------------
 template <class VT>
 RASBERY_XSR_HD inline void nodalTrlcff0Group(const NodalViewT<VT>& v, int lk, int ig) {
-    const int lkd0 = lk * NDIR;
-    double    avgjnet[NDIR];
+    double avgjnet[NDIR];
 
     for (int idir = 0; idir < NDIR; idir++) {
         const int lsl = v.lktosfc[(lk * NDIR + idir) * NLR + C_LEFT];
         const int lsr = v.lktosfc[(lk * NDIR + idir) * NLR + C_RIGHT];
         avgjnet[idir] =
-            (v.jnet[lsr * NG + ig] - v.jnet[lsl * NG + ig]) / v.hmesh[lk * NDIR + idir];
+            (v.jnet[lsr * NG + ig] - v.jnet[lsl * NG + ig]) / v.hmesh[v.hm(lk, idir)];
     }
-    v.trlcff0[(lkd0 + C_XDIR) * NG + ig] = avgjnet[C_YDIR] + avgjnet[C_ZDIR];
-    v.trlcff0[(lkd0 + C_YDIR) * NG + ig] = avgjnet[C_XDIR] + avgjnet[C_ZDIR];
-    v.trlcff0[(lkd0 + C_ZDIR) * NG + ig] = avgjnet[C_XDIR] + avgjnet[C_YDIR];
+    v.trlcff0[v.ndg(lk, C_XDIR, ig)] = avgjnet[C_YDIR] + avgjnet[C_ZDIR];
+    v.trlcff0[v.ndg(lk, C_YDIR, ig)] = avgjnet[C_XDIR] + avgjnet[C_ZDIR];
+    v.trlcff0[v.ndg(lk, C_ZDIR, ig)] = avgjnet[C_XDIR] + avgjnet[C_YDIR];
 }
 
 template <class VT>
@@ -445,21 +586,19 @@ RASBERY_XSR_HD inline void nodalTrlcff0(const NodalViewT<VT>& v, int lk) {
 template <class VT, class POL>
 RASBERY_XSR_HD inline void nodalTrlcff12Cell(const NodalViewT<VT>& v, int lk, int idir,
                                              int ig, const POL& pol) {
-    const int lkd = lk * NDIR + idir;
-
     const int lkl = v.neib[lk * NEWSB + idir * NLR + C_LEFT];
     const int lkr = v.neib[lk * NEWSB + idir * NLR + C_RIGHT];
 
     double avgtrl3[3] = {};
     double hmesh3[3]  = {};
-    hmesh3[C_CENTER]  = v.hmesh[lk * NDIR + idir];
-    avgtrl3[C_CENTER] = v.trlcff0[lkd * NG + ig];
+    hmesh3[C_CENTER]  = v.hmesh[v.hm(lk, idir)];
+    avgtrl3[C_CENTER] = v.trlcff0[v.ndg(lk, idir, ig)];
 
     if (lkl > -1) {
         const int lsl    = v.lktosfc[(lk * NDIR + idir) * NLR + C_LEFT];
         const int idirl  = v.idirlr[lsl * NLR + C_LEFT];
-        hmesh3[C_LEFT]   = v.hmesh[lkl * NDIR + idirl];
-        avgtrl3[C_LEFT]  = v.trlcff0[(lkl * NDIR + idirl) * NG + ig];
+        hmesh3[C_LEFT]   = v.hmesh[v.hm(lkl, idirl)];
+        avgtrl3[C_LEFT]  = v.trlcff0[v.ndg(lkl, idirl, ig)];
     } else if (v.albedo[idir * NLR + C_LEFT] < 1.0E-10) {
         hmesh3[C_LEFT]  = hmesh3[C_CENTER];
         avgtrl3[C_LEFT] = avgtrl3[C_CENTER];
@@ -468,8 +607,8 @@ RASBERY_XSR_HD inline void nodalTrlcff12Cell(const NodalViewT<VT>& v, int lk, in
     if (lkr > -1) {
         const int lsr    = v.lktosfc[(lk * NDIR + idir) * NLR + C_RIGHT];
         const int idirr  = v.idirlr[lsr * NLR + C_RIGHT];
-        hmesh3[C_RIGHT]  = v.hmesh[lkr * NDIR + idirr];
-        avgtrl3[C_RIGHT] = v.trlcff0[(lkr * NDIR + idirr) * NG + ig];
+        hmesh3[C_RIGHT]  = v.hmesh[v.hm(lkr, idirr)];
+        avgtrl3[C_RIGHT] = v.trlcff0[v.ndg(lkr, idirr, ig)];
     } else if (v.albedo[idir * NLR + C_RIGHT] < 1.0E-10) {
         hmesh3[C_RIGHT]  = hmesh3[C_CENTER];
         avgtrl3[C_RIGHT] = avgtrl3[C_CENTER];
@@ -481,8 +620,8 @@ RASBERY_XSR_HD inline void nodalTrlcff12Cell(const NodalViewT<VT>& v, int lk, in
     // the reference has to be to the stored type; the arithmetic that produces
     // the value below is still double either way, and the rounding happens
     // once, at the assignment, exactly as CtaWorkspaceF32 rounds.
-    auto& out1 = v.trlcff1[lkd * NG + ig];
-    auto& out2 = v.trlcff2[lkd * NG + ig];
+    auto& out1 = v.trlcff1[v.ndg(lk, idir, ig)];
+    auto& out2 = v.trlcff2[v.ndg(lk, idir, ig)];
     double  sh[4];
     const double rh =
         (1 / ((hmesh3[C_LEFT] + hmesh3[C_CENTER] + hmesh3[C_RIGHT]) *
@@ -536,7 +675,6 @@ RASBERY_XSR_HD inline void nodalTrlcff12Group(const NodalViewT<VT>& v, int lk, i
 // ---------------------------------------------------------------------------
 template <class VT, class POL>
 RASBERY_XSR_HD inline void nodalUpdateMatrix(const NodalViewT<VT>& v, int lk, const POL& pol) {
-    const int lkd0 = lk * NDIR;
     const int nxyz = v.nxyz;
     // Same double either way (see NodalView::reigv_dev); the load exists only
     // so a captured CUDA graph does not bake the eigenvalue of its capture
@@ -545,17 +683,17 @@ RASBERY_XSR_HD inline void nodalUpdateMatrix(const NodalViewT<VT>& v, int lk, co
 
     for (int ige = 0; ige < NG; ige++) {
         for (int igs = 0; igs < NG; igs++) {
-            v.matMs[lk * NG2 + ige * NG + igs] = -v.xssm[(igs * NG + ige) * nxyz + lk];
+            v.matMs[v.ng2(lk, ige * NG + igs)] = -v.xssm[(igs * NG + ige) * nxyz + lk];
             const double chif_v = v.chif_empty ? (ige == 0 ? 1.0 : 0.0)
                                                : v.chif[ige * nxyz + lk];
-            v.matMf[lk * NG2 + ige * NG + igs] = chif_v * v.xsnf[igs * nxyz + lk];
+            v.matMf[v.ng2(lk, ige * NG + igs)] = chif_v * v.xsnf[igs * nxyz + lk];
         }
-        v.matMs[lk * NG2 + ige * NG + ige] += v.xsrf[ige * nxyz + lk];
+        v.matMs[v.ng2(lk, ige * NG + ige)] += v.xsrf[ige * nxyz + lk];
 
         for (int igs = 0; igs < NG; igs++) {
-            v.matM[lk * NG2 + ige * NG + igs] =
-                pol.ma(1, 0, -reigv, v.matMf[lk * NG2 + ige * NG + igs],
-                       v.matMs[lk * NG2 + ige * NG + igs]);
+            v.matM[v.ng2(lk, ige * NG + igs)] =
+                pol.ma(1, 0, -reigv, v.matMf[v.ng2(lk, ige * NG + igs)],
+                       v.matMs[v.ng2(lk, ige * NG + igs)]);
         }
     }
 
@@ -565,52 +703,50 @@ RASBERY_XSR_HD inline void nodalUpdateMatrix(const NodalViewT<VT>& v, int lk, co
 
     if (fabs(det) > 1.E-10) {
         const double rdet = 1 / det;
-        v.matMI[lk * NG2 + 0 * NG + 0] = rdet * nvMatM(v, 1, 1, lk);
-        v.matMI[lk * NG2 + 0 * NG + 1] = -rdet * nvMatM(v, 1, 0, lk);
-        v.matMI[lk * NG2 + 1 * NG + 0] = -rdet * nvMatM(v, 0, 1, lk);
-        v.matMI[lk * NG2 + 1 * NG + 1] = rdet * nvMatM(v, 0, 0, lk);
+        v.matMI[v.ng2(lk, 0 * NG + 0)] = rdet * nvMatM(v, 1, 1, lk);
+        v.matMI[v.ng2(lk, 0 * NG + 1)] = -rdet * nvMatM(v, 1, 0, lk);
+        v.matMI[v.ng2(lk, 1 * NG + 0)] = -rdet * nvMatM(v, 0, 1, lk);
+        v.matMI[v.ng2(lk, 1 * NG + 1)] = rdet * nvMatM(v, 0, 0, lk);
     } else {
-        v.matMI[lk * NG2 + 0 * NG + 0] = 0;
-        v.matMI[lk * NG2 + 0 * NG + 1] = 0;
-        v.matMI[lk * NG2 + 1 * NG + 0] = 0;
-        v.matMI[lk * NG2 + 1 * NG + 1] = 0;
+        v.matMI[v.ng2(lk, 0 * NG + 0)] = 0;
+        v.matMI[v.ng2(lk, 0 * NG + 1)] = 0;
+        v.matMI[v.ng2(lk, 1 * NG + 0)] = 0;
+        v.matMI[v.ng2(lk, 1 * NG + 1)] = 0;
     }
 
     const double rm011 = 1. / M011;
 
     for (int idir = 0; idir < NDIR; idir++) {
-        const int lkd = lkd0 + idir;
-
         double tempz[2][2] = {};
 
         for (int igd = 0; igd < NG; igd++) {
             const double tau1 =
-                M033 * (v.diagDI[lkd * NG + igd] / v.m253[lkd * NG + igd]);
+                M033 * (v.diagDI[v.ndg(lk, idir, igd)] / v.m253[v.ndg(lk, idir, igd)]);
 
             tempz[igd][igd] = tempz[igd][igd] + M231;
 
             for (int igs = 0; igs < NG; igs++) {
-                v.tau[lkd * NG2 + igd * NG + igs] =
+                v.tau[v.dg2(lk, idir, igd * NG + igs)] =
                     tau1 * nvMatM(v, igs, igd, lk);
 
                 tempz[igs][igd] =
-                    pol.ma(1, 2, v.m251[lkd * NG + igd],
-                           v.tau[lkd * NG2 + igd * NG + igs], tempz[igs][igd]);
+                    pol.ma(1, 2, v.m251[v.ndg(lk, idir, igd)],
+                           v.tau[v.dg2(lk, idir, igd * NG + igs)], tempz[igs][igd]);
 
-                tempz[igs][igd] *= v.diagD[lkd * NG + igd];
+                tempz[igs][igd] *= v.diagD[v.ndg(lk, idir, igd)];
             }
         }
 
-        v.mu[lkd * NG2 + 0 * NG + 0] =
+        v.mu[v.dg2(lk, idir, 0 * NG + 0)] =
             rm011 * pol.ma(1, 3, nvMatMI(v, 0, 0, lk), tempz[0][0],
                            xsrMul(nvMatMI(v, 1, 0, lk), tempz[0][1]));
-        v.mu[lkd * NG2 + 0 * NG + 1] =
+        v.mu[v.dg2(lk, idir, 0 * NG + 1)] =
             rm011 * pol.ma(1, 3, nvMatMI(v, 0, 0, lk), tempz[1][0],
                            xsrMul(nvMatMI(v, 1, 0, lk), tempz[1][1]));
-        v.mu[lkd * NG2 + 1 * NG + 0] =
+        v.mu[v.dg2(lk, idir, 1 * NG + 0)] =
             rm011 * pol.ma(1, 3, nvMatMI(v, 0, 1, lk), tempz[0][0],
                            xsrMul(nvMatMI(v, 1, 1, lk), tempz[0][1]));
-        v.mu[lkd * NG2 + 1 * NG + 1] =
+        v.mu[v.dg2(lk, idir, 1 * NG + 1)] =
             rm011 * pol.ma(1, 3, nvMatMI(v, 0, 1, lk), tempz[1][0],
                            xsrMul(nvMatMI(v, 1, 1, lk), tempz[1][1]));
     }
@@ -635,19 +771,16 @@ RASBERY_XSR_HD inline void nodalUpdateMatrix(const NodalViewT<VT>& v, int lk, co
 // ---------------------------------------------------------------------------
 template <class VT, class POL>
 RASBERY_XSR_HD inline void nodalCalculateEven(const NodalViewT<VT>& v, int lk, const POL& pol) {
-    const int lkd0 = lk * NDIR;
-
     for (int idir = 0; idir < NDIR; idir++) {
-        const int lkd = lkd0 + idir;
         double    at2[2][2], a[2][2], rm4464[2], bt1[2], bt2[2], b[2];
 
         for (int igd = 0; igd < NG; igd++) {
             rm4464[igd] = 0.0;
-            if (fabs(v.m264[lkd * NG + igd]) > 1.0E-10)
-                rm4464[igd] = M044 / v.m264[lkd * NG + igd];
+            if (fabs(v.m264[v.ndg(lk, idir, igd)]) > 1.0E-10)
+                rm4464[igd] = M044 / v.m264[v.ndg(lk, idir, igd)];
 
             const double mu2 =
-                rm4464[igd] * v.m260[lkd * NG + igd] * v.diagDI[lkd * NG + igd];
+                rm4464[igd] * v.m260[v.ndg(lk, idir, igd)] * v.diagDI[v.ndg(lk, idir, igd)];
             // Named exactly the way `m022 * rm220 * mu2 * matM` associates:
             // ((m022*rm220) * mu2) * matM.  The temp adds no rounding, it just
             // gives the diagonal's multiply-add a spellable a*b+c shape.
@@ -661,7 +794,7 @@ RASBERY_XSR_HD inline void nodalCalculateEven(const NodalViewT<VT>& v, int lk, c
         }
 
         for (int igd = 0; igd < NG; igd++) {
-            const double mu1 = rm4464[igd] * v.m262[lkd * NG + igd];
+            const double mu1 = rm4464[igd] * v.m262[v.ndg(lk, idir, igd)];
             for (int igs = 0; igs < NG; igs++) {
                 // ((mu1*matM + matM0*at2_0) + matM1*at2_1).  gcc contracts
                 // each UNROLLED copy of these NG=2 loops independently, so
@@ -674,47 +807,47 @@ RASBERY_XSR_HD inline void nodalCalculateEven(const NodalViewT<VT>& v, int lk, c
                     pol.ma(2, 8 + inst, nvMatM(v, 1, igd, lk), at2[igs][1], t1);
             }
             a[igd][igd] =
-                pol.ma(2, 12 + igd, v.diagD[lkd * NG + igd], M242, a[igd][igd]);
+                pol.ma(2, 12 + igd, v.diagD[v.ndg(lk, idir, igd)], M242, a[igd][igd]);
             bt2[igd] =
                 2 * (pol.ma2(2, 14 + 2 * igd, nvMatM(v, 0, igd, lk),
                              v.flux[lk * NG + 0], nvMatM(v, 1, igd, lk),
                              v.flux[lk * NG + 1]) +
-                     v.trlcff0[lkd * NG + igd]);
-            bt1[igd] = M022 * RM220 * v.diagDI[lkd * NG + igd] * bt2[igd];
+                     v.trlcff0[v.ndg(lk, idir, igd)]);
+            bt1[igd] = M022 * RM220 * v.diagDI[v.ndg(lk, idir, igd)] * bt2[igd];
         }
 
         for (int ig = 0; ig < NG; ig++) {
             const double inner =
                 pol.ma2(2, 18 + 2 * ig, nvMatM(v, 0, ig, lk), bt1[0],
                         nvMatM(v, 1, ig, lk), bt1[1]);
-            b[ig] = pol.ma(2, 22 + ig, M022, v.trlcff2[lkd * NG + ig], inner);
+            b[ig] = pol.ma(2, 22 + ig, M022, v.trlcff2[v.ndg(lk, idir, ig)], inner);
         }
 
         double rdet = pol.ma2(2, 24, a[0][0], a[1][1], -a[1][0], a[0][1]);
 
         if (rdet != 0.0) {
             rdet = 1. / rdet;
-            v.dsncff4[lkd * NG + 0] =
+            v.dsncff4[v.ndg(lk, idir, 0)] =
                 rdet * pol.ma2(2, 26, a[1][1], b[0], -a[1][0], b[1]);
-            v.dsncff4[lkd * NG + 1] =
+            v.dsncff4[v.ndg(lk, idir, 1)] =
                 rdet * pol.ma2(2, 28, a[0][0], b[1], -a[0][1], b[0]);
         } else {
-            v.dsncff4[lkd * NG + 0] = 0.0;
-            v.dsncff4[lkd * NG + 1] = 0.0;
+            v.dsncff4[v.ndg(lk, idir, 0)] = 0.0;
+            v.dsncff4[v.ndg(lk, idir, 1)] = 0.0;
         }
 
         for (int ig = 0; ig < NG; ig++) {
-            v.dsncff6[lkd * NG + ig] =
-                v.diagDI[lkd * NG + ig] * rm4464[ig] *
+            v.dsncff6[v.ndg(lk, idir, ig)] =
+                v.diagDI[v.ndg(lk, idir, ig)] * rm4464[ig] *
                 pol.ma2(2, 30 + 2 * ig, nvMatM(v, 0, ig, lk),
-                        v.dsncff4[lkd * NG + 0], nvMatM(v, 1, ig, lk),
-                        v.dsncff4[lkd * NG + 1]);
+                        v.dsncff4[v.ndg(lk, idir, 0)], nvMatM(v, 1, ig, lk),
+                        v.dsncff4[v.ndg(lk, idir, 1)]);
             const double t2 =
-                pol.ma2(2, 34 + 2 * ig, v.diagDI[lkd * NG + ig], bt2[ig],
-                        -M240, v.dsncff4[lkd * NG + ig]);
-            v.dsncff2[lkd * NG + ig] =
-                RM220 * pol.ma(2, 38 + ig, -v.m260[lkd * NG + ig],
-                               v.dsncff6[lkd * NG + ig], t2);
+                pol.ma2(2, 34 + 2 * ig, v.diagDI[v.ndg(lk, idir, ig)], bt2[ig],
+                        -M240, v.dsncff4[v.ndg(lk, idir, ig)]);
+            v.dsncff2[v.ndg(lk, idir, ig)] =
+                RM220 * pol.ma(2, 38 + ig, -v.m260[v.ndg(lk, idir, ig)],
+                               v.dsncff6[v.ndg(lk, idir, ig)], t2);
         }
     }
 }
@@ -728,7 +861,6 @@ RASBERY_XSR_HD inline void nodalJnet1n(const NodalViewT<VT>& v, int ls, int lr,
                                        double alb, const POL& pol) {
     const int lk   = v.lklr[ls * NLR + lr];
     const int idir = v.idirlr[ls * NLR + lr];
-    const int lkd  = lk * NDIR + idir;
     int       sgn  = 1;
     if (lr == C_RIGHT)
         sgn = -1;
@@ -742,37 +874,37 @@ RASBERY_XSR_HD inline void nodalJnet1n(const NodalViewT<VT>& v, int ls, int lr,
             a11[igs][ige] = nvMatM(v, igs, ige, lk) * M011;
 
     for (int ig = 0; ig < NG; ig++)
-        a12[ig] = -v.diagD[lkd * NG + ig] * M231;
+        a12[ig] = -v.diagD[v.ndg(lk, idir, ig)] * M231;
 
     for (int ig = 0; ig < NG; ig++)
-        a13[ig] = -v.diagD[lkd * NG + ig] * v.m251[lkd * NG + ig];
+        a13[ig] = -v.diagD[v.ndg(lk, idir, ig)] * v.m251[v.ndg(lk, idir, ig)];
 
     for (int ige = 0; ige < NG; ige++)
         for (int igs = 0; igs < NG; igs++)
             a22[igs][ige] = nvMatM(v, igs, ige, lk) * M033;
 
     for (int ig = 0; ig < NG; ig++)
-        a23[ig] = -v.diagD[lkd * NG + ig] * v.m253[lkd * NG + ig];
+        a23[ig] = -v.diagD[v.ndg(lk, idir, ig)] * v.m253[v.ndg(lk, idir, ig)];
 
     for (int ig = 0; ig < NG; ig++)
-        diagDj[ig] = 0.5 * v.hmesh[lk * NDIR + idir] * v.diagD[lkd * NG + ig];
+        diagDj[ig] = 0.5 * v.hmesh[v.hm(lk, idir)] * v.diagD[v.ndg(lk, idir, ig)];
 
     for (int ig = 0; ig < NG; ig++)
         a31[ig] = diagDj[ig] + alb;
     for (int ig = 0; ig < NG; ig++)
         a32[ig] = pol.ma(3, 26, 6., diagDj[ig], alb);
     for (int ig = 0; ig < NG; ig++)
-        a33[ig] = pol.ma(3, 0, diagDj[ig], v.eta1[lkd * NG + ig], alb);
+        a33[ig] = pol.ma(3, 0, diagDj[ig], v.eta1[v.ndg(lk, idir, ig)], alb);
 
     for (int ig = 0; ig < NG; ig++)
-        b1[ig] = -M011 * v.trlcff1[lkd * NG + ig];
+        b1[ig] = -M011 * v.trlcff1[v.ndg(lk, idir, ig)];
     for (int ig = 0; ig < NG; ig++) {
         const double t1 = pol.ma(
-            3, 3, v.eta2[lkd * NG + ig], v.dsncff6[lkd * NG + ig],
-            pol.ma2(3, 1, 3, v.dsncff2[lkd * NG + ig], 10,
-                    v.dsncff4[lkd * NG + ig]));
-        const double t2 = v.flux[lk * NG + ig] + v.dsncff2[lkd * NG + ig] +
-                          v.dsncff4[lkd * NG + ig] + v.dsncff6[lkd * NG + ig];
+            3, 3, v.eta2[v.ndg(lk, idir, ig)], v.dsncff6[v.ndg(lk, idir, ig)],
+            pol.ma2(3, 1, 3, v.dsncff2[v.ndg(lk, idir, ig)], 10,
+                    v.dsncff4[v.ndg(lk, idir, ig)]));
+        const double t2 = v.flux[lk * NG + ig] + v.dsncff2[v.ndg(lk, idir, ig)] +
+                          v.dsncff4[v.ndg(lk, idir, ig)] + v.dsncff6[v.ndg(lk, idir, ig)];
         b2[ig] = -sgn * pol.ma2(3, 4, diagDj[ig], t1, alb, t2);
     }
 
@@ -827,19 +959,19 @@ RASBERY_XSR_HD inline void nodalJnet1n(const NodalViewT<VT>& v, int ls, int lr,
 
     for (int ig = 0; ig < NG; ig++) {
         const double even_t = pol.ma(
-            3, 22, v.eta2[lkd * NG + ig], v.dsncff6[lkd * NG + ig],
-            pol.ma2(3, 20, 3, v.dsncff2[lkd * NG + ig], 10,
-                    v.dsncff4[lkd * NG + ig]));
+            3, 22, v.eta2[v.ndg(lk, idir, ig)], v.dsncff6[v.ndg(lk, idir, ig)],
+            pol.ma2(3, 20, 3, v.dsncff2[v.ndg(lk, idir, ig)], 10,
+                    v.dsncff4[v.ndg(lk, idir, ig)]));
         const double odd_t = pol.ma(
-            3, 24, v.eta1[lkd * NG + ig], oddcff[2][ig],
+            3, 24, v.eta1[v.ndg(lk, idir, ig)], oddcff[2][ig],
             pol.ma(3, 23, 6, oddcff[1][ig], oddcff[0][ig]));
-        v.jnet[ls * NG + ig] = -v.hmesh[lk * NDIR + idir] * 0.5 *
-                               v.diagD[lkd * NG + ig] *
+        v.jnet[ls * NG + ig] = -v.hmesh[v.hm(lk, idir)] * 0.5 *
+                               v.diagD[v.ndg(lk, idir, ig)] *
                                pol.ma(3, 25, static_cast<double>(sgn), even_t, odd_t);
 
         v.phis[ls * NG + ig] =
-            v.flux[lk * NG + ig] + v.dsncff2[lkd * NG + ig] +
-            v.dsncff4[lkd * NG + ig] + v.dsncff6[lkd * NG + ig] +
+            v.flux[lk * NG + ig] + v.dsncff2[v.ndg(lk, idir, ig)] +
+            v.dsncff4[v.ndg(lk, idir, ig)] + v.dsncff6[v.ndg(lk, idir, ig)] +
             sgn * (oddcff[0][ig] + oddcff[1][ig] + oddcff[2][ig]);
     }
 }
@@ -852,23 +984,21 @@ RASBERY_XSR_HD inline void nodalJnet2n(const NodalViewT<VT>& v, int ls, const PO
     const int idirr = v.idirlr[ls * NLR + C_RIGHT];
     const int sgnl  = v.sgnlr[ls * NLR + C_LEFT];
     const int sgnr  = v.sgnlr[ls * NLR + C_RIGHT];
-    const int lkdl  = lkl * NDIR + idirl;
-    const int lkdr  = lkr * NDIR + idirr;
 
     double diagDj[2][2], tempz[2][2], tempzI[2][2], zeta1[2][2], zeta2[2],
         bfc[2], mat1g[2][2];
 
     for (int ig = 0; ig < NG; ig++) {
         diagDj[ig][C_LEFT] =
-            0.5 * v.hmesh[lkl * NDIR + idirl] * v.diagD[lkdl * NG + ig];
+            0.5 * v.hmesh[v.hm(lkl, idirl)] * v.diagD[v.ndg(lkl, idirl, ig)];
         diagDj[ig][C_RIGHT] =
-            0.5 * v.hmesh[lkr * NDIR + idirr] * v.diagD[lkdr * NG + ig];
+            0.5 * v.hmesh[v.hm(lkr, idirr)] * v.diagD[v.ndg(lkr, idirr, ig)];
     }
 
-    tempz[0][0] = nvMu(v, 0, 0, lkdr) + nvTau(v, 0, 0, lkdr) + 1;
-    tempz[1][0] = nvMu(v, 1, 0, lkdr) + nvTau(v, 1, 0, lkdr);
-    tempz[0][1] = nvMu(v, 0, 1, lkdr) + nvTau(v, 0, 1, lkdr);
-    tempz[1][1] = nvMu(v, 1, 1, lkdr) + nvTau(v, 1, 1, lkdr) + 1;
+    tempz[0][0] = nvMu(v, 0, 0, lkr, idirr) + nvTau(v, 0, 0, lkr, idirr) + 1;
+    tempz[1][0] = nvMu(v, 1, 0, lkr, idirr) + nvTau(v, 1, 0, lkr, idirr);
+    tempz[0][1] = nvMu(v, 0, 1, lkr, idirr) + nvTau(v, 0, 1, lkr, idirr);
+    tempz[1][1] = nvMu(v, 1, 1, lkr, idirr) + nvTau(v, 1, 1, lkr, idirr) + 1;
 
     double rdet =
         1 / pol.ma2(4, 0, tempz[0][0], tempz[1][1], -tempz[1][0], tempz[0][1]);
@@ -877,10 +1007,10 @@ RASBERY_XSR_HD inline void nodalJnet2n(const NodalViewT<VT>& v, int ls, const PO
     tempzI[0][1] = -rdet * tempz[0][1];
     tempzI[1][1] = rdet * tempz[0][0];
 
-    tempz[0][0] = nvMu(v, 0, 0, lkdl) + nvTau(v, 0, 0, lkdl) + 1;
-    tempz[1][0] = nvMu(v, 1, 0, lkdl) + nvTau(v, 1, 0, lkdl);
-    tempz[0][1] = nvMu(v, 0, 1, lkdl) + nvTau(v, 0, 1, lkdl);
-    tempz[1][1] = nvMu(v, 1, 1, lkdl) + nvTau(v, 1, 1, lkdl) + 1;
+    tempz[0][0] = nvMu(v, 0, 0, lkl, idirl) + nvTau(v, 0, 0, lkl, idirl) + 1;
+    tempz[1][0] = nvMu(v, 1, 0, lkl, idirl) + nvTau(v, 1, 0, lkl, idirl);
+    tempz[0][1] = nvMu(v, 0, 1, lkl, idirl) + nvTau(v, 0, 1, lkl, idirl);
+    tempz[1][1] = nvMu(v, 1, 1, lkl, idirl) + nvTau(v, 1, 1, lkl, idirl) + 1;
 
     zeta1[0][0] = pol.ma2(4, 2, tempzI[0][0], tempz[0][0], tempzI[1][0], tempz[0][1]);
     zeta1[1][0] = pol.ma2(4, 2, tempzI[0][0], tempz[1][0], tempzI[1][0], tempz[1][1]);
@@ -889,15 +1019,15 @@ RASBERY_XSR_HD inline void nodalJnet2n(const NodalViewT<VT>& v, int ls, const PO
 
     for (int ig = 0; ig < NG; ig++) {
         const double right_part = pol.ma(
-            4, 5, nvMatMI(v, 1, ig, lkr), sgnr * v.trlcff1[lkdr * NG + 1],
-            pol.ma(4, 4, nvMatMI(v, 0, ig, lkr), sgnr * v.trlcff1[lkdr * NG + 0],
-                   v.dsncff2[lkdr * NG + ig] + v.dsncff4[lkdr * NG + ig] +
-                       v.dsncff6[lkdr * NG + ig] + v.flux[lkr * NG + ig]));
+            4, 5, nvMatMI(v, 1, ig, lkr), sgnr * v.trlcff1[v.ndg(lkr, idirr, 1)],
+            pol.ma(4, 4, nvMatMI(v, 0, ig, lkr), sgnr * v.trlcff1[v.ndg(lkr, idirr, 0)],
+                   v.dsncff2[v.ndg(lkr, idirr, ig)] + v.dsncff4[v.ndg(lkr, idirr, ig)] +
+                       v.dsncff6[v.ndg(lkr, idirr, ig)] + v.flux[lkr * NG + ig]));
         const double left_part = pol.ma(
-            4, 5, nvMatMI(v, 1, ig, lkl), sgnl * v.trlcff1[lkdl * NG + 1],
-            pol.ma(4, 4, nvMatMI(v, 0, ig, lkl), sgnl * v.trlcff1[lkdl * NG + 0],
-                   -v.dsncff2[lkdl * NG + ig] - v.dsncff4[lkdl * NG + ig] -
-                       v.dsncff6[lkdl * NG + ig] - v.flux[lkl * NG + ig]));
+            4, 5, nvMatMI(v, 1, ig, lkl), sgnl * v.trlcff1[v.ndg(lkl, idirl, 1)],
+            pol.ma(4, 4, nvMatMI(v, 0, ig, lkl), sgnl * v.trlcff1[v.ndg(lkl, idirl, 0)],
+                   -v.dsncff2[v.ndg(lkl, idirl, ig)] - v.dsncff4[v.ndg(lkl, idirl, ig)] -
+                       v.dsncff6[v.ndg(lkl, idirl, ig)] - v.flux[lkl * NG + ig]));
         bfc[ig] = right_part + left_part;
     }
 
@@ -905,62 +1035,62 @@ RASBERY_XSR_HD inline void nodalJnet2n(const NodalViewT<VT>& v, int ls, const PO
         zeta2[ig] = pol.ma2(4, 6, tempzI[0][ig], bfc[0], tempzI[1][ig], bfc[1]);
 
     tempz[0][0] = diagDj[0][C_RIGHT] *
-                  pol.ma(4, 8, v.eta1[lkdr * NG + 0], nvTau(v, 0, 0, lkdr),
-                         nvMu(v, 0, 0, lkdr) + 6);
+                  pol.ma(4, 8, v.eta1[v.ndg(lkr, idirr, 0)], nvTau(v, 0, 0, lkr, idirr),
+                         nvMu(v, 0, 0, lkr, idirr) + 6);
     tempz[1][0] = diagDj[0][C_RIGHT] *
-                  pol.ma(4, 8, v.eta1[lkdr * NG + 0], nvTau(v, 1, 0, lkdr),
-                         nvMu(v, 1, 0, lkdr));
+                  pol.ma(4, 8, v.eta1[v.ndg(lkr, idirr, 0)], nvTau(v, 1, 0, lkr, idirr),
+                         nvMu(v, 1, 0, lkr, idirr));
     tempz[0][1] = diagDj[1][C_RIGHT] *
-                  pol.ma(4, 8, v.eta1[lkdr * NG + 1], nvTau(v, 0, 1, lkdr),
-                         nvMu(v, 0, 1, lkdr));
+                  pol.ma(4, 8, v.eta1[v.ndg(lkr, idirr, 1)], nvTau(v, 0, 1, lkr, idirr),
+                         nvMu(v, 0, 1, lkr, idirr));
     tempz[1][1] = diagDj[1][C_RIGHT] *
-                  pol.ma(4, 8, v.eta1[lkdr * NG + 1], nvTau(v, 1, 1, lkdr),
-                         nvMu(v, 1, 1, lkdr) + 6);
+                  pol.ma(4, 8, v.eta1[v.ndg(lkr, idirr, 1)], nvTau(v, 1, 1, lkr, idirr),
+                         nvMu(v, 1, 1, lkr, idirr) + 6);
 
     mat1g[0][0] = pol.ma(4, 10, -tempz[1][0], zeta1[0][1],
                          pol.ma(4, 9, -tempz[0][0], zeta1[0][0],
                                 -diagDj[0][C_LEFT] *
-                                    pol.ma(4, 8, v.eta1[lkdl * NG + 0],
-                                           nvTau(v, 0, 0, lkdl),
-                                           nvMu(v, 0, 0, lkdl) + 6)));
+                                    pol.ma(4, 8, v.eta1[v.ndg(lkl, idirl, 0)],
+                                           nvTau(v, 0, 0, lkl, idirl),
+                                           nvMu(v, 0, 0, lkl, idirl) + 6)));
     mat1g[1][0] = pol.ma(4, 10, -tempz[1][0], zeta1[1][1],
                          pol.ma(4, 9, -tempz[0][0], zeta1[1][0],
                                 -diagDj[0][C_LEFT] *
-                                    pol.ma(4, 8, v.eta1[lkdl * NG + 0],
-                                           nvTau(v, 1, 0, lkdl),
-                                           nvMu(v, 1, 0, lkdl))));
+                                    pol.ma(4, 8, v.eta1[v.ndg(lkl, idirl, 0)],
+                                           nvTau(v, 1, 0, lkl, idirl),
+                                           nvMu(v, 1, 0, lkl, idirl))));
     mat1g[0][1] = pol.ma(4, 10, -tempz[1][1], zeta1[0][1],
                          pol.ma(4, 9, -tempz[0][1], zeta1[0][0],
                                 -diagDj[1][C_LEFT] *
-                                    pol.ma(4, 8, v.eta1[lkdl * NG + 1],
-                                           nvTau(v, 0, 1, lkdl),
-                                           nvMu(v, 0, 1, lkdl))));
+                                    pol.ma(4, 8, v.eta1[v.ndg(lkl, idirl, 1)],
+                                           nvTau(v, 0, 1, lkl, idirl),
+                                           nvMu(v, 0, 1, lkl, idirl))));
     mat1g[1][1] = pol.ma(4, 10, -tempz[1][1], zeta1[1][1],
                          pol.ma(4, 9, -tempz[0][1], zeta1[1][0],
                                 -diagDj[1][C_LEFT] *
-                                    pol.ma(4, 8, v.eta1[lkdl * NG + 1],
-                                           nvTau(v, 1, 1, lkdl),
-                                           nvMu(v, 1, 1, lkdl) + 6)));
+                                    pol.ma(4, 8, v.eta1[v.ndg(lkl, idirl, 1)],
+                                           nvTau(v, 1, 1, lkl, idirl),
+                                           nvMu(v, 1, 1, lkl, idirl) + 6)));
 
     double bcc[2], vec1g[2];
 
     for (int ig = 0; ig < NG; ig++) {
         const double even_l =
-            pol.ma(4, 13, v.eta2[lkdl * NG + ig], v.dsncff6[lkdl * NG + ig],
-                   pol.ma2(4, 11, 3, v.dsncff2[lkdl * NG + ig], 10,
-                           v.dsncff4[lkdl * NG + ig]));
+            pol.ma(4, 13, v.eta2[v.ndg(lkl, idirl, ig)], v.dsncff6[v.ndg(lkl, idirl, ig)],
+                   pol.ma2(4, 11, 3, v.dsncff2[v.ndg(lkl, idirl, ig)], 10,
+                           v.dsncff4[v.ndg(lkl, idirl, ig)]));
         const double even_r =
-            pol.ma(4, 13, v.eta2[lkdr * NG + ig], v.dsncff6[lkdr * NG + ig],
-                   pol.ma2(4, 11, 3, v.dsncff2[lkdr * NG + ig], 10,
-                           v.dsncff4[lkdr * NG + ig]));
+            pol.ma(4, 13, v.eta2[v.ndg(lkr, idirr, ig)], v.dsncff6[v.ndg(lkr, idirr, ig)],
+                   pol.ma2(4, 11, 3, v.dsncff2[v.ndg(lkr, idirr, ig)], 10,
+                           v.dsncff4[v.ndg(lkr, idirr, ig)]));
         bcc[ig] = pol.ma2(4, 14, diagDj[ig][C_LEFT], even_l,
                           diagDj[ig][C_RIGHT], even_r);
         const double trl_l =
-            pol.ma2(4, 16, nvMatMI(v, 0, ig, lkl), sgnl * v.trlcff1[lkdl * NG + 0],
-                    nvMatMI(v, 1, ig, lkl), sgnl * v.trlcff1[lkdl * NG + 1]);
+            pol.ma2(4, 16, nvMatMI(v, 0, ig, lkl), sgnl * v.trlcff1[v.ndg(lkl, idirl, 0)],
+                    nvMatMI(v, 1, ig, lkl), sgnl * v.trlcff1[v.ndg(lkl, idirl, 1)]);
         const double trl_r =
-            pol.ma2(4, 16, nvMatMI(v, 0, ig, lkr), sgnr * v.trlcff1[lkdr * NG + 0],
-                    nvMatMI(v, 1, ig, lkr), sgnr * v.trlcff1[lkdr * NG + 1]);
+            pol.ma2(4, 16, nvMatMI(v, 0, ig, lkr), sgnr * v.trlcff1[v.ndg(lkr, idirr, 0)],
+                    nvMatMI(v, 1, ig, lkr), sgnr * v.trlcff1[v.ndg(lkr, idirr, 1)]);
         const double tz =
             pol.ma2(4, 18, tempz[0][ig], zeta2[0], tempz[1][ig], zeta2[1]);
         vec1g[ig] = pol.ma(4, 21, diagDj[ig][C_RIGHT], trl_r,
@@ -982,36 +1112,36 @@ RASBERY_XSR_HD inline void nodalJnet2n(const NodalViewT<VT>& v, int ls, const PO
     oddcff[1][0] = zeta2[0] - pol.ma2(4, 26, zeta1[0][0], s0, zeta1[1][0], s1);
     oddcff[1][1] = zeta2[1] - pol.ma2(4, 26, zeta1[0][1], s0, zeta1[1][1], s1);
 
-    oddcff[2][0] = pol.ma2(4, 28, nvTau(v, 0, 0, lkdr), oddcff[1][0],
-                           nvTau(v, 1, 0, lkdr), oddcff[1][1]);
-    oddcff[2][1] = pol.ma2(4, 28, nvTau(v, 0, 1, lkdr), oddcff[1][0],
-                           nvTau(v, 1, 1, lkdr), oddcff[1][1]);
+    oddcff[2][0] = pol.ma2(4, 28, nvTau(v, 0, 0, lkr, idirr), oddcff[1][0],
+                           nvTau(v, 1, 0, lkr, idirr), oddcff[1][1]);
+    oddcff[2][1] = pol.ma2(4, 28, nvTau(v, 0, 1, lkr, idirr), oddcff[1][0],
+                           nvTau(v, 1, 1, lkr, idirr), oddcff[1][1]);
 
     for (int ig = 0; ig < NG; ig++) {
-        double t = pol.ma2(4, 30, nvMu(v, 0, ig, lkdr), oddcff[1][0],
+        double t = pol.ma2(4, 30, nvMu(v, 0, ig, lkr, idirr), oddcff[1][0],
                            -nvMatMI(v, 0, ig, lkr),
-                           sgnr * v.trlcff1[lkdr * NG + 0]);
-        t = pol.ma(4, 32, nvMu(v, 1, ig, lkdr), oddcff[1][1], t);
+                           sgnr * v.trlcff1[v.ndg(lkr, idirr, 0)]);
+        t = pol.ma(4, 32, nvMu(v, 1, ig, lkr, idirr), oddcff[1][1], t);
         t = pol.ma(4, 33, -nvMatMI(v, 1, ig, lkr),
-                   sgnr * v.trlcff1[lkdr * NG + 1], t);
+                   sgnr * v.trlcff1[v.ndg(lkr, idirr, 1)], t);
         oddcff[0][ig] = t;
     }
 
     for (int ig = 0; ig < NG; ig++) {
         double chain = pol.ma2(4, 34, -1.0, oddcff[0][ig], 3,
-                               v.dsncff2[lkdr * NG + ig]);
+                               v.dsncff2[v.ndg(lkr, idirr, ig)]);
         chain = pol.ma(4, 36, -6, oddcff[1][ig], chain);
-        chain = pol.ma(4, 37, 10, v.dsncff4[lkdr * NG + ig], chain);
-        chain = pol.ma(4, 38, -v.eta1[lkdr * NG + ig], oddcff[2][ig], chain);
-        chain = pol.ma(4, 39, v.eta2[lkdr * NG + ig], v.dsncff6[lkdr * NG + ig], chain);
-        v.jnet[ls * NG + ig] = sgnr * v.hmesh[lkr * NDIR + idirr] * 0.5 *
-                               v.diagD[lkdr * NG + ig] * chain;
+        chain = pol.ma(4, 37, 10, v.dsncff4[v.ndg(lkr, idirr, ig)], chain);
+        chain = pol.ma(4, 38, -v.eta1[v.ndg(lkr, idirr, ig)], oddcff[2][ig], chain);
+        chain = pol.ma(4, 39, v.eta2[v.ndg(lkr, idirr, ig)], v.dsncff6[v.ndg(lkr, idirr, ig)], chain);
+        v.jnet[ls * NG + ig] = sgnr * v.hmesh[v.hm(lkr, idirr)] * 0.5 *
+                               v.diagD[v.ndg(lkr, idirr, ig)] * chain;
 
         v.phis[ls * NG + ig] =
             v.flux[lkr * NG + ig] -
             (oddcff[0][ig] + oddcff[1][ig] + oddcff[2][ig]) +
-            v.dsncff2[lkdr * NG + ig] + v.dsncff4[lkdr * NG + ig] +
-            v.dsncff6[lkdr * NG + ig];
+            v.dsncff2[v.ndg(lkr, idirr, ig)] + v.dsncff4[v.ndg(lkr, idirr, ig)] +
+            v.dsncff6[v.ndg(lkr, idirr, ig)];
     }
 }
 
@@ -1042,15 +1172,14 @@ RASBERY_XSR_HD inline void nodalCalculateJnet(const NodalViewT<VT>& v, int ls,
 template <class VT, class POL>
 RASBERY_XSR_HD inline void nodalEvenProbe(const NodalViewT<VT>& v, int lk, int idir,
                                           const POL& pol, double* out) {
-    const int lkd = lk * NDIR + idir;
     double    at2[2][2], a[2][2], rm4464[2], bt1[2], bt2[2], b[2];
 
     for (int igd = 0; igd < NG; igd++) {
         rm4464[igd] = 0.0;
-        if (fabs(v.m264[lkd * NG + igd]) > 1.0E-10)
-            rm4464[igd] = M044 / v.m264[lkd * NG + igd];
+        if (fabs(v.m264[v.ndg(lk, idir, igd)]) > 1.0E-10)
+            rm4464[igd] = M044 / v.m264[v.ndg(lk, idir, igd)];
         const double mu2 =
-            rm4464[igd] * v.m260[lkd * NG + igd] * v.diagDI[lkd * NG + igd];
+            rm4464[igd] * v.m260[v.ndg(lk, idir, igd)] * v.diagDI[v.ndg(lk, idir, igd)];
         out[23 + igd] = mu2;
         const double mu2c = M022 * RM220 * mu2;
         for (int igs = 0; igs < NG; igs++)
@@ -1062,18 +1191,18 @@ RASBERY_XSR_HD inline void nodalEvenProbe(const NodalViewT<VT>& v, int lk, int i
     out[2] = at2[0][0]; out[3] = at2[1][0]; out[4] = at2[0][1]; out[5] = at2[1][1];
 
     for (int igd = 0; igd < NG; igd++) {
-        const double mu1 = rm4464[igd] * v.m262[lkd * NG + igd];
+        const double mu1 = rm4464[igd] * v.m262[v.ndg(lk, idir, igd)];
         out[25 + igd] = mu1;
         for (int igs = 0; igs < NG; igs++) {
             const double t1 = pol.ma2(2, 0 + 2 * (igd * NG + igs), mu1, nvMatM(v, igs, igd, lk),
                                       nvMatM(v, 0, igd, lk), at2[igs][0]);
             a[igs][igd] = pol.ma(2, 8 + igd * NG + igs, nvMatM(v, 1, igd, lk), at2[igs][1], t1);
         }
-        a[igd][igd] = pol.ma(2, 12 + igd, v.diagD[lkd * NG + igd], M242, a[igd][igd]);
+        a[igd][igd] = pol.ma(2, 12 + igd, v.diagD[v.ndg(lk, idir, igd)], M242, a[igd][igd]);
         bt2[igd] = 2 * (pol.ma2(2, 14 + 2 * igd, nvMatM(v, 0, igd, lk), v.flux[lk * NG + 0],
                                 nvMatM(v, 1, igd, lk), v.flux[lk * NG + 1]) +
-                        v.trlcff0[lkd * NG + igd]);
-        bt1[igd] = M022 * RM220 * v.diagDI[lkd * NG + igd] * bt2[igd];
+                        v.trlcff0[v.ndg(lk, idir, igd)]);
+        bt1[igd] = M022 * RM220 * v.diagDI[v.ndg(lk, idir, igd)] * bt2[igd];
     }
     out[6] = a[0][0]; out[7] = a[1][0]; out[8] = a[0][1]; out[9] = a[1][1];
     out[10] = bt2[0]; out[11] = bt2[1];
@@ -1084,7 +1213,7 @@ RASBERY_XSR_HD inline void nodalEvenProbe(const NodalViewT<VT>& v, int lk, int i
     for (int ig = 0; ig < NG; ig++) {
         const double inner = pol.ma2(2, 18 + 2 * ig, nvMatM(v, 0, ig, lk), bt1[0],
                                      nvMatM(v, 1, ig, lk), bt1[1]);
-        b[ig] = pol.ma(2, 22 + ig, M022, v.trlcff2[lkd * NG + ig], inner);
+        b[ig] = pol.ma(2, 22 + ig, M022, v.trlcff2[v.ndg(lk, idir, ig)], inner);
     }
     out[14] = b[0]; out[15] = b[1];
 
@@ -1099,14 +1228,14 @@ RASBERY_XSR_HD inline void nodalEvenProbe(const NodalViewT<VT>& v, int lk, int i
     out[17] = c4l[0]; out[18] = c4l[1];
     for (int ig = 0; ig < NG; ig++) {
         const double c6v =
-            v.diagDI[lkd * NG + ig] * rm4464[ig] *
+            v.diagDI[v.ndg(lk, idir, ig)] * rm4464[ig] *
             pol.ma2(2, 30 + 2 * ig, nvMatM(v, 0, ig, lk), c4l[0], nvMatM(v, 1, ig, lk),
                     c4l[1]);
         out[19 + ig] = c6v;
-        const double t2 = pol.ma2(2, 34 + 2 * ig, v.diagDI[lkd * NG + ig], bt2[ig],
+        const double t2 = pol.ma2(2, 34 + 2 * ig, v.diagDI[v.ndg(lk, idir, ig)], bt2[ig],
                                   -M240, c4l[ig]);
         out[21 + ig] =
-            RM220 * pol.ma(2, 38 + ig, -v.m260[lkd * NG + ig], c6v, t2);
+            RM220 * pol.ma(2, 38 + ig, -v.m260[v.ndg(lk, idir, ig)], c6v, t2);
     }
 }
 

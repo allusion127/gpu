@@ -568,6 +568,64 @@ __global__ void kernelFlatXs(fxs::FlatXsView v) {
 
 namespace ndl = rasbery::nodal;
 
+/// WP21-C2: THE ONE PERMUTATION KERNEL, AND IT KNOWS NOTHING ABOUT NODAL.
+///
+/// Every private nodal array is a `rows x cols` table -- rows are nodes, cols
+/// are whatever the class packs per node ((dir, group), the 2x2, the three
+/// directions) -- and BOTH layouts address it as `row*row_stride +
+/// col*col_stride`.  That is not a coincidence to be relied on quietly: it is
+/// true because `ndg_dir == NG * ndg_grp` and `dg2_dir == NG2 * dg2_elem` hold
+/// in both layouts (src/NodalKernel.h), so the (dir, group) pair collapses to
+/// one column ordinal on either side.  One kernel therefore serves the pack
+/// (host order -> device order) AND the unpack, in both directions, for all
+/// four classes, by which strides the caller hands it.
+///
+/// IT IS A PURE PERMUTATION.  No arithmetic, no conversion, no reduction, and
+/// the LOGICAL element walked by thread `i` is the same on both sides -- so
+/// this cannot change a value, only where it lives.  That is what keeps
+/// WP21-C2 B0.
+template <class T>
+__global__ void kNodalPermute(T* __restrict__ dst, const T* __restrict__ src,
+                              int rows, int cols, int d_row, int d_col,
+                              int s_row, int s_col) {
+    const int i = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= rows * cols) return;
+    const int r = i / cols;
+    const int c = i - r * cols;
+    dst[r * d_row + c * d_col] = src[r * s_row + c * s_col];
+}
+
+template <class T>
+inline void nodalPermuteLaunch(T* dst, const T* src, int rows, int cols,
+                               int d_row, int d_col, int s_row, int s_col,
+                               cudaStream_t stream) {
+    const long long n = static_cast<long long>(rows) * cols;
+    if (n <= 0) return;
+    const int b = 256;
+    kNodalPermute<T><<<static_cast<int>((n + b - 1) / b), b, 0, stream>>>(
+        dst, src, rows, cols, d_row, d_col, s_row, s_col);
+}
+
+/// The NODE-MAJOR reference strides, taken from NodalViewT's OWN DEFAULTS.
+///
+/// Not respelled as literals here: the host arrays are in whatever layout the
+/// struct defaults to, so if that ever moves, the pack moves with it instead of
+/// silently packing from an order nothing is in.
+inline const ndl::NodalView& nodalAosStrides() {
+    static const ndl::NodalView aos{};
+    return aos;
+}
+
+/// The node-innermost strides for a deck of `nxyz` nodes, from the SAME
+/// function the views use.  A second spelling here is how a pack and a kernel
+/// end up disagreeing about one array.
+inline ndl::NodalView nodalSoaStrides(int nxyz) {
+    ndl::NodalView v = nodalAosStrides();
+    v.nxyz = nxyz;
+    return ndl::nodalNodeInnermostView(v);
+}
+
+
 // ---------------------------------------------------------------------------
 // WP21-C: THE TWO STORAGE ORDERS THE NODAL DRIVE RUNS IN, NAMED
 // ---------------------------------------------------------------------------
@@ -604,7 +662,22 @@ namespace ndl = rasbery::nodal;
 //     conversion, and the three reasons it is not here, are written down rather
 //     than implied: docs/WP21_BC_FLATXS_NODAL_COALESCING_20260831_KO.md §4.
 constexpr const char* kNodalCanonicalLayout = "element";
-constexpr const char* kNodalPrivateLayout   = "node_major";
+/// WP21-C2 CONVERTED THE PRIVATE ARRAYS, so there are now two private layouts
+/// and the receipt must print the one that RAN.  `kNodalPrivateLayout` is the
+/// shipped order (node-innermost); `kNodalPrivateLayoutAos` is the arm
+/// RASBERY_GPU_NODAL_SOA=0 selects, which is the order every HOST array in the
+/// tree is still in and always will be (Nodal.cpp's production phases, the
+/// RASBERY_NODAL_DUMP capture, the replay tools).
+constexpr const char* kNodalPrivateLayout    = "soa";
+constexpr const char* kNodalPrivateLayoutAos = "node_major";
+
+/// The one selector.  The receipt, the pack helpers and the view builders all
+/// ask `rasberyGpuNodalSoaEnabled()`; this is the only place that turns the
+/// answer into a word, so a run cannot print one layout and index another.
+inline const char* nodalPrivateLayoutName() {
+    return rasbery::rasberyGpuNodalSoaEnabled() ? kNodalPrivateLayout
+                                                : kNodalPrivateLayoutAos;
+}
 
 std::atomic<unsigned long long> g_nodal_drives{0};
 /// Rev.7.1 Task 18-lite receipt: bytes the canonical binding kept off the bus.
@@ -1359,6 +1432,13 @@ private:
         const std::size_t o_flux = take_slot(ng1);
         const std::size_t o_phis = take_slot(sg);
         const std::size_t o_reig = take_slot(1);
+        // WP21-C2: the permutation staging.  SHARED, not per slot: every use
+        // of it is stream-ordered on the arena's single _stream between the
+        // copy that fills it and the kernel that drains it, and the arena has
+        // exactly one stream by construction.  `ndg` is the largest class it
+        // ever holds.  Taken on BOTH arms so RASBERY_GPU_NODAL_SOA=0 does not
+        // move one address of the block.
+        const std::size_t o_perm = take_shared(ndg);
         const std::size_t o_tr0  = take_slot(ndg);
         const std::size_t o_tr1  = take_slot(ndg);
         const std::size_t o_tr2  = take_slot(ndg);
@@ -1421,12 +1501,30 @@ private:
             {p.idirlr, o_idirlr, ns * ndl::NLR * sizeof(int), true},
             {p.sgnlr, o_sgnlr, ns * ndl::NLR * sizeof(int), true},
         };
+        // WP21-C2: hmesh is the one geometry table in the permuted set, so its
+        // destination is the staging region when the arm is on and a kernel
+        // moves it into place.  Everything else here is surface- or
+        // node-indexed integer geometry the campaign deliberately left alone.
+        _soa = rasbery::rasberyGpuNodalSoaEnabled();
         for (const auto& g : geo) {
+            const bool permute = _soa && !g.is_int && g.off == o_hmesh;
             void* dst = g.is_int ? static_cast<void*>(_idx + g.off)
+                       : permute ? static_cast<void*>(_dbl + o_perm)
                                  : static_cast<void*>(_dbl + g.off);
             rc = rasbery::xfer::memcpy("CudaXsReconBackend.cu:NodalArena::init", "geometry",
                                  dst, g.src, g.bytes, cudaMemcpyHostToDevice);
             if (rc != cudaSuccess) { fail("cudaMemcpy(nodal arena geometry)", rc); return; }
+            if (permute) {
+                const ndl::NodalView& a = nodalAosStrides();
+                const ndl::NodalView  b = nodalSoaStrides(_nxyz);
+                nodalPermuteLaunch(_dbl + o_hmesh,
+                                   static_cast<const double*>(_dbl + o_perm),
+                                   _nxyz, ndl::NDIR, b.hm_node, b.hm_dir,
+                                   a.hm_node, a.hm_dir, _stream);
+                rc = rasbery::xfer::streamSync("CudaXsReconBackend.cu:NodalArena::init",
+                                               "hmesh permute", _stream);
+                if (rc != cudaSuccess) { fail("nodal arena hmesh permute", rc); return; }
+            }
         }
 
         // The SLOT-0 base view.  Everything the graph bakes lives here and none
@@ -1471,6 +1569,11 @@ private:
         _base.dsncff6    = _dbl + o_ds6;
         _base.reigv      = 0.0;              // superseded by reigv_dev, per slot
         _base.reigv_dev  = _dbl + o_reig;
+        // WP21-C2: the slot-0 base carries the layout, so `nodalSlotView` --
+        // which only advances pointers by element COUNTS -- hands every lane
+        // the same map, and the graph bakes it exactly once.
+        _d_perm          = _dbl + o_perm;
+        if (_soa) _base  = ndl::nodalNodeInnermostView(_base);
 
         _cnt_ndg = ndg; _cnt_ng1 = ng1; _cnt_ng2 = ng2; _cnt_sg = sg;
 
@@ -1780,10 +1883,25 @@ private:
             _h_reigv[s]          = sl.reigv;
 
             if (!sl.have_const || sl.const_gen != sl.res_const_gen) {
-                for (int i = 0; i < 9; ++i)
-                    if (!memcpyAsyncOrFail(_dbl_const(i) + s * _cnt_ndg, sl.h_const[i], ndgb,
+                // WP21-C2: same nine copies, same bytes, same tag; when the arm
+                // is on each lands in the shared staging region and a kernel
+                // reorders it into this slot's stripe.  The reuse across the
+                // nine (and across slots) is safe because the arena owns ONE
+                // stream and every copy and kernel here is issued on it.
+                const ndl::NodalView& a = nodalAosStrides();
+                const ndl::NodalView  b = nodalSoaStrides(_nxyz);
+                for (int i = 0; i < 9; ++i) {
+                    double* const cdst = _dbl_const(i) + s * _cnt_ndg;
+                    if (!memcpyAsyncOrFail(_soa ? _d_perm : cdst, sl.h_const[i], ndgb,
                                            cudaMemcpyHostToDevice, "nodal arena consts H2D"))
                         return drained();
+                    if (_soa)
+                        nodalPermuteLaunch(cdst,
+                                           static_cast<const double*>(_d_perm),
+                                           _nxyz, ndl::NDIR * ndl::NG,
+                                           b.ndg_node, b.ndg_grp,
+                                           a.ndg_node, a.ndg_grp, _stream);
+                }
                 sl.res_const_gen = sl.const_gen;
                 sl.have_const    = true;
             }
@@ -2025,6 +2143,10 @@ private:
     bool           _compact     = nodalCompactEnabled();
     double*        _h_reigv     = nullptr; // pinned
 
+    /// WP21-C2: the shared permutation staging and the arm it serves.
+    double*         _d_perm = nullptr;
+    bool            _soa    = false;
+
     ndl::NodalView  _base{};
     /// One instantiation per (bucket, fusion, geometry).  A graph bakes grid.y,
     /// so the dispatch width IS topology; the coarse bucket ladder is what keeps
@@ -2147,7 +2269,8 @@ struct NodalReceipt {
                   // first is a two-sided invariant with WP21-A and the second is
                   // a standing statement of an inventoried residual.
                   << ",\"canonical_layout\":\"" << kNodalCanonicalLayout
-                  << "\",\"private_layout\":\"" << kNodalPrivateLayout << "\"}"
+                  << "\",\"private_layout\":\"" << nodalPrivateLayoutName()
+                  << "\"}"
                   << std::endl;
 
         // The arena's own receipt, on its own tag so nothing consuming the line
@@ -2372,6 +2495,8 @@ struct XsReconBackend::Impl {
     unsigned long long resident_const_generation = 0;
     unsigned long long resident_chif_generation  = 0;
     int                nodal_nsurf = 0;
+    /// WP21-C2 permutation staging (doubles), inside ndev_dbl.
+    std::size_t n_off_perm = 0;
     std::size_t n_off_hmesh = 0, n_off_albedo = 0, n_off_consts = 0,
                 n_off_chif = 0, n_off_jnet = 0, n_off_flux = 0, n_off_phis = 0,
                 n_off_reigv = 0, n_off_work = 0;
@@ -4660,6 +4785,15 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         } else {
             d.n_off_work = off; off += nwork;
         }
+        // WP21-C2: the permutation staging.  One `ndg0`-double region -- the
+        // largest class this backend ever permutes (the nine constants and the
+        // hybrid arm's trlcff0/trlcff2; matM at nx*NG2 and hmesh at nx*NDIR are
+        // smaller and reuse it) -- so the H2D and the D2H keep their exact byte
+        // counts, their exact directions and their exact xfer:: tags, and the
+        // reorder happens on the device between them.  405 KB on the KNGR deck.
+        // ALLOCATED ON BOTH ARMS: `RASBERY_GPU_NODAL_SOA=0` must not change one
+        // address of this block, or the A/B would be comparing two allocations.
+        d.n_off_perm = off; off += ndg0;
         RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&d.ndev_dbl),
                                           off * sizeof(double)), d.status);
         if (nnarrow) {
@@ -4689,12 +4823,31 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     }
     const std::size_t ndg = nx * ndl::NDIR * ndl::NG;
 
+    // WP21-C2.  Resolved ONCE per call, and the two stride sets come from the
+    // view's own defaults and from the same nodalNodeInnermostView() the kernels
+    // are handed -- so a pack and a kernel cannot disagree about one array.
+    const bool nsoa = rasberyGpuNodalSoaEnabled();
+    const ndl::NodalView& n_aos = nodalAosStrides();
+    const ndl::NodalView  n_soa = nodalSoaStrides(static_cast<int>(nx));
+    double* const         n_perm = d.ndev_dbl + d.n_off_perm;
+
     if (!d.nodal_geom_uploaded) {
+        // WP21-C2: hmesh is the one GEOMETRY table in the permuted set.  The
+        // copy below is byte-for-byte what it always was; when the arm is on it
+        // lands in the staging region and a permutation kernel moves it into
+        // place, so the ledger sees one H2D of nx*NDIR doubles either way.
         RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal", "hmesh",
-                                     d.ndev_dbl + d.n_off_hmesh, host.hmesh,
+                                     nsoa ? n_perm : d.ndev_dbl + d.n_off_hmesh,
+                                     host.hmesh,
                                      nx * ndl::NDIR * sizeof(double),
                                      cudaMemcpyHostToDevice, d.stream),
                          d.status);
+        if (nsoa)
+            nodalPermuteLaunch(d.ndev_dbl + d.n_off_hmesh,
+                               static_cast<const double*>(n_perm),
+                               static_cast<int>(nx), ndl::NDIR,
+                               n_soa.hm_node, n_soa.hm_dir,
+                               n_aos.hm_node, n_aos.hm_dir, d.stream);
         RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal", "albedo",
                                      d.ndev_dbl + d.n_off_albedo, host.albedo,
                                      ndl::NDIR * ndl::NLR * sizeof(double),
@@ -4752,6 +4905,21 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
                                 "consts stage reuse", d.nodal_stage_event);
             for (int i = 0; i < 9; ++i) {
                 float* stg = d.nodal_stage + static_cast<std::size_t>(i) * ndg;
+                // WP21-C2.  The narrow arm already touches every element on the
+                // host to convert it, so the permutation is FREE here -- it is
+                // the destination subscript of a loop that had to run anyway,
+                // and it needs no device staging and no extra kernel.  Reading
+                // `[e]` linearly is reading the node-major order, which is what
+                // the host arrays are in.
+                if (nsoa)
+                    for (int lk = 0; lk < static_cast<int>(nx); ++lk)
+                        for (int c = 0; c < ndl::NDIR * ndl::NG; ++c)
+                            stg[static_cast<std::size_t>(lk * n_soa.ndg_node +
+                                                         c * n_soa.ndg_grp)] =
+                                static_cast<float>(
+                                    consts[i][static_cast<std::size_t>(
+                                        lk * n_aos.ndg_node + c * n_aos.ndg_grp)]);
+                else
                 for (std::size_t e = 0; e < ndg; ++e)
                     stg[e] = static_cast<float>(consts[i][e]);
                 RASBERY_CUDA_TRY(
@@ -4773,13 +4941,28 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
             if (d.nodal_stage_event != nullptr)
                 cudaEventRecord(d.nodal_stage_event, d.stream);
         } else {
-            for (int i = 0; i < 9; ++i)
+            for (int i = 0; i < 9; ++i) {
+                // WP21-C2.  Same bytes, same tag, same direction; when the arm
+                // is on the copy lands in the staging region and the kernel
+                // below reorders it.  Staging is reused nine times in a row --
+                // safe because every one of these is stream-ordered on
+                // d.stream, so copy i+1 cannot start before permute i finished.
                 RASBERY_CUDA_TRY(
                     xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal", "consts",
-                                        d.ndev_dbl + d.n_off_consts + i * ndg, consts[i],
+                                        nsoa ? n_perm
+                                             : d.ndev_dbl + d.n_off_consts + i * ndg,
+                                        consts[i],
                                         ndg * sizeof(double), cudaMemcpyHostToDevice,
                                         d.stream),
                     d.status);
+                if (nsoa)
+                    nodalPermuteLaunch(d.ndev_dbl + d.n_off_consts + i * ndg,
+                                       static_cast<const double*>(n_perm),
+                                       static_cast<int>(nx),
+                                       ndl::NDIR * ndl::NG,
+                                       n_soa.ndg_node, n_soa.ndg_grp,
+                                       n_aos.ndg_node, n_aos.ndg_grp, d.stream);
+            }
         }
         // WP15 §2.  NOT ELIDED, and the census says why.  These nine arrays are
         // recomputed on the HOST by Nodal::updateConstant every time xsrf/xsdf
@@ -4902,6 +5085,16 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         v.dsncff6 = wk; wk += ndg;
     }
 
+    // WP21-C2: THE LAYOUT, ONCE, AFTER EVERY POINTER IS BOUND.
+    //
+    // The strides are not pointers -- they say how the kernels walk whatever is
+    // behind them -- so this line and the packs above are ONE decision that
+    // must be taken together.  Applying it here, at the end of the bind and
+    // before the first launch, means the FP32 shell below (`nodalWideShell`
+    // copies the ten strides verbatim), the hybrid arm's downloads and the
+    // captured graph all see the same map.
+    if (nsoa) v = ndl::nodalNodeInnermostView(v);
+
     const int B  = 128;
     const int gn = (host.nxyz + B - 1) / B;
     const int gs = (host.nsurf + B - 1) / B;
@@ -4957,19 +5150,51 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         // and finish in solveNodalPost.
         const std::size_t ndg2 = nx * ndl::NDIR * ndl::NG;
         double* wk0 = d.ndev_dbl + d.n_off_work;
-        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal(hybrid)",
-                                     "trlcff0", host.trlcff0, wk0,
-                                     ndg2 * sizeof(double), cudaMemcpyDeviceToHost,
-                                     d.stream),
-                         d.status);
-        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal(hybrid)",
-                                     "trlcff2", host.trlcff2, wk0 + 2 * ndg2,
-                                     ndg2 * sizeof(double), cudaMemcpyDeviceToHost,
-                                     d.stream),
-                         d.status);
         double* wmat = wk0 + 3 * ndg2 + 2 * nx * ndl::NDIR * ndl::NG2;
+        // WP21-C2: THE UNPACK.  `Nodal::calculateEven` is about to run on the
+        // HOST, over `_trlcff0` / `_trlcff2` / `_matM`, in Nodal.cpp's own
+        // node-major code -- which is exactly why the host arrays were never
+        // permuted.  So the three downloads reverse the permutation on the
+        // device first and copy the same bytes to the same addresses.  Reusing
+        // one staging region for three transfers is safe for the same reason
+        // the const upload's reuse is: everything here is stream-ordered on
+        // d.stream, and the drain below closes the sequence.
+        const double* src_tr0 = wk0;
+        const double* src_tr2 = wk0 + 2 * ndg2;
+        const double* src_mat = wmat;
+        if (nsoa) {
+            nodalPermuteLaunch(n_perm, static_cast<const double*>(wk0),
+                               static_cast<int>(nx), ndl::NDIR * ndl::NG,
+                               n_aos.ndg_node, n_aos.ndg_grp,
+                               n_soa.ndg_node, n_soa.ndg_grp, d.stream);
+            src_tr0 = n_perm;
+        }
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal(hybrid)",
+                                     "trlcff0", host.trlcff0, src_tr0,
+                                     ndg2 * sizeof(double), cudaMemcpyDeviceToHost,
+                                     d.stream),
+                         d.status);
+        if (nsoa) {
+            nodalPermuteLaunch(n_perm, static_cast<const double*>(wk0 + 2 * ndg2),
+                               static_cast<int>(nx), ndl::NDIR * ndl::NG,
+                               n_aos.ndg_node, n_aos.ndg_grp,
+                               n_soa.ndg_node, n_soa.ndg_grp, d.stream);
+            src_tr2 = n_perm;
+        }
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal(hybrid)",
+                                     "trlcff2", host.trlcff2, src_tr2,
+                                     ndg2 * sizeof(double), cudaMemcpyDeviceToHost,
+                                     d.stream),
+                         d.status);
+        if (nsoa) {
+            nodalPermuteLaunch(n_perm, static_cast<const double*>(wmat),
+                               static_cast<int>(nx), ndl::NG2,
+                               n_aos.ng2_node, n_aos.ng2_elem,
+                               n_soa.ng2_node, n_soa.ng2_elem, d.stream);
+            src_mat = n_perm;
+        }
         RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal(hybrid)", "matM",
-                                     host.matM, wmat, nx * ndl::NG2 * sizeof(double),
+                                     host.matM, src_mat, nx * ndl::NG2 * sizeof(double),
                                      cudaMemcpyDeviceToHost, d.stream),
                          d.status);
         RASBERY_CUDA_TRY(xfer::streamSync("CudaXsReconBackend.cu:solveNodal(hybrid)", "drain",
@@ -5483,18 +5708,30 @@ bool XsReconBackend::solveNodalPost(const ndl::NodalView& host) {
     double* wk0 = d.ndev_dbl + d.n_off_work;
     double* wds = wk0 + 3 * ndg2 + 2 * nx * ndl::NDIR * ndl::NG2 +
                   4 * nx * ndl::NG2;
-    RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodalPost", "dsncff2", wds,
-                                 host.dsncff2, ndg2 * sizeof(double),
-                                 cudaMemcpyHostToDevice, d.stream),
-                     d.status);
-    RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodalPost", "dsncff4",
-                                 wds + ndg2, host.dsncff4, ndg2 * sizeof(double),
-                                 cudaMemcpyHostToDevice, d.stream),
-                     d.status);
-    RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodalPost", "dsncff6",
-                                 wds + 2 * ndg2, host.dsncff6, ndg2 * sizeof(double),
-                                 cudaMemcpyHostToDevice, d.stream),
-                     d.status);
+    // WP21-C2: THE PACK, and it is the mirror of solveNodal(hybrid)'s unpack.
+    // The three blocks come from `Nodal::calculateEven`, which ran on the host
+    // over host arrays -- node-major, unconditionally -- so the copies below
+    // land in the staging region and a permutation kernel puts them where the
+    // jnet kernel will look.  Same bytes, same tags, same direction.
+    const bool            nsoa   = rasberyGpuNodalSoaEnabled();
+    const ndl::NodalView& n_aos  = nodalAosStrides();
+    const ndl::NodalView  n_soa  = nodalSoaStrides(static_cast<int>(nx));
+    double* const         n_perm = d.ndev_dbl + d.n_off_perm;
+    const double* const   dsn[3] = {host.dsncff2, host.dsncff4, host.dsncff6};
+    const char* const     dtag[3] = {"dsncff2", "dsncff4", "dsncff6"};
+    for (int i = 0; i < 3; ++i) {
+        double* const dst = wds + static_cast<std::size_t>(i) * ndg2;
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodalPost", dtag[i],
+                                     nsoa ? n_perm : dst, dsn[i],
+                                     ndg2 * sizeof(double),
+                                     cudaMemcpyHostToDevice, d.stream),
+                         d.status);
+        if (nsoa)
+            nodalPermuteLaunch(dst, static_cast<const double*>(n_perm),
+                               static_cast<int>(nx), ndl::NDIR * ndl::NG,
+                               n_soa.ndg_node, n_soa.ndg_grp,
+                               n_aos.ndg_node, n_aos.ndg_grp, d.stream);
+    }
 
     ndl::NodalView v = host;
     v.lklr    = d.ndev_int + d.n_ioff_lklr;
@@ -5533,6 +5770,11 @@ bool XsReconBackend::solveNodalPost(const ndl::NodalView& host) {
     v.dsncff2 = wk; wk += ndg2;
     v.dsncff4 = wk; wk += ndg2;
     v.dsncff6 = wk; wk += ndg2;
+
+    // WP21-C2: the same layout solveNodal enqueued its phases with.  This
+    // function finishes THAT drive over THOSE arrays, so a different map here
+    // would read the device's own trlcff1/mu/tau through the wrong one.
+    if (nsoa) v = ndl::nodalNodeInnermostView(v);
 
     const int B  = 128;
     const int gs = (host.nsurf + B - 1) / B;
@@ -5880,6 +6122,20 @@ int rasberyGpuFlatXsCtaTile() {
 
 bool rasberyGpuNodalEnabled() {
     static const bool on = envFlagEnabled("RASBERY_GPU_NODAL");
+    return on;
+}
+
+bool rasberyGpuNodalSoaEnabled() {
+    // WP21-C2.  envFlagDisabled, i.e. ABSENT MEANS ON: the node-innermost
+    // layout is what the drive ships with and RASBERY_GPU_NODAL_SOA=0 is the
+    // A/B reference.  Both arms compute the same doubles from the same
+    // operands in the same order -- the permutation moves WHERE an element
+    // lives, never which element an arithmetic site reads -- and
+    // test/nodal_layout_equivalence.cpp proves that bit-for-bit on every build,
+    // with a sabotage arm that requires the comparison to FAIL when a stride is
+    // swapped.  What the off switch buys is a one-variable bisect if the 238
+    // digest ever disagrees.
+    static const bool on = !envFlagDisabled("RASBERY_GPU_NODAL_SOA");
     return on;
 }
 

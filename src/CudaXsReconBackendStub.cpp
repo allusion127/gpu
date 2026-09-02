@@ -169,6 +169,9 @@ unsigned long long rasberyGpuFlatXsCtaTailNodes() { return 0; }
 
 bool rasberyGpuNodalEnabled() { return false; }
 
+// WP21-C2.  No device, no device array, no permutation.
+bool rasberyGpuNodalSoaEnabled() { return false; }
+
 bool rasberyGpuXeEnabled() { return false; }
 
 bool rasberyGpuXeTxnEnabled() { return false; }

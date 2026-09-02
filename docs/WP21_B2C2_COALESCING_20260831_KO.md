@@ -173,9 +173,114 @@ RASBERY_GPU_FLATXS_CTA_TILE=<n>     # 미설정 = arm 기본(FP64 4 / FP32 8), 1
 
 ---
 
-## 3. WP21-C2 — nodal stride 뷰 (이 커밋에서는 미착수)
+## 3. WP21-C2 — nodal stride 뷰
 
-§4 이후는 두 번째 커밋에서 채운다.
+### 3.0 선행 문서의 사실관계 하나를 정정한다
+
+WP21-C는 미변환의 첫 번째 사유로 이렇게 적었다: *"`src/Nodal.cpp:884/958`이 자기 호스트 배열
+위에서 **같은 함수들을** 프로덕션 경로로 돌린다."* **그렇지 않다.** 884와 958은
+`Nodal::MakeView()` 호출이고(하나는 `RASBERY_NODAL_DUMP` 캡처, 하나는 `TryDriveGpu`의
+디바이스 핸드오프), `Nodal.cpp`의 프로덕션 위상 함수들(`caltrlcff0`/`caltrlcff12`/
+`updateMatrix`/`calculateEven`/`calculateJnet`)은 **`NodalKernel.h`를 전혀 호출하지 않는
+독립 구현**이다. 트리 전체에서 공유 본문을 부르는 곳은 `CudaXsReconBackend.cu`(디바이스),
+`test/nodal_device_replay.cu`·`test/nodal_mine_device.cu`(디바이스), 그리고
+`test/nodal_replay.cpp`(**호스트**) 넷뿐이다.
+
+**결론은 그래도 바뀌지 않는다.** 호스트 배열은 여전히 노드-메이저여야 한다 —
+`Nodal.cpp`의 자기 코드가 그 순서로 읽고 쓰고, 하이브리드 arm이 그 배열로 D2H를 받고,
+캡처 파일 포맷이 그 순서이며, `test/nodal_replay.cpp`가 그 캡처 위에서 공유 본문을 돈다.
+바뀌는 것은 **컴파일 타임 플립이 왜 안 되는가**의 이유이지 **안 된다**는 사실이 아니다.
+그래서 WP21-C가 §4.2에서 설계한 형태 2(뷰가 stride를 나른다)가 그대로 옳고, 이 WP는 그것을
+지었다.
+
+### 3.1 설계 — 뷰가 stride를 나르고, 기본값이 호스트 레이아웃이다
+
+`NodalViewT`에 **열 개의 stride**가 붙고, 기본값이 **오늘의 노드-메이저 값**이다:
+
+| 클래스 | 배열 | AoS 기본(호스트) | SoA(디바이스) |
+|---|---|---|---|
+| `ndg` (node,dir,group) | 상수 9 + `trlcff0/1/2` + `dsncff2/4/6` = **15** | `lk*6 + idir*2 + ig` | `lk + idir*2·nxyz + ig·nxyz` |
+| `dg2` (node,dir) 2×2 | `mu`, `tau` = **2** | `lk*12 + idir*4 + e` | `lk + idir*4·nxyz + e·nxyz` |
+| `ng2` (node) 2×2 | `matM/matMI/matMs/matMf` = **4** | `lk*4 + e` | `lk + e·nxyz` |
+| `hm` (node,dir) | `hmesh` = **1** | `lk*3 + idir` | `lk + idir·nxyz` |
+
+`NodalView v{}` — `Nodal::MakeView`, `nodalDumpState`, `test/nodal_replay.cpp`,
+`test/canonical_state.cpp`, `test/nodal_device_replay.cu`가 전부 쓰는 형태 — 는 **기본값을
+받으므로 한 글자도 바뀌지 않는다.** 디바이스 뷰만 `nodalNodeInnermostView(v)`를 통과한다.
+
+인덱스는 네 개의 접근자로만 합성된다(`v.ndg(lk,idir,ig)`, `v.dg2(lk,idir,e)`,
+`v.ng2(lk,e)`, `v.hm(lk,idir)`). 변환된 지점: **ndg 113 + dg2 6 + ng2 14 + hmesh 9 = 142**,
+그리고 `nvMu`/`nvTau` 호출 38곳(시그니처가 `lkd` → `(lk, idir)`로 바뀌었다 — `lkd`는 그
+자체가 AoS 주소이고, 노드-최내측에서 `lk`와 `idir`는 stride가 다르므로 곱에서 되찾으려면
+나눗셈이 필요하다). 인라인 노드-메이저 철자는 **0개** 남았고, 계약 테스트가 그 0을 강제한다.
+
+비용은 인덱스마다 IMAD 세 개다. 분기보다 싸고, 템플릿 파라미터와 달리 5,900줄 TU의 커널
+인스턴스를 두 배로 만들지 않는다. **하나의 본문을 유지하는 가장 싼 형태다.**
+
+### 3.2 전송 — 바이트는 하나도 안 움직인다
+
+디바이스에서만 순열이 일어나므로, 모든 H2D/D2H는 **같은 바이트 수·같은 방향·같은
+`xfer::` 태그**를 유지한다. 순열은 복사와 커널 사이에서 일어난다:
+
+| 배열 | 방향 | 빈도 | 처리 |
+|---|---|---|---|
+| 상수 9종 | H2D | 세대 변화마다(런당 ~9,675 호출) | 스테이징으로 복사 → `kNodalPermute` |
+| `hmesh` | H2D | 런당 1회 | 〃 |
+| `trlcff0`,`trlcff2`,`matM` | D2H | hybrid arm(`RASBERY_GPU_NODAL_FULL` 미설정)의 드라이브마다 | `kNodalPermute`로 언팩 → 복사 |
+| `dsncff2/4/6` | H2D | 〃 hybrid (`solveNodalPost`) | 복사 → `kNodalPermute` |
+| `trlcff1`,`mu`,`tau`,`matMI/Ms/Mf` | — | 전송 안 됨 | 순열 불필요 |
+| `flux`,`jnet`,`phis`,`xs*` | 양방향 | — | **순열 안 함**(§3.3) |
+
+- **스테이징은 `ndg` 더블 하나**(KNGR 덱에서 50,706 × 8 = 396 KiB). 인스턴스마다 하나,
+  아레나에는 **공유** 하나. 아홉 상수를 연달아 재사용해도 안전한 이유는 전부 **같은
+  스트림에 순서지어 발행**되기 때문이다 — 복사 i+1은 순열 i가 끝난 뒤에 시작한다.
+- **FP32 arm은 스테이징도 커널도 쓰지 않는다.** 좁은 arm은 이미 호스트에서 원소마다
+  double→float 변환 루프를 돌므로, 순열은 **그 루프의 목적지 첨자**일 뿐이고 공짜다.
+- 두 arm 모두에서 스테이징을 **할당한다**. `RASBERY_GPU_NODAL_SOA=0`이 블록의 주소를 하나도
+  움직이면 A/B가 두 개의 다른 할당을 비교하게 된다.
+
+### 3.3 움직일 수 없는 것 — 그리고 그 이유
+
+| 배열 | 인덱스 | 왜 그대로인가 |
+|---|---|---|
+| `flux` / `jnet` / `phis` | `[lk*NG+ig]` / `[ls*NG+ig]` | **정본 핸드오프.** 공유 모드에서 이 포인터가 곧 CMFD 백엔드의 버퍼다. WP21-A가 CMFD 쪽 `phi`/`dtil`/`dhat`를 `[2l+ig]`에 남긴 것과 **짝을 이루는 양면 불변식**이고, 한쪽만 움직이면 두 백엔드가 같은 바이트를 다른 지도로 읽는다 |
+| `lklr` / `idirlr` / `sgnlr` | `[ls*NLR+side]` | 서페이스-인덱스 지오메트리. 4→2섹터를 사지만 커널 로드의 몇 %다. 같은 파일에서 나중에 |
+| `xsrf`/`xsnf`/`xssm`/`chif` | `[ig*nxyz+lk]` | **이미 노드-최내측**이다 |
+| `albedo` | `[dir*NLR+side]` | 6개 테이블, 워프 전체 브로드캐스트 |
+| 호스트 배열 전부 | 노드-메이저 | §3.0 |
+
+### 3.4 게이트 — `test/nodal_layout_equivalence.cpp`
+
+"하나의 본문이 두 레이아웃을 섬긴다"는 **소스 속성이 아니라 두 실행 사이의 동치**다. 그리고
+그것을 확인하는 데는 GPU도 nvcc도 캡처도 필요 없다:
+
+1. 4×3×5 구조 격자(노드 60, 서페이스 227)를 세운다 — 내부 2n 서페이스와 양쪽 경계 1n
+   서페이스, 없는 이웃까지 전부 나오도록.
+2. 결정론적 LCG로 채운다.
+3. 다섯 위상을 **두 번** 돈다: 노드-메이저 배열 + 기본 stride, 그리고 **같은 값을**
+   노드-최내측으로 팩한 배열 + 순열 stride.
+4. 모든 출력(15 ndg + 2 dg2 + 4 ng2 + jnet + phis)을 **비트 패턴으로** 비교한다.
+
+`ctest`가 두 arm을 등록한다: 평범한 arm은 mismatch 0을 요구하고,
+**`RASBERY_NODAL_LAYOUT_SABOTAGE=1` arm은 `ndg_dir`와 `ndg_grp`를 맞바꾼 뒤 비교가 실패할
+것을 요구한다.** 뒤바뀐 stride는 모든 인덱스를 범위 안에 두고 모든 값을 유한하게 두므로 —
+바로 이 WP가 두려워하는 버그의 모양이다 — 그것이 걸리지 않으면 이 게이트는 아무것도 재고
+있지 않다는 뜻이다. 로컬에서 두 arm 모두 통과했다(mismatch 0 / 5,648).
+
+팩 루틴은 **두 뷰의 접근자로 쓰여 있다**: 소스 첨자는 AoS 뷰에서, 목적지 첨자는 SoA 뷰에서
+온다. 그래서 stride 하나가 틀리면 값이 커널이 보지 않는 곳으로 가고 §4의 비교가 깨진다 —
+팩이 커널과 같은 방향으로 틀려서 게이트를 통과하는 경로가 없다.
+
+### 3.5 기대 ncu
+
+| 커널 | ld 전 | **ld 후 기대** | 근거 |
+|---|---:|---:|---|
+| `kNodalJnet<0>` | **16.7** | **~3** | 스레드=서페이스. X방향 서페이스에서는 `lk`가 `ls`에 대해 연속이라 8 B stride(모델 2)로 가지만, Y/Z에서는 `lk`가 `nx`/`nxy` 간격으로 뛰어 게더로 남는다. **방향별로 이득이 다르므로 ~2가 아니라 ~3을 적는다** |
+| `kNodalTrl0/Trl12/Mat/Even/MatEven` | 미측정 | 개선 | 전부 **thread-per-node**라 `lk`가 레인에 대해 연속이다. **jnet보다 이쪽 몫이 더 클 수 있다** — 블록 39는 이 다섯을 재지 않았으므로 이번에 같이 잰다 |
+| `kNodalPermute` (신규) | — | — | 상수 세대마다 9회 × 50,706 원소. 드라이브당이 아니라 **세대당**이다 |
+
+`[RASBERY][XFER]` 총계는 **바이트도 호출도 불변**이어야 한다. 움직이면 순열이 복사를
+추가했다는 뜻이고, 그것은 이 설계가 하지 않기로 한 일이다.
 
 ---
 
@@ -208,8 +313,11 @@ python3 tools/test_xfer_ledger_contract.py
 python3 tools/test_enum_alias_contract.py
 python3 tools/test_dependent_template_contract.py
 python3 tools/test_nodal_gpu_refactor_contract.py
-ctest
+ctest   # nodal_layout_equivalence 와 nodal_layout_equivalence_negative 포함
 ```
+
+`ctest`의 두 항목이 WP21-C2의 실질 게이트다(§3.4): 평범한 arm은 mismatch 0,
+sabotage arm은 mismatch > 0을 요구한다.
 
 ### 6.1 리플레이 게이트 — **이것이 B0의 실증이다**
 
@@ -242,6 +350,18 @@ env $V6_ENV RASBERY_GPU_FLATXS_CTA_TILE=1 <arm> ... -o "$OUT/a_tile1"   # 미타
 - `[RASBERY][MICX][LAYOUT]`가 `"layout":"soa","layout_version":2` (불변)
 - `[RASBERY][XFER]` 총계 바이트/호출 **불변**
 - CSV(핀 파워/AO/keff) 전 항목 Δ = 0
+- `[RASBERY][NODAL][GPU]`가 `"private_layout":"soa"` (WP21-C2 arm이 돌았다는 진술)
+- `[RASBERY][NODAL_ARENA]`가 `"canon_locked":1` (WP19.2b)
+
+WP21-C2의 A/B도 같은 형태로 한 쌍 더 돈다:
+
+```bash
+env $V6_ENV RASBERY_GPU_NODAL_SOA=0 <arm> ... -o "$OUT/a_soa0"
+```
+
+합격 조건: digest 동일 + `h5diff -c` 0 + `[RASBERY][XFER]` **바이트/호출 불변**
+(§3.2 — 순열은 복사를 추가하지 않는다) + `private_layout`가 `"node_major"`로 바뀔 것.
+**digest가 갈리면 `RASBERY_GPU_NODAL_SOA`가 곧 이분점이다.**
 
 ### 6.3 ncu 재측정 — 블록 39와 같은 디렉티브
 

@@ -629,6 +629,22 @@ unsigned long long rasberyGpuXeCommits();
 /// RASBERY_GPU_NODAL, read once per process.  Stub builds return false.
 bool rasberyGpuNodalEnabled();
 
+/// RASBERY_GPU_NODAL_SOA, read once per process: WP21-C2's NODE-INNERMOST
+/// layout for the nodal drive's private arrays (the nine updateConstant
+/// products, the twelve working arrays, the four per-node matrices, hmesh).
+/// DEFAULT ON -- `=0` is the off switch and the A/B reference.
+///
+/// It is a PERMUTATION, not a precision or a schedule: the same double is read
+/// from a different address by the same arithmetic site, which is why the
+/// layout travels in NodalViewT as strides and why the host arrays -- Nodal.cpp
+/// production phases, the RASBERY_NODAL_DUMP capture, the replay tools -- keep
+/// the node-major order unconditionally.  The backend packs at upload and
+/// unpacks at the hybrid arm's download, so `[RASBERY][XFER]` byte counts are
+/// identical on both arms.  test/nodal_layout_equivalence.cpp proves the two
+/// layouts compute bit-identical outputs on every build.  Stub builds return
+/// false: with no CUDA there is no device array to permute.
+bool rasberyGpuNodalSoaEnabled();
+
 /// RASBERY_GPU_NODAL_FULL: run calculateEven on the device too, so the drive
 /// is one uninterrupted device pipeline instead of the hybrid round-trip.
 ///
