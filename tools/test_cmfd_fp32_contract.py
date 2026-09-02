@@ -17,11 +17,19 @@ check by diffing an h5:
   4. the FP32 reductions use a float payload with a DOUBLE accumulator and reuse
      the unmodified double stage-2 folds;
   5. the non-finite fallback to FP64 exists, is env-independent, and invalidates
-     the cached graphs.
+     the cached graphs;
+  6. the fallback ROLLS THE FLUX BACK.  update_solution_f32's non-finite guard is
+     per ELEMENT while the flag, the halt and the host valve are per SLOT, so
+     without an explicit rollback the flux that survives the valve is a mixture
+     of advanced and frozen nodes -- and absorb() clears the flag on it, adopts
+     the mirror and lets the run report success with one stale node.  Section 6
+     is the guard against that, with negative controls, because it is exactly
+     the kind of claim a comment can assert and no h5 diff can check.
 """
 from __future__ import annotations
 
 import py_compile
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -132,6 +140,8 @@ FP32_KERNELS = (
     "prepare_p_jacobi_f32",
     "update_s_jacobi_f32",
     "update_solution_f32",
+    "snapshot_flux_f32",
+    "restore_flux_f32",
 )
 for kernel in FP32_KERNELS:
     if f"__global__ void {kernel}(" not in CUDA:
@@ -441,5 +451,219 @@ if "BATCH_OCCUPANCY" not in CUDA:
 if "_f32" in body_after("void CudaBatchArena::reportBatchOccupancy"):
     fail("BATCH_OCCUPANCY must be unchanged by the precision mode")
 
+# ---------------------------------------------------------------------------
+# 6. THE ROLLBACK -- what makes absorb()'s "the failed FP32 attempt is
+#    DISCARDED, never accepted" a fact instead of a sentence.
+#
+# THE DEFECT THIS GUARDS AGAINST.  update_solution_f32 guards per ELEMENT: its
+# `return` is one thread's return, so on the failing inner iteration every node
+# whose own alpha*y + omega*z stayed finite is still written and only the node
+# that overflowed keeps the previous value -- and every earlier iteration of the
+# same outer had already been accumulated into phi.  The flag, the halt and the
+# host valve are all per SLOT.  So the vector that reached absorb() was a
+# MIXTURE; absorb() cleared `nonfinite`, no exception was thrown, adoptFluxMirror
+# published it, and the Wielandt loop carried on in FP64 from a flux with one
+# stale node.  The run reported success.  Nothing in an h5 diff can see this,
+# which is why it is a static rule.
+#
+# THE RULES BELOW ARE WRITTEN AGAINST A TEXT PARAMETER, not against the module's
+# CUDA, so the negative controls at the end can feed them mutations that put the
+# defect back and prove each rule actually fires.
+# ---------------------------------------------------------------------------
+NONFINITE_TEST = "if ((flags[m] & static_cast<std::uint32_t>(NONFINITE_DETECTED)) == 0u) return;"
+PARTICIPATION_TEST = "active[m] == 0u || sweep_halt[m] != 0u"
+
+
+def _block(text: str, anchor: str):
+    """body_after() that returns None instead of exiting -- controls need that."""
+    start = text.find(anchor)
+    if start < 0:
+        return None
+    open_at = text.find("{", start)
+    if open_at < 0:
+        return None
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_at : i + 1]
+    return None
+
+
+def _squash(text: str) -> str:
+    return re.sub(r"\s+", " ", text)
+
+
+def rollback_problems(cuda: str) -> list:
+    problems = []
+    snap    = _block(cuda, "__global__ void snapshot_flux_f32(")
+    restore = _block(cuda, "__global__ void restore_flux_f32(")
+    outer   = _block(cuda, "void enqueue_outer(int nmax)")
+    absorb  = _block(cuda, "void absorb(const int* active_slots, int count)")
+    alloc   = _block(cuda, "if (fp32_inner) {")
+
+    # -- the snapshot ------------------------------------------------------
+    if snap is None:
+        problems.append(
+            "snapshot_flux_f32 is gone: nothing records the iterate the outer "
+            "began with, so there is nothing for the valve to fall back TO")
+    else:
+        if "phi_entry[base + i] = phi[base + i];" not in _squash(snap):
+            problems.append("snapshot_flux_f32 does not copy phi into phi_entry")
+        if "HALT_GUARD(halt + m)" not in snap:
+            problems.append(
+                "snapshot_flux_f32 is not halt-guarded; it must cover exactly "
+                "the slots initialize_solver_state let run, or restore_flux_f32 "
+                "is handed a lane that never took a snapshot")
+
+    # -- the rollback ------------------------------------------------------
+    if restore is None:
+        problems.append(
+            "restore_flux_f32 is gone: a latched slot's flux is once again the "
+            "MIXTURE update_solution_f32's per-element guard leaves behind, and "
+            "absorb() adopts it")
+    else:
+        if "HALT_GUARD" in restore:
+            problems.append(
+                "restore_flux_f32 is halt-guarded.  The slot it exists for is "
+                "PRECISELY the one whose halt the non-finite latch raised, so a "
+                "halt guard here skips every slot it is meant to repair and the "
+                "kernel becomes a no-op that still looks like a fix")
+        if "NONFINITE_DETECTED" not in restore:
+            problems.append(
+                "restore_flux_f32 does not select on NONFINITE_DETECTED; it must "
+                "touch the latched slots and only those, or it would throw away "
+                "every healthy slot's outer as well")
+        if PARTICIPATION_TEST not in restore:
+            problems.append(
+                "restore_flux_f32 does not reproduce initialize_solver_state's "
+                "participation test.  `flags` is zeroed only for slots that "
+                "participate, so a non-participant can still be carrying a stale "
+                "NONFINITE_DETECTED -- and it has no snapshot to be restored from")
+        if "phi[base + i] = phi_entry[base + i];" not in _squash(restore):
+            problems.append("restore_flux_f32 does not write phi back from phi_entry")
+
+    # -- where the two sit in the outer -----------------------------------
+    if outer is None:
+        problems.append("enqueue_outer not found; the ordering rules are vacuous")
+    else:
+        snap_at  = outer.find("snapshot_flux_f32<<<")
+        rest_at  = outer.find("restore_flux_f32<<<")
+        move_at  = outer.find("begin_outer_fused_f32<<<")
+        final_at = outer.find("finalize_status<<<")
+        if snap_at < 0:
+            problems.append("enqueue_outer never takes the entry snapshot")
+        if rest_at < 0:
+            problems.append("enqueue_outer never rolls the flux back")
+        if 0 <= move_at < snap_at:
+            problems.append(
+                "the snapshot is taken after the first FP32 kernel of the round; "
+                "it must precede every kernel that can move phi or it records an "
+                "iterate the failed attempt already touched")
+        if rest_at >= 0 and 0 <= final_at < rest_at:
+            problems.append(
+                "the rollback runs after finalize_status.  It has to precede the "
+                "status packet, the flux D2H, the Wielandt update and absorb(), "
+                "because every one of those is a reader of the failed flux")
+        if 0 <= rest_at < snap_at:
+            problems.append("the rollback is enqueued before the snapshot it reads")
+        arms = fp32_arms(outer)
+        for launch in ("snapshot_flux_f32<<<", "restore_flux_f32<<<"):
+            if outer.count(launch) != arms.count(launch):
+                problems.append(
+                    launch + " is enqueued outside an fp32Active() arm, so it "
+                    "would change the FP64 topology and break feature-off byte "
+                    "identity")
+
+    # -- the buffer --------------------------------------------------------
+    if alloc is None or "&phi_entry)" not in alloc:
+        problems.append(
+            "phi_entry is not allocated inside the gated FP32 block; the FP64 "
+            "arm must not pay for it, and the FP32 arm must not run without it")
+    if "cudaFree(phi_entry);" not in cuda:
+        problems.append("phi_entry is never freed")
+    writers = re.findall(r"phi_entry\s*\[[^\]]*\]\s*=[^=]", cuda)
+    if len(writers) != 1:
+        problems.append(
+            "phi_entry has %d writers; snapshot_flux_f32 must be the only one, "
+            "or the vector the rollback restores is not the entry iterate"
+            % len(writers))
+
+    # -- the sentence that started this ------------------------------------
+    if absorb is None:
+        problems.append("absorb() not found")
+    elif "restore_flux_f32" not in absorb:
+        problems.append(
+            "absorb()'s safety-valve note no longer names restore_flux_f32 as "
+            "what makes 'the failed FP32 attempt is DISCARDED' true.  That "
+            "sentence was ornamental once and the cost was a silent wrong answer")
+    return problems
+
+
+ROLLBACK = rollback_problems(CUDA)
+
+# ---------------------------------------------------------------------------
+# NEGATIVE CONTROLS.  Each mutation of the real source puts one link of the
+# rollback back the way the defect had it; the rule that owns that link must
+# fire.  A control whose anchor no longer exists is itself a failure, so these
+# cannot rot into no-ops.
+# ---------------------------------------------------------------------------
+SNAP_LAUNCH = "snapshot_flux_f32<<<"
+REST_LAUNCH = "restore_flux_f32<<<"
+SENTINEL = "@@swapped@@"
+
+
+def _halt_guard_the_rollback(text: str) -> str:
+    """Put a HALT_GUARD back into restore_flux_f32 -- and only there."""
+    body = _block(text, "__global__ void restore_flux_f32(")
+    if body is None:
+        return text
+    return text.replace(
+        body,
+        body.replace("RASBERY_CMFD_SLOT(m);",
+                     "RASBERY_CMFD_SLOT(m);\n    HALT_GUARD(halt + m);", 1),
+        1)
+
+
+def _swap_launches(text: str) -> str:
+    return (text.replace(SNAP_LAUNCH, SENTINEL)
+                .replace(REST_LAUNCH, SNAP_LAUNCH)
+                .replace(SENTINEL, REST_LAUNCH))
+
+
+CONTROLS = (
+    ("the rollback launch deleted -- the defect exactly as reported",
+     lambda t: t.replace(REST_LAUNCH, "restore_flux_f32_never_launched<<<")),
+    ("restore_flux_f32 halt-guarded, so it skips the only slot it exists for",
+     _halt_guard_the_rollback),
+    ("the latch test dropped, so the rollback would discard healthy outers",
+     lambda t: t.replace(NONFINITE_TEST, "")),
+    ("snapshot and rollback swapped, so the outer restores before it records",
+     _swap_launches),
+    ("a second writer of phi_entry",
+     lambda t: t.replace("        iter_batch_used      = captured;",
+                         "        phi_entry[0] = 0.0;\n"
+                         "        iter_batch_used      = captured;")),
+    ("phi_entry no longer allocated on the FP32 arm",
+     lambda t: t.replace("allocate(reinterpret_cast<void**>(&phi_entry), vec_bytes);", "")),
+    ("absorb()'s claim back to a bare assertion with no mechanism named",
+     lambda t: t.replace("That is restore_flux_f32's doing",
+                         "That is the element guards' doing")),
+)
+
+for label, mutate in CONTROLS:
+    mutant = mutate(CUDA)
+    if mutant == CUDA:
+        fail("negative control no longer applies (its anchor is gone): " + label)
+    if not rollback_problems(mutant):
+        fail("negative control did not fire: " + label)
+
+if ROLLBACK:
+    fail("non-finite rollback: " + "; ".join(ROLLBACK))
+
 py_compile.compile(str(Path(__file__).resolve()), doraise=True)
-print("cmfd fp32 contract: PASS")
+print("cmfd fp32 contract: PASS (%d rollback negative controls, all fired)"
+      % len(CONTROLS))

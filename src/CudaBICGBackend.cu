@@ -3241,11 +3241,17 @@ __global__ void update_s_jacobi_f32(const int nxyz,
 /// true FP64 residual is re-established by begin_outer_fused_f32 at the next
 /// outer, which is what makes this refinement rather than a plain FP32 solve.
 ///
-/// The non-finite guards are the FP64 ones, and they still refuse to WRITE a
-/// bad flux: on failure the element keeps its last finite value, so a slot that
-/// trips this exits the inner loop with the iterate it entered with rather than
-/// with garbage.  That is what lets the host absorb one FP32 failure and fall
-/// back to the FP64 path instead of failing the deck (see BatchCore::drain).
+/// The non-finite guards are the FP64 ones, and they refuse to WRITE a bad
+/// value: on failure THAT ELEMENT keeps its last finite value.  Read that
+/// literally -- the guard is PER ELEMENT, because `return` here is one thread's
+/// return, while the flag it raises, the halt that flag causes and the host
+/// valve in BatchCore::absorb() are all PER SLOT.  So this kernel alone does NOT
+/// leave the slot holding the iterate it entered the outer with: it leaves a
+/// MIXTURE of elements that advanced and elements that did not.  What makes the
+/// slot-wide claim true is snapshot_flux_f32/restore_flux_f32 below, which roll
+/// the whole vector back before the outer's status is finalised; without that
+/// pair the host valve would clear the flag and adopt the mixture (see
+/// BatchCore::absorb).
 __global__ void update_solution_f32(const int n,
                                     const int strict_acc,
                                     const long long vec_stride,
@@ -3303,6 +3309,73 @@ __global__ void update_solution_f32(const int n,
     phi[base + i] = next_phi;
     r_f[base + i] = next_r;
     if (i == 0) sm[kOmega] = omega;
+}
+
+// ---------------------------------------------------------------------------
+// THE OTHER HALF OF THE MIXED-PRECISION SAFETY VALVE.
+//
+// BatchCore::absorb() clears NONFINITE_DETECTED for an FP32 slot, suppresses the
+// throw and lets adoptFluxMirror() publish the flux, on the stated ground that
+// "the slot comes back holding the iterate it entered the outer with".  Nothing
+// used to make that true.  update_solution_f32's guard is per ELEMENT, so on the
+// failing inner iteration every node whose own alpha*y + omega*z stayed finite
+// still advanced while the node that overflowed did not, and every earlier
+// iteration of the same outer had already been accumulated into phi.  What
+// survived the valve was therefore a MIXTURE -- one stale node in an otherwise
+// advanced flux -- adopted as a valid mirror, with the run reporting success.
+//
+// The fix is to make the claim true rather than to weaken it.  snapshot_flux_f32
+// copies phi at the top of the FP32 outer, before any FP32 kernel can move it;
+// restore_flux_f32 puts the whole vector back for any slot that latched, before
+// finalize_status and therefore before the flux D2H, the Wielandt update and the
+// host valve ever see it.  A slot that did not latch is not touched, so the FP32
+// trajectory is bit-unchanged everywhere the valve does not fire, and the FP64
+// topology enqueues neither kernel.
+//
+// The granularity is the OUTER and not the refinement round, because that is
+// what the valve's own sentence promises and because refine_round_open already
+// refuses to re-open a slot carrying NONFINITE_DETECTED: a round that fails ends
+// the outer, and the outer's entry iterate is the last state the FP64 path can
+// carry on from without inheriting anything the failed attempt produced.
+// ---------------------------------------------------------------------------
+__global__ void snapshot_flux_f32(const int n,
+                                  const long long vec_stride,
+                                  const double* __restrict__ phi,
+                                  double* __restrict__ phi_entry,
+                                  const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
+    HALT_GUARD(halt + m);
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const long long base = m * vec_stride;
+    phi_entry[base + i]  = phi[base + i];
+}
+
+/// Roll a latched slot's flux back to the snapshot.
+///
+/// NOT halt-guarded, and that is the point: the slot this kernel exists for is
+/// exactly the one whose halt accumulate_iteration raised when it saw the
+/// non-finite flag, so a HALT_GUARD here would skip every slot it is meant to
+/// repair.  The participation test is initialize_solver_state's, reproduced the
+/// way refine_round_open reproduces it, because `flags` is zeroed only for slots
+/// that participated -- a non-participant can still be carrying a stale
+/// NONFINITE_DETECTED from an earlier outer and has no snapshot to restore from.
+__global__ void restore_flux_f32(const int n,
+                                 const long long vec_stride,
+                                 const std::uint32_t* __restrict__ flags,
+                                 const std::uint32_t* __restrict__ active,
+                                 const std::uint32_t* __restrict__ sweep_halt,
+                                 const double* __restrict__ phi_entry,
+                                 double* __restrict__ phi,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
+    if (active[m] == 0u || sweep_halt[m] != 0u) return;
+    if ((flags[m] & static_cast<std::uint32_t>(NONFINITE_DETECTED)) == 0u) return;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const long long base = m * vec_stride;
+    phi[base + i]        = phi_entry[base + i];
 }
 
 // ---------------------------------------------------------------------------
@@ -4580,6 +4653,12 @@ public:
                 allocate(reinterpret_cast<void**>(&t_f), vec_f_bytes);
                 allocate(reinterpret_cast<void**>(&y_f), vec_f_bytes);
                 allocate(reinterpret_cast<void**>(&z_f), vec_f_bytes);
+                // The entry-iterate snapshot the non-finite valve rolls back to
+                // (snapshot_flux_f32 / restore_flux_f32).  DOUBLE, because it is
+                // a copy of the FP64 flux and not a narrowed mirror, and
+                // allocated only on the arm that can latch -- the FP64 footprint
+                // is unchanged.
+                allocate(reinterpret_cast<void**>(&phi_entry), vec_bytes);
                 if (fp32_strict) {
                     // The narrow partials exist only on the STRICT arm.  They
                     // are the same element COUNT as the double pair they
@@ -4606,9 +4685,15 @@ public:
                 // they replace is the double operand stream the inner matvec
                 // and the colour sweeps used to read, and that stream is read
                 // far more often than the mirrors are written (once per outer).
+                //
+                // `phi_entry` is SUBTRACTED for the same reason the mirrors are
+                // added: it is a footprint this arm pays and the FP64 arm does
+                // not, so leaving it out would let the receipt quote a saving
+                // larger than the arm delivers.
                 rasbery::fp32::noteBytesSaved(
                     8u * vec_f_bytes +
-                    (2u * S * matrix_count + S * coupling_count) * sizeof(float));
+                    (2u * S * matrix_count + S * coupling_count) * sizeof(float) -
+                    vec_bytes);
             }
             allocate(reinterpret_cast<void**>(&sweep_halt), S * sizeof(std::uint32_t));
             allocate(reinterpret_cast<void**>(&device_assembly_active),
@@ -4832,8 +4917,10 @@ public:
         cudaFree(t_f);
         cudaFree(y_f);
         cudaFree(z_f);
+        cudaFree(phi_entry);
         diag_f = dinv_f = cc_f = nullptr;
         r_f = r0_f = p_f = v_f = s_f = t_f = y_f = z_f = nullptr;
+        phi_entry = nullptr;
         xs_chif = xs_xsnf = xs_xsrf = xs_xssm = dtil_dev = dhat_dev = nullptr;
         node_vol = udiag_dev = psi_dev = nullptr;
         sweep_halt = device_assembly_active = nullptr;
@@ -5747,6 +5834,13 @@ public:
             // the mirror refreshed here is the one every round consumes.
             refresh_operator_mirror_f32<<<node_grid(), block_size, 0, stream>>>(
                 nxyz, mat_stride(), cpl_stride(), diag, cc, diag_f, cc_f, device_halt, d_slot_map, lanes);
+            // THE ENTRY ITERATE, taken here and nowhere else: after
+            // initialize_solver_state has set `halt` from the participation mask
+            // (so the snapshot covers exactly the slots that will run), and
+            // before any FP32 kernel of this outer can move `phi`.  Its only
+            // reader is restore_flux_f32 at the bottom of this function.
+            snapshot_flux_f32<<<cmfd_vector_grid(), cmfd_block_threads(), 0, stream>>>(
+                n, vec_stride(), phi, phi_entry, device_halt, d_slot_map, lanes);
         }
 
         // The algorithmic budget is `1 + nmax`; the capture may be deeper.
@@ -5835,6 +5929,19 @@ public:
                 else
                     enqueue_iteration(allow_halt, force_halt);
             }
+        }
+        if (fp32Active()) {
+            // THE ROLLBACK.  Before finalize_status, therefore before the flux
+            // D2H, before the Wielandt update of a device-resident sweep and
+            // before BatchCore::absorb() ever sees the slot: a slot that latched
+            // NONFINITE_DETECTED anywhere in this outer goes back to the vector
+            // snapshot_flux_f32 took above, WHOLE, so what the host valve clears
+            // the flag on really is the iterate the outer began with.  Every
+            // other slot is untouched -- the kernel's own flag test, not the
+            // halt, is what selects the work.
+            restore_flux_f32<<<cmfd_vector_grid(), cmfd_block_threads(), 0, stream>>>(
+                n, vec_stride(), device_flags, device_active, sweep_halt, phi_entry,
+                phi, d_slot_map, lanes);
         }
         // A property of the capture, not a tally: assigned, never accumulated.
         // Set here rather than at launch so it is right on the graph-off path
@@ -6668,9 +6775,16 @@ public:
             if (nonfinite && fp32_was_active) {
                 // MIXED-PRECISION SAFETY VALVE, deliberately env-independent.
                 //
-                // The FP32 kernels refuse to write a non-finite flux, so the
-                // slot comes back holding the iterate it entered the outer
+                // The slot comes back holding the iterate it entered the outer
                 // with: the failed FP32 attempt is DISCARDED, never accepted.
+                // That is restore_flux_f32's doing and NOT the element guards'.
+                // update_solution_f32 declines to write a non-finite value one
+                // ELEMENT at a time, which on its own leaves a mixture of
+                // advanced and frozen nodes -- and clearing the flag on a
+                // mixture is exactly how a run with one stale node used to
+                // report success.  The rollback runs inside the graph, before
+                // the flux D2H, so by the time this line executes the whole
+                // vector is the snapshot again.
                 // Absorb it once, move the whole arena back to FP64 and let the
                 // outer Wielandt loop carry on from that last good iterate --
                 // which is the same self-healing the BiCGSTAB restart
@@ -6999,6 +7113,13 @@ public:
     /// residual that fixes the reference norm) are NOT here: they stay double.
     float *r_f = nullptr, *r0_f = nullptr, *p_f = nullptr, *v_f = nullptr;
     float *s_f = nullptr, *t_f = nullptr, *y_f = nullptr, *z_f = nullptr;
+    /// The FP32 outer's ENTRY FLUX, in double.  Written once per outer by
+    /// snapshot_flux_f32 and read only by restore_flux_f32, which puts it back
+    /// for a slot that latched NONFINITE_DETECTED -- the half of the host valve
+    /// that makes "the failed FP32 attempt is DISCARDED" a fact rather than a
+    /// hope.  Null (and unreachable, since neither kernel is enqueued) on the
+    /// FP64 arm.
+    double*       phi_entry = nullptr;
 
     // ---- device-resident CMFD sweep state (RASBERY_GPU_CMFD_SWEEP) ----
     double*        xs_chif    = nullptr; ///< [slot][ig*nxyz+l]

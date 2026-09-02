@@ -410,7 +410,12 @@ EXPECTED_STRUCTURE = {
         # 1 unless RASBERY_GPU_FP32_REFINE arms it, so the DEFAULT node census
         # below is unchanged: at one round the loop enqueues exactly the
         # prologue it always did.
-        "<<<": 12,
+        #
+        # Plus the non-finite ROLLBACK pair -- snapshot_flux_f32 in the FP32
+        # prologue arm and restore_flux_f32 in its own fp32Active() arm before
+        # finalize_status.  Both sit inside fp32Active(), so like the mirror they
+        # are two more `<<<` in this body and ZERO nodes in the FP64 capture.
+        "<<<": 14,
         # The status D2H.  Spelled `xfer::memcpyAsync(` since WP13.1 routed
         # every transfer in src/ through the site-tagged wrapper; the token is
         # the SUFFIX so this counts the call whichever of the two it is, because
@@ -449,15 +454,16 @@ def model(nmax: int, rb: int, fuse: int, scalar_fusion: bool = True,
     dot_nodes = 1 if (fuse & 1) else 2
     dot2_nodes = 1 if (fuse & 2) else 2
     tail = 1 if scalar_fusion else 2
-    # prologue: initialize_solver_state, [refresh_operator_mirror_f32,]
-    #           begin_outer_fused, reduce_dot_stage1, stage-2 tail
-    prologue = 2 + (1 if fp32 else 0) + 1 + tail
+    # prologue: initialize_solver_state, [refresh_operator_mirror_f32,
+    #           snapshot_flux_f32,] begin_outer_fused, reduce_dot_stage1,
+    #           stage-2 tail
+    prologue = 2 + (2 if fp32 else 0) + 1 + tail
     # iteration: 2 dots + 1 dot2 + 2 x rb colour sweeps + prepare_p_jacobi +
     #            2 matvecs + update_s_jacobi + update_solution +
     #            reduce_dot_stage1 + stage-2 tail
     iteration = 2 * dot_nodes + dot2_nodes + 2 * rb + 6 + tail
-    # epilogue: finalize_status + the status D2H memcpy node
-    outer = prologue + captured * iteration + 2
+    # epilogue: [restore_flux_f32,] finalize_status + the status D2H memcpy node
+    outer = prologue + captured * iteration + 2 + (1 if fp32 else 0)
     if chunked_wiel:
         wiel = 1 if (fuse & 4) else 2
     else:
