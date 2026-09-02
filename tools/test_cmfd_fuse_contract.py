@@ -198,6 +198,12 @@ def rule_flag_family(code: str) -> list:
     return problems
 
 
+# The four bits that were priced and adopted.  kFuseDefaultMask must be exactly
+# these, spelled by name -- never a literal, and never kFuseAllBits, which since
+# WP21-A also contains the unpriced bit 4.
+ADOPTED_BITS = ("kFuseDot", "kFuseDot2", "kFuseWiel", "kFuseSweepPre")
+
+
 def rule_default_mask_is_all_bits(code: str) -> list:
     """The named default exists and is the mask both hosts gated.
 
@@ -207,15 +213,37 @@ def rule_default_mask_is_all_bits(code: str) -> list:
     that also cleared the 0.2 s adoption threshold (-0.396 s interleaved, where
     mask 4 managed -0.183 s).  A default that quietly became a DIFFERENT member
     of the family would be a wall claim nobody measured, so the constant is
-    pinned to kFuseAllBits by name.
+    pinned to the four adopted bits BY NAME.
+
+    WP21-A ADDED A FIFTH BIT AND DID NOT ADOPT IT.  kFuseNorm (bit 4, the
+    residual-norm stage-2 fold) is B0 by the same textual argument as the other
+    four, but it has not been priced on 238, so it is in kFuseAllBits -- which
+    is what cmfdFuseMask() validates a user's request against -- and OUT of the
+    default.  That is why this rule can no longer be "== kFuseAllBits": the two
+    constants deliberately differ now, and the gate has to say which is which.
     """
     problems = []
-    if "kFuseDefaultMask = kFuseAllBits" not in code:
+    default = re.search(r"kFuseDefaultMask = ([^;]*);", code)
+    if not default:
+        problems.append("kFuseDefaultMask is missing")
+        return problems
+    spelling = default.group(1)
+    if "kFuseAllBits" in spelling:
         problems.append(
-            "kFuseDefaultMask must be defined as kFuseAllBits: the adopted "
-            "default is mask 15, and spelling it as a literal or as a subset "
-            "would change the arm without changing the receipt's vocabulary"
-        )
+            "kFuseDefaultMask is kFuseAllBits, which now includes the unpriced "
+            "bit 4 (kFuseNorm): the default would become a wall claim nobody "
+            "measured")
+    for bit in ADOPTED_BITS:
+        if bit not in spelling:
+            problems.append(
+                "kFuseDefaultMask no longer names %s: the adopted default is the "
+                "four priced bits, spelled by name so a literal cannot change "
+                "the arm without changing the receipt's vocabulary" % bit)
+    if "kFuseNorm" in spelling:
+        problems.append(
+            "kFuseNorm is in kFuseDefaultMask: bit 4 ships armed and OFF until "
+            "the 238 runbook in docs/WP21_A_CMFD_COALESCING_20260831_KO.md "
+            "prices mask 31 against mask 15")
     return problems
 
 
@@ -345,7 +373,10 @@ EXPECTED_STRUCTURE = {
         "dot(": 2,        # rho_new and r0.v
         "dot2(": 1,       # the (s.t, t.t) pair
         "precondition_sweeps(": 2,
-        "<<<": 9,         # 5 elementwise + reduce_dot_stage1 + 3 scalar-tail variants
+        # 5 elementwise + reduce_dot_stage1 + 3 scalar-tail variants, plus
+        # WP21-A's bit-4 branch (reduce_norm_accumulate_fused) which replaces
+        # the stage1 + stage2 pair with one node when the bit is set.
+        "<<<": 10,
     },
     "void enqueue_outer(": {
         "<<<": 9,         # init, fp32 mirror, 2 begin variants, stage1, 3 stage2
@@ -490,11 +521,18 @@ def self_test() -> list:
         '    return m;\n}\n',
         "cmfdFuseMask() defaulting back to the reference mask 0",
     )
-    # 2c. The default spelled as a literal instead of the named constant.
+    # 2c. The default spelled as a literal instead of the named constants.
     expect_fail(
         rule_default_mask_is_all_bits,
         "enum : unsigned { kFuseDefaultMask = 15u };\n",
-        "kFuseDefaultMask spelled as a literal rather than kFuseAllBits",
+        "kFuseDefaultMask spelled as a literal rather than the adopted bits",
+    )
+    # 2d. The unpriced bit 4 folded into the default.
+    expect_fail(
+        rule_default_mask_is_all_bits,
+        "enum : unsigned { kFuseDefaultMask = kFuseDot | kFuseDot2 | kFuseWiel"
+        " | kFuseSweepPre | kFuseNorm };\n",
+        "the unpriced kFuseNorm adopted into kFuseDefaultMask",
     )
     # 3. Fused kernel with no order note.
     expect_fail(
@@ -598,7 +636,7 @@ def main() -> int:
     print("    outer graph      FUSE=0 %3d nodes -> FUSE=7 %3d nodes" % (outer0, outer_f))
     print("    sweep graph      FUSE=0 %3d nodes/sweep -> FUSE=7 %3d nodes/sweep"
           % (sweep0, sweep_f))
-    print("  negative controls: %d, all fired" % 9)
+    print("  negative controls: %d, all fired" % 10)
     return 0
 
 

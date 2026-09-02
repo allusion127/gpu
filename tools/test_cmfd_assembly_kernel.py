@@ -5,6 +5,14 @@ The test quotes the legacy CPU loop and compares every output byte against
 cmfd_assembly::assembleNode2G for deterministic random inputs, both with and
 without the Wielandt shift. It is intentionally a standalone C++20 harness so
 it does not need HDF5 or CUDA.
+
+WP21-A.  The legacy loop below is left in the NODE-MAJOR order it always had --
+it is the historical text and the whole point of quoting it -- while
+assembleNode2G now writes through rasbery::cmfd_layout.  So the comparison goes
+through the layout helper, which makes this test the executable statement of
+the permutation: every output value is identical, only its address moved.  With
+kNodeInnermost = false the helper degenerates to l*per_node + k and this test is
+byte-for-byte the one that ran before WP21-A.
 """
 from __future__ import annotations
 
@@ -135,9 +143,21 @@ int main() {
         std::vector<double> actual_diag(nxyz * 4, 0.0);
         std::vector<double> actual_cc(nxyz * 12, 0.0);
         std::vector<double> actual_udiag(nxyz * 4, 0.0);
+        // WP21-A: the View reads node_surface and face_area through
+        // cmfd_layout too, so they go in permuted the same way.
+        std::vector<int> view_node_surface(node_surface.size());
+        std::vector<double> view_face_area(face_area.size());
+        for (int l = 0; l < nxyz; ++l) {
+            for (int f = 0; f < NDIR * LR; ++f)
+                view_node_surface[rasbery::cmfd_layout::face(nxyz, l, f)] =
+                    node_surface[l * NDIR * LR + f];
+            for (int d = 0; d < NDIR; ++d)
+                view_face_area[rasbery::cmfd_layout::dir(nxyz, l, d)] =
+                    face_area[l * NDIR + d];
+        }
         rasbery::cmfd_assembly::View view{
             nxyz,
-            node_surface.data(), face_area.data(), volume.data(),
+            view_node_surface.data(), view_face_area.data(), volume.data(),
             xsrf.data(), xssm.data(), chif.data(), xsnf.data(),
             dtil.data(), dhat.data(),
             reigvs, eshift,
@@ -146,9 +166,25 @@ int main() {
         for (int l = 0; l < nxyz; ++l)
             rasbery::cmfd_assembly::assembleNode2G(view, l);
 
-        if (!same(expected_diag, actual_diag)) return eshift == 0.0 ? 10 : 11;
-        if (!same(expected_cc, actual_cc)) return eshift == 0.0 ? 12 : 13;
-        if (!same(expected_udiag, actual_udiag)) return eshift == 0.0 ? 14 : 15;
+        // Permute the node-major reference into the layout the kernel wrote,
+        // then compare BYTE FOR BYTE: WP21-A moved addresses, not values.
+        std::vector<double> permuted_diag(nxyz * 4, 0.0);
+        std::vector<double> permuted_cc(nxyz * 12, 0.0);
+        std::vector<double> permuted_udiag(nxyz * 4, 0.0);
+        for (int l = 0; l < nxyz; ++l) {
+            for (int k = 0; k < 4; ++k) {
+                const auto at = rasbery::cmfd_layout::mat(nxyz, l, k);
+                permuted_diag[at] = expected_diag[l * 4 + k];
+                permuted_udiag[at] = expected_udiag[l * 4 + k];
+            }
+            for (int j = 0; j < 12; ++j)
+                permuted_cc[rasbery::cmfd_layout::cpl(nxyz, l, j)] =
+                    expected_cc[l * 12 + j];
+        }
+
+        if (!same(permuted_diag, actual_diag)) return eshift == 0.0 ? 10 : 11;
+        if (!same(permuted_cc, actual_cc)) return eshift == 0.0 ? 12 : 13;
+        if (!same(permuted_udiag, actual_udiag)) return eshift == 0.0 ? 14 : 15;
     }
     return 0;
 }

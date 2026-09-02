@@ -305,13 +305,21 @@ bool cmfdScalarFusionEnabled() {
 //     colours (cooperative grid.sync), which is a different and far less local
 //     argument than anything in this bitmask, and it would change the
 //     occupancy the sweep runs at.  NOT FUSABLE, and it stays that way.
-//   * the trailing reduce_dot_stage1 of an iteration, and the prologue one.
-//     Their stage-2 partners (reduce_norm_accumulate_stage2 and
-//     reduce_norm_store_reference_stage2) already carry a SECOND kernel's body
-//     under the scalar-fusion arm, and they gate on `active` where stage 1
-//     gates on `halt` -- the difference between those two guards is exactly
-//     where the over-run telemetry lives.  Folding stage 1 in would collapse
-//     the two guards into one and change what the counters mean.
+//   * the PROLOGUE reduce_dot_stage1 and reduce_norm_store_reference_stage2.
+//     The stage-2 partner already carries a SECOND kernel's body under the
+//     scalar-fusion arm, and it gates on `active` where stage 1 gates on
+//     `halt`; the prologue has no over-run path to preserve and no measured
+//     dispatch cost to justify a fifth bit.
+//     WP21-A RETIRED THE OTHER HALF OF THIS BULLET.  The TRAILING pair
+//     (reduce_dot_stage1(r,r) + reduce_norm_accumulate_stage2) is now bit 4.
+//     The objection above was that the two guards differ and that collapsing
+//     them would change what the counters mean -- true of a naive fusion, and
+//     precisely why reduce_norm_accumulate_fused keeps BOTH guards: the halt
+//     branch is stage 2's halted path, executed once, and the `active` test
+//     sits after the fold barrier where stage 2 had it.  The counters mean
+//     exactly what they meant.  It is bit 4 and not part of the default mask
+//     for the usual reason: a default is a claim, and this one has not been
+//     priced on 238 yet.
 //   * the FP32 twins (reduce_dot_stage1_f32 / reduce_dot2_stage1_f32).  The
 //     mixed-precision inner loop is its own opt-in arm; keeping the two gates
 //     independent means neither A/B has to carry the other's variance.
@@ -321,7 +329,12 @@ enum CmfdFuseBit : unsigned {
     kFuseDot2     = 1u << 1, ///< reduce_dot2_stage1 + reduce_dot2_stage2
     kFuseWiel     = 1u << 2, ///< cmfd_wiel_stage1   + cmfd_wiel_finalize_chunked
     kFuseSweepPre = 1u << 3, ///< cmfd_sweep_gate    + cmfd_sweep_patch
-    kFuseAllBits  = kFuseDot | kFuseDot2 | kFuseWiel | kFuseSweepPre
+    /// WP21-A.  reduce_dot_stage1(r,r) + reduce_norm_accumulate_stage2, the
+    /// last one-block/one-thread tail of the BiCGSTAB iteration (3.7 % of all
+    /// kernel time over 47k launches, pricing block 39).  Requires the scalar
+    /// fusion arm, which is what puts the accumulate body in stage 2 at all.
+    kFuseNorm     = 1u << 4, ///< reduce_dot_stage1  + reduce_norm_accumulate_stage2
+    kFuseAllBits  = kFuseDot | kFuseDot2 | kFuseWiel | kFuseSweepPre | kFuseNorm
 };
 
 /// THE DEFAULT, since the v5 freeze.  Mask 15 was measured B0 against mask 0 on
@@ -333,7 +346,13 @@ enum CmfdFuseBit : unsigned {
 /// campaign has: the fused body is the two reference bodies concatenated
 /// character for character, so "same operations, same order, same rounding"
 /// is a property of the text, not of a measurement that could drift.
-enum : unsigned { kFuseDefaultMask = kFuseAllBits };
+/// NOT kFuseAllBits any more: WP21-A added bit 4 (kFuseNorm) and left it OUT
+/// of the default, because the paragraph above is a rule and not a habit --
+/// mask 15 is what was measured B0 and adopted on both hosts, and 31 has not
+/// been priced yet.  The 238 runbook in
+/// docs/WP21_A_CMFD_COALESCING_20260831_KO.md prices 31 against 15; until it
+/// does, `RASBERY_GPU_CMFD_FUSE=31` is how you ask for the fold.
+enum : unsigned { kFuseDefaultMask = kFuseDot | kFuseDot2 | kFuseWiel | kFuseSweepPre };
 
 /// Read ONCE, like every other RASBERY_* gate: the mask fixes the captured
 /// graph topology, so it must not be able to change between two outers of the
@@ -1234,15 +1253,15 @@ __global__ void matvec_two_group(const int nxyz,
 
     const double x0 = xm[2 * l + 0];
     const double x1 = xm[2 * l + 1];
-    double       y0 = dm[4 * l + 0] * x0 + dm[4 * l + 1] * x1;
-    double       y1 = dm[4 * l + 2] * x0 + dm[4 * l + 3] * x1;
+    double       y0 = dm[cmfd_layout::mat(nxyz, l, 0)] * x0 + dm[cmfd_layout::mat(nxyz, l, 1)] * x1;
+    double       y1 = dm[cmfd_layout::mat(nxyz, l, 2)] * x0 + dm[cmfd_layout::mat(nxyz, l, 3)] * x1;
 
 #pragma unroll
     for (int slot = 0; slot < 6; ++slot) {
-        const int neighbor = neighbors[6 * l + slot];
+        const int neighbor = neighbors[cmfd_layout::face(nxyz, l, slot)];
         if (neighbor >= 0) {
-            y0 += cm[12 * l + slot] * xm[2 * neighbor + 0];
-            y1 += cm[12 * l + 6 + slot] * xm[2 * neighbor + 1];
+            y0 += cm[cmfd_layout::cpl(nxyz, l, slot)] * xm[2 * neighbor + 0];
+            y1 += cm[cmfd_layout::cpl(nxyz, l, 6 + slot)] * xm[2 * neighbor + 1];
         }
     }
 
@@ -1307,16 +1326,16 @@ __global__ void begin_outer_fused(const int nxyz,
     {
         double* im = dinv + m * mat_stride;
 
-        const double a00  = dm[4 * l + 0];
-        const double a01  = dm[4 * l + 1];
-        const double a10  = dm[4 * l + 2];
-        const double a11  = dm[4 * l + 3];
+        const double a00  = dm[cmfd_layout::mat(nxyz, l, 0)];
+        const double a01  = dm[cmfd_layout::mat(nxyz, l, 1)];
+        const double a10  = dm[cmfd_layout::mat(nxyz, l, 2)];
+        const double a11  = dm[cmfd_layout::mat(nxyz, l, 3)];
         const double rdet = 1.0 / (a00 * a11 - a10 * a01);
 
-        im[4 * l + 0] = rdet * a11;
-        im[4 * l + 1] = -rdet * a01;
-        im[4 * l + 2] = -rdet * a10;
-        im[4 * l + 3] = rdet * a00;
+        im[cmfd_layout::mat(nxyz, l, 0)] = rdet * a11;
+        im[cmfd_layout::mat(nxyz, l, 1)] = -rdet * a01;
+        im[cmfd_layout::mat(nxyz, l, 2)] = -rdet * a10;
+        im[cmfd_layout::mat(nxyz, l, 3)] = rdet * a00;
     }
 
     // ---- matvec_two_group(x = phi -> y = ax) ----
@@ -1326,15 +1345,15 @@ __global__ void begin_outer_fused(const int nxyz,
 
     const double x0 = xm[2 * l + 0];
     const double x1 = xm[2 * l + 1];
-    double       y0 = dm[4 * l + 0] * x0 + dm[4 * l + 1] * x1;
-    double       y1 = dm[4 * l + 2] * x0 + dm[4 * l + 3] * x1;
+    double       y0 = dm[cmfd_layout::mat(nxyz, l, 0)] * x0 + dm[cmfd_layout::mat(nxyz, l, 1)] * x1;
+    double       y1 = dm[cmfd_layout::mat(nxyz, l, 2)] * x0 + dm[cmfd_layout::mat(nxyz, l, 3)] * x1;
 
 #pragma unroll
     for (int slot = 0; slot < 6; ++slot) {
-        const int neighbor = neighbors[6 * l + slot];
+        const int neighbor = neighbors[cmfd_layout::face(nxyz, l, slot)];
         if (neighbor >= 0) {
-            y0 += cm[12 * l + slot] * xm[2 * neighbor + 0];
-            y1 += cm[12 * l + 6 + slot] * xm[2 * neighbor + 1];
+            y0 += cm[cmfd_layout::cpl(nxyz, l, slot)] * xm[2 * neighbor + 0];
+            y1 += cm[cmfd_layout::cpl(nxyz, l, 6 + slot)] * xm[2 * neighbor + 1];
         }
     }
 
@@ -1476,8 +1495,8 @@ __global__ void prepare_p_jacobi(const int nxyz,
     const double* im = dinv + m * mat_stride;
     double*       xm = y + m * vec_stride;
 
-    xm[2 * l + 0] = im[4 * l + 0] * b0 + im[4 * l + 1] * b1;
-    xm[2 * l + 1] = im[4 * l + 2] * b0 + im[4 * l + 3] * b1;
+    xm[2 * l + 0] = im[cmfd_layout::mat(nxyz, l, 0)] * b0 + im[cmfd_layout::mat(nxyz, l, 1)] * b1;
+    xm[2 * l + 1] = im[cmfd_layout::mat(nxyz, l, 2)] * b0 + im[cmfd_layout::mat(nxyz, l, 3)] * b1;
 }
 
 __global__ void colored_block_sweep(const int nxyz,
@@ -1507,15 +1526,15 @@ __global__ void colored_block_sweep(const int nxyz,
     double b1 = bm[2 * l + 1];
 #pragma unroll
     for (int slot = 0; slot < 6; ++slot) {
-        const int neighbor = neighbors[6 * l + slot];
+        const int neighbor = neighbors[cmfd_layout::face(nxyz, l, slot)];
         if (neighbor >= 0) {
-            b0 -= cm[12 * l + slot] * xm[2 * neighbor + 0];
-            b1 -= cm[12 * l + 6 + slot] * xm[2 * neighbor + 1];
+            b0 -= cm[cmfd_layout::cpl(nxyz, l, slot)] * xm[2 * neighbor + 0];
+            b1 -= cm[cmfd_layout::cpl(nxyz, l, 6 + slot)] * xm[2 * neighbor + 1];
         }
     }
 
-    xm[2 * l + 0] = im[4 * l + 0] * b0 + im[4 * l + 1] * b1;
-    xm[2 * l + 1] = im[4 * l + 2] * b0 + im[4 * l + 3] * b1;
+    xm[2 * l + 0] = im[cmfd_layout::mat(nxyz, l, 0)] * b0 + im[cmfd_layout::mat(nxyz, l, 1)] * b1;
+    xm[2 * l + 1] = im[cmfd_layout::mat(nxyz, l, 2)] * b0 + im[cmfd_layout::mat(nxyz, l, 3)] * b1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1593,8 +1612,8 @@ __global__ void update_s_jacobi(const int nxyz,
     const double* im = dinv + m * mat_stride;
     double*       xm = z + m * vec_stride;
 
-    xm[2 * l + 0] = im[4 * l + 0] * b0 + im[4 * l + 1] * b1;
-    xm[2 * l + 1] = im[4 * l + 2] * b0 + im[4 * l + 3] * b1;
+    xm[2 * l + 0] = im[cmfd_layout::mat(nxyz, l, 0)] * b0 + im[cmfd_layout::mat(nxyz, l, 1)] * b1;
+    xm[2 * l + 1] = im[cmfd_layout::mat(nxyz, l, 2)] * b0 + im[cmfd_layout::mat(nxyz, l, 3)] * b1;
 }
 
 __global__ void update_solution(const int n,
@@ -1736,6 +1755,167 @@ __global__ void reduce_norm_accumulate_stage2(
     double sum = 0.0;
     for (int i = 0; i < blocks; ++i) sum += pm[i];
     const double norm = sqrt(sum);
+    double* sm = scalars + static_cast<long long>(m) * kScalarCount;
+    sm[kInitialNorm] = norm;
+
+    accumulate_iteration_active(m, allow_halt, force_halt, scalars, iter_flags,
+                                sticky_flags, counters, halt);
+}
+
+// ---------------------------------------------------------------------------
+// RASBERY_GPU_CMFD_FUSE bit 4 (kFuseNorm): the residual-norm stage 1 and
+// reduce_norm_accumulate_stage2 in ONE graph node.
+//
+// WHY IT IS WORTH A KERNEL.  reduce_norm_accumulate_stage2 launches ONE block
+// of ONE thread, once per BiCGSTAB iteration, and block 39's nsys sweep put it
+// at 3.7 % of all GPU kernel time over 47k launches -- essentially pure
+// dispatch.  It is the last surviving one-thread tail of the iteration; every
+// other stage-2 node was folded in WP7 stage B.
+//
+// ORDER-PRESERVATION -- why this is bit-identical to the two-node pair.
+// The argument is reduce_dot_fused's, point for point (see that kernel's six
+// numbered notes), with ONE addition that the halt path forces:
+//
+//  7. THE OVERRUN TALLY IS NOT A COMPUTATION AND CANNOT BE FUSED AWAY.  In the
+//     two-node form a halted slot ran stage 1's HALT_GUARD (writing nothing)
+//     and stage 2 STILL incremented kOverrunCount.  A naive fusion would return
+//     in the stage-1 guard and lose that tally, which is the direct evidence
+//     the halt gating is complete (BackendCounters::overrun_iterations).  So
+//     the halt branch below is not a guard, it IS stage 2's halted path, run by
+//     exactly one thread of the grid and grid-uniform in the slot -- the same
+//     shape bicg_iteration_persistent uses for the same reason.
+//     `active[m] == 0` is likewise stage 2's first test: it suppresses the
+//     tally, and after the fold barrier it suppresses the whole scalar tail.
+//     Stage 1 still runs for an inactive slot and still writes its partials,
+//     which is exactly what the two-node form did and what nothing reads.
+//
+// Saving: one node per iteration -- the last one there is to take.
+// ---------------------------------------------------------------------------
+__global__ void reduce_norm_accumulate_fused(const int n,
+                                             const long long vec_stride,
+                                             const int allow_halt,
+                                             const int force_halt,
+                                             const double* __restrict__ r,
+                                             double* partial,
+                                             double* scalars,
+                                             std::uint32_t* iter_flags,
+                                             std::uint32_t* sticky_flags,
+                                             std::uint32_t* counters,
+                                             std::uint32_t* halt,
+                                             const std::uint32_t* __restrict__ active,
+                                             unsigned int* __restrict__ retire,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
+    if (halt[m] != 0u) {
+        // ---- stage 2's halted path, verbatim, run once ---------------------
+        if (blockIdx.x == 0u && threadIdx.x == 0u && active[m] != 0u)
+            ++counters[static_cast<long long>(m) * kCounterSlots + kOverrunCount];
+        return;
+    }
+    __shared__ double shared[kReduceThreads];
+
+    // ---- reduce_dot_stage1(r, r), copied not rewritten ---------------------
+    const double* am = r + m * vec_stride;
+    const double* bm = r + m * vec_stride;
+    double*       pm = partial + static_cast<long long>(m) * kMaxReduceBlocks;
+
+    const int chunk = (n + static_cast<int>(gridDim.x) - 1) / static_cast<int>(gridDim.x);
+    const int begin = static_cast<int>(blockIdx.x) * chunk;
+    const int end   = min(begin + chunk, n);
+
+    double sum = 0.0;
+    for (int i = begin + static_cast<int>(threadIdx.x); i < end;
+         i += static_cast<int>(blockDim.x))
+        sum += am[i] * bm[i];
+
+    shared[threadIdx.x] = sum;
+    __syncthreads();
+
+    for (int stride = kReduceThreads / 2; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride)
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+        __syncthreads();
+    }
+
+    if (threadIdx.x != 0) return;
+    pm[blockIdx.x] = shared[0];
+    __threadfence();
+    if (atomicInc(retire + m, gridDim.x - 1u) != gridDim.x - 1u) return;
+    if (active[m] == 0u) return;
+
+    // ---- the former reduce_norm_accumulate_stage2 node, verbatim -----------
+    const volatile double* vpm    = pm;
+    const int              blocks = static_cast<int>(gridDim.x);
+    double                 fold   = 0.0;
+    for (int i = 0; i < blocks; ++i) fold += vpm[i];   // strict index order
+    const double norm = sqrt(fold);
+    double* sm = scalars + static_cast<long long>(m) * kScalarCount;
+    sm[kInitialNorm] = norm;
+
+    accumulate_iteration_active(m, allow_halt, force_halt, scalars, iter_flags,
+                                sticky_flags, counters, halt);
+}
+
+/// FP32-payload twin: reduce_dot_stage1_f32's body -- the FP32 loads widened
+/// into the same FP64 accumulator, the same partition, the same tree -- with
+/// reduce_norm_accumulate_fused's tail.  The fold and everything after it are
+/// FP64 in both arms, so the two paths differ exactly where the FP32 arm
+/// already differed and nowhere else.
+__global__ void reduce_norm_accumulate_fused_f32(const int n,
+                                                 const long long vec_stride,
+                                                 const int allow_halt,
+                                                 const int force_halt,
+                                                 const float* __restrict__ r,
+                                                 double* partial,
+                                                 double* scalars,
+                                                 std::uint32_t* iter_flags,
+                                                 std::uint32_t* sticky_flags,
+                                                 std::uint32_t* counters,
+                                                 std::uint32_t* halt,
+                                                 const std::uint32_t* __restrict__ active,
+                                                 unsigned int* __restrict__ retire,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
+    if (halt[m] != 0u) {
+        if (blockIdx.x == 0u && threadIdx.x == 0u && active[m] != 0u)
+            ++counters[static_cast<long long>(m) * kCounterSlots + kOverrunCount];
+        return;
+    }
+    __shared__ double shared[kReduceThreads];
+
+    const float* am = r + m * vec_stride;
+    const float* bm = r + m * vec_stride;
+    double*      pm = partial + static_cast<long long>(m) * kMaxReduceBlocks;
+
+    const int chunk = (n + static_cast<int>(gridDim.x) - 1) / static_cast<int>(gridDim.x);
+    const int begin = static_cast<int>(blockIdx.x) * chunk;
+    const int end   = min(begin + chunk, n);
+
+    double sum = 0.0;
+    for (int i = begin + static_cast<int>(threadIdx.x); i < end;
+         i += static_cast<int>(blockDim.x))
+        sum += static_cast<double>(am[i]) * static_cast<double>(bm[i]);
+
+    shared[threadIdx.x] = sum;
+    __syncthreads();
+
+    for (int stride = kReduceThreads / 2; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride)
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+        __syncthreads();
+    }
+
+    if (threadIdx.x != 0) return;
+    pm[blockIdx.x] = shared[0];
+    __threadfence();
+    if (atomicInc(retire + m, gridDim.x - 1u) != gridDim.x - 1u) return;
+    if (active[m] == 0u) return;
+
+    const volatile double* vpm    = pm;
+    const int              blocks = static_cast<int>(gridDim.x);
+    double                 fold   = 0.0;
+    for (int i = 0; i < blocks; ++i) fold += vpm[i];   // strict index order
+    const double norm = sqrt(fold);
     double* sm = scalars + static_cast<long long>(m) * kScalarCount;
     sm[kInitialNorm] = norm;
 
@@ -1939,15 +2119,15 @@ __device__ inline void persistentColourSweepNode(const int l,
     double b1 = bm[2 * l + 1];
 #pragma unroll
     for (int slot = 0; slot < 6; ++slot) {
-        const int neighbor = a.neighbors[6 * l + slot];
+        const int neighbor = a.neighbors[cmfd_layout::face(a.nxyz, l, slot)];
         if (neighbor >= 0) {
-            b0 -= cm[12 * l + slot] * xm[2 * neighbor + 0];
-            b1 -= cm[12 * l + 6 + slot] * xm[2 * neighbor + 1];
+            b0 -= cm[cmfd_layout::cpl(a.nxyz, l, slot)] * xm[2 * neighbor + 0];
+            b1 -= cm[cmfd_layout::cpl(a.nxyz, l, 6 + slot)] * xm[2 * neighbor + 1];
         }
     }
 
-    xm[2 * l + 0] = im[4 * l + 0] * b0 + im[4 * l + 1] * b1;
-    xm[2 * l + 1] = im[4 * l + 2] * b0 + im[4 * l + 3] * b1;
+    xm[2 * l + 0] = im[cmfd_layout::mat(a.nxyz, l, 0)] * b0 + im[cmfd_layout::mat(a.nxyz, l, 1)] * b1;
+    xm[2 * l + 1] = im[cmfd_layout::mat(a.nxyz, l, 2)] * b0 + im[cmfd_layout::mat(a.nxyz, l, 3)] * b1;
 }
 
 /// matvec_two_group's body for one node, verbatim.
@@ -1960,15 +2140,15 @@ __device__ inline void persistentMatvecNode(const int l,
 
     const double x0 = xm[2 * l + 0];
     const double x1 = xm[2 * l + 1];
-    double       y0 = dm[4 * l + 0] * x0 + dm[4 * l + 1] * x1;
-    double       y1 = dm[4 * l + 2] * x0 + dm[4 * l + 3] * x1;
+    double       y0 = dm[cmfd_layout::mat(a.nxyz, l, 0)] * x0 + dm[cmfd_layout::mat(a.nxyz, l, 1)] * x1;
+    double       y1 = dm[cmfd_layout::mat(a.nxyz, l, 2)] * x0 + dm[cmfd_layout::mat(a.nxyz, l, 3)] * x1;
 
 #pragma unroll
     for (int slot = 0; slot < 6; ++slot) {
-        const int neighbor = a.neighbors[6 * l + slot];
+        const int neighbor = a.neighbors[cmfd_layout::face(a.nxyz, l, slot)];
         if (neighbor >= 0) {
-            y0 += cm[12 * l + slot] * xm[2 * neighbor + 0];
-            y1 += cm[12 * l + 6 + slot] * xm[2 * neighbor + 1];
+            y0 += cm[cmfd_layout::cpl(a.nxyz, l, slot)] * xm[2 * neighbor + 0];
+            y1 += cm[cmfd_layout::cpl(a.nxyz, l, 6 + slot)] * xm[2 * neighbor + 1];
         }
     }
 
@@ -2040,8 +2220,8 @@ __global__ void bicg_iteration_persistent(PersistentBicgParams a,
             }
             a.p[base + i0] = b0;
             a.p[base + i1] = b1;
-            a.y[base + 2 * l + 0] = im[4 * l + 0] * b0 + im[4 * l + 1] * b1;
-            a.y[base + 2 * l + 1] = im[4 * l + 2] * b0 + im[4 * l + 3] * b1;
+            a.y[base + 2 * l + 0] = im[cmfd_layout::mat(a.nxyz, l, 0)] * b0 + im[cmfd_layout::mat(a.nxyz, l, 1)] * b1;
+            a.y[base + 2 * l + 1] = im[cmfd_layout::mat(a.nxyz, l, 2)] * b0 + im[cmfd_layout::mat(a.nxyz, l, 3)] * b1;
         }
     }
     grid.sync();
@@ -2093,8 +2273,8 @@ __global__ void bicg_iteration_persistent(PersistentBicgParams a,
             }
             a.s[base + i0] = b0;
             a.s[base + i1] = b1;
-            a.z[base + 2 * l + 0] = im[4 * l + 0] * b0 + im[4 * l + 1] * b1;
-            a.z[base + 2 * l + 1] = im[4 * l + 2] * b0 + im[4 * l + 3] * b1;
+            a.z[base + 2 * l + 0] = im[cmfd_layout::mat(a.nxyz, l, 0)] * b0 + im[cmfd_layout::mat(a.nxyz, l, 1)] * b1;
+            a.z[base + 2 * l + 1] = im[cmfd_layout::mat(a.nxyz, l, 2)] * b0 + im[cmfd_layout::mat(a.nxyz, l, 3)] * b1;
         }
     }
     grid.sync();
@@ -2305,12 +2485,12 @@ __global__ void refresh_operator_mirror_f32(const int nxyz,
     const double* dm = diag + m * mat_stride;
     float*        df = diag_f + m * mat_stride;
 #pragma unroll
-    for (int k = 0; k < 4; ++k) df[4 * l + k] = static_cast<float>(dm[4 * l + k]);
+    for (int k = 0; k < 4; ++k) df[cmfd_layout::mat(nxyz, l, k)] = static_cast<float>(dm[cmfd_layout::mat(nxyz, l, k)]);
 
     const double* cm = cc + m * cpl_stride;
     float*        cf = cc_f + m * cpl_stride;
 #pragma unroll
-    for (int k = 0; k < 12; ++k) cf[12 * l + k] = static_cast<float>(cm[12 * l + k]);
+    for (int k = 0; k < 12; ++k) cf[cmfd_layout::cpl(nxyz, l, k)] = static_cast<float>(cm[cmfd_layout::cpl(nxyz, l, k)]);
 }
 
 /// FP32 twin of begin_outer_fused, and the FP64 half of the refinement step.
@@ -2353,16 +2533,16 @@ __global__ void begin_outer_fused_f32(const int nxyz,
     {
         float* im = dinv_f + m * mat_stride;
 
-        const double a00  = dm[4 * l + 0];
-        const double a01  = dm[4 * l + 1];
-        const double a10  = dm[4 * l + 2];
-        const double a11  = dm[4 * l + 3];
+        const double a00  = dm[cmfd_layout::mat(nxyz, l, 0)];
+        const double a01  = dm[cmfd_layout::mat(nxyz, l, 1)];
+        const double a10  = dm[cmfd_layout::mat(nxyz, l, 2)];
+        const double a11  = dm[cmfd_layout::mat(nxyz, l, 3)];
         const double rdet = 1.0 / (a00 * a11 - a10 * a01);
 
-        im[4 * l + 0] = static_cast<float>(rdet * a11);
-        im[4 * l + 1] = static_cast<float>(-rdet * a01);
-        im[4 * l + 2] = static_cast<float>(-rdet * a10);
-        im[4 * l + 3] = static_cast<float>(rdet * a00);
+        im[cmfd_layout::mat(nxyz, l, 0)] = static_cast<float>(rdet * a11);
+        im[cmfd_layout::mat(nxyz, l, 1)] = static_cast<float>(-rdet * a01);
+        im[cmfd_layout::mat(nxyz, l, 2)] = static_cast<float>(-rdet * a10);
+        im[cmfd_layout::mat(nxyz, l, 3)] = static_cast<float>(rdet * a00);
     }
 
     // ---- matvec_two_group(x = phi -> y = ax), in FP64 ----
@@ -2372,15 +2552,15 @@ __global__ void begin_outer_fused_f32(const int nxyz,
 
     const double x0 = xm[2 * l + 0];
     const double x1 = xm[2 * l + 1];
-    double       y0 = dm[4 * l + 0] * x0 + dm[4 * l + 1] * x1;
-    double       y1 = dm[4 * l + 2] * x0 + dm[4 * l + 3] * x1;
+    double       y0 = dm[cmfd_layout::mat(nxyz, l, 0)] * x0 + dm[cmfd_layout::mat(nxyz, l, 1)] * x1;
+    double       y1 = dm[cmfd_layout::mat(nxyz, l, 2)] * x0 + dm[cmfd_layout::mat(nxyz, l, 3)] * x1;
 
 #pragma unroll
     for (int slot = 0; slot < 6; ++slot) {
-        const int neighbor = neighbors[6 * l + slot];
+        const int neighbor = neighbors[cmfd_layout::face(nxyz, l, slot)];
         if (neighbor >= 0) {
-            y0 += cm[12 * l + slot] * xm[2 * neighbor + 0];
-            y1 += cm[12 * l + 6 + slot] * xm[2 * neighbor + 1];
+            y0 += cm[cmfd_layout::cpl(nxyz, l, slot)] * xm[2 * neighbor + 0];
+            y1 += cm[cmfd_layout::cpl(nxyz, l, 6 + slot)] * xm[2 * neighbor + 1];
         }
     }
 
@@ -2524,15 +2704,15 @@ __global__ void matvec_two_group_f32(const int nxyz,
 
     const float x0 = xm[2 * l + 0];
     const float x1 = xm[2 * l + 1];
-    float       y0 = dm[4 * l + 0] * x0 + dm[4 * l + 1] * x1;
-    float       y1 = dm[4 * l + 2] * x0 + dm[4 * l + 3] * x1;
+    float       y0 = dm[cmfd_layout::mat(nxyz, l, 0)] * x0 + dm[cmfd_layout::mat(nxyz, l, 1)] * x1;
+    float       y1 = dm[cmfd_layout::mat(nxyz, l, 2)] * x0 + dm[cmfd_layout::mat(nxyz, l, 3)] * x1;
 
 #pragma unroll
     for (int slot = 0; slot < 6; ++slot) {
-        const int neighbor = neighbors[6 * l + slot];
+        const int neighbor = neighbors[cmfd_layout::face(nxyz, l, slot)];
         if (neighbor >= 0) {
-            y0 += cm[12 * l + slot] * xm[2 * neighbor + 0];
-            y1 += cm[12 * l + 6 + slot] * xm[2 * neighbor + 1];
+            y0 += cm[cmfd_layout::cpl(nxyz, l, slot)] * xm[2 * neighbor + 0];
+            y1 += cm[cmfd_layout::cpl(nxyz, l, 6 + slot)] * xm[2 * neighbor + 1];
         }
     }
 
@@ -2570,15 +2750,15 @@ __global__ void colored_block_sweep_f32(const int nxyz,
     float b1 = bm[2 * l + 1];
 #pragma unroll
     for (int slot = 0; slot < 6; ++slot) {
-        const int neighbor = neighbors[6 * l + slot];
+        const int neighbor = neighbors[cmfd_layout::face(nxyz, l, slot)];
         if (neighbor >= 0) {
-            b0 -= cm[12 * l + slot] * xm[2 * neighbor + 0];
-            b1 -= cm[12 * l + 6 + slot] * xm[2 * neighbor + 1];
+            b0 -= cm[cmfd_layout::cpl(nxyz, l, slot)] * xm[2 * neighbor + 0];
+            b1 -= cm[cmfd_layout::cpl(nxyz, l, 6 + slot)] * xm[2 * neighbor + 1];
         }
     }
 
-    xm[2 * l + 0] = im[4 * l + 0] * b0 + im[4 * l + 1] * b1;
-    xm[2 * l + 1] = im[4 * l + 2] * b0 + im[4 * l + 3] * b1;
+    xm[2 * l + 0] = im[cmfd_layout::mat(nxyz, l, 0)] * b0 + im[cmfd_layout::mat(nxyz, l, 1)] * b1;
+    xm[2 * l + 1] = im[cmfd_layout::mat(nxyz, l, 2)] * b0 + im[cmfd_layout::mat(nxyz, l, 3)] * b1;
 }
 
 /// FP32 twin of prepare_p_jacobi.  The breakdown test and beta itself are
@@ -2632,8 +2812,8 @@ __global__ void prepare_p_jacobi_f32(const int nxyz,
     const float* im = dinv_f + m * mat_stride;
     float*       xm = y_f + m * vec_stride;
 
-    xm[2 * l + 0] = im[4 * l + 0] * b0 + im[4 * l + 1] * b1;
-    xm[2 * l + 1] = im[4 * l + 2] * b0 + im[4 * l + 3] * b1;
+    xm[2 * l + 0] = im[cmfd_layout::mat(nxyz, l, 0)] * b0 + im[cmfd_layout::mat(nxyz, l, 1)] * b1;
+    xm[2 * l + 1] = im[cmfd_layout::mat(nxyz, l, 2)] * b0 + im[cmfd_layout::mat(nxyz, l, 3)] * b1;
 }
 
 /// FP32 twin of update_s_jacobi.  rho, r0.v and alpha are the FP64 dot results
@@ -2690,8 +2870,8 @@ __global__ void update_s_jacobi_f32(const int nxyz,
     const float* im = dinv_f + m * mat_stride;
     float*       xm = z_f + m * vec_stride;
 
-    xm[2 * l + 0] = im[4 * l + 0] * b0 + im[4 * l + 1] * b1;
-    xm[2 * l + 1] = im[4 * l + 2] * b0 + im[4 * l + 3] * b1;
+    xm[2 * l + 0] = im[cmfd_layout::mat(nxyz, l, 0)] * b0 + im[cmfd_layout::mat(nxyz, l, 1)] * b1;
+    xm[2 * l + 1] = im[cmfd_layout::mat(nxyz, l, 2)] * b0 + im[cmfd_layout::mat(nxyz, l, 3)] * b1;
 }
 
 /// THE REFINEMENT STEP.  The correction dx = alpha*y + omega*z is formed in
@@ -3274,7 +3454,7 @@ __global__ void cmfd_updls(const int nxyz,
         for (int igs = 0; igs < 2; ++igs) {
             const double c2 =
                 __dmul_rn(__dmul_rn(cm[ige * nxyz + l], xm[igs * nxyz + l]), reigvs);
-            const long long idx = static_cast<long long>(l) * 4 + ige * 2 + igs;
+            const long long idx = cmfd_layout::mat(nxyz, l, ige * 2 + igs);
             dm[idx]             = fma(-c2, vl, um[idx]);
         }
 }
@@ -3531,6 +3711,14 @@ __global__ void cmfd_sweep_gate_patch(std::uint32_t* sweep_halt,
 ///   node_blocks          blocks_per_launch for the per-NODE classes.
 ///   vector_blocks        blocks_per_launch for the per-ELEMENT class.
 ///   persistent_arm       whether the cooperative single-launch iteration ran.
+///   layout               WP21-A: "soa" when the node-indexed operator arrays
+///                        (diag/dinv/udiag/cc/neighbors/node_surface/face_area)
+///                        are component-major -- component k of node l at
+///                        k*nxyz + l -- and "aos" for the historical
+///                        node-major packing.
+///   layout_version       2 for "soa", 1 for "aos".  Stamped so a profile, a
+///                        digest and a graph census can never be read against
+///                        the wrong kernel bodies.
 static void reportCmfdGraphCensus(const char* tag, cudaGraph_t graph, int sweeps,
                                   int iterations_per_outer, unsigned fuse_mask,
                                   int block_threads, int node_blocks,
@@ -3583,6 +3771,12 @@ static void reportCmfdGraphCensus(const char* tag, cudaGraph_t graph, int sweeps
          << ",\"node_blocks\":" << node_blocks
          << ",\"vector_blocks\":" << vector_blocks
          << ",\"persistent_arm\":" << (persistent_arm ? 1 : 0)
+         // WP21-A: which packing the node-indexed operator arrays are in.  A
+         // build carries exactly one (cmfd_layout::kNodeInnermost is a
+         // compile-time constant), so this is the receipt that tells a reader
+         // which kernels the ncu numbers below it belong to.
+         << ",\"layout\":\"" << cmfd_layout::layoutName() << "\""
+         << ",\"layout_version\":" << cmfd_layout::kLayoutVersion
          << ",\"fuse_mask\":" << fuse_mask << "}";
     std::cout << line.str() << std::endl;
 }
@@ -3847,6 +4041,7 @@ public:
             fuse_dot2      = (fuse_mask & kFuseDot2) != 0u;
             fuse_wiel      = (fuse_mask & kFuseWiel) != 0u;
             fuse_sweep_pre = (fuse_mask & kFuseSweepPre) != 0u;
+            fuse_norm      = (fuse_mask & kFuseNorm) != 0u;
             fp32_inner    = cmfdFp32InnerEnabled();
             telemetry.fp32_active = fp32_inner ? 1u : 0u;
             // WP17.  Both are latched here, once, for the same reason the fuse
@@ -3874,10 +4069,34 @@ public:
                       ", precision=" + (fp32_inner ? "mixed" : "fp64") +
                       ", slots=" + std::to_string(slots) + ")";
 
+            // -------------------------------------------------------------
+            // WP21-A: the geometry-static arrays go up COMPONENT-MAJOR.
+            //
+            // The host copies above stay node-major on purpose -- the greedy
+            // colouring, the topology guard in compatible() and Geometry itself
+            // all read them that way -- so the permutation happens exactly once,
+            // here, at arena construction.  Same element count, same bytes, same
+            // xfer::memcpy site names: only the order within the buffer moves.
+            // -------------------------------------------------------------
+            std::vector<int>    soa_neighbors(host_neighbors.size());
+            std::vector<int>    soa_node_surface(host_node_surface.size());
+            std::vector<double> soa_face_area(host_face_area.size());
+            for (int l = 0; l < nxyz; ++l) {
+                for (int f = 0; f < 6; ++f) {
+                    const size_t to = static_cast<size_t>(cmfd_layout::face(nxyz, l, f));
+                    const size_t from = static_cast<size_t>(l) * 6 + static_cast<size_t>(f);
+                    soa_neighbors[to]    = host_neighbors[from];
+                    soa_node_surface[to] = host_node_surface[from];
+                }
+                for (int d = 0; d < NDIRMAX; ++d)
+                    soa_face_area[static_cast<size_t>(cmfd_layout::dir(nxyz, l, d))] =
+                        host_face_area[static_cast<size_t>(l) * NDIRMAX + static_cast<size_t>(d)];
+            }
+
             const size_t S = static_cast<size_t>(slots);
             allocate(reinterpret_cast<void**>(&neighbors), host_neighbors.size() * sizeof(int));
             CUDA_CHECK(rasbery::xfer::memcpy("CudaBICGBackend.cu:BatchCore::init", "neighbors", neighbors,
-                                  host_neighbors.data(),
+                                  soa_neighbors.data(),
                                   host_neighbors.size() * sizeof(int),
                                   cudaMemcpyHostToDevice));
             allocate(reinterpret_cast<void**>(&colors), host_colors.size() * sizeof(int));
@@ -3889,14 +4108,14 @@ public:
                      host_node_surface.size() * sizeof(int));
             CUDA_CHECK(rasbery::xfer::memcpy("CudaBICGBackend.cu:BatchCore::init",
                                   "assembly_node_surface", assembly_node_surface,
-                                  host_node_surface.data(),
+                                  soa_node_surface.data(),
                                   host_node_surface.size() * sizeof(int),
                                   cudaMemcpyHostToDevice));
             allocate(reinterpret_cast<void**>(&assembly_face_area),
                      host_face_area.size() * sizeof(double));
             CUDA_CHECK(rasbery::xfer::memcpy("CudaBICGBackend.cu:BatchCore::init",
                                   "assembly_face_area", assembly_face_area,
-                                  host_face_area.data(),
+                                  soa_face_area.data(),
                                   host_face_area.size() * sizeof(double),
                                   cudaMemcpyHostToDevice));
             allocate(reinterpret_cast<void**>(&assembly_volume),
@@ -4035,6 +4254,7 @@ public:
             CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&host_assembly_active),
                                       SL * sizeof(std::uint32_t)));
             std::memset(host_assembly_active, 0, SL * sizeof(std::uint32_t));
+
             // SNAPSHOT BUFFER for the sweep mask.  issueSweepUploads used to
             // build the participation mask in host_active, upload it, and then
             // INVERT THAT SAME BUFFER IN PLACE for the sweep_halt upload -- a
@@ -4077,6 +4297,36 @@ public:
                                   "d_slot_map seed", d_slot_map, stageSlotMap(),
                                   S * sizeof(int), cudaMemcpyHostToDevice));
             lanes = slots;
+
+            // -------------------------------------------------------------
+            // WP21-A: THE OPERATOR TRANSPOSE LANES.
+            //
+            // The host operator arrays (CMFD::_diag, CMFD::_cc, BICGCMFD's
+            // _udiag) are node-major -- the CPU reference solver in
+            // BICGSolver.cpp indexes them that way and is not ours to move --
+            // while the device ones are component-major (cmfd_layout).  These
+            // pinned lanes are where the permutation lands, so the DMA still
+            // moves ONE contiguous block of EXACTLY the byte count it moved
+            // before: the xfer ledger sees the same site, the same leaf name
+            // and the same bytes.
+            //
+            // One lane PER SLOT, not one shared lane, because the pushes are
+            // cudaMemcpyAsync: slot m's source has to stay untouched until the
+            // copy retires, and the loop reaches slot m+1 long before that.
+            // Three lanes wide because diag, udiag and cc can be in flight at
+            // once on the host-assembly path.
+            //
+            // Cost: (2*4 + 12) * nxyz doubles per slot, ~1.1 MB at the 8,451-node
+            // KNGR deck.  Nothing is copied into them on the DEVICE-assembly
+            // path, which is what v6 runs: there the operator never crosses PCIe
+            // at all (cmfd_diag_h2d_elided_bytes).
+            // -------------------------------------------------------------
+            CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&xpose_diag),
+                                      S * matrix_count * sizeof(double)));
+            CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&xpose_udiag),
+                                      S * matrix_count * sizeof(double)));
+            CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&xpose_cc),
+                                      S * coupling_count * sizeof(double)));
 
             CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
             CUBLAS_CHECK(cublasCreate(&handle));
@@ -4207,6 +4457,10 @@ public:
         host_sweep_scalars = nullptr;
         if (host_assembly_active != nullptr) cudaFreeHost(host_assembly_active);
         host_assembly_active = nullptr;
+        if (xpose_diag != nullptr) cudaFreeHost(xpose_diag);
+        if (xpose_udiag != nullptr) cudaFreeHost(xpose_udiag);
+        if (xpose_cc != nullptr) cudaFreeHost(xpose_cc);
+        xpose_diag = xpose_udiag = xpose_cc = nullptr;
         neighbors = nullptr;
         colors = nullptr;
         assembly_node_surface = nullptr;
@@ -4673,12 +4927,14 @@ public:
                 const size_t bytes = matrix_count * sizeof(double);
                 CUDA_CHECK(rasbery::xfer::memcpyAsync(
                     "CudaBICGBackend.cu:issueUploads", "diag", diag + m * mat_stride(),
-                    sl.host_diag, bytes, cudaMemcpyHostToDevice, stream));
+                    packMat(xpose_diag, m, sl.host_diag), bytes,
+                    cudaMemcpyHostToDevice, stream));
                 ++telemetry.bulk_h2d_calls_during_iteration;
                 telemetry.bulk_h2d_bytes_during_iteration += bytes;
             }
             pushOrSkip("issueUploads:cc", cc + m * cpl_stride(), sl.host_cc,
-                       coupling_count, sl.push_cc, sl.cc_mirror);
+                       coupling_count, sl.push_cc, sl.cc_mirror,
+                       sl.push_cc ? packCpl(m, sl.host_cc) : nullptr);
             pushOrSkip("issueUploads:phi", phi + m * vec_stride(), sl.host_phi,
                        static_cast<size_t>(n), sl.push_phi, sl.phi_mirror);
 
@@ -4711,16 +4967,77 @@ public:
         }
     }
 
+    // -----------------------------------------------------------------------
+    // WP21-A: THE HOST<->DEVICE OPERATOR PERMUTATION.
+    //
+    // Four calls, one direction each way per array class.  They move NO value
+    // and change NO byte count: element (l, k) of the node-major host array is
+    // element cmfd_layout::mat/cpl(nxyz, l, k) of the component-major device
+    // one, and both buffers hold exactly matrix_count / coupling_count doubles.
+    // Under the AoS layout cmfd_layout::mat(nxyz, l, k) IS l*4 + k, so these
+    // degenerate to a straight copy and the arrays stay byte-identical.
+    // -----------------------------------------------------------------------
+
+    /// Pack one slot's node-major diag/udiag into its pinned lane; returns the
+    /// DMA source.
+    const double* packMat(double* lane, int m, const double* host_aos) {
+        // Null in, null out: the callers' own "received a null host buffer"
+        // diagnostics are the ones that must fire, not a segfault in here.
+        if (host_aos == nullptr) return nullptr;
+        double* out = lane + static_cast<size_t>(m) * matrix_count;
+        for (int l = 0; l < nxyz; ++l)
+            for (int k = 0; k < 4; ++k)
+                out[static_cast<size_t>(cmfd_layout::mat(nxyz, l, k))] =
+                    host_aos[static_cast<size_t>(l) * 4 + static_cast<size_t>(k)];
+        return out;
+    }
+
+    /// Pack one slot's node-major cc into its pinned lane.
+    const double* packCpl(int m, const double* host_aos) {
+        if (host_aos == nullptr) return nullptr;
+        double* out = xpose_cc + static_cast<size_t>(m) * coupling_count;
+        for (int l = 0; l < nxyz; ++l)
+            for (int j = 0; j < 12; ++j)
+                out[static_cast<size_t>(cmfd_layout::cpl(nxyz, l, j))] =
+                    host_aos[static_cast<size_t>(l) * 12 + static_cast<size_t>(j)];
+        return out;
+    }
+
+    /// Scatter one slot's component-major lane back into the node-major host
+    /// array.  Called only AFTER the download drain, never before.
+    void unpackMat(const double* lane, int m, double* host_aos) const {
+        const double* in = lane + static_cast<size_t>(m) * matrix_count;
+        for (int l = 0; l < nxyz; ++l)
+            for (int k = 0; k < 4; ++k)
+                host_aos[static_cast<size_t>(l) * 4 + static_cast<size_t>(k)] =
+                    in[static_cast<size_t>(cmfd_layout::mat(nxyz, l, k))];
+    }
+
+    void unpackCpl(int m, double* host_aos) const {
+        const double* in = xpose_cc + static_cast<size_t>(m) * coupling_count;
+        for (int l = 0; l < nxyz; ++l)
+            for (int j = 0; j < 12; ++j)
+                host_aos[static_cast<size_t>(l) * 12 + static_cast<size_t>(j)] =
+                    in[static_cast<size_t>(cmfd_layout::cpl(nxyz, l, j))];
+    }
+
+    /// @param dma_source when non-null, the bytes actually pushed -- WP21-A's
+    ///        component-major pack of @p host_buffer.  The MIRROR still shadows
+    ///        @p host_buffer, because the mirror's job is to answer "has the
+    ///        HOST array changed since the last push", and that question is
+    ///        about the host array whatever order the DMA saw it in.
     void pushOrSkip(const char* leaf, double* device_buffer, const double* host_buffer,
-                    size_t count, bool push, MirroredUpload& mirror) {
+                    size_t count, bool push, MirroredUpload& mirror,
+                    const double* dma_source = nullptr) {
         if (!push) {
             ++telemetry.bulk_h2d_skipped_during_iteration;
             return;
         }
         const size_t bytes = count * sizeof(double);
         CUDA_CHECK(rasbery::xfer::memcpyAsync("CudaBICGBackend.cu:pushOrSkip", leaf,
-                                       device_buffer, host_buffer, bytes,
-                                       cudaMemcpyHostToDevice, stream));
+                                       device_buffer,
+                                       dma_source != nullptr ? dma_source : host_buffer,
+                                       bytes, cudaMemcpyHostToDevice, stream));
         mirror.shadow.assign(host_buffer, host_buffer + count);
         mirror.valid = true;
         ++telemetry.bulk_h2d_calls_during_iteration;
@@ -4838,6 +5155,16 @@ public:
             n, vec_stride(), scalars, iter_flags, y_f, z_f, s_f, t_f, phi, r_f,
             device_halt, d_slot_map, lanes);
         const int norm_blocks = reduce_blocks_for(n);
+        // FUSE bit 4, FP32 payload.  Same node count change, same tail.
+        if (fuse_norm && scalar_fusion) {
+            reduce_norm_accumulate_fused_f32<<<
+                dim3(static_cast<unsigned>(norm_blocks), static_cast<unsigned>(lanes)),
+                kReduceThreads, 0, stream>>>(
+                n, vec_stride(), allow_halt, force_halt, r_f, partials, scalars,
+                iter_flags, device_flags, device_counters, device_halt, device_active,
+                fuse_retire, d_slot_map, lanes);
+            return;
+        }
         reduce_dot_stage1_f32<<<
             dim3(static_cast<unsigned>(norm_blocks), static_cast<unsigned>(lanes)),
             kReduceThreads, 0, stream>>>(
@@ -4916,6 +5243,18 @@ public:
         // The stage-1 partition is unchanged; only the scalar stage-2 node is
         // optionally fused with its immediately dependent bookkeeping node.
         const int norm_blocks = reduce_blocks_for(n);
+        // FUSE bit 4: the two nodes below in one.  It needs scalar_fusion,
+        // because without it the stage-2 node is a plain reduce_dot_stage2 and
+        // the accumulate is a third node -- a different pair, not this one.
+        if (fuse_norm && scalar_fusion) {
+            reduce_norm_accumulate_fused<<<
+                dim3(static_cast<unsigned>(norm_blocks), static_cast<unsigned>(lanes)),
+                kReduceThreads, 0, stream>>>(
+                n, vec_stride(), allow_halt, force_halt, r, partials, scalars,
+                iter_flags, device_flags, device_counters, device_halt, device_active,
+                fuse_retire, d_slot_map, lanes);
+            return;
+        }
         reduce_dot_stage1<<<
             dim3(static_cast<unsigned>(norm_blocks), static_cast<unsigned>(lanes)),
             kReduceThreads, 0, stream>>>(
@@ -5604,12 +5943,17 @@ public:
                 sl.xsnf_mirror.invalidate();
                 push("xsnf (host assembly)", xs_xsnf + m * vec_stride(), sl.host_xsnf,
                      static_cast<size_t>(n));
+                // WP21-A: the three node-major host operator arrays are the
+                // only host buffers on this path that are not already
+                // component-major, so they -- and only they -- go through the
+                // pack lanes.  xsnf/xsrf/chif/xssm are group-major already.
                 push("udiag (host assembly)", udiag_dev + m * mat_stride(),
-                     sl.host_udiag, matrix_count);
-                push("diag (host assembly)", diag + m * mat_stride(), sl.host_diag,
-                     matrix_count);
+                     packMat(xpose_udiag, m, sl.host_udiag), matrix_count);
+                push("diag (host assembly)", diag + m * mat_stride(),
+                     packMat(xpose_diag, m, sl.host_diag), matrix_count);
                 pushOrSkip("issueSweepUploads:cc", cc + m * cpl_stride(), sl.host_cc,
-                           coupling_count, sl.push_cc, sl.cc_mirror);
+                           coupling_count, sl.push_cc, sl.cc_mirror,
+                           sl.push_cc ? packCpl(m, sl.host_cc) : nullptr);
                 ++telemetry.cmfd_assembly_cpu_fallbacks;
             }
 
@@ -5720,6 +6064,9 @@ public:
     void issueExceptionalOperatorDownloads(const int* active_slots, int count,
                                            bool forced = false) {
         bool queued = false;
+        // WP21-A: slots whose operator landed in a pack lane and still owe a
+        // scatter back into their node-major host arrays after the drain.
+        std::vector<int> unpack_operator;
         for (int i = 0; i < count; ++i) {
             const int m = active_slots[i];
             Slot& sl = slot[static_cast<size_t>(m)];
@@ -5747,18 +6094,27 @@ public:
                 sl.host_udiag == nullptr)
                 throw std::runtime_error(
                     "CMFD device assembly fallback has no writable host operator buffers");
+            // WP21-A: the device operator is component-major, the host one
+            // node-major, so the pull lands in the slot's pack lane and the
+            // scatter runs AFTER the drain below -- never before, or the D2H
+            // would still be reading the bytes we were rewriting.  Byte counts
+            // and ledger leaves are exactly what they were.
             CUDA_CHECK(rasbery::xfer::memcpyAsync(
                 "CudaBICGBackend.cu:issueExceptionalOperatorDownloads", "diag",
-                sl.host_diag_out, diag + m * mat_stride(), matrix_count * sizeof(double),
+                xpose_diag + static_cast<size_t>(m) * matrix_count,
+                diag + m * mat_stride(), matrix_count * sizeof(double),
                 cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(rasbery::xfer::memcpyAsync(
                 "CudaBICGBackend.cu:issueExceptionalOperatorDownloads", "cc",
-                sl.host_cc_out, cc + m * cpl_stride(), coupling_count * sizeof(double),
+                xpose_cc + static_cast<size_t>(m) * coupling_count,
+                cc + m * cpl_stride(), coupling_count * sizeof(double),
                 cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(rasbery::xfer::memcpyAsync(
                 "CudaBICGBackend.cu:issueExceptionalOperatorDownloads", "udiag",
-                sl.host_udiag, udiag_dev + m * mat_stride(),
+                xpose_udiag + static_cast<size_t>(m) * matrix_count,
+                udiag_dev + m * mat_stride(),
                 matrix_count * sizeof(double), cudaMemcpyDeviceToHost, stream));
+            unpack_operator.push_back(m);
             telemetry.bulk_d2h_calls_during_iteration += 3;
             telemetry.bulk_d2h_bytes_during_iteration +=
                 (2 * static_cast<std::uint64_t>(matrix_count) +
@@ -5770,6 +6126,14 @@ public:
         CUDA_CHECK(rasbery::xfer::streamSync(
             "CudaBICGBackend.cu:issueExceptionalOperatorDownloads", "drain", stream));
         CUDA_CHECK(cudaGetLastError());
+        // WP21-A: the pack lanes now hold what the device holds; scatter them
+        // back into the node-major host arrays the CPU reference solver reads.
+        for (int m : unpack_operator) {
+            Slot& sl = slot[static_cast<size_t>(m)];
+            unpackMat(xpose_diag, m, sl.host_diag_out);
+            unpackCpl(m, sl.host_cc_out);
+            unpackMat(xpose_udiag, m, sl.host_udiag);
+        }
     }
 
     /// The one drain per launch.  It covers the flux copies *and* the status
@@ -5991,12 +6355,22 @@ public:
     std::vector<std::uint32_t> shadow_assembly_active;
     std::vector<Slot> slot;
     std::uint32_t* host_assembly_active = nullptr; // pinned, (slots+1) lanes
+    /// WP21-A operator transpose lanes, pinned, one slot's worth each.  See
+    /// the allocation comment: the host operator is node-major, the device one
+    /// component-major, and these are where packMat/packCpl land the
+    /// permutation before the unchanged-size DMA.
+    double* xpose_diag  = nullptr; ///< [slot][matrix_count]
+    double* xpose_udiag = nullptr; ///< [slot][matrix_count]
+    double* xpose_cc    = nullptr; ///< [slot][coupling_count]
     bool          use_graph = true;
     bool          scalar_fusion = true;
     /// WP7 stage B: RASBERY_GPU_CMFD_FUSE, latched once at construction so the
     /// captured topology cannot change between two outers of the same run.  The
     /// four booleans are the mask, unpacked at the enqueue sites.
     unsigned      fuse_mask      = 0u;
+    /// WP21-A bit 4: fold the residual-norm stage 2 into the last block of its
+    /// stage 1.  Off unless RASBERY_GPU_CMFD_FUSE asks for bit 4.
+    bool          fuse_norm      = false;
     bool          fuse_dot       = false;
     bool          fuse_dot2      = false;
     bool          fuse_wiel      = false;
