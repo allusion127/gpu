@@ -171,9 +171,46 @@ inline bool captureTraceEnabled() {
 
 /// A small dense thread ordinal, because a std::thread::id hash is unreadable
 /// in a log and the only question asked of it is "same thread or not".
+///
+/// WHY THE STORAGE IS SPLIT OUT FROM THE MINTING (WP19.2 follow-up).  The crash
+/// handler in CrashReport.h prints this ordinal, and the shape below --
+///
+///     static thread_local int id = next.fetch_add(1, ...);
+///
+/// -- is exactly what a signal handler may not run: a function-local
+/// thread_local with a DYNAMIC initialiser is a guarded lazy init, and the
+/// initialiser itself is an atomic read-modify-write on a process-global.  On
+/// the runs that matter (tracing off, no capture race) NO thread had ever
+/// called this, so the handler was the first caller in the process -- it did
+/// the lazy init inside the signal, and the number it minted was a fresh 0 that
+/// cross-referenced against nothing in the rest of the log.
+///
+/// So the ordinal now lives in a CONSTANT-initialised thread_local (`-1` is a
+/// compile-time initialiser, so no guard variable and no dynamic initialisation
+/// are emitted for it), reading it is captureThreadOrdinalIfKnown(), and
+/// minting stays here where the ordinary callers are.
+inline int& captureThreadOrdinalSlot() {
+    // Constant-initialised on purpose: no guard, no dynamic init, no RMW.
+    static thread_local int id = -1;
+    return id;
+}
+
+/// The ordinal this thread ALREADY has, or -1 if it was never given one.
+///
+/// Read-only: no allocation, no lock, no atomic RMW, no lazy initialiser -- so
+/// a signal handler may call it.  It answers -1 rather than minting, which is
+/// the honest answer: a thread that never appeared in a [RASBERY][CAPTURE] or
+/// [CAPTURE_RACE] line has no ordinal to cross-reference, and printing a
+/// freshly minted 0 would claim that it did.
+inline int captureThreadOrdinalIfKnown() { return captureThreadOrdinalSlot(); }
+
+/// Mint on first use, stable for the life of the thread.  NOT for a signal
+/// handler -- use captureThreadOrdinalIfKnown() there, and pre-warm this on the
+/// ordinary path (crash::enter() does) so the handler has something to read.
 inline int captureThreadOrdinal() {
-    static std::atomic<int>  next{0};
-    static thread_local int  id = next.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int> next{0}; // constant-initialised: no guard either
+    int&                    id = captureThreadOrdinalSlot();
+    if (id < 0) id = next.fetch_add(1, std::memory_order_relaxed);
     return id;
 }
 

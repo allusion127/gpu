@@ -46,6 +46,31 @@ close it, and every one is re-run against a mutated copy that breaks it:
      record, because the record that says a worker crashed is the one a reader
      greps and the one block 38 found empty.
 
+  5. THE HANDLER READS; IT DOES NOT MINT.  Rule 2 is a BAN-LIST, and a ban-list
+     only ever catches the unsafe calls somebody already thought of.  It did
+     not catch this one: the first cut of the handler printed `"tid"` by
+     calling captureThreadOrdinal(), whose storage was
+
+         static thread_local int id = next.fetch_add(1, ...);
+
+     -- a function-local thread_local with a DYNAMIC initialiser, i.e. a
+     guarded lazy init, whose initialiser is an atomic read-modify-write on a
+     process-global counter.  With tracing off and no capture race (every
+     healthy run, and BOTH block-38 SIGSEGVs) nothing had ever called it, so
+     the handler was the first caller in the process: it ran the guarded init
+     inside the signal, and the number it printed was a freshly minted 0 that
+     cross-referenced against nothing -- while the header's own line 38-47
+     claimed the handler "calls exactly write(2), backtrace(),
+     backtrace_symbols_fd(), sigaction(), getpid(), and raise()".
+
+     So this rule is the COMPLEMENT of rule 2: an allowlist over every
+     identifier the handler names, plus the three structural facts that keep
+     the allowed reads readable -- the ordinal's storage is CONSTANT-initialised
+     (no guard variable), the reader is pure, and the minting happens on the
+     ordinary path in crash::enter() and crash::install() so the handler has a
+     real, cross-referenceable ordinal to load.  A newly added call is a finding
+     until somebody justifies it in ALLOWED_HANDLER_CALLS.
+
 Run:  python tools/test_crash_report_contract.py
 """
 
@@ -59,7 +84,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "src")
 TOOLS = os.path.join(ROOT, "tools")
 
-TARGETS = ("CrashReport.h", "EvaluatorServer.h", "CudaOuterGraph.cu")
+TARGETS = ("CrashReport.h", "EvaluatorServer.h", "CudaOuterGraph.cu",
+           "GpuCaptureArbiter.h")
 
 #: The signals a solver can actually take and must not take silently.
 FATAL_SIGNALS = ("SIGSEGV", "SIGBUS", "SIGFPE", "SIGILL", "SIGABRT")
@@ -72,6 +98,35 @@ BANNED_IN_HANDLER = (
     "std::to_string", "snprintf", "sprintf", "fprintf", "printf",
     "new ", "malloc(", "std::vector",
 )
+
+#: Rule 5.  Every identifier the handler is allowed to name.  An ALLOWLIST on
+#: purpose: BANNED_IN_HANDLER above is a ban-list, and captureThreadOrdinal()
+#: -- a guarded lazy init plus an atomic RMW, run inside the signal -- was on
+#: none of the ban-list's spellings.
+ALLOWED_HANDLER_CALLS = frozenset((
+    # this file's own renderers.  write(2) all the way down; see rawWrite().
+    "rawWrite", "rawStr", "rawInt", "rawQuoted", "signalName", "reraise",
+    # POSIX async-signal-safe.
+    "write", "getpid", "raise", "sigaction",
+    # glibc's documented malloc-free frame list -- the only stack that exists
+    # on a host with ulimit -c 0 and coredumpctl unreadable.
+    "backtrace", "backtrace_symbols_fd",
+    # Pure loads of CONSTANT-initialised storage: a lock-free CAS on a
+    # function-local std::atomic, the breadcrumb table, and thread_locals that
+    # crash::enter() / crash::install() have already touched on the ordinary
+    # path.  Nothing here allocates, locks, or lazily initialises.
+    "reporting", "compare_exchange_strong", "load",
+    "breadcrumbs", "currentLane", "captureArbiterOpen", "threadIsCapturing",
+    "captureRaceEvents", "captureThreadOrdinalIfKnown",
+))
+
+#: Keywords the identifier scan would otherwise read as calls.
+NOT_A_CALL = frozenset((
+    "if", "for", "while", "switch", "return", "sizeof", "catch",
+    "static_cast", "reinterpret_cast", "const_cast",
+))
+
+CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 
 CRASH_TAG = "[RASBERY][CRASH]"
 
@@ -223,6 +278,98 @@ def check_says_which_case(files: dict[str, str]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# rule 5 -- the handler READS; it does not mint, allocate or lazily initialise
+# ---------------------------------------------------------------------------
+
+def check_handler_only_reads(files: dict[str, str]) -> list[str]:
+    bad: list[str] = []
+    crash = files["CrashReport.h"]
+    arb = files["GpuCaptureArbiter.h"]
+    body = between(crash, "inline void handler(int sig)", "\n} // namespace detail")
+    if not body:
+        return ["src/CrashReport.h has no handler(int) -- this rule has no subject"]
+    code = strip_comments(body)
+
+    # (a) the allowlist.  Anything the handler names that is not on it is a
+    #     finding, whether or not anyone has thought about why.
+    named = {m.group(1) for m in CALL_RE.finditer(code)} - NOT_A_CALL
+    named.discard("handler")
+    for name in sorted(named - ALLOWED_HANDLER_CALLS):
+        bad.append("src/CrashReport.h: the handler calls %s(), which is not on "
+                   "ALLOWED_HANDLER_CALLS.  Either it is async-signal-safe -- a "
+                   "pure load of constant-initialised storage, or a call on the "
+                   "POSIX list -- and belongs there with a reason, or it is the "
+                   "next captureThreadOrdinal(): a lazy initialiser run inside "
+                   "the signal, on a heap the fault may have corrupted" % name)
+
+    # (b) the ordinal is read, never minted, in the handler.
+    if "captureThreadOrdinalIfKnown(" not in code:
+        bad.append("src/CrashReport.h: the handler does not read the thread "
+                   "ordinal through captureThreadOrdinalIfKnown().  The minting "
+                   "spelling runs a guarded lazy init and an atomic RMW inside "
+                   "the signal, and on a healthy run the handler is its FIRST "
+                   "caller in the process -- so the tid it prints is a fresh 0 "
+                   "that cross-references against nothing in the rest of the log")
+    if re.search(r"\bcaptureThreadOrdinal\s*\(", code):
+        bad.append("src/CrashReport.h: the handler calls captureThreadOrdinal() "
+                   "-- the minting spelling.  Use captureThreadOrdinalIfKnown()")
+
+    # (c) the storage the reader loads is CONSTANT-initialised, so no guard
+    #     variable and no dynamic initialiser exist for the handler to run.
+    slot = between(arb, "inline int& captureThreadOrdinalSlot()", "\n}\n")
+    if not slot:
+        bad.append("src/GpuCaptureArbiter.h has no captureThreadOrdinalSlot() -- "
+                   "the ordinal's storage and its minting are one function again, "
+                   "so there is no spelling a signal handler may use")
+    else:
+        slot_code = strip_comments(slot)
+        if "thread_local" not in slot_code:
+            bad.append("src/GpuCaptureArbiter.h: captureThreadOrdinalSlot() is not "
+                       "thread_local -- the ordinal would no longer identify a "
+                       "thread")
+        if "fetch_add" in slot_code or "fetch_sub" in slot_code:
+            bad.append("src/GpuCaptureArbiter.h: the ordinal's storage has a "
+                       "DYNAMIC initialiser again.  A function-local thread_local "
+                       "initialised by a fetch_add is a guarded lazy init, which "
+                       "is precisely what the crash handler must not run")
+
+    peek = between(arb, "inline int captureThreadOrdinalIfKnown()", "\n")
+    if not peek:
+        bad.append("src/GpuCaptureArbiter.h has no captureThreadOrdinalIfKnown() "
+                   "-- the handler has nothing signal-safe to call")
+    else:
+        for token in ("fetch_add", "fetch_sub", "getenv", "lock", "new "):
+            if token in peek:
+                bad.append("src/GpuCaptureArbiter.h: captureThreadOrdinalIfKnown() "
+                           "uses %r.  It is called from a signal handler; it must "
+                           "be a load and nothing else" % token)
+
+    # (d) somebody warms it on the ordinary path, or the honest read is always
+    #     -1 and the record is no more use than the one block 38 got.
+    enter_body = strip_comments(between(crash, "inline void enter(int lane,", "\n}\n"))
+    if "captureThreadOrdinal()" not in enter_body:
+        bad.append("src/CrashReport.h: crash::enter() does not warm the thread "
+                   "ordinal.  Every lane passes through it at the top of every "
+                   "case; without the warm the handler's honest read is -1 for "
+                   "every crash and the tid says nothing at all")
+    install = strip_comments(between(crash, "inline void install()", "\n}\n"))
+    if "captureThreadOrdinal()" not in install:
+        bad.append("src/CrashReport.h: install() does not warm the installing "
+                   "thread's ordinal.  It runs on the thread that never opens a "
+                   "lane Scope -- which is where block 38's run3 proc1 died, ~10 s "
+                   "in, during stand-up")
+
+    # (e) and the record says which lane faulted, not just which were open.
+    if "currentLane()" not in code:
+        bad.append("src/CrashReport.h: the record does not name the FAULTING "
+                   "lane.  `lanes[]` lists every case open anywhere in the "
+                   "process -- up to sixteen rows on an M16 worker -- and marks "
+                   "none of them, so the record names the suspects and not the "
+                   "corpse")
+    return bad
+
+
+# ---------------------------------------------------------------------------
 # rule 4 -- the harness keeps the dead child's last words
 # ---------------------------------------------------------------------------
 
@@ -289,6 +436,7 @@ CHECKS = (
     ("the record names case, lane, slot, phase -- and re-raises",
      check_says_which_case),
     ("the harness keeps the dead child's last words", check_harness_keeps_the_tail),
+    ("the handler reads and does not mint", check_handler_only_reads),
 )
 
 
@@ -340,6 +488,41 @@ def controls(files: dict[str, str]):
          mutate(files, "EvaluatorServer.h",
                 "const rasbery::crash::Scope _crumb(\n                lane, i,",
                 "const int _crumb_off = lane; (void)_crumb_off; //(\n                lane, i,")),
+        # --- rule 5 -------------------------------------------------------
+        ("the handler mints a thread ordinal inside the signal again",
+         check_handler_only_reads,
+         mutate(files, "CrashReport.h",
+                "rawInt(captureThreadOrdinalIfKnown());",
+                "rawInt(captureThreadOrdinal());")),
+        ("the ordinal's storage goes back to a guarded lazy initialiser",
+         check_handler_only_reads,
+         mutate(files, "GpuCaptureArbiter.h",
+                "static thread_local int id = -1;",
+                "static thread_local int id = next.fetch_add(1, "
+                "std::memory_order_relaxed);")),
+        ("nobody warms the ordinal on the ordinary path",
+         check_handler_only_reads,
+         mutate(files, "CrashReport.h",
+                "    (void)captureThreadOrdinal();\n    (void)threadIsCapturing();",
+                "    // (void)captureThreadOrdinal();\n    (void)threadIsCapturing();")),
+        ("the reader starts minting after all",
+         check_handler_only_reads,
+         mutate(files, "GpuCaptureArbiter.h",
+                "inline int captureThreadOrdinalIfKnown() { return "
+                "captureThreadOrdinalSlot(); }",
+                "inline int captureThreadOrdinalIfKnown() { return "
+                "next.fetch_add(1); }")),
+        ("the handler picks up a call nobody vetted",
+         check_handler_only_reads,
+         mutate(files, "CrashReport.h",
+                '    rawStr(",\\"capture_open\\":");',
+                '    captureArbiterProvenance();\n'
+                '    rawStr(",\\"capture_open\\":");')),
+        ("the record stops saying which lane faulted",
+         check_handler_only_reads,
+         mutate(files, "CrashReport.h",
+                "    rawInt(currentLane());",
+                "    rawInt(-1);")),
     ]
 
 

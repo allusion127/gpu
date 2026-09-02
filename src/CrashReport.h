@@ -24,7 +24,7 @@
 // (subprocess.STDOUT), so the record reaches the harness with no new plumbing:
 //
 //   [RASBERY][CRASH] {"signal":11,"name":"SIGSEGV","pid":41213,"tid":6,
-//    "capture_open":1,"thread_capturing":0,"capture_race_events":2,
+//    "lane":5,"capture_open":1,"thread_capturing":0,"capture_race_events":2,
 //    "lanes":[{"lane":5,"case":8,"slot":-1,"phase":"drive",
 //              "deck":".../candidate_0060.json"}]}
 //   [RASBERY][CRASH][FRAME] ...backtrace_symbols_fd output...
@@ -33,18 +33,46 @@
 // The four facts the block-38 forensics wanted and could not get -- case, lane,
 // slot, phase -- are the first four fields, and `capture_open` /
 // `capture_race_events` answer the standing question of whether a capture
-// window was open somewhere in the process when the thread died.
+// window was open somewhere in the process when the thread died.  `"lane"` is
+// the FAULTING thread's lane, so a record with several rows in `lanes[]` still
+// says which of them died; `"tid"` is the same ordinal the [RASBERY][CAPTURE]
+// and [CAPTURE_RACE] lines print, or -1 on a thread that has never been given
+// one (see below).
 //
-// ASYNC-SIGNAL SAFETY, KEPT RATHER THAN CLAIMED.  Inside the handler this file
-// calls exactly write(2), backtrace(), backtrace_symbols_fd(), sigaction(),
-// getpid(), and raise() -- every one of them on the POSIX
-// async-signal-safe list, except backtrace()/backtrace_symbols_fd(), which
-// glibc documents as the malloc-free spelling of the pair and which are the
-// only way to get a frame list without a core.  No std::ostream, no
-// std::string, no snprintf, no locale.  Integers are rendered by a local
-// reverse-digit loop into a stack buffer.  `backtrace()` is called ONCE at
-// install time so the dynamic loader has already resolved it and populated its
-// internal state before a signal can arrive.
+// ASYNC-SIGNAL SAFETY, KEPT RATHER THAN CLAIMED.  The SYSTEM calls the handler
+// makes are exactly write(2), backtrace(), backtrace_symbols_fd(), sigaction(),
+// getpid(), and raise() -- every one of them on the POSIX async-signal-safe
+// list, except backtrace()/backtrace_symbols_fd(), which glibc documents as the
+// malloc-free spelling of the pair and which are the only way to get a frame
+// list without a core.  No std::ostream, no std::string, no snprintf, no
+// locale.  Integers are rendered by a local reverse-digit loop into a stack
+// buffer.  `backtrace()` is called ONCE at install time so the dynamic loader
+// has already resolved it and populated its internal state before a signal can
+// arrive.
+//
+// It ALSO reads five in-process facts -- captureThreadOrdinalIfKnown(),
+// currentLane(), captureArbiterOpen(), threadIsCapturing() and
+// captureRaceEvents() -- plus the breadcrumb table itself, and every one of
+// them is a plain load out of storage that is CONSTANT-initialised (a
+// thread_local `int`, a function-local std::atomic or array of them, all with
+// constexpr constructors).  None of them takes a lock, allocates, or runs a
+// guarded lazy initialiser inside the signal.  The two thread_locals are also
+// FIRST TOUCHED on the ordinary path -- enter() warms both, install() warms the
+// ordinal on the thread that never opens a lane -- so even the loader's lazy
+// per-thread TLS block is already there when the signal arrives.  The contract
+// test enforces this as an ALLOWLIST of what the handler may name, because a
+// ban-list only ever catches the unsafe calls somebody already thought of.
+//
+// THAT COST A DEFECT ONCE, WHICH IS WHY IT IS SPELLED OUT.  The first cut
+// printed `"tid"` by calling captureThreadOrdinal(), which mints on first use:
+// a function-local thread_local with a DYNAMIC initialiser (a guarded lazy
+// init) whose initialiser is a fetch_add on a process-global counter.  With
+// tracing off and no capture race -- i.e. every healthy run, and both block-38
+// SIGSEGVs -- nothing had ever called it, so the HANDLER was the first caller
+// in the process: it ran the guarded init inside the signal, and the number it
+// printed was a freshly minted 0 that cross-referenced against nothing.  The
+// minting now happens on the ordinary path, in enter(), on every lane at the
+// top of every case; the handler only reads what is already there.
 //
 // THE BREADCRUMBS ARE LOCK-FREE AND LANE-LOCAL.  `Breadcrumb` is a fixed table
 // indexed by host thread ordinal; a lane writes only its own row and only with
@@ -150,6 +178,16 @@ inline int& currentLane() {
 /// Open a lane's row.  `lane` outside the table is dropped rather than folded,
 /// because folding two lanes onto one row would make the crash record lie.
 inline void enter(int lane, int case_index, const char* deck, const char* phase) {
+    // WARM, ON THE ORDINARY PATH, EVERY THREAD-LOCAL THE HANDLER WILL READ.
+    // captureThreadOrdinal() mints this thread's ordinal -- a guarded lazy init
+    // whose initialiser is an atomic RMW -- and threadIsCapturing() is the first
+    // touch of the capture-depth TLS.  Neither may run inside a signal, and both
+    // are free here: after the first case on a lane they are a load and a
+    // branch.  This is what lets the handler be a pure reader, and it is what
+    // makes the `"tid"` it prints the SAME ordinal the [RASBERY][CAPTURE] and
+    // [CAPTURE_RACE] lines print rather than a number minted in the signal.
+    (void)captureThreadOrdinal();
+    (void)threadIsCapturing();
     currentLane() = lane;
     if (lane < 0 || lane >= kMaxLanes) return;
     Breadcrumb& b = breadcrumbs()[lane];
@@ -307,7 +345,19 @@ inline void handler(int sig) {
     rawStr("\",\"pid\":");
     rawInt(static_cast<long long>(::getpid()));
     rawStr(",\"tid\":");
-    rawInt(captureThreadOrdinal());
+    // READ, never mint: the minting spelling is a guarded lazy init plus an
+    // atomic RMW, and on a healthy run the handler would be its FIRST caller in
+    // the process.  enter() warms it on every lane; -1 here means the faulting
+    // thread genuinely never had an ordinal, which is the honest answer rather
+    // than a freshly minted 0 that cross-references against nothing.
+    rawInt(captureThreadOrdinalIfKnown());
+    // WHICH of the rows below is the one that died.  `lanes[]` lists every case
+    // open anywhere in the process -- on an M16 worker that is up to sixteen
+    // rows and none of them is marked -- so without this the record names the
+    // suspects and not the corpse.  -1 means the faulting thread had no case
+    // open: stand-up, teardown, or a thread that is not a lane at all.
+    rawStr(",\"lane\":");
+    rawInt(currentLane());
     // The three numbers that say whether a capture was in flight anywhere in
     // the process when this thread died -- the standing question WP19 left and
     // block 38 could not answer for either SIGSEGV.
@@ -372,6 +422,12 @@ inline void install() {
     if (!installed.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) return;
     const char* off = std::getenv("RASBERY_CRASH_REPORT");
     if (off != nullptr && off[0] == '0' && off[1] == '\0') return;
+    // Warm the INSTALLING thread's ordinal as well.  install() runs at the top
+    // of the evaluator's run(), on the thread that never opens a lane Scope --
+    // and that is exactly where block 38's run3 proc1 died, ~10 s in, during
+    // stand-up.  Without this the record for the one crash the breadcrumbs
+    // cannot describe would also carry an unknown tid.
+    (void)captureThreadOrdinal();
 #if RASBERY_HAS_BACKTRACE
     // Warm the loader BEFORE a signal can arrive: the first backtrace() in a
     // process resolves symbols and may allocate, and a handler is the wrong
