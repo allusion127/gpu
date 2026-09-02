@@ -221,15 +221,17 @@ __device__ inline void flatxsSolveNodeCta(const FlatXsView& v, int i,
     for (int q = tid; q < Q_LMP; q += T) {
         const int t  = q / NG;
         const int ig = q - t * NG;
-        w.bl[q]      = fxsRefLmp(v, t, ig * nxyz + l);
+        w.bl[q]      = fxsRefLmp(v, t, block_layout::lmp(nxyz, l, ig));
     }
-    for (int q = tid; q < Q_LSM; q += T) w.bls[q] = fxsRefLsm(v, q * nxyz + l);
+    for (int q = tid; q < Q_LSM; q += T)
+        w.bls[q] = fxsRefLsm(v, block_layout::lsm(nxyz, l, q));
     for (int q = tid; q < Q_MIC; q += T) {
         const int t = q / NMIC;
         const int e = q - t * NMIC;
-        w.bm[q]     = fxsRefMic(v, t, e * nxyz + l);
+        w.bm[q]     = fxsRefMic(v, t, block_layout::mic(nxyz, l, e));
     }
-    for (int q = tid; q < Q_MSM; q += T) w.bms[q] = fxsRefMsm(v, q * nxyz + l);
+    for (int q = tid; q < Q_MSM; q += T)
+        w.bms[q] = fxsRefMsm(v, block_layout::msm(nxyz, l, q));
 
     // NO BARRIER HERE, AND THAT IS DELIBERATE: by (P1) the lane that wrote
     // element q is the lane that reads it below.  A barrier would be free
@@ -331,15 +333,17 @@ __device__ inline void flatxsSolveNodeCta(const FlatXsView& v, int i,
     for (int q = tid; q < Q_LMP; q += T) {
         const int t             = q / NG;
         const int ig            = q - t * NG;
-        fxsStoreLmp(v, t, ig * nxyz + l, w.bl[q]);
+        fxsStoreLmp(v, t, block_layout::lmp(nxyz, l, ig), w.bl[q]);
     }
-    for (int q = tid; q < Q_LSM; q += T) fxsStoreLsm(v, q * nxyz + l, w.bls[q]);
+    for (int q = tid; q < Q_LSM; q += T)
+        fxsStoreLsm(v, block_layout::lsm(nxyz, l, q), w.bls[q]);
     for (int q = tid; q < Q_MIC; q += T) {
         const int t            = q / NMIC;
         const int e            = q - t * NMIC;
-        fxsStoreMic(v, t, e * nxyz + l, w.bm[q]);
+        fxsStoreMic(v, t, block_layout::mic(nxyz, l, e), w.bm[q]);
     }
-    for (int q = tid; q < Q_MSM; q += T) fxsStoreMsm(v, q * nxyz + l, w.bms[q]);
+    for (int q = tid; q < Q_MSM; q += T)
+        fxsStoreMsm(v, block_layout::msm(nxyz, l, q), w.bms[q]);
 
     // Publish the workspace and sh_iden: from here on lanes read elements they
     // did not write.

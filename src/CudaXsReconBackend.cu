@@ -2161,6 +2161,40 @@ struct NodalReceipt {
 };
 NodalReceipt g_nodal_receipt;
 
+/// WP21-B: the micx/lmpx block's STORAGE ORDER, said out loud once per process.
+///
+/// WHY A RECEIPT AND NOT A CAPTURE KEY.  Same finding as WP21-A: the layout is
+/// a compile-time constant (fxs::block_layout::kNodeInnermost), so one process
+/// cannot hold two of them and a key field would compare a constant against
+/// itself for ever.  What a reader actually needs it for is the other
+/// direction -- reading an ncu profile, a digest or a census against the WRONG
+/// kernel body -- and that is a receipt's job.
+///
+/// ITS OWN TAG, `[RASBERY][MICX][LAYOUT]`.  Driver.h prints the WP15 residency
+/// line under `[RASBERY][MICX]` and Driver.h is not this member's file to edit;
+/// a third tag segment keeps a `[RASBERY][MICX]` grep finding both while
+/// leaving the residency line's schema alone.  Printed UNCONDITIONALLY, so a
+/// run with the flat-XS arm off still states which order its host arrays are
+/// in -- the host accessors in XSSet.h use the same order whether or not any
+/// device ever ran.
+///
+/// `elem_bytes` is on this line and not only on the residency one because the
+/// two together are what identify the block: an address is an order AND a
+/// width, and WP20.1 made the width an arm.
+struct FlatXsLayoutReceipt {
+    ~FlatXsLayoutReceipt() {
+        std::cout << "[RASBERY][MICX][LAYOUT] {\"layout\":\""
+                  << fxs::block_layout::name() << "\",\"layout_version\":"
+                  << fxs::block_layout::kLayoutVersion
+                  << ",\"elem_bytes\":" << flatxsMicxElemBytes()
+                  << ",\"components_per_node\":"
+                  << (fxs::N_ACTIVE * (xsr::NG + fxs::NMIC) + fxs::NLSM + fxs::NMSM)
+                  << ",\"cta_arm\":" << (rasbery::rasberyGpuFlatXsCtaEnabled() ? 1 : 0)
+                  << "}" << std::endl;
+    }
+};
+FlatXsLayoutReceipt g_flatxs_layout_receipt;
+
 } // namespace
 
 struct XsReconBackend::Impl {

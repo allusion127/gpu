@@ -49,6 +49,73 @@ constexpr int NMIC     = NISO * NG;      // 78 micro scalars per xt slot
 constexpr int NLSM     = NG * NG;        // 4 lumped scatter elements
 constexpr int NMSM     = NISO * NG * NG; // 156 micro scatter elements
 
+// ---------------------------------------------------------------------------
+// WP21-B: THE ONE DEFINITION OF THE micx/lmpx BLOCK'S STORAGE ORDER
+// ---------------------------------------------------------------------------
+//
+// The four blocks -- lmp (NG per node), lsm (NLSM), mic (NMIC), msm (NMSM),
+// each times the N_ACTIVE xt slots where it has them -- are stored
+// COMPONENT-MAJOR, NODE-INNERMOST: component c of node l lives at
+// `c*nxyz + l`.  That is the same rule `rasbery::cmfd_layout` states for the
+// CMFD operator (docs/WP21_A_CMFD_COALESCING_20260831_KO.md) and the same rule
+// `NodalViewT`'s xs inputs already follow, and it is what makes the whole xs
+// side ONE convention instead of three.
+//
+// IT WAS ALREADY THIS WAY.  This namespace does not permute anything: every
+// helper below returns, character for character, the expression its call sites
+// spelled inline before WP21-B.  What it adds is a NAME for the convention, so
+// that (a) the convention has a single place to be read, (b) the receipt can
+// quote a version, and (c) tools/test_micx_layout_contract.py can hold every
+// producer and every consumer to it -- which is the actual risk here.  The
+// block is handed to the CRAM backend BY ADDRESS (XSSet::FillCramMicDevice ->
+// CudaCramBackend's D2D fill), aliased by the eleven host `_micx`/`_lmpx`
+// vectors, downloaded D2H into those same host vectors, and re-uploaded on a
+// generation miss.  A single consumer that disagreed about the order would read
+// finite, plausible, wrong cross sections -- with no error anywhere.
+//
+// WHY THE AoS BRANCH IS KEPT AS LIVE, REACHABLE TEXT: same reason WP21-A kept
+// it.  Flipping `kNodeInnermost` returns the whole tree to node-major
+// addressing in one edit, which is what makes a layout question bisectable.
+// It is NOT a supported arm -- flipping it also requires the host accessors in
+// src/XSSet.h and the CRAM D2D fill to be flipped, and the contract test says
+// so.
+namespace block_layout {
+
+/// true  = `c*nxyz + l`  (component-major, node innermost -- what ships)
+/// false = `l*per_node + c`  (node-major AoS -- the bisect branch)
+constexpr bool kNodeInnermost = true;
+constexpr int  kLayoutVersion = kNodeInnermost ? 2 : 1;
+
+/// Host-only: the receipt's spelling of the constant above.
+inline const char* name() { return kNodeInnermost ? "soa" : "aos"; }
+
+/// Component `c` of node `l`.  `per_node` is the array's own component count
+/// and is UNUSED on the shipping branch -- it is there so the AoS branch is a
+/// complete expression rather than a comment.
+///
+/// `int`, not `std::size_t`, deliberately: every call site passed an `int`
+/// before WP21-B and the accessors (fxsRefMic and friends) take an `int`, so
+/// the addressing instruction sequence is the one that was mined and measured.
+/// The widest product is NMIC*nxyz = 78 * 8,451 = 659,178 on the KNGR deck.
+RASBERY_XSR_HD constexpr int elem(int nxyz, int l, int c, int per_node) {
+    return kNodeInnermost ? c * nxyz + l : l * per_node + c;
+}
+
+RASBERY_XSR_HD constexpr int lmp(int nxyz, int l, int ig) {
+    return elem(nxyz, l, ig, NG);
+}
+RASBERY_XSR_HD constexpr int lsm(int nxyz, int l, int e) {
+    return elem(nxyz, l, e, NLSM);
+}
+RASBERY_XSR_HD constexpr int mic(int nxyz, int l, int e) {
+    return elem(nxyz, l, e, NMIC);
+}
+RASBERY_XSR_HD constexpr int msm(int nxyz, int l, int e) {
+    return elem(nxyz, l, e, NMSM);
+}
+
+} // namespace block_layout
+
 // Isotope rows RefreshLightIsotopes rewrites (contiguous by design of the
 // Chiffon isotope registry: H-1, B-10, O-16).
 constexpr int IH1  = 0;
@@ -305,14 +372,14 @@ RASBERY_XSR_HD inline void flatxsSolveNode(const FlatXsView& v, int i,
     // 1. Gather the reference state into the workspace (plain copies).
     for (int t = 0; t < N_ACTIVE; ++t)
         for (int ig = 0; ig < NG; ++ig)
-            bl[t * NG + ig] = fxsRefLmp(v, t, ig * nxyz + l);
+            bl[t * NG + ig] = fxsRefLmp(v, t, block_layout::lmp(nxyz, l, ig));
     for (int sm = 0; sm < NLSM; ++sm)
-        bls[sm] = fxsRefLsm(v, sm * nxyz + l);
+        bls[sm] = fxsRefLsm(v, block_layout::lsm(nxyz, l, sm));
     for (int t = 0; t < N_ACTIVE; ++t)
         for (int e = 0; e < NMIC; ++e)
-            bm[t * NMIC + e] = fxsRefMic(v, t, e * nxyz + l);
+            bm[t * NMIC + e] = fxsRefMic(v, t, block_layout::mic(nxyz, l, e));
     for (int e = 0; e < NMSM; ++e)
-        bms[e] = fxsRefMsm(v, e * nxyz + l);
+        bms[e] = fxsRefMsm(v, block_layout::msm(nxyz, l, e));
 
     // 2. Apply the resolved delta stream in CPU call order.
     const int s0 = v.node_off[i];
@@ -397,14 +464,14 @@ RASBERY_XSR_HD inline void flatxsSolveNode(const FlatXsView& v, int i,
     // 4. Scatter the workspace back to the SoA arrays (plain copies).
     for (int t = 0; t < N_ACTIVE; ++t)
         for (int ig = 0; ig < NG; ++ig)
-            fxsStoreLmp(v, t, ig * nxyz + l, bl[t * NG + ig]);
+            fxsStoreLmp(v, t, block_layout::lmp(nxyz, l, ig), bl[t * NG + ig]);
     for (int sm = 0; sm < NLSM; ++sm)
-        fxsStoreLsm(v, sm * nxyz + l, bls[sm]);
+        fxsStoreLsm(v, block_layout::lsm(nxyz, l, sm), bls[sm]);
     for (int t = 0; t < N_ACTIVE; ++t)
         for (int e = 0; e < NMIC; ++e)
-            fxsStoreMic(v, t, e * nxyz + l, bm[t * NMIC + e]);
+            fxsStoreMic(v, t, block_layout::mic(nxyz, l, e), bm[t * NMIC + e]);
     for (int e = 0; e < NMSM; ++e)
-        fxsStoreMsm(v, e * nxyz + l, bms[e]);
+        fxsStoreMsm(v, block_layout::msm(nxyz, l, e), bms[e]);
 
     // 5. Rebuild this node's macroscopic XS from the workspace.  The CPU
     //    reads _iden from memory here; rows 0..2 of the local copy hold
@@ -453,7 +520,7 @@ inline double flatxsProbeMicElement(const FlatXsView& v, int l, int t, int e,
                                     const int* dids, const double* xs_,
                                     const double* scales, int count,
                                     const POL& pol) {
-    double acc = fxsRefMic(v, t, e * v.nxyz + l);
+    double acc = fxsRefMic(v, t, block_layout::mic(v.nxyz, l, e));
     if (!v.has_coeff_micx) return acc;
     for (int s = 0; s < count; ++s) {
         const int    did   = dids[s];
