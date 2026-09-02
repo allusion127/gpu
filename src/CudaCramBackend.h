@@ -47,15 +47,35 @@
 // at most 19 in any one row.  That is the whole reason this is a GPU problem at
 // all: 8,451 independent 36-unknown sparse solves.
 //
-// ONE THREAD PER NODE, AND THE EXACTNESS ARGUMENT FORCES IT.  Gauss-Seidel is
-// sequential in `row` (row i reads the x[j] this sweep already updated for
-// j < i) and the inner `sum -= vals[i] * x[cols[i]]` is sequential in i.  A
-// warp-per-node kernel would have to reassociate one of those two, which turns
-// a reproduction into a different method.  So the only parallelism taken is
-// across nodes, one thread each, and the per-node state (~4 KB: cond4, the
-// 160 matrix values, x, accum, iden) lives in per-thread LOCAL memory, which
-// CUDA already interleaves across the warp.  Occupancy is low by construction;
-// the win is that 8,451 serial solves run 64-128 at a time instead of 24.
+// THE SWEEP IS SERIAL AND STAYS SERIAL; THE NODE IS NOT, AND NO LONGER IS.
+// Gauss-Seidel is sequential in `row` (row i reads the x[j] this sweep already
+// updated for j < i) and the inner `sum -= vals[i] * x[cols[i]]` is sequential
+// in i.  A kernel that spread EITHER of those across lanes would reassociate,
+// which turns a reproduction into a different method, so neither is spread.
+//
+// But the POLES are not one of those two.  Order 8 is four independent complex
+// linear solves against the same real matrix; they share `mdiag` and the
+// compressed off-diagonals and nothing else, and the only thing that couples
+// them is milk.h's closing `accum[row] += x_pole[row]`, a fixed left-to-right
+// walk over pole = 0, 1, 2, 3.  WP21-D therefore maps ONE NODE TO FOUR LANES,
+// lane == pole, and re-forms that walk with __shfl_sync IN POLE ORDER: the same
+// four addends into the same zero-initialised accumulator in the same order, so
+// the sums are bit-identical additions and not merely equivalent ones.  The
+// per-node state (~4.7 KB: cond4, the 160 matrix values, x, accum, iden) still
+// lives in per-thread LOCAL memory -- shared memory for the pole-invariant half
+// would cap a 64-thread block at eight nodes and cost more occupancy than the
+// four-fold rebuild costs instructions -- and the win is that the 4-pole serial
+// latency chain that made kPredictor/kCorrector 4.4 ms per launch at 4.15 %
+// warps active now runs four-wide, 33,804 lanes instead of 8,451 threads.
+//
+// WHICH MAKES THE POLE-PARALLEL ARM B0 AGAINST THE SERIAL ONE.  That is a
+// DIFFERENT claim from the N1 below, and both are true at once: the device is
+// N1 against the HOST because of complex division, and the pole-parallel kernel
+// is B0 against the SERIAL KERNEL because it performs the same operations in
+// the same order.  RASBERY_GPU_CRAM_PARALLEL=serial keeps the pre-WP21-D body
+// in the same binary so that equality is a measurement anyone can repeat.
+// There is no `jacobi` arm: it would only be needed if lane-per-pole could not
+// preserve the pole-sum order, and it can, so nothing N1 is offered here.
 //
 // THE MINED PATTERN IS A SUPERSET, AND THE ZERO TEST IS STILL RUN.  The host
 // compresses each row by scanning `A(row, col)` and skipping `value == 0.0`.
@@ -186,8 +206,13 @@ struct PredictorView {
     /// these only when the resident block's generation equals `micx_generation`
     /// below.  A null pair is not an error, it is "use the host copy" -- which
     /// is what a stub build, a declined solve, or a host-rebuilt _micx gives.
-    const double* mic_device[11]  = {};
+    const void*   mic_device[11]  = {};
     void*         mic_device_ready = nullptr; ///< cudaEvent_t, or null
+    /// WP20.1: element width of what `mic_device` points at -- 8 on the FP64
+    /// arm, 4 under RASBERY_GPU_FP32.  CRAM's own state stays FP64 (the
+    /// partial-fraction sum cancels catastrophically), so a narrow source is
+    /// WIDENED on the device rather than memcpy'd.
+    int           mic_device_elem_bytes = static_cast<int>(sizeof(double));
 };
 
 /// XSSet::CorrectorStep over every node, pcSubsteps == 1.
@@ -215,8 +240,10 @@ struct CorrectorView {
     const double* mic[11]  = {};      ///< EOS micro XS; BOS comes from the device snapshot
     /// WP15.1: see PredictorView::mic_device -- same contract, same all-or-
     /// nothing rule, same caller-owned generation check.
-    const double* mic_device[11]  = {};
+    const void*   mic_device[11]  = {};
     void*         mic_device_ready = nullptr; ///< cudaEvent_t, or null
+    /// WP20.1: see PredictorView::mic_device_elem_bytes.
+    int           mic_device_elem_bytes = static_cast<int>(sizeof(double));
     const double* iden_bos = nullptr; ///< [niso * nxyz]
     double*       iden     = nullptr; ///< [niso * nxyz]: predictor inventory in, corrected out
     const int*    burn_bos = nullptr; ///< [nxyz]
@@ -279,6 +306,29 @@ public:
     /// Statepoints whose corrector reused the device BOS snapshot instead of a
     /// second 11-block upload.
     [[nodiscard]] unsigned long long bosReuses() const;
+
+    // --- WP21-D: which node mapping ran, and what it cost ------------------
+
+    /// "pole4" (default: kLanesPerNode lanes per node, lane == pole) or
+    /// "serial" (the pre-WP21-D body).  RASBERY_GPU_CRAM_PARALLEL selects it.
+    /// The receipt has to carry this: two runs of the same binary with the same
+    /// arm knobs but different mappings are the same TRAJECTORY (the default arm
+    /// is B0 against serial) and a different KERNEL, and a per-launch time
+    /// quoted without it is unattributable.
+    [[nodiscard]] const std::string& kernelVariant() const;
+
+    /// Lanes co-operating on one node: 4 on the pole-parallel arm, 1 on serial.
+    [[nodiscard]] int lanesPerNode() const;
+
+    /// kPredictor/kCorrector launches, counted on the decline path too -- a
+    /// launch that produced a bad node still ran and still cost its time.
+    [[nodiscard]] unsigned long long launches() const;
+
+    /// Mean cudaEvent-measured microseconds per KERNEL launch, or -1.0 when
+    /// RASBERY_GPU_CRAM_TIMING is unset.  `wallMs()` is the whole call --
+    /// transfers, status drain and all -- which is not the number ncu prints
+    /// for block 39; this one is, and -1 is "never measured" rather than 0.
+    [[nodiscard]] double launchUsMean() const;
 
 private:
     struct Impl;

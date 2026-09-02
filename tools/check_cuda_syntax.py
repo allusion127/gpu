@@ -124,6 +124,26 @@ inline unsigned int atomicOr(unsigned int* address, unsigned int val) {
     *address |= val;
     return old;
 }
+// Warp-level primitives.  WP21-D's pole-parallel CRAM node puts one CRAM pole
+// on each of four lanes and re-forms the pole sum with __shfl_sync, so this
+// gate has to know the names.  A single-threaded host shim cannot MODEL a warp;
+// what it can check -- and what this gate is for -- is that every call resolves
+// to a declared overload with the right argument types.  __shfl_sync therefore
+// returns the caller's own value: on a shim there is no second lane to ask.
+inline unsigned int __ballot_sync(unsigned int mask, bool pred) {
+    return pred ? mask : 0u;
+}
+inline unsigned int __activemask() { return 0xffffffffu; }
+inline void __syncwarp(unsigned int = 0xffffffffu) {}
+inline int __ffs(int x) {
+    for (int i = 0; i < 32; ++i)
+        if (x & (1 << i)) return i + 1;
+    return 0;
+}
+inline int __shfl_sync(unsigned int, int v, int, int = 32) { return v; }
+inline unsigned int __shfl_sync(unsigned int, unsigned int v, int, int = 32) { return v; }
+inline float __shfl_sync(unsigned int, float v, int, int = 32) { return v; }
+inline double __shfl_sync(unsigned int, double v, int, int = 32) { return v; }
 inline long long __double_as_longlong(double x) {
     long long r;
     std::memcpy(&r, &x, sizeof r);

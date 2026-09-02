@@ -254,7 +254,15 @@ def r_status_before_d2h(src: dict[str, str]) -> None:
         j = cu.find("\n}\n", i)
         body = cu[i:j]
         check = body.find("if (s.h_stats[0] != 0)")
-        d2h = body.find("cudaMemcpyDeviceToHost, s.stream);\n    if (rc != cudaSuccess) return s.fail(\"D2H iden\"")
+        # WP21-D repaired this needle.  It used to spell the download as
+        # `cudaMemcpyDeviceToHost, s.stream);` on one line, which stopped
+        # being the text when WP13.1 routed the copy through
+        # rasbery::xfer::memcpyAsync and the argument list wrapped -- so the
+        # rule had been reporting "the iden download moved" against a file
+        # where it had not moved at all.  The anchor is now the failure
+        # label, which is what the ORDER is about and is invariant under
+        # reformatting of the call it labels.
+        d2h = body.find('return s.fail("D2H iden"')
         assert check >= 0, f"{entry}: the per-node status reduction is gone"
         assert d2h >= 0, f"{entry}: the iden download moved"
         assert check < d2h, (

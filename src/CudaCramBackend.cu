@@ -59,6 +59,20 @@ constexpr int kCondXSFF = 1;
 constexpr int kCondXS2N = 2;
 constexpr int kCondXS3N = 3;
 
+/// WP20.1: the narrow-block handover, D2D.
+///
+/// Under RASBERY_GPU_FP32 the flat-XS micx block is float and CRAM's own state
+/// is not (src/GpuFp32Arm.h: the partial-fraction sum cancels, and float has no
+/// headroom for that cancellation).  So the four condensation slots arrive
+/// through a widening copy instead of a memcpy.  It is a plain elementwise
+/// convert -- no arithmetic, no reduction, no order to argue about -- and it
+/// still moves only `n * sizeof(float)` off DRAM, which is the whole point.
+__global__ void kCramWidenMic(double* __restrict__ dst,
+                              const float* __restrict__ src, size_t n) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = static_cast<double>(src[i]);
+}
+
 // ---------------------------------------------------------------------------
 // CRAM order-8 constants -- milk.h solveBatemanCRAM, `order == 8` branch
 // ---------------------------------------------------------------------------
@@ -70,6 +84,35 @@ constexpr double kMatrixSgn = -1.0;
 constexpr int    kPoleCount = 4;
 constexpr double kAbsTol    = 1.0e-28;
 constexpr double kDiagTol   = 1.0e-30;
+
+// ---------------------------------------------------------------------------
+// WP21-D: where the four poles live
+// ---------------------------------------------------------------------------
+//
+// The serial kernel walks pole 0..3 inside ONE thread, which is why block 39 of
+// the 238 ncu profile shows 133 blocks x 64 threads, 4.38/4.49 ms per launch,
+// 4.15 % warps active and 0.45 % of DRAM peak: the kernel is neither bandwidth-
+// nor compute-bound, it is a long serial latency chain running on 2 % of the
+// card.  The four poles are four INDEPENDENT complex linear solves against the
+// same real matrix -- they share `mdiag` and the compressed off-diagonals and
+// nothing else -- so the only thing that couples them is the closing sum
+// `accum[row] += x_pole[row]`, and that sum is a fixed left-to-right walk over
+// pole = 0, 1, 2, 3.  Moving each pole to its own LANE and re-forming that walk
+// with __shfl_sync IN POLE ORDER gives the identical sequence of double
+// additions, so the pole-parallel arm is B0 against the serial one, not N1.
+//
+// FOUR LANES AND NOT EIGHT.  A real/imaginary split would need a shuffle inside
+// the Gauss-Seidel inner product, where the host's arithmetic is the complex
+// `sum -= vals[i] * x[cols[i]]`; that reassociates, and the class would drop to
+// N1 for a factor the occupancy does not need.  The sweep itself stays serial in
+// `row` and serial in `i` -- WP21-D widened the node, not the sweep.
+constexpr int kLanesPerNode = kPoleCount; ///< pole-parallel arm: lane == pole
+
+/// Which node body the launch selects.  RASBERY_GPU_CRAM_PARALLEL.
+enum class Variant : int {
+    kSerial = 0, ///< one thread per node, poles in a loop (the WP21-D baseline)
+    kPole4  = 1, ///< default: kLanesPerNode lanes per node, lane == pole
+};
 
 __constant__ double kAlphaRe[4] = {
     +1.83174069610856716e+00, -2.43619809577363400e+00,
@@ -250,21 +293,21 @@ __device__ inline double transEntry(const DevCtx& x, const double* cond4,
     return v;
 }
 
-/// milk::Solver<double>::solveBatemanCRAM(A, N, dt, out=N, ws, 8, first).
-/// `iden` is both N and out, exactly as every host call site passes it.
-/// Returns a status mask; on anything non-zero `iden` is left in whatever state
-/// the partial solve reached, which is why the caller writes to staging.
-__device__ unsigned int cramSolveNode(const DevCtx& x, double* iden,
-                                      const double* cond4, double sumflux,
-                                      double dt, unsigned long long* gs_iters) {
+/// The split, once per node: the host's row scan of `A(row, col)` over
+/// `col >= first`, with its `value == 0.0` compression, in ascending row and
+/// ascending column order.  POLE-INVARIANT -- nothing in it reads theta or
+/// alpha -- which is what lets the pole-parallel arm hand each pole its own lane
+/// and simply have all four lanes rebuild this identically.  (Sharing it through
+/// shared memory was costed and rejected: 3.7 KB per node caps a 64-thread block
+/// at eight nodes, and that costs more occupancy than the redundancy costs
+/// instructions -- the build is ~200 transEntry evaluations against the sweeps'
+/// ~25,000 complex operations.)
+__device__ inline void cramBuildSplit(const DevCtx& x, const double* cond4,
+                                      double sumflux, double dt, double* cval,
+                                      unsigned char* ccol, int* cend,
+                                      double* mdiag) {
     const int n     = x.niso;
     const int first = x.first;
-
-    // --- the split, with the host's per-node zero compression ---------------
-    double        cval[kMaxNnz];
-    unsigned char ccol[kMaxNnz];
-    int           cend[kNiso]; ///< end offset of row r's compacted list
-    double        mdiag[kNiso];
 
     int fill = 0;
     for (int row = first; row < n; ++row) {
@@ -283,102 +326,220 @@ __device__ unsigned int cramSolveNode(const DevCtx& x, double* iden,
         const double dvalue = transEntry(x, cond4, sumflux, row, row);
         mdiag[row]          = (dvalue == 0.0) ? 0.0 : (kMatrixSgn * dvalue * dt);
     }
+}
 
-    // --- accumulator --------------------------------------------------------
-    double accr[kNiso], acci[kNiso];
-    for (int row = 0; row < n; ++row) {
-        accr[row] = 0.0;
-        acci[row] = 0.0;
+/// ONE pole of milk.h's partial-fraction sum: the body of its
+/// `for (pole = 0; pole < pole_count; ++pole)` loop, statement for statement.
+/// `xr`/`xi` receive that pole's x; `*iters_out` the Gauss-Seidel sweeps it
+/// actually ran (0 when the diagonal test refused before the first one).
+__device__ unsigned int cramPole(const DevCtx& x, const double* iden,
+                                 const double* cval, const unsigned char* ccol,
+                                 const int* cend, const double* mdiag, int pole,
+                                 double* xr, double* xi, int* iters_out) {
+    const int n     = x.niso;
+    const int first = x.first;
+
+    *iters_out = 0;
+
+    const double th_r = kThetaRe[pole];
+    const double th_i = kThetaIm[pole];
+    const double al_r = kAlphaRe[pole];
+    const double al_i = kAlphaIm[pole];
+
+    double rhs_norm = 0.0;
+    for (int row = first; row < n; ++row) {
+        const double dg_r = mdiag[row] - th_r;
+        const double dg_i = 0.0 - th_i;
+        if (cmagnitude(dg_r, dg_i) <= kDiagTol) return kZeroDiag;
+
+        // rhs[row] = complex(N[row], 0) * alpha[pole]
+        double rr, ri;
+        cmul(iden[row], 0.0, al_r, al_i, &rr, &ri);
+        cdiv(rr, ri, dg_r, dg_i, &xr[row], &xi[row]);
+        rhs_norm = dmax(rhs_norm, cmagnitude(rr, ri));
     }
+    rhs_norm = dmax(rhs_norm, 1.0e-30);
 
-    double xr[kNiso], xi[kNiso];
+    bool converged = false;
+    int  iters     = 0;
+    for (int iter = 0; iter < kMaxIter; ++iter) {
+        // The compacted lists are laid out row by row in ascending row and
+        // ascending column order, so one running cursor walks them in the
+        // host's `for (i = 0; i < cols.size(); ++i)` order.
+        int k = 0;
+        for (int row = first; row < n; ++row) {
+            // sum = rhs[row]
+            double sr, si;
+            cmul(iden[row], 0.0, al_r, al_i, &sr, &si);
+            for (; k < cend[row]; ++k) {
+                const int c = static_cast<int>(ccol[k]);
+                double    pr, pi;
+                cmul(cval[k], 0.0, xr[c], xi[c], &pr, &pi);
+                sr -= pr;
+                si -= pi;
+            }
+            const double dg_r = mdiag[row] - th_r;
+            const double dg_i = 0.0 - th_i;
+            cdiv(sr, si, dg_r, dg_i, &xr[row], &xi[row]);
+        }
 
-    for (int pole = 0; pole < kPoleCount; ++pole) {
-        const double th_r = kThetaRe[pole];
-        const double th_i = kThetaIm[pole];
-        const double al_r = kAlphaRe[pole];
-        const double al_i = kAlphaIm[pole];
-
-        double rhs_norm = 0.0;
+        double max_residual = 0.0;
+        k                   = 0;
         for (int row = first; row < n; ++row) {
             const double dg_r = mdiag[row] - th_r;
             const double dg_i = 0.0 - th_i;
-            if (cmagnitude(dg_r, dg_i) <= kDiagTol) return kZeroDiag;
-
-            // rhs[row] = complex(N[row], 0) * alpha[pole]
+            double       axr, axi;
+            cmul(dg_r, dg_i, xr[row], xi[row], &axr, &axi);
+            for (; k < cend[row]; ++k) {
+                const int c = static_cast<int>(ccol[k]);
+                double    pr, pi;
+                cmul(cval[k], 0.0, xr[c], xi[c], &pr, &pi);
+                axr += pr;
+                axi += pi;
+            }
             double rr, ri;
             cmul(iden[row], 0.0, al_r, al_i, &rr, &ri);
-            cdiv(rr, ri, dg_r, dg_i, &xr[row], &xi[row]);
-            rhs_norm = dmax(rhs_norm, cmagnitude(rr, ri));
-        }
-        rhs_norm = dmax(rhs_norm, 1.0e-30);
-
-        bool converged = false;
-        int  iters     = 0;
-        for (int iter = 0; iter < kMaxIter; ++iter) {
-            // The compacted lists are laid out row by row in ascending row and
-            // ascending column order, so one running cursor walks them in the
-            // host's `for (i = 0; i < cols.size(); ++i)` order.
-            int k = 0;
-            for (int row = first; row < n; ++row) {
-                // sum = rhs[row]
-                double sr, si;
-                cmul(iden[row], 0.0, al_r, al_i, &sr, &si);
-                for (; k < cend[row]; ++k) {
-                    const int c = static_cast<int>(ccol[k]);
-                    double    pr, pi;
-                    cmul(cval[k], 0.0, xr[c], xi[c], &pr, &pi);
-                    sr -= pr;
-                    si -= pi;
-                }
-                const double dg_r = mdiag[row] - th_r;
-                const double dg_i = 0.0 - th_i;
-                cdiv(sr, si, dg_r, dg_i, &xr[row], &xi[row]);
-            }
-
-            double max_residual = 0.0;
-            k                   = 0;
-            for (int row = first; row < n; ++row) {
-                const double dg_r = mdiag[row] - th_r;
-                const double dg_i = 0.0 - th_i;
-                double       axr, axi;
-                cmul(dg_r, dg_i, xr[row], xi[row], &axr, &axi);
-                for (; k < cend[row]; ++k) {
-                    const int c = static_cast<int>(ccol[k]);
-                    double    pr, pi;
-                    cmul(cval[k], 0.0, xr[c], xi[c], &pr, &pi);
-                    axr += pr;
-                    axi += pi;
-                }
-                double rr, ri;
-                cmul(iden[row], 0.0, al_r, al_i, &rr, &ri);
-                max_residual = dmax(max_residual, cmagnitude(rr - axr, ri - axi));
-            }
-
-            iters = iter + 1;
-            if (max_residual <= kAbsTol + kRelTol * rhs_norm) {
-                converged = true;
-                break;
-            }
+            max_residual = dmax(max_residual, cmagnitude(rr - axr, ri - axi));
         }
 
-        *gs_iters += static_cast<unsigned long long>(iters);
-        if (!converged) return kNoConverge;
-
-        for (int row = first; row < n; ++row) {
-            accr[row] += xr[row];
-            acci[row] += xi[row];
+        iters = iter + 1;
+        if (max_residual <= kAbsTol + kRelTol * rhs_norm) {
+            converged = true;
+            break;
         }
     }
 
+    *iters_out = iters;
+    return converged ? kOk : kNoConverge;
+}
+
+/// milk.h's closing loop: `alpha0 * N[row] + 2 * accum[row].real()`, the
+/// negative clamp, and the finite test the host's `static_cast<T>` cannot do.
+/// The IMAGINARY accumulator milk.h carries is never read by that expression --
+/// `.real()` is the only projection taken -- so it is not carried here either;
+/// dropping a sum nothing reads changes no result and saves 312 B of local
+/// memory per thread on a kernel whose problem is per-thread state.
+__device__ inline unsigned int cramFinish(const DevCtx& x, double* iden,
+                                          const double* accr) {
     unsigned int status = kOk;
-    for (int row = first; row < n; ++row) {
+    for (int row = x.first; row < x.niso; ++row) {
         double value = kAlpha0 * iden[row] + 2.0 * accr[row];
         if (value < 0.0 && fabs(value) < 1.0e-12) value = 0.0;
         if (!isfinite(value)) status |= kNonFinite;
         iden[row] = value;
     }
     return status;
+}
+
+/// milk::Solver<double>::solveBatemanCRAM(A, N, dt, out=N, ws, 8, first), the
+/// SERIAL arm: one thread walks all four poles.  `iden` is both N and out,
+/// exactly as every host call site passes it.  Returns a status mask; on
+/// anything non-zero `iden` is left in whatever state the partial solve reached,
+/// which is why the caller writes to staging.
+__device__ unsigned int cramSolveNode(const DevCtx& x, double* iden,
+                                      const double* cond4, double sumflux,
+                                      double dt, unsigned long long* gs_iters) {
+    const int n     = x.niso;
+    const int first = x.first;
+
+    double        cval[kMaxNnz];
+    unsigned char ccol[kMaxNnz];
+    int           cend[kNiso];
+    double        mdiag[kNiso];
+    cramBuildSplit(x, cond4, sumflux, dt, cval, ccol, cend, mdiag);
+
+    double accr[kNiso];
+    for (int row = 0; row < n; ++row) accr[row] = 0.0;
+
+    double xr[kNiso], xi[kNiso];
+
+    for (int pole = 0; pole < kPoleCount; ++pole) {
+        int                iters = 0;
+        const unsigned int st =
+            cramPole(x, iden, cval, ccol, cend, mdiag, pole, xr, xi, &iters);
+        // A zero diagonal refuses BEFORE the first sweep, so it contributes no
+        // sweeps; a non-convergence contributes the 64 it ran.  gs_iters_mean is
+        // the receipt observable that says the device solved the same iteration
+        // the host does, so which of the two it is has to survive.
+        if (st == kZeroDiag) return kZeroDiag;
+        *gs_iters += static_cast<unsigned long long>(iters);
+        if (st != kOk) return st;
+
+        for (int row = first; row < n; ++row) accr[row] += xr[row];
+    }
+
+    return cramFinish(x, iden, accr);
+}
+
+/// The SAME solve with the four poles on four lanes of one warp (WP21-D).
+///
+/// `pole` is the lane's index inside its group and IS the pole it solves; `base`
+/// is the group's first lane in the warp and `mask` its four lanes.  Every lane
+/// rebuilds the pole-invariant split, solves its own pole, and then the group
+/// re-forms the two things the serial loop did ACROSS poles:
+///
+///   * the STATUS, which is the FIRST failing pole's -- __ffs over the group's
+///     ballot -- so a pole-3 non-convergence behind a pole-0 zero diagonal still
+///     declines with the message the serial kernel prints, and the sweep count
+///     still stops at that pole;
+///   * the ACCUMULATION, `accr[row] += x_pole[row]` walked p = 0, 1, 2, 3 with
+///     __shfl_sync supplying pole p's value.  That is the serial loop nest with
+///     ONE substitution, so it is the same sequence of double additions and not
+///     merely an equivalent one -- which is what makes this arm B0, not N1.
+__device__ unsigned int cramSolveNodePole4(const DevCtx& x, double* iden,
+                                           const double* cond4, double sumflux,
+                                           double dt, unsigned long long* gs_iters,
+                                           int pole, unsigned int mask, int base) {
+    const int n     = x.niso;
+    const int first = x.first;
+
+    double        cval[kMaxNnz];
+    unsigned char ccol[kMaxNnz];
+    int           cend[kNiso];
+    double        mdiag[kNiso];
+    cramBuildSplit(x, cond4, sumflux, dt, cval, ccol, cend, mdiag);
+
+    double             xr[kNiso], xi[kNiso];
+    int                iters = 0;
+    const unsigned int st =
+        cramPole(x, iden, cval, ccol, cend, mdiag, pole, xr, xi, &iters);
+
+    // Every lane of the group reaches this point -- cramPole returns, it does
+    // not exit -- so the whole `mask` is converged here and at every shuffle
+    // below.  A lane that failed still participates; only its VALUES are unused.
+    const unsigned int failed      = __ballot_sync(mask, st != kOk) & mask;
+    unsigned int       node_status = kOk;
+    int                last_run    = kPoleCount - 1;
+    if (failed != 0u) {
+        const int lane = __ffs(static_cast<int>(failed)) - 1;
+        node_status    = __shfl_sync(mask, st, lane);
+        last_run       = lane - base;
+    }
+
+    unsigned long long swept = 0;
+    for (int p = 0; p < kPoleCount; ++p) {
+        const int          it = __shfl_sync(mask, iters, base + p);
+        const unsigned int sp = __shfl_sync(mask, st, base + p);
+        if (p < last_run || (p == last_run && sp != kZeroDiag))
+            swept += static_cast<unsigned long long>(it);
+    }
+    *gs_iters += swept;
+    // `node_status` came off a ballot, so it is uniform over the group: all four
+    // lanes take this return or none does, and no shuffle below is left orphaned.
+    if (node_status != kOk) return node_status;
+
+    // THE POLE-SUM ORDER.  This is the serial driver's
+    // `for (pole) for (row) accr[row] += xr[row]` with pole p's `xr[row]` fetched
+    // from the lane that owns pole p.  Same nesting, same direction, same four
+    // addends in the same order into the same zero-initialised accumulator.
+    double accr[kNiso];
+    for (int row = 0; row < n; ++row) accr[row] = 0.0;
+    for (int p = 0; p < kPoleCount; ++p) {
+        for (int row = first; row < n; ++row)
+            accr[row] += __shfl_sync(mask, xr[row], base + p);
+    }
+
+    return cramFinish(x, iden, accr);
 }
 
 /// ComputeXeEquilibrium + ApplyXeEquilibrium, transcribed.
@@ -410,11 +571,14 @@ __device__ inline void applyXeEquilibrium(const DevCtx& x, double* iden,
 // Kernels
 // ---------------------------------------------------------------------------
 
-/// XSSet::Deplete's per-node body (DepleteNode, ngrp == 2 branch).
-__global__ void kPredictor(DevCtx x) {
-    const int l = blockIdx.x * blockDim.x + threadIdx.x;
-    if (l >= x.nxyz) return;
+// The node body's two halves are factored so the serial and the pole-parallel
+// kernel run the SAME prologue and the SAME epilogue.  An A/B whose two arms
+// differ in the condensation as well as in the solve measures two things at once.
 
+/// The part of DepleteNode that runs before solveBatemanCRAM: the 2-group flux
+/// normalisation, the four-slot condensation, and the inventory load.
+__device__ inline void predictorPrologue(const DevCtx& x, int l, double* cond4,
+                                         double* iden, double* sumflux_out) {
     const int    ng   = x.ng;
     const size_t nxyz = static_cast<size_t>(x.nxyz);
 
@@ -426,7 +590,6 @@ __global__ void kPredictor(DevCtx x) {
     }
     const double invflux = (raw_sumflux > 0.0) ? 1.0 / raw_sumflux : 0.0;
 
-    double       cond4[kNiso * 4];
     const double f0 = abs_flux[0] * invflux;
     const double f1 = abs_flux[1] * invflux;
     for (int iso = 0; iso < x.niso; ++iso) {
@@ -438,14 +601,31 @@ __global__ void kPredictor(DevCtx x) {
 
     double s = 0.0;
     for (int ig = 0; ig < ng; ++ig) s += abs_flux[ig];
-    const double sumflux = s * 1.0e-24; // FluxScale
+    *sumflux_out = s * 1.0e-24; // FluxScale
 
-    double iden[kNiso];
     for (int i = 0; i < x.niso; ++i)
         iden[i] = x.iden_in[static_cast<size_t>(i) * nxyz + l];
+}
 
-    unsigned long long gs = 0;
-    unsigned int status = cramSolveNode(x, iden, cond4, sumflux, x.dt, &gs);
+/// DepleteNode's tail: the Xe equilibrium overwrite, the publish, the counters.
+///
+/// THE STORE IS ALREADY NODE-INNERMOST, AND THAT IS THE FINDING.
+/// `iden_out[iso * nxyz + l]` puts the node index in the fastest-varying
+/// position, so a warp writing one isotope covers 32 consecutive doubles -- 256
+/// bytes, which IS the 8-sectors-per-request floor for fp64.  The 8.7
+/// sectors/request ncu reports for block 39 is therefore NOT this store: it is
+/// the LOCAL-memory traffic of `cval`/`ccol`, whose `fill` cursor diverges
+/// across a warp because the host's `value == 0.0` compression is per node.
+/// Grouping four lanes per node makes those cursors agree inside a group -- 8
+/// distinct cursors per warp instead of 32 -- which is where WP21-D's store-side
+/// win comes from.  There is no SoA transpose to do, and none is done; nothing
+/// downstream (WP15.1's FillCramMicDevice, the XSSet host readers, the D2H of
+/// rows [first, niso) as one contiguous copy) sees a layout change at all.
+__device__ inline void predictorEpilogue(const DevCtx& x, int l, double* iden,
+                                         const double* cond4, double sumflux,
+                                         unsigned int status,
+                                         unsigned long long gs) {
+    const size_t nxyz = static_cast<size_t>(x.nxyz);
 
     if (status == kOk && !x.xe_transient)
         applyXeEquilibrium(x, iden, cond4, sumflux);
@@ -458,11 +638,55 @@ __global__ void kPredictor(DevCtx x) {
     atomicAdd(&x.stats[2], static_cast<unsigned long long>(kPoleCount));
 }
 
-/// XSSet::CorrectorStep's per-node body, pcSubsteps == 1.
-__global__ void kCorrector(DevCtx x) {
+/// XSSet::Deplete's per-node body (DepleteNode, ngrp == 2 branch), serial arm.
+__global__ void kPredictor(DevCtx x) {
     const int l = blockIdx.x * blockDim.x + threadIdx.x;
     if (l >= x.nxyz) return;
 
+    double cond4[kNiso * 4];
+    double iden[kNiso];
+    double sumflux = 0.0;
+    predictorPrologue(x, l, cond4, iden, &sumflux);
+
+    unsigned long long gs     = 0;
+    const unsigned int status = cramSolveNode(x, iden, cond4, sumflux, x.dt, &gs);
+
+    predictorEpilogue(x, l, iden, cond4, sumflux, status, gs);
+}
+
+/// The same body with kLanesPerNode lanes per node, lane == pole (WP21-D).
+__global__ void kPredictorP4(DevCtx x) {
+    const int gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int l    = gtid / kLanesPerNode;
+    const int pole = gtid % kLanesPerNode;
+    if (l >= x.nxyz) return;
+
+    // blockDim.x is one of 32/64/128/256 and kLanesPerNode divides 32, so a
+    // node's group never straddles a warp boundary and `mask` is always four
+    // lanes of ONE warp -- the precondition every __shfl_sync downstream needs.
+    // A tail group is out of range as a whole (the group IS the node), so the
+    // mask never names a lane that already returned.
+    const int          base = (threadIdx.x & 31) & ~(kLanesPerNode - 1);
+    const unsigned int mask = ((1u << kLanesPerNode) - 1u) << base;
+
+    double cond4[kNiso * 4];
+    double iden[kNiso];
+    double sumflux = 0.0;
+    predictorPrologue(x, l, cond4, iden, &sumflux);
+
+    unsigned long long gs = 0;
+    const unsigned int status =
+        cramSolveNodePole4(x, iden, cond4, sumflux, x.dt, &gs, pole, mask, base);
+
+    if (pole == 0) predictorEpilogue(x, l, iden, cond4, sumflux, status, gs);
+}
+
+/// The part of CorrectorStep that runs before solveBatemanCRAM: the BOS/EOS
+/// flux and kappa-fission average, the burnup integrand, the inventory load and
+/// the four-slot condensation on averaged micro XS.
+__device__ inline void correctorPrologue(const DevCtx& x, int l, double* cond4,
+                                         double* iden, double* sumflux_out,
+                                         double* burn_out) {
     const int    ng   = x.ng;
     const size_t nxyz = static_cast<size_t>(x.nxyz);
     const size_t node = static_cast<size_t>(l);
@@ -484,8 +708,8 @@ __global__ void kCorrector(DevCtx x) {
                          x.xskf_eos[static_cast<size_t>(ig) * nxyz + node]);
         burn += sigma_corrected * corrected_flux[ig] * x.vol[node] * x.dt;
     }
+    *burn_out = burn;
 
-    double iden[kNiso];
     for (int i = 0; i < x.niso; ++i)
         iden[i] = x.iden_in[static_cast<size_t>(i) * nxyz + node];
 
@@ -495,10 +719,10 @@ __global__ void kCorrector(DevCtx x) {
 
     double sfl = 0.0;
     for (int ig = 0; ig < ng; ++ig) sfl += corrected_flux[ig];
-    const double corrected_sumflux = sfl * 1.0e-24; // FluxScale
-    const double xe_sumflux        = corrected_sumflux;
+    // The Xe equilibrium overwrite uses this same value; the host's
+    // `xe_sumflux` was never a second quantity, only a second name.
+    *sumflux_out = sfl * 1.0e-24; // FluxScale
 
-    double cond4[kNiso * 4];
     for (int iso = 0; iso < x.niso; ++iso) {
         for (int s = 0; s < 4; ++s) {
             double sum = 0.0;
@@ -513,12 +737,21 @@ __global__ void kCorrector(DevCtx x) {
             cond4[iso * 4 + s] = sum * invflux;
         }
     }
+}
 
-    unsigned long long gs = 0;
-    unsigned int status = cramSolveNode(x, iden, cond4, corrected_sumflux, x.dt, &gs);
+/// CorrectorStep's tail: the Xe equilibrium overwrite, the Eq. (6.20) density
+/// average, the optional post-average Xe fix, the burnup key, the counters.
+/// The store is `iden_out[iso * nxyz + node]` -- see predictorEpilogue for why
+/// that is already the coalesced layout and why nothing is transposed.
+__device__ inline void correctorEpilogue(const DevCtx& x, int l, double* iden,
+                                         const double* cond4, double sumflux,
+                                         double burn, unsigned int status,
+                                         unsigned long long gs) {
+    const size_t nxyz = static_cast<size_t>(x.nxyz);
+    const size_t node = static_cast<size_t>(l);
 
     if (status == kOk && !x.xe_transient)
-        applyXeEquilibrium(x, iden, cond4, corrected_sumflux);
+        applyXeEquilibrium(x, iden, cond4, sumflux);
 
     // N^C published, or the Eq. (6.20) average against the predictor inventory.
     for (int i = x.first; i < x.niso; ++i) {
@@ -533,7 +766,7 @@ __global__ void kCorrector(DevCtx x) {
 
     if (x.xe_equilibrium_fix && x.density_average && !x.xe_transient &&
         status == kOk) {
-        applyXeEquilibrium(x, iden, cond4, xe_sumflux);
+        applyXeEquilibrium(x, iden, cond4, sumflux);
         x.iden_out[static_cast<size_t>(x.i135) * nxyz + node]   = iden[x.i135];
         x.iden_out[static_cast<size_t>(x.xe135) * nxyz + node]  = iden[x.xe135];
         x.iden_out[static_cast<size_t>(x.xe135m) * nxyz + node] = iden[x.xe135m];
@@ -558,6 +791,46 @@ __global__ void kCorrector(DevCtx x) {
     atomicAdd(&x.stats[2], static_cast<unsigned long long>(kPoleCount));
 }
 
+/// XSSet::CorrectorStep's per-node body, pcSubsteps == 1, serial arm.
+__global__ void kCorrector(DevCtx x) {
+    const int l = blockIdx.x * blockDim.x + threadIdx.x;
+    if (l >= x.nxyz) return;
+
+    double cond4[kNiso * 4];
+    double iden[kNiso];
+    double sumflux = 0.0;
+    double burn    = 0.0;
+    correctorPrologue(x, l, cond4, iden, &sumflux, &burn);
+
+    unsigned long long gs     = 0;
+    const unsigned int status = cramSolveNode(x, iden, cond4, sumflux, x.dt, &gs);
+
+    correctorEpilogue(x, l, iden, cond4, sumflux, burn, status, gs);
+}
+
+/// The same body with kLanesPerNode lanes per node, lane == pole (WP21-D).
+__global__ void kCorrectorP4(DevCtx x) {
+    const int gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int l    = gtid / kLanesPerNode;
+    const int pole = gtid % kLanesPerNode;
+    if (l >= x.nxyz) return;
+
+    const int          base = (threadIdx.x & 31) & ~(kLanesPerNode - 1);
+    const unsigned int mask = ((1u << kLanesPerNode) - 1u) << base;
+
+    double cond4[kNiso * 4];
+    double iden[kNiso];
+    double sumflux = 0.0;
+    double burn    = 0.0;
+    correctorPrologue(x, l, cond4, iden, &sumflux, &burn);
+
+    unsigned long long gs = 0;
+    const unsigned int status =
+        cramSolveNodePole4(x, iden, cond4, sumflux, x.dt, &gs, pole, mask, base);
+
+    if (pole == 0) correctorEpilogue(x, l, iden, cond4, sumflux, burn, status, gs);
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -571,9 +844,19 @@ struct CramBackend::Impl {
     int         device = -1;
     int         block  = 64;
 
+    /// WP21-D.  kPole4 is the DEFAULT and is B0 against kSerial; kSerial is kept
+    /// so the A/B has a same-binary control arm and so a regression can be
+    /// bisected to the mapping rather than to the build.
+    Variant     variant      = Variant::kPole4;
+    std::string variant_text = "pole4";
+    /// RASBERY_GPU_CRAM_TIMING: bracket the KERNEL with a second event pair.
+    bool        timing = false;
+
     cudaStream_t stream = nullptr;
     cudaEvent_t  ev_start = nullptr;
     cudaEvent_t  ev_stop  = nullptr;
+    cudaEvent_t  ev_k0    = nullptr; ///< kernel only, under `timing`
+    cudaEvent_t  ev_k1    = nullptr;
 
     // Shape this instance is sized for; a change re-allocates.
     int niso = 0, nxyz = 0, ng = 0, first = 0, nnz = 0;
@@ -621,6 +904,11 @@ struct CramBackend::Impl {
     unsigned long long n_micx_d2d_bytes = 0;
     unsigned long long n_bos_reuse  = 0;
     double             wall_ms      = 0.0;
+    /// WP21-D: kernel launches (predictor + corrector), and the cudaEvent time
+    /// of the kernels ALONE.  `wall_ms` has always been the whole call --
+    /// transfers, status drain and all -- which is not the number ncu prints.
+    unsigned long long n_launches = 0;
+    double             kernel_ms  = 0.0;
 
     ~Impl() { release(); }
 
@@ -641,6 +929,8 @@ struct CramBackend::Impl {
         if (h_stats) cudaFreeHost(h_stats);
         if (ev_start) cudaEventDestroy(ev_start);
         if (ev_stop) cudaEventDestroy(ev_stop);
+        if (ev_k0) cudaEventDestroy(ev_k0);
+        if (ev_k1) cudaEventDestroy(ev_k1);
         if (stream) cudaStreamDestroy(stream);
         d_dep_decay = d_dep_trans = nullptr;
         d_row_ptr = nullptr; d_col_idx = nullptr;
@@ -650,7 +940,7 @@ struct CramBackend::Impl {
         d_iden_in = d_iden_pred = d_iden_out = nullptr;
         d_burn_bos = d_burn_out = nullptr;
         d_stats = nullptr; h_stats = nullptr;
-        ev_start = ev_stop = nullptr; stream = nullptr;
+        ev_start = ev_stop = nullptr; ev_k0 = ev_k1 = nullptr; stream = nullptr;
         lib_uploaded = false; micx_resident = 0; bos_valid = false;
     }
 
@@ -671,6 +961,33 @@ struct CramBackend::Impl {
     bool decline(const char* why) {
         status_text = std::string("declined: ") + why;
         return false;
+    }
+
+    /// WP21-D receipt: one launch, and -- only when RASBERY_GPU_CRAM_TIMING is
+    /// set -- the microseconds it took.  Two extra event records per launch are
+    /// two extra ordering points in a stream a production batch drives 102 times
+    /// per case, so they are behind the flag rather than always on.  Called
+    /// AFTER the stats drain, which is the sync that makes ev_k1 readable, and
+    /// on the decline path too: a launch that produced a bad node still ran.
+    void noteLaunch() {
+        ++n_launches;
+        if (!timing) return;
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, ev_k0, ev_k1) == cudaSuccess)
+            kernel_ms += static_cast<double>(ms);
+    }
+
+    /// Threads for `nxyz` nodes under the selected mapping, and the grid to
+    /// cover them.  The serial arm is one thread per node; the pole-parallel arm
+    /// is kLanesPerNode.
+    int gridFor(int nxyz_in) const {
+        const long long threads =
+            static_cast<long long>(nxyz_in) * lanesPerNode();
+        return static_cast<int>((threads + block - 1) / block);
+    }
+
+    int lanesPerNode() const {
+        return (variant == Variant::kPole4) ? kLanesPerNode : 1;
     }
 
     bool ensureShape(const cram::LibView& lib, int ng_in, int nxyz_in, int nnz_in) {
@@ -707,6 +1024,8 @@ struct CramBackend::Impl {
         if (rc != cudaSuccess) return fail("cudaStreamCreateWithFlags", rc);
         if ((rc = cudaEventCreate(&ev_start)) != cudaSuccess) return fail("cudaEventCreate", rc);
         if ((rc = cudaEventCreate(&ev_stop)) != cudaSuccess) return fail("cudaEventCreate", rc);
+        if ((rc = cudaEventCreate(&ev_k0)) != cudaSuccess) return fail("cudaEventCreate", rc);
+        if ((rc = cudaEventCreate(&ev_k1)) != cudaSuccess) return fail("cudaEventCreate", rc);
 
         const size_t nn   = static_cast<size_t>(nxyz);
         const size_t nng  = nn * ng;
@@ -772,8 +1091,21 @@ struct CramBackend::Impl {
     /// different streams, so without the wait this stream could read the block
     /// while the flat-XS kernel is still writing it -- a race that produces
     /// finite, plausible, wrong inventories.  No event offered, no D2D.
-    bool fillMic(const double* const* host_mic, const double* const* dev_mic,
-                 void* ready, size_t nmic, const char* who) {
+    ///
+    /// WP20.1: THE SOURCE MAY NOW BE FLOAT AND THE DESTINATION MAY NOT.
+    ///
+    /// RASBERY_GPU_FP32 narrows the flat-XS micx/lmpx blocks to float, but
+    /// CRAM stays FP64 on purpose (src/GpuFp32Arm.h: the partial-fraction sum
+    /// alternates in sign over nuclide fields spanning ~20 decades and cancels
+    /// catastrophically).  So when the offered block is four bytes wide the
+    /// handover is a WIDENING KERNEL rather than a memcpy -- same stream, same
+    /// event wait, same all-or-nothing rule.  A memcpy would have copied
+    /// `nmic * sizeof(double)` bytes out of a `nmic * sizeof(float)` block:
+    /// half of it the next slot's data, and the inventories finite, plausible
+    /// and wrong.  `elem_bytes` is the caller's word for the width and the
+    /// only thing this function is allowed to believe about it.
+    bool fillMic(const double* const* host_mic, const void* const* dev_mic,
+                 void* ready, size_t nmic, int elem_bytes, const char* who) {
         const bool d2d = dev_mic != nullptr && dev_mic[kSlot[0]] != nullptr &&
                          ready != nullptr;
         if (d2d) {
@@ -781,12 +1113,25 @@ struct CramBackend::Impl {
                 cudaStreamWaitEvent(stream, static_cast<cudaEvent_t>(ready), 0);
             if (we != cudaSuccess) return fail("wait micx event", we);
         }
+        const bool narrow = d2d && elem_bytes == static_cast<int>(sizeof(float));
         for (int k = 0; k < 4; ++k) {
             const size_t bytes = nmic * sizeof(double);
-            if (d2d) {
+            if (narrow) {
+                const size_t moved = nmic * sizeof(float);
+                const int    block = 256;
+                const int    grid =
+                    static_cast<int>((nmic + static_cast<size_t>(block) - 1) /
+                                     static_cast<size_t>(block));
+                kCramWidenMic<<<grid, block, 0, stream>>>(
+                    d_mic[k], static_cast<const float*>(dev_mic[kSlot[k]]), nmic);
+                const cudaError_t rc = cudaGetLastError();
+                if (rc != cudaSuccess) return fail("D2D mic (widen)", rc);
+                n_micx_d2d_bytes += moved;
+            } else if (d2d) {
                 const cudaError_t rc = rasbery::xfer::memcpyAsync(
-                    "CudaCramBackend.cu:fillMic", "D2D mic", d_mic[k], dev_mic[kSlot[k]],
-                    bytes, cudaMemcpyDeviceToDevice, stream);
+                    "CudaCramBackend.cu:fillMic", "D2D mic", d_mic[k],
+                    static_cast<const double*>(dev_mic[kSlot[k]]), bytes,
+                    cudaMemcpyDeviceToDevice, stream);
                 if (rc != cudaSuccess) return fail("D2D mic", rc);
                 n_micx_d2d_bytes += bytes;
             } else {
@@ -861,7 +1206,26 @@ CramBackend::CramBackend() : _impl(new Impl) {
         const int v = std::atoi(b);
         if (v == 32 || v == 64 || v == 128 || v == 256) _impl->block = v;
     }
+    // WP21-D.  The DEFAULT is the pole-parallel mapping, which is B0 against the
+    // serial one; `serial` selects the pre-WP21-D body for a same-binary A/B.
+    // An unrecognised spelling keeps the default AND SAYS SO in the status --
+    // silently running a different arithmetic than the one the operator typed is
+    // the failure mode this knob exists to avoid.
     _impl->status_text = "on";
+    if (const char* p = std::getenv("RASBERY_GPU_CRAM_PARALLEL")) {
+        const std::string want(p);
+        if (want == "serial") {
+            _impl->variant      = Variant::kSerial;
+            _impl->variant_text = "serial";
+        } else if (want == "pole" || want == "pole4") {
+            _impl->variant      = Variant::kPole4;
+            _impl->variant_text = "pole4";
+        } else {
+            _impl->status_text =
+                "on (unknown RASBERY_GPU_CRAM_PARALLEL=" + want + ", using pole4)";
+        }
+    }
+    _impl->timing = truthy(std::getenv("RASBERY_GPU_CRAM_TIMING"));
 }
 
 CramBackend::~CramBackend() = default;
@@ -879,6 +1243,15 @@ unsigned long long CramBackend::micxH2dBytes() const { return _impl->n_micx_byte
 
 unsigned long long CramBackend::micxD2dBytes() const { return _impl->n_micx_d2d_bytes; }
 unsigned long long CramBackend::bosReuses() const { return _impl->n_bos_reuse; }
+const std::string& CramBackend::kernelVariant() const { return _impl->variant_text; }
+int                CramBackend::lanesPerNode() const { return _impl->lanesPerNode(); }
+unsigned long long CramBackend::launches() const { return _impl->n_launches; }
+
+double CramBackend::launchUsMean() const {
+    // -1 is "never measured", which reads very differently from "measured 0".
+    if (!_impl->timing || _impl->n_launches == 0) return -1.0;
+    return _impl->kernel_ms * 1000.0 / static_cast<double>(_impl->n_launches);
+}
 
 namespace {
 
@@ -964,7 +1337,8 @@ bool CramBackend::predictor(const cram::LibView& lib, const cram::PredictorView&
     if (!s.h2d(s.d_iden_in, v.iden, nis * sizeof(double), "H2D iden")) return false;
 
     if (s.micx_resident != v.micx_generation) {
-        if (!s.fillMic(v.mic, v.mic_device, v.mic_device_ready, nmic, "predictor"))
+        if (!s.fillMic(v.mic, v.mic_device, v.mic_device_ready, nmic,
+                       v.mic_device_elem_bytes, "predictor"))
             return false;
         s.micx_resident = v.micx_generation;
     }
@@ -987,9 +1361,14 @@ bool CramBackend::predictor(const cram::LibView& lib, const cram::PredictorView&
     cudaError_t rc = cudaMemsetAsync(s.d_stats, 0, 3 * sizeof(unsigned long long), s.stream);
     if (rc != cudaSuccess) return s.fail("memset stats", rc);
 
-    const int blocks = (v.nxyz + s.block - 1) / s.block;
+    const int blocks = s.gridFor(v.nxyz);
     cudaEventRecord(s.ev_start, s.stream);
-    kPredictor<<<blocks, s.block, 0, s.stream>>>(x);
+    if (s.timing) cudaEventRecord(s.ev_k0, s.stream);
+    if (s.variant == Variant::kPole4)
+        kPredictorP4<<<blocks, s.block, 0, s.stream>>>(x);
+    else
+        kPredictor<<<blocks, s.block, 0, s.stream>>>(x);
+    if (s.timing) cudaEventRecord(s.ev_k1, s.stream);
     if ((rc = cudaGetLastError()) != cudaSuccess) return s.fail("kPredictor launch", rc);
 
     rc = rasbery::xfer::memcpyAsync("CudaCramBackend.cu:predictor", "stats", s.h_stats,
@@ -999,6 +1378,7 @@ bool CramBackend::predictor(const cram::LibView& lib, const cram::PredictorView&
     if ((rc = rasbery::xfer::streamSync("CudaCramBackend.cu:predictor", "stats drain",
                                         s.stream)) != cudaSuccess)
         return s.fail("predictor sync", rc);
+    s.noteLaunch();
 
     // NOTHING has touched a host array yet.  A node that hit either of milk.h's
     // throw conditions, or produced a non-finite density, makes the entire call
@@ -1071,7 +1451,8 @@ bool CramBackend::corrector(const cram::LibView& lib, const cram::CorrectorView&
         return false;
 
     if (s.micx_resident != v.micx_generation) {
-        if (!s.fillMic(v.mic, v.mic_device, v.mic_device_ready, nmic, "corrector"))
+        if (!s.fillMic(v.mic, v.mic_device, v.mic_device_ready, nmic,
+                       v.mic_device_elem_bytes, "corrector"))
             return false;
         s.micx_resident = v.micx_generation;
     }
@@ -1089,9 +1470,14 @@ bool CramBackend::corrector(const cram::LibView& lib, const cram::CorrectorView&
     cudaError_t rc = cudaMemsetAsync(s.d_stats, 0, 3 * sizeof(unsigned long long), s.stream);
     if (rc != cudaSuccess) return s.fail("memset stats", rc);
 
-    const int blocks = (v.nxyz + s.block - 1) / s.block;
+    const int blocks = s.gridFor(v.nxyz);
     cudaEventRecord(s.ev_start, s.stream);
-    kCorrector<<<blocks, s.block, 0, s.stream>>>(x);
+    if (s.timing) cudaEventRecord(s.ev_k0, s.stream);
+    if (s.variant == Variant::kPole4)
+        kCorrectorP4<<<blocks, s.block, 0, s.stream>>>(x);
+    else
+        kCorrector<<<blocks, s.block, 0, s.stream>>>(x);
+    if (s.timing) cudaEventRecord(s.ev_k1, s.stream);
     if ((rc = cudaGetLastError()) != cudaSuccess) return s.fail("kCorrector launch", rc);
 
     rc = rasbery::xfer::memcpyAsync("CudaCramBackend.cu:corrector", "stats", s.h_stats,
@@ -1101,6 +1487,7 @@ bool CramBackend::corrector(const cram::LibView& lib, const cram::CorrectorView&
     if ((rc = rasbery::xfer::streamSync("CudaCramBackend.cu:corrector", "stats drain",
                                         s.stream)) != cudaSuccess)
         return s.fail("corrector sync", rc);
+    s.noteLaunch();
 
     if (s.h_stats[0] != 0) {
         s.status_text = "declined: node status " + std::to_string(s.h_stats[0]) +

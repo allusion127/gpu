@@ -5646,6 +5646,19 @@ public:
         // -- the mean Gauss-Seidel sweep count per (node, pole), which is the
         // observable that says the device solved the SAME iteration the host
         // does rather than a differently-converged one.
+        //
+        // WP21-D ADDED THE MAPPING, AND THE MAPPING IS NOT THE ARM.  The
+        // pole-parallel kernel (`kernel_variant`:"pole4", `lanes_per_node`:4)
+        // is B0 against the serial one -- same additions in the same order --
+        // so RASBERY_GPU_CRAM_PARALLEL is deliberately NOT in kArmEnv: it does
+        // not move the trajectory the way RASBERY_GPU_CRAM does.  But it does
+        // move the TIME, and a per-launch figure quoted without the mapping it
+        // was measured under is unattributable, which is why both fields are
+        // here and why `gs_iters_mean` sitting next to them is the check that
+        // the wider kernel solved the same iteration count as the narrow one.
+        // `launch_us_mean` is -1 unless RASBERY_GPU_CRAM_TIMING was set: it is
+        // the cudaEvent time of the KERNELS ALONE, which is what ncu's block 39
+        // reports, whereas `wall_ms` is and has always been the whole call.
         {
             const CramBackend& c = cross_sections.cram();
             if (c.available() || c.predictorCalls() > 0 || c.correctorCalls() > 0 ||
@@ -5661,11 +5674,15 @@ public:
                     "\"corrector_calls\":{},\"nodes\":{},\"device\":{},"
                     "\"host_fallbacks\":{},\"gs_iters_mean\":{:.3f},"
                     "\"gs_solves\":{},\"micx_h2d_mb\":{:.1f},"
+                    "\"kernel_variant\":\"{}\",\"lanes_per_node\":{},"
+                    "\"launches\":{},\"launch_us_mean\":{:.1f},"
                     "\"bos_reuse\":{},\"wall_ms\":{:.3f},\"status\":\"{}\"}}\n",
                     cmfd_solver.batchSlot(), c.predictorCalls(), c.predictorCalls(),
                     c.correctorCalls(), c.nodesSolved(), c.deviceOrdinal(),
                     cross_sections.cramHostFallbacks(), gs_mean, c.gsSolves(),
                     static_cast<double>(c.micxH2dBytes()) / (1024.0 * 1024.0),
+                    c.kernelVariant(), c.lanesPerNode(), c.launches(),
+                    c.launchUsMean(),
                     c.bosReuses(), c.wallMs(), c.status());
             }
         }
