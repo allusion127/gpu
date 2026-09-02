@@ -1471,6 +1471,47 @@ public:
         /// The screening case_key this one was promoted FROM, or empty.
         std::string        promoted_from;
         bool               acceptance_eligible = false;
+        /// WHAT PRECISION THIS CASE ACTUALLY RESOLVED TO.
+        ///
+        /// WP20 put RASBERY_GPU_FP32/_STRICT/_CRAM on trajectory::kArmEnv and
+        /// wrote the guarantee beside that list: being there folds them into
+        /// the WP10.1 case key, "so an FP64 answer can never be served to an
+        /// FP32 request".  THAT GUARANTEE HELD ONLY WHILE ONE PROCESS RAN ONE
+        /// CASE, and the resident evaluator is one process for N cases.
+        ///
+        /// The non-finite safety valve (CudaBICGBackend.cu latchFp32Off) is
+        /// ARENA-WIDE AND STICKY: it retires the narrow CMFD path for the rest
+        /// of the process, and the arena is process-global.  So case 12 of a
+        /// 64-case chunk can latch, cases 13..64 then solve in FP64, and every
+        /// one of their receipts still carries the FP32 `case_key` above --
+        /// because the env string the key digests is a process constant, not a
+        /// per-case fact.  The only trace was one
+        /// `[RASBERY][FP32][FALLBACK]` line on stderr and the process-total
+        /// `[RASBERY][FP32]` receipt at close(), which names no case boundary
+        /// and is not printed at all if the worker is killed.
+        ///
+        /// So the resolved precision is carried like the per-case fact it is,
+        /// as TWO words rather than one, because the straddling case is a
+        /// third state and not a rounding of the other two:
+        ///
+        ///   entry "fp32",    exit "fp32"     ran wholly under the narrow arm
+        ///   entry "latched", exit "latched"  ran wholly FP64 under an FP32 key
+        ///   entry "fp32",    exit "latched"  STRADDLED the latch -- mixed, and
+        ///                                    the case that IS the boundary
+        ///   entry "fp64",    exit "fp64"     the arm was never asked for
+        ///
+        /// The spellings are fp32::backendState(Backend::Cmfd)'s own, so this
+        /// field and the end-of-run [RASBERY][FP32] receipt cannot part company
+        /// over a word.  Empty means "nobody stamped this receipt", which is
+        /// NOT the same as "fp64" and must not be reported as it.
+        ///
+        /// FILLED BY THE CASE RUNNER (EvaluatorServer::runOneCase), not by
+        /// Drive(), and that is the point rather than an omission: the window
+        /// that has to be bracketed is the case's WHOLE lifetime, including a
+        /// case that threw before the fold closed -- which is exactly the shape
+        /// a diverging GA candidate has, and exactly the case that latches.
+        std::string        fp32_entry;  ///< backendState(Cmfd) as the case STARTED
+        std::string        fp32_exit;   ///< ... and as it ENDED
     };
 
 private:

@@ -29,6 +29,12 @@ otherwise have to take on trust, and that is this file:
      makes the claim testable rather than asserted.
   5. THE FALLBACK IS LOUD, COUNTED, STICKY AND ENV-INDEPENDENT, and the CMFD
      backend bridges its own latch into it.
+  6. THE LATCH HAS A CASE BOUNDARY, AND IT IS ON THE RECEIPT.  The latch is
+     process-lifetime and the evaluator is one process for N cases, so "this
+     worker ran FP32" is a claim about a PREFIX.  Every per-case receipt says
+     which side of the latch its case fell on, a latched case does not publish
+     a case_key an FP32 request could be served from, and the wave receipt
+     names the boundary before a killed worker can lose it.
 
 Pure python, no build, no device.
 
@@ -105,6 +111,7 @@ XSSET = read("src", "XSSet.cpp")
 XSSET_H = read("src", "XSSet.h")
 BICG = read("src", "CudaBICGBackend.cu")
 DRIVER = read("src", "Driver.h")
+EVAL = read("src", "EvaluatorServer.h")
 MAIN = read("src", "main.cpp")
 DOC = read("docs", "WP20_GPU_FP32_20260831_KO.md")
 
@@ -1568,9 +1575,143 @@ check("int narrow_blocks;" in FXK and "int narrow_blocks;" in XSRK,
       "rests on")
 
 # ---------------------------------------------------------------------------
+# 12. THE LATCH HAS A CASE BOUNDARY (defect: src/CudaBICGBackend.cu
+#     latchFp32Off -- process-wide, sticky, and invisible per case).
+#
+# WHAT WENT WRONG.  Driver.h's kArmEnv comment claims that listing
+# RASBERY_GPU_FP32 there folds it into the WP10.1 case key "so an FP64 answer
+# can never be served to an FP32 request".  That is true of the KEY and false
+# of the ANSWER in the only mode the dispatcher and the soak use.
+# `latchFp32Off()` retires the narrow CMFD path for the rest of the PROCESS
+# (`fp32_latched_off` is a member of BatchCore, and BatchCore is owned by the
+# process-global arena), while the evaluator is one process for N cases.  So a
+# diverging candidate at case 12 of 64 sends cases 13..64 to FP64 with an
+# unchanged FP32 case_key on every receipt, and the only trace was a
+# [RASBERY][FP32][FALLBACK] line on stderr plus a process-total
+# [RASBERY][FP32] line at close() -- which names no boundary and is not
+# printed at all if the worker is killed.
+#
+# WHAT THESE RULES PIN.  Not that the latch is per case: it CANNOT be, one
+# captured graph serves every slot of a launch and that is why the latch is
+# arena-wide.  They pin that the RESOLVED precision is a per-case fact, is
+# bracketed around the whole case (a case that throws is the case that
+# latches), reaches the per-case receipt, is counted per wave, and -- the one
+# behavioural rule -- that a case which did not run under the arm its key names
+# does not publish that key as a cacheable identity.
+# ---------------------------------------------------------------------------
+CMFD_STATE_CALL = "rasbery::fp32::backendState(rasbery::fp32::Backend::Cmfd)"
+
+
+def rule_receipt_carries_precision(driver: str) -> bool:
+    """Driver::CaseReceipt carries the resolved precision, both ends."""
+    try:
+        rec = body_after(driver, "struct CaseReceipt")
+    except LookupError:
+        return False
+    return (re.search(r"\bstd::string\s+fp32_entry;", rec) is not None
+            and re.search(r"\bstd::string\s+fp32_exit;", rec) is not None)
+
+
+def rule_stamp_brackets_the_whole_case(evaluator: str) -> bool:
+    """Read before the try, stamped after the LAST catch block.
+
+    The case that latches is the case that throws -- a diverging candidate
+    comes back non-finite, the valve absorbs it, and the FP64 path raises it
+    on the next outer.  A stamp inside the try is therefore missing on exactly
+    the receipt that carries the boundary.
+    """
+    try:
+        body = body_after(evaluator, "static void runOneCase(")
+    except LookupError:
+        return False
+    if body.count(CMFD_STATE_CALL) != 2:
+        return False
+    try_at = body.find("try {")
+    if try_at < 0 or not 0 <= body.find(CMFD_STATE_CALL) < try_at:
+        return False
+    try:
+        catch_all = body_after(body, "catch (...)")
+    except LookupError:
+        return False
+    after = body[body.rindex(catch_all) + len(catch_all):]
+    return "receipt.fp32_entry" in after and "receipt.fp32_exit" in after
+
+
+def rule_latched_case_withholds_its_key(evaluator: str) -> bool:
+    """A latched case does not publish a key a cache could serve FP32 from."""
+    try:
+        body = body_after(evaluator, "void reportCase(long long wave_id")
+    except LookupError:
+        return False
+    return ('receipt.fp32_exit == "latched"' in body
+            and "receipt.case_key.empty() || fp32_latched" in body
+            and r'\"case_key_withheld\":' in body)
+
+
+def rule_case_line_reports_both_ends(evaluator: str) -> bool:
+    try:
+        body = body_after(evaluator, "void reportCase(long long wave_id")
+    except LookupError:
+        return False
+    return all(field in body for field in (r'\"fp32_entry\":', r'\"fp32_exit\":',
+                                           r'\"fp32_latch_boundary\":'))
+
+
+def rule_every_wave_receipt_names_the_boundary(evaluator: str) -> bool:
+    """BOTH wave receipts -- the wave path's and the rolling path's."""
+    waves = evaluator.count(r'[RASBERY][EVALUATOR][WAVE] {\"wave_id\":')
+    if waves != 2:
+        return False
+    return (evaluator.count(r'\"fp32_latched_cases\":') == waves
+            and evaluator.count(r'\"fp32_boundary_cases\":') == waves
+            and evaluator.count(r'\"fp32_first_latched_case\":') == waves)
+
+
+def rule_tally_is_reset_per_wave(evaluator: str) -> bool:
+    """Once per stand-up, both paths: a wave must not inherit a stale count."""
+    return len(re.findall(r"_fp32\s*=\s*Fp32WaveTally\{\};", evaluator)) == 2
+
+
+check('#include "GpuFp32Arm.h"' in EVAL,
+      "the evaluator includes the arm header -- it has to ASK the arm what "
+      "precision answered a case, not infer it from the environment")
+check(rule_receipt_carries_precision(DRIVER),
+      "Driver::CaseReceipt carries fp32_entry/fp32_exit: the resolved "
+      "precision is a per-case fact because the latch has a case boundary")
+check(rule_stamp_brackets_the_whole_case(EVAL),
+      "runOneCase reads the arm's state either side of the case, both reads "
+      "outside the try/catch, so the case that threw AND latched still reports")
+check(rule_latched_case_withholds_its_key(EVAL),
+      "a case whose CMFD arm resolved to \"latched\" emits case_key null with "
+      "case_key_withheld -- it did not run under the arm its key names, so a "
+      "cache must not be able to serve it to an FP32 request")
+check(rule_case_line_reports_both_ends(EVAL),
+      "[EVALUATOR][CASE] reports fp32_entry, fp32_exit and the derived "
+      "fp32_latch_boundary, so a Gate A/B comparison cannot silently mix arms")
+check(rule_every_wave_receipt_names_the_boundary(EVAL),
+      "BOTH [EVALUATOR][WAVE] receipts count the latched cases and name the "
+      "first one -- the process-total [RASBERY][FP32] line is printed at "
+      "close() and a SIGKILLed worker never prints it")
+check(rule_tally_is_reset_per_wave(EVAL),
+      "the per-wave tally is reset at both stand-ups, so a wave never reports "
+      "the previous wave's boundary as its own")
+check("fp32_latched_off" in body_after(BICG, "void latchFp32Off()"),
+      "the latch itself stays ARENA-WIDE -- one captured graph serves every "
+      "slot, so a per-slot precision would double the node count.  The fix is "
+      "that the boundary is REPORTED, not that the latch is per case")
+
+
+# ---------------------------------------------------------------------------
 # NEGATIVE CONTROLS.  Each probe is the rule applied to a mutation that MUST
 # make it fail; a rule that cannot fail is not a rule.
 # ---------------------------------------------------------------------------
+#: The exact three lines runOneCase stamps with, so the "moved inside the try"
+#: probe below is a real MOVE and not a deletion dressed up as one.
+STAMP_BLOCK = (
+    "        receipt.fp32_entry = fp32_entry;\n"
+    "        receipt.fp32_exit =\n"
+    "            rasbery::fp32::backendState(rasbery::fp32::Backend::Cmfd);\n")
+
 NEGATIVES: list[tuple[str, object]] = [
     ("the arm becomes opt-OUT",
      lambda: rule_gate_is_cached_opt_in(
@@ -1695,6 +1836,29 @@ NEGATIVES: list[tuple[str, object]] = [
      lambda: rule_demotion_claim_matches_call_sites(
          ARM,
          SRC_ALL + "\nrasbery::fp32::noteDemotion(rasbery::fp32::Backend::Xe);\n")),
+    ("the receipt stops carrying the resolved precision",
+     lambda: rule_receipt_carries_precision(
+         DRIVER.replace("std::string        fp32_entry;", ""))),
+    ("the precision stamp moves INSIDE the try, so a case that threw while "
+     "latching reports nothing",
+     lambda: rule_stamp_brackets_the_whole_case(
+         EVAL.replace(STAMP_BLOCK, "").replace(
+             "                receipt = driver.caseReceipt();\n",
+             "                receipt = driver.caseReceipt();\n" + STAMP_BLOCK))),
+    ("a latched case goes back to publishing its FP32 case_key",
+     lambda: rule_latched_case_withholds_its_key(
+         EVAL.replace("(receipt.case_key.empty() || fp32_latched)",
+                      "(receipt.case_key.empty())"))),
+    ("the per-case line drops the resolved precision again",
+     lambda: rule_case_line_reports_both_ends(
+         EVAL.replace(r'\"fp32_exit\":', r'\"unused\":'))),
+    ("only ONE of the two wave receipts names the boundary",
+     lambda: rule_every_wave_receipt_names_the_boundary(
+         EVAL.replace(r'<< ",\"fp32_latched_cases\":" << _fp32.latched_cases' + "\n",
+                      "", 1))),
+    ("a wave stops resetting the tally and inherits the last wave's boundary",
+     lambda: rule_tally_is_reset_per_wave(
+         EVAL.replace("_fp32          = Fp32WaveTally{};\n", "", 1))),
 ]
 for label, probe in NEGATIVES:
     checks += 1

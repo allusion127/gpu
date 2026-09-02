@@ -99,6 +99,7 @@
 #include "Driver.h"
 #include "GpuDeviceBlockPool.h"
 #include "GpuCaptureArbiter.h"
+#include "GpuFp32Arm.h"
 #include "HostPinRegistry.h"
 #include "IoWriter.h"
 #include "RunContract.h"
@@ -1511,6 +1512,7 @@ private:
         }
 
         const auto wave_start = std::chrono::steady_clock::now();
+        _fp32 = Fp32WaveTally{};
         refill::ledger().begin(njobs, width, host_threads);
 
         std::vector<int>         status(static_cast<std::size_t>(njobs), 0);
@@ -1700,6 +1702,9 @@ private:
              << ",\"pin_live_ranges\":" << live_ranges
              << ",\"isolation_match\":"
              << (_options.isolation_check ? (isolation_mismatch ? "false" : "true") : "null")
+             << ",\"fp32_latched_cases\":" << _fp32.latched_cases
+             << ",\"fp32_boundary_cases\":" << _fp32.boundary_cases
+             << ",\"fp32_first_latched_case\":" << _fp32.first_case
              << "}" << std::endl;
         _out.unsetf(std::ios::floatfield);
         reportMemory(wave.wave_id);
@@ -1897,6 +1902,26 @@ private:
         RollingJob          first_job;
     };
 
+    /// WHERE THE FP32 ARM STOPPED BEING THE FP32 ARM, per wave.
+    ///
+    /// The latch is process-lifetime, so "this worker ran FP32" is a claim
+    /// about a PREFIX of its cases and about nothing after it.  A Gate A/Gate B
+    /// comparison or a c/h table built from a wave's receipts has to be able to
+    /// see that boundary without re-reading every case line, and the
+    /// process-level [RASBERY][FP32] receipt cannot show it: it is one line, it
+    /// carries process totals, and a worker that is SIGSEGV'd or SIGKILLed
+    /// never prints it at all.  The wave receipt is printed at the barrier,
+    /// before any of that can be lost.
+    ///
+    /// `first_case` is the SMALLEST index among the latched cases, not the
+    /// first one reported: lanes finish out of order, so completion order is
+    /// not case order and only the index is stable across a rerun.
+    struct Fp32WaveTally {
+        long long latched_cases  = 0;  ///< answered FP64 under an FP32 case key
+        long long boundary_cases = 0;  ///< in flight when the latch fired
+        int       first_case     = -1; ///< smallest latched case index, -1 if none
+    };
+
     /// Admit one case: open a session if none is running, then queue it.
     void rollingAdmit(CaseRequest& request) {
         if (!_roll.running) rollingOpen();
@@ -1960,6 +1985,7 @@ private:
 #endif
         _roll.capacity = detail::rollingQueueCapacity(_roll.lanes);
         _roll.session  = _summary.generations + 1;
+        _fp32          = Fp32WaveTally{};
         _roll.jobs     = 0;
         _roll.ok       = 0;
         _roll.failed   = 0;
@@ -2244,6 +2270,9 @@ private:
              << ",\"pin_live_ranges\":" << live_ranges
              << ",\"isolation_match\":"
              << (_options.isolation_check ? (isolation_mismatch ? "false" : "true") : "null")
+             << ",\"fp32_latched_cases\":" << _fp32.latched_cases
+             << ",\"fp32_boundary_cases\":" << _fp32.boundary_cases
+             << ",\"fp32_first_latched_case\":" << _fp32.first_case
              << ",\"rolling\":true}" << std::endl;
         _out.unsetf(std::ios::floatfield);
         (void)wave_mode;
@@ -2378,6 +2407,22 @@ private:
                            double& seconds, double& teardown_ms) {
         const auto started = std::chrono::steady_clock::now();
         auto       drove   = started;
+        // WHICH PRECISION ANSWERED **THIS** CASE.
+        //
+        // Not the environment this process was launched with: the FP32 latch is
+        // arena-wide and sticky (CudaBICGBackend.cu latchFp32Off), so a process
+        // started with RASBERY_GPU_FP32=1 answers a prefix of its cases under
+        // the narrow arm and the rest in FP64 -- while every case key it stamps
+        // says FP32, because the key digests the env and the env does not move.
+        // Bracketing the case is the only way to tell the three states apart.
+        //
+        // READ OUTSIDE THE try, AND STAMPED OUTSIDE IT TOO, because the case
+        // that latches is usually the case that throws: a diverging GA
+        // candidate comes back non-finite, the valve absorbs it, and the FP64
+        // path raises it on the next outer.  A stamp inside the try would be
+        // missing on exactly the receipt that carries the boundary.
+        const std::string fp32_entry =
+            rasbery::fp32::backendState(rasbery::fp32::Backend::Cmfd);
         // FAILURE ISOLATION (plan WP8 "실패 격리").  An escaping exception would
         // terminate the OpenMP region and take the other cases' partial results
         // with it; a RASBERY_GPU_FULL=1 fail-closed refusal arrives here as
@@ -2414,6 +2459,9 @@ private:
             failure = "unknown exception";
             drove   = std::chrono::steady_clock::now();
         }
+        receipt.fp32_entry = fp32_entry;
+        receipt.fp32_exit =
+            rasbery::fp32::backendState(rasbery::fp32::Backend::Cmfd);
         const auto done = std::chrono::steady_clock::now();
         seconds     = std::chrono::duration<double>(done - started).count();
         teardown_ms = std::chrono::duration<double>(done - drove).count() * 1.0e3;
@@ -2424,6 +2472,31 @@ private:
                     int status, const std::string& failure,
                     const Driver::CaseReceipt& receipt, double seconds, double teardown_ms,
                     int lane, bool isolation) {
+        // A CASE THAT DID NOT RUN UNDER THE ARM ITS KEY NAMES DOES NOT GET TO
+        // HAND OUT THAT KEY.
+        //
+        // `case_key` is the CANONICAL DUPLICATE key -- a controller stores an
+        // answer under it and serves the next request that computes the same
+        // one.  Once the CMFD arm is latched off, this case solved in FP64
+        // while its key still digests RASBERY_GPU_FP32=1, so caching it would
+        // serve an FP64 answer to a later FP32 request: precisely the thing
+        // kArmEnv's comment claims cannot happen.  `null` is the spelling this
+        // line already uses for "this case has no canonical key", and
+        // `case_key_withheld` says WHY, so a withheld key and a case that never
+        // computed one are never the same finding.
+        //
+        // NOTHING LATCHED -> `fp32_latched` is false -> the key is emitted
+        // exactly as before, byte for byte.  An unstamped receipt (empty
+        // `fp32_exit`) is also untouched: absence of a stamp is not evidence of
+        // a latch.
+        const bool fp32_latched  = receipt.fp32_exit == "latched";
+        const bool fp32_boundary = fp32_latched && receipt.fp32_entry != "latched";
+        if (!isolation && index >= 0 && fp32_latched) {
+            ++_fp32.latched_cases;
+            if (fp32_boundary) ++_fp32.boundary_cases;
+            if (_fp32.first_case < 0 || index < _fp32.first_case)
+                _fp32.first_case = index;
+        }
         std::ostringstream line;
         line << "[RASBERY][EVALUATOR][CASE] {\"wave_id\":" << wave_id << ",\"case\":" << index
              << ",\"key\":" << (key.empty() ? std::string("null") : detail::quoted(key))
@@ -2436,8 +2509,13 @@ private:
              // for the second: two labels can name one case, and one label can
              // name two after a deck edit.
              << ",\"case_key\":"
-             << (receipt.case_key.empty() ? std::string("null")
-                                          : detail::quoted(receipt.case_key))
+             << ((receipt.case_key.empty() || fp32_latched)
+                     ? std::string("null")
+                     : detail::quoted(receipt.case_key))
+             << ",\"case_key_withheld\":"
+             << (fp32_latched && !receipt.case_key.empty()
+                     ? std::string("\"fp32_latched\"")
+                     : std::string("null"))
              << ",\"deck\":" << detail::quoted(deck)
              << ",\"output\":" << detail::quoted(output)
              << ",\"result_mode\":\"" << ResultModeName(mode)
@@ -2489,6 +2567,20 @@ private:
              << ",\"wall_s\":" << seconds
              << ",\"teardown_ms\":" << teardown_ms
              << ",\"isolation_check\":" << (isolation ? "true" : "false")
+             // The resolved precision, as the case itself bracketed it.  Two
+             // words and the derived boundary flag, so a reader never has to
+             // reconstruct "was this case before or after the latch" by
+             // correlating stderr against a process-total receipt that may
+             // never have been printed.
+             << ",\"fp32_entry\":"
+             << (receipt.fp32_entry.empty() ? std::string("null")
+                                            : detail::quoted(receipt.fp32_entry))
+             << ",\"fp32_exit\":"
+             << (receipt.fp32_exit.empty() ? std::string("null")
+                                           : detail::quoted(receipt.fp32_exit))
+             << ",\"fp32_latch_boundary\":"
+             << (receipt.fp32_exit.empty() ? std::string("null")
+                                           : std::string(fp32_boundary ? "true" : "false"))
              << ",\"error\":"
              << (failure.empty() ? std::string("null") : detail::quoted(failure)) << "}";
         _out << line.str() << std::endl;
@@ -2547,6 +2639,11 @@ private:
     // never names any of it.
     RollingQueue                          _queue;
     RollingState                          _roll;
+    /// Reset at every wave stand-up (both paths) and read at that wave's
+    /// barrier.  Written only from reportCase, which the wave path calls
+    /// serially on the reader thread and the rolling path calls under
+    /// `_out_mutex`, so it needs no synchronisation of its own.
+    Fp32WaveTally                         _fp32{};
     std::mutex                            _out_mutex;
 };
 
