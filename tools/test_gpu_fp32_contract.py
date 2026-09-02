@@ -171,6 +171,60 @@ check("std::getenv" in ARM and 'std::getenv("RASBERY_GPU_FP32")' not in ARM,
       "the arm header reads the environment through ONE helper (envFlagOn) "
       "rather than calling getenv per knob")
 
+# WP20.2 -- THE PPR EXTENSION IS A KNOB OF A DIFFERENT SHAPE, AND IT IS READ.
+#
+# RASBERY_GPU_FP32_PPR is deliberately NOT in kArmEnv (section 3: PPR runs after
+# the statepoint's last SolveLoop and feeds nothing back, so two runs that
+# differ only in it are the same arm), which is why it is not in KNOBS above --
+# that loop demands case-key membership.  It is still a GATE, and it was once a
+# gate in prose only: the flag was named by the commit that added the narrowing,
+# by the doc's flag row, backend table and arm-D runbook, and by four comments
+# in this tree -- and by no getenv anywhere.  `inScope()` special-cased CRAM and
+# let every other converted backend through, so the narrowing engaged on
+# RASBERY_GPU_FP32 alone, arm B and arm D were the same binary, and the receipt
+# printed "ppr":"fp32" for an extension nobody had asked for.  So this block
+# asserts the two halves the old rules did not: the READ, and the SCOPE test.
+check(rule_gate_is_cached_opt_in(ARM, "RASBERY_GPU_FP32_PPR", "pprExtended"),
+      "RASBERY_GPU_FP32_PPR is read once into a cached static by pprExtended(), "
+      "opt-IN -- the same shape cramExtended() has, and for the same reason: "
+      "the answer fixes a device allocation and may not move mid-run")
+check(ARM_CODE.count('"RASBERY_GPU_FP32_PPR"') == 1,
+      "and is spelled exactly once in the arm header -- a second reader is a "
+      "second policy")
+
+
+# EVERY FLAG THE DOC'S FLAG ROW NAMES IS READ BY THIS BINARY.
+#
+# The general form of the same defect, and the reason this rule is written over
+# the DOC ROW rather than over a list kept here: a knob that reaches the doc,
+# the runbook and the receipt without reaching a getenv cannot be caught by any
+# rule that only asks "is the name absent from kArmEnv" or "is it mentioned in
+# the doc" -- both of which passed while the gate was dead.  Add a flag to the
+# row and it must be read, or this test fails before the campaign does.
+FLAG_ROW = [ln for ln in DOC.splitlines() if ln.startswith("| 플래그 |")]
+check(len(FLAG_ROW) == 1,
+      "docs/WP20_GPU_FP32_20260831_KO.md carries exactly one flag row, which is "
+      "the list this rule is stated over")
+DOC_FLAGS = sorted(set(re.findall(r"RASBERY_[A-Z0-9_]+",
+                                  FLAG_ROW[0] if FLAG_ROW else "")))
+check(len(DOC_FLAGS) == 5,
+      "the flag row names the arm and its four extensions, five in all -- got "
+      "%s" % ", ".join(DOC_FLAGS))
+
+
+def rule_flag_is_read(text: str, flag: str) -> bool:
+    """A flag is READ when a gate passes its NAME to envFlagOn or getenv.  Called
+    on STRIPPED source: a flag named only in a comment is exactly the defect."""
+    return bool(re.search(r'(?:envFlagOn|std::getenv)\(\s*"%s"\s*\)' % re.escape(flag),
+                          text))
+
+
+for flag in DOC_FLAGS:
+    check(rule_flag_is_read(ARM_CODE, flag),
+          "%s is READ by src/GpuFp32Arm.h and not merely documented -- a knob "
+          "the doc names, the runbook sets and no getenv reads is a flag every "
+          "A/B silently attributes a number to for nothing" % flag)
+
 
 # ---------------------------------------------------------------------------
 # 2. ONE ROUTING PREDICATE, AND EVERY BACKEND IS NAMED IN IT.
@@ -227,9 +281,20 @@ try:
     SCOPE = body_after(ARM, "inline bool inScope(Backend which)")
 except LookupError:
     SCOPE = ""
-check("converted(which)" in SCOPE and "cramExtended()" in SCOPE,
+
+
+def rule_scope_gates_extensions(scope: str) -> bool:
+    """Both FLAGGED backends are tested BY NAME in inScope().  A converted
+    backend that falls through to `return true` is one the arm takes without
+    being asked -- which is what `ppr` did until its flag was wired."""
+    return ("converted(which)" in scope and "cramExtended()" in scope
+            and "pprExtended()" in scope)
+
+
+check(rule_scope_gates_extensions(SCOPE),
       "inScope() refuses a backend the tree does not narrow, and refuses CRAM "
-      "unless RASBERY_GPU_FP32_CRAM extends the arm to it")
+      "and PPR unless RASBERY_GPU_FP32_CRAM / RASBERY_GPU_FP32_PPR extend the "
+      "arm to them by name")
 
 try:
     CONVERTED = body_after(ARM, "inline bool converted(Backend which)")
@@ -303,9 +368,11 @@ check(rule_scope_gate_is_live(ARM),
       "otherwise the `!converted(which)` line above shadows the gate, the "
       "extension flag becomes unobservable, and `declined` becomes unreachable "
       "for all six backends")
-check(scope_gated_backends(ARM) == ["Cram"],
-      "and CRAM is the ONE backend with a second gate, which is what the "
-      "receipt's `declined` word and the header's CRAM paragraph both describe")
+check(scope_gated_backends(ARM) == ["Cram", "Ppr"],
+      "and CRAM and PPR are the backends with a second gate, in that order -- "
+      "which is what the receipt's `declined` word, the header's CRAM paragraph "
+      "and the `ppr` row of the backend table all describe.  A third one added "
+      "without a line here is a knob nobody pinned")
 check(rule_scope_gate_is_live(ARM)
       and "rasbery::fp32::routes(rasbery::fp32::Backend::Cram)" in CRAM
       and "if (s.fp32_pole) kPredictor<true><<<" in CRAM,
@@ -1739,21 +1806,38 @@ NEGATIVES: list[tuple[str, object]] = [
     ("the xsrecon reader goes back to the wide pointer",
      lambda: rule_no_bare_block_read(
          XSRK + "\n  double z = v.mic[xt][(iso * NG + ig) * nxyz + l];\n")),
+    ("the PPR extension goes back to being declared everywhere and read nowhere",
+     lambda: rule_flag_is_read(
+         ARM_CODE.replace('envFlagOn("RASBERY_GPU_FP32_PPR")', "false"),
+         "RASBERY_GPU_FP32_PPR")),
+    ("a flag row knob is 'read' by a COMMENT rather than by a gate",
+     lambda: rule_flag_is_read(
+         strip_comments('/// envFlagOn("RASBERY_GPU_FP32_PPR") -- one day\n'),
+         "RASBERY_GPU_FP32_PPR")),
+    ("inScope() stops testing PPR and the narrowing engages on the main flag alone",
+     lambda: rule_scope_gates_extensions(
+         SCOPE.replace("if (which == Backend::Ppr)  return pprExtended();", ""))),
     # 3b (a): the state goes dead by the table rather than by the ordering --
     # exactly how it was dead before WP20.2 converted CRAM.
-    ("the only gated backend stops being converted, so `declined` is dead text",
+    # BOTH gated backends, because there are two of them now: a mutation that
+    # defers only CRAM leaves PPR converted-and-gated, so `declined` is still
+    # reachable and the control would be reporting on nothing.
+    ("no gated backend is converted any more, so `declined` is dead text",
      lambda: rule_declined_is_reachable(
          ARM.replace("case Backend::Cram:   return true;",
-                     "case Backend::Cram:   return false;"))),
+                     "case Backend::Cram:   return false;")
+            .replace("case Backend::Ppr:    return true;",
+                     "case Backend::Ppr:    return false;"))),
     # 3b (a) again, the other way in: the ordering answers before scope is asked.
     ("backendState stops asking !inScope at all",
      lambda: rule_declined_is_reachable(
          ARM.replace('if (!inScope(which)) return "declined";', ""))),
     # 3b (a), the third way: the gate leaves inScope, so every converted backend
     # routes and the receipt can only ever say fp32.
-    ("inScope loses the per-backend gate that makes `declined` possible",
+    ("inScope loses the per-backend gates that make `declined` possible",
      lambda: rule_declined_is_reachable(
-         ARM.replace("if (which == Backend::Cram) return cramExtended();", ""))),
+         ARM.replace("if (which == Backend::Cram) return cramExtended();", "")
+            .replace("if (which == Backend::Ppr)  return pprExtended();", ""))),
     # 3b (b): the promise goes back to being prose with nothing behind it.
     ("the CRAM refusal stops being counted",
      lambda: rule_declined_is_counted(
@@ -1813,11 +1897,16 @@ NEGATIVES: list[tuple[str, object]] = [
      lambda: rule_scope_gate_is_live(
          ARM.replace("case Backend::Cram:   return true;",
                      "case Backend::Cram:   return false;"))),
-    ("inScope() stops gating CRAM at all, so RASBERY_GPU_FP32_CRAM forks the "
+    ("inScope() stops gating anything at all, so the extension flags fork the "
      "case key without being able to withhold anything",
      lambda: rule_scope_gate_is_live(
-         ARM.replace("    if (which == Backend::Cram) return cramExtended();\n",
-                     ""))),
+         ARM.replace("    if (which == Backend::Cram) return cramExtended();\n", "")
+            .replace("    if (which == Backend::Ppr)  return pprExtended();\n", ""))),
+    # And the new gate's own liveness: PPR is gated, so PPR must be converted.
+    ("converted() defers PPR again, so its brand-new gate is dead text",
+     lambda: rule_scope_gate_is_live(
+         ARM.replace("case Backend::Ppr:    return true;",
+                     "case Backend::Ppr:    return false;"))),
     ("backendState() returns fp32 before it tests !inScope, so a withheld "
      "backend reports the conversion it did not get",
      lambda: rule_declined_is_reachable_ordered(

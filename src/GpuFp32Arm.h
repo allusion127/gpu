@@ -127,8 +127,9 @@
 // answers `!converted(which)` FIRST, so a backend the table defers can never
 // reach its own extension test: were CRAM `false` there, `inScope(Cram)` would
 // be false via the WRONG test, `backendState()` would return `deferred` before
-// it could ever return `declined` -- for CRAM and therefore for every backend,
-// since CRAM is the only one gated twice -- and this knob would fork the WP10.1
+// it could ever return `declined` -- for CRAM and therefore for every backend
+// gated the same way (CRAM and, since RASBERY_GPU_FP32_PPR was wired to a
+// reader rather than only to prose, PPR) -- and this knob would fork the WP10.1
 // case key while changing nothing the binary does.  WP20.2 is what makes the
 // pair honest: the pole sum below is a real narrow path, and this flag is what
 // withholds it.  tools/test_gpu_fp32_contract.py holds the pair structurally.
@@ -331,6 +332,20 @@ inline bool cramExtended() {
     return on;
 }
 
+/// Extend the arm to PPR's two MASTER-mode scratch arrays.  Default OFF under
+/// RASBERY_GPU_FP32 for the reason the `ppr` row of the table below gives, and
+/// READ HERE rather than only declared: this flag was named by the commit that
+/// added the narrowing, by three lines of docs/WP20_GPU_FP32_20260831_KO.md and
+/// by that doc's arm-D runbook while NO line of code asked for it, so the
+/// narrowing engaged on RASBERY_GPU_FP32 alone -- arm B and arm D were one
+/// binary and the receipt said `fp32` for an extension nobody had requested.
+/// A gate that is documented and unread is worse than no gate: every number
+/// attributed to it is attributed to nothing.
+inline bool pprExtended() {
+    static const bool on = envFlagOn("RASBERY_GPU_FP32_PPR");
+    return on;
+}
+
 /// WP20.2 -- THE REFINEMENT ROUND CAP, and the one knob in this header whose
 /// value is a NUMBER rather than a bit.
 ///
@@ -483,9 +498,13 @@ inline Tally& tally() {
 ///           plus its compensation is the same 312 B/thread, and 144 additions
 ///           per node is not a bandwidth item.  It is a NUMERICAL PROBE of the
 ///           WP20 cancellation claim, with a receipt.
-///   ppr     CONVERTED SINCE WP20.2, and converted AS A VRAM ITEM, which is
-///           what the WP20 sentence this replaces already said it would be: PPR
-///           is strictly downstream of the iteration and worth nothing to the
+///   ppr     CONVERTED SINCE WP20.2 **AND STILL FLAGGED**
+///           (RASBERY_GPU_FP32_PPR), on the same footing `cram` is: `inScope()`
+///           keeps its own test for it -- `pprExtended()` -- so the receipt
+///           says `declined` rather than `fp32` unless the extension is asked
+///           for by name.  Converted AS A VRAM ITEM, which is what the WP20
+///           sentence this replaces already said it would be: PPR is strictly
+///           downstream of the iteration and worth nothing to the
 ///           trajectory.  RASBERY_GPU_FP32_PPR narrows the two device arrays
 ///           MASTER MODE ALLOCATES FOR ITSELF -- `phic_next` and `mrel`, the
 ///           CPB Jacobi's next-iterate and its per-(node, group) relative-change
@@ -520,11 +539,17 @@ inline bool converted(Backend which) {
 ///
 /// Separate from `routes()` so the receipt can distinguish the states a reader
 /// actually cares about: not asked (arm off), asked and deferred (no narrow
-/// path in this tree), asked and declined (CRAM without its extension, or a
-/// latch), asked and taken.
+/// path in this tree), asked and declined (CRAM or PPR without its own
+/// extension flag, or a latch), asked and taken.
+///
+/// The extension tests are written one backend per line, and the line IS the
+/// gate: a backend whose flag exists only in a doc is a backend the arm takes
+/// unasked, which is how `ppr` spent WP20.2 reporting an extension that was
+/// never requested.
 inline bool inScope(Backend which) {
     if (!converted(which)) return false;
     if (which == Backend::Cram) return cramExtended();
+    if (which == Backend::Ppr)  return pprExtended();
     return true;
 }
 
