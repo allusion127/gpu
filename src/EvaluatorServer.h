@@ -1775,13 +1775,49 @@ private:
              << ",\"device_pool_hits\":" << dev.pool_hits
              << ",\"device_pool_parks\":" << dev.pool_parks
              << ",\"device_blocks_live\":" << dev.blocks_live
-             // MUST be 0 in steady state.  This is the number that answers the
-             // question the VRAM sawtooth raised -- "is the arena torn down and
-             // rebuilt per generation?" -- from inside, instead of by inference
-             // from a board-level memory trace.
-             << ",\"arena_rebuilds\":" << dev.arena_rebuilds
+             << ",\"device_blocks_pooled\":" << dev.blocks_pooled
+             // MUST be 0 in steady state, AND NOW MEANS THAT.
+             //
+             // WP10.8.  Until this build the field carried
+             // `blockpool::Stats::arena_rebuilds`, which three sites in
+             // CudaXsReconBackend.cu and one in GpuPhysicsArenaCuda.cu
+             // incremented -- and the 238 block-38 soak read +17 per generation
+             // in BOTH arms, i.e. one per CASE, which is a per-instance device
+             // block being re-laid-out at its first real geometry and not an
+             // arena teardown at all.  The report that read it concluded
+             // `RASBERY_ARENA_PERSIST=1` was failing to prevent rebuilds; the
+             // flag never claimed to prevent THOSE.  The quantity is still
+             // printed, under the name of the thing it counts
+             // (`block_reshapes`), and this field now carries the number its
+             // own name always promised: process-lifetime regions handed back.
+             // Between generations that is 0, and a nonzero one IS the arena
+             // teardown the VRAM sawtooth raised.
+             << ",\"arena_rebuilds\":" << rasbery::gpu::blockpool::arenaRebuilds(dev)
+             << ",\"arena_standups\":" << dev.arena_standups
+             << ",\"block_reshapes\":" << dev.block_reshapes
              << ",\"arena_persist\":"
              << (rasbery::gpu::blockpool::enabled() ? "true" : "false")
+             // WP10.8.  THE FREE LIST IS BOUNDED, AND THIS IS THE PROOF.
+             // `pool_size_classes` climbing generation on generation is a size
+             // key that carries something per case; `pool_evictions` /
+             // `pool_park_refusals` are the cap doing its job, and both being 0
+             // with `vram_pooled_mb` flat is a pool inside its budget with no
+             // policy pressure at all.  `pool_bookkeeping_bytes` weighs the
+             // pool's OWN host containers, so "the pool is the RSS growth" is
+             // an arithmetic claim a reader can check rather than a suspicion:
+             // the 238 arm-B finding was 115.97 MB/generation and nothing in
+             // that report could weigh the accused.
+             << ",\"pool_cap_mb\":"
+             << detail::toMiB(rasbery::gpu::blockpool::capBytes())
+             << ",\"pool_cap_blocks\":" << rasbery::gpu::blockpool::capBlocks()
+             << ",\"pool_class_depth\":" << rasbery::gpu::blockpool::capClassDepth()
+             << ",\"pool_size_classes\":" << dev.size_classes
+             << ",\"pool_evictions\":" << dev.pool_evictions
+             << ",\"pool_evicted_mb\":" << detail::toMiB(dev.bytes_evicted)
+             << ",\"pool_park_refusals\":" << dev.park_refusals
+             << ",\"pool_bookkeeping_bytes\":" << dev.bookkeeping_bytes
+             << ",\"pool_reclaimer\":"
+             << (rasbery::gpu::blockpool::hasReclaimer() ? "true" : "false")
              // WP10.6.  The allocator, asked directly.  See mallocRetention().
              << ",\"malloc_taken_mb\":" << detail::toMiB(mall.taken_bytes)
              << ",\"malloc_in_use_mb\":" << detail::toMiB(mall.in_use_bytes)
@@ -1819,6 +1855,12 @@ private:
              << ",\"xslib_digest\":" << xslib.digest_evictions
              << ",\"cohort\":" << cohorts.evictions
              << ",\"digest_memo_clears\":" << BatchLightResult::HashCacheClears()
+             // WP10.8.  The device free list evicts too, and an eviction count
+             // that lived only beside the VRAM fields would be the one cache in
+             // this receipt whose evictions a reader had to look somewhere else
+             // for.
+             << ",\"blockpool\":" << dev.pool_evictions
+             << ",\"blockpool_refusals\":" << dev.park_refusals
              << "}"
              // Bytes page-locked through HostPinRegistry right now.  The arena's
              // own cudaMallocHost blocks are stood up once for the process and

@@ -376,9 +376,19 @@ def check_soak_attribution() -> list[str]:
             encoding="utf-8-sig"):
         bad.append("the warm-up count is not an operator-visible flag")
 
-    if "attribute_rss_growth(generations," not in (ROOT / "tools" / "soak_run.py").read_text(
-            encoding="utf-8-sig"):
+    soak_source = (ROOT / "tools" / "soak_run.py").read_text(encoding="utf-8-sig")
+    if "attribute_rss_growth(" not in soak_source:
         bad.append("soak_run never calls attribute_rss_growth on an RSS finding")
+    # WP10.8.  ATTRIBUTE THE FINDING THE GATE ACTUALLY MADE.  The gate no longer
+    # fits the whole run -- it fits one evaluator process's lifetime, because a
+    # slope across a restart measures a fresh child re-warming (238 block 38,
+    # arm B: 115.97 MB/gen fitted through a SIGSEGV).  An attribution that then
+    # walked the FIRST and LAST MEM receipt of the whole run would be pricing
+    # containers across the same seam the slope was just kept off.
+    elif "attribute_rss_growth(window" not in soak_source:
+        bad.append("soak_run attributes RSS growth over the whole run rather than over "
+                   "the epoch segment its slope was fitted on; a container priced "
+                   "across a restart is priced across two processes")
     return bad
 
 

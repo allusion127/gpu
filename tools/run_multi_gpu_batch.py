@@ -1436,6 +1436,12 @@ class WorkerResult:
     #: Decks whose [EVALUATOR][CASE] receipt said `failed`, plus the ones no
     #: receipt ever mentioned once the single re-queue was spent.
     failed_cases: list[str] = field(default_factory=list)
+    #: WP10.8.  Cases that were re-queued onto a fresh child after their worker
+    #: died and DID report the second time.  A recovered case is not a lost one
+    #: and must not read as a failure -- but it ran on a cold process, so its
+    #: wall time is not comparable and a campaign has to be able to see which
+    #: ones they were.
+    restart_recovered: list[str] = field(default_factory=list)
     #: WP19.  "<deck>: <message>" for every case that died with a message.
     #:
     #: THE DEFECT THIS CLOSES.  `failed_cases` is a list of NAMES, and it was
@@ -1847,6 +1853,11 @@ def _run_wave_chunk(
     pending = list(chunk)
     manifest = manifest_arg
     attempt = 0
+    #: WP10.8.  What the previous attempt handed to a fresh child.  A receipt
+    #: for one of these is a RECOVERED case, and it is marked as such: the
+    #: 238 block-38 restarts were recovered and nothing downstream could tell a
+    #: recovered case from one that never had a problem.
+    requeued_keys: set[str] = set()
     while pending:
         attempt += 1
         # Unique per worker AND per attempt: the wave id is the sentinel this
@@ -1858,7 +1869,18 @@ def _run_wave_chunk(
 
         done_keys: set[str] = set()
         for case in outcome.cases:
-            done_keys.add(path_key(str(case.get("output", ""))))
+            key = path_key(str(case.get("output", "")))
+            done_keys.add(key)
+            if key in requeued_keys:
+                result.restart_recovered.append(
+                    str(case.get("deck") or case.get("output")))
+                print("[RASBERY][MULTI_GPU][EVALUATOR][CASE][RESTART_RECOVERED] "
+                      + json.dumps({"gpu": gpu, "proc": proc, "chunk": chunk_index,
+                                    "attempt": attempt, "wave_id": wave_id,
+                                    "output": case.get("output"),
+                                    "status": case.get("status"),
+                                    "restart_recovered": True},
+                                   separators=(",", ":")))
             if case.get("status") != "ok":
                 result.failed_cases.append(str(case.get("deck") or case.get("output")))
         for refusal in outcome.refused:
@@ -1920,6 +1942,12 @@ def _run_wave_chunk(
             return "".join(texts), problems
 
         pending = unfinished
+        requeued_keys = {path_key(job[1]) for job in pending}
+        print("[RASBERY][MULTI_GPU][EVALUATOR][RESTART_RECOVERY] "
+              + json.dumps({"gpu": gpu, "proc": proc, "chunk": chunk_index,
+                            "attempt": attempt, "requeued": len(pending),
+                            "cases": [job[0] for job in pending]},
+                           separators=(",", ":")))
         retry = workdir / f"{stem}.chunk{chunk_index:04d}.retry.txt"
         retry.write_text(
             "".join(

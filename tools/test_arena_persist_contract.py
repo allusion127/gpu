@@ -83,6 +83,8 @@ SOAK = read("tools/soak_run.py")
 def check_pool(pool: str) -> list[str]:
     bad: list[str] = []
     for symbol in ("take(", "give(", "noteAllocated(", "noteArenaRebuild(",
+                   "noteBlockReshape(", "arenaRebuilds(", "setReclaimer(",
+                   "capBytes(", "capBlocks(", "capClassDepth(",
                    "snapshot(", "enabled(", "deviceBlockAlloc(",
                    "deviceBlockAllocOnce(", "deviceBlockFree("):
         if symbol not in pool:
@@ -148,9 +150,12 @@ def check_sites(xsrecon: str) -> list[str]:
         bad.append("the process-lifetime singletons (nodal arena, flat-XS library) do "
                    "not use the once-allocator, so they would be counted as poolable "
                    "and parked on a free list that will never be asked for them")
-    if "noteArenaRebuild(" not in xsrecon:
-        bad.append("nothing counts an arena rebuild in CudaXsReconBackend.cu, so "
-                   "'is the arena rebuilt per generation' stays a question a receipt "
+    # WP10.8.  EITHER SPELLING.  `noteArenaRebuild()` is now a deprecated alias
+    # of `noteBlockReshape()`; docs/patches/wp10_8_xsrecon.patch converts these
+    # three sites, and this tree has to pass before and after that patch lands.
+    if "noteArenaRebuild(" not in xsrecon and "noteBlockReshape(" not in xsrecon:
+        bad.append("nothing counts a device block reshape in CudaXsReconBackend.cu, so "
+                   "'was a live region re-laid-out per case' stays a question a receipt "
                    "cannot answer")
     return bad
 
@@ -175,7 +180,8 @@ def check_arena(arena: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 REQUIRED_MEM_FIELDS = ("vram_mb", "vram_delta_mb", "device_allocs", "device_frees",
-                       "arena_rebuilds")
+                       "arena_rebuilds", "block_reshapes", "pool_size_classes",
+                       "pool_evictions", "pool_bookkeeping_bytes")
 
 
 def check_receipt(server: str) -> list[str]:
@@ -360,8 +366,49 @@ int main() {
     std::printf("allocs_counted %d\n", st.device_allocs == 2);
     std::printf("frees_counted %d\n", st.device_frees == (on ? 0u : 2u));
 
+    // WP10.8.  THE COUNTER THAT WAS MISNAMED.  `noteArenaRebuild()` always
+    // counted a per-INSTANCE device block re-laid-out under a shape change --
+    // one per case, in BOTH arms of the 238 block-38 soak -- and never an arena
+    // teardown.  It is now `noteBlockReshape()` and lands in `block_reshapes`;
+    // the old spelling is a deprecated alias and must go to the same place, or
+    // the two .cu files that still call it would be counting into nothing.
+    bp::noteBlockReshape();
     bp::noteArenaRebuild();
-    std::printf("rebuilds_counted %d\n", bp::snapshot().arena_rebuilds == 1);
+    std::printf("reshapes_counted %d\n", bp::snapshot().block_reshapes == 2);
+
+    // And the number `arena_rebuilds` now carries is derived from the
+    // registration flag with no call site cooperating: a process-lifetime
+    // region handed back IS the arena teardown the old name promised.
+    bp::resetForTest();
+    void* once = fake(7);
+    bp::noteAllocated(once, 4096, false);
+    std::printf("arena_rebuilds_zero_until_teardown %d\n",
+                bp::arenaRebuilds(bp::snapshot()) == 0 &&
+                bp::snapshot().arena_standups == 1);
+    bp::give(once);
+    std::printf("arena_rebuilds_counts_teardown %d\n",
+                bp::arenaRebuilds(bp::snapshot()) == 1);
+
+    // WP10.8.  THE FREE LIST IS BOUNDED.  Without a reclaimer installed the
+    // pool must REFUSE to park past its depth rather than grow: an unbounded
+    // free list is what WP10.6 shipped and what nothing in a receipt said.
+    bp::resetForTest();
+    std::vector<void*> many;
+    for (int i = 0; i < 8; ++i) {
+        void* p = fake(100 + i);
+        many.push_back(p);
+        bp::noteAllocated(p, 777, true);
+    }
+    int parked_count = 0;
+    for (void* p : many) parked_count += bp::give(p) ? 1 : 0;
+    const bp::Stats capped = bp::snapshot();
+    // RASBERY_ARENA_PERSIST_CLASS_DEPTH=3 is set by the runner for this arm.
+    const bool depth_held = !on || (capped.blocks_pooled <= 3 &&
+                                    capped.park_refusals == (8u - 3u));
+    std::printf("class_depth_bounds_the_pool %d\n",
+                depth_held && parked_count == (on ? 3 : 0));
+    std::printf("one_size_class %d\n", capped.size_classes == (on ? 1u : 0u));
+    std::printf("bookkeeping_weighed %d\n", capped.bookkeeping_bytes > 0);
     return 0;
 }
 """
@@ -383,7 +430,24 @@ EXPECTED = {
     "allocs_counted": "device_allocs did not count the driver allocations",
     "frees_counted": "device_frees counted a free that never reached the driver (or "
                      "missed one that did)",
-    "rebuilds_counted": "noteArenaRebuild() did not move arena_rebuilds",
+    "reshapes_counted": "noteBlockReshape(), or its deprecated alias "
+                        "noteArenaRebuild(), did not move block_reshapes",
+    "arena_rebuilds_zero_until_teardown":
+        "a process-lifetime region was registered and arena_rebuilds was already "
+        "nonzero, or arena_standups did not count it -- the field would then still "
+        "be reporting the per-case reshape the old one did",
+    "arena_rebuilds_counts_teardown":
+        "a process-lifetime region was handed back and arena_rebuilds did not count "
+        "it; that event IS the arena teardown the VRAM sawtooth raised",
+    "class_depth_bounds_the_pool":
+        "the free list parked past RASBERY_ARENA_PERSIST_CLASS_DEPTH with no "
+        "reclaimer installed. A pool that can only grow is the WP10.6 pool, and "
+        "nothing in a receipt would say how big it had become",
+    "one_size_class": "the exact-size free list did not report exactly one size class "
+                      "for eight blocks of one size",
+    "bookkeeping_weighed": "pool_bookkeeping_bytes is zero with blocks registered, so "
+                           "'is the pool the RSS growth?' stays a suspicion instead of "
+                           "arithmetic",
 }
 
 
@@ -448,6 +512,11 @@ def compiled_contract() -> bool:
             env.pop("RASBERY_ARENA_PERSIST", None)
             if value is not None:
                 env["RASBERY_ARENA_PERSIST"] = value
+            # WP10.8.  A cap small enough to reach in a unit test.  The default
+            # depth is 64 and the default byte cap 8 GiB -- a harness that could
+            # only exercise the defaults would be a harness that never saw the
+            # bound hold.
+            env["RASBERY_ARENA_PERSIST_CLASS_DEPTH"] = "3"
             done = subprocess.run([str(exe)], capture_output=True,
                                   universal_newlines=True, env=env)
             if done.returncode != 0:

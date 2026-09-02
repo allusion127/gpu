@@ -362,7 +362,39 @@ def linear_slope_mb_per_generation(series: Sequence[float | None]) -> float | No
     return sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denominator
 
 
-def growth_slopes(series: Sequence[float | None], warmup: int
+def longest_epoch_segment(epochs: Sequence[int]) -> "tuple[int, int]":
+    """(start, stop) of the longest run of one process epoch in *epochs*.
+
+    WP10.8 -- WHY A SLOPE MUST NOT CROSS A RESTART.  The 238 block-38 arm-B soak
+    reported RSS climbing 115.97 MB/generation under `RASBERY_ARENA_PERSIST=1`
+    against a budget of 8, and that number decided the arm.  It was fitted
+    through a SIGSEGV: the evaluator died in generation 1 and the dispatcher
+    stood a fresh child up, so generations 2..19 are a DIFFERENT PROCESS
+    climbing its own cold-start ramp from nothing to its warm plateau.  A least-
+    squares line through "old process at plateau, then new process from cold"
+    reads that one-time re-warm as a per-generation leak, and no warm-up rule
+    can drop it -- the warm-up it needs to drop is in the middle of the run.  A
+    leak is a slope WITHIN one process's lifetime; across two it is arithmetic
+    on two unrelated series.  So the gate fits the longest single-epoch segment
+    and the whole-series slope is published beside it, labelled, never gated on.
+
+    Ties go to the LATER segment: two equally long lifetimes make the one that
+    survived to the end of the run the one whose steady state is worth gating.
+    """
+    if not epochs:
+        return (0, 0)
+    best_start, best_stop = 0, 1
+    start = 0
+    for i in range(1, len(epochs) + 1):
+        if i == len(epochs) or epochs[i] != epochs[start]:
+            if (i - start) >= (best_stop - best_start):
+                best_start, best_stop = start, i
+            start = i
+    return (best_start, best_stop)
+
+
+def growth_slopes(series: Sequence[float | None], warmup: int,
+                  epochs: "Sequence[int] | None" = None
                   ) -> "dict[str, float | None]":
     """Every slope worth reporting, and which one the gate uses.
 
@@ -379,7 +411,19 @@ def growth_slopes(series: Sequence[float | None], warmup: int
     of WARM-UP generations is the rule that holds at both lengths, and the raw
     slope is published beside it so nothing is hidden by the choice.
     """
-    tail = list(series)[max(0, warmup):]
+    # WP10.8.  THE SEGMENT FIRST, THE WARM-UP SECOND.  Restrict to one process
+    # lifetime before dropping warm-up generations, because the warm-up that
+    # matters is the SEGMENT's -- a child stood up at generation 2 has its own
+    # stand-up step, and dropping generations 0..N-1 of the RUN drops nothing of
+    # its ramp.
+    whole = list(series)
+    start, stop = (0, len(whole))
+    crossed = False
+    if epochs is not None and len(epochs) == len(whole) and whole:
+        start, stop = longest_epoch_segment(list(epochs))
+        crossed = (stop - start) != len(whole)
+    segment = whole[start:stop]
+    tail = segment[max(0, warmup):]
     return {
         # THE GATE: a straight fit through the POST-WARM-UP series, all of it.
         #
@@ -401,6 +445,18 @@ def growth_slopes(series: Sequence[float | None], warmup: int
         "slope_second_half_all_mb_per_generation":
             leak_slope_mb_per_generation(series),
         "warmup_generations": warmup,
+        # WP10.8.  What the gate actually looked at, so a reader can tell a
+        # 20-generation fit from a 4-generation one and can see when a restart
+        # took the other sixteen out of scope.
+        "segment_first_generation": start,
+        "segment_last_generation": stop - 1,
+        "segment_generations": stop - start,
+        "crossed_a_restart": crossed,
+        # The number the pre-WP10.8 gate would have produced.  Published, never
+        # gated on: on the 238 arm-B soak these two differ by an order of
+        # magnitude and only one of them is about memory.
+        "slope_across_restarts_mb_per_generation":
+            linear_slope_mb_per_generation(whole[max(0, warmup):]),
     }
 
 
@@ -559,10 +615,40 @@ def attribute_rss_growth(generations: "Sequence[GenerationResult]",
     if device is not None:
         head, tail = device
         rebuilds = last.get("arena_rebuilds")
+        reshapes = last.get("block_reshapes")
         notes.append(f"and the process's OWN device footprint went {head:.1f} -> "
                      f"{tail:.1f} MB with arena_rebuilds="
                      f"{rebuilds if rebuilds is not None else 'absent'} "
-                     "(0 means the arena was stood up once and never rebuilt)")
+                     "(0 means every process-lifetime region was stood up once and "
+                     "never handed back)"
+                     + ("" if reshapes is None else
+                        f" and block_reshapes={reshapes:.0f}, which is per-CASE device "
+                        "block re-layout and is EXPECTED to climb -- WP10.8: this is "
+                        "the quantity the 238 block-38 report read off the old "
+                        "`arena_rebuilds` field and mistook for an arena teardown"))
+    # WP10.8.  THE FREE LIST, WEIGHED RATHER THAN SUSPECTED.  The 238 arm-B
+    # finding was 115.97 MB/generation under RASBERY_ARENA_PERSIST=1 and the
+    # pool was the obvious suspect -- and nothing in that receipt could price
+    # it.  `pool_bookkeeping_bytes` is what the pool's own host containers
+    # weigh, so the suspicion is now arithmetic: on that run the pool held ~374
+    # blocks per generation, which is ~24 KB of bookkeeping, four orders of
+    # magnitude below the finding.
+    book = _paired(first, last, "pool_bookkeeping_bytes")
+    if book is not None:
+        head, tail = book
+        gained = _mb(tail - head)
+        verdict = ("which is too small by orders of magnitude to be the cause"
+                   if rss_growth_mb is None or rss_growth_mb <= 0.0
+                   or gained < ATTRIBUTION_SHARE * rss_growth_mb
+                   else "which IS big enough to matter -- the free list is the mover")
+        notes.append(f"and the device free list's own host bookkeeping went "
+                     f"{head:.0f} -> {tail:.0f} bytes (+{gained:.3f} MB), {verdict}")
+    classes = _paired(first, last, "pool_size_classes")
+    if classes is not None and classes[1] > classes[0]:
+        notes.append(f"and pool_size_classes went {classes[0]:.0f} -> {classes[1]:.0f}: "
+                     "the free list is keyed by exact byte count, so a class count that "
+                     "keeps climbing is a SIZE that carries something per case, and "
+                     "those blocks are parked for a request that will never come")
     if not explains:
         notes.append("so nothing [EVALUATOR][MEM] can see accounts for the growth: look "
                      "at the allocator (compare rss_peak_mb with rss_mb -- a large gap "
@@ -576,12 +662,56 @@ def attribute_rss_growth(generations: "Sequence[GenerationResult]",
 # ---------------------------------------------------------------------------
 
 
+def case_names(case: dict) -> "set[str]":
+    """Every name a receipt could identify this REQUEST by.
+
+    The evaluator's `[EVALUATOR][CASE]` line carries `key` and `output`; the
+    Driver's own `[RASBERY][CASE]` line carries only `output`.  Matching on the
+    union means a receipt from either half accounts for the request, which is
+    the same rule build_generation's `declare()` already uses for fidelity.
+    """
+    names = set()
+    for field_name in ("key", "output"):
+        value = case.get(field_name)
+        if isinstance(value, str) and value:
+            names.add(value)
+    output = case.get("output")
+    if isinstance(output, str) and output:
+        names.add(Path(output).name)
+    return names
+
+
+def reported_names(receipts: Sequence[dict]) -> "set[str]":
+    """Every name the receipts of one wave claim to have finished."""
+    names: set[str] = set()
+    for receipt in receipts:
+        names |= case_names(receipt)
+    return names
+
+
+def unreported(requests: Sequence[dict], reported: "set[str]") -> list[dict]:
+    """The requests no receipt in *reported* accounts for, in send order."""
+    return [case for case in requests if not (case_names(case) & reported)]
+
+
 @dataclass
 class GenerationResult:
     index: int
+    #: How many case requests this generation SENT.  WP10.8: `cases` is how many
+    #: came back, and the two were never compared per generation -- the 238
+    #: block-38 arm-B soak lost all eighteen of generation 1 to a SIGSEGV and
+    #: only the run-level total noticed, at the very end, with no ids.
+    requested: int = 0
     cases: int = 0
     ok: int = 0
     failed: int = 0
+    #: The evaluator PROCESS this generation ran on (`EvaluatorSession.starts`).
+    #: A slope across two of these is not a slope; see longest_epoch_segment().
+    epoch: int = 1
+    #: Cases re-run on a fresh child after their worker died mid-generation.
+    recovered: int = 0
+    #: Requested, never reported, not recovered.  By name, in the report.
+    missing: list[str] = field(default_factory=list)
     wall_s: float = 0.0
     cases_per_hour: float = 0.0
     vram_mb: float | None = None
@@ -721,6 +851,13 @@ def render_markdown(report: dict) -> str:
     lines.append(f"- wall: {report['wall_s']:.1f} s")
     lines.append(f"- restarts: {report['restarts']} "
                  f"(injected poison: {report['poisoned']})")
+    # WP10.8.  Accounted-for is the FIRST thing a reader of a GA soak needs, and
+    # on the 238 arm-B run it was buried at the bottom of a problem list.
+    lines.append(f"- cases accounted for: "
+                 f"**{'yes' if report.get('cases_accounted') else 'NO'}**"
+                 f" (recovered after a restart: {report.get('cases_recovered', 0)}"
+                 + (f"; never reported: {', '.join(report['cases_missing'])}"
+                    if report.get("cases_missing") else "") + ")")
     lines.append(f"- command: `{report['command']}`")
     lines.append("")
     lines.append("## Zero receipts")
@@ -742,13 +879,20 @@ def render_markdown(report: dict) -> str:
     # WP10.6.  The SCOPE column is not decoration.  A board reading and a
     # process reading in the same column with no label is how eight MPS clients
     # on another board became a soak finding about this evaluator.
-    lines.append("| gen | cases | ok | failed | wall s | c/h | VRAM MB | scope | RSS MB |")
-    lines.append("|---|---|---|---|---|---|---|---|---|")
+    # WP10.8.  `req` and `epoch` are not decoration either.  A generation whose
+    # cases number fewer than its requested is a generation that lost
+    # candidates, and an epoch that changes mid-table is the seam no slope may
+    # be fitted across.
+    lines.append("| gen | req | cases | ok | failed | epoch | recov | wall s | c/h | "
+                 "VRAM MB | scope | RSS MB |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for gen in report["per_generation"]:
         vram = "-" if gen["vram_mb"] is None else format(gen["vram_mb"], ".0f")
         rss = "-" if gen["rss_mb"] is None else format(gen["rss_mb"], ".0f")
         lines.append(
-            f"| {gen['index']} | {gen['cases']} | {gen['ok']} | {gen['failed']} | "
+            f"| {gen['index']} | {gen.get('requested', '?')} | {gen['cases']} | "
+            f"{gen['ok']} | {gen['failed']} | {gen.get('epoch', 1)} | "
+            f"{gen.get('recovered', 0)} | "
             f"{gen['wall_s']:.2f} | {gen['cases_per_hour']:.1f} | {vram} | "
             f"{gen.get('vram_scope', '?')} | {rss} |")
     lines.append("")
@@ -769,11 +913,22 @@ def render_markdown(report: dict) -> str:
         # Gated number first, raw beside it.  Printing only one of them is how
         # the 55c0dce report ended up arguing with the table above it.
         lines.append(
-            f"- {what} growth (gate, post-warm-up, {warm} gen dropped): "
+            f"- {what} growth (gate, post-warm-up, {warm} gen dropped, "
+            f"generations {block.get('segment_first_generation', 0)}.."
+            f"{block.get('segment_last_generation', 0)} of one evaluator process): "
             f"{shown('slope_mb_per_generation')}, limit {limit} MB/gen "
             f"[raw over every generation {shown('slope_raw_mb_per_generation')}; "
             f"second half of the whole run "
-            f"{shown('slope_second_half_all_mb_per_generation')}]")
+            f"{shown('slope_second_half_all_mb_per_generation')}"
+            + ("; ACROSS RESTARTS (not gated, measures a re-warm) "
+               + shown('slope_across_restarts_mb_per_generation')
+               if block.get("crossed_a_restart") else "") + "]")
+    if report.get("notes"):
+        lines.append("")
+        lines.append("## Notes (not verdicts)")
+        lines.append("")
+        for note in report["notes"]:
+            lines.append(f"- {note}")
     if report["problems"]:
         lines.append("")
         lines.append("## Problems")
@@ -910,22 +1065,89 @@ def main(argv: Sequence[str] | None = None) -> int:
         result.promotions = 0 if args.no_promote else 1
         result.screens = sum(1 for c in cases if c.get("fidelity") == "L3coarse")
 
+        result.requested = len(cases)
         if not session.alive and not session.restart():
             result.alive = False
+            result.missing = sorted(str(c.get("key") or c.get("output")) for c in cases)
             generations.append(result)
             break
+        result.epoch = session.starts
         wave_start = time.time()
         outcome = session.wave(wave_id=g + 1, cases=cases)
         transcript += outcome.text
-        result.wall_s = time.time() - wave_start
-        result.alive = outcome.alive
+        generation_text = outcome.text
+        collected = list(outcome.cases)
         result.refused = list(outcome.refused)
-        result.cases = len(outcome.cases)
-        result.ok = sum(1 for c in outcome.cases if c.get("status") == "ok")
+        alive = outcome.alive
+        receipt = outcome.receipt
+
+        # WP10.8 -- RESTART RECOVERY.  A worker that DIES mid-generation takes
+        # every case still in flight with it, and until now this loop simply
+        # went on to the next generation: the 238 block-38 arm-B soak lost all
+        # eighteen requests of generation 1 that way (16 candidates + the poison
+        # + the promote), the restarted child was handed g0002 as if nothing had
+        # happened, and the only trace was a run-level `cases_reported` short by
+        # 18 with no ids in it.  The dispatcher's chunked path (run_multi_gpu_
+        # batch._run_wave_chunk) has re-queued once on death since WP8; the soak
+        # drove the same EvaluatorSession and did not.  It does now, by the same
+        # rule and with the same bound: ONE re-queue, of exactly the requests no
+        # receipt accounted for, and anything still unaccounted for after it is
+        # reported BY NAME rather than quietly subtracted from the total.
+        recovery_attempt = 0
+        while not alive:
+            missing = unreported(cases, reported_names(collected))
+            if not missing:
+                break
+            recovery_attempt += 1
+            if recovery_attempt > 1 or not session.restart():
+                break
+            result.epoch = session.starts
+            names = [str(c.get("key") or c.get("output")) for c in missing]
+            print("[RASBERY][SOAK][RESTART_RECOVERY] " + json.dumps({
+                "generation": g, "epoch": session.starts,
+                "died_reporting": len(collected), "requeued": len(missing),
+                "cases": names}, separators=(",", ":")))
+            # A wave id that cannot collide with a generation's own (1..N) or
+            # with another generation's recovery, for the same reason
+            # _run_wave_chunk makes its retry id unique: the wave id is the
+            # sentinel the dispatcher reads its reply on, and a repeated one
+            # after a restart lets a stale receipt end the wrong wait.
+            again = session.wave(wave_id=(g + 1) * 1000 + recovery_attempt,
+                                 cases=missing)
+            transcript += again.text
+            generation_text += again.text
+            recovered = reported_names(again.cases)
+            for case in again.cases:
+                # The marker.  A recovered case's receipt is otherwise
+                # indistinguishable from a first-pass one, and a generation that
+                # silently re-ran a third of itself on a fresh process is a
+                # generation whose throughput number means something else.
+                print("[RASBERY][SOAK][CASE][RESTART_RECOVERED] " + json.dumps({
+                    "generation": g, "epoch": session.starts,
+                    "key": case.get("key"), "output": case.get("output"),
+                    "status": case.get("status"), "restart_recovered": True},
+                    separators=(",", ":")))
+            result.recovered += len(again.cases)
+            collected.extend(again.cases)
+            result.refused.extend(again.refused)
+            alive = again.alive
+            if again.receipt:
+                receipt = again.receipt
+            if recovered:
+                continue
+            break
+
+        result.wall_s = time.time() - wave_start
+        result.alive = alive
+        result.cases = len(collected)
+        result.ok = sum(1 for c in collected if c.get("status") == "ok")
         result.failed = result.cases - result.ok
-        if outcome.receipt:
-            result.wall_s = float(outcome.receipt.get("wall_s", result.wall_s))
-            result.cases_per_hour = float(outcome.receipt.get("cases_per_hour", 0.0))
+        result.missing = sorted(
+            str(c.get("key") or c.get("output"))
+            for c in unreported(cases, reported_names(collected)))
+        if receipt:
+            result.wall_s = float(receipt.get("wall_s", result.wall_s))
+            result.cases_per_hour = float(receipt.get("cases_per_hour", 0.0))
         elif result.wall_s > 0:
             result.cases_per_hour = 3600.0 * result.cases / result.wall_s
         # The per-case fidelity audit, ON THIS GENERATION's declarations.  Done
@@ -933,7 +1155,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # per generation and folding them all into one map would let generation
         # 7's key answer for generation 3's case.
         result.fidelity_problems = exact_audit.audit_case_fidelity(
-            outcome.text, declared, require_any=result.cases > 0)
+            generation_text, declared, require_any=result.cases > 0)
         # VRAM/RSS BETWEEN generations, not during: a sample taken mid-wave
         # measures where the wave happened to be, and the question is what is
         # left behind when it is over.
@@ -943,7 +1165,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         result.vram_foreign = len(vram.foreign_pids)
         result.vram_board_mb = vram.board_mb
         result.rss_mb = sample_rss_mb(session.pid)
-        mem_receipts = receipts_of(outcome.text, "[RASBERY][EVALUATOR][MEM]")
+        mem_receipts = receipts_of(generation_text, "[RASBERY][EVALUATOR][MEM]")
         result.mem = mem_receipts[-1] if mem_receipts else None
         # WP10.6.  THE PROCESS'S OWN NUMBER WINS for VRAM, which is the opposite
         # of the RSS rule three lines down, and deliberately so.  RSS is read
@@ -967,7 +1189,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if isinstance(reported, (int, float)) and reported > 0:
                 result.rss_mb = float(reported)
         generations.append(result)
-        if not outcome.alive and not session.restart():
+        if not alive and not session.restart():
             break
 
     transcript += session.close()
@@ -975,6 +1197,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # -- the assertions ----------------------------------------------------
     problems: list[str] = []
+    #: WP10.8.  Facts a reader must see that are NOT verdicts.  A restart the
+    #: soak recovered from loses nothing, so it does not fail the run -- but a
+    #: generation whose cases were re-run on a cold child has a throughput
+    #: number that is not comparable, and a report that stayed silent about it
+    #: would be handing over a c/h column with an unmarked outlier in it.
+    notes: list[str] = []
     zero_values: dict[str, int | None] = {}
     not_asserted: dict[str, str] = {}
     for name, tag, field_name in ZERO_RECEIPTS:
@@ -1135,22 +1363,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"evaluator. Run the soak on an idle board, or use a build whose "
             f"[EVALUATOR][MEM] receipt carries vram_mb.")
 
+    # WP10.8.  WHICH PROCESS EACH SAMPLE CAME OFF.  A restart makes the series
+    # two series, and a slope fitted across the seam measures a re-warm.
+    epochs = [g.epoch for g in generations]
     growth = {}
     for what, series, limit in (
             ("vram", [g.vram_mb for g in generations], args.vram_leak_mb),
             ("rss", [g.rss_mb for g in generations], args.rss_leak_mb)):
         if what == "vram" and contaminated:
-            growth[what] = dict(growth_slopes(series, args.warmup_generations),
+            growth[what] = dict(growth_slopes(series, args.warmup_generations, epochs),
                                 limit_mb_per_generation=limit, samples=series,
+                                epochs=epochs,
                                 scopes=sorted(vram_scopes),
                                 gated=False,
                                 gate_skipped_because="board-scoped with other tenants")
             continue
-        slopes = growth_slopes(series, args.warmup_generations)
+        slopes = growth_slopes(series, args.warmup_generations, epochs)
         slope = slopes["slope_mb_per_generation"]
         growth[what] = dict(slopes,
                             limit_mb_per_generation=limit,
                             samples=series,
+                            epochs=epochs,
                             gated=True)
         if what == "vram":
             growth[what]["scopes"] = sorted(vram_scopes)
@@ -1159,22 +1392,71 @@ def main(argv: Sequence[str] | None = None) -> int:
             post = slopes["slope_post_warmup_mb_per_generation"]
             problems.append(
                 f"{what} grew {slope:.2f} MB/generation over the post-warm-up run "
-                f"({args.warmup_generations} generation(s) dropped, limit {limit}); "
+                f"({args.warmup_generations} generation(s) dropped, limit {limit}, "
+                f"generations {slopes['segment_first_generation']}.."
+                f"{slopes['segment_last_generation']} of one evaluator process); "
                 f"after the warm plateau nothing should still be climbing. Raw slope "
                 f"over every generation including the stand-up step "
                 f"{'n/a' if raw is None else format(raw, '.2f')} MB/gen"
                 + ("" if post is None or slope is None or abs(post - slope) < 1e-9
                    else f", post-warm-up {post:.2f} MB/gen"))
             if what == "rss":
-                present = [v for v in series if v is not None]
+                head = slopes["segment_first_generation"]
+                tail_index = slopes["segment_last_generation"]
+                window = generations[head:tail_index + 1]
+                present = [v for v in series[head:tail_index + 1] if v is not None]
                 observed = (present[-1] - present[0]) if len(present) >= 2 else None
-                problems.extend(attribute_rss_growth(generations, observed))
+                problems.extend(attribute_rss_growth(window or generations, observed))
+        # WP10.8.  SAY WHEN THE GATE COULD ONLY SEE PART OF THE RUN.  A restart
+        # is not itself a leak finding, but a gate that quietly fitted four
+        # generations instead of twenty and passed is a gate that passed on
+        # less evidence than the run bought, and the report has to say so.
+        if slopes["crossed_a_restart"]:
+            problems.append(
+                f"the {what} slope was fitted over generations "
+                f"{slopes['segment_first_generation']}.."
+                f"{slopes['segment_last_generation']} only "
+                f"({slopes['segment_generations']} of {len(generations)}): the "
+                "evaluator restarted mid-run, and a slope across two process "
+                "lifetimes measures the new child's re-warm, not a leak. The "
+                "across-restarts number the old gate would have used is "
+                + ("n/a" if slopes['slope_across_restarts_mb_per_generation'] is None
+                   else f"{slopes['slope_across_restarts_mb_per_generation']:.2f} MB/gen")
+                + ". Re-run on a clean process before promoting anything on this.")
+
+    # WP10.8.  EVERY GENERATION MUST REPORT WHAT IT REQUESTED -- per generation
+    # and BY NAME.  The run-level `cases_reported < cases_requested` check below
+    # is kept, but on the 238 block-38 arm-B soak it was the ONLY signal: 18 of
+    # 360 short, at the end, with no way to tell which generation lost them or
+    # which candidates they were.  A GA reading that report cannot know whether
+    # its elite survived.
+    for gen in generations:
+        if gen.missing:
+            problems.append(
+                f"generation {gen.index} requested {gen.requested} cases and reported "
+                f"{gen.cases}; {len(gen.missing)} were never reported even after "
+                f"restart recovery: {', '.join(gen.missing)}. A generation that "
+                "silently lost candidates is not a generation.")
+        elif gen.recovered:
+            # A NOTE, NOT A PROBLEM.  Nothing was lost, and `--expect-restarts`
+            # is already the flag that says whether a restart itself is a
+            # finding; making recovery a failure too would make that flag
+            # unusable and would push a future runner towards not recovering.
+            # It is loud in the report because a case re-run on a cold child has
+            # a wall time that is not comparable with the rest of the wave.
+            notes.append(
+                f"generation {gen.index} lost its evaluator mid-wave and recovered "
+                f"{gen.recovered} case(s) on a fresh child. Every request was "
+                "reported, so no candidate was lost, but those cases ran on a cold "
+                "process and their throughput is not comparable with the rest.")
 
     cases_reported = sum(g.cases for g in generations)
-    if cases_reported < cases_requested:
+    if cases_reported != cases_requested:
+        missing_names = [name for g in generations for name in g.missing]
         problems.append(
-            f"{cases_requested - cases_reported} of {cases_requested} cases were never "
-            "reported. A generation that silently lost candidates is not a generation.")
+            f"{cases_requested} cases were requested and {cases_reported} reported"
+            + (f"; unaccounted for: {', '.join(missing_names)}" if missing_names else "")
+            + ". A generation that silently lost candidates is not a generation.")
 
     report = {
         "schema": "rasbery-soak/v1",
@@ -1184,6 +1466,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         "width": args.width,
         "cases_requested": cases_requested,
         "cases_reported": cases_reported,
+        # WP10.8.  The three numbers a reader needs to tell "nothing went wrong"
+        # from "something went wrong and was recovered" from "candidates were
+        # lost".  The 238 block-38 arm-B report could only say the third, at the
+        # end, without ids.
+        "cases_recovered": sum(g.recovered for g in generations),
+        "cases_missing": [name for g in generations for name in g.missing],
+        "cases_accounted": cases_reported == cases_requested,
         "poisoned": poisoned,
         "restarts": session.restarts,
         "expect_restarts": args.expect_restarts,
@@ -1209,7 +1498,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         "growth": growth,
         "per_generation": [
-            {"index": g.index, "cases": g.cases, "ok": g.ok, "failed": g.failed,
+            {"index": g.index, "requested": g.requested, "cases": g.cases,
+             "ok": g.ok, "failed": g.failed,
+             "epoch": g.epoch, "recovered": g.recovered, "missing": g.missing,
              "wall_s": g.wall_s, "cases_per_hour": g.cases_per_hour,
              "vram_mb": g.vram_mb, "vram_scope": g.vram_scope,
              "vram_foreign_procs": g.vram_foreign, "vram_board_mb": g.vram_board_mb,
@@ -1218,6 +1509,7 @@ def main(argv: Sequence[str] | None = None) -> int:
              "mem": g.mem}
             for g in generations],
         "problems": problems,
+        "notes": notes,
     }
 
     report_path = args.report or (workdir / "soak_report.json")
@@ -1230,6 +1522,8 @@ def main(argv: Sequence[str] | None = None) -> int:
           f"({cases_reported}/{cases_requested} cases, {len(problems)} problems)")
     for problem in problems:
         print("  - " + problem)
+    for note in notes:
+        print("  . " + note)
     print(f"wrote {report_path} and {report_path.with_suffix('.md')}")
     return 0 if report["pass"] else 1
 

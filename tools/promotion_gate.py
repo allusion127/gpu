@@ -309,6 +309,49 @@ def evaluate(block: dict) -> Verdict:
         else:
             result.reasons.append(f"soak clean ({soak.get('report', 'inline')})")
 
+    # -- WP10.8: the two facts a soak's own `pass` is allowed to be wrong about
+    #
+    # A SOAK THAT PASSED IS NOT A SOAK THAT EVALUATED EVERY CANDIDATE.  The 238
+    # block-38 arm-B soak lost 18 of its 360 cases to a SIGSEGV that took the
+    # evaluator down mid-generation, and the only record was a run-level total
+    # short by 18 with no ids.  A flag promoted on a generation that silently
+    # dropped a third of a wave is a flag promoted on a sample nobody chose, so
+    # this is refused HERE too rather than trusted to the soak's own verdict --
+    # and a block from a soak that predates the field says nothing and is
+    # neither credited nor blamed, the same rule as every other unstated fact.
+    #
+    # A SLOPE FITTED ACROSS A RESTART IS NOT A LEAK MEASUREMENT.  The same run
+    # reported RSS +115.97 MB/generation against a budget of 8 -- fitted through
+    # the restart, so most of it was a fresh child re-warming.  A block whose
+    # soak crossed a restart has a memory verdict nobody can read either way,
+    # and "unreadable" is not "passed".
+    if isinstance(soak, dict):
+        accounted = soak.get("cases_accounted")
+        missing = soak.get("cases_missing")
+        if accounted is False or (isinstance(missing, list) and missing):
+            names = ", ".join(str(m) for m in (missing or [])[:8]) or "unnamed"
+            result.blockers.append(
+                f"the soak did not account for every case it requested "
+                f"({soak.get('cases_reported')} of {soak.get('cases_requested')} "
+                f"reported; unaccounted for: {names}). A default promoted on a "
+                "campaign that lost candidates mid-generation is a default promoted "
+                "on whichever candidates happened to survive.")
+        growth = soak.get("growth")
+        if isinstance(growth, dict):
+            for what in ("rss", "vram"):
+                block_growth = growth.get(what)
+                if not isinstance(block_growth, dict):
+                    continue
+                if block_growth.get("crossed_a_restart") is True:
+                    result.blockers.append(
+                        f"the soak's {what} slope was fitted over generations "
+                        f"{block_growth.get('segment_first_generation')}.."
+                        f"{block_growth.get('segment_last_generation')} of "
+                        f"{len(block_growth.get('samples') or [])} because the "
+                        "evaluator restarted mid-run. A slope across two process "
+                        "lifetimes measures the new child's re-warm; re-run the soak "
+                        "on a process that survives it before promoting.")
+
     # -- rollback ----------------------------------------------------------
     if block.get("env_rollback") is not True:
         result.blockers.append(

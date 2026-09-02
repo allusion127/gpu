@@ -1,0 +1,81 @@
+WP10.8 -- the three XsRecon sites call the counter by the name of what it counts.
+
+WHY THIS IS A PATCH FILE AND NOT A COMMIT.  src/CudaXsReconBackend.cu is held by
+the concurrent WP21-B2/C2 arm.  This diff is written against the file as it
+stands on codex/exact-throughput-campaign at 43f8174, and is to be applied after
+that arm lands:
+
+    git apply --3way docs/patches/wp10_8_xsrecon.patch
+
+NOTHING BEHAVES DIFFERENTLY EITHER WAY, AND THAT IS DELIBERATE.  WP10.8 renamed
+`blockpool::Stats::arena_rebuilds` to `block_reshapes` and kept
+`noteArenaRebuild()` as an inline alias of the new `noteBlockReshape()` -- the
+alias exists precisely so this file (and GpuPhysicsArenaCuda.cu) could keep
+compiling untouched while it was held by another arm.  The tree passes
+`tools/test_arena_persist_contract.py` and
+`tools/test_device_block_pool_contract.py` before and after this patch.
+
+WHAT WAS WRONG WITH THE NAME.  The 238 block-38 phase-2 soak read `arena_rebuilds`
+climbing +17 per generation -- at width 16 with one promote, exactly one per
+CASE -- and it did so in BOTH arms, with `RASBERY_ARENA_PERSIST` off and on.  The
+report concluded that "`RASBERY_ARENA_PERSIST=1` is not preventing rebuilds the
+way its name promises".  It never promised that.  The three sites below fire when
+a per-INSTANCE device region is freed and re-laid-out because its SHAPE changed
+under it -- `Impl::ensure()` when `want_nxyz != nxyz`, the node table when
+`n_nodes > nodes_cap`, the stream arrays when `stream_len > stream_cap` -- which
+is a backend instance standing its blocks up at its first real geometry, once per
+case, and is not an arena teardown at all.  The persist flag pools the BLOCKS
+those sites release; it was never going to stop the sites firing.
+
+The number is real and worth keeping.  It is now called `block_reshapes`, and the
+receipt's `arena_rebuilds` field carries the thing its own name always promised:
+process-lifetime (`poolable=false`) regions handed back, derived inside the pool
+from the registration flag with no call site cooperating.  Between generations
+that is 0, and a nonzero one IS the arena teardown the VRAM sawtooth raised.
+
+--- a/src/CudaXsReconBackend.cu
++++ b/src/CudaXsReconBackend.cu
+@@
+         rasbery::AllocWindow _alloc_window("xsrecon.instance.regrow");
+-        // WP10.6.  A REBUILD is a live region freed and re-laid-out under a
+-        // shape change; a first stand-up is not one.  The distinction is the
+-        // whole question the VRAM sawtooth raised -- "is the arena torn down
+-        // per generation?" -- and it is now a counter in the MEM receipt
+-        // instead of an inference from a board-level memory trace.
+-        if (dev_block != nullptr) rasbery::gpu::blockpool::noteArenaRebuild();
++        // WP10.8.  A RESHAPE is a live PER-INSTANCE region freed and re-laid-out
++        // under a shape change; a first stand-up is not one.  This fires about
++        // once per case, in both arms -- it is this backend instance sizing its
++        // blocks to the deck's geometry, not an arena teardown.  WP10.6 called
++        // it `noteArenaRebuild()` and the 238 block-38 report read the resulting
++        // `arena_rebuilds=+17/generation` as evidence that RASBERY_ARENA_PERSIST
++        // was failing.  The counter now has the name of what it counts, and the
++        // receipt's `arena_rebuilds` answers the arena question separately.
++        if (dev_block != nullptr) rasbery::gpu::blockpool::noteBlockReshape();
+         if (dev_block) { rasbery::gpu::deviceBlockFree(dev_block); dev_block = nullptr; }
+@@
+         rasbery::AllocWindow _alloc_window("xsrecon.nodes.regrow");
+-        if (d.dev_nodes != nullptr) rasbery::gpu::blockpool::noteArenaRebuild();
++        if (d.dev_nodes != nullptr) rasbery::gpu::blockpool::noteBlockReshape();
+         if (d.dev_nodes) rasbery::gpu::deviceBlockFree(d.dev_nodes);
+@@
+         rasbery::AllocWindow _alloc_window("xsrecon.stream.regrow");
+-        if (d.dev_sdid != nullptr) rasbery::gpu::blockpool::noteArenaRebuild();
++        if (d.dev_sdid != nullptr) rasbery::gpu::blockpool::noteBlockReshape();
+         if (d.dev_sdid) rasbery::gpu::deviceBlockFree(d.dev_sdid);
+
+APPLY-BY-HAND EQUIVALENT (three lines, if `git apply` refuses after a rebase):
+
+    src/CudaXsReconBackend.cu:2748   noteArenaRebuild()  ->  noteBlockReshape()
+    src/CudaXsReconBackend.cu:4074   noteArenaRebuild()  ->  noteBlockReshape()
+    src/CudaXsReconBackend.cu:4094   noteArenaRebuild()  ->  noteBlockReshape()
+
+(line numbers as of 43f8174; the call is unique on each of those lines)
+
+AFTERWARDS, THE ALIAS CAN GO.  `noteArenaRebuild()` in src/GpuDeviceBlockPool.h
+is kept only for these three sites and the one in src/GpuPhysicsArenaCuda.cu:197
+(`if (++standups > 1)`, which is also a reshape by the new vocabulary -- the
+arena being stood up a second time -- and which the derived `arena_standups` /
+`arena_teardowns` counters now report on their own).  Once both files are
+converted, delete the alias and drop `"noteArenaRebuild("` from the symbol list
+in tools/test_arena_persist_contract.py::check_pool.
