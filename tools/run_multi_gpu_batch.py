@@ -79,6 +79,7 @@ from run_single_gpu_batch import (  # noqa: E402
     DEFAULT_ENV,
     LaunchPlan,
     check_run_receipts,
+    declared_preset_from_env,
     launch_env,
     parse_overrides,
     path_key,
@@ -87,7 +88,7 @@ from run_single_gpu_batch import (  # noqa: E402
     resolve_unset,
     visible_cpu_threads,
 )
-from exact_audit import DECLARABLE_FIDELITIES, receipt_policy  # noqa: E402
+from exact_audit import DECLARABLE_FIDELITIES, receipt_policy, receipt_preset  # noqa: E402
 
 # WP16 host-spin: TWO KNOBS THAT ARE DELIBERATELY NOT IN DEFAULT_ENV.
 #
@@ -1470,6 +1471,31 @@ class WorkerResult:
         return counts
 
     @property
+    def presets(self) -> dict[str, int]:
+        """jobs measured, keyed by the NAMED preset the run printed.
+
+        WP24.  The companion to `fidelities`, and it is not optional: `policy`
+        is `A2` for every staged arm this binary can run, so a campaign table
+        labelled only by policy cannot say whether its A2 column is the measured
+        50/1000 production arm or screen100 -- which moves the published
+        tolerances as well as the loose stage.  `"none"` is a real answer (no
+        preset was named) and is a different fact from `strict`; `"unreported"`
+        means the child predates WP24 and printed no field at all.
+
+        `"unreported"` IS A CAMPAIGN FAILURE, not a table entry: a binary that
+        prints no `fidelity_preset` ignored the RASBERY_FIDELITY it was given and
+        solved at production polish tolerances under a screening name.
+        check_run_receipts() refuses such a run outright, so a key of
+        `"unreported"` can only ever appear beside a recorded problem -- if it
+        appears WITHOUT one, that refusal has been lost.
+        """
+        counts: dict[str, int] = {}
+        for entry in self.case_fidelity:
+            key = entry.get("fidelity_preset") or "unreported"
+            counts[key] = counts.get(key, 0) + int(entry.get("jobs", 0))
+        return counts
+
+    @property
     def mean_width(self) -> float:
         """Rendezvous width this PROCESS achieved, launch-weighted.
 
@@ -1788,6 +1814,11 @@ def _run_rolling_worker(
         result_mode=chunk_result_mode(list(outstanding.values()) or jobs[start:end],
                                       result_mode),
         declared_fidelity=declared_fidelity,
+        # WP24.  The row this worker's child was launched with, read off the
+        # CHILD ENVIRONMENT rather than threaded from main(): `env` here IS
+        # what the process was given, so the audit compares the request against
+        # the receipt with nothing in between to get out of step.
+        declared_preset=declared_preset_from_env(env),
     )
     result.problems.extend(
         f"gpu{gpu} p{proc} rolling: {p}" for p in check_run_receipts(audit_text, plan)
@@ -1796,6 +1827,12 @@ def _run_rolling_worker(
         "chunk": 1,
         "jobs": result.jobs,
         "policy": receipt_policy(audit_text),
+        # WP24.  `policy` is `A2` for BOTH the measured 50/1000 production arm
+        # and screen100 -- which additionally moves the PUBLISHED keff, search,
+        # flux, Xe and rod-crit tolerances.  A receipt naming only the family is
+        # a number nobody can reproduce, and it is what let promotion_gate's A/B
+        # hygiene check pass a screen100 candidate against an A2 baseline.
+        "fidelity_preset": receipt_preset(audit_text),
         "result_mode": plan.result_mode,
         "scope": "process",
     })
@@ -2195,6 +2232,10 @@ def run_worker(
             gpu=gpu,
             result_mode=chunk_result_mode(jobs[start:end], result_mode),
             declared_fidelity=declared_fidelity,
+            # WP24.  See the rolling path: `env` is this child's resolved
+            # environment, so the preset the audit expects is the preset that
+            # was actually handed over.
+            declared_preset=declared_preset_from_env(env),
         )
         result.problems.extend(
             f"gpu{gpu} p{proc} chunk{chunk_index}: {p}"
@@ -2213,6 +2254,10 @@ def run_worker(
             # fidelity the process did not resolve), so a wave inherits its
             # worker's word and the label stays true per case.
             "policy": receipt_policy(audit_text),
+            # WP24.  See the sibling append above: `policy` alone cannot tell
+            # screen100 from the 50/1000 A2 arm, and the promotion gate reads
+            # this field beside it.
+            "fidelity_preset": receipt_preset(audit_text),
             "result_mode": plan.result_mode,
             "scope": "process" if evaluator else "chunk",
         })
@@ -2385,6 +2430,12 @@ class TuneCandidate:
     # only line that could have explained it printed `problems: 6`.
     declared_fidelity: str = "strict"
     fidelities: dict[str, int] = field(default_factory=dict)
+    #: WP24.  The NAMED presets this candidate's cases reported, jobs-weighted.
+    #: `fidelities` says `A2` for the production arm and for screen100 alike, so
+    #: an A/B whose two arms differ only in the preset was indistinguishable
+    #: from an A/B of one arm -- which is what tools/promotion_gate.py's
+    #: "the arms ran at different fidelities" check was reading.
+    presets: dict[str, int] = field(default_factory=dict)
 
     @property
     def cases_per_hour(self) -> float:
@@ -2447,6 +2498,7 @@ class TuneCandidate:
             "problem_detail": detail,
             "declared_fidelity": self.declared_fidelity,
             "fidelity_measured": self.fidelities,
+            "fidelity_preset_measured": self.presets,
             "eligible": self.eligible,
             "disqualified": self.disqualified,
         }
@@ -2694,6 +2746,10 @@ def _measure_candidate(
     for result in results:
         for policy, count in result.fidelities.items():
             cand.fidelities[policy] = cand.fidelities.get(policy, 0) + count
+        # WP24.  The preset half, folded the same way and in the same loop, so
+        # the two can never be gathered over different case populations.
+        for preset, count in result.presets.items():
+            cand.presets[preset] = cand.presets.get(preset, 0) + count
     return cand, results
 
 
@@ -2746,6 +2802,8 @@ def calibrate(
                 merged.refused = merged.refused or cand.refused
                 for policy, count in cand.fidelities.items():
                     merged.fidelities[policy] = merged.fidelities.get(policy, 0) + count
+                for preset, count in cand.presets.items():
+                    merged.presets[preset] = merged.presets.get(preset, 0) + count
             if observed_writer is None:
                 for log in sorted((tune_root / f"k{procs:02d}").rglob("*.log")):
                     observed_writer = writer_threads_from_receipt(
@@ -3579,6 +3637,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     # the one the plan declared.  The audit already fails a
                     # mismatch; this is what lets a table say which arm it is.
                     "fidelity_measured": r.fidelities,
+                    # WP24.  Which NAMED preset, beside which policy family.
+                    "fidelity_preset_measured": r.presets,
                     "case_fidelity": r.case_fidelity,
                     # What the children were launched with, not what the plan
                     # intended: the [ENV] line above is a prediction, this is
@@ -3679,6 +3739,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     for r in results:
         for policy, count in r.fidelities.items():
             fidelity_measured[policy] = fidelity_measured.get(policy, 0) + count
+    # WP24.  And by NAMED preset, for the same reason and in the same shape: a
+    # row labelled `A2` alone does not say whether it is the production arm or
+    # screen100, and those are two different convergence policies.
+    fidelity_preset_measured: dict[str, int] = {}
+    for r in results:
+        for preset, count in r.presets.items():
+            fidelity_preset_measured[preset] = (
+                fidelity_preset_measured.get(preset, 0) + count)
     print(
         "[RASBERY][MULTI_GPU][TOTAL] "
         + json.dumps(
@@ -3736,6 +3804,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "declared_fidelity": declared_fidelity,
                 "declared_fidelity_source": fidelity_source,
                 "fidelity_measured": fidelity_measured,
+                "fidelity_preset_measured": fidelity_preset_measured,
                 "rc": exit_code,
                 "fail_lines": total_fail,
             },

@@ -496,9 +496,14 @@ def lane():
              "digest": "%016x" % index, "isolation_check": False}))
 
 
+# WP24: the stand-in prints `fidelity_preset` because a CURRENT binary does, and
+# check_run_receipts() now requires the child to report back the preset it was
+# handed.  A receipt without the field means "this binary predates WP24 and
+# ignored RASBERY_FIDELITY", which is a refusal -- so a stand-in that omitted it
+# would be standing in for the wrong binary.
 emit('[RASBERY][PHYSICS_MODE] {"policy":"strict","physics_fidelity":"full",'
      '"acceptance_eligible":true,"screening":false,"result_mode":"light",'
-     '"feedback_pass_limit":0}')
+     '"feedback_pass_limit":0,"fidelity_preset":"none"}')
 emit('[RASBERY][EVALUATOR][READY] {"batch_width":4,"rolling":true,'
      '"rolling_prefetch":2,"rolling_target_inflight":6}')
 

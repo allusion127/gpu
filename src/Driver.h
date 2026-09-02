@@ -796,6 +796,15 @@ inline constexpr const char* kArmEnv[] = {
     "RASBERY_XE_ANDERSON_MAX_STEP",
     "RASBERY_XE_CASCADE_BUDGET",
     "RASBERY_XE_INTERIM_L2",
+    // WP24.  THE NAMED CONVERGENCE PRESET (src/FidelityPreset.h).  It belongs
+    // here more plainly than anything else on this list: it is the only knob
+    // that moves the PUBLISHED (polish) tolerances -- the eigenvalue tolerance,
+    // the CMFD flux L2, the Xe equilibrium tolerance, the critical-search
+    // tolerance and the rod-crit clamp -- so two runs that differ only in it
+    // converge to two different answers, not merely by two different paths.  A
+    // cache that did not fold it would serve a 100 pcm screening k_eff to a
+    // production request, once, quietly.
+    "RASBERY_FIDELITY",
     "RASBERY_STAGED_FLUX_TOL",
     "RASBERY_STAGED_XE_TOL",
     "RASBERY_STAGED_LOOSE_SETTLE",
@@ -1468,6 +1477,13 @@ public:
         std::string        physics_fidelity;  ///< the plan Sec 6.2 spelling
         std::string        statepoint_grid;   ///< "full" unless the deck was coarsened
         std::string        fidelity_declared; ///< the request's word, raw, or empty
+        /// WP24.  WHICH staged arm, by name.  `policy` says "A2" for every
+        /// staged convergence policy this binary can run, and A2 is a FAMILY
+        /// (CaseFidelity.h:51-58) -- so on its own it does not identify a run.
+        /// "none" when no preset was named, which is not the same fact as
+        /// "strict": the tolerances are the built-ins either way, but only
+        /// `strict` also CLEARED whatever the environment was carrying.
+        std::string        fidelity_preset;
         /// The screening case_key this one was promoted FROM, or empty.
         std::string        promoted_from;
         bool               acceptance_eligible = false;
@@ -1704,6 +1720,20 @@ private:
         /// (processCaseFidelity()), so a Driver nobody configured behaves
         /// exactly as this tree did before.
         CaseFidelity fidelity = processCaseFidelity();
+        /// WP24.  WHAT THIS CASE'S PUBLISHED ANSWER IS CONVERGED TO, resolved
+        /// ONCE from `fidelity`'s preset row and read by every consumer that
+        /// used to name a Driver class constant: the outer verdict, the CMFD
+        /// sweep exit, the Xe cascade, the Anderson arming gate and the device
+        /// Xe request.  Five readers of one value, because five readers of five
+        /// constants is how a preset comes to apply to four of them.
+        ///
+        /// Default-constructed it IS the built-in constant set, so a Driver
+        /// nobody configured converges exactly as this tree did before -- and
+        /// the multipliers below are applied as `x * 1.0`, which is exact.
+        // ONE call, not two: `tolerances` is a FUNCTION OF the `fidelity`
+        // member above, and spelling it as a second processCaseFidelity()
+        // read made two halves of one value read as two facts.
+        SolveTolerances tolerances = fidelity.tolerances();
         /// WP9-D stage D.  HOW THIS RUN'S CRITICAL SEARCH PROPOSES.  Resolved
         /// once from the environment (Scheduler.h processSearchPolicy) and
         /// carried here for the same reason `fidelity` is: SolveLoop is static,
@@ -3235,7 +3265,9 @@ private:
             ++ncol_after;
         }
         req.ncol     = ncol_after;
-        req.eq_tol   = XE_EQUILIBRIUM_TOLERANCE;
+        // WP24: the CASE's Xe tolerance, so the device arm and the host arm
+        // cannot be asked for two different equilibria within one solve.
+        req.eq_tol   = ctx.tolerances.xe_tol;
         req.min_gram = XE_ANDERSON_MIN_GRAM;
         req.max_step = max_step;
         req.relax    = 1.0; // see the header: SolveLoop guarantees it
@@ -3382,7 +3414,7 @@ private:
 
         // 3. Arming -- NOT a rejection, so neither counter moves.  Same two
         //    terms, same reasons, as the host arm.
-        if (aa.ncol == 0 || picard < XE_EQUILIBRIUM_TOLERANCE)
+        if (aa.ncol == 0 || picard < ctx.tolerances.xe_tol)
             return false;
 
         ++ctx.telemetry.xe_aa_proposed;
@@ -3650,7 +3682,7 @@ private:
         //    extrapolation buys no steps and would put a state the production
         //    test never measured into the published inventory.  With this test
         //    in place, what a cascade PUBLISHES is always a plain Picard image.
-        if (aa.ncol == 0 || picard < XE_EQUILIBRIUM_TOLERANCE)
+        if (aa.ncol == 0 || picard < ctx.tolerances.xe_tol)
             return false;
 
         ++ctx.telemetry.xe_aa_proposed;
@@ -3927,12 +3959,32 @@ private:
         // the keff(rod) staircase but residual kinks at fine-cell boundaries leave a ~3e-5 keff
         // noise floor. A 1e-5 search tolerance sits inside that noise, so the secant bounces
         // (8-13 trials/step). Raise the floor above the noise so it converges in ~half as many.
+        //
+        // WP24.  The floor and the RODCRIT cap both come from the preset row
+        // now (FidelityPreset.h), and with no preset they are the 5.0e-5 and
+        // kRodCritSearchTol this line and Scheduler::criticalSearchTolerance()
+        // carried as literals.  BOTH are needed: the cap's min() would discard
+        // a relaxed search tolerance outright, and the floor's max() would then
+        // pin the rod search at 5e-5 whatever the cap allowed.
+        const SolveTolerances& tol = ctx.tolerances;
+        schedule.rodcrit_search_cap = tol.rodcrit_search_cap;
         if (has_search && schedule.searchType == SearchType::RODCRIT)
-            schedule.rodcrit_search_floor = (ctx.cross_sections.axial_rod_division() > 0) ? 5.0e-5 : 0.0;
+            schedule.rodcrit_search_floor =
+                (ctx.cross_sections.axial_rod_division() > 0) ? tol.rodcrit_search_floor_cusping
+                                                              : 0.0;
 
-        const double keff_tol   = schedule.tolerance_keff;
-        const double search_tol = schedule.criticalSearchTolerance();
-        const double flux_tol   = std::max(keff_tol, CMFD_FLUX_L2_TOLERANCE);
+        // WP24.  MULTIPLIERS, NOT REWRITES.  The deck states tolerance_keff and
+        // tolerance_search, and IO::ReadInput folds the deck's canonical digest
+        // immediately after the parse -- so a preset that rewrote the deck
+        // would move the case key's DECK half instead of its ENV half, and two
+        // fidelities of one core would look like two different cores.  Scaling
+        // here keeps the deck the deck.  With no preset both multipliers are
+        // exactly 1.0 and `flux_l2_tol` is CMFD_FLUX_L2_TOLERANCE, so all three
+        // lines are the pre-WP24 lines to the bit.
+        const double keff_tol   = schedule.tolerance_keff * tol.keff_tol_mult;
+        const double search_tol =
+            schedule.criticalSearchTolerance(tol.search_tol_mult, tol.search_tol_cap);
+        const double flux_tol   = std::max(keff_tol, tol.flux_l2_tol);
 
         // =================================================================
         // A2: STAGED TOLERANCE -- loose while the statepoint is still moving,
@@ -4006,7 +4058,10 @@ private:
         // nothing reads the digits and is not allowed to reach the digits the
         // search reads.  With no search there is no such consumer and the
         // multiplier stands as given.
-        constexpr double STAGED_SEARCH_MARGIN = 4.0;
+        // WP24 (review).  The literal moved to Scheduler.h
+        // (kStagedSearchMarginBuiltIn) so the [RASBERY][FIDELITY] receipt can
+        // print the EFFECTIVE margin without re-spelling it here.
+        constexpr double STAGED_SEARCH_MARGIN = kStagedSearchMarginBuiltIn;
         // WP9-D stage D, candidate D3 (gate A2).  The margin was a literal
         // nobody could sweep, and it is the one number that decides how much of
         // the loosening a search TRIAL is allowed to keep.  The knob may only
@@ -4020,7 +4075,7 @@ private:
             has_search ? std::min(keff_tol * staged_flux_mult, search_tol / staged_search_margin)
                        : keff_tol * staged_flux_mult;
         const double loose_flux_tol = std::max(loose_keff_tol, flux_tol * staged_flux_mult);
-        const double loose_xe_tol   = XE_EQUILIBRIUM_TOLERANCE * staged_xe_mult;
+        const double loose_xe_tol   = tol.xe_tol * staged_xe_mult;
         // FALSE means the loose stage is in force.  Latched true the first time
         // every feedback agrees at the loose tolerance, and cleared again by any
         // committed perturbation, because a perturbation invalidates the
@@ -4347,7 +4402,7 @@ private:
             // these are three copies and no behaviour.
             const double keff_tol_now = polishing ? keff_tol : loose_keff_tol;
             const double flux_tol_now = polishing ? flux_tol : loose_flux_tol;
-            const double xe_tol_now   = polishing ? XE_EQUILIBRIUM_TOLERANCE : loose_xe_tol;
+            const double xe_tol_now   = polishing ? tol.xe_tol : loose_xe_tol;
             // ===============================================================
             // Rev.7.1 Task 10: the SolveLoop delegation
             // ===============================================================
@@ -4659,8 +4714,7 @@ private:
                         "[RASBERY][WARN][xe] cascade budget exhausted at statepoint {} "
                         "(EFPD {:.3f}): {} steps, last rel={:.3e} > tol {:.1e}; published "
                         "Xe inventory is NOT converged\n",
-                        ctx.statepoint, ctx.efpd, xe_count, prev_xe_change,
-                        XE_EQUILIBRIUM_TOLERANCE);
+                        ctx.statepoint, ctx.efpd, xe_count, prev_xe_change, tol.xe_tol);
             }
 
             // 3. Equilibrium xenon feedback.  Previously equilibrium Xe was
@@ -4770,7 +4824,13 @@ private:
                 // the run's 13,383 outers that way.  Halving the applied step leaves the
                 // fixed point alone and turns the oscillation into a contraction.  Once
                 // engaged it stays engaged for this solve: re-raising it re-enters the cycle.
-                if (xe_change >= XE_OSCILLATION_FLOOR && xe_change >= prev_xe_change)
+                // WP24.  tol.xe_oscillation_floor, NOT 100 x the (possibly
+                // relaxed) Xe tolerance.  Letting the floor float with the
+                // tolerance would move it from 1e-4 to 1e-3 under screen100 --
+                // straight onto the documented pathology (APR1400 cy01
+                // oscillating at ~1e-3 for 80+ steps), which the damper would
+                // then stop engaging on.  Every preset row pins 1e-4.
+                if (xe_change >= tol.xe_oscillation_floor && xe_change >= prev_xe_change)
                     ++xe_no_progress;
                 else
                     xe_no_progress = 0;
@@ -4966,7 +5026,7 @@ private:
                         std::cout << std::format(
                             "        [STAGE] loose agreement at outer {}; polishing at "
                             "keff_tol={:.2e} flux_tol={:.2e} xe_tol={:.2e}\n",
-                            iout, keff_tol, flux_tol, XE_EQUILIBRIUM_TOLERANCE);
+                            iout, keff_tol, flux_tol, tol.xe_tol);
                     continue;
                 }
                 exit_reason = SolveExit::CONVERGED;
@@ -5286,6 +5346,18 @@ private:
         const char*         raw  = std::getenv(name);
         const std::string   text = raw != nullptr ? std::string(raw) : std::string();
         const auto spell = [](double value) { return std::format("{:.17g}", value); };
+        // WP24.  The preset is per case for exactly the reason the three staged
+        // knobs below are: an evaluator standing in a screen100 campaign that
+        // answers a promoted strict re-run would otherwise fold the SAME
+        // `RASBERY_FIDELITY` string into both keys, and the cache would serve
+        // the screening answer as the acceptance one.  A case that asked for
+        // nothing different keeps the RAW environment string, byte for byte, so
+        // every key this tree has ever computed for a preset-free run is
+        // unchanged.
+        if (std::strcmp(name, "RASBERY_FIDELITY") == 0) {
+            if (fidelity.preset == base.preset) return text;
+            return fidelity.preset;
+        }
         if (std::strcmp(name, "RASBERY_STAGED_FLUX_TOL") == 0) {
             if (fidelity.staged_flux_mult == base.staged_flux_mult) return text;
             return fidelity.staged_flux_mult > 1.0 ? spell(fidelity.staged_flux_mult)
@@ -5299,6 +5371,64 @@ private:
         if (std::strcmp(name, "RASBERY_STAGED_LOOSE_SETTLE") == 0) {
             if (fidelity.loose_settle == base.loose_settle) return text;
             return fidelity.loose_settle ? std::string("1") : std::string();
+        }
+        // WP24 (review).  THE FIVE SEARCH KNOBS ARE PER CASE NOW TOO, and they
+        // have to be folded per case for exactly the reason the four above are.
+        //
+        // THE COLLISION THIS CLOSES.  A preset row ASSERTS these five (the row
+        // replaces the environment rather than defaulting to it), so a case
+        // that named `"fidelity_preset":"screen100"` and a process that
+        // exported `RASBERY_SEARCH_BORON_BRACKET=1` and no preset are two
+        // different search policies -- while a screen100 case answered by a
+        // process whose shell exported `RASBERY_SEARCH_CARRY_SLOPE=1` is the
+        // SAME policy as one answered by a clean process, because the row pins
+        // the lever off in both.  Folding the RAW environment left the
+        // env-level and per-case screen100 lanes on ONE key while they still
+        // ran two different policies -- a wrong HIT, and that is what this
+        // closes.  Folding the EFFECTIVE policy is the same rule the staged
+        // knobs follow.
+        //
+        // WHAT IT DOES NOT CLOSE, STATED SO NOBODY READS MORE INTO IT.  The
+        // raw string is still kept whenever the CASE did not override, and
+        // "did not override" is judged against the PROCESS's policy -- so in a
+        // process that names a row, a shell exporting
+        // `RASBERY_SEARCH_BORON_BRACKET=1` beside `RASBERY_FIDELITY=screen100`
+        // folds "1" where a clean screen100 process folds "", for two solves
+        // the row makes bit-identical.  That is a cache MISS, never a wrong
+        // hit: it costs compute and can never serve a wrong answer.  The same
+        // asymmetry applies to the three staged names, to the preset name
+        // itself, and to a lever a row pins OFF that the shell exported ON
+        // (docs/WP24 Sec 7.1 enumerates all three shapes).  Keeping the raw
+        // text is what makes every key this tree has ever computed for a
+        // preset-free run unchanged, byte for byte, and keeps
+        // tools/case_key.py -- which reads these out of a resolved child
+        // environment as raw text -- in agreement there.
+        const SearchPolicy& base_search = processSearchPolicy();
+        const SearchPolicy  case_search = fidelity.searchPolicy();
+        const auto          flag        = [](bool on) {
+            return on ? std::string("1") : std::string();
+        };
+        if (std::strcmp(name, "RASBERY_SEARCH_CARRY_SLOPE") == 0)
+            return case_search.carry_slope == base_search.carry_slope
+                       ? text
+                       : flag(case_search.carry_slope);
+        if (std::strcmp(name, "RASBERY_SEARCH_WARM_BORON") == 0)
+            return case_search.warm_boron == base_search.warm_boron
+                       ? text
+                       : flag(case_search.warm_boron);
+        if (std::strcmp(name, "RASBERY_SEARCH_BORON_BRACKET") == 0)
+            return case_search.boron_bracket == base_search.boron_bracket
+                       ? text
+                       : flag(case_search.boron_bracket);
+        if (std::strcmp(name, "RASBERY_SEARCH_MAX_TRIALS") == 0) {
+            if (case_search.max_trials == base_search.max_trials) return text;
+            return case_search.max_trials > 0 ? std::to_string(case_search.max_trials)
+                                              : std::string();
+        }
+        if (std::strcmp(name, "RASBERY_SEARCH_STAGED_MARGIN") == 0) {
+            if (case_search.staged_margin == base_search.staged_margin) return text;
+            return case_search.staged_margin > 0.0 ? spell(case_search.staged_margin)
+                                                   : std::string();
         }
         return text;
     }
@@ -5444,7 +5574,12 @@ public:
 
         BICGCMFD cmfd_solver(geometry, cross_sections);
         cmfd_solver.setNcmfd(5);
-        cmfd_solver.setEpsl2(1.0e-6);
+        // WP24 (review).  THE `setEpsl2(1.0e-6)` THAT USED TO BE HERE IS GONE.
+        // It was unconditionally overwritten twenty-four lines below by the
+        // per-case `setEpsl2(ctx.tolerances.cmfd_sweep_epsl2)`, so it was dead
+        // -- but it was also a SECOND SPELLING of a number src/FidelityPreset.h
+        // now owns (kProdCmfdSweepEpsl2), and a second spelling nothing forces
+        // to move is exactly the drift the single-source rule exists to stop.
         cmfd_solver.setEshift(0.04);
 
         Nodal nodal_solver(geometry, cross_sections);
@@ -5458,6 +5593,57 @@ public:
         // strings -- there is no path where copying it per case is measurable
         // beside a deck parse.
         ctx.fidelity = _fidelity;
+        // WP24.  The preset's production tolerances, resolved from the SAME
+        // value the receipt and the case key are spelled from, so a case cannot
+        // converge to one number while three receipts name another.
+        ctx.tolerances = _fidelity.tolerances();
+        // WP24 (review).  AND THE OTHER HALF OF THE ROW, from the same lookup.
+        //
+        // Without this line SolverContext::search_policy kept the value its
+        // default member initialiser gave it -- processSearchPolicy(), which
+        // resolves the preset from the ENVIRONMENT.  A case that asked for
+        // `"fidelity_preset":"screen100"` by JSON therefore ran the row's eight
+        // tolerances against the environment's five search knobs: bracket off,
+        // margin back at the built-in 4.0 (clipping loose_keff_tol to 2.5e-5
+        // where the row intends 5e-5), and inside a campaign shell exporting
+        // RASBERY_SEARCH_CARRY_SLOPE it ran the +8.11 % lever the row pins off.
+        // The receipt below then printed the ROW's knobs for a run that used
+        // none of them, and armEnvValue folded the same "screen100" string for
+        // both paths -- one case key, two different converged answers.
+        //
+        // A case with no row resolves environmentSearchPolicy() through
+        // CaseFidelity::searchPolicy() -- the RAW environment, which in a
+        // preset-free process is bit-for-bit what processSearchPolicy()
+        // answers, so this assignment is the identity on every preset-free run.
+        // In a process that NAMES a row it is the fix for the second half of
+        // the same defect: a case that CLEARS the preset (`op:"promote"`, or
+        // any `"fidelity":"strict"` request) used to keep the PROCESS row's
+        // five search knobs, so the acceptance lane inside a screen100 campaign
+        // ran boron_bracket ON and folded a key indistinguishable from a
+        // genuine strict run whose bracket was off.  See
+        // CaseFidelity::searchPolicy().
+        ctx.search_policy = _fidelity.searchPolicy();
+        // The CMFD SWEEP-loop exit (BICGCMFD::drive's `if (errl2 < _epsl2)
+        // break`) is set here rather than in the solver's constructor because
+        // it is a per-CASE number now.  The invariant the table enforces is
+        // `cmfd_sweep_epsl2 <= flux_tol`: a sweep allowed to stop LOOSER than
+        // the outer verdict requires would make the sweep, not the preset,
+        // decide the published flux.
+        //
+        // AN EARLIER COMMENT HERE HAD THE MECHANISM BACKWARDS and claimed a
+        // TIGHTER epsl2 kept the outer's L2 half from being "true by
+        // construction".  It is the other way round.  drive() breaks on
+        // `errl2 < _epsl2` and otherwise exhausts _ncmfd = 5, so at
+        // epsl2 == flux_tol the outer test `residual < flux_tol_now` is exactly
+        // "the sweep loop converged" (break -> pass, cap-exhaust -> fail),
+        // which is the strictest reading available; at epsl2 < flux_tol the
+        // break passes trivially AND a cap-exhausted sweep landing in
+        // [epsl2, flux_tol) passes too.  Tighter is MORE permissive here, and
+        // it costs inner sweeps.  screen100 carries 1e-5 against 1e-4 anyway
+        // for a different, unmeasured reason -- a better-converged flux per
+        // outer is the lever on the |dk| half's OUTER COUNT -- and
+        // src/FidelityPreset.h names it as the first knob to sweep.
+        cmfd_solver.setEpsl2(ctx.tolerances.cmfd_sweep_epsl2);
 
         // ===================================================================
         // Rev.7.1 Task 9 link 1: stand the device outer segment up, ONCE.
@@ -5699,6 +5885,7 @@ public:
         _case_receipt.physics_fidelity    = _fidelity.physicsFidelity();
         _case_receipt.statepoint_grid     = _fidelity.gridToken();
         _case_receipt.fidelity_declared   = _fidelity.declared;
+        _case_receipt.fidelity_preset     = _fidelity.presetToken();
         _case_receipt.promoted_from       = _fidelity.promoted_from;
         _case_receipt.acceptance_eligible = _fidelity.acceptanceEligible();
         // WP10.4.  `physics_fidelity` IS `fidelity`, PRINTED TWICE ON PURPOSE.
@@ -5726,8 +5913,100 @@ public:
         // exists in every mode (argv, `--jobs` manifest, evaluator) -- unlike
         // the evaluator's optional client `key` -- and the Driver already has
         // it, so nothing is plumbed to print it.  schema_version 6.
+        // WP24.  THE PRESET'S OWN RECEIPT, printed ONLY when a preset was named.
+        //
+        // WHY A SEPARATE LINE AND NOT ANOTHER FIELD.  The [CASE] line answers
+        // "which case was this and what policy word does it carry"; this one
+        // answers "and what NUMBERS is that word", which is the question a
+        // screening arm has to answer to be reproducible and the question the
+        // A2 arm has never been able to answer at all.  Every knob the row
+        // asserts is printed, including the ones it sets to the built-in
+        // default, because a knob missing from the receipt is a knob a reader
+        // has to go and guess the environment for.
+        //
+        // WHY IT IS CONDITIONAL.  With no preset there is no line, so a run of
+        // this tree with RASBERY_FIDELITY unset prints byte-for-byte what it
+        // printed before -- the feature-off identity is a property of the
+        // source and not of a diff somebody remembered to run.
+        if (const FidelityPresetSpec* preset_spec = _fidelity.presetSpec()) {
+            // WP24 (review).  EVERY KNOB IS PRINTED FROM THE EFFECTIVE RUN, NOT
+            // FROM THE TABLE ROW.  The five search knobs used to be spelled
+            // straight out of `preset_spec`, so across the whole per-case lane
+            // -- where SolverContext::search_policy came from the ENVIRONMENT
+            // and not from the row -- five of seventeen fields asserted knobs
+            // the run did not use.  A receipt that names the row instead of the
+            // run is the defect this WP exists to end, so they come off
+            // `ctx.search_policy`, which IS what SolveLoop reads.  The staged
+            // multipliers move for the same reason: an explicit
+            // `"staged_flux_tol"` in the request overrides the row
+            // (resolveCaseFidelity), and the row's number would then be wrong.
+            const SolveTolerances pt = ctx.tolerances;
+            const SearchPolicy&   sp = ctx.search_policy;
+            // WP24 (review).  AND THE RESOLVED ABSOLUTES BESIDE THE MULTIPLIERS.
+            // keff_tol_mult and search_tol_mult scale numbers the DECK states
+            // (`tolerance_keff`, `search_pcm_tolerance` x 1e-5), so a reader
+            // holding this line alone could not say what the case converged to
+            // without also holding the deck -- and a deck stating
+            // search_pcm_tolerance = 5 is already at 5e-5, which x10 is 5e-4 =
+            // 50 pcm, half a screening boron envelope from one knob.  These are
+            // SCHEDULE ENTRY 0's numbers, computed through the same accessors
+            // SolveLoop uses: a copy of the entry carries the preset's RODCRIT
+            // cap and cusping floor, which SolveLoop assigns per statepoint.  A
+            // deck whose later entries state other tolerances is reported for
+            // its first one, and the field name says which.
+            Schedule entry0 = scheduler.schedule(0);
+            entry0.rodcrit_search_cap = pt.rodcrit_search_cap;
+            if (entry0.hasCriticalSearch() && entry0.searchType == SearchType::RODCRIT)
+                entry0.rodcrit_search_floor =
+                    (cross_sections.axial_rod_division() > 0)
+                        ? pt.rodcrit_search_floor_cusping
+                        : 0.0;
+            const double r_keff_tol   = entry0.tolerance_keff * pt.keff_tol_mult;
+            const double r_search_tol =
+                entry0.criticalSearchTolerance(pt.search_tol_mult, pt.search_tol_cap);
+            const double r_flux_tol   = std::max(r_keff_tol, pt.flux_l2_tol);
+            const double r_margin     = sp.stagedMargin(kStagedSearchMarginBuiltIn);
+            const double r_loose_keff =
+                entry0.hasCriticalSearch()
+                    ? std::min(r_keff_tol * _fidelity.staged_flux_mult,
+                               r_search_tol / r_margin)
+                    : r_keff_tol * _fidelity.staged_flux_mult;
+            const double r_loose_flux =
+                std::max(r_loose_keff, r_flux_tol * _fidelity.staged_flux_mult);
+            const double r_loose_xe = pt.xe_tol * _fidelity.staged_xe_mult;
+            std::cout << std::format(
+                "  [RASBERY][FIDELITY] {{\"schema_version\":2,\"preset\":\"{}\","
+                "\"policy\":\"{}\",\"acceptance_eligible\":{},\"knobs\":{{"
+                "\"staged_flux_mult\":{:.17g},\"staged_xe_mult\":{:.17g},"
+                "\"staged_loose_settle\":{},\"staged_search_margin\":{:.17g},"
+                "\"keff_tol_mult\":{:.17g},\"search_tol_mult\":{:.17g},"
+                "\"search_tol_cap\":{:.17g},"
+                "\"flux_l2_tol\":{:.17g},\"xe_tol\":{:.17g},"
+                "\"xe_oscillation_floor\":{:.17g},\"cmfd_sweep_epsl2\":{:.17g},"
+                "\"rodcrit_search_cap\":{:.17g},\"rodcrit_search_floor_cusping\":{:.17g},"
+                "\"boron_bracket\":{},\"carry_slope\":{},\"warm_boron\":{},"
+                "\"max_trials\":{},\"statepoint_grid\":\"{}\"}},"
+                "\"resolved_entry0\":{{\"keff_tol\":{:.17g},\"search_tol\":{:.17g},"
+                "\"flux_tol\":{:.17g},\"xe_tol\":{:.17g},\"loose_keff_tol\":{:.17g},"
+                "\"loose_flux_tol\":{:.17g},\"loose_xe_tol\":{:.17g}}}}}\n",
+                preset_spec->name, _fidelity.policy(),
+                _fidelity.acceptanceEligible() ? "true" : "false",
+                _fidelity.staged_flux_mult, _fidelity.staged_xe_mult,
+                _fidelity.loose_settle ? "true" : "false",
+                r_margin, pt.keff_tol_mult, pt.search_tol_mult,
+                pt.search_tol_cap,
+                pt.flux_l2_tol, pt.xe_tol, pt.xe_oscillation_floor, pt.cmfd_sweep_epsl2,
+                pt.rodcrit_search_cap, pt.rodcrit_search_floor_cusping,
+                sp.boron_bracket ? "true" : "false",
+                sp.carry_slope ? "true" : "false",
+                sp.warm_boron ? "true" : "false",
+                sp.max_trials,
+                _fidelity.gridToken(),
+                r_keff_tol, r_search_tol, r_flux_tol, pt.xe_tol,
+                r_loose_keff, r_loose_flux, r_loose_xe);
+        }
         std::cout << std::format(
-            "  [RASBERY][CASE] {{\"schema_version\":6,\"case_key\":\"{}\",\"key_schema\":\"{}\","
+            "  [RASBERY][CASE] {{\"schema_version\":7,\"case_key\":\"{}\",\"key_schema\":\"{}\","
             "\"core_op\":\"{}\",\"deck_digest\":\"{}\",\"env_digest\":\"{}\","
             "\"env_set\":\"{}\","
             "\"xslib_digest\":\"{}\",\"xslib_policy\":\"{}\",\"warm_start_token\":\"{}\","
@@ -5735,7 +6014,8 @@ public:
             "\"policy\":\"{}\","
             "\"result_mode\":\"{}\",\"output\":\"{}\","
             "\"warm_start\":\"{}\",\"statepoint_grid\":\"{}\","
-            "\"acceptance_eligible\":{},\"fidelity_declared\":{},\"promoted_from\":{}}}\n",
+            "\"acceptance_eligible\":{},\"fidelity_declared\":{},\"fidelity_preset\":\"{}\","
+            "\"promoted_from\":{}}}\n",
             case_key, casekey::kSchema, input_output.deck_key_core_op(),
             input_output.deck_key_digest(), case_env_digest,
             casekey::envSetToken(case_provenance),
@@ -5751,6 +6031,7 @@ public:
             _fidelity.declared.empty()
                 ? std::string("null")
                 : "\"" + jsonString(_fidelity.declared) + "\"",
+            _case_receipt.fidelity_preset,
             _fidelity.promoted_from.empty()
                 ? std::string("null")
                 : "\"" + jsonString(_fidelity.promoted_from) + "\"");
@@ -6106,6 +6387,7 @@ public:
                     light_fidelity.physics_fidelity    = _case_receipt.physics_fidelity;
                     light_fidelity.statepoint_grid     = _case_receipt.statepoint_grid;
                     light_fidelity.declared            = _case_receipt.fidelity_declared;
+                    light_fidelity.preset              = _case_receipt.fidelity_preset;
                     light_fidelity.promoted_from       = _case_receipt.promoted_from;
                     light_fidelity.acceptance_eligible = _case_receipt.acceptance_eligible;
                     BatchLightResult::Write(_input, input_output.xs_path(), case_key,

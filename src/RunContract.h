@@ -50,6 +50,8 @@
 // nothing; the raw declaration is reported beside the effective one so the
 // attempt is visible.
 
+#include "FidelityPreset.h"
+
 #include <cstdlib>
 #include <string>
 
@@ -127,6 +129,30 @@ inline double stagedMultiplier(const char* name) {
 
 } // namespace detail
 
+/// WP24.  The two staged multipliers the PROCESS is configured with, PRESET
+/// INCLUDED, and there is exactly one implementation of that sentence because a
+/// second one is how a receipt and a solver come to disagree about which arm
+/// ran.
+///
+/// A NAMED PRESET REPLACES THE TWO KNOBS RATHER THAN DEFAULTING THEM.  The
+/// argument is in FidelityPreset.h and it is short: `run_single_gpu_batch`'s
+/// DEFAULT_ENV exports 50/1000, so a preset that merely supplied defaults would
+/// mean a screen100 case solving at the A2 arm's multipliers under a receipt
+/// that says screen100 -- the unnamed-arm defect this whole table exists to end.
+///
+/// WITH NO PRESET THESE ARE THE PRE-WP24 EXPRESSIONS, character for character,
+/// so every fidelity this tree has ever detected is unchanged.
+inline double processStagedFluxMult() {
+    const FidelityPresetSpec* preset = lookupFidelityPreset(fidelityPresetEnvName());
+    return preset != nullptr ? preset->staged_flux_mult
+                             : detail::stagedMultiplier("RASBERY_STAGED_FLUX_TOL");
+}
+inline double processStagedXeMult() {
+    const FidelityPresetSpec* preset = lookupFidelityPreset(fidelityPresetEnvName());
+    return preset != nullptr ? preset->staged_xe_mult
+                             : detail::stagedMultiplier("RASBERY_STAGED_XE_TOL");
+}
+
 /// What the environment actually configures.  Read once: the receipt is the
 /// first reader and every later reader must agree with it.
 inline PhysicsFidelity detectedPhysicsFidelity() {
@@ -134,8 +160,12 @@ inline PhysicsFidelity detectedPhysicsFidelity() {
         const char* passes = std::getenv("RASBERY_GA_FEEDBACK_PASSES");
         if (passes != nullptr && *passes != '\0' && std::atoi(passes) > 0)
             return PhysicsFidelity::FeedbackLimited;
-        if (detail::stagedMultiplier("RASBERY_STAGED_FLUX_TOL") > 1.0 ||
-            detail::stagedMultiplier("RASBERY_STAGED_XE_TOL") > 1.0)
+        // WP24.  A preset is not a fifth PhysicsFidelity -- kFidelityTraits is a
+        // CLOSED four-row table that tools/case_key.py, exact_audit.py and
+        // test_result_fidelity_contract.py all mirror by index.  screen100
+        // resolves to StagedA2 like any other staged arm; WHICH staged arm is
+        // the preset name, carried in the case key and the receipts.
+        if (processStagedFluxMult() > 1.0 || processStagedXeMult() > 1.0)
             return PhysicsFidelity::StagedA2;
         return PhysicsFidelity::FullExact;
     }();

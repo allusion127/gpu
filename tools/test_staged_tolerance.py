@@ -99,7 +99,14 @@ if "bool polishing = !staged_tol;" not in SOLVE:
 for line in (
     "const double keff_tol_now = polishing ? keff_tol : loose_keff_tol;",
     "const double flux_tol_now = polishing ? flux_tol : loose_flux_tol;",
-    "const double xe_tol_now   = polishing ? XE_EQUILIBRIUM_TOLERANCE : loose_xe_tol;",
+    # WP24: the POLISH-stage Xe tolerance is the CASE's, not the class
+    # constant, because a named fidelity preset moves the published tolerances
+    # and not only the loose stage (src/FidelityPreset.h).  The structure this
+    # line exists to pin -- one resolution site, `polishing` selecting between a
+    # production value and a loose one -- is unchanged; only where the
+    # production value is read from moved, and with no preset `tol.xe_tol` IS
+    # XE_EQUILIBRIUM_TOLERANCE.
+    "const double xe_tol_now   = polishing ? tol.xe_tol : loose_xe_tol;",
 ):
     if SOLVE.count(line) != 1:
         fail(f"the per-outer tolerance must be resolved in exactly one place: {line!r}")
@@ -165,8 +172,15 @@ if "if (staged_tol && polishing) {" not in loop or "++ctx.telemetry.staged_relap
 cap = region(SOLVE, "const double loose_keff_tol =", ";\n", "search tolerance cap")
 if "search_tol / staged_search_margin" not in cap or "std::min" not in cap:
     fail("the loose keff tolerance is not capped below search_tol when a search is running")
-if not re.search(r"constexpr double STAGED_SEARCH_MARGIN = [1-9]", SOLVE):
-    fail("STAGED_SEARCH_MARGIN is missing or not a positive literal")
+# WP24 (review).  The literal moved to Scheduler.h so the [RASBERY][FIDELITY]
+# receipt can print the EFFECTIVE margin -- `stagedMargin(built_in)` -- without
+# re-spelling 4.0 beside the solve it claims to describe.  What is pinned is
+# therefore BOTH halves: SolveLoop takes the constant from the one place that
+# defines it, and that place still defines it as a positive literal.
+if "constexpr double STAGED_SEARCH_MARGIN = kStagedSearchMarginBuiltIn;" not in SOLVE:
+    fail("SolveLoop's STAGED_SEARCH_MARGIN is not taken from "
+         "Scheduler.h kStagedSearchMarginBuiltIn; a second spelling of the margin is a "
+         "number the receipt and the solve can disagree about")
 # WP9-D stage D (candidate D3) made the margin the sweepable thing it always
 # had to be, and the ONE property that matters is that the knob can only
 # REPLACE the built-in: unset, `stagedMargin` answers with the literal above and
@@ -185,6 +199,10 @@ SCHEDULER_SRC = (ROOT / "src" / "Scheduler.h").read_text(encoding="utf-8-sig")
 if "return staged_margin > 0.0 ? staged_margin : built_in;" not in SCHEDULER_SRC:
     fail("SearchPolicy::stagedMargin no longer falls back to the built-in margin, so an "
          "unset RASBERY_SEARCH_STAGED_MARGIN would change the loose tolerance")
+if not re.search(r"inline constexpr double kStagedSearchMarginBuiltIn = [1-9]",
+                 SCHEDULER_SRC):
+    fail("Scheduler.h no longer defines kStagedSearchMarginBuiltIn as a positive "
+         "literal; SolveLoop's divisor and the receipt's effective margin both read it")
 if "p.staged_margin = (m >= 1.0) ? m : 0.0;" not in SCHEDULER_SRC:
     fail("RASBERY_SEARCH_STAGED_MARGIN is not clamped to off below 1.0; a margin under 1 "
          "would let the loose stage sample k_eff looser than the search tolerance, which "

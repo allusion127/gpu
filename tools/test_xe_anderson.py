@@ -671,7 +671,8 @@ if GRAM is None or not 0.0 < float(GRAM.group(1)) < 1.0:
 # convergence tolerance, returns false WITHOUT charging a counter -- and the
 # tolerance term is what keeps an unmeasured state out of the published
 # inventory.
-ARM = "if (aa.ncol == 0 || picard < XE_EQUILIBRIUM_TOLERANCE)"
+# WP24: the Xe tolerance is the CASE's now (src/FidelityPreset.h), because a named fidelity preset moves the PUBLISHED tolerances and not only the loose stage. The property this pins is unchanged -- ONE value, read by both arms -- and with no preset ctx.tolerances.xe_tol IS XE_EQUILIBRIUM_TOLERANCE.
+ARM = "if (aa.ncol == 0 || picard < ctx.tolerances.xe_tol)"
 if ARM not in AA:
     fail(f"the arming test is not {ARM!r}; without the tolerance term a cascade could "
          "publish an extrapolated inventory the convergence test never measured")

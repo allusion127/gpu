@@ -384,6 +384,27 @@ struct DeviceScheduleParams {
     double        tolerance_keff;      ///< kEigvTol          = 1e-6
     double        tolerance_search;    ///< kCritSearchTol    = 1e-5
     double        rodcrit_search_floor;
+    // WP24.  The RODCRIT clamp, whose host twin stopped being a literal when
+    // the fidelity preset had to be able to move it (Scheduler.h
+    // criticalSearchTolerance).  It is here for the SAME reason
+    // rodcrit_search_floor is -- the host and device search parameter blocks are
+    // pinned field-for-field by tools/test_gpu_physics_interface_contract.py, so
+    // a host field with no device twin is a mirror that has quietly stopped
+    // being one.
+    //
+    // TODO(WP24-device-search): RESET-ONLY TODAY, AND THAT IS A HOLE THE
+    // MIRROR CONTRACT CANNOT SEE.  resetDeviceScheduleParams() writes
+    // kDevRodCritSearchTol here and nothing ever feeds it from
+    // ctx.tolerances.rodcrit_search_cap, so the day the device search goes
+    // live the device would clamp at the BUILT-IN while the host clamps at the
+    // preset's -- two search tolerances inside one solve, which is exactly the
+    // "half applied" failure src/FidelityPreset.h exists to prevent, arriving
+    // on the axis nobody is watching.  `search_tol_cap` has no device twin at
+    // all for the same reason (it is an argument to
+    // Scheduler::criticalSearchTolerance, not a Schedule field), so it lands
+    // here too.  The contract test pins this marker, so the reminder cannot be
+    // deleted without wiring the value.
+    double        rodcrit_search_cap;
     double        tolerance_th;        ///< kThTol            = 1e-6
     double        target_keff;
     double        tolerance_tmod;      ///< kTempSearchTol    = 0.01
@@ -608,6 +629,7 @@ RASBERY_GPU_HD inline void deviceScheduleParamsReset(DeviceScheduleParams& d) {
     d.tolerance_keff       = kDevEigvTol;
     d.tolerance_search     = kDevCritSearchTol;
     d.rodcrit_search_floor = 0.0;
+    d.rodcrit_search_cap   = kDevRodCritSearchTol;
     d.tolerance_th         = kDevThTol;
     d.target_keff          = 1.0;
     d.tolerance_tmod       = kDevTempSearchTol;

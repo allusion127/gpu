@@ -204,6 +204,12 @@ public:
         std::string physics_fidelity    = "full_exact";
         std::string statepoint_grid     = "full";
         std::string declared;      ///< the request's word, raw; empty prints null
+        /// WP24.  WHICH staged arm, by name (src/FidelityPreset.h).  `policy`
+        /// says "A2" for every staged convergence policy this binary can run
+        /// and A2 is a FAMILY, so a GA ranking light scalars against each other
+        /// needs the row name to know two numbers are comparable.  "none" is
+        /// the default and means the built-in tolerances with no row applied.
+        std::string preset = "none";
         std::string promoted_from; ///< the screened case_key this replaces
         bool        acceptance_eligible = true;
     };
@@ -262,6 +268,11 @@ public:
         receipt["fidelity_declared"]   = fidelity.declared.empty()
                                              ? nlohmann::ordered_json(nullptr)
                                              : nlohmann::ordered_json(fidelity.declared);
+        // WP24.  Never null: "none" is a fact about the run, and a field that
+        // was sometimes absent would let a reader mistake an old binary's
+        // silence for a preset-free run.
+        receipt["fidelity_preset"] =
+            fidelity.preset.empty() ? std::string("none") : fidelity.preset;
         // WP10.3 promotion.  The screening case_key this line's case is the
         // strict re-run OF, so the two rows link without the GA having to
         // remember which request it sent.  Null on everything that was not

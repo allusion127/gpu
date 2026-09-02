@@ -154,9 +154,10 @@ check(
     f"(host {reject_order(host_arm)} vs device {reject_order(gpu_arm)})",
 )
 
+# WP24: the Xe tolerance is the CASE's now (src/FidelityPreset.h), because a named fidelity preset moves the PUBLISHED tolerances and not only the loose stage. The property this pins is unchanged -- ONE value, read by both arms -- and with no preset ctx.tolerances.xe_tol IS XE_EQUILIBRIUM_TOLERANCE.
 for const in (
     "XE_ANDERSON_MIN_GRAM",
-    "XE_EQUILIBRIUM_TOLERANCE",
+    "ctx.tolerances.xe_tol",
     "XE_ANDERSON_DEPTH",
 ):
     check(
@@ -210,8 +211,8 @@ check("pred2 = gg - proj" in host_arm and "pred2 = gg - proj" in gpu_arm,
 
 # Arming, and the counters that hang off it.
 check(
-    "if (aa.ncol == 0 || picard < XE_EQUILIBRIUM_TOLERANCE)" in host_arm
-    and "if (aa.ncol == 0 || picard < XE_EQUILIBRIUM_TOLERANCE)" in gpu_arm,
+    "if (aa.ncol == 0 || picard < ctx.tolerances.xe_tol)" in host_arm
+    and "if (aa.ncol == 0 || picard < ctx.tolerances.xe_tol)" in gpu_arm,
     "both arms arm on the same two terms",
 )
 check(

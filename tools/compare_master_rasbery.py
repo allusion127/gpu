@@ -20,9 +20,13 @@ from __future__ import annotations
 import argparse
 import csv
 import re
+import sys
 from pathlib import Path
 
 import h5py
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gate_b_envelope  # noqa: E402
 
 
 def parse_master_summary(path: Path) -> dict[float, dict[str, float]]:
@@ -129,14 +133,39 @@ DELTA_PAIRS = [
 ]
 
 
-def main() -> None:
+def column_maxes(joined: list[dict], key_cols: list[str]) -> dict[str, float]:
+    """max|delta| per column, skipping a column no joined row actually carries.
+
+    `max(abs(r[c]) for r in joined if c in r)` raises ValueError on an empty
+    generator, and that is reachable: a column can survive the `any(c in r)`
+    filter that builds the table and still be absent from every row this
+    reduction sees.  A gate whose first act is a traceback is a gate nobody can
+    read a verdict off, and the new nonzero exit makes that reachable from a
+    `set -e` runbook.
+    """
+    out: dict[str, float] = {}
+    for c in key_cols[1:]:
+        values = [abs(r[c]) for r in joined if c in r]
+        if values:
+            out[c] = max(values)
+    return out
+
+
+def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("mas_sum", type=Path)
     ap.add_argument("h5", type=Path)
     ap.add_argument("-o", "--out-prefix", default="master_vs_rasbery")
     ap.add_argument("--efpd-tol", type=float, default=1e-3,
                     help="EFPD match tolerance for joining states")
+    # WP24.  This tool used to print max|delta| and exit 0 whatever it found, so
+    # the production envelope (1.905 pcm / 15.309 ppm / 0.013 AO) lived only in
+    # docs/ and nothing enforced it.  The default is `production`, so no
+    # existing invocation silently gets the looser screening envelope; what
+    # changes for existing callers is that a breach now exits nonzero.
+    gate_b_envelope.add_envelope_argument(ap)
     args = ap.parse_args()
+    envelope = gate_b_envelope.resolve(args.envelope)
 
     master = parse_master_summary(args.mas_sum)
     ras = parse_rasbery_summary(args.h5)
@@ -184,13 +213,57 @@ def main() -> None:
         f.write("|" + "---|" * len(key_cols) + "\n")
         for r in joined:
             f.write("| " + " | ".join(f"{r.get(c, float('nan')):.3f}" for c in key_cols) + " |\n")
-        maxes = {c: max(abs(r[c]) for r in joined if c in r) for c in key_cols[1:]}
+        maxes = column_maxes(joined, key_cols)
         f.write("\nmax|delta|: " + ", ".join(f"{c}={v:.3f}" for c, v in maxes.items()) + "\n")
+        # The envelope NAME goes in the .md, not only on the terminal: a table
+        # of deltas with no envelope beside it is a table that can be quoted
+        # into the wrong column six months later.
+        f.write(f"\nenvelope: {envelope.name} -- {envelope.note}\n")
 
     print(f"{len(joined)} states joined -> {csv_path}, {md_path}")
-    for c, v in {c: max(abs(r[c]) for r in joined if c in r) for c in key_cols[1:]}.items():
+    maxes = column_maxes(joined, key_cols)
+    for c, v in maxes.items():
         print(f"  max|{c}| = {v:.3f}")
+
+    # THE JOIN FROM COLUMN NAMES TO ENVELOPE METRICS.  A column the deck does
+    # not produce -- `delta_ppm` on a deck with no boron search -- is simply
+    # absent, and gate_b_envelope.verdict() skips what it was not given rather
+    # than assuming a pass.
+    measured = {}
+    pinned = []
+    for column, metric in (("delta_pcm", "keff_pcm"), ("delta_ppm", "ppm"),
+                           ("delta_ao", "ao")):
+        if column in maxes:
+            measured[metric] = maxes[column]
+            # A COLUMN THAT IS IDENTICALLY ZERO ON EVERY JOINED STATEPOINT WAS
+            # NOT MEASURED, IT WAS FIXED.  The case this exists for is the
+            # rod-crit deck families (iSMR / CY): the deck STATES the boron and
+            # searches the rod, so `delta_ppm` is one constant minus the same
+            # constant on every row and is exactly 0.000 whatever the physics
+            # did.  Scoring it and calling the result PASS is a verdict about
+            # the deck's input file.  Reported to gate_b_envelope as `pinned`,
+            # which keeps the row visible, keeps a nonzero breach a failure, and
+            # refuses to call a run SCORED when every judged column is one of
+            # these.
+            #
+            # THE TEST IS EXACT EQUALITY WITH ZERO, deliberately: a near-zero
+            # column is a real agreement and must keep scoring.  So this can
+            # only ever UNDER-report a pinned column (both sides printing the
+            # same quantity at different precision), which leaves the previous
+            # behaviour rather than inventing a NOT SCORED.
+            if maxes[column] == 0.0:
+                pinned.append(metric)
+    # gate_b_envelope.report() REFUSES to print PASS when nothing was scored.
+    # That is what stops a compare run producing none of the three columns from
+    # printing "GATE B scalars: PASS" having judged nothing -- a gate that
+    # passes on no data is the same failure mode this WP exists to end.  It also
+    # names the envelope columns this tool does not measure at all (the two pin
+    # ones) and the peaking columns NEITHER envelope judges, so "Gate B passed"
+    # cannot be quoted from half the envelope.
+    passed, code = gate_b_envelope.report(envelope, measured, "GATE B scalars",
+                                          pinned)
+    return 0 if passed else code
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

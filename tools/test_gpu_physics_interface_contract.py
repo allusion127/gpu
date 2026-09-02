@@ -240,6 +240,7 @@ SCHEDULE_PARAM_MAP = {
     "tolerance_keff": "tolerance_keff",
     "tolerance_search": "tolerance_search",
     "rodcrit_search_floor": "rodcrit_search_floor",
+    "rodcrit_search_cap": "rodcrit_search_cap",
     "tolerance_th": "tolerance_th",
     "target_keff": "target_keff",
     "tolerance_tmod": "tolerance_tmod",
@@ -271,8 +272,11 @@ need(len(host_search_memory) == 5,
      f"Scheduler.h SearchMemory now has {len(host_search_memory)} fields, the map covers 5")
 need(len(host_runtime) == 21,
      f"Scheduler.h runtime/termination search block now has {len(host_runtime)} fields, the map covers 21")
-need(len(host_params) == 22,
-     f"Scheduler.h search-condition block now has {len(host_params)} fields, the map covers 22")
+# WP24 took this to 23: Schedule::rodcrit_search_cap, the RODCRIT clamp that
+# used to be the kRodCritSearchTol literal inside criticalSearchTolerance() and
+# had to become a value for a fidelity preset to be able to move it.
+need(len(host_params) == 23,
+     f"Scheduler.h search-condition block now has {len(host_params)} fields, the map covers 23")
 
 for host_name in host_search_memory + host_runtime:
     mapped = {**SEARCH_MEMORY_MAP, **RUNTIME_SEARCH_MAP}.get(host_name)

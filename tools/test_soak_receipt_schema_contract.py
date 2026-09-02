@@ -125,8 +125,9 @@ def emitters_carry_every_audited_field() -> None:
 
 def driver_receipt_bumped_schema() -> None:
     block = driver_case_block()
-    if block and '\\"schema_version\\":6' not in block:
-        fail("[RASBERY][CASE] gained fields without bumping schema_version to 6; "
+    # WP24 took this to 7 when the line gained `fidelity_preset`.
+    if block and '\\"schema_version\\":7' not in block:
+        fail("[RASBERY][CASE] gained fields without bumping schema_version to 7; "
              "a reader cannot tell a receipt that carries them from one that "
              "cannot")
 

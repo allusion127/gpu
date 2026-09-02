@@ -1,4 +1,5 @@
 #pragma once
+#include "FidelityPreset.h"
 #include "Geometry.h"
 
 #include <algorithm>
@@ -141,6 +142,16 @@ struct SearchMemory {
 // receipt carries the raw value and the WP10.1 case key folds it -- no cached
 // answer can be served across a policy change, and no A/B can silently differ
 // in two knobs at once.
+/// WP24 (review).  THE BUILT-IN STAGED SEARCH-SAMPLE MARGIN, in ONE place.
+///
+/// Driver::SolveLoop owned this as a bare `constexpr double
+/// STAGED_SEARCH_MARGIN = 4.0` local, which was fine while SolveLoop was its
+/// only reader.  The [RASBERY][FIDELITY] receipt now has to print the
+/// EFFECTIVE margin a case ran with -- `stagedMargin(built_in)` -- and a
+/// receipt that re-spelled `4.0` would be a second copy of the number that
+/// could disagree with the solve it claims to describe.
+inline constexpr double kStagedSearchMarginBuiltIn = 4.0;
+
 struct SearchPolicy {
     bool   carry_slope   = false; ///< RASBERY_SEARCH_CARRY_SLOPE
     bool   warm_boron    = false; ///< RASBERY_SEARCH_WARM_BORON
@@ -175,11 +186,56 @@ inline bool searchFlagEnabled(const char* value) {
              s == "FALSE");
 }
 
-/// Read ONCE.  These are environment facts, and re-reading them per case would
-/// let a mid-run setenv split a wave -- the same argument processCaseFidelity()
-/// makes.  The case key is stamped from this same value, so a key and a solve
-/// cannot disagree about the policy.
-inline const SearchPolicy& processSearchPolicy() {
+/// WP24.  THE FIVE SEARCH KNOBS ONE PRESET ROW ASSERTS, as a value.
+///
+/// SPLIT OUT OF processSearchPolicy() BECAUSE A PRESET IS PER CASE AND THAT
+/// FUNCTION IS PER PROCESS.  processSearchPolicy() resolves the row from
+/// RASBERY_FIDELITY -- the ENVIRONMENT -- into a function-local static, so a
+/// case that named `"fidelity_preset":"screen100"` over the evaluator socket
+/// used to get the row's TOLERANCES (CaseFidelity::tolerances()) and the
+/// environment's SEARCH POLICY.  Half a row is exactly the unnamed arm the
+/// table exists to end, and it was worse than a miss: RASBERY_FIDELITY folds
+/// the same string into the case key from both paths, so an env-level
+/// screen100 and a per-case screen100 computed ONE key for TWO different
+/// solves -- a wrong cache hit.  CaseFidelity::searchPolicy() calls this, and
+/// Driver::Run assigns it onto SolverContext beside `tolerances`.
+///
+/// A NULL row answers the built-in defaults, NOT the environment: the caller
+/// that has no row is the one that must fall back to processSearchPolicy(),
+/// and making that decision here would make this function unusable from inside
+/// processSearchPolicy() itself.
+inline SearchPolicy presetSearchPolicy(const FidelityPresetSpec* spec) {
+    SearchPolicy p;
+    if (spec == nullptr) return p;
+    p.carry_slope   = spec->carry_slope == PresetFlag::On;
+    p.warm_boron    = spec->warm_boron == PresetFlag::On;
+    p.boron_bracket = spec->boron_bracket == PresetFlag::On;
+    p.max_trials    = spec->max_trials;
+    p.staged_margin =
+        (spec->staged_search_margin >= 1.0) ? spec->staged_search_margin : 0.0;
+    return p;
+}
+
+/// THE FIVE KNOBS AS THE RAW ENVIRONMENT STATES THEM -- the pre-WP24 read,
+/// character for character, with NO preset in it.
+///
+/// SPLIT OUT OF processSearchPolicy() BECAUSE "NO ROW" HAS TO MEAN NO ROW.
+/// processSearchPolicy() resolves RASBERY_FIDELITY, so it is the PROCESS's
+/// answer and not a preset-free one.  A case that CLEARED its preset -- an
+/// `op:"promote"`, or any `"fidelity":"strict"` request (CaseFidelity.h) --
+/// asked for exactly that, and falling back to processSearchPolicy() gave it
+/// the process row's five search knobs instead: inside the deployment the
+/// WP24 runbook prescribes (`--set RASBERY_FIDELITY=screen100`) a promoted
+/// elite got the built-in TOLERANCES and screen100's SEARCH POLICY, i.e.
+/// boron_bracket ON -- the lever 238 measured at Gate A 2.27 pcm and rejected
+/// on the 1.905 pcm production envelope -- on the one lane whose entire job is
+/// to be acceptance-eligible.  Worse, armEnvValue() then folded the SAME
+/// payload as a genuine strict run in a preset-free process whose bracket is
+/// off: one case key, two solves.
+///
+/// Read ONCE, for the same reason processSearchPolicy() is: re-reading per case
+/// would let a mid-run setenv split a wave.
+inline const SearchPolicy& environmentSearchPolicy() {
     static const SearchPolicy value = [] {
         SearchPolicy p;
         p.carry_slope   = searchFlagEnabled(std::getenv("RASBERY_SEARCH_CARRY_SLOPE"));
@@ -194,6 +250,30 @@ inline const SearchPolicy& processSearchPolicy() {
         // exists to keep out.  Refused by clamping to off rather than honoured.
         p.staged_margin = (m >= 1.0) ? m : 0.0;
         return p;
+    }();
+    return value;
+}
+
+/// Read ONCE.  These are environment facts, and re-reading them per case would
+/// let a mid-run setenv split a wave -- the same argument processCaseFidelity()
+/// makes.  The case key is stamped from this same value, so a key and a solve
+/// cannot disagree about the policy.
+inline const SearchPolicy& processSearchPolicy() {
+    static const SearchPolicy value = []() -> SearchPolicy {
+        // WP24.  A NAMED PRESET ASSERTS THIS WHOLE STRUCT, including the knobs
+        // it sets to the built-in default.  The reason is measured: 238 block
+        // 33 put RASBERY_SEARCH_CARRY_SLOPE at +8.11 % outers, so a screen100
+        // run inside a campaign shell that already exported it would be eight
+        // percent SLOWER under a receipt saying screen100 -- the preset would
+        // be a name for whatever the environment happened to be carrying.  So
+        // the row REPLACES these five rather than defaulting them.  ONE
+        // spelling of that replacement, presetSearchPolicy(), which is also
+        // what a PER-CASE preset resolves through.
+        if (const FidelityPresetSpec* spec = lookupFidelityPreset(fidelityPresetEnvName()))
+            return presetSearchPolicy(spec);
+        // With no process preset the two functions are the SAME OBJECT's worth
+        // of bits, so every preset-free run is unchanged to the bit.
+        return environmentSearchPolicy();
     }();
     return value;
 }
@@ -322,6 +402,14 @@ struct Schedule {
     double     tolerance_keff      = kEigvTol;       // Eigenvalue iteration tolerance
     double     tolerance_search    = kCritSearchTol; // Critical-search tolerance on |k_eff - target|
     double     rodcrit_search_floor = 0.0;           // Lower bound on rod-crit search tol (set when cusping kinks add keff noise)
+    // WP24.  THE RODCRIT CLAMP, MADE A VALUE.  criticalSearchTolerance() used
+    // to min() against the kRodCritSearchTol LITERAL, which meant any preset
+    // that relaxed tolerance_search was DISCARDED on every rod-crit statepoint
+    // -- a screen100 receipt over an iSMR / CY deck would have claimed a
+    // relaxation the solve never took, i.e. a case solving FINER than it
+    // declared (CaseFidelity.h:34-39).  Defaulted to the same constant, so with
+    // no preset the expression below is the one this tree had, to the bit.
+    double     rodcrit_search_cap  = kRodCritSearchTol;
     double     tolerance_th        = kThTol;         // TH feedback convergence on |Δk_eff|
     double     target_keff         = 1.0;            // Target eigenvalue for search
     double     tolerance_tmod      = kTempSearchTol; // Search tolerance for moderator temperature (K)
@@ -656,10 +744,30 @@ struct Schedule {
         }
     }
 
-    [[nodiscard]] double criticalSearchTolerance() const {
+    /// *scale* is the WP24 preset's `search_tol_mult`, applied to the deck's
+    /// tolerance BEFORE the rod-crit clamp -- after it, the min() would eat the
+    /// relaxation again and the preset would be inert on exactly the deck
+    /// families it was measured to matter least on.
+    ///
+    /// *cap* is the preset's `search_tol_cap`: an ABSOLUTE ceiling on the
+    /// scaled tolerance, 0.0 for none.  It exists because *scale* multiplies a
+    /// DECK-STATED number -- a deck at `search_pcm_tolerance: 5` is already at
+    /// 5e-5, and x10 is 50 pcm, half a 100 pcm screening budget from one knob
+    /// that the preset's own ppm arithmetic computes as 10.  Applied AFTER the
+    /// scale and BEFORE the rod-crit clamp, so the rod-crit floor's max() still
+    /// has the last word (a floor exists to keep the search out of measured
+    /// keff noise, and a ceiling must not push it back in).
+    ///
+    /// scale = 1.0, cap = 0.0 and rodcrit_search_cap = kRodCritSearchTol
+    /// reproduce the pre-WP24 expression exactly (a multiply by 1.0 is exact in
+    /// IEEE-754 and the cap branch is not taken).
+    [[nodiscard]] double criticalSearchTolerance(double scale = 1.0,
+                                                 double cap   = 0.0) const {
+        double base = tolerance_search * scale;
+        if (cap > 0.0 && base > cap) base = cap;
         return (searchType == SearchType::RODCRIT)
-                   ? std::max(std::min(tolerance_search, kRodCritSearchTol), rodcrit_search_floor)
-                   : tolerance_search;
+                   ? std::max(std::min(base, rodcrit_search_cap), rodcrit_search_floor)
+                   : base;
     }
 
     void UpdateRodBracket(double k_residual) {

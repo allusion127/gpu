@@ -100,10 +100,36 @@ want(DRIVER, "SearchCarry  search_carry{};", "Driver.h SolverContext",
 # read it: it prints a line and changes nothing, which is why it is not in
 # kArmEnv either.  The scan below is per knob NAME rather than per prefix, so
 # the trace knob is not mistaken for a policy one.
+# WP24 (review).  THE ONE PLACE IS environmentSearchPolicy(), AND
+# processSearchPolicy() IS THAT PLUS THE PRESET ROW.
+#
+# The split exists because "this case names no preset" has to be answerable
+# WITHOUT the process's row: processSearchPolicy() resolves RASBERY_FIDELITY,
+# so a case that CLEARED its preset -- a promotion, or any
+# "fidelity":"strict" request -- used to inherit the process row's five
+# search knobs, which inside a `--set RASBERY_FIDELITY=screen100` campaign
+# meant the ACCEPTANCE lane ran screen100's boron_bracket and folded a case
+# key indistinguishable from a genuine strict run.  The raw reads therefore
+# live in environmentSearchPolicy() and processSearchPolicy() delegates to
+# it; the "exactly one std::getenv per knob" rule below is unchanged and is
+# what keeps the split from becoming two answers.
+ENV_FN = region(SCHEDULER, "inline const SearchPolicy& environmentSearchPolicy() {",
+                "\n}\n", "environmentSearchPolicy")
 POLICY_FN = region(SCHEDULER, "inline const SearchPolicy& processSearchPolicy() {",
                    "\n}\n", "processSearchPolicy")
+want(POLICY_FN, "environmentSearchPolicy()", "Scheduler.h processSearchPolicy",
+     "processSearchPolicy() must fall through to environmentSearchPolicy() when no "
+     "preset row is named, or the preset-free path is a second copy of the raw reads")
+want(POLICY_FN, "lookupFidelityPreset(fidelityPresetEnvName())",
+     "Scheduler.h processSearchPolicy",
+     "processSearchPolicy() is the PROCESS answer and must resolve RASBERY_FIDELITY; "
+     "a named row REPLACES these five knobs rather than defaulting them")
+if "lookupFidelityPreset" in ENV_FN:
+    fail("environmentSearchPolicy() resolves a preset row. It exists to be the read "
+         "with NO row in it -- the answer a case that cleared its preset asked for "
+         "-- and a row here makes the split a rename.")
 for knob in KNOBS:
-    want(POLICY_FN, knob, "Scheduler.h processSearchPolicy",
+    want(ENV_FN, knob, "Scheduler.h environmentSearchPolicy",
          f"{knob} must be resolved in the one place every reader takes its value from")
     if DRIVER.count('std::getenv("%s")' % knob) != 0:
         fail(f"Driver.h reads {knob} directly; there must be exactly one reader")

@@ -58,6 +58,12 @@
 // guessed at.
 
 #include "RunContract.h"
+// WP24 (review).  For SearchPolicy / presetSearchPolicy / processSearchPolicy.
+// A preset row asserts FIVE search knobs as well as eight tolerances, and a
+// case that resolved only the tolerance half ran boron_bracket and the staged
+// search margin off the ENVIRONMENT while its receipt named the row -- see
+// searchPolicy() below.
+#include "Scheduler.h"
 #include "StatepointGrid.h"
 
 #include <cstdlib>
@@ -119,6 +125,73 @@ struct CaseFidelity {
     /// the screening result it is the strict re-run of.  Pure provenance --
     /// nothing in the solve reads it.
     std::string promoted_from;
+    /// WP24.  The NAMED convergence policy this case runs, or empty for "no
+    /// preset" -- which is the pre-WP24 path and not the same thing as
+    /// "strict".  Empty means the tolerances are the built-in constants and the
+    /// two multipliers came from the environment; `strict` means a row was
+    /// applied that happens to restate those constants and CLEARED the
+    /// environment's multipliers.  Two different facts, so two different
+    /// values.
+    std::string preset;
+
+    /// The row this case names, or nullptr.  ONE lookup, so nothing downstream
+    /// can resolve the name a second (different) way.
+    [[nodiscard]] const FidelityPresetSpec* presetSpec() const {
+        return lookupFidelityPreset(preset);
+    }
+    /// The production tolerances this case converges to.  The built-ins when no
+    /// preset is named, bit for bit.
+    [[nodiscard]] SolveTolerances tolerances() const {
+        return presetTolerances(presetSpec());
+    }
+    /// WP24 (review).  HOW THIS CASE'S CRITICAL SEARCH PROPOSES -- the other
+    /// half of the row, resolved from the SAME lookup `tolerances()` uses.
+    ///
+    /// THE DEFECT THIS CLOSES.  SolverContext::search_policy was initialised
+    /// from processSearchPolicy() and never reassigned, and that function reads
+    /// RASBERY_FIDELITY -- the ENVIRONMENT.  So a GA case asking for
+    /// `"fidelity_preset":"screen100"` over the evaluator socket got the row's
+    /// eight tolerances and the environment's five search knobs: boron_bracket
+    /// Off where the row says On, and staged_search_margin falling back to the
+    /// built-in 4.0, which clips loose_keff_tol to min(1e-5 x 5, 1e-4/4) =
+    /// 2.5e-5 instead of the row's intended 5e-5.  A different secant sequence,
+    /// a different converged answer -- under a receipt that printed the ROW's
+    /// five knobs and therefore asserted knobs the run did not use.  Worse, the
+    /// case key folded the same "screen100" string from both paths, so the
+    /// env-level arm and the per-case arm collided on ONE key: a wrong cache
+    /// hit, which is the one direction Driver.h's kArmEnv comment says the list
+    /// must never allow.
+    ///
+    /// NO ROW MEANS NO ROW -- environmentSearchPolicy(), NOT
+    /// processSearchPolicy().
+    ///
+    /// THE SECOND DEFECT, WHICH THE FIRST FIX LEFT STANDING.  This used to
+    /// answer processSearchPolicy() for a case with no preset, and that
+    /// function resolves the row from RASBERY_FIDELITY (Scheduler.h).  So in
+    /// the deployment WP24's runbook prescribes -- a process started with
+    /// `--set RASBERY_FIDELITY=screen100` -- a case that CLEARED the preset
+    /// got the built-in TOLERANCES (correct) and screen100's SEARCH POLICY
+    /// (wrong): boron_bracket ON, staged margin 2.0.  The two ways to clear are
+    /// `op:"promote"` (EvaluatorServer.h) and any `"fidelity":"strict"` request
+    /// -- i.e. the ACCEPTANCE lane, the one row in a generation whose entire
+    /// job is to be quotable against the production envelope, running the one
+    /// lever 238 measured at Gate A 2.27 pcm and rejected on that very
+    /// envelope.  And the key collided: armEnvValue() folded "" for the preset
+    /// and "" for all five search knobs (the row, not the shell, was supplying
+    /// them), which is byte-identical to a genuine strict run in a preset-free
+    /// process whose bracket is OFF.  One key, two solves.
+    ///
+    /// With environmentSearchPolicy() the two are the same solve again, so the
+    /// shared key is a true hit; and in a preset-free process the two functions
+    /// answer the same bits, so every existing run is unchanged.
+    [[nodiscard]] SearchPolicy searchPolicy() const {
+        const FidelityPresetSpec* spec = presetSpec();
+        return spec != nullptr ? presetSearchPolicy(spec) : environmentSearchPolicy();
+    }
+    /// "none" for a receipt, so a preset field is never an empty string.
+    [[nodiscard]] std::string presetToken() const {
+        return preset.empty() ? std::string("none") : preset;
+    }
 
     [[nodiscard]] bool staged() const {
         return staged_flux_mult > 1.0 || staged_xe_mult > 1.0;
@@ -156,6 +229,23 @@ struct CaseFidelity {
 inline const CaseFidelity& processCaseFidelity() {
     static const CaseFidelity value = [] {
         CaseFidelity f;
+        // WP24.  RASBERY_FIDELITY names a ROW, and a row is a complete
+        // declaration of its own space -- it replaces the three knobs rather
+        // than defaulting them (FidelityPreset.h, "WHY A NAMED PRESET
+        // OVERRIDES THE ENVIRONMENT").  With it unset the three reads below are
+        // the pre-WP24 reads, character for character.
+        f.preset = fidelityPresetEnvName();
+        if (const FidelityPresetSpec* spec = lookupFidelityPreset(f.preset)) {
+            f.staged_flux_mult = spec->staged_flux_mult;
+            f.staged_xe_mult   = spec->staged_xe_mult;
+            f.loose_settle     = spec->loose_settle;
+            f.statepoint_grid  = spec->statepoint_grid;
+            return f;
+        }
+        // An UNKNOWN name is dropped here rather than honoured: main.cpp and
+        // the evaluator both refuse it up front, and a silently-kept typo would
+        // reach the case key as a payload nothing in this process acts on.
+        f.preset.clear();
         f.staged_flux_mult = detail::stagedMultiplier("RASBERY_STAGED_FLUX_TOL");
         f.staged_xe_mult   = detail::stagedMultiplier("RASBERY_STAGED_XE_TOL");
         f.loose_settle     = parseStagedLooseSettle(std::getenv("RASBERY_STAGED_LOOSE_SETTLE"));
@@ -169,6 +259,11 @@ inline const CaseFidelity& processCaseFidelity() {
 /// unchanged.
 struct FidelityRequest {
     std::string fidelity;        ///< strict | A2 | L3coarse | feedback_limited
+    /// WP24.  `"fidelity_preset":"screen100"` -- the NAME of a row in
+    /// FidelityPreset.h's table.  Set `has_preset` to ask for "no preset" (the
+    /// empty string) explicitly, which is what a promotion does.
+    std::string preset;
+    bool        has_preset = false;
     std::string statepoint_grid; ///< full | coarse | three | a GWd/t list
     bool        has_grid = false;
     bool        has_flux_mult = false;
@@ -180,19 +275,64 @@ struct FidelityRequest {
     std::string promoted_from;
 
     [[nodiscard]] bool empty() const {
-        return fidelity.empty() && !has_grid && !has_flux_mult && !has_xe_mult &&
-               !has_loose_settle && promoted_from.empty();
+        return fidelity.empty() && !has_preset && !has_grid && !has_flux_mult &&
+               !has_xe_mult && !has_loose_settle && promoted_from.empty();
     }
 };
 
 /// Resolve *request* against *base*.  False with *error* set when the process
 /// cannot honour it -- and REFUSING is the point: the alternative is a case
 /// that runs at one fidelity while its receipt claims another.
-inline bool resolveCaseFidelity(const FidelityRequest& request, const CaseFidelity& base,
+inline bool resolveCaseFidelity(const FidelityRequest& in_request, const CaseFidelity& base,
                                 CaseFidelity& out, std::string& error) {
+    // WP24 (review).  `"none"` IS THE OUTPUT VOCABULARY; ACCEPT IT AS INPUT.
+    //
+    // presetToken() writes "none" into [CASE], [PHYSICS_MODE], the light JSONL
+    // and the evaluator's per-case line, because a receipt field that is
+    // sometimes an empty string is a field a reader has to special-case.  But
+    // the INPUT spelling for "no preset" is the empty string, so a GA that
+    // round-tripped a light-result field straight back into its next request --
+    // the most natural code path there is -- hit "is not a preset this build
+    // knows" on the value this binary had just printed.  One alias, here, so
+    // the two vocabularies cannot diverge again; `""` still means the same
+    // thing and no shipped row is named `none`.
+    FidelityRequest request = in_request;
+    if (request.has_preset && request.preset == "none") request.preset.clear();
+
     out = base;
     out.declared      = request.fidelity;
     out.promoted_from = request.promoted_from;
+
+    // 0. WP24.  THE PRESET, FIRST, because it is the only input that sets more
+    //    than one knob and the explicit knobs below have to be able to override
+    //    it.  A row REPLACES the staged half of *base* wholesale -- half a
+    //    preset is exactly the unnamed arm the table exists to end -- and an
+    //    empty `preset` with `has_preset` set is how a promotion says "no
+    //    preset", which is not the same request as `"fidelity_preset":"strict"`.
+    if (request.has_preset) {
+        if (request.preset.empty()) {
+            out.preset           = std::string();
+            out.staged_flux_mult = 1.0;
+            out.staged_xe_mult   = 1.0;
+            out.loose_settle     = false;
+        } else {
+            const FidelityPresetSpec* spec = lookupFidelityPreset(request.preset);
+            if (spec == nullptr) {
+                error = "\"fidelity_preset\":\"" + request.preset +
+                        "\" is not a preset this build knows. Use one of: " +
+                        fidelityPresetNames() +
+                        ". A preset is a NAMED row of src/FidelityPreset.h, not a free "
+                        "set of multipliers: a receipt that named an arm this binary "
+                        "cannot reproduce would be the defect the table exists to end.";
+                return false;
+            }
+            out.preset           = spec->name;
+            out.staged_flux_mult = spec->staged_flux_mult;
+            out.staged_xe_mult   = spec->staged_xe_mult;
+            out.loose_settle     = spec->loose_settle;
+            out.statepoint_grid  = spec->statepoint_grid;
+        }
+    }
 
     // 1. The explicit knobs, applied first, so a declaration is checked against
     //    what they produced rather than the other way round.
@@ -243,6 +383,22 @@ inline bool resolveCaseFidelity(const FidelityRequest& request, const CaseFideli
                     std::to_string(request.xe_mult) + " contradicts itself";
             return false;
         }
+        // WP24.  A preset the REQUEST named is a contradiction the same way an
+        // explicit multiplier is, and it has to be refused rather than cleared:
+        // clearing would silently discard a relaxation the caller asked for by
+        // name, and a preset also carries POLISH tolerances -- the numbers the
+        // published answer is converged to -- which `strict` cannot honour.  A
+        // preset merely INHERITED from the process is cleared, because that is
+        // the promotion lane (see the header comment).
+        if (request.has_preset && !request.preset.empty() &&
+            request.preset != std::string("strict")) {
+            error = "\"fidelity\":\"strict\" with \"fidelity_preset\":\"" + request.preset +
+                    "\" contradicts itself -- a preset carries the PUBLISHED (polish) "
+                    "tolerances, not only the loose stage, so it cannot be reconciled with "
+                    "a strict declaration by dropping multipliers. Ask for one or the other.";
+            return false;
+        }
+        out.preset           = request.has_preset ? request.preset : std::string();
         out.staged_flux_mult = 1.0;
         out.staged_xe_mult   = 1.0;
         out.loose_settle     = false;

@@ -237,6 +237,30 @@ def evaluate(block: dict) -> Verdict:
                 f"the arms ran at different fidelities ({base.get('policy')!r} vs "
                 f"{cand.get('policy')!r}); that comparison measures the policy, not "
                 "the flag")
+        # WP24.  AND THE NAMED PRESET, BESIDE THE POLICY WORD.
+        #
+        # `policy` is `A2` for EVERY staged arm this binary can run: the measured
+        # 50/1000 production arm reports it, and so does screen100 -- which also
+        # moves the published keff, search, flux, Xe and rod-crit tolerances.  So
+        # the check above passed a screen100 candidate benchmarked against a
+        # production A2 baseline and scored its throughput gain as if the two
+        # arms were one arm.  That is verbatim the "A2 is a FAMILY, a receipt
+        # naming only the family is a number nobody can reproduce" defect, left
+        # standing in the one tool whose job is gating.
+        #
+        # ABSENT ON BOTH SIDES IS NOT A MISMATCH: a block written before WP24
+        # carries the field nowhere and must keep gating on `policy` alone.
+        # Absent on ONE side is: it means one arm's receipts were read by a
+        # harness that knew about presets and the other's were not, so the two
+        # numbers did not come from one measurement.
+        if ("fidelity_preset" in base or "fidelity_preset" in cand) and \
+                base.get("fidelity_preset") != cand.get("fidelity_preset"):
+            result.blockers.append(
+                f"the arms ran at different fidelity PRESETS "
+                f"({base.get('fidelity_preset')!r} vs {cand.get('fidelity_preset')!r}); "
+                "`policy` says A2 for every staged arm, so two arms can share it and "
+                "still be two convergence policies -- that comparison measures the "
+                "preset, not the flag")
         for entry, label in ((base, "baseline"), (cand, "candidate")):
             cases, ok = entry.get("cases"), entry.get("ok")
             if isinstance(cases, int) and isinstance(ok, int) and ok < cases:
@@ -358,6 +382,30 @@ def evaluate(block: dict) -> Verdict:
             "the block does not assert `env_rollback`. WP11 requires every feature to "
             "stay switchable off WITHOUT a rebuild; a default that needs a rebuild to "
             "back out is a default nobody can back out at 3 a.m.")
+
+    # -- WP24.  THE GRADE IS OPERATOR-WRITTEN; THE ARMS' RECEIPTS ARE NOT ---
+    #
+    # The NEVER verdict below keys on `block["grade"]`, a word a human typed
+    # into the block.  Nothing cross-checked it against what the arms actually
+    # reported, so "screen100 is structurally unpromotable" rested entirely on
+    # somebody remembering to write `A2` in a field.  A candidate arm whose
+    # receipts name a preset that is not `none` or `strict` ran a NAMED
+    # screening policy -- one that moves the published tolerances -- and it
+    # cannot be graded as a default-eligible lever whatever the block says.
+    for entry, label in ((base, "baseline"), (cand, "candidate")):
+        if not isinstance(entry, dict):
+            continue
+        preset = entry.get("fidelity_preset")
+        if isinstance(preset, str) and preset not in ("", "none", "strict") and \
+                grade not in ("A2", "L3coarse"):
+            result.blockers.append(
+                f"the {label} arm reports fidelity_preset {preset!r} but the block is "
+                f"graded {grade!r}. An arm measured under a NAMED preset is "
+                f"mode-specific by construction: `screen100` moves the PUBLISHED "
+                f"convergence tolerances, and `A2` -- which by design moves only the "
+                f"loose stage -- is still a named screening ARM whose throughput is not "
+                f"the strict lane\'s. Grade it A2/L3coarse, or re-measure the arm with "
+                f"no preset.")
 
     # -- the grade's own promotion rule ------------------------------------
     if grade in ("A2", "L3coarse"):

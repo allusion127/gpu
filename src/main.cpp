@@ -903,6 +903,21 @@ int main(int argc, char* argv[]) {
         std::cerr << ")." << std::endl;
         return 2;
     }
+    // WP24.  Same argument, one axis over: a typo'd RASBERY_FIDELITY is a
+    // preset that silently did not happen, and the run would then converge at
+    // PRODUCTION tolerances while every downstream reader files its numbers in
+    // a screening lane.  Refuse rather than fall back to "no preset".
+    if (rasbery::fidelityPresetEnvIsUnknown()) {
+        std::cerr << "[RASBERY][EXACT_ONLY][FAIL] RASBERY_FIDELITY=\""
+                  << rasbery::fidelityPresetEnvName()
+                  << "\" is not a preset this build knows. Use one of: "
+                  << rasbery::fidelityPresetNames()
+                  << " (or leave it unset for the built-in tolerances). A preset is a "
+                     "NAMED row of src/FidelityPreset.h; a run that silently ignored the "
+                     "name would publish production-tolerance numbers under a screening "
+                     "receipt." << std::endl;
+        return 2;
+    }
     // WP10.3.  THE RUN'S FIDELITY, and it is no longer the environment's alone:
     // `--statepoint-grid` is a deck transform, so it is the ONE fidelity input
     // RunContract.h could never detect and had to be declared through
@@ -1035,6 +1050,12 @@ int main(int argc, char* argv[]) {
               // that did not ask for a grid, so an audit can REQUIRE the field
               // rather than treat its absence as "probably full".
               << "\",\"statepoint_grid\":\"" << run_fidelity.gridToken()
+              // WP24.  WHICH staged arm, by name.  `policy` says "A2" for every
+              // staged convergence policy this binary can run, and A2 is a
+              // FAMILY -- 50/1000 is one arm, screen100 is another, and a
+              // receipt naming only the family is a number nobody can
+              // reproduce.  "none" when no row was applied.
+              << "\",\"fidelity_preset\":\"" << run_fidelity.presetToken()
               << "\",\"policy\":\"" << rasbery::physicsPolicyName(fidelity)
               << "\",\"acceptance_eligible\":"
               << (rasbery::fidelityIsAcceptanceEligible(fidelity) ? "true" : "false")

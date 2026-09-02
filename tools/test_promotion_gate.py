@@ -263,6 +263,175 @@ for forbidden in ("write_text(", "os.environ["):
         fail("promotion_gate.py sets an environment variable; it reports, it does not "
              "flip")
 
+# ---------------------------------------------------------------------------
+# WP24.  THE NAMED PRESET, BOTH HALVES -- because `policy` cannot see it
+# ---------------------------------------------------------------------------
+#
+# WHY THIS SECTION EXISTS.  WP24 added two checks to promotion_gate.py and
+# neither had a fixture: no block in this file carried `fidelity_preset` at all,
+# so both were uncontrolled by the same standard the C++ half is held to ("a
+# check that survives its own control is a comment").  The defect they exist for
+# is that `policy` is `A2` for EVERY staged arm this binary can run -- the
+# measured 50/1000 production arm and screen100, which additionally moves the
+# published keff, search, flux, Xe and rod-crit tolerances, report the same
+# word.  So a screen100 candidate benchmarked against a production A2 baseline
+# passed "the arms ran at different fidelities" and had its throughput gain
+# scored as if the two arms were one arm.
+
+def arms_with(base_preset, cand_preset):
+    """The clean block's two arms, each carrying a preset (or not)."""
+    off = dict(block()["arms"][0])
+    on = dict(block()["arms"][1])
+    if base_preset is not None:
+        off["fidelity_preset"] = base_preset
+    if cand_preset is not None:
+        on["fidelity_preset"] = cand_preset
+    return [off, on]
+
+
+def blockers_of(**overrides):
+    return gate.evaluate(block(**overrides)).blockers
+
+
+def wants_blocker(label, needle, **overrides):
+    """The BLOCKER, not the verdict word.
+
+    A block can already be NEVER for its grade, or HOLD for a missing soak, so
+    asserting the verdict would let a check that never fired pass on somebody
+    else's refusal.  What these two checks OWE is a named reason.
+    """
+    got = blockers_of(**overrides)
+    if not any(needle in b for b in got):
+        fail(f"{label}: no blocker naming {needle!r} (blockers={got})")
+
+
+def refuses_blocker(label, needle, **overrides):
+    got = blockers_of(**overrides)
+    if any(needle in b for b in got):
+        fail(f"{label}: blocked on {needle!r} when it should not have (blockers={got})")
+
+
+PRESET_MISMATCH = "different fidelity PRESETS"
+PRESET_GRADE = "mode-specific by construction"
+
+# ABSENT ON BOTH SIDES IS NOT A MISMATCH: a block written before WP24 carries
+# the field nowhere and must keep gating on `policy` alone.  This is the control
+# that keeps the new checks from failing every pre-WP24 block.
+expect("a pre-WP24 block with no preset field anywhere still qualifies",
+       gate.DEFAULT_ON, arms=arms_with(None, None))
+
+refuses_blocker("both arms under the same preset are one arm, not two",
+                PRESET_MISMATCH, grade="A2", arms=arms_with("A2", "A2"))
+
+wants_blocker("a screen100 candidate against a production A2 baseline",
+              PRESET_MISMATCH, grade="A2", arms=arms_with("A2", "screen100"))
+
+# ABSENT ON ONE SIDE IS a mismatch: it means one arm's receipts were read by a
+# harness that knew about presets and the other's were not, so the two numbers
+# did not come from one measurement.
+wants_blocker("a preset on one arm only", PRESET_MISMATCH,
+              grade="A2", arms=arms_with(None, "screen100"))
+
+# ...and `policy` cannot substitute: BOTH arms here say A2, which is what let
+# this comparison through before the preset check existed.
+same_policy = block(grade="A2", arms=arms_with("A2", "screen100"))
+if any("different fidelities" in b for b in gate.evaluate(same_policy).blockers):
+    fail("the policy check claims to see a screen100-vs-A2 comparison. It cannot: "
+         "`policy` is A2 for both, which is the whole reason the preset check exists.")
+
+# THE GRADE IS OPERATOR-WRITTEN; THE ARMS' RECEIPTS ARE NOT.  Before the
+# cross-check, "screen100 is structurally unpromotable" rested entirely on
+# somebody remembering to type `A2` into a field.
+wants_blocker("a screen100 arm graded B0", PRESET_GRADE,
+              arms=arms_with("screen100", "screen100"))
+
+# The A2 ROW trips it too: an arm measured under a named screening arm is
+# mode-specific even though that row moves only the loose stage.
+wants_blocker("an A2-preset arm graded B0", PRESET_GRADE,
+              arms=arms_with("A2", "A2"))
+
+# `strict` is a row that was APPLIED and cleared an A2 environment, and `none`
+# is the binary's own word for no row at all.  Neither is a screening arm.
+expect("a `strict`-preset block still qualifies", gate.DEFAULT_ON,
+       arms=arms_with("strict", "strict"))
+expect("a `none`-preset block still qualifies", gate.DEFAULT_ON,
+       arms=arms_with("none", "none"))
+
+
+# ---------------------------------------------------------------------------
+# WP24.  receipt_preset(), AND THE HARNESS ROUND TRIP THAT USES IT
+# ---------------------------------------------------------------------------
+#
+# The gate above can only be as good as the field the harness puts in the block,
+# and that field comes from one reader.  The failure it has to survive is the
+# most likely operational mistake on a multi-host fleet: `--set
+# RASBERY_FIDELITY=screen100` against a binary built BEFORE WP24 -- one host not
+# rebuilt.  That binary ignores the variable, solves the DEFAULT_ENV A2 arm at
+# PRODUCTION polish tolerances, prints `policy:"A2"` and no preset field; and
+# derive_declared_fidelity() ALSO answers "A2" (it reads the ROW's multipliers),
+# so the policy audit compares A2 against A2 and passes.
+import exact_audit  # noqa: E402
+from run_single_gpu_batch import (  # noqa: E402
+    LaunchPlan,
+    check_run_receipts,
+    declared_preset_from_env,
+)
+
+MODE = ('  [RASBERY][PHYSICS_MODE] {"schema_version":4,"policy":"%s",'
+        '"physics_fidelity":"%s","acceptance_eligible":%s,"screening":false,'
+        '"result_mode":"full","feedback_pass_limit":0%s}')
+
+
+def physics_mode(policy="A2", preset='"screen100"'):
+    tail = "" if preset is None else ',"fidelity_preset":%s' % preset
+    fidelity = "staged_a2" if policy == "A2" else "full_exact"
+    return MODE % (policy, fidelity, "true" if policy == "strict" else "false", tail)
+
+
+for text, want, why in (
+    (physics_mode(preset='"screen100"'), "screen100", "a named row"),
+    (physics_mode(preset='"none"'), "none",
+     "`none` is a REAL value, not a missing one -- the binary prints it when no "
+     "row was named, and it is a different fact from `strict`"),
+    (physics_mode(preset=None), None, "a binary that predates WP24"),
+):
+    got = exact_audit.receipt_preset(text)
+    if got != want:
+        fail(f"exact_audit.receipt_preset() answered {got!r} for {why}, want {want!r}")
+
+if declared_preset_from_env({}) != "none" or \
+        declared_preset_from_env({"RASBERY_FIDELITY": ""}) != "none" or \
+        declared_preset_from_env({"RASBERY_FIDELITY": "screen100"}) != "screen100":
+    fail("declared_preset_from_env() does not answer the binary's own vocabulary "
+         "(`none` for no row), so the request and the receipt are not comparable")
+
+BATCH_HOST = '  [RASBERY][BATCH_HOST] {"host_threads":1}'
+
+
+def receipt_problems(child_text, asked):
+    plan = LaunchPlan(batch_width=1, jobs=1, visible_cpus=1, host_workers=1,
+                      worker_policy="t", gpu="0", declared_fidelity="A2",
+                      declared_preset=asked)
+    return check_run_receipts(child_text + "\n" + BATCH_HOST, plan)
+
+
+clean = receipt_problems(physics_mode(preset='"screen100"'), "screen100")
+if clean:
+    fail(f"check_run_receipts() faults a child that ran the preset it was given: {clean}")
+
+stale = receipt_problems(physics_mode(preset=None), "screen100")
+if not any("predates WP24" in p for p in stale):
+    fail("check_run_receipts() PASSES a pre-WP24 binary handed "
+         "RASBERY_FIDELITY=screen100. That binary ignored the variable and solved the "
+         "DEFAULT_ENV A2 arm at PRODUCTION polish tolerances; it prints policy:A2 and "
+         "derive_declared_fidelity() derives A2, so the policy check cannot see it and "
+         f"the campaign files production numbers under a screening name. Got: {stale}")
+
+wrong = receipt_problems(physics_mode(preset='"A2"'), "screen100")
+if not any("fidelity_preset" in p and "asked for" in p for p in wrong):
+    fail("check_run_receipts() PASSES a child that ran a DIFFERENT named preset from "
+         f"the one the launch asked for; `policy` is A2 for both. Got: {wrong}")
+
 import shutil  # noqa: E402
 shutil.rmtree(workdir, ignore_errors=True)
 

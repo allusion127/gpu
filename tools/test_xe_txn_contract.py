@@ -318,7 +318,8 @@ check(
 for name in ("eq_tol", "min_gram", "max_step"):
     check("%s" % name in BACKEND_H, "XeTxnRequest carries %s from the host" % name)
 check(
-    "req.eq_tol   = XE_EQUILIBRIUM_TOLERANCE;" in DRIVER
+    # WP24: the Xe tolerance is the CASE's now (src/FidelityPreset.h), because a named fidelity preset moves the PUBLISHED tolerances and not only the loose stage. The property this pins is unchanged -- ONE value, read by both arms -- and with no preset ctx.tolerances.xe_tol IS XE_EQUILIBRIUM_TOLERANCE.
+    "req.eq_tol   = ctx.tolerances.xe_tol;" in DRIVER
     and "req.min_gram = XE_ANDERSON_MIN_GRAM;" in DRIVER,
     "the request is filled from Driver.h's own constants",
 )

@@ -290,7 +290,15 @@ for anchor, phase in (
     i = DRIVER.find(anchor)
     if i < 0:
         fail(f"WP9-A instrumentation anchor vanished: {anchor!r}")
-    if f"sptelem::{phase}" not in DRIVER[max(0, i - 1500):i]:
+    # THE WINDOW IS A PROXIMITY HEURISTIC, NOT A SEMANTIC BOUND: what is being
+    # checked is that a scope of the right phase is OPEN over the call, and the
+    # character count is only how this static reader approximates "open".  It is
+    # widened when the block between the two legitimately grows -- WP24 added
+    # one field to the light-result Fidelity fill inside PH_RESULT_WRITE's scope
+    # and put the anchor 1,543 characters out.  Widening it is not a weakening
+    # as long as no OTHER scope opens in between, which the nesting rules
+    # checked above already forbid.
+    if f"sptelem::{phase}" not in DRIVER[max(0, i - 1800):i]:
         fail(f"{phase} has no scope opened before {anchor!r}")
 # xe_step is charged over the WHOLE Xe step region -- the Anderson attempt, the
 # production Picard step and the trust-region bookkeeping -- so it is pinned by

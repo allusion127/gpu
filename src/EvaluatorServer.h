@@ -742,6 +742,21 @@ inline bool parseFidelityFields(const nlohmann::json& object, FidelityRequest& o
     // either vocabulary, so a controller may use whichever its manifests use.
     if (!string_field("fidelity", out.fidelity)) return false;
     if (out.fidelity.empty() && !string_field("physics_fidelity", out.fidelity)) return false;
+    // WP24.  `fidelity_preset` names a ROW of src/FidelityPreset.h's table, and
+    // it is a DIFFERENT axis from `fidelity`: the word says which of the four
+    // PhysicsFidelity policies the case runs, the preset says WHICH staged arm
+    // -- "A2" is a family and a receipt that names only the family cannot be
+    // reproduced (CaseFidelity.h:51-58).  An empty string is a legal request
+    // and means "no preset", which is how a promotion clears an inherited one.
+    if (object.contains("fidelity_preset")) {
+        if (!object["fidelity_preset"].is_string()) {
+            error = R"("fidelity_preset" must be a string: the name of a preset row, or "" )"
+                    R"(for none)";
+            return false;
+        }
+        out.preset     = object["fidelity_preset"].get<std::string>();
+        out.has_preset = true;
+    }
     if (object.contains("statepoint_grid")) {
         if (!object["statepoint_grid"].is_string()) {
             error = R"("statepoint_grid" must be a string: full | coarse | three | a )"
@@ -811,6 +826,13 @@ inline void applyWaveFidelityDefault(const FidelityRequest& wave, FidelityReques
                                      bool promoted) {
     if (promoted) return;
     if (request.fidelity.empty()) request.fidelity = wave.fidelity;
+    // WP24.  A wave-level preset is a DEFAULT like every other field here: a
+    // generation declares `"fidelity_preset":"screen100"` once instead of on
+    // sixty-four case lines, and a case that named its own keeps it.
+    if (!request.has_preset && wave.has_preset) {
+        request.preset     = wave.preset;
+        request.has_preset = true;
+    }
     if (!request.has_grid && wave.has_grid) {
         request.statepoint_grid = wave.statepoint_grid;
         request.has_grid        = true;
@@ -1060,6 +1082,27 @@ public:
              << "\",\"fidelity_per_case\":true"
              << ",\"fidelity_default\":\"" << processCaseFidelity().policy()
              << "\",\"fidelity_floor\":\"" << physicsPolicyName(processFidelityFloor())
+             // WP24.  The rows this binary has, so a controller can ask for one
+             // by name instead of discovering by refusal that its campaign's
+             // preset is not in this build.  `fidelity_preset_default` is the
+             // row the process itself carries (RASBERY_FIDELITY), "none" when
+             // it carries none -- and "none" is accepted BACK as an input alias
+             // for "no preset", so a controller may round-trip this field.
+             //
+             // TWO FIELDS, TWO VOCABULARIES, AND THEY OVERLAP.  `strict` and
+             // `A2` are legal values of BOTH `fidelity` and `fidelity_preset`;
+             // `screen100` is legal only in the second and `L3coarse` only in
+             // the first.  So a controller that puts the right word in the
+             // wrong field is REFUSED for screen100 and SILENTLY ACCEPTED for
+             // strict/A2 -- where the two mean different things (`fidelity` is
+             // a declaration checked for equality against what the case solves;
+             // `fidelity_preset` NAMES A ROW that sets seventeen knobs).  The
+             // hello line says so rather than leaving it to be found once.
+             << "\",\"fidelity_field_note\":\"fidelity declares; fidelity_preset "
+                "names a row. strict|A2 are legal in both and mean different "
+                "things\""
+             << ",\"fidelity_presets\":\"" << fidelityPresetNames()
+             << "\",\"fidelity_preset_default\":\"" << processCaseFidelity().presetToken()
              << "\",\"statepoint_grid_default\":\"" << processCaseFidelity().gridToken()
              << "\",\"idle_timeout_s\":" << _options.idle_timeout_s
              << ",\"isolation_check\":" << (_options.isolation_check ? "true" : "false");
@@ -1117,6 +1160,20 @@ public:
                     if (!request.request_fidelity.has_grid) {
                         request.request_fidelity.statepoint_grid = "full";
                         request.request_fidelity.has_grid        = true;
+                    }
+                    // WP24.  A PROMOTION CLEARS THE PRESET, and it is the same
+                    // argument WP10.7 makes for `strict`, `full` and the full
+                    // grid: an evaluator standing in a screen100 campaign has
+                    // the preset in its process default, and the promotion --
+                    // the one row in a generation whose entire job is to be
+                    // acceptance-eligible -- would otherwise re-run the elite
+                    // at 100 pcm screening tolerances while reporting
+                    // `policy:"strict"`.  An explicit preset on the promote
+                    // line is left alone so the refusal in resolveCaseFidelity
+                    // can say what is wrong rather than being silently undone.
+                    if (!request.request_fidelity.has_preset) {
+                        request.request_fidelity.preset.clear();
+                        request.request_fidelity.has_preset = true;
                     }
                     // The LINK, and the reason the op exists at all.  Without
                     // it the strict re-run is an unrelated row and nothing in
@@ -2555,6 +2612,15 @@ private:
              << ",\"fidelity_declared\":"
              << (receipt.fidelity_declared.empty() ? std::string("null")
                                                    : detail::quoted(receipt.fidelity_declared))
+             // WP24.  WHICH staged arm this case actually ran, by name, from the
+             // Driver's own receipt rather than from the request -- so a preset
+             // that was mis-applied shows up as a mismatch and not as an echo.
+             // Null only when the case never got a receipt at all.
+             << ",\"fidelity_preset\":"
+             << (have_fidelity ? detail::quoted(receipt.fidelity_preset.empty()
+                                                    ? std::string("none")
+                                                    : receipt.fidelity_preset)
+                               : std::string("null"))
              << ",\"promoted_from\":"
              << (receipt.promoted_from.empty() ? std::string("null")
                                                : detail::quoted(receipt.promoted_from))

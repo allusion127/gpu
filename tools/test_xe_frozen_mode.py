@@ -507,7 +507,8 @@ if RECONV not in SOLVE_LOOP:
 # --- The staged tolerance must be the production one whenever it is not asked
 # --- for, or every gate above is measuring against a different number than the
 # --- one this file's contracts are written in terms of.
-STAGED = "const double xe_tol_now   = polishing ? XE_EQUILIBRIUM_TOLERANCE : loose_xe_tol;"
+# WP24: the Xe tolerance is the CASE's now (src/FidelityPreset.h), because a named fidelity preset moves the PUBLISHED tolerances and not only the loose stage. The property this pins is unchanged -- ONE value, read by both arms -- and with no preset ctx.tolerances.xe_tol IS XE_EQUILIBRIUM_TOLERANCE.
+STAGED = "const double xe_tol_now   = polishing ? tol.xe_tol : loose_xe_tol;"
 if STAGED not in SOLVE_LOOP:
     fail("xe_tol_now is not resolved from XE_EQUILIBRIUM_TOLERANCE at the polish stage, so "
          "the once-mode gates above cannot be read as tests against the equilibrium tolerance")

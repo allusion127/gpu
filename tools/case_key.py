@@ -44,6 +44,15 @@ import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+# WP24.  For the preset table, which effective_fidelity() has to read for the
+# same reason it reads kArmEnv out of src/Driver.h: a second copy of the row's
+# multipliers here is a second answer to "what fidelity did this environment
+# configure", and the day the two disagree is the day this mirror computes a
+# different case key from the binary.  exact_audit reads the header lazily, so
+# importing it costs nothing until a preset is actually named.
+import exact_audit  # noqa: E402
+
 SCHEMA = "rasbery-case-key/v1"
 CODE_SHA_ENV = "RASBERY_CODE_SHA"
 
@@ -258,7 +267,26 @@ def deck_payload(config: dict) -> tuple[str, str]:
 
 
 def effective_fidelity(env) -> int:
-    """src/RunContract.h effectivePhysicsFidelity(), rank for rank."""
+    """src/RunContract.h effectivePhysicsFidelity(), rank for rank.
+
+    WP24.  A NAMED PRESET REPLACES THE TWO STAGED KNOBS, so it has to be read
+    here or this mirror computes a different key from the binary for exactly the
+    invocation the runbook prescribes.  The demonstration: with
+    `RASBERY_FIDELITY=screen100` and the three `RASBERY_STAGED_*` names UNSET --
+    docs/WP24 Sec 7.1 calls that spelling mandatory -- this function used to
+    answer rank 0 (`strict`, `full_exact`) while the binary folds
+    `fidelity="staged_a2"` / `policy="A2"` and exact_audit.derive_declared_fidelity
+    answers `A2`.  Those two strings are payload lines in `payload_of()`, so the
+    two key implementations parted company on every screen100 run.
+
+    The row's multipliers come from src/FidelityPreset.h through
+    exact_audit.FIDELITY_PRESETS -- the same single source
+    derive_declared_fidelity() reads, so the two derivations cannot drift.  An
+    UNKNOWN name is treated as no preset here rather than raised on: the binary
+    refuses such a run before it prints anything (src/main.cpp), so there is no
+    key to compute and no wrong hit to serve, and a key tool that throws on a
+    stale environment is a key tool nobody can run over an archive.
+    """
     passes = env.get("RASBERY_GA_FEEDBACK_PASSES", "")
     detected = 0
     try:
@@ -266,14 +294,34 @@ def effective_fidelity(env) -> int:
             detected = 3
     except ValueError:
         pass
+    preset = (env.get("RASBERY_FIDELITY") or "").strip()
+    row = None
+    if preset:
+        try:
+            row = exact_audit.FIDELITY_PRESETS.get(preset)
+        except SystemExit:
+            # The header is not beside this checkout.  ARM_ENV already refuses
+            # in that situation; nothing to add here.
+            row = None
     if detected == 0:
-        for name in ("RASBERY_STAGED_FLUX_TOL", "RASBERY_STAGED_XE_TOL"):
-            try:
-                if float(env.get(name, "1") or "1") > 1.0:
-                    detected = 1
-                    break
-            except ValueError:
-                pass
+        if row is not None:
+            # The preset REPLACES the environment's multipliers, so this branch
+            # does not fall through to the reads below -- a screen100 run inside
+            # DEFAULT_ENV has 50/1000 exported AND the row's 5/100 in force, and
+            # only the row is what the binary solved at.
+            if (exact_audit.preset_number(row, "staged_flux_mult") > 1.0 or
+                    exact_audit.preset_number(row, "staged_xe_mult") > 1.0):
+                detected = 1
+        else:
+            # No row (no preset named, or a name this build has none for, which
+            # processCaseFidelity() drops the same way) -- the pre-WP24 read.
+            for name in ("RASBERY_STAGED_FLUX_TOL", "RASBERY_STAGED_XE_TOL"):
+                try:
+                    if float(env.get(name, "1") or "1") > 1.0:
+                        detected = 1
+                        break
+                except ValueError:
+                    pass
     declared_text = env.get("RASBERY_PHYSICS_FIDELITY", "")
     for i, (policy, fidelity) in enumerate(FIDELITY_TRAITS):
         if declared_text in (policy, fidelity) and declared_text:

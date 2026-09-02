@@ -24,7 +24,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from exact_audit import (  # noqa: E402
@@ -32,6 +32,7 @@ from exact_audit import (  # noqa: E402
     NON_STRICT_ENV_KEYS,
     audit_physics_mode,
     derive_declared_fidelity,
+    receipt_preset,
 )
 
 
@@ -257,6 +258,22 @@ class LaunchPlan:
     # "operator" (--fidelity) or "env" (derived).  Reported, so a receipt says
     # whether the word was typed or computed.
     fidelity_source: str = "env"
+    # WP24.  The NAMED preset this launch handed the child -- the child env's
+    # RASBERY_FIDELITY, or "none" -- which check_run_receipts() requires the
+    # child to have PRINTED BACK.  Default "none" is the preset-free launch, so
+    # a caller that predates the field still states the truth.
+    declared_preset: str = "none"
+
+
+def declared_preset_from_env(env: "Mapping[str, str]") -> str:
+    """The preset name a child launched with *env* is being ASKED for.
+
+    ONE spelling, shared by both harnesses, and it is the same vocabulary the
+    binary prints: CaseFidelity::presetToken() answers `"none"` when no row was
+    named, so the request and the receipt are comparable without either side
+    special-casing an empty string.
+    """
+    return (env.get("RASBERY_FIDELITY") or "").strip() or "none"
 
 
 def visible_cpu_threads() -> int:
@@ -393,6 +410,43 @@ def check_run_receipts(output: str, plan: "LaunchPlan") -> list[str]:
     # that was asked for, in both directions (tools/exact_audit.py).
     problems = audit_physics_mode(output, plan.declared_fidelity)
 
+    # WP24.  AND THE PRESET THE CHILD ACTUALLY RAN, not only the policy word.
+    #
+    # THE FAILURE THIS CATCHES, which is the most likely operational mistake on
+    # a multi-host fleet: run the documented `--set RASBERY_FIDELITY=screen100`
+    # against a binary built BEFORE WP24 -- one host not rebuilt, a stale
+    # RASBERY on the PATH.  That binary does not know the variable, ignores it,
+    # solves the plain DEFAULT_ENV 50/1000 A2 arm at PRODUCTION polish
+    # tolerances, and prints `policy:"A2"`.  derive_declared_fidelity() also
+    # answers "A2" (it reads the ROW's multipliers), so the policy comparison
+    # above sees A2 against A2 and PASSES -- and the campaign files a
+    # production-tolerance throughput number under a screening name, which is
+    # verbatim the defect src/FidelityPreset.h and main.cpp's
+    # fidelityPresetEnvIsUnknown() refusal exist to prevent.  main.cpp cannot
+    # help here because the OLD binary is the one running; only the harness,
+    # which knows both halves, can.
+    #
+    # An ABSENT field is a REFUSAL and not a pass, the same shape
+    # CASE_REQUIRED_FIELDS uses for the WP10.3 version check: the field that
+    # would have voided the run is the missing one.
+    printed_preset = receipt_preset(output)
+    if printed_preset is None:
+        problems.append(
+            "[RASBERY][PHYSICS_MODE] carries no `fidelity_preset` field: this binary "
+            "predates WP24 and cannot honour the preset it was given "
+            "(RASBERY_FIDELITY=%s). It ignored the variable and solved at whatever the "
+            "RASBERY_STAGED_* environment said, at PRODUCTION polish tolerances, while "
+            "reporting the same `policy` word a screening arm reports -- so this run's "
+            "number cannot be filed in either column. Rebuild this host."
+            % plan.declared_preset)
+    elif printed_preset != plan.declared_preset:
+        problems.append(
+            "[RASBERY][PHYSICS_MODE] fidelity_preset=%r but this launch asked for %r. "
+            "`policy` is `A2` for every staged arm this binary can run, so the policy "
+            "check above cannot see this: the run solved at a NAMED convergence policy "
+            "nobody requested."
+            % (printed_preset, plan.declared_preset))
+
     receipt = None
     for match in BATCH_HOST_RECEIPT.finditer(output):
         try:
@@ -456,7 +510,17 @@ def resolve_declared_fidelity(args: argparse.Namespace,
     stated = getattr(args, "fidelity", None)
     if stated:
         return stated, "operator"
-    return derive_declared_fidelity(env), "env"
+    try:
+        return derive_declared_fidelity(env), "env"
+    except ValueError as exc:
+        # WP24.  derive_declared_fidelity() raises on a RASBERY_FIDELITY this
+        # build has no row for, because the binary REFUSES it and there is then
+        # no policy to declare.  Its message is carefully worded; surfacing it
+        # as a Python traceback out of the harness would bury it.
+        # sys.argv[0] and not __file__: resolve_declared_fidelity() is imported
+        # and called by run_multi_gpu_batch.py too, so naming this file sends the
+        # reader to a script they did not run.
+        raise SystemExit(f"{os.path.basename(sys.argv[0]) or __file__}: {exc}") from None
 
 
 def parse_overrides(items: Iterable[str]) -> dict[str, str]:
@@ -528,6 +592,7 @@ def build_plan(args: argparse.Namespace, command: list[str]) -> tuple[LaunchPlan
         result_mode=(values_after(command, "--result") or ["full"])[0],
         declared_fidelity=fidelity,
         fidelity_source=fidelity_source,
+        declared_preset=declared_preset_from_env(env),
     )
     return plan, command, env
 
@@ -673,6 +738,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         # wave while every receipt in it said rc=0.
         "declared_fidelity": plan.declared_fidelity,
         "declared_fidelity_source": plan.fidelity_source,
+        # WP24.  The row this launch is asking the child for, so `--print-env`
+        # answers "which arm is this" before the GPU time is spent.
+        "declared_preset": plan.declared_preset,
         "cmfd_wait_us": env.get("RASBERY_BATCH_WAIT_US"),
         "cmfd_wait_max_us": env.get("RASBERY_BATCH_WAIT_MAX_US"),
         "command": command,
@@ -716,7 +784,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 3
     print("[RASBERY][SINGLE_GPU_PROFILE][OK] "
           + json.dumps({"host_threads": plan.host_workers, "graph_fallbacks": 0,
-                        "fidelity": plan.declared_fidelity},
+                        "fidelity": plan.declared_fidelity,
+                        "fidelity_preset": plan.declared_preset},
                        separators=(",", ":")))
     return 0
 

@@ -68,6 +68,9 @@ import shlex
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import exact_audit  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # The receipts a launcher audits
@@ -82,10 +85,47 @@ def _multiplier(name: str) -> float:
     return value if value >= 1.0 else 1.0
 
 
+def declared_preset() -> str:
+    # NOTE: THE UNKNOWN-NAME PATH IS UNREACHABLE THROUGH THE HARNESS.  The real
+    # binary exits 2 on an unknown RASBERY_FIDELITY (src/main.cpp
+    # fidelityPresetEnvIsUnknown) and tools/run_single_gpu_batch.py raises
+    # SystemExit before it ever launches a child, so this stub cannot stand in
+    # for that refusal and deliberately does not try: it answers "none", which
+    # is what a launch that reached a child would legitimately mean.
+    """RASBERY_FIDELITY, as `CaseFidelity::presetToken()` spells it.
+
+    WP24.  The name if this build's table has a row for it, `"none"` otherwise
+    -- an unknown name is what main.cpp REFUSES, and the fake's job is to print
+    what a real child prints for the environments a test actually drives.
+    """
+    name = (os.environ.get("RASBERY_FIDELITY") or "").strip()
+    if not name:
+        return "none"
+    try:
+        rows = exact_audit.fidelity_presets()
+    except SystemExit:
+        return "none"
+    return name if name in rows else "none"
+
+
 def declared_policy() -> tuple[str, str]:
-    """(policy, physics_fidelity) by src/RunContract.h's rule."""
+    """(policy, physics_fidelity) by src/RunContract.h's rule.
+
+    WP24.  A NAMED PRESET REPLACES the two staged multipliers rather than
+    defaulting them, so RASBERY_FIDELITY is consulted FIRST and does not fall
+    through to the environment -- exactly as processCaseFidelity() does and as
+    exact_audit.derive_declared_fidelity() already does on the Python side.  A
+    fake that ignored the preset would print `strict` for a screen100 child and
+    hide a policy mismatch the real harness would hit on 238.
+    """
     if int(os.environ.get("RASBERY_GA_FEEDBACK_PASSES") or 0) > 0:
         return "feedback_limited", "feedback_limited"
+    preset = declared_preset()
+    if preset != "none":
+        row = exact_audit.fidelity_presets()[preset]
+        staged = (exact_audit.preset_number(row, "staged_flux_mult") > 1.0 or
+                  exact_audit.preset_number(row, "staged_xe_mult") > 1.0)
+        return ("A2", "staged_a2") if staged else ("strict", "full_exact")
     if _multiplier("RASBERY_STAGED_FLUX_TOL") > 1.0 or _multiplier("RASBERY_STAGED_XE_TOL") > 1.0:
         return "A2", "staged_a2"
     return "strict", "full_exact"
@@ -99,7 +139,11 @@ def print_declarations(result_mode: str) -> None:
         "physics_mode": "full_exact_nodal", "screening": False, "feedback_pass_limit": 0,
         "full_hdf5": True, "physics_fidelity": fidelity, "policy": policy,
         "acceptance_eligible": policy == "strict", "requires_exact_rerun": False,
-        "result_mode": result_mode, "fidelity_declared": None, "gpu_full": False}))
+        "result_mode": result_mode, "fidelity_declared": None, "gpu_full": False,
+        # WP24.  `policy` is `A2` for BOTH the measured 50/1000 production arm
+        # and screen100, so the harness cannot tell them apart without this
+        # field -- and tools/promotion_gate.py's A/B hygiene check now reads it.
+        "fidelity_preset": declared_preset()}))
 
 
 def print_batch_host(jobs: int, width: int, host: int) -> None:
@@ -255,7 +299,8 @@ def run_case(deck: str, output: str, mode: str, *, wave_id: int, index: int,
         "policy": declared_policy()[0], "physics_fidelity": declared_policy()[1],
         "statepoint_grid": "full",
         "acceptance_eligible": declared_policy()[0] == "strict",
-        "fidelity_declared": None, "promoted_from": None}
+        "fidelity_declared": None, "fidelity_preset": declared_preset(),
+        "promoted_from": None}
     # WP10.5.  THE DRIVER'S OWN TAG, which the fake did not print.
     #
     # This is the second time the same hole cost a session.  WP10.4: the fake
@@ -268,7 +313,11 @@ def run_case(deck: str, output: str, mode: str, *, wave_id: int, index: int,
     # (the real one is not behind a telemetry gate either).
     if not failed:
         emit("  [RASBERY][CASE] " + json.dumps({
-            "schema_version": 6,
+            # WP24: schema 7 adds `fidelity_preset`.  A tag the harness never
+            # prints is a tag the harness cannot defend -- WP10.4 and WP10.5
+            # were both exactly that, and the field this stub was missing this
+            # time is the one that tells screen100 from the 50/1000 A2 arm.
+            "schema_version": 7,
             "case_key": f"fake-{Path(deck).stem}",
             "key_schema": "casekey/v1",
             "core_op": "op",
@@ -286,6 +335,7 @@ def run_case(deck: str, output: str, mode: str, *, wave_id: int, index: int,
             "statepoint_grid": resolved.get("statepoint_grid"),
             "acceptance_eligible": resolved.get("acceptance_eligible"),
             "fidelity_declared": resolved.get("fidelity_declared"),
+            "fidelity_preset": resolved.get("fidelity_preset"),
             "promoted_from": resolved.get("promoted_from")}))
     if receipts:
         receipt = {

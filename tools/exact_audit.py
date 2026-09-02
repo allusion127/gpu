@@ -57,6 +57,8 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping as _AbcMapping
+from pathlib import Path
 from typing import Iterable, Mapping
 
 PHYSICS_MODE_RECEIPT = re.compile(r"\[RASBERY\]\[PHYSICS_MODE\]\s*(\{.*\})")
@@ -79,6 +81,135 @@ DECLARABLE_FIDELITIES = ("strict", "A2", "L3coarse")
 
 # The two knobs src/RunContract.h reads as multipliers.  Above 1.0 -> A2.
 STAGED_TOLERANCE_KEYS = ("RASBERY_STAGED_FLUX_TOL", "RASBERY_STAGED_XE_TOL")
+
+# WP24.  THE PRESET TABLE, READ OUT OF THE SOURCE -- never copied.
+#
+# THE DEFECT THIS AVOIDS IS THE ONE THIS MODULE EXISTS FOR (see the docstring).
+# derive_declared_fidelity() tells the harness what to EXPECT the child to
+# print, so a derivation that does not follow the binary's own rule is a
+# guaranteed mismatch dressed as a guard.  With RASBERY_FIDELITY=screen100 the
+# binary reports `A2` (the row's staged multipliers are above 1.0), and a
+# Python side that only knew about RASBERY_STAGED_* would derive `strict` and
+# void every screen100 run on a policy mismatch -- a verbatim re-commit of the
+# WP4 defect.  So the multipliers come from the table, and the table comes from
+# the header, which is the campaign's one maintained answer.
+FIDELITY_PRESET_SOURCE = Path(__file__).resolve().parents[1] / "src" / "FidelityPreset.h"
+
+
+def parse_fidelity_preset_constants(text: str) -> dict[str, float]:
+    """The `kProd*` production tolerances the strict row is written in terms of."""
+    found = re.findall(r"inline constexpr double\s+(kProd\w+)\s*=\s*([0-9.eE+-]+);", text)
+    if not found:
+        raise SystemExit("exact_audit: no kProd* constants in the preset header")
+    return {name: float(value) for name, value in found}
+
+
+def parse_fidelity_presets(text: str) -> dict[str, dict[str, str]]:
+    """src/FidelityPreset.h kFidelityPresets, row by row, as raw token text.
+
+    TAKES TEXT, not a path, so a contract test can re-run its checks against a
+    header broken on purpose -- a check that can only ever be handed the real
+    file is a check nobody can prove catches anything.
+
+    The rows are written with `/*field*/ value` designators exactly so this
+    parse is a lookup and not a positional count: a column inserted in the
+    middle of the C++ table must not silently re-label every value here.
+
+    Each row carries its own resolved constants under `_constants`, so a row
+    parsed from a modified header resolves `kProd*` against THAT header.
+    """
+    anchor = "inline constexpr FidelityPresetSpec kFidelityPresets[] = {"
+    if anchor not in text:
+        raise SystemExit("exact_audit: cannot find kFidelityPresets in the preset header")
+    constants = parse_fidelity_preset_constants(text)
+    block = text[text.index(anchor) + len(anchor):]
+    block = block[:block.index("\n};")]
+    rows: dict[str, dict[str, str]] = {}
+    for row_text in re.findall(r"\{(.*?)\n    \}", block, re.S):
+        fields: dict[str, str] = {}
+        for name, value in re.findall(r"/\*(\w+)\*/\s*([^,]*?),\s*(?=\n|/\*|$)", row_text):
+            fields[name] = value.strip()
+        if "name" in fields:
+            fields["_constants"] = constants  # type: ignore[assignment]
+            rows[fields["name"].strip('"')] = fields
+    if not rows:
+        raise SystemExit("exact_audit: kFidelityPresets parsed empty")
+    return rows
+
+
+def _read_fidelity_presets(path: Path = FIDELITY_PRESET_SOURCE) -> dict[str, dict[str, str]]:
+    return parse_fidelity_presets(path.read_text(encoding="utf-8-sig"))
+
+
+# LAZY, AND CACHED.  Reading the header at IMPORT time made every importer of
+# this module hard-require the source tree beside tools/ and raise SystemExit
+# from an `import` statement when it was not there -- and exact_audit is
+# imported by the dispatcher, the single-GPU harness and half a dozen contract
+# tests, some of which never look at a preset.  A module that cannot be
+# imported without the C++ tree is a module a receipt reader cannot use.
+_PRESET_CACHE: dict[str, dict] = {}
+
+
+def fidelity_presets() -> dict[str, dict[str, str]]:
+    """src/FidelityPreset.h's table, read once, on first use."""
+    if "rows" not in _PRESET_CACHE:
+        _PRESET_CACHE["rows"] = _read_fidelity_presets()
+    return _PRESET_CACHE["rows"]
+
+
+def fidelity_preset_constants() -> dict[str, float]:
+    """The `kProd*` production tolerances, read once, on first use."""
+    if "constants" not in _PRESET_CACHE:
+        _PRESET_CACHE["constants"] = parse_fidelity_preset_constants(
+            FIDELITY_PRESET_SOURCE.read_text(encoding="utf-8-sig"))
+    return _PRESET_CACHE["constants"]
+
+
+class _LazyPresetMapping(_AbcMapping):
+    """`FIDELITY_PRESETS` / `FIDELITY_PRESET_CONSTANTS` as they read, resolved
+    on first access.  The names stay because they are the ones the contract
+    tests and the harness already use; only the moment of the file read moves.
+    """
+
+    def __init__(self, loader):
+        self._loader = loader
+
+    def __getitem__(self, key):
+        return self._loader()[key]
+
+    def __iter__(self):
+        return iter(self._loader())
+
+    def __len__(self):
+        return len(self._loader())
+
+    def __repr__(self):
+        return repr(self._loader())
+
+
+FIDELITY_PRESET_CONSTANTS = _LazyPresetMapping(fidelity_preset_constants)
+FIDELITY_PRESETS = _LazyPresetMapping(fidelity_presets)
+
+
+def preset_number(row: Mapping, field: str) -> float:
+    """One numeric cell of a preset row, with `kProd*` names resolved.
+
+    A cell is either a literal or the name of one of the production constants
+    the header restates -- and resolving the name against the row's OWN header
+    rather than hard-coding its value is the whole point: the strict row and the
+    tree's built-ins have to move together or not at all.
+    """
+    token = row[field]
+    constants = row.get("_constants") or FIDELITY_PRESET_CONSTANTS
+    if token in constants:
+        return constants[token]
+    return float(token)
+
+
+def preset_flag(row: Mapping, field: str) -> bool:
+    """One `PresetFlag` / bool cell, as the C++ means it."""
+    return row[field] in ("PresetFlag::On", "true")
+
 # RASBERY_STAGED_LOOSE_SETTLE is a staged knob but NOT a fidelity one: Driver.h
 # :3886 only consults it inside a LOOSE stage, and with a single stage
 # `polishing` is true throughout ("It is inert unless staging is on",
@@ -89,7 +220,14 @@ STAGED_TOLERANCE_KEYS = ("RASBERY_STAGED_FLUX_TOL", "RASBERY_STAGED_XE_TOL")
 STAGED_KEYS = STAGED_TOLERANCE_KEYS + ("RASBERY_STAGED_LOOSE_SETTLE",)
 # Everything that can move a child off `strict`.  `--strict` clears all of them
 # from the child environment, including any the operator's shell exported.
-NON_STRICT_ENV_KEYS = STAGED_KEYS + ("RASBERY_GA_FEEDBACK_PASSES",
+#
+# WP24: RASBERY_FIDELITY is on this list because a preset row sets the staged
+# multipliers ITSELF -- clearing RASBERY_STAGED_* from a child while leaving
+# `RASBERY_FIDELITY=screen100` behind would produce a child that is still A2,
+# still at 100 pcm tolerances, and now says so nowhere the `--strict` caller
+# looked.
+NON_STRICT_ENV_KEYS = STAGED_KEYS + ("RASBERY_FIDELITY",
+                                     "RASBERY_GA_FEEDBACK_PASSES",
                                      "RASBERY_PHYSICS_FIDELITY")
 
 # The fields the audit needs.  A receipt without them is from a binary older
@@ -139,8 +277,28 @@ def derive_declared_fidelity(env: Mapping[str, str]) -> str:
         feedback = int(passes)
     except ValueError:
         feedback = 0
+    # WP24.  A NAMED PRESET REPLACES THE TWO KNOBS rather than defaulting them
+    # (src/RunContract.h processStagedFluxMult), so this branch has to come
+    # FIRST and must not fall through to the environment: a screen100 run inside
+    # `run_single_gpu_batch.DEFAULT_ENV` has 50/1000 exported AND the row's
+    # 5/100 in force, and only the row is what the binary solved at.
+    preset = (env.get("RASBERY_FIDELITY") or "").strip()
+    row = FIDELITY_PRESETS.get(preset) if preset else None
+    if preset and row is None:
+        # The binary REFUSES an unknown name (main.cpp), so there is no fidelity
+        # to derive.  Deriving `strict` here would let the harness declare a
+        # policy for a run that is going to exit 2 before it prints one.
+        raise ValueError(
+            f"RASBERY_FIDELITY={preset!r} is not a preset src/FidelityPreset.h has a row "
+            f"for; the binary refuses it. Known: {', '.join(sorted(FIDELITY_PRESETS))}"
+        )
     if feedback > 0:
         detected = "feedback_limited"
+    elif row is not None:
+        detected = ("A2"
+                    if (preset_number(row, "staged_flux_mult") > 1.0 or
+                        preset_number(row, "staged_xe_mult") > 1.0)
+                    else "strict")
     elif any(_staged_multiplier(env, key) > 1.0 for key in STAGED_TOLERANCE_KEYS):
         detected = "A2"
     else:
@@ -181,6 +339,32 @@ def receipt_policy(output: str) -> str | None:
     return policy if isinstance(policy, str) else None
 
 
+def receipt_preset(output: str) -> str | None:
+    """The NAMED preset the run printed, or None when it printed no receipt.
+
+    WHY THIS IS NOT OPTIONAL BESIDE receipt_policy().  `policy` is `A2` for
+    EVERY staged arm this binary can run: the measured 50/1000 production arm
+    and screen100 -- which additionally moves the published keff, search, flux,
+    Xe and rod-crit tolerances -- report the same word.  So a campaign receipt
+    carrying only `policy` cannot tell a screening candidate from a production
+    baseline, and tools/promotion_gate.py's A/B hygiene check ("the arms ran at
+    different fidelities") passes a comparison between them.  That is verbatim
+    the "A2 is a FAMILY, a receipt naming only the family is a number nobody can
+    reproduce" defect, in the one tool whose job is gating.
+
+    `"none"` is a real value here, not a missing one: the binary prints it when
+    no preset was named (CaseFidelity::presetToken()), and it is a DIFFERENT
+    fact from `strict`, which is a row that was applied and cleared an A2
+    environment.  A binary that predates WP24 prints no field at all, and that
+    reads as None.
+    """
+    receipt, _why = parse_physics_mode(output)
+    if receipt is None:
+        return None
+    preset = receipt.get("fidelity_preset")
+    return preset if isinstance(preset, str) else None
+
+
 def audit_physics_mode(output: str, declared: str = "strict") -> list[str]:
     """Problems with *output*'s physics-mode receipt.  Empty list means PASS.
 
@@ -216,8 +400,10 @@ def audit_physics_mode(output: str, declared: str = "strict") -> list[str]:
             "run did not solve at the fidelity it was asked for, so its throughput "
             "belongs in neither column (plan Sec 6.2: never mix strict and A2 in one "
             "table). Declare what is actually running with --fidelity, or change the "
-            "environment that decides it (%s)."
-            % (policy, declared, ", ".join(STAGED_KEYS)))
+            "environment that decides it (%s -- and RASBERY_FIDELITY names a ROW that "
+            "REPLACES the other three, so it is the one to look at first)."
+            % (policy, declared,
+               ", ".join(("RASBERY_FIDELITY",) + STAGED_KEYS)))
 
     # Internal consistency.  The binary derives all three from one table
     # (src/RunContract.h kFidelityTraits); a receipt where they disagree is a
@@ -496,7 +682,12 @@ __all__ = ["POLICIES", "DECLARABLE_FIDELITIES", "REQUIRED_FIELDS",
            "CASE_FIELD_SYNONYMS", "case_field",
            "case_field_present",
            "STAGED_TOLERANCE_KEYS", "STAGED_KEYS", "NON_STRICT_ENV_KEYS",
+           "FIDELITY_PRESET_SOURCE", "FIDELITY_PRESETS", "FIDELITY_PRESET_CONSTANTS",
+           "parse_fidelity_presets", "parse_fidelity_preset_constants",
+           "preset_number", "preset_flag",
+           "fidelity_presets", "fidelity_preset_constants",
            "PHYSICS_MODE_RECEIPT", "CASE_RECEIPT", "EVALUATOR_CASE_RECEIPT",
-           "parse_physics_mode", "receipt_policy", "parse_case_receipts",
+           "parse_physics_mode", "receipt_policy", "receipt_preset",
+           "parse_case_receipts",
            "derive_declared_fidelity", "audit_physics_mode", "audit_case_fidelity",
            "promotion_links", "strip_non_strict"]
