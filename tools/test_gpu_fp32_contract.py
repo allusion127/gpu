@@ -731,6 +731,45 @@ for deferred in ("nodal", "xe", "cram", "ppr"):
     check(deferred in DOC.lower(),
           "the doc says what happened to %s" % deferred)
 
+# WP20.2: the doc carries the DIAGNOSIS, the DESIGN and a runbook PER ARM.
+#
+# The arms are now five and they do not share a runbook: a single procedure
+# would leave a reader unable to attribute a number to a flag, which is the same
+# failure the per-backend receipt exists to prevent one level down.
+for token, what in (
+        ("RASBERY_GPU_FP32_REFINE", "the refinement knob"),
+        ("RASBERY_GPU_FP32_PPR", "the PPR knob"),
+        ("4,502", "the outer count the FP32 arm actually produced"),
+        ("10.40", "the wall it produced"),
+        ("9.75", "the FP64 wall it has to beat"),
+        ("1e-7", "the FP32 inner solve's attainable residual, which is the "
+                 "diagnosis"),
+        ("refine_round_open", "the round opener"),
+        ("refine_round_test", "the round test"),
+        ("fp32_refine_rounds", "the receipt field the mean is computed from"),
+        ("fp32_refine_solves", "and its denominator"),
+        ("search_residual", "the transport, named rather than left to be found"),
+        ("kCornerFluxTolerance", "the PPR break test that PERMITS its arm"),
+        ("kRelTol", "the CRAM break test that FORBIDS its solve"),
+        ("Neumaier", "the compensation, named -- plain Kahan would be a "
+                     "different claim"),
+        ("kAlpha0", "the CRAM term that stays double"),
+        ("pole_sum", "the CRAM receipt field"),
+        ("phic_next", "the PPR array that narrows"),
+        ("reduce_dot_stage1_f32_strict", "the STRICT kernel"),
+        ("bicg_restarts", "the counter STRICT is read on"),
+        ("8×M16", "the batch reference"),
+):
+    check(token in DOC,
+          "docs/WP20_GPU_FP32_20260831_KO.md names %s (%s)" % (token, what))
+for arm in ("9.1 arm A", "9.2 arm B", "9.3 arm C", "9.4 arm D", "9.5 arm E"):
+    check(arm in DOC,
+          "the doc carries a SEPARATE 238 runbook for %s -- one procedure for "
+          "five arms cannot attribute a number to a flag" % arm)
+check("채택하지 않는다" in DOC,
+      "and says outright that STRICT is not an arm to adopt: it is measured to "
+      "settle a claim, not to be shipped")
+
 
 
 # ---------------------------------------------------------------------------
