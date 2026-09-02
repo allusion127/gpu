@@ -102,6 +102,7 @@ CRAM = read("src", "CudaCramBackend.cu")
 CRAM_H = read("src", "CudaCramBackend.h")
 XSR_H = read("src", "CudaXsReconBackend.h")
 XSSET = read("src", "XSSet.cpp")
+XSSET_H = read("src", "XSSet.h")
 BICG = read("src", "CudaBICGBackend.cu")
 DRIVER = read("src", "Driver.h")
 MAIN = read("src", "main.cpp")
@@ -1183,6 +1184,51 @@ check("int           mic_device_elem_bytes" in CRAM_H,
       "the CRAM views carry the width beside the addresses")
 check(CRAM_H.count("const void*   mic_device[11]") == 2,
       "both the predictor and the corrector view carry untyped addresses")
+
+
+def rule_offer_follows_the_view(cram_h: str, xsset_h: str, xsset_cpp: str) -> bool:
+    """The PRODUCER of `mic_device` is spelled in the view's own pointee type.
+
+    WP20.1 widened `PredictorView::mic_device` and `CorrectorView::mic_device`
+    from `const double*[11]` to `const void*[11]`.  The one producer that fills
+    them is XSSet::FillCramMicDevice, and C++ gives `const void**` NO implicit
+    conversion to `const double**` -- a pointer-to-pointer conversion needs
+    identical pointee types modulo top-level qualification.  So a widening that
+    stops at the header is not a latent bug, it is a hard compile error at both
+    call sites, and every gate the commit claims becomes unreachable because no
+    binary can be produced.  That is exactly what shipped in WP21-D
+    (5b237bd..d6b51a7) and had to be repaired out of band in 3e36a10.
+
+    The expected signature is DERIVED FROM THE VIEW rather than hard-coded, so
+    the next width change has to move both sides or fail here.  The width is
+    checked too: a call site that takes `elem_bytes` and drops it leaves the
+    view's FP64 default standing over a float block, which is the silent half
+    of the same mistake.
+    """
+    view = strip_comments(cram_h)
+    pointee = re.search(r"const\s+(\w+)\s*\*\s+mic_device\[11\]", view)
+    if not pointee:
+        return False
+    want = ("FillCramMicDevice(const %s** dev, void*& ready, int& elem_bytes)"
+            % pointee.group(1))
+    if want not in strip_comments(xsset_h):
+        return False
+    body = strip_comments(xsset_cpp)
+    if ("bool XSSet::" + want) not in body:
+        return False
+    if body.count("FillCramMicDevice(v.mic_device, mic_ready, mic_bytes)") != 2:
+        return False
+    return body.count("v.mic_device_elem_bytes = mic_bytes;") == 2
+
+
+check(rule_offer_follows_the_view(CRAM_H, XSSET_H, XSSET),
+      "XSSet::FillCramMicDevice -- the ONLY producer of mic_device -- is "
+      "declared and defined in the pointee type the CRAM views declare, and "
+      "both call sites publish the width it hands back into "
+      "v.mic_device_elem_bytes.  A view widened without the producer does not "
+      "compile at all (const void** does not convert to const double**), and a "
+      "producer whose elem_bytes is dropped lets CRAM memcpy 8 bytes per "
+      "element out of a 4-byte block")
 FILLMIC = body_after(CRAM, "bool fillMic(const double* const* host_mic")
 check("elem_bytes == static_cast<int>(sizeof(float))" in FILLMIC,
       "fillMic decides from the caller's word, not from a guess")
@@ -1372,6 +1418,19 @@ NEGATIVES: list[tuple[str, object]] = [
      lambda: rule_iden_authority_is_published_wide(
          CTA.replace("w.iden[IH1]             = nden_h1;",
                      "w.iden[IH1]             = 2.0 * nH2O;"))),
+    # WP21-D shipped exactly this: the view widened, the producer did not, and
+    # the tree stopped compiling at src/XSSet.cpp:5374 and :5434.
+    ("the view is widened but the producer stays on const double**",
+     lambda: rule_offer_follows_the_view(
+         CRAM_H,
+         XSSET_H.replace("FillCramMicDevice(const void**",
+                         "FillCramMicDevice(const double**"),
+         XSSET.replace("FillCramMicDevice(const void**",
+                       "FillCramMicDevice(const double**"))),
+    ("a call site stops publishing the width it was handed",
+     lambda: rule_offer_follows_the_view(
+         CRAM_H, XSSET_H,
+         XSSET.replace("    v.mic_device_elem_bytes = mic_bytes;\n", "", 1))),
 ]
 for label, probe in NEGATIVES:
     checks += 1
