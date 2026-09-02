@@ -399,9 +399,26 @@ inline Tally& tally() {
 ///           plus its compensation is the same 312 B/thread, and 144 additions
 ///           per node is not a bandwidth item.  It is a NUMERICAL PROBE of the
 ///           WP20 cancellation claim, with a receipt.
-///   ppr     DEFERRED.  Strictly downstream of the iteration and therefore
-///           worth nothing to the trajectory; it is a VRAM item, not a
-///           throughput one.
+///   ppr     CONVERTED SINCE WP20.2, and converted AS A VRAM ITEM, which is
+///           what the WP20 sentence this replaces already said it would be: PPR
+///           is strictly downstream of the iteration and worth nothing to the
+///           trajectory.  RASBERY_GPU_FP32_PPR narrows the two device arrays
+///           MASTER MODE ALLOCATES FOR ITSELF -- `phic_next` and `mrel`, the
+///           CPB Jacobi's next-iterate and its per-(node, group) relative-change
+///           scratch -- and those two only.  The SENM arm never touches either,
+///           so the narrowing needs no mode gate and cannot move a B0 answer.
+///           Everything else in that backend stays FP64 with a reason: `phic`
+///           and `partials` are SHARED with the SENM arm (and `partials`
+///           carries a host-pinned 256-chunk association, i.e. a bit-exactness
+///           claim); `c` is the interpolant the reconstruction consumes; and
+///           `pin_power` is the answer Gate B measures and leaves the device as
+///           double.  The numeric argument for the two that do narrow is the
+///           break test itself: kCornerFluxTolerance is 1.0E-5 and float
+///           resolves a relative change to ~1.2e-7, so there are two decades
+///           between the fixed point the arm reaches and the tolerance it is
+///           asked to reach.  (Contrast CRAM's 1.0e-13, six decades the WRONG
+///           side of float eps -- which is why that solve may not narrow and
+///           this one may.)
 inline bool converted(Backend which) {
     switch (which) {
         case Backend::Cmfd:   return true;
@@ -409,7 +426,7 @@ inline bool converted(Backend which) {
         case Backend::Nodal:  return true;
         case Backend::Xe:     return false;
         case Backend::Cram:   return true;
-        case Backend::Ppr:    return false;
+        case Backend::Ppr:    return true;
         case Backend::Count:  break;
     }
     return false;

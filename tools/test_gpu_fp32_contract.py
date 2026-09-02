@@ -200,10 +200,67 @@ check("case Backend::Cram:   return true;" in CONVERTED,
       "in float with a Neumaier compensation.  It is still gated behind "
       "RASBERY_GPU_FP32_CRAM by inScope(), so the arm reports `declined` and "
       "not `fp32` unless the extension is asked for explicitly")
-check("case Backend::Xe:     return false;" in CONVERTED
-      and "case Backend::Ppr:    return false;" in CONVERTED,
-      "xe / ppr are declared DEFERRED in the table rather than "
-      "left to look converted")
+check("case Backend::Ppr:    return true;" in CONVERTED,
+      "WP20.2 converted PPR, and converted it AS A VRAM ITEM -- which is what "
+      "the WP20 deferral sentence already said it would be")
+check("case Backend::Xe:     return false;" in CONVERTED,
+      "xe is declared DEFERRED in the table rather than left to look converted")
+
+# WP20.2 -- PPR: THE TWO ARRAYS MASTER MODE OWNS, AND NOT ONE MORE.
+#
+# PPR is downstream of the statepoint, so this arm cannot buy throughput and
+# does not claim to.  What it can get wrong is SCOPE: `phic` and `partials` are
+# shared with the SENM arm, which is B0 against the host, and `partials` carries
+# a host-pinned chunk association -- narrowing either would put a bit-exactness
+# claim behind a rounding flag.  So the rules here are about which arrays the
+# arm may touch, and about the one place a corner value crosses into memory.
+PPR = read("src", "CudaPprBackend.cu")
+PPR_CODE = strip_comments(PPR)
+check(PPR_CODE.count("rasbery::fp32::routes(") == 1
+      and "rasbery::fp32::routes(rasbery::fp32::Backend::Ppr)" in PPR,
+      "the PPR backend asks the arm exactly once")
+GATE = body_after(PPR, "inline bool pprNarrowCorner()")
+check("static const bool on" in GATE,
+      "and caches it: the answer fixes a device allocation and a field of the "
+      "captured graph key, so it may not move between two statepoints")
+for name in ("float*  phic_next_f;", "float*  mrel_f;", "int     narrow_corner;"):
+    check(name in PPR, "DevCtx declares %s" % name)
+check("x.narrow_corner = (s.d_phic_next_f != nullptr) ? 1 : 0;" in PPR,
+      "the ctx stamps the flag from the BLOCK IT BOUND, so it can never "
+      "describe a width its pointers do not have")
+check("narrow_corner ? (void**)&d_phic_next_f : (void**)&d_phic_next" in PPR,
+      "ONE of the two rows is allocated, never both -- the wide pointer stays "
+      "null on the narrow arm so a body that skipped the accessors faults "
+      "instead of reading some other allocation and computing something "
+      "finite and plausible")
+check("phicNextPtr" not in PPR_CODE,
+      "the raw phic_next pointer accessor is GONE rather than kept-and-unused: "
+      "one that returned the wide array on the narrow arm is a null "
+      "dereference waiting for one more caller")
+for narrowed, why in (
+        ("phic_next", "the CPB Jacobi's next iterate"),
+        ("mrel", "the per-(node, group) relative-change scratch")):
+    check("x.%s_f[i]" % narrowed in PPR,
+          "%s (%s) has a narrow twin" % (narrowed, why))
+for wide, why in (
+        ("double* phic;", "SHARED with the SENM arm, which is B0 against the host"),
+        ("double* partials;", "SHARED, and its 256-chunk association is host-pinned"),
+        ("double* c;", "the interpolant the reconstruction consumes")):
+    check(wide in PPR, "%s stays FP64 -- %s" % (wide, why))
+check("double* pin_power" in read("src", "PprReconstructionKernel.cuh"),
+      "pin_power is the answer Gate B measures and leaves the device as double")
+STORE = body_after(PPR, "inline void pprPhicNextStore(")
+check("static_cast<float>(value)" in STORE,
+      "the rounding to the arm's width happens at the ONE place a corner value "
+      "crosses into memory")
+check('"RASBERY_GPU_FP32_PPR"' not in DRIVER,
+      "RASBERY_GPU_FP32_PPR is NOT in kArmEnv, on the same footing "
+      "RASBERY_GPU_PPR is not: PPR runs after the statepoint's last SolveLoop "
+      "and feeds nothing back, so two runs that differ only in it are the same "
+      "arm and must compare as one")
+check("RASBERY_GPU_FP32_PPR is deliberately ABSENT" in DRIVER,
+      "and the absence is EXPLAINED where the list is, because an unexplained "
+      "absence reads as an oversight and gets fixed")
 
 # WP20.2 -- CRAM: EXACTLY ONE ACCUMULATOR NARROWS, AND EVERY OTHER DOUBLE IN
 # THAT FILE HAS A NUMBER BEHIND IT.

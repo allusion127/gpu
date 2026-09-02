@@ -11,6 +11,7 @@
 
 #include "CudaPprBackend.h"
 #include "GpuCaptureArbiter.h"
+#include "GpuFp32Arm.h"      // WP20.2: RASBERY_GPU_FP32_PPR, the CPB scratch arm
 #include "PprReconstructionKernel.cuh"
 #include "XferLedger.h"
 
@@ -140,6 +141,44 @@ struct DevCtx {
     /// scatter-free read of `c`.
     double* phic_next;
     double* mrel;
+    /// WP20.2 -- RASBERY_GPU_FP32_PPR.  The NARROW twins of the two buffers
+    /// above, and of those two ONLY.
+    ///
+    /// WHY THOSE TWO AND NOTHING ELSE, since a reader will ask why `phic`, `c`
+    /// and `pin_power` are not here.  These are the only device arrays master
+    /// mode ALLOCATES FOR ITSELF: the comment above says it, and the SENM arm
+    /// -- which is B0 against the host's own corner update -- never reads or
+    /// writes either.  So narrowing them cannot move the SENM answer and needs
+    /// no mode gate at all, which is the whole reason the arm stops here:
+    ///
+    ///   phic      SHARED.  kCornerInit writes it in both modes and three SENM
+    ///             kernels read it.  Narrowing it would narrow a B0 arm.
+    ///   partials  SHARED, and worse: the SENM corner-sum fold's association is
+    ///             pinned to the host's 256-chunk order, so its width is part
+    ///             of a bit-exactness claim.
+    ///   c         the interpolant coefficients the RECONSTRUCTION consumes;
+    ///             pin_power comes out of them and pin_power is what Gate B
+    ///             measures.
+    ///   pin_power the answer.  It leaves the device as double and reaches
+    ///             _g.PinPower() as double.
+    ///
+    /// THE NUMERIC ARGUMENT for the two that do narrow: the CPB loop's break
+    /// test is `maxrel < kCornerFluxTolerance` = 1.0E-5, and float resolves a
+    /// relative change to ~1.2e-7.  There are two decades between the fixed
+    /// point this arm can reach and the tolerance it is asked to reach, so the
+    /// loop still terminates on the criterion rather than on its own noise.
+    /// (Contrast CRAM, whose kRelTol is 1.0e-13 -- six decades the wrong side
+    /// of float eps, which is why THAT solve may not narrow.)
+    ///
+    /// Null when the arm is off; the wide pair is null when it is on, so a
+    /// reader that skipped the accessors faults instead of computing something
+    /// finite and plausible.
+    float*  phic_next_f;
+    float*  mrel_f;
+    /// 1 = the pair above is the live one.  Carried in the ctx, and therefore
+    /// in the graph key, for the same reason `mode_master` is: it is a
+    /// different set of memcpy widths and a different kernel body.
+    int     narrow_corner;
     /// 1 = the master body was enqueued.  Carried in the ctx (and therefore in
     /// the graph key) so a capture cannot be replayed under the other scheme.
     int mode_master;
@@ -197,6 +236,18 @@ __device__ inline double dCrdf(const DevCtx& x, int lk, int g) {
 __device__ inline bool pprHalted(const DevCtx& x) { return x.loop->converged != 0; }
 
 /// Upper-triangular slot of the 15-term expansion: 5i - i(i-1)/2 + j.
+/// WP20.2.  Is the master-mode CPB scratch narrowed?
+///
+/// Read ONCE and cached, for the reason every width question in this campaign
+/// is: it fixes a device ALLOCATION and it is a field of the captured graph's
+/// key, so it may not move between two statepoints of one run.  routes() folds
+/// RASBERY_GPU_FP32 and the sticky non-finite latch together, so there is one
+/// answer and the launch site, the allocation and the receipt all read it.
+inline bool pprNarrowCorner() {
+    static const bool on = rasbery::fp32::routes(rasbery::fp32::Backend::Ppr);
+    return on;
+}
+
 __device__ inline int triIdx(int i, int j) { return 5 * i - (i * (i - 1)) / 2 + j; }
 
 __device__ inline double* pPtr(const DevCtx& x, int lk, int g) { return &x.p[(lk * 15 * x.ng) + g * 15]; }
@@ -237,8 +288,37 @@ __device__ inline double getJoutRedD(const DevCtx& x, int lr, int dir, int lk, i
     return sgn * jn * h / (2.0 * D);
 }
 
-__device__ inline double* phicNextPtr(const DevCtx& x, int lk, int g) {
-    return &x.phic_next[(lk * 4 * x.ng) + g * 4];
+/// WP20.2.  The MASTER-ONLY CPB scratch, reached at the arm's width.
+///
+/// Accessors rather than a pointer, and that is the same discipline
+/// src/FlatXsKernel.h's fxsRefMic/fxsStoreMic established for the micx blocks:
+/// the width travels WITH the address, so a body cannot name one and get the
+/// other.  `phicNextPtr` is gone rather than kept-and-unused -- a pointer that
+/// returns the wide array on the narrow arm is a null dereference waiting for
+/// somebody to add one more caller.
+__device__ inline long long pprCornerIdx(const DevCtx& x, int lk, int g, int dir) {
+    return static_cast<long long>(lk) * 4 * x.ng + static_cast<long long>(g) * 4 + dir;
+}
+__device__ inline double pprPhicNext(const DevCtx& x, int lk, int g, int dir) {
+    const long long i = pprCornerIdx(x, lk, g, dir);
+    return x.narrow_corner ? static_cast<double>(x.phic_next_f[i]) : x.phic_next[i];
+}
+__device__ inline void pprPhicNextStore(const DevCtx& x, int lk, int g, int dir,
+                                        double value) {
+    const long long i = pprCornerIdx(x, lk, g, dir);
+    // The ONE place a corner value crosses into memory, so the ONE place it is
+    // rounded to the arm's width.
+    if (x.narrow_corner) x.phic_next_f[i] = static_cast<float>(value);
+    else                 x.phic_next[i]   = value;
+}
+__device__ inline double pprMrel(const DevCtx& x, int lk, int g) {
+    const long long i = static_cast<long long>(lk) * x.ng + g;
+    return x.narrow_corner ? static_cast<double>(x.mrel_f[i]) : x.mrel[i];
+}
+__device__ inline void pprMrelStore(const DevCtx& x, int lk, int g, double value) {
+    const long long i = static_cast<long long>(lk) * x.ng + g;
+    if (x.narrow_corner) x.mrel_f[i] = static_cast<float>(value);
+    else                 x.mrel[i]   = value;
 }
 
 /// PPR::buildStencil.
@@ -873,8 +953,7 @@ __global__ void kMasterCpb(DevCtx x) {
     bool xrev[3][3], yrev[3][3];
     buildStencilD(x, lk, idx, xrev, yrev);
 
-    const double* phic_in  = phicPtr(x, lk, g);
-    double*       phic_out = phicNextPtr(x, lk, g);
+    const double* phic_in = phicPtr(x, lk, g);
 
     double node_max = 0.0;
 
@@ -924,17 +1003,22 @@ __global__ void kMasterCpb(DevCtx x) {
                 // and leaving `node_max` alone is the other half -- writing a
                 // relativeChange of a value against itself would report 1.0 for
                 // an untouched zero corner and hold the loop open forever.
-                phic_out[dir] = fold;
+                pprPhicNextStore(x, lk, g, dir, fold);
                 continue;
             }
 
+            // The balance, the quotient and the relative change stay FP64 on
+            // both arms: only the STORED corner narrows.  Narrowing the
+            // arithmetic as well would move the fixed point instead of the
+            // resolution it is held at, and the break test would then be
+            // measuring the arm rather than the sweep.
             const double fnew = num / den;
             if (fold != 0.0) node_max = fmax(node_max, fabs((fnew - fold) / fold));
-            phic_out[dir] = fnew;
+            pprPhicNextStore(x, lk, g, dir, fnew);
         }
     }
 
-    x.mrel[lk * x.ng + g] = node_max;
+    pprMrelStore(x, lk, g, node_max);
 }
 
 /// driveMaster step 2, the commit: `phic_next` becomes `phic`, and the same
@@ -959,13 +1043,14 @@ __global__ void kMasterCommit(DevCtx x) {
     double m = 0.0;
     for (int lk = lb; lk < le; ++lk) {
         for (int g = 0; g < x.ng; ++g) {
-            double*       dst = phicPtr(x, lk, g);
-            const double* src = phicNextPtr(x, lk, g);
-            dst[0] = src[0];
-            dst[1] = src[1];
-            dst[2] = src[2];
-            dst[3] = src[3];
-            m = fmax(m, x.mrel[lk * x.ng + g]);
+            double* dst = phicPtr(x, lk, g);
+            // `phic` itself stays FP64 -- it is shared with the SENM arm -- so
+            // on the narrow arm this widening IS the commit, and it is exact.
+            dst[0] = pprPhicNext(x, lk, g, 0);
+            dst[1] = pprPhicNext(x, lk, g, 1);
+            dst[2] = pprPhicNext(x, lk, g, 2);
+            dst[3] = pprPhicNext(x, lk, g, 3);
+            m = fmax(m, pprMrel(x, lk, g));
         }
     }
     x.partials[c] = m;
@@ -1302,6 +1387,9 @@ struct PprBackend::Impl {
     // would turn a mode switch into a re-shape of every buffer and every graph.
     double* d_phic_next = nullptr;
     double* d_mrel      = nullptr;
+    /// WP20.2.  Exactly one of each pair is non-null for the life of the Impl.
+    float*  d_phic_next_f = nullptr;
+    float*  d_mrel_f      = nullptr;
 
     double* d_partials = nullptr;
     double* h_partials = nullptr; ///< pinned, 4 * nchunk
@@ -1488,6 +1576,7 @@ struct PprBackend::Impl {
         f(d_xsdf);   f(d_xsrf);    f(d_xsnf);   f(d_xssm);  f(d_chif); f(d_crdf);
         f(d_phic);   f(d_p);       f(d_a);      f(d_c);     f(d_q);    f(d_l);  f(d_bt);
         f(d_phic_next); f(d_mrel);
+        f(d_phic_next_f); f(d_mrel_f);
         f(d_partials); f(d_loop);  f(d_mismatch);
         releaseRecon();
         if (h_partials) cudaFreeHost(h_partials);
@@ -1501,6 +1590,7 @@ struct PprBackend::Impl {
         d_xsdf = d_xsrf = d_xsnf = d_xssm = d_chif = d_crdf = nullptr;
         d_phic = d_p = d_a = d_c = d_q = d_l = d_bt = nullptr;
         d_phic_next = nullptr; d_mrel = nullptr;
+        d_phic_next_f = nullptr; d_mrel_f = nullptr;
         d_partials = nullptr; h_partials = nullptr;
         d_loop = nullptr; h_loop = nullptr;
         d_mismatch = nullptr; h_mismatch = nullptr;
@@ -1592,6 +1682,9 @@ struct PprBackend::Impl {
         const size_t nng = nn * ng;
         const size_t nsg = static_cast<size_t>(nsurf) * ng;
 
+        // WP20.2.  Asked ONCE, here, at the allocation the answer sizes.
+        const bool narrow_corner = pprNarrowCorner();
+
         struct Alloc { void** p; size_t bytes; const char* name; };
         const Alloc allocs[] = {
             {(void**)&d_hmesh,   nn * kNDIRMAX * sizeof(double),      "hmesh"},
@@ -1614,8 +1707,14 @@ struct PprBackend::Impl {
             {(void**)&d_q,       nng * 15 * sizeof(double),           "q"},
             {(void**)&d_l,       nng * 9 * sizeof(double),            "l"},
             {(void**)&d_bt,      nng * sizeof(double),                "bt"},
-            {(void**)&d_phic_next, nng * 4 * sizeof(double),          "phic_next"},
-            {(void**)&d_mrel,    nng * sizeof(double),                "mrel"},
+            // WP20.2.  ONE of the two rows is taken, never both: the wide
+            // pointer stays null on the narrow arm so a body that skipped the
+            // accessors faults rather than reading the MACROSCOPIC region of
+            // some other allocation and computing something plausible.
+            {narrow_corner ? (void**)&d_phic_next_f : (void**)&d_phic_next,
+             nng * 4 * (narrow_corner ? sizeof(float) : sizeof(double)), "phic_next"},
+            {narrow_corner ? (void**)&d_mrel_f : (void**)&d_mrel,
+             nng * (narrow_corner ? sizeof(float) : sizeof(double)),     "mrel"},
             {(void**)&d_partials, static_cast<size_t>(4 * nchunk) * sizeof(double), "partials"},
             {(void**)&d_loop,    sizeof(PprLoopState),                "loop_state"},
             {(void**)&d_mismatch,
@@ -2002,6 +2101,11 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
     x.bt        = s.d_bt;
     x.phic_next = s.d_phic_next;
     x.mrel      = s.d_mrel;
+    x.phic_next_f = s.d_phic_next_f;
+    x.mrel_f      = s.d_mrel_f;
+    // Stamped from the BLOCK THAT WAS ACTUALLY BOUND rather than from the gate,
+    // so the ctx can never describe a width its pointers do not have.
+    x.narrow_corner = (s.d_phic_next_f != nullptr) ? 1 : 0;
     x.mode_master = step.mode_master ? 1 : 0;
     x.c_ro      = s.d_c;
 

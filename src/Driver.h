@@ -611,6 +611,11 @@ inline constexpr const char* kArmEnv[] = {
     "RASBERY_GPU_FP32",
     "RASBERY_GPU_FP32_STRICT",
     "RASBERY_GPU_FP32_CRAM",
+    // WP20.2.  RASBERY_GPU_FP32_PPR is deliberately ABSENT from this list, on
+    // the same footing RASBERY_GPU_PPR is: PPR is downstream of the statepoint
+    // and cannot move a trajectory, so two runs that differ only in it are the
+    // same arm and must compare as one.  It appears in the [RASBERY][FP32]
+    // receipt instead, which is where a VRAM item belongs.
     // WP20.2.  The refinement ROUND CAP, and it belongs here for a sharper
     // reason than the other three: it does not merely change the rounding of a
     // kernel, it changes HOW MANY TIMES the inner solve runs and what the outer

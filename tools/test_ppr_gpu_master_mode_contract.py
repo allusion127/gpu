@@ -240,27 +240,63 @@ def check(raw: dict[str, str]) -> list[str]:
     if not cpb:
         problems.append("CudaPprBackend.cu: kMasterCpb not found")
     else:
-        want(cpb, "double*       phic_out = phicNextPtr(x, lk, g);", "kMasterCpb",
+        # WP20.2 replaced the two `phic_next` POINTERS with accessors, because
+        # the array's width is now the RASBERY_GPU_FP32_PPR arm's to choose and
+        # a pointer cannot carry a width.  What the rule is about is unchanged
+        # and is checked on the accessor instead: the sweep writes the NEXT
+        # iterate and never the current one.
+        want(cpb, "pprPhicNextStore(x, lk, g, dir,", "kMasterCpb",
              "the sweep writes the NEXT iterate")
+        forbid(cpb, "phicNextPtr(", "kMasterCpb",
+               "a raw pointer into phic_next is null on the narrow arm; the width has "
+               "to travel with the address, which is what the accessors are for")
         want(cpb, "x.phic[(m * 4 * x.ng) + (g * 4) + adj1]", "kMasterCpb",
              "and reads the current one, from the neighbouring node")
         if re.search(r"phicPtr\(x,\s*lk,\s*g\)\s*;?\s*$", cpb, re.M) and \
-                "const double* phic_in  = phicPtr(x, lk, g);" not in cpb:
+                "const double* phic_in = phicPtr(x, lk, g);" not in cpb:
             problems.append("kMasterCpb: takes a MUTABLE phicPtr; the sweep may only read "
                             "the current iterate")
         forbid(cpb, "phic_in[dir] =", "kMasterCpb",
                "writing the current iterate from the sweep is the in-place Gauss-Seidel "
                "the host does and the device cannot: neighbouring threads read it")
+        # The BALANCE stays FP64 on both arms.  Only the stored corner narrows;
+        # narrowing the arithmetic would move the fixed point rather than the
+        # resolution it is held at, and the break test would then be measuring
+        # the arm instead of the sweep.
+        want(cpb, "const double fnew = num / den;", "kMasterCpb",
+             "the corner balance and its quotient are FP64 whatever the arm")
+        want(cpb, "node_max = fmax(node_max, fabs((fnew - fold) / fold));", "kMasterCpb",
+             "and so is the relative change the break test folds")
 
     commit = function_body(CU, "__global__ void kMasterCommit(DevCtx x)")
     if not commit:
         problems.append("CudaPprBackend.cu: kMasterCommit not found")
     else:
-        want(commit, "const double* src = phicNextPtr(x, lk, g);", "kMasterCommit",
+        want(commit, "dst[0] = pprPhicNext(x, lk, g, 0);", "kMasterCommit",
              "the commit is the only writer of phic during the master drive")
+        want(commit, "m = fmax(m, pprMrel(x, lk, g));", "kMasterCommit",
+             "and it folds the relative changes through the same accessor pair")
+        forbid(commit, "phicNextPtr(", "kMasterCommit",
+               "the commit reaches phic_next through the accessor too, so the arm's "
+               "width is decided in ONE place for the whole master body")
         want(commit, "detChunkBegin(x.nxyz, nchunk, c)", "kMasterCommit",
              "and it folds the relative changes over the SAME deterministic partition the "
              "corner sums use, so the arm stays run-to-run deterministic")
+
+    # WP20.2.  `phic_next` and `mrel` are the two arrays MASTER MODE ALLOCATES
+    # FOR ITSELF, which is what makes them narrowable at all: the SENM arm --
+    # B0 against the host's own corner update -- never touches either, so the
+    # width is a master-mode property and belongs in this file.  What has to
+    # hold is that the width travels WITH the address: a body that named the
+    # wide pointer on the narrow arm would read a null.
+    for accessor in ("pprPhicNext", "pprMrel"):
+        body = function_body(CU, "inline double %s(const DevCtx& x" % accessor)
+        if not body:
+            problems.append("CudaPprBackend.cu: %s not found" % accessor)
+        else:
+            want(body, "x.narrow_corner ?", accessor,
+                 "the accessor branches on the ctx's OWN width flag rather than on a "
+                 "global, so the width cannot disagree with the pointers it describes")
 
     fold = function_body(CU, "__global__ void kMasterFoldAndCheck(DevCtx x)")
     if not fold:
@@ -531,8 +567,11 @@ __global__ void kMasterCpb(DevCtx x) {
      """template <bool kGuarded>
 __global__ void kMasterCpb(DevCtx x) {"""),
     ("the sweep writes the current iterate (the in-place race)", "cu",
-     "    double*       phic_out = phicNextPtr(x, lk, g);",
-     "    double*       phic_out = phicPtr(x, lk, g);"),
+     "            pprPhicNextStore(x, lk, g, dir, fnew);",
+     "            phic_in[dir] = fnew;"),
+    ("the narrow arm loses its accessor and reads the wide pointer", "cu",
+     "    return x.narrow_corner ? static_cast<double>(x.phic_next_f[i]) : x.phic_next[i];",
+     "    return x.phic_next[i];"),
     ("a coefficient term is reassociated", "cu",
      "c[triIdx(2, 0)] = r14 * (10.0 * (pxr + pxl) + (jxr + jxl) - 20.0 * pb);",
      "c[triIdx(2, 0)] = r14 * ((jxr + jxl) + 10.0 * (pxr + pxl) - 20.0 * pb);"),
