@@ -1276,6 +1276,22 @@ struct CramBackend::Impl {
                     d_mic[k], static_cast<const float*>(dev_mic[kSlot[k]]), nmic);
                 const cudaError_t rc = cudaGetLastError();
                 if (rc != cudaSuccess) return fail("D2D mic (widen)", rc);
+                // THE TWO ARMS REPORT INTO THE SAME LEDGER ROW OR NEITHER DOES.
+                // The wide arm below is a rasbery::xfer::memcpyAsync, so its
+                // D2D payload lands in [RASBERY][XFER] under the row
+                // "CudaCramBackend.cu:fillMic:D2D mic" by construction.  This
+                // arm is a KERNEL, and no memcpy wrapper can see a kernel --
+                // which is exactly the case xfer::note exists for.  Without
+                // this line the narrow arm's four launches per fill would move
+                // 4 * nmic * 4 B that the ledger never counts, the ledger's
+                // D2D total would drop by the arm's whole payload relative to
+                // the FP64 arm, and an A/B that reads the two ledgers against
+                // each other would charge the difference to RASBERY_GPU_FP32
+                // instead of to the instrumentation gap.  Same scope, same
+                // leaf, and the same `moved` the backend-local tally uses, so
+                // the two receipts agree on both arms.
+                rasbery::xfer::note("CudaCramBackend.cu:fillMic", "D2D mic",
+                                    rasbery::xfer::XferDir::kD2D, moved);
                 n_micx_d2d_bytes += moved;
             } else if (d2d) {
                 const cudaError_t rc = rasbery::xfer::memcpyAsync(

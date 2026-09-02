@@ -1240,6 +1240,67 @@ check("nmic * sizeof(float)" in FILLMIC,
 
 
 # ---------------------------------------------------------------------------
+# 13.1 WP20.1 -- THE WIDTH HAS A PRODUCER, AND THE WIDEN ARM IS ON THE LEDGER.
+#
+# Two ways the section above can be true of the TEXT and false of the BINARY,
+# and both have happened:
+#
+#   * `mic_device_elem_bytes` defaults to sizeof(double) in both views.  If no
+#     caller ever writes it, `narrow` is always false, `kCramWidenMic` is dead
+#     code, and the header's "the handover is a WIDENING KERNEL rather than a
+#     memcpy" describes behaviour RASBERY_GPU_FP32=1 cannot reach.  A field
+#     with a default and no producer is a comment, not a contract.
+#   * The wide arm is a rasbery::xfer::memcpyAsync and is therefore in the
+#     [RASBERY][XFER] ledger by construction; the narrow arm is a bare kernel
+#     launch that no memcpy wrapper can see.  If it does not declare its own
+#     row, the ledger's D2D total silently drops by the arm's whole payload the
+#     moment the arm goes live, and the A/B that reads the FP32 and FP64
+#     ledgers against each other charges the missing bytes to the arm.
+# ---------------------------------------------------------------------------
+def rule_cram_width_has_a_producer(xsset_text: str) -> bool:
+    """The width is ASKED FOR and then HANDED ON, at both view-fill sites."""
+    xs = strip_comments(xsset_text)
+    offer = body_after(xs, "bool XSSet::FillCramMicDevice(")
+    if "elem_bytes = _xsrecon_backend->micxDeviceElemBytes();" not in offer:
+        return False
+    # Both the predictor's and the corrector's view: one of the two left on the
+    # default is one arm silently memcpying out of a float block.
+    return (xs.count("FillCramMicDevice(v.mic_device, mic_ready, mic_bytes)") == 2
+            and xs.count("v.mic_device_elem_bytes = mic_bytes;") == 2)
+
+
+def rule_widen_arm_is_on_the_xfer_ledger(cram_text: str) -> bool:
+    """The kernel arm declares the SAME ledger row the memcpy arm gets free,
+    for the SAME bytes its own tally counts."""
+    body = strip_comments(body_after(cram_text,
+                                     "bool fillMic(const double* const* host_mic"))
+    wide = re.search(r'xfer::memcpyAsync\(\s*"([^"]*)"\s*,\s*"([^"]*)"', body)
+    if wide is None:
+        return False
+    narrow = re.search(r'xfer::note\(\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,\s*'
+                       r'rasbery::xfer::XferDir::kD2D\s*,\s*moved\s*\)', body)
+    if narrow is None:
+        return False
+    if narrow.groups() != wide.groups():
+        return False
+    # ...and `moved` is what the backend-local tally adds, so the two receipts
+    # cannot drift apart on either arm.
+    return "n_micx_d2d_bytes += moved;" in body
+
+
+check(rule_cram_width_has_a_producer(XSSET),
+      "the CRAM view's element width has a PRODUCER: FillCramMicDevice asks "
+      "the flat-XS backend and both view-fill sites hand the answer on.  With "
+      "no writer the field keeps its sizeof(double) default, `narrow` is never "
+      "true and kCramWidenMic is unreachable")
+check(rule_widen_arm_is_on_the_xfer_ledger(CRAM),
+      "the widening arm records its D2D bytes in the [RASBERY][XFER] ledger "
+      "under the SAME scope and leaf the memcpy arm uses -- a kernel cannot go "
+      "through the memcpy wrapper, so it declares the row with xfer::note or "
+      "the ledger stops agreeing with itself the moment the arm goes live")
+
+
+# ---------------------------------------------------------------------------
 # 14. WP20.1 -- NODAL: ONE BODY, TWO INSTANTIATIONS, AND A KEY THAT KNOWS.
 # ---------------------------------------------------------------------------
 check("template <class ValueT>\nstruct NodalViewT {" in NODK,
@@ -1431,6 +1492,24 @@ NEGATIVES: list[tuple[str, object]] = [
      lambda: rule_offer_follows_the_view(
          CRAM_H, XSSET_H,
          XSSET.replace("    v.mic_device_elem_bytes = mic_bytes;\n", "", 1))),
+    ("the offer stops asking the backend for the block's width",
+     lambda: rule_cram_width_has_a_producer(
+         XSSET.replace("elem_bytes = _xsrecon_backend->micxDeviceElemBytes();",
+                       "elem_bytes = static_cast<int>(sizeof(double));"))),
+    ("one of the two view-fill sites drops the width and keeps the default",
+     lambda: rule_cram_width_has_a_producer(
+         XSSET.replace("    v.mic_device_elem_bytes = mic_bytes;\n", "", 1))),
+    ("the widening arm's ledger row drifts off the memcpy arm's",
+     lambda: rule_widen_arm_is_on_the_xfer_ledger(
+         CRAM.replace('rasbery::xfer::note("CudaCramBackend.cu:fillMic"',
+                      'rasbery::xfer::note("CudaCramBackend.cu:fillMicWiden"'))),
+    ("the widening arm stops declaring a ledger row at all",
+     lambda: rule_widen_arm_is_on_the_xfer_ledger(
+         CRAM.replace("rasbery::xfer::note(", "(void)sizeof("))),
+    ("the ledger is told a different number from the one the tally adds",
+     lambda: rule_widen_arm_is_on_the_xfer_ledger(
+         CRAM.replace("rasbery::xfer::XferDir::kD2D, moved);",
+                      "rasbery::xfer::XferDir::kD2D, bytes);"))),
 ]
 for label, probe in NEGATIVES:
     checks += 1
