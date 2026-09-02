@@ -9,7 +9,7 @@
 | 기준 덱 | KNGR `kngr_238.json`, `nxyz = 8,451`, `nsurf = 26,692`, `NG = 2` |
 | 게이트 등급 | **B0** — 이 WP는 **주소를 하나도 바꾸지 않는다**. 규약에 이름을 붙이고, 수신증에 적고, 계약으로 고정한다 |
 | 판정 | digest **`1f36e75dc00ed2b4` / `4377`** 불변 + `h5diff -c` 0 + 핀 CSV Δ=0 |
-| 계약 테스트 | `tools/test_micx_layout_contract.py` · `tools/test_nodal_soa_contract.py` (순수 python, negative control 각 9/8종) |
+| 계약 테스트 | `tools/test_micx_layout_contract.py` · `tools/test_nodal_soa_contract.py` (순수 python, negative control 각 9종 / 7종) |
 | 소스 | `src/FlatXsKernel.h` · `src/FlatXsCtaKernel.cuh` · `src/CudaXsReconBackend.cu` |
 | 결론 한 줄 | **WP21-B의 전제가 뒤집혀 있었다.** 블록은 이미 SoA였고, 25.2는 레이아웃 결함이 아니라 **CTA-per-node라는 병렬화 축과 SoA의 구조적 불일치**다 |
 
@@ -264,9 +264,15 @@ WP21-A와 WP21-C 사이의 **핸드오프 규약**을 양쪽에서 고정한다.
 nodal 쪽에서는 아무 데도 강제되지 않는다. 누가 나중에 `phi`를 순열하면 nodal은 그것을
 `flux[lk*NG+ig]`로 읽는다 — 조용히.
 
-고정하는 것: 정본 세 영역의 인덱스 형태(양쪽 파일에서), `cmfd_layout` 헬퍼가 정본 배열을
-**덮지 않을 것**, `canonicalFromSlotView`의 레이아웃 주석이 살아 있을 것, nodal 수신증의 두
-필드, 그리고 §4.1.1의 미변환 인벤토리가 이 문서에 남아 있을 것.
+6개 규칙 + negative control 7종. 고정하는 것: 정본 세 영역의 인덱스 형태(`NodalKernel.h`),
+어떤 레이아웃 헬퍼도 정본 포인터에 적용되지 않을 것(**양쪽 파일에서**),
+`canonicalFromSlotView`의 레이아웃 주석이 살아 있을 것, `CudaBICGBackend.cu`가 `2*l+ig`를
+유지할 것, nodal 수신증의 두 필드가 리터럴이 아니라 상수를 인용할 것, 그리고 §4.1.1의
+노드-메이저 철자가 **실제로 그 자리에 있을 것**(109 + 16 + 8 + 9 = 142 지점).
+
+마지막 규칙이 이 게이트의 자물쇠다: 배열을 변환하면 철자 수가 줄어 게이트가 깨지고, 그때
+고치는 방법은 `kNodalPrivateLayout`과 이 문서 §4를 같이 갱신하는 것뿐이다. **미변환이
+잊히는 경로가 없다.**
 
 ---
 

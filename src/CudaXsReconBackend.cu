@@ -548,6 +548,44 @@ __global__ void kernelFlatXs(fxs::FlatXsView v) {
 
 namespace ndl = rasbery::nodal;
 
+// ---------------------------------------------------------------------------
+// WP21-C: THE TWO STORAGE ORDERS THE NODAL DRIVE RUNS IN, NAMED
+// ---------------------------------------------------------------------------
+//
+// These are DESCRIPTIONS, not switches.  The orders themselves are spelled in
+// ndl::NodalViewT's indexing note (src/NodalKernel.h) and in the bodies that
+// index it, and NodalKernel.h is the SHARED host/device text -- Nodal.cpp runs
+// the same functions over its own host arrays as a production arm, so the order
+// is not this file's to flip.  What this file can do, and what WP21-C does, is
+// make a run STATE which order it ran in, so an ncu profile or a digest is
+// never read against the wrong kernel body.
+//
+//   kNodalCanonicalLayout  "element": flux at [lk*NG + ig], jnet and phis at
+//     [ls*NG + ig].  Under canonical sharing these three pointers ARE the CMFD
+//     backend's buffers (src/GpuCanonicalState.h: "the same bytes both backends
+//     already index, not a transposed copy that would need a conversion kernel
+//     on every handover"), and WP21-A left the CMFD side of that handoff --
+//     phi, src and the Krylov state -- at the element index [2l+ig] precisely
+//     so it stays true.  So this string is a TWO-SIDED INVARIANT, not a note:
+//     if either side moves without the other, the nodal kernels and the CMFD
+//     operator read the same bytes through two different maps and every number
+//     downstream is finite and wrong.
+//
+//   kNodalPrivateLayout  "node_major": the nine updateConstant products
+//     (eta1/eta2/m260/m251/m253/m262/m264/diagD/diagDI) and the twelve working
+//     arrays at [(lk*NDIR + idir)*NG + ig], the four per-node matrices
+//     (matM/matMI/matMs/matMf) at [lk*NG2 + j*NG + i], and mu/tau at
+//     [(lk*NDIR + idir)*NG2 + j*NG + i].  Six to twelve doubles per node with
+//     the node OUTERMOST, which is what puts kNodalJnet's loads at 16.7 sectors
+//     per request (pricing block 39) -- and it is a residual WP21-C measured,
+//     inventoried and did NOT convert.  Printed as a standing statement of that
+//     residual: while this reads "node_major" the 16.7 is explained rather than
+//     unattributed, and whoever converts it changes this string first.  The
+//     conversion, and the three reasons it is not here, are written down rather
+//     than implied: docs/WP21_BC_FLATXS_NODAL_COALESCING_20260831_KO.md §4.
+constexpr const char* kNodalCanonicalLayout = "element";
+constexpr const char* kNodalPrivateLayout   = "node_major";
+
 std::atomic<unsigned long long> g_nodal_drives{0};
 /// Rev.7.1 Task 18-lite receipt: bytes the canonical binding kept off the bus.
 ///
@@ -2082,7 +2120,14 @@ struct NodalReceipt {
                   << ",\"drains_deferred\":"
                   << g_nodal_drains_deferred.load(std::memory_order_relaxed)
                   << ",\"reigv_device_drives\":"
-                  << g_nodal_reigv_device.load(std::memory_order_relaxed) << "}"
+                  << g_nodal_reigv_device.load(std::memory_order_relaxed)
+                  // WP21-C.  WHICH STORAGE ORDER THE NODAL ARRAYS RAN IN.  Two
+                  // fields because there are two orders and only one of them is
+                  // ours to move; see kNodalCanonicalLayout above for why the
+                  // first is a two-sided invariant with WP21-A and the second is
+                  // a standing statement of an inventoried residual.
+                  << ",\"canonical_layout\":\"" << kNodalCanonicalLayout
+                  << "\",\"private_layout\":\"" << kNodalPrivateLayout << "\"}"
                   << std::endl;
 
         // The arena's own receipt, on its own tag so nothing consuming the line
