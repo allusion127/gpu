@@ -301,6 +301,47 @@ sm_61에서 400만 인자를 훑어 `sqrt`는 전부 일치, `exp`는 **3.34 %�
 그리고 그것은 Gate B 핀출력 미스로 발견하는 것보다 수신증에서 읽는 편이 훨씬 낫다.
 표본이 없는 런은 `0`이 아니라 **`-1`**을 찍는다("표본 없음"과 "0 ulp"는 다른 사실이다).
 
+### 6.1 블록 49가 찍은 `max_ulp:9545195`는 산술이 아니라 **경합**이었다
+
+블록 49v2의 수신증: `checked_elems:184320, max_ulp:9545195, max_ulp_array:7,
+over_1ulp:107279`(58.2 %) — **그런데 Gate A·Gate B는 통과했다.** 950만 ulp는 "exp가 1 ulp
+다르다"가 아니다. 셋 중 어느 것인지를 코드에서 가렸다.
+
+**배열 7은 `diagD = 4·xsdf / (hmesh·hmesh)`다.** exp도 sqrt도 없고, form 마스크 사이트도
+없고, `--fmad=false` 아래 IEEE 나눗셈 하나다. 호스트와 디바이스가 **1 ulp도** 다를 수 없다.
+그러므로 그 숫자는 애초에 산술에 대한 것이 아니었다. (참고: `CudaNodalConstantKernel.h`의
+**아레나** 커널 enum은 7 = `diagDI`, 8 = `diagD`로 **반대**다. 이 백엔드의 패킹은 7 = `diagD`이고,
+수신증은 이제 배열 이름을 함께 찍는다.)
+
+**진짜 원인**: 커널은 `cudaStreamNonBlocking`으로 만든 `stream`에서 돌고, 자기검사의
+`xfer::memcpy`는 **레거시 기본 스트림**의 블로킹 복사다. 레거시 스트림은 non-blocking
+스트림과 **암묵적 순서를 갖지 않는다.** 즉 되읽기는 `kNodalConstsDevice`가 아직 쓰지 않은
+메모리를 표본했고, 비교 대상은 **직전 generation의 계수**(또는 OFF 경로가 올려 둔 값)였다.
+Gate A/B가 통과한 것은 이 아름의 **진짜 소비자**가 같은 스트림 위의 커널들이라 처음부터
+빌드 뒤에 올바르게 정렬돼 있었기 때문이다 — 순서를 어긴 것은 **진단뿐**이었다.
+
+**수정 세 가지** (`src/CudaXsReconBackend.cu`, `src/NodalConstsReceipt.h`):
+
+1. 되읽기 전에 **빌드 스트림을 배수**한다(`xfer::streamSync(…, "selfcheck drain", stream)`).
+   표본은 1,081빌드 중 5회뿐이므로 이 동기화는 아름의 경로가 아니라 **진단의 경로**에 있다.
+2. **지표를 배열별·상대오차로** 바꾼다. ULP 거리는 0 근처에서 무한대이고 부호가 바뀌면
+   의미가 없는데 이 계수들은 실제로 0을 넘나든다. `rel = |a−b| / max(|a|,|b|,floor)`이고
+   **floor는 그 배열 자신의 표본 최대 크기 × 1e-12** — 누가 고른 상수가 아니다. ULP도 함께
+   남긴다(스파이크의 경계가 ulp로 서술돼 있으므로).
+3. `max_ulp_array`를 **저장하지 않고 유도**한다. 기존 코드는 compare-exchange **뒤에**
+   다시 읽은 `worst >= max_ulp`로 저장했는데, 이것은 뒤의 검사가 최대값을 **동점으로 맞추기만
+   해도** 참이 된다. 이제 9칸 배열별 표가 기록이고 두 스칼라는 그 argmax이며, 수신증은
+   `by_array`로 표 전체를 찍는다.
+
+`tools/test_nodal_consts_gpu_contract.py`의 규칙 13·14가 각각 부정 대조군과 함께 이 두
+성질(배수 순서, 배열별 상대 지표)을 잡아 둔다. 규칙 13의 대조군은 `stream` 대신 `nullptr`을
+동기화하는 것 — 즉 **버그 그 자체**다.
+
+**재확인**: 238에서 `RASBERY_GPU_NODAL_CONSTS=1`을 다시 돌려
+`[RASBERY][NODAL_CONSTS]`의 `max_ulp`가 **1 이하**, `over_1ulp`가 0에 가깝고,
+`by_array`의 `diagD`·`diagDI` 항목이 `ulp:0` / `rel:0`인지 본다. `diagD`가 여전히 0이
+아니면 그때는 경합이 아니라 **진짜 불일치**이므로 커널을 본다.
+
 ---
 
 ## 7. 238 런북

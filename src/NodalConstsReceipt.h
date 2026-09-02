@@ -42,8 +42,42 @@
 // anything larger is a different phenomenon -- a contraction the --fmad=false
 // build did not stop, a stale xsdf, a layout disagreement -- and it is better to
 // read it in the receipt than to discover it as a Gate B pin-power miss.
+//
+// ---------------------------------------------------------------------------
+// WHY THE METRIC IS PER-ARRAY AND RELATIVE, AND WHAT IT COST TO FIND OUT
+// ---------------------------------------------------------------------------
+//
+// The 238 run of block 49 reported `max_ulp:9545195, max_ulp_array:7,
+// over_1ulp:107279 (58 %)` while Gate A and Gate B both PASSED.  Nine and a half
+// million ulp is not "exp differs by 1 ulp", and a receipt that can print that
+// number next to a passing gate is a receipt nobody can act on.  Array 7 is
+// `diagD = 4 * xsdf / (hmesh * hmesh)`: no exp, no sqrt, no contraction site, one
+// IEEE divide, under --fmad=false.  Host and device CANNOT legitimately disagree
+// there by one ulp, let alone by nine million -- so the number was never about
+// the arithmetic.  It was the read-back racing the build kernel (see the
+// self-check in CudaXsReconBackend.cu, which now drains the stream first).
+//
+// Three things changed here so the next surprise reads correctly the first time:
+//
+//   * PER-ARRAY.  One global maximum and one "which array carried it" scalar
+//     cannot say whether ONE array is broken or all nine are drifting, and the
+//     scalar was being stored under a predicate (`worst >= max_ulp` re-read
+//     AFTER the compare-exchange) that is true whenever a later check merely
+//     TIES.  It is now DERIVED as the argmax of the per-array table, which
+//     cannot disagree with the maximum it names.
+//   * RELATIVE, WITH A FLOOR.  A ULP distance is meaningless across a sign
+//     change and unbounded near zero, and these arrays legitimately hold values
+//     that straddle zero.  `rel = |a - b| / max(|a|, |b|, floor)` says how wrong
+//     the value is; the ULP figure is kept beside it because the exp spike's own
+//     bound is stated in ulp and that bound is still the thing to check.
+//   * THE FLOOR IS THE ARRAY'S OWN SCALE, not a constant somebody picked.  Each
+//     sampled array's largest host magnitude times kRelFloorFrac is the floor for
+//     that array, so a coefficient that is 1e-30 in an array whose scale is 1e2
+//     is compared absolutely instead of reporting a spectacular relative error
+//     about a number that does not matter.
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <ostream>
@@ -73,6 +107,76 @@ inline unsigned long long ulpDistance(double a, double b) {
     return static_cast<unsigned long long>(ka > kb ? ka - kb : kb - ka);
 }
 
+/// The nine arrays, in the order the upload uses and the device kernel stores
+/// them: index i here is `dst[i * ndg + idx]` in kNodalConstsDevice.
+///
+/// NAMED, NOT NUMBERED, BECAUSE THE NUMBERS COLLIDE.  CudaNodalConstantKernel.h
+/// has an enum for the ARENA kernel in which 7 is diagDI and 8 is diagD -- the
+/// other way round from this table.  238 reported `max_ulp_array:7` and reading
+/// it against the wrong table sends the reader to `1/D` when the array is `D`.
+inline constexpr int         kNodalConstsCount   = 9;
+inline constexpr const char* kNodalConstsNames[] = {"eta1", "eta2",  "m260",
+                                                    "m251", "m253",  "m262",
+                                                    "m264", "diagD", "diagDI"};
+
+/// The relative-error floor, AS A FRACTION OF THE ARRAY'S OWN SAMPLED SCALE.
+/// Values below it are compared absolutely: a relative error on a coefficient
+/// twelve orders of magnitude under everything else in its own array is a
+/// statement about rounding noise, not about the physics.
+inline constexpr double kRelFloorFrac = 1.0e-12;
+
+/// `|a - b| / max(|a|, |b|, floor)`.  Never NaN: two NaNs agree, one NaN is
+/// infinitely wrong.  Defined so a sign change reports ~2 rather than the
+/// astronomical integer a ULP distance across zero produces.
+inline double relError(double a, double b, double floor_abs) {
+    const bool na = !(a == a), nb = !(b == b);
+    if (na && nb) return 0.0;
+    if (na || nb) return HUGE_VAL;
+    if (a == b) return 0.0;
+    const double aa = a < 0.0 ? -a : a;
+    const double ab = b < 0.0 ? -b : b;
+    double       den = aa > ab ? aa : ab;
+    if (!(den > floor_abs)) den = floor_abs;
+    if (!(den > 0.0)) return 0.0;
+    const double d = a - b;
+    return (d < 0.0 ? -d : d) / den;
+}
+
+/// A non-negative double as a monotone unsigned key, so a lock-free running
+/// maximum can be kept in the same atomic<unsigned long long> the ULP maxima
+/// use.  Monotone for non-negative IEEE doubles by construction.
+inline unsigned long long relKey(double r) {
+    if (!(r == r)) return ~0ULL; // NaN cannot outrank a real disagreement quietly
+    if (r < 0.0) r = 0.0;
+    std::uint64_t u = 0;
+    std::memcpy(&u, &r, sizeof u);
+    return static_cast<unsigned long long>(u);
+}
+
+inline double relFromKey(unsigned long long k) {
+    if (k == ~0ULL) return HUGE_VAL;
+    const std::uint64_t u = static_cast<std::uint64_t>(k);
+    double              r = 0.0;
+    std::memcpy(&r, &u, sizeof r);
+    return r;
+}
+
+/// JSON HAS NO INFINITY, so a relative error that came back non-finite -- which
+/// relError produces for exactly one case, a NaN on one side and not the other --
+/// is printed as the sentinel -2.  -1 already means "no sample"; a bare `inf` in
+/// the receipt would make the line unparseable for the gate script that reads it,
+/// which is a worse failure than the one it is trying to report.
+inline constexpr double kRelNonFinite = -2.0;
+
+inline double relForJson(double r) { return (r - r == 0.0) ? r : kRelNonFinite; }
+
+/// Lock-free running maximum.
+inline void bumpMax(std::atomic<unsigned long long>& slot, unsigned long long value) {
+    unsigned long long prev = slot.load(std::memory_order_relaxed);
+    while (value > prev && !slot.compare_exchange_weak(prev, value, std::memory_order_relaxed))
+        ;
+}
+
 struct NodalConstsTally {
     /// solveNodal calls that reached the constants gate with the arm armed.
     std::atomic<unsigned long long> gates{0};
@@ -93,13 +197,54 @@ struct NodalConstsTally {
     /// the largest ULP distance to the host answer seen across all of them.
     std::atomic<unsigned long long> checks{0};
     std::atomic<unsigned long long> checked_elems{0};
-    std::atomic<unsigned long long> max_ulp{0};
-    /// Which of the nine arrays carried that maximum (0..8 in the eta1, eta2,
-    /// m260, m251, m253, m262, m264, diagD, diagDI order the upload uses).
-    std::atomic<unsigned long long> max_ulp_array{0};
+    /// PER-ARRAY, and the scalars below are DERIVED from these rather than kept
+    /// beside them.  A separately-stored "which array" scalar is a second source
+    /// of truth that drifts: the one this replaced was written under a predicate
+    /// that any later check could satisfy by TYING the maximum, so it named the
+    /// last array to tie rather than the array that carried the max.
+    std::atomic<unsigned long long> max_ulp_by_array[kNodalConstsCount]{};
+    /// Relative error, as the monotone bit key relKey() produces.
+    std::atomic<unsigned long long> max_rel_by_array[kNodalConstsCount]{};
     /// Elements whose ULP distance exceeded 1 -- the spike's own bound.  A
     /// non-zero count here is the thing to look at before any gate is quoted.
     std::atomic<unsigned long long> over_1ulp{0};
+
+    unsigned long long maxUlp() const {
+        unsigned long long m = 0;
+        for (int i = 0; i < kNodalConstsCount; ++i) {
+            const unsigned long long v = max_ulp_by_array[i].load(std::memory_order_relaxed);
+            if (v > m) m = v;
+        }
+        return m;
+    }
+    /// Argmax, ties going to the LOWEST index, so the answer is a function of
+    /// the table and not of the order the checks happened to run in.
+    int maxUlpArray() const {
+        int                m = 0;
+        unsigned long long best = max_ulp_by_array[0].load(std::memory_order_relaxed);
+        for (int i = 1; i < kNodalConstsCount; ++i) {
+            const unsigned long long v = max_ulp_by_array[i].load(std::memory_order_relaxed);
+            if (v > best) { best = v; m = i; }
+        }
+        return m;
+    }
+    unsigned long long maxRelKey() const {
+        unsigned long long m = 0;
+        for (int i = 0; i < kNodalConstsCount; ++i) {
+            const unsigned long long v = max_rel_by_array[i].load(std::memory_order_relaxed);
+            if (v > m) m = v;
+        }
+        return m;
+    }
+    int maxRelArray() const {
+        int                m = 0;
+        unsigned long long best = max_rel_by_array[0].load(std::memory_order_relaxed);
+        for (int i = 1; i < kNodalConstsCount; ++i) {
+            const unsigned long long v = max_rel_by_array[i].load(std::memory_order_relaxed);
+            if (v > best) { best = v; m = i; }
+        }
+        return m;
+    }
 };
 
 inline NodalConstsTally& nodalConstsTally() {
@@ -112,8 +257,11 @@ inline constexpr const char* kNodalConstsPolicyNote =
     "test/nodal_constant_exp_probe.cu found CUDA's exp differs from glibc's on "
     "3.34% of the arguments this body evaluates, always by 1 ulp "
     "(src/NodalConstantKernel.h). It therefore moves the trajectory and is priced "
-    "with Gate A/B, never with a digest equality; max_ulp above is this run's own "
-    "check of that bound (docs/WP23_FLATXS_STREAM_GPU_20260902_KO.md section 6)";
+    "with Gate A/B, never with a digest equality; max_ulp/max_rel above are this "
+    "run's own check of that bound, measured per array AFTER the build stream is "
+    "drained -- 238 block 49 reported max_ulp 9545195 on diagD, an array with no "
+    "libm and no contraction site, because the read-back was racing the kernel "
+    "(docs/WP23_FLATXS_STREAM_GPU_20260902_KO.md section 6)";
 
 inline bool nodalConstsReceiptWanted() {
     const NodalConstsTally& t = nodalConstsTally();
@@ -141,10 +289,27 @@ inline void appendNodalConstsReceiptFields(std::ostream& os) {
        << ",\"max_ulp\":";
     // Never 0 on an unchecked run: 0 ulp is a RESULT and "no sample" is not one.
     if (checks > 0)
-        os << t.max_ulp.load(std::memory_order_relaxed) << ",\"max_ulp_array\":"
-           << t.max_ulp_array.load(std::memory_order_relaxed);
+        os << t.maxUlp() << ",\"max_ulp_array\":" << t.maxUlpArray();
     else
         os << "-1,\"max_ulp_array\":-1";
+    os << ",\"max_rel\":";
+    if (checks > 0)
+        os << relForJson(relFromKey(t.maxRelKey())) << ",\"max_rel_array\":" << t.maxRelArray();
+    else
+        os << "-1,\"max_rel_array\":-1";
+    // AND THE TABLE THE TWO SCALARS ARE THE ARGMAX OF.  A maximum without its
+    // distribution cannot tell ONE broken array from nine drifting ones, which
+    // is exactly the question 238's `max_ulp_array:7` left open.
+    os << ",\"by_array\":{";
+    for (int i = 0; i < kNodalConstsCount; ++i) {
+        if (i != 0) os << ",";
+        os << "\"" << kNodalConstsNames[i]
+           << "\":{\"ulp\":" << t.max_ulp_by_array[i].load(std::memory_order_relaxed)
+           << ",\"rel\":"
+           << relForJson(relFromKey(t.max_rel_by_array[i].load(std::memory_order_relaxed)))
+           << "}";
+    }
+    os << "}";
     os << ",\"over_1ulp\":" << t.over_1ulp.load(std::memory_order_relaxed)
        << ",\"policy_note\":\"" << kNodalConstsPolicyNote << "\"";
 }

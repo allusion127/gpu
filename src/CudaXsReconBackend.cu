@@ -4013,7 +4013,35 @@ struct XsReconBackend::Impl {
         if (ndev_flt != nullptr) nc_chk_f.resize(run);
         else                     nc_chk_d.resize(run);
 
-        unsigned long long worst = 0, worst_arr = 0, over = 0;
+        // DRAIN THE BUILD BEFORE READING IT BACK, AND THIS LINE IS THE WHOLE OF
+        // 238 BLOCK 49'S max_ulp:9545195.
+        //
+        // `stream` is created with cudaStreamNonBlocking (see the constructor),
+        // and xfer::memcpy is the BLOCKING form issued on the LEGACY DEFAULT
+        // stream.  The legacy stream synchronises implicitly with every BLOCKING
+        // stream in the context -- and with no non-blocking one.  So the nine
+        // downloads below had NO ordering against the kNodalConstsDevice launch
+        // above them: they sampled whatever was in the block at the time, which
+        // is the PREVIOUS generation's coefficients, or the OFF path's uploaded
+        // ones, or nothing.  The number that came back was a race, not a
+        // rounding difference, and array 7 is what proves it: `diagD` is
+        // `4 * xsdf / (hmesh * hmesh)` -- no exp, no sqrt, no contraction site,
+        // one IEEE divide under --fmad=false -- so host and device CANNOT
+        // disagree there by even one ulp, let alone by nine million.  Gate A and
+        // Gate B passed throughout because the arm's real consumers are kernels
+        // on THIS stream and were correctly ordered behind the build all along;
+        // only the diagnostic was reading out of turn.
+        //
+        // FIVE BUILDS IN 1,081 ARE SAMPLED, so this drain is not on the arm's
+        // path, it is on the diagnostic's -- which is the only reason a
+        // synchronise is an acceptable thing to put here at all.
+        if (xfer::streamSync("CudaXsReconBackend.cu:nodalConstsOnDevice", "selfcheck drain",
+                             stream) != cudaSuccess) {
+            cudaGetLastError();
+            return true; // a check that could not run is not a build that failed
+        }
+
+        unsigned long long over = 0;
         for (int i = 0; i < 9; ++i) {
             const void* src = ndev_flt != nullptr
                                   ? static_cast<const void*>(ndev_flt + n_off_consts +
@@ -4028,6 +4056,21 @@ struct XsReconBackend::Impl {
                 return true; // a check that could not run is not a build that failed
             }
             t.bytes_d2h.fetch_add(run * elem, std::memory_order_relaxed);
+
+            // THE RELATIVE-ERROR FLOOR IS THIS ARRAY'S OWN SCALE, measured in one
+            // extra pass over 4,096 doubles.  A ULP distance is unbounded near
+            // zero and meaningless across a sign change, and these coefficients
+            // legitimately straddle zero; a fixed absolute floor would be a
+            // magic constant that is wrong for eight of the nine arrays.
+            double scale = 0.0;
+            for (std::size_t e = 0; e < run; ++e) {
+                const std::size_t hh = aos ? e : e * (ndl::NDIR * ndl::NG);
+                const double      m  = consts[i][hh] < 0.0 ? -consts[i][hh] : consts[i][hh];
+                if (m > scale) scale = m;
+            }
+            const double floor_abs = scale * nodalconsts::kRelFloorFrac;
+
+            unsigned long long worst_u = 0, worst_r = 0;
             for (std::size_t e = 0; e < run; ++e) {
                 const std::size_t h = aos ? e : e * (ndl::NDIR * ndl::NG);
                 const double hv = consts[i][h];
@@ -4041,19 +4084,22 @@ struct XsReconBackend::Impl {
                                      ? static_cast<double>(nc_chk_f[e])
                                      : nc_chk_d[e];
                 const unsigned long long u = nodalconsts::ulpDistance(a, b);
-                if (u > worst) { worst = u; worst_arr = static_cast<unsigned long long>(i); }
+                if (u > worst_u) worst_u = u;
+                const unsigned long long rk =
+                    nodalconsts::relKey(nodalconsts::relError(a, b, floor_abs));
+                if (rk > worst_r) worst_r = rk;
                 if (u > 1) ++over;
             }
+            // PER ARRAY.  The scalars the receipt prints are the argmax of this
+            // table, so "which array" cannot disagree with "how much" -- the
+            // scalar this replaced was stored under a predicate any later check
+            // could satisfy by merely TYING the running maximum.
+            nodalconsts::bumpMax(t.max_ulp_by_array[i], worst_u);
+            nodalconsts::bumpMax(t.max_rel_by_array[i], worst_r);
         }
         t.checks.fetch_add(1, std::memory_order_relaxed);
         t.checked_elems.fetch_add(9ULL * run, std::memory_order_relaxed);
         t.over_1ulp.fetch_add(over, std::memory_order_relaxed);
-        unsigned long long prev = t.max_ulp.load(std::memory_order_relaxed);
-        while (worst > prev &&
-               !t.max_ulp.compare_exchange_weak(prev, worst, std::memory_order_relaxed))
-            ;
-        if (worst >= t.max_ulp.load(std::memory_order_relaxed))
-            t.max_ulp_array.store(worst_arr, std::memory_order_relaxed);
         return true;
     }
 };

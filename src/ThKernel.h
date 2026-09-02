@@ -87,6 +87,15 @@ enum ThFormBit : int {
     TH_RELAX_HI = 6,
     /// GetTfuel: `rise * safe_lpd / first_lpd` -- a product feeding a divide, so
     /// the only choice is whether the product is rounded before the divide.
+    ///
+    /// AND ON EVERY TARGET THIS TREE COMPILES FOR, IT ISN'T A CHOICE.  There is
+    /// no add for the product to be contracted into; a double multiply rounds
+    /// either way, and thMul's barrier only stops a fusion that has nothing to
+    /// fuse with.  So the two spellings are the same number and this bit carries
+    /// no information -- measured, not assumed: thmine::dontCareMask reports it
+    /// alongside TH_HAVG.  The bit stays so the mask has one field per
+    /// multiply-add, and TH_EXPECTED_DONT_CARE names it so a fixture is never
+    /// blamed for failing to pin something no fixture can.
     TH_TFUEL_LINEAR = 7,
     /// SolveTH: `h_avg = 0.5 * (h_cur + h_out)`.  Exact in binary floating point
     /// either way, so this site is a DON'T-CARE and the mining will legitimately
@@ -105,15 +114,53 @@ inline constexpr int TH_ONE_BIT_END = TH_RELAX;
 
 inline constexpr unsigned long long TH_ALL_FORMS = (1ull << TH_BIT_COUNT) - 1ull;
 
-/// The mask MEASURED on the authoring box (WSL2 / g++ 13.3, -O3 -march=native):
-/// LERP_Y and TFUEL fused, POWER_ACC and both x-lerps not, RELAX contracting the
-/// `(1 - w) * old` product.  It is the value the receipt COMPARES AGAINST, not a
-/// value the run depends on: the production binary mines its own
-/// (src/ThFormMiner.cpp) for exactly the reason CmfdOuterFormMiner.cpp exists --
-/// a baked constant is a record of the machine it was measured on, not of the
-/// physics, and the same probe on a box WITHOUT -march=native mines 0x0 because
-/// an ISA with no FMA lets gcc contract nothing at all.
-inline constexpr unsigned long long TH_FORMS_DEFAULT = 0x54ull;
+/// The TWO sites the mining fixture is allowed not to pin, and the only two.
+/// Both are don't-cares by ARITHMETIC rather than by operand coverage, so no
+/// fixture can ever pin them: `0.5 * (h_cur + h_out)` is exact in binary floating
+/// point under either form, and GetTfuel's `rise * safe_lpd` has no add to be
+/// contracted into, so its two spellings are the same number.
+///
+/// TH_TFUEL_LINEAR IS ON THIS LIST BECAUSE THE CENSUS PUT IT THERE.  It was
+/// written as a real site and believed to be one; dontCareMask returned 0x180 on
+/// the first run against the repaired fixture, and the arithmetic above is why.
+///
+/// EVERYTHING ELSE MUST BE PINNED, and thmine::dontCareMask measures whether it
+/// is.  A site the fixture cannot reach is not a site the mask "guesses right"
+/// -- the coordinate descent settles wherever its seed started and the value
+/// that reaches the device is an accident.  WP22 shipped exactly that: the first
+/// fixture's `norm` was 1e-3 where SolveTH's is of order 1e2, every one of its
+/// 1,280 fuel nodes came out under 0.03 W/cm, every tf query therefore clamped
+/// to the first LPD knot with `fx == 0`, and both x-lerps were unreachable.  The
+/// mining returned 0x54 with a ZERO residual and no warning; the deck ran 0x57.
+inline constexpr unsigned long long TH_EXPECTED_DONT_CARE =
+    (1ull << TH_HAVG) | (1ull << TH_TFUEL_LINEAR);
+
+/// The mask MEASURED AGAINST THE PRODUCTION PATH on 238 (WSL2 / g++, -O3
+/// -march=native): both x-lerps, LERP_Y and TFUEL fused, POWER_ACC not, RELAX
+/// contracting the `(1 - w) * old` product.
+///
+/// THIS NUMBER IS A MEASUREMENT OF THE DECK, NOT OF THE MINER.  Block 48 of the
+/// 2026-08-30 pricing log swept `RASBERY_TH_FORMS` over {0x00, 0x54, 0x57,
+/// 0x1f3} with the device arm on: 0x57 alone reproduced the flag-off digest
+/// `1f36e75dc00ed2b4` bit for bit (h5diff rc=0, 0 lines), and the other three
+/// each moved 866 lines.  The mining of the day returned 0x54 -- 0x57 with bits
+/// 0-1 (TH_LERP_X0, TH_LERP_X1) cleared -- because the mining fixture never
+/// REACHED those two sites: its node powers put every tf query on the first LPD
+/// knot, so 0x54 and 0x57 both scored zero and the descent returned its seed.
+/// ThReference.h carries the diagnosis, buildFixture the repair, and
+/// thmine::dontCareMask the check that makes the failure loud next time; this
+/// constant carries the answer the deck gave.
+///
+/// It is still the value the receipt COMPARES AGAINST rather than a value the
+/// run depends on: the production binary mines its own (src/ThFormMiner.cpp) for
+/// exactly the reason CmfdOuterFormMiner.cpp exists -- a baked constant is a
+/// record of the machine it was measured on, not of the physics, and the same
+/// probe on a box WITHOUT -march=native mines 0x0 because an ISA with no FMA
+/// lets gcc contract nothing at all.  Because of that, this constant is ALSO the
+/// falsifier for the ThReference.h reshape: if the mining still returns 0x54,
+/// GpuFormMask.h::resolveCalibratedFormMask prints the disagreement on stderr
+/// and the run says so in `[RASBERY][FORMS]` -- which is the whole check.
+inline constexpr unsigned long long TH_FORMS_DEFAULT = 0x57ull;
 
 RASBERY_TH_HD inline bool thForm(unsigned long long forms, int bit) {
     return ((forms >> bit) & 1ull) != 0ull;

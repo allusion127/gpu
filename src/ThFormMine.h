@@ -76,10 +76,20 @@ inline th::ThView viewOf(const thref::Fixture& f, std::vector<double>& node_powe
 /// separately compiled reference.
 ///
 /// EVERY SITE IS SCORED THROUGH THE BODY THAT SHIPS, not through a re-spelling
-/// of it: refChannelSweep and thChannelSweep are driven over the same operands
-/// and their tmod/dmod/tful outputs are compared bit for bit, so a site the
-/// author forgot to give a bit shows up as an unremovable residual rather than
-/// as a silent agreement.
+/// of it: refSolveTH and thChannelSweep are driven over the same operands and
+/// their tmod/dmod/tful outputs are compared bit for bit, so a site the author
+/// forgot to give a bit shows up as an unremovable residual rather than as a
+/// silent agreement.
+///
+/// THE TWO SIDES ARE DRIVEN AT DIFFERENT GRANULARITY ON PURPOSE.  The reference
+/// is called ONCE for the whole core because XSSet::SolveTH is one function with
+/// the channel loop inside it, and that loop is part of the context gcc
+/// contracts in (ThReference.h says what scoring a per-channel entry point cost:
+/// bits 0-1 mined the wrong way and 238 measured 866 differing lines).  The
+/// shipped body is called per channel because the device launches it per lane,
+/// and the ceiling triple is folded here exactly as CudaThBackend.cu's
+/// kernelFolds folds it -- ascending channel order, first wins -- so the
+/// reduction the run publishes is the reduction the mining scored.
 inline long scoreMask(const thref::Fixture& f, unsigned long long mask) {
     const std::size_t n = static_cast<std::size_t>(f.nxyz);
 
@@ -99,15 +109,23 @@ inline long scoreMask(const thref::Fixture& f, unsigned long long mask) {
             ++bad;
     }
 
+    const thref::Overflow ro = thref::refSolveTH(f, ref_power.data(), ref_tmod.data(),
+                                                 ref_dmod.data(), ref_tful.data());
+
+    int    go_count = 0;
+    double go_worst = 0.0;
+    int    go_node  = -1;
     for (int l = 0; l < f.nxy; ++l) {
-        const thref::Overflow ro = thref::refChannelSweep(f, l, ref_power.data(),
-                                                          ref_tmod.data(), ref_dmod.data(),
-                                                          ref_tful.data());
         const th::ThChannelOverflow go =
             th::thChannelSweep(v, l, f.norm, f.flow_per_channel, mask);
-        if (ro.count != go.count || bits(ro.worst) != bits(go.worst) || ro.node != go.node)
-            ++bad;
+        go_count += go.count;
+        if (go.count > 0 && go.worst > go_worst) {
+            go_worst = go.worst;
+            go_node  = go.node;
+        }
     }
+    if (ro.count != go_count || bits(ro.worst) != bits(go_worst) || ro.node != go_node) ++bad;
+
     for (std::size_t i = 0; i < n; ++i) {
         if (bits(got_tmod[i]) != bits(ref_tmod[i])) ++bad;
         if (bits(got_dmod[i]) != bits(ref_dmod[i])) ++bad;
@@ -170,6 +188,41 @@ inline unsigned long long mineForms(const thref::Fixture& f, unsigned long long 
 /// in binary floating point), so different seeds legitimately settle on
 /// different bits there and both masks are equally correct.  Demanding pattern
 /// equality would fail on a mask that is provably right.
+/// WHICH SITES THIS FIXTURE CANNOT PIN ON THIS HOST -- the check that was
+/// missing, and whose absence cost WP22 a wrong mask with a clean receipt.
+///
+/// A residual of zero says "the mask I found reproduces the reference".  It does
+/// NOT say "the reference could tell the alternatives apart".  When a site's
+/// other forms ALSO score zero, the fixture reaches no operand that
+/// distinguishes them: the coordinate descent then settles wherever its seed
+/// started, `mineStable` reports sound, and the bit that reaches the device is an
+/// accident.  That is precisely what shipped -- see TH_EXPECTED_DONT_CARE in
+/// ThKernel.h for the arithmetic of how it happened.
+///
+/// Returns the set of sites whose every alternative form reproduces the
+/// reference.  TH_RELAX is scored as ONE site with THREE states, because that is
+/// what it is; a bit-at-a-time census would call it pinned on the strength of one
+/// surviving alternative.
+inline unsigned long long dontCareMask(const thref::Fixture& f, unsigned long long mined) {
+    unsigned long long dc = 0ull;
+    auto oneBit = [&](int b) {
+        if (scoreMask(f, mined ^ (1ull << b)) == 0) dc |= 1ull << b;
+    };
+    for (int b = 0; b < th::TH_ONE_BIT_END; ++b) oneBit(b);
+    for (int b = th::TH_TFUEL_LINEAR; b < th::TH_BIT_COUNT; ++b) oneBit(b);
+
+    const unsigned long long cur  = (mined >> th::TH_RELAX) & 3ull;
+    const unsigned long long base = mined & ~(3ull << th::TH_RELAX);
+    for (unsigned long long s = 0; s < 3ull; ++s) {
+        if (s == cur) continue;
+        if (scoreMask(f, base | (s << th::TH_RELAX)) == 0) {
+            dc |= 3ull << th::TH_RELAX;
+            break;
+        }
+    }
+    return dc;
+}
+
 inline unsigned long long mineStable(const thref::Fixture& f, bool& sound) {
     const unsigned long long seeds[4] = {0ull, th::TH_ALL_FORMS, 0x1ull,
                                          th::TH_FORMS_DEFAULT};

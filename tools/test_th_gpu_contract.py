@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""GPU thermal-hydraulics contract -- WP22, commit 1.
+"""GPU thermal-hydraulics contract -- WP22, commit 1 (+ the 238 forms datum).
 
-Fifteen properties.  Not one of them is visible to a numerical comparison of two
-runs, which is exactly why they are asserted here: a passing kngr_238 A/B would
-keep passing right up until the day one of them mattered.
+Eighteen properties.  Not one of them is visible to a numerical comparison of
+two runs, which is exactly why they are asserted here: a passing kngr_238 A/B
+would keep passing right up until the day one of them mattered.
 
   1. DEFAULT OFF, AND THE OFF PATH IS THE OLD PATH.  The backend is reached only
      through XSSet::TryUpdateTHGpu, whose false return must be followed by the
@@ -65,6 +65,45 @@ keep passing right up until the day one of them mattered.
      under RASBERY_GPU_FULL an arm that refuses every update fails the case
      instead of looking exactly like an arm that was never set.
 
+ 16. THE BUILD DEFAULT IS THE 238 DATUM, WHICH IS 0x57.  Block 48 of the
+     2026-08-30 pricing log swept RASBERY_TH_FORMS over {0x00, 0x54, 0x57,
+     0x1f3} on kngr_238 with the arm on; 0x57 alone reproduced the flag-off
+     digest 1f36e75dc00ed2b4 bit for bit and the other three each moved 866
+     lines.  0x54 -- what the miner returned that day, and what this constant
+     used to say -- is 0x57 with bits 0-1 (TH_LERP_X0, TH_LERP_X1) cleared.  The
+     constant is what resolveCalibratedFormMask compares the mining against, so
+     pinning it to the measured value is what makes a mining that has drifted
+     back to 0x54 announce itself on stderr instead of passing silently.  A rule
+     rather than a comment because a constant nobody checks is a constant that
+     gets "tidied" back.
+
+ 17. THE QUOTATION IS THE CALL GRAPH, NOT JUST THE EXPRESSIONS.  Which multiply
+     gcc folds into an add is decided per inlining context, so ThReference.cpp
+     must quote XSSet::SolveTH as ONE function with the channel loop inside it,
+     and must reach milk::Table::Get and XSSet::GetTfuel the way SolveTH does --
+     through `inline`, internal-linkage helpers, never through an out-of-line
+     body and never through a per-channel or per-table entry point.  This is
+     HARDENING, and honestly labelled as such: it was measured NOT to be what
+     produced 0x54 (with the operands repaired, the old shape mines 0x57 too).
+     It is held anyway because the gap is real and already measured elsewhere in
+     this tree -- CudaThBackend.h records 17 mismatches versus 0 between the
+     out-of-line and inlined spellings of the tf lookup -- and because nothing
+     else stops somebody adding a convenient `refTableGet` back.
+
+ 18. THE MINING MEASURES WHAT IT CANNOT PIN, AND SAYS SO.  A zero residual means
+     "the mask I found reproduces the reference".  It does NOT mean "the
+     reference could tell the alternatives apart".  WP22 shipped a fixture whose
+     node powers put every tf query on the first LPD knot: 0x54 and 0x57 both
+     scored zero, the coordinate descent returned whichever its seed began at,
+     and the receipt said `mined_sound:1` for a mask the deck disagreed with by
+     866 lines.  thmine::dontCareMask now scores every site's alternatives --
+     TH_RELAX as ONE site with THREE states, because a bit-at-a-time census would
+     call it pinned on the strength of one survivor -- and ThFormMiner.cpp warns
+     when the answer is anything but {TH_HAVG, TH_TFUEL_LINEAR}, the two sites no
+     operand set can distinguish.  The census earned its keep on its first run:
+     TH_TFUEL_LINEAR was written as a real site and is not one.  This is the rule
+     that would have caught the bug.
+
 Every rule runs against a deliberately broken copy of the same text as a
 negative control, so a rule that has stopped discriminating fails loudly instead
 of passing vacuously.
@@ -83,6 +122,7 @@ FILES = {
     "stub": "src/CudaThBackendStub.cpp",
     "kernel": "src/ThKernel.h",
     "ref": "src/ThReference.cpp",
+    "ref_h": "src/ThReference.h",
     "mine": "src/ThFormMine.h",
     "miner": "src/ThFormMiner.cpp",
     "mask": "src/ThFormMask.h",
@@ -327,6 +367,86 @@ def r_scalars_before_arrays(src: dict[str, str]) -> None:
         "been tested; a field its convergence metric had not cleared would be published")
 
 
+def r_forms_datum(src: dict[str, str]) -> None:
+    kernel = src["kernel"]
+    code = strip_comments(kernel)
+    m = re.search(r"TH_FORMS_DEFAULT\s*=\s*(0x[0-9a-fA-F]+)ull", code)
+    assert m, "TH_FORMS_DEFAULT is gone; the receipt has nothing to compare the mining against"
+    assert int(m.group(1), 16) == 0x57, (
+        f"TH_FORMS_DEFAULT is {m.group(1)}, but 238 block 48 measured 0x57: it is the ONLY "
+        "mask of {0x00, 0x54, 0x57, 0x1f3} under which the arm reproduced the flag-off "
+        "digest 1f36e75dc00ed2b4 (h5diff rc=0, 0 lines).  0x54 is that value with bits 0-1 "
+        "(TH_LERP_X0, TH_LERP_X1) cleared and moved 866 lines.")
+    # And the constant has to CITE its measurement, or the next reader cannot tell a
+    # datum from somebody's guess.
+    assert "1f36e75dc00ed2b4" in kernel, \
+        "TH_FORMS_DEFAULT does not name the digest it was measured against"
+    assert "0x54" in kernel, \
+        "TH_FORMS_DEFAULT does not name the superseded mask, so a revert reads as a fresh start"
+
+
+def r_quotation_call_graph(src: dict[str, str]) -> None:
+    code = strip_comments(src["ref"])
+
+    # ONE entry point for SolveTH, and the channel loop is inside it -- because it
+    # is inside SolveTH, and the size of the function gcc ends up compiling is an
+    # input to its contraction decisions.
+    body = region(code, "Overflow refSolveTH(", "\n}", "refSolveTH")
+    assert "for (int l = 0; l < nxy; ++l)" in body, (
+        "refSolveTH does not carry SolveTH's channel loop; a per-channel quotation is a "
+        "smaller function with fewer inlined Table::Get copies in it, which is exactly the "
+        "shape that mined 0x54 where the deck ran 0x57")
+
+    # No per-channel and no per-table entry point, in either the .cpp or the header:
+    # an external declaration is what leaves gcc an out-of-line body to score through.
+    for gone in ("refChannelSweep", "refTableGet", "refGetTfuel"):
+        assert gone not in code, (
+            f"{gone} is back in ThReference.cpp.  milk::Table::Get and XSSet::GetTfuel are "
+            "class-body inlines with one copy per call site inside SolveTH; a separately "
+            "callable quotation of them pins bit TH_LERP_X0 the other way (17 mismatches "
+            "versus 0 over a 20k sweep, CudaThBackend.h)")
+    hdr = strip_comments(src["ref_h"])
+    for gone in ("refChannelSweep", "refTableGet", "refGetTfuel"):
+        assert gone not in hdr, f"ThReference.h still declares {gone}"
+
+    # The helpers exist, are `inline`, and live above the first external definition --
+    # which is where the anonymous namespace ends.
+    head = code[: code.find("void refNodePower(")]
+    assert "namespace {" in head, "the quotation's helpers are no longer in an anonymous namespace"
+    for fn in ("inline double tableGet(", "inline double getTmod(",
+               "inline double getDmod(", "inline double getTfuel("):
+        assert fn in head, (
+            f"{fn!r} is not an inline, internal-linkage helper of the quotation; production "
+            "reaches every one of these through a class-body inline")
+
+
+def r_dontcare_census(src: dict[str, str]) -> None:
+    kernel = strip_comments(src["kernel"])
+    assert re.search(r"TH_EXPECTED_DONT_CARE\s*=\s*\(1ull << TH_HAVG\)\s*\|\s*"
+                     r"\(1ull << TH_TFUEL_LINEAR\)", kernel), (
+        "the declared set of unpinnable sites is not {TH_HAVG, TH_TFUEL_LINEAR}.  Those "
+        "two are don't-cares by ARITHMETIC -- 0.5*(a+b) is exact, and rise*safe_lpd has no "
+        "add to contract into -- so no fixture can pin them and a census that expects to "
+        "would cry wolf on every run.  Every OTHER site must be reachable.")
+
+    mine = strip_comments(src["mine"])
+    body = region(mine, "inline unsigned long long dontCareMask(", "\n}", "dontCareMask")
+    assert "scoreMask(f, mined ^ (1ull << b))" in body, (
+        "dontCareMask does not score each single-bit site's alternative form.  A zero "
+        "residual says the mask reproduces the reference; only this says the reference "
+        "could tell the alternatives apart -- and WP22 shipped 0x54 on exactly that "
+        "difference (0x54 and 0x57 both scored zero; the deck ran 0x57).")
+    assert "3ull << th::TH_RELAX" in body, (
+        "TH_RELAX is being censused bit-at-a-time.  It is ONE site with THREE states, so "
+        "a bit-at-a-time scan calls it pinned on the strength of one surviving alternative")
+
+    miner = strip_comments(src["miner"])
+    assert "thmine::dontCareMask(fixture, mined)" in miner,         "the production miner does not run the census"
+    assert "dc != TH_EXPECTED_DONT_CARE" in miner, (
+        "the census result is computed and then ignored; a site nobody can pin has to be "
+        "a SENTENCE on stderr, not a silence")
+
+
 RULES = [
     ("default-off", r_default_off, "cu",
      ('getenv("RASBERY_GPU_TH")', 'getenv("RASBERY_ALWAYS_ON")')),
@@ -365,6 +485,13 @@ RULES = [
     ("scalars-before-arrays", r_scalars_before_arrays, "cu",
      ('"CudaThBackend.cu:solveTh", "scalars"',
       '"CudaThBackend.cu:solveTh", "late_scalars"')),
+    ("forms-datum-0x57", r_forms_datum, "kernel",
+     ("TH_FORMS_DEFAULT = 0x57ull", "TH_FORMS_DEFAULT = 0x54ull")),
+    ("quotation-call-graph", r_quotation_call_graph, "ref",
+     ("inline double getTfuel(const Table& tf",
+      "double getTfuel(const Table& tf")),
+    ("dontcare-census", r_dontcare_census, "miner",
+     ("if (dc != TH_EXPECTED_DONT_CARE) {", "if (false) {")),
 ]
 
 

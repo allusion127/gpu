@@ -6,7 +6,7 @@
 |---|---|
 | 대상 | `XSSet::UpdateTH` / `XSSet::SolveTH` (0.70 s/statepoint) · `XSSet::SetBoron`의 노드별 쓰기 |
 | 플래그 | `RASBERY_GPU_TH=1`(기본 off) · `RASBERY_GPU_SEARCH=1`(기본 off) · `RASBERY_TH_FORMS=0x…`(수축 마스크 override) |
-| 게이트 등급 | T/H = **N1**(B0가 목표, 아직 미측정) · 붕산 적용 = **B0**(구성상) |
+| 게이트 등급 | T/H = **N1**(산술은 238에서 `RASBERY_TH_FORMS=0x57`로 **B0 측정 완료**; 채굴이 오버라이드 없이 `0x57`을 낼 때까지 인용 등급은 N1 — §2.1, §2.2.1, §8.1.1) · 붕산 적용 = **B0**(구성상) |
 | 계약 테스트 | `tools/test_th_gpu_contract.py`(16 규칙) · `tools/test_search_gpu_contract.py`(13 규칙), 각 규칙마다 negative control |
 | 동반 테스트 | `test_enum_alias_contract` · `test_dependent_template_contract` · `test_xfer_ledger_contract` · `test_gpu_full_fail_closed` · `test_cram_gpu_contract` · `test_statepoint_telemetry` — 전부 PASS |
 | 신규 소스 | `src/ThKernel.h` · `ThReference.{h,cpp}` · `ThFormMine.h` · `ThFormMask.h` · `ThFormMiner.cpp` · `ThGpuReceipt.h` · `CudaThBackend.{h,cu}` · `CudaThBackendStub.cpp` · `SearchKernel.h` · `SearchGpuReceipt.h` |
@@ -72,19 +72,35 @@ multiply-add는 형태를 **마스크에서 읽는다**. 사이트는 9비트/8�
 어느 쪽이든 융합할 수 있고, 세 번째 형태가 존재한다. 1비트 사이트였다면 호스트가 실제로
 돌린 형태를 **표현할 수 없어** 채굴이 제거 불가능한 잔차를 보고했을 것이다.
 
-### 2.1 실측값
+### 2.1 실측값 — 그리고 238이 뒤집은 것
 
 이 저작 호스트(WSL2 / g++ 13.3)에서 `src/ThFormMiner.cpp`의 채굴을 그대로 돌린 결과:
 
 | 빌드 플래그 | 채굴 마스크 | 잔차 | 해석 |
 |---|---|---|---|
-| `-O3 -march=native` | **`0x54`** | 0 (4개 시드 전부) | `LERP_Y`·`TFUEL` 융합, `POWER_ACC` 미융합, `RELAX`는 `(1-w)·old` 융합 |
+| `-O3 -march=native` | `0x54` | 0 (4개 시드 전부) | `LERP_Y`·`TFUEL` 융합, `POWER_ACC`·두 x-lerp 미융합, `RELAX`는 `(1-w)·old` 융합 |
 | `-O3` (march 없음) | **`0x0`** | 0 (4개 시드 전부) | ISA에 FMA가 없으면 gcc는 **아무것도 수축하지 않는다** |
 
-`TH_FORMS_DEFAULT = 0x54`는 그래서 **런이 의존하는 값이 아니라 수신증이 비교하는
-대상**이다. 프로덕션 바이너리는 시작 시 자기 자신을 채굴한다 —
-`CmfdOuterFormMiner.cpp`가 존재하는 것과 정확히 같은 이유이고, 그 문서가 기록하듯
-베이크된 상수 하나는 그것이 측정된 기계의 기록일 뿐이다.
+**그런데 그 `0x54`는 틀렸다.** 2026-08-30 pricing 로그 블록 48이 kngr_238에서 아름을
+켜고 `RASBERY_TH_FORMS`를 `{0x00, 0x54, 0x57, 0x1f3}`로 스윕한 결과:
+
+| 마스크 | h5diff | 판정 |
+|---|---|---|
+| `0x00` | rc=1, 866줄 | 이동 |
+| `0x54` (그날 채굴값 = 그날의 빌드 기본값) | rc=1, 866줄 | **이동** |
+| **`0x57`** | **rc=0, 0줄** | **플래그-오프 digest `1f36e75dc00ed2b4` 완전 재현** |
+| `0x1f3` | rc=1, 866줄 | 이동 |
+
+`0x57`은 `0x54`에서 **비트 0·1(`TH_LERP_X0`, `TH_LERP_X1`)만 켠 값**이다. 즉 호스트는
+`milk::Table::Get`의 두 x-lerp를 **융합한다**. 채굴은 아니라고 말했다. §2.2가 왜인지를
+적는다.
+
+`TH_FORMS_DEFAULT`는 이제 **`0x57`**이고, 이것은 저작 호스트의 기록이 아니라 **덱의
+측정값**이다. 여전히 **런이 의존하는 값이 아니라 수신증이 비교하는 대상**이다 —
+프로덕션 바이너리는 시작 시 자기 자신을 채굴하고(`CmfdOuterFormMiner.cpp`와 같은 이유),
+채굴값이 기본값과 다르면 `resolveCalibratedFormMask`가 stderr에 그 사실을 찍는다.
+그래서 이 상수는 §2.2 수정의 **반증 장치**이기도 하다: 재구성된 인용문이 여전히 `0x54`를
+채굴하면 런이 스스로 그렇게 말한다.
 
 ### 2.2 fixture가 사이트를 고정하지 못하고 있었다 — 세 건
 
@@ -107,6 +123,83 @@ multiply-add는 형태를 **마스크에서 읽는다**. 사이트는 9비트/8�
 어느 철자든 정확하다. 이것은 산술의 성질이지 fixture의 결함이 아니며,
 `mineStable()`이 마스크 일치가 아니라 **잔차**로 건전성을 보고하는 이유가 바로 이것이다.
 
+#### 2.2.1 네 번째 건 — fixture가 **사이트에 도달한 적이 없었다**
+
+위 세 수리는 전부 **축(axis)**에 대한 것이었고, 정작 스윕이 **무엇을 질의하는지**는 아무도
+확인하지 않았다. 그리고 스윕은 `Fixture::node_power`를 **읽지 않는다** — 그 필드는 아무도
+읽지 않는다. `scoreMask`는 `XSSet::UpdateTH`가 하는 것과 똑같이 xskf/phif/vol에서 출하
+바디의 폴드로 노드 출력을 유도해 그것을 스윕에 넘긴다.
+
+`buildFixture`의 `norm`은 **`1.0e-3`**이었다. `SolveTH`의 `norm`은
+`actual_power / total_raw_power`, 즉 **1e2 오더**다. 181에서의 실측:
+
+```text
+node_power(computed) min=0.815 max=22.23   f.norm=0.001
+lpd n=1280 min=0.00087 med=0.0073 max=0.024 | P<=0:0  <50:1280  interior:0  >900:0
+```
+
+**1,280개 연료 노드 전부가 `lpd < 0.03` W/cm**이다. 따라서 모든 tf 질의가 첫 LPD 격자점
+(50 W/cm)으로 클램프되고 `fx = 0`이 되어 **두 x-lerp가 항등**이었다. 즉:
+
+* `score(0x54) = 0` **그리고** `score(0x57) = 0` — 두 마스크가 모두 기준을 재현한다.
+* 좌표 하강은 **시드가 시작한 값**을 그대로 돌려준다(시드 0 → 비트 0·1 clear → `0x54`).
+* `mineStable`은 잔차가 진짜로 0이므로 **정직하게 `sound=1`을 보고**한다.
+* 그리고 238이 덱을 돌려 866줄로 반박한다.
+
+`P_node <= 0` 스킵도, 물성표 천장 클램프도 **한 번도 도달되지 않았다**. 세 population은
+`f.node_power`에 기록됐고 그 배열은 읽히지 않는다.
+
+**수리 세 가지** (`src/ThReference.cpp::buildFixture`):
+
+1. `norm = 50.0`. 덱이 계산하는 오더.
+2. tf 표의 **burnup 축 단위**를 고친다. 질의는 `bu = burnup[lk]/1000.0`, 즉 **GWd/tHM**(0–60)
+   이고 `include/Database/tf.csv`도 그렇다. fixture는 0–60000(MWd/tHM)이었고, 그래서 모든
+   질의가 첫 구간 안에 들어가 `fy`가 [0, 0.012]에 갇혔다. `z1`의 차이는 `fy·(z1−z0)`으로만
+   답에 도달하므로 **`TH_LERP_X1`이 약 2^7만큼 감쇠**되어 여전히 don't-care였다
+   (`norm`만 고친 중간 상태의 실측 채굴값 = **`0x55`**).
+3. population을 `f.node_power`가 아니라 **`xskf`에 넣는다**(스윕이 읽는 배열).
+   scale 0 / 0.02 / 3 / 30 으로 `P<=0` 스킵, 50 W/cm 미만 선형 연장, LPD 표 클램프,
+   물성표 천장을 각각 도달시킨다. 실측: `P<=0:79, <50:158, interior:967, >900:76`.
+
+**결과(181, g++ 13.3 `-O3 -march=native`)**:
+
+```text
+mined=0x57 sound=1 residual=0 dontcare=0x180 (expected 0x180)
+  score(0x0)=415   score(0x54)=37   score(0x57)=0   score(0x1F3)=186
+```
+
+**채굴값이 238이 측정한 `0x57`과 일치**하고, `0x54`는 이제 37워드로 기각된다.
+
+##### 인라인 문맥은 원인이 **아니었다** (그리고 그렇게 적어 둔다)
+
+이 커밋은 `ThReference.cpp`를 **호출 그래프 자체**로도 재구성했다 — 채널 루프를 가진
+`refSolveTH` 하나, `tableGet` / `getTmod` / `getDmod` / `getTfuel`은 익명 네임스페이스의
+`inline`(프로덕션의 클래스 본문 inline과 같은 형상). 그러나 **그것이 `0x54`를 만든 것은
+아니다**: 피연산자만 고치고 **옛 형상(out-of-line + 채널당 진입점)** 그대로 채굴해도 결과는
+동일한 `mined=0x57 residual=0`이고 점수도 동일하다(181 실측). 재구성은 §3.1이 이미 측정해
+둔 실재하는 틈(17 대 0)에 대한 **경화**이지 이번 버그의 수정이 아니며,
+`tools/test_th_gpu_contract.py`의 규칙 17이 그렇게 라벨을 붙여 잡아 둔다.
+
+##### 진짜 재발 방지 장치: don't-care 인구조사
+
+잔차 0은 **"내가 찾은 마스크가 기준을 재현한다"**는 뜻이지 **"기준이 대안들을 구별할 수
+있다"**는 뜻이 아니다. 이 둘이 다르다는 것이 이번 버그의 전부다. 그래서
+`thmine::dontCareMask`가 **모든 사이트에 대해 대안 형태를 채점**하고(`TH_RELAX`는 2비트가
+아니라 **3상태 사이트 하나**로 다룬다 — 비트 단위 조사는 대안 하나가 살아남았다는 이유로
+"고정됨"이라 답한다), `ThFormMiner.cpp`가 결과가 `TH_EXPECTED_DONT_CARE`가 아니면 stderr에
+경고한다. 규칙 18이 이것을 잡는다.
+
+**인구조사는 첫 실행에서 이미 값을 했다**: 결과가 `0x180`이었다. `TH_HAVG`(비트 8)뿐 아니라
+**`TH_TFUEL_LINEAR`(비트 7)도 don't-care**다 — `rise * safe_lpd / first_lpd`에는 곱이
+융합될 **덧셈이 없고**, `thMul`의 배리어는 융합할 것이 없는 융합을 막을 뿐이므로 두 철자는
+같은 수다. 이것은 fixture의 결함이 아니라 **산술의 성질**이고, 그래서
+`TH_EXPECTED_DONT_CARE = (1 << TH_HAVG) | (1 << TH_TFUEL_LINEAR)`로 이름을 붙여 둔다.
+사이트로 쓰였지만 사이트가 아니었던 비트 하나를, 인구조사가 즉시 찾아냈다.
+
+**남은 위험, 이름을 붙여 둔다**: 압력이 격자점을 벗어난 덱은 tf 문맥으로만 고정된 사이트를
+돌게 된다. 그런 덱이 나오면 mod_* 질의를 일반 위치로 옮긴 fixture로 다시 채굴하고, 잔차가
+0이 아니면 2비트 필드가 부족하다는 뜻이다.
+
 ---
 
 ## 3. 조각별 정확도 등급
@@ -124,10 +217,17 @@ multiply-add는 형태를 **마스크에서 읽는다**. 사이트는 9비트/8�
 
 ### 3.1 그런데 왜 문서 상단 등급은 N1인가
 
-**도달 가능(reachable)은 측정(measured)이 아니다.** 위 표는 전부 "B0 목표"이고, 238이
-`RASBERY_GPU_TH=1`로 `1f36e75dc00ed2b4` / `4377`을 재현하기 전까지 인용 가능한 등급은
-**N1**이며 게이트는 Gate A / Gate B다. `src/ThGpuReceipt.h`의 `policy_note`가 게이트
-스크립트가 읽는 형태로 같은 문장을 싣는다.
+**도달 가능(reachable)은 측정(measured)이 아니었다 — 그리고 이제 절반은 측정됐다.**
+블록 48에서 `RASBERY_TH_FORMS=0x57`로 강제한 아름은 플래그-오프 digest
+`1f36e75dc00ed2b4`를 **정확히** 재현했다(h5diff rc=0, 0줄). 즉 **이 아름의 산술은 이 덱에서
+B0다.** 설명할 잔차도, libm 차이도, 남는 것이 없다.
+
+따라서 남은 질문은 "디바이스가 호스트를 재현할 수 있는가"가 아니라 **"채굴이 호스트가
+실제로 돌린 마스크를 돌려주는가"**다. §2.2.1의 수정이 그것을 겨냥한다. **환경 오버라이드
+없이** 한 런이 `[RASBERY][FORMS] … "value":"0x57","source":"mined"`를 찍고 digest를
+재현하기 전까지, 마스크를 강제하지 않고 인용할 수 있는 등급은 **N1**이며 게이트는
+Gate A / Gate B다. `src/ThGpuReceipt.h`의 `policy_note`가 게이트 스크립트가 읽는 형태로
+같은 문장을 싣는다.
 
 그리고 **채굴이 충분하지 않을 수 있는 이름 있는 이유**가 하나 있다 — WP7-C가 값을
 치른 그것이다. 마스크는 `src/ThReference.cpp`, 즉 **인용문**에 대해 교정되는데
@@ -220,7 +320,7 @@ multiply-add는 형태를 **마스크에서 읽는다**. 사이트는 9비트/8�
 [RASBERY][TH_GPU] {"schema_version":1,"slot":0,"device":0,"arm":1,
   "th_updates":N,"device_updates":N,"host_fallbacks":0,"device_share":1.0,
   "channels":nxy,"nodes":8451,"bytes_elided":0,"bytes_h2d":…,"bytes_d2h":…,
-  "wall_ms":…,"forms_mask":"0x54","policy_note":"…","status":"on"}
+  "wall_ms":…,"forms_mask":"0x57","policy_note":"…","status":"on"}
 ```
 
 읽는 법 세 가지.
@@ -281,6 +381,37 @@ h5diff -c "$OUT/wp22_a_off/kngr.h5" "$OUT/wp22_a_th/kngr.h5"
    돌린 마스크이고, `TH_FORMS_DEFAULT`가 아니라 **fixture**를 고쳐야 한다.
 3. `[RASBERY][FORMS] {"mask":"TH_FORMS",…,"mined_sound":1}`을 확인한다.
    `mined_sound:0`이면 그 런에 대해서는 비트 동일성이 **성립하지 않는다**.
+
+#### 8.1.1 블록 48 이후의 재확인 — 이 커밋이 요구하는 것
+
+블록 48은 판정 2를 실행했고 스윕은 `0x57`에서 만났다. §2.2.1이 fixture를 고쳤고 **181에서
+채굴값이 `0x57`로 확인됐다**(g++ 13.3, `-O3 -march=native`). 238에서 확인할 것은 같은 일이
+그 호스트에서도 일어나는가, 그리고 그 마스크로 digest가 맞는가이다.
+
+```bash
+# (a) 채굴값과 don't-care 인구조사 -- 환경 오버라이드 없이.  기대 두 줄:
+#       "value":"0x57","source":"mined_matches_default","mined_sound":1
+#       {"mask":"TH_FORMS","dontcare":"0x180","expected_dontcare":"0x180"}
+#     dontcare가 0x180이 아니면 fixture가 어떤 사이트에 도달하지 못한다는 뜻이고,
+#     그 경우 채굴값의 그 비트들은 측정이 아니라 시드의 잔재다(WARN 줄이 나온다).
+env $V6_ENV RASBERY_GPU_TH=1 "$BLD/RASBERY" kngr_238.json -o "$OUT/wp22r_a_th" \
+  2>&1 | grep -E '\[RASBERY\](\[WARN\])?\[FORMS\]'
+
+# (b) 그 마스크로 digest가 기준과 같은가.  기대: rc=0, 0줄.
+h5diff -c "$OUT/wp22_a_off/kngr.h5" "$OUT/wp22r_a_th/kngr.h5"; echo "rc=$?"
+
+# (c) 수신증의 forms_mask가 (a)와 같은가 -- 커널이 실제로 돈 마스크.
+grep -h 'RASBERY\]\[TH_GPU' "$OUT/wp22r_a_th"/*.log
+
+# (d) 정적 계약(로컬에서 돌려도 되는 유일한 것).
+python tools/test_th_gpu_contract.py        # 19 rules
+```
+
+(a)가 `0x57`이고 (b)가 rc=0이면 **B0로 승격**하고 §3.1·`CudaThBackend.h`·
+`kThGpuPolicyNote`의 조건문을 측정으로 바꾼다. (a)가 `0x54`인데 `dontcare`가 `0x180`이면
+이번에는 fixture 도달성이 아니라 **호스트 차이**가 원인이므로, 그때 비로소 남은 형상 차이
+— `SolveTH`의 **preamble**(직렬 total_power 폴드, `GetHmod` 두 번, total_area 루프) —
+을 인용문에 넣는 것이 다음 수순이다.
 
 ### 8.2 B. T/H 아름 — 단계 벽시계
 

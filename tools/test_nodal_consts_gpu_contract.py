@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Device nodal-constants arm contract -- WP23 item 3.
 
-Thirteen properties.  This arm is unusual in the tree in that its inexactness is
+Fourteen properties.  This arm is unusual in the tree in that its inexactness is
 MEASURED rather than feared -- test/nodal_constant_exp_probe.cu found CUDA's exp
 differing from glibc's by exactly 1 ulp on 3.34 % of the arguments this body
 evaluates -- so most of what has to be held here is about not letting that known,
@@ -58,6 +58,25 @@ priced deviation be confused with an unknown one.
 
  12. THE ARM KNOB IS IN trajectory::kArmEnv, and the STUB keeps CPU-only builds
      compiling.
+
+ 13. THE SELF-CHECK DRAINS THE BUILD STREAM BEFORE IT READS THE BUILD BACK, AND
+     THIS RULE IS 238 BLOCK 49 WRITTEN DOWN.  That run reported
+     `max_ulp:9545195, max_ulp_array:7, over_1ulp:107279 (58 %)` beside a PASSING
+     Gate A and Gate B.  Array 7 is diagD = 4*xsdf/(hmesh*hmesh) -- no exp, no
+     sqrt, no contraction site, one IEEE divide under --fmad=false -- so host and
+     device cannot legitimately differ there by one ulp, never mind nine million.
+     The kernel runs on a cudaStreamNonBlocking stream and xfer::memcpy is the
+     blocking form on the LEGACY DEFAULT stream, which has no implicit ordering
+     with a non-blocking one: the download was sampling memory the build had not
+     written.  The sync must name the BUILD stream -- syncing the default stream
+     instead reproduces the bug exactly -- and it must come before the copy.
+
+ 14. AND THE METRIC IS PER-ARRAY AND RELATIVE, WITH A FLOOR.  A ULP distance is
+     unbounded near zero and meaningless across a sign change, and one global
+     maximum plus a separately-stored "which array" scalar is two sources of
+     truth: the scalar this replaced was written under `worst >= max_ulp` re-read
+     AFTER the compare-exchange, which is true whenever a later check merely
+     TIES.  The per-array table is the record and both scalars are its argmax.
 
 Every rule runs against a deliberately broken copy of the same text as a
 negative control.
@@ -225,6 +244,49 @@ def r_self_check(src: dict[str, str]) -> None:
          'from "0 ulp"')
 
 
+def r_self_check_ordered(src: dict[str, str]) -> None:
+    cu = strip_comments(src["cu"])
+    chk = region(cu, "const bool sample = (nc_builds == 1)", "return true;\n    }",
+                 "self-check")
+    m = re.search(r'streamSync\(\s*"CudaXsReconBackend\.cu:nodalConstsOnDevice"\s*,\s*'
+                  r'"selfcheck drain"\s*,\s*stream\)', chk, re.S)
+    assert m, (
+        "the self-check does not drain the BUILD stream before reading it back.  "
+        "kNodalConstsDevice runs on a cudaStreamNonBlocking stream and xfer::memcpy is "
+        "the blocking form on the LEGACY DEFAULT stream, which carries no implicit "
+        "ordering with a non-blocking one -- so the download samples memory the build "
+        "may not have written.  That is 238 block 49's max_ulp:9545195 on diagD, an "
+        "array of one multiply and one IEEE divide under --fmad=false.")
+    copy = chk.find("cudaMemcpyDeviceToHost")
+    assert copy >= 0, "the self-check never reads the device back"
+    assert m.start() < copy, "the drain is issued AFTER the read-back it is supposed to order"
+
+
+def r_self_check_metric(src: dict[str, str]) -> None:
+    cu = strip_comments(src["cu"])
+    chk = region(cu, "const bool sample = (nc_builds == 1)", "return true;\n    }",
+                 "self-check")
+    assert "nodalconsts::relError(a, b, floor_abs)" in chk, (
+        "the self-check reports no relative error.  A ULP distance is unbounded near "
+        "zero and meaningless across a sign change, and these coefficients straddle "
+        "zero; 9,545,195 ulp beside a passing Gate B is a number nobody can act on.")
+    assert "scale * nodalconsts::kRelFloorFrac" in chk, \
+        "the relative floor is not this array's own scale, so it is a magic constant"
+    for slot in ("t.max_ulp_by_array[i]", "t.max_rel_by_array[i]"):
+        assert f"nodalconsts::bumpMax({slot}" in chk, \
+            f"the self-check does not keep {slot}; one global maximum cannot tell one " \
+            "broken array from nine drifting ones"
+    assert "max_ulp_array" not in chk, (
+        "max_ulp_array is being STORED again.  It must be DERIVED as the argmax of the "
+        "per-array table: the scalar this replaced was written under a predicate any "
+        "later check could satisfy by merely TYING the running maximum.")
+    rc = src["receipt"]
+    assert "maxUlpArray()" in rc and "maxRelArray()" in rc, \
+        "the receipt does not derive the argmax from the per-array table"
+    for field in (r'\"max_rel\"', r'\"by_array\"'):
+        assert field in rc, f"the receipt is missing the {field} field"
+
+
 def r_gpu_full_seam(src: dict[str, str]) -> None:
     full = strip_comments(src["full"])
     assert "NodalConsts," in full, "Subsystem::NodalConsts is not declared"
@@ -278,6 +340,11 @@ RULES = [
      ("CLASS N1 BY MEASUREMENT", "class B0 by construction")),
     ("self-check", r_self_check, "cu",
      ("nodalconsts::ulpDistance(a, b)", "0ULL * (unsigned long long)(a + b)")),
+    ("self-check-ordered", r_self_check_ordered, "cu",
+     ('"selfcheck drain",\n                             stream)',
+      '"selfcheck drain",\n                             nullptr)')),
+    ("self-check-metric", r_self_check_metric, "cu",
+     ("nodalconsts::relError(a, b, floor_abs)", "0.0")),
     ("gpu-full-seam", r_gpu_full_seam, "full",
      ("    NodalConsts,\n", "\n")),
     ("arm-env-and-stub", r_arm_env_and_stub, "driver",

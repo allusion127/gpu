@@ -71,9 +71,11 @@ struct ThGpuTally {
 /// declared N1 here so a reader cannot mistake an intention for a measurement.
 inline constexpr const char* kThGpuPolicyNote =
     "RASBERY_GPU_TH=1 targets B0 (all arithmetic is +-*/ under a mined "
-    "contraction mask, device TU built --fmad=false); the class is N1 until a "
-    "238 run reproduces the flag-off digest "
-    "(docs/WP22_TH_SEARCH_GPU_20260902_KO.md section 6)";
+    "contraction mask, device TU built --fmad=false); 238 block 48 reproduced "
+    "the flag-off digest 1f36e75dc00ed2b4 EXACTLY under RASBERY_TH_FORMS=0x57, "
+    "so the arithmetic is B0 on this deck; the class quoted without a forced "
+    "mask stays N1 until a run mines 0x57 and reproduces that digest with no "
+    "override (docs/WP22_TH_SEARCH_GPU_20260902_KO.md sections 2.2 and 6)";
 
 /// One tally per process, and the only global in the arm.
 inline ThGpuTally& thGpuTally() {

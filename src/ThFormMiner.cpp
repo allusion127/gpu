@@ -21,6 +21,8 @@
 #include "GpuFormMask.h"
 #include "ThFormMine.h"
 
+#include <iostream>
+
 namespace rasbery::th {
 
 unsigned long long mineThFormsOnThisHost(bool& sound) {
@@ -31,7 +33,29 @@ unsigned long long mineThFormsOnThisHost(bool& sound) {
     // whole four-seed descent is milliseconds.  A mask mined on operands that
     // never reach a branch would be mined on a fraction of the function.
     static const thref::Fixture fixture = thref::buildFixture(64, 24, 2, 22);
-    return thmine::mineStable(fixture, sound);
+    const unsigned long long    mined   = thmine::mineStable(fixture, sound);
+
+    // AND THE CENSUS THAT MAKES `sound` MEAN SOMETHING.  A zero residual says the
+    // mask reproduces the reference; it does not say the reference could tell the
+    // alternatives apart.  WP22 shipped a fixture that reached neither x-lerp --
+    // 0x54 and 0x57 both scored zero -- and the receipt reported `mined_sound:1`
+    // for a mask the deck disagreed with by 866 lines.  A site nobody can pin is
+    // now a SENTENCE rather than a silence.
+    const unsigned long long dc = thmine::dontCareMask(fixture, mined);
+    if (dc != TH_EXPECTED_DONT_CARE) {
+        std::cerr << "[RASBERY][WARN][FORMS] TH_FORMS: the mining fixture cannot pin site"
+                     " mask 0x"
+                  << std::hex << (dc & ~TH_EXPECTED_DONT_CARE) << std::dec
+                  << " (expected only TH_HAVG and TH_TFUEL_LINEAR, 0x180).  Those bits of the"
+                     " mined mask 0x"
+                  << std::hex << mined << std::dec
+                  << " are whatever the descent's seed started from, NOT a measurement of"
+                     " this host.  src/ThReference.cpp::buildFixture must reach them.\n";
+    }
+    std::cerr << "[RASBERY][FORMS] {\"mask\":\"TH_FORMS\",\"dontcare\":\"0x" << std::hex << dc
+              << std::dec << "\",\"expected_dontcare\":\"0x" << std::hex
+              << TH_EXPECTED_DONT_CARE << std::dec << "\"}" << std::endl;
+    return mined;
 }
 
 unsigned long long thFormMask() {

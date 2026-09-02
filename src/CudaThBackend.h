@@ -32,26 +32,50 @@
 //     order, because a tree reduction of a non-associative fold is a different
 //     number and the norm it produces multiplies every node power.
 //
-// REACHABLE IS NOT MEASURED.  Until a 238 run with RASBERY_GPU_TH=1 reproduces
-// the flag-off digest 1f36e75dc00ed2b4 / 4377 outers, the class this header
-// declares is N1 and the gates are Gate A (against the FP64 host trajectory) and
-// Gate B (against MASTER).  src/ThGpuReceipt.h carries the same sentence in the
-// string a gate script reads.
+// REACHABLE IS NOT MEASURED -- AND 238 HAS NOW MEASURED PART OF IT.  Block 48 of
+// the 2026-08-30 pricing log ran the arm on kngr_238 and swept
+// `RASBERY_TH_FORMS` over {0x00, 0x54, 0x57, 0x1f3}:
 //
-// AND THERE IS A NAMED REASON THE MINING MIGHT NOT BE ENOUGH, which is the one
-// WP7-C paid for.  The mask is calibrated against src/ThReference.cpp, a
-// QUOTATION of the host arithmetic in its own translation unit -- and a
-// quotation is not a call site.  The production spelling lives inside
-// XSSet::SolveTH, where milk::Table::Get and XSSet::GetTfuel are inlined into a
-// much larger function, and gcc's contraction decisions are made in THAT
-// context.  This is measurable rather than hypothetical: the same operands
-// scored against the quotation's OUT-OF-LINE refGetTfuel and against its
-// INLINED use inside refChannelSweep pin bit TH_LERP_X0 differently (17
-// mismatches versus 0 over a 20k sweep), which is the whole phenomenon in one
-// number.  refChannelSweep is used as the reference precisely because its
-// inlining shape is SolveTH's; if 238 measures a digest change with the arm on
-// and a sound mask, that gap is the first thing to look at, exactly as
-// src/XeFormAudit.h describes for the Anderson algebra.
+//   * with 0x57 the run reproduced the flag-off digest 1f36e75dc00ed2b4
+//     EXACTLY -- h5diff rc=0, 0 lines.  THE ARITHMETIC OF THIS ARM IS B0 ON THIS
+//     DECK.  There is no residual to explain, no libm difference, nothing left
+//     over: under the right mask the device T/H is the host T/H, bit for bit.
+//   * with the mask the binary MINED that day (0x54) it moved 866 lines, which
+//     is what put the arm in N1 in the first place.
+//
+// So the open question is no longer "can the device reproduce the host" but
+// "does the mining return the mask the host actually ran".  The gates are
+// unchanged -- Gate A against the FP64 host trajectory, Gate B against MASTER --
+// and the class quoted without a forced mask stays N1 until a 238 run shows
+// `[RASBERY][FORMS] {"mask":"TH_FORMS",...,"value":"0x57","source":"mined"...}`
+// and reproduces the digest with NO override in the environment.
+// src/ThGpuReceipt.h carries the same sentence in the string a gate script reads.
+//
+// AND THE REASON THE MINING WAS NOT ENOUGH IS NOT THE ONE THIS HEADER EXPECTED.
+// The suspicion was WP7-C's: a quotation is not a call site, the production
+// spelling lives inside XSSet::SolveTH where milk::Table::Get and XSSet::GetTfuel
+// are inlined into a much larger function, and gcc decides contraction THERE.
+// That gap is real and measured (the same operands scored against the
+// quotation's OUT-OF-LINE refGetTfuel and against its INLINED use pin bit
+// TH_LERP_X0 differently, 17 mismatches versus 0 over a 20k sweep), and
+// ThReference.cpp now quotes the call graph rather than only the expressions:
+// one refSolveTH holding the channel loop, with tableGet / getTmod / getDmod /
+// getTfuel inline and internal, as milk.h and XSSet.h spell them.
+//
+// BUT THAT WAS NOT WHAT PRODUCED 0x54, and the difference matters because the
+// wrong diagnosis would have been "fixed" and shipped again.  The fixture never
+// REACHED the two x-lerps: scoreMask derives node power from xskf/phif/vol
+// through the shipped fold (nothing reads Fixture::node_power), buildFixture's
+// `norm` was 1.0e-3 where SolveTH's is of order 1e2, so all 1,280 fuel nodes came
+// out at `lpd < 0.03` W/cm and every tf query clamped to the first LPD knot with
+// `fx == 0`.  0x54 and 0x57 both scored ZERO; the descent returned its seed and
+// `mineStable` truthfully reported a zero residual.  With the operands repaired,
+// BOTH the old shape and the new one mine 0x57.
+//
+// The check that was missing now exists: thmine::dontCareMask asks of every site
+// whether the fixture can tell its forms apart, and src/ThFormMiner.cpp warns on
+// anything but TH_HAVG.  src/XeFormAudit.h describes the same class of gap for
+// the Anderson algebra.
 //
 // ---------------------------------------------------------------------------
 // WHAT IS SAVED, AND WHAT IS NOT -- STATED SO IT CAN BE CHECKED
