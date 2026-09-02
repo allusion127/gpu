@@ -96,6 +96,58 @@ protected:
     /// no-ops and are reported separately as BackendCounters::overrun_iterations.
     long long _bicg_iters;
 
+public:
+    /// A2 S0 (docs/A2_OUTER_REDUCTION_DESIGN_20260902_KO.md Sec 1.5-1.6, Sec 3.1
+    /// S0, Sec 5 items 4-5).  WHY ONE DRIVE ENDED, and how many of its sweeps
+    /// nothing charged for.
+    ///
+    /// The campaign has `cmfd_sweeps / outers` = 4.256 against a budget of 5 and
+    /// no way to read what that ratio MEANS.  If most drives stop because
+    /// `errl2 < _epsl2` then relaxing `_epsl2` buys sweeps (design S3); if most
+    /// stop because the budget ran out, a drive that cannot reach 1e-6 in five
+    /// sweeps will not reach 5e-6 either and S3 is dead before it is written.
+    /// That single number is S3's K0 gate and there was no counter behind it.
+    ///
+    /// `negative_retry_sweeps` is the design's Sec 1.6 loss: a sweep that
+    /// produced a negative flux is re-run without consuming the budget (up to
+    /// `20 * _ncmfd`), so it is a real launch that appears in NO outer-count
+    /// receipt.  `icmfd_done - sweeps_done` has been carried in CmfdSweepIO all
+    /// along and simply never read.
+    ///
+    /// `deferred_drives` / `deferred_sweeps` are the honest hole.  On the device
+    /// outer-segment arm the verdict kernel sums a whole SEGMENT of drives into
+    /// one Accum whose `state` is only the LAST launch's, so the per-drive exit
+    /// of the others cannot be recovered without a device-side histogram -- and
+    /// S0 opens no .cu file.  They are reported separately rather than folded in
+    /// so the exit ratio's denominator is on the face of the receipt, and their
+    /// `sweeps / drive` is the usable proxy: at the budget it IS exhaustion.
+    struct DriveExits {
+        long long drives                = 0; ///< drives whose exit the host classified
+        long long converged             = 0; ///< ended on tolerance: errl2 < _epsl2
+        long long budget                = 0; ///< ended on the sweep budget instead
+        long long aborted               = 0; ///< a launch refused mid-drive; caller fell back
+        long long deferred_drives       = 0; ///< segment-summed drives, exit unattributed
+        long long deferred_sweeps       = 0; ///< their charged sweeps, for sweeps/drive
+        long long sweeps_charged        = 0; ///< sweeps that consumed the drive budget
+        long long negative_retry_sweeps = 0; ///< sweeps re-run for a negative flux
+    };
+
+protected:
+    /// See DriveExits.  Zeroed by resetIteration() with the other diagnostics,
+    /// so what it holds is one SolveLoop's own total.
+    DriveExits _drive_exits{};
+
+    /// Charge one finished drive to `converged` or `budget`.
+    ///
+    /// ONE TEST, EVERY PATH, AND IT IS THE DRIVE'S OWN.  `errl2 < _epsl2` is the
+    /// exit condition the host loop breaks on, the condition the device kernel
+    /// raises sweep state 1 for (cmfd_sweep_end, and state 1 takes precedence
+    /// over state 3), and the condition the Rayleigh hand-back returns true on.
+    /// Reading it once at the exit therefore classifies a device drive, a host
+    /// drive and a hand-back by the same rule, without the caller having to know
+    /// which one it took -- and it is exactly the question S3's K0 gate asks.
+    void chargeDriveExit(double errl2);
+
     /// @brief Number of CMFD sweeps since the last resetIteration(), used ONLY to decide
     /// when the Wielandt extrapolation may take over from the Rayleigh-quotient warm-up.
     ///
@@ -335,6 +387,17 @@ public:
 
     /// @brief inner BiCGSTAB iterations since the last resetIteration()
     [[nodiscard]] long long bicgIterations() const { return _bicg_iters; }
+
+    /// @brief why this SolveLoop's drives ended.  See DriveExits.
+    [[nodiscard]] const DriveExits& driveExits() const { return _drive_exits; }
+
+    /// @brief the inner BiCGSTAB budget this instance resolved (A2 S2 scoring:
+    /// the only honest way to price nmax is `outers * cmfd_sweeps * (1 + nmax)`,
+    /// because `bicg_iters` is DERIVED from it on the device arm).
+    [[nodiscard]] int innerBudget() const { return _nmaxbicg; }
+    /// @brief the CMFD sweep budget per drive (`_ncmfd`), the denominator the
+    /// budget-exhausted fraction is read against.
+    [[nodiscard]] int sweepBudget() const { return _ncmfd; }
 
     /// @brief the CUDA backend's cumulative counters, whichever backend this
     /// instance actually uses.  Zeroed when there is no CUDA backend at all.

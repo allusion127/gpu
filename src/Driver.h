@@ -315,6 +315,67 @@ struct Counters {
     long long th_search_coincident = 0;  ///< outers where T/H and search both fired
     long long cmfd_sweeps          = 0;
     long long bicg_iters           = 0;
+
+    // =====================================================================
+    // A2 S0 -- the outer-budget receipt's own counters
+    // (docs/A2_OUTER_REDUCTION_DESIGN_20260902_KO.md Sec 3.1 S0)
+    // =====================================================================
+    //
+    // ADDITIVE AND UNREAD BY THE LADDER, which is what makes S0 free: every
+    // field below is written by a plain increment and read only by the
+    // `[RASBERY][OUTER_BUDGET]` line, so the trajectory digest is untouched and
+    // an arm that turns the receipt off does not exist -- there is nothing to
+    // turn off.  See the outerbudget namespace for what the receipt does with
+    // them.
+
+    /// Settle-gate outers taken while the A2 staging is in its LOOSE stage.
+    /// `outers_by_cause[CAUSE_SETTLE] - settle_outers_loose` is the polish half.
+    /// The design's S2/S3 both trade against this split and it was not counted:
+    /// the gate buys a settled d-hat for the sample the search TRUSTS, and under
+    /// staging most of its outers are bought for samples that are re-tested at
+    /// production tolerance before anything is published.
+    long long settle_outers_loose  = 0;
+
+    /// The four `prev_inner = eigv + 1.0` sites, counted where they fire.
+    /// Sec 1.4(a) attributes >= 42 % of the run to the first of them and Sec 1.4
+    /// records the counter-argument; these four say how large each site's
+    /// population actually is, which is the half of that dispute that is
+    /// arithmetic rather than physics.
+    long long poison_xe_step       = 0;  ///< Driver.h, the Xe cascade handoff
+    long long poison_xe_interim    = 0;  ///< the interim (loose-flux) Xe probe
+    long long poison_settle        = 0;  ///< the settling gate
+    long long poison_polish        = 0;  ///< the LOOSE -> POLISH transition
+
+    /// THE COUNTERFACTUAL (Sec 3.1 S0 `xe_first_outer_would_converge`, and the
+    /// kill criterion for S4).  Armed at the Xe handoff with the eigenvalue the
+    /// sentinel overwrote, read ONCE on the next outer's convergence test and
+    /// then disarmed.  EVALUATED AND NOT USED: the ladder reads its own
+    /// `flux_converged`, so the digest cannot move.
+    ///
+    /// `poison_probed` is the denominator -- handoffs whose next outer ran on
+    /// the HOST body, which is the only arm that computes a per-outer verdict
+    /// the probe can ride.  On the device-segment arm the segment returns one
+    /// verdict for several outers, so a handoff followed by a segment is not
+    /// probed and is not counted here either; the receipt publishes the
+    /// coverage so the hit rate is never read against the wrong denominator.
+    long long poison_probed        = 0;
+    long long poison_would_converge = 0;
+    /// The same pair restricted to the LOOSE stage, because S4 is `!polishing`
+    /// only: this is the hit rate its kill criterion is actually about.
+    long long poison_probed_loose  = 0;
+    long long poison_would_converge_loose = 0;
+
+    /// BICGCMFD::DriveExits, folded at the SolveLoop close beside cmfd_sweeps.
+    /// `cmfd_sweeps == cmfd_sweeps_charged + cmfd_negative_retry_sweeps` is an
+    /// identity, not an approximation: BICGCMFD splits every sweep it counts.
+    long long cmfd_drives          = 0;
+    long long cmfd_drives_converged = 0;
+    long long cmfd_drives_budget   = 0;
+    long long cmfd_drives_aborted  = 0;
+    long long cmfd_drives_deferred = 0;
+    long long cmfd_sweeps_deferred = 0;
+    long long cmfd_sweeps_charged  = 0;
+    long long cmfd_negative_retry_sweeps = 0;
     double    wall                 = 0.0;  ///< solve wall of the statepoint
     double    io_wall              = 0.0;
     double    phase[PH_COUNT]{};
@@ -444,6 +505,23 @@ struct Counters {
         th_search_coincident += step.th_search_coincident;
         cmfd_sweeps          += step.cmfd_sweeps;
         bicg_iters           += step.bicg_iters;
+        settle_outers_loose  += step.settle_outers_loose;
+        poison_xe_step       += step.poison_xe_step;
+        poison_xe_interim    += step.poison_xe_interim;
+        poison_settle        += step.poison_settle;
+        poison_polish        += step.poison_polish;
+        poison_probed        += step.poison_probed;
+        poison_would_converge += step.poison_would_converge;
+        poison_probed_loose  += step.poison_probed_loose;
+        poison_would_converge_loose += step.poison_would_converge_loose;
+        cmfd_drives          += step.cmfd_drives;
+        cmfd_drives_converged += step.cmfd_drives_converged;
+        cmfd_drives_budget   += step.cmfd_drives_budget;
+        cmfd_drives_aborted  += step.cmfd_drives_aborted;
+        cmfd_drives_deferred += step.cmfd_drives_deferred;
+        cmfd_sweeps_deferred += step.cmfd_sweeps_deferred;
+        cmfd_sweeps_charged  += step.cmfd_sweeps_charged;
+        cmfd_negative_retry_sweeps += step.cmfd_negative_retry_sweeps;
         wall                 += step.wall;
         io_wall              += step.io_wall;
         graph_delta          += step.graph_delta;
@@ -839,6 +917,148 @@ inline std::string armEnvJson() {
 }
 
 } // namespace trajectory
+
+// ===========================================================================
+// A2 S0 -- the outer-budget receipt
+// (docs/A2_OUTER_REDUCTION_DESIGN_20260902_KO.md Sec 3.1, spike S0)
+// ===========================================================================
+//
+// WHAT IT IS FOR.  The A2 outer-reduction programme is a set of bets about
+// where 125-165 outers per statepoint go, and every one of those bets was
+// priced off a KNGR profile with no cause-attribution receipt behind it (the
+// design's Sec 1.1 and Sec 5 item 1 both say so).  Its first spike is not a
+// lever at all: it is this line, so the levers can be scored against a
+// measurement instead of against an inference.
+//
+// THE CASCADE IDENTITY IS THE POINT.  The existing [RASBERY][SPTELEM] receipt
+// already splits outers six ways, and the design's Sec 1.3 shows that the split
+// UNDERSTATES what a boron trial costs by a factor of three, because a trial
+// does not merely spend the outers charged to CAUSE_SEARCH -- it RELOADS a Xe
+// cascade whose outers are charged to CAUSE_XE.  The re-attribution runs
+// through one identity,
+//
+//     cascades = solve_loops + th_updates + search_trials - th_search_coincident
+//
+// and every term of it is already counted.  So the receipt publishes the
+// identity's RESIDUAL rather than the identity's claim: a residual that is not
+// zero means the three cascade-start sites and the four counters have drifted
+// apart, and every re-attribution built on them is void.
+//
+// WHY IT IS ALWAYS ON, AND WHY THAT IS FREE.  The design forbids reading a
+// budget beside a wall (Sec 4.2: RASBERY_STATEPOINT_TELEMETRY costs ~2.5 % of a
+// single deck and destroys a batch), so a budget receipt that rode the
+// telemetry gate could never be quoted next to a c/h number -- which is the
+// only place the programme's conclusions get spent.  The cost of not gating it
+// is one struct fold per statepoint and one formatted line per run: every
+// counter it reads is advanced unconditionally by SolveLoop already, and
+// nothing here runs per outer or per sweep.  It is the same argument the
+// trajectory receipt above makes for itself, for the same reason.
+//
+// B0.  Every field is written by a plain increment and read by nothing but this
+// function.  The trajectory digest folds no counter from here, the ladder never
+// reads the counterfactual, and the two numbers the design's S3 and S4 kill
+// criteria need are measured WITHOUT either spike being implemented -- which is
+// what makes S0 a spike that can be run before deciding whether to write S3 or
+// S4 at all.
+namespace outerbudget {
+
+/// x / y, or 0 when y is zero.  A receipt that printed a nan would be a receipt
+/// every consumer had to special-case before it could plot anything.
+inline double ratio(long long x, long long y) {
+    return (y > 0) ? static_cast<double>(x) / static_cast<double>(y) : 0.0;
+}
+
+/// The whole receipt, as one line.
+///
+/// @param c            the run accumulator (ob_run), folded outside the telemetry gate
+/// @param statepoints  how many statepoints the schedule actually ran
+/// @param slot         the batch arena slot, or -1
+/// @param sweep_budget BICGCMFD::sweepBudget() -- `_ncmfd`, the denominator the
+///                     deferred bucket's sweeps/drive is read against
+/// @param inner_budget BICGCMFD::innerBudget() -- `_nmaxbicg`, published because
+///                     the design's Sec 4.3 forbids scoring nmax with `bicg_iters`
+///                     (a DERIVED quantity on the device arm) and requires
+///                     `outers * cmfd_sweeps * (1 + nmax)`, which is `nmax_work`.
+inline std::string line(const sptelem::Counters& c, int statepoints, int slot,
+                        int sweep_budget, int inner_budget) {
+    const long long attributed = c.outers();
+    const long long settle     = c.outers_by_cause[sptelem::CAUSE_SETTLE];
+    // Sec 1.3.  Every term is counted at the site that causes it; the residual
+    // is published so a reader can watch the identity hold rather than trust it.
+    const long long cascades_predicted =
+        c.solve_loops + c.th_updates + c.search_trials - c.th_search_coincident;
+    const long long cascade_residual = c.xe_cascades - cascades_predicted;
+    const long long drive_exits      = c.cmfd_drives + c.cmfd_drives_deferred;
+    const long long sweep_split      = c.cmfd_sweeps_charged + c.cmfd_negative_retry_sweeps;
+    const double    outers_per_cascade = ratio(c.outers_driver, c.xe_cascades);
+    const double    search_bucket_per_trial =
+        ratio(c.outers_by_cause[sptelem::CAUSE_SEARCH], c.search_trials);
+    // Sec 1.3's ALL-IN price of one trial: the outers charged to its own bucket
+    // plus the Xe cascade the commit reloads, which the bucket never sees.
+    const double    search_all_in_per_trial =
+        (c.search_trials > 0) ? search_bucket_per_trial + outers_per_cascade : 0.0;
+    return std::format(
+        "[RASBERY][OUTER_BUDGET] {{\"schema_version\":1,\"slot\":{},\"statepoints\":{},"
+        "\"outers\":{},\"outers_attributed\":{},\"outers_per_statepoint\":{:.3f},"
+        "\"outers_by_phase\":{{\"initial\":{},\"xe\":{},\"th\":{},\"search\":{},"
+        "\"settle\":{},\"fallback\":{}}},"
+        "\"cascade\":{{\"cascades\":{},\"solve_loops\":{},\"th_updates\":{},"
+        "\"search_trials\":{},\"th_search_coincident\":{},\"predicted\":{},"
+        "\"residual\":{},\"outers_per_cascade\":{:.3f},\"xe_steps\":{},"
+        "\"xe_steps_per_cascade\":{:.3f}}},"
+        "\"search\":{{\"trials\":{},\"trials_per_statepoint\":{:.3f},"
+        "\"outers_per_trial_bucket\":{:.3f},\"outers_per_trial_all_in\":{:.3f},"
+        "\"proposals\":{},\"refused\":{},\"iterations\":{}}},"
+        "\"xe\":{{\"steps\":{},\"interim_steps\":{},\"cascades\":{},"
+        "\"budget_exhausted\":{}}},"
+        "\"settle\":{{\"outers\":{},\"outers_loose\":{},\"outers_polish\":{}}},"
+        "\"sentinel\":{{\"xe_step\":{},\"xe_interim\":{},\"settle\":{},\"polish\":{},"
+        "\"total\":{}}},"
+        "\"counterfactual\":{{\"probed\":{},\"would_converge\":{},\"hit_rate\":{:.4f},"
+        "\"probe_coverage\":{:.4f},\"loose_probed\":{},\"loose_would_converge\":{},"
+        "\"loose_hit_rate\":{:.4f}}},"
+        "\"cmfd\":{{\"sweeps\":{},\"sweeps_per_outer\":{:.4f},\"sweeps_charged\":{},"
+        "\"negative_retry_sweeps\":{},\"negative_retry_frac\":{:.4f},"
+        "\"sweep_split_residual\":{},"
+        "\"drives\":{},\"exit_converged\":{},\"exit_budget\":{},\"exit_aborted\":{},"
+        "\"exit_deferred\":{},\"exit_attributed_frac\":{:.4f},"
+        "\"budget_exhausted_frac\":{:.4f},\"deferred_sweeps_per_drive\":{:.4f},"
+        "\"sweep_budget\":{},\"inner_budget\":{},\"bicg_iters\":{},\"nmax_work\":{}}},"
+        "\"flux_limit_retries\":{},\"staged_relapses\":{}}}\n",
+        slot, statepoints,
+        c.outers_driver, attributed, ratio(c.outers_driver, statepoints),
+        c.outers_by_cause[sptelem::CAUSE_INITIAL], c.outers_by_cause[sptelem::CAUSE_XE],
+        c.outers_by_cause[sptelem::CAUSE_TH], c.outers_by_cause[sptelem::CAUSE_SEARCH],
+        settle, c.outers_by_cause[sptelem::CAUSE_FALLBACK],
+        c.xe_cascades, c.solve_loops, c.th_updates, c.search_trials,
+        c.th_search_coincident, cascades_predicted, cascade_residual,
+        outers_per_cascade, c.xe_updates, ratio(c.xe_updates, c.xe_cascades),
+        c.search_trials, ratio(c.search_trials, statepoints),
+        search_bucket_per_trial, search_all_in_per_trial,
+        c.search_proposals, c.search_refused, c.search_iterations,
+        c.xe_updates, c.xe_interim_updates, c.xe_cascades, c.xe_budget_exhausted,
+        settle, c.settle_outers_loose, settle - c.settle_outers_loose,
+        c.poison_xe_step, c.poison_xe_interim, c.poison_settle, c.poison_polish,
+        c.poison_xe_step + c.poison_xe_interim + c.poison_settle + c.poison_polish,
+        c.poison_probed, c.poison_would_converge,
+        ratio(c.poison_would_converge, c.poison_probed),
+        ratio(c.poison_probed, c.poison_xe_step),
+        c.poison_probed_loose, c.poison_would_converge_loose,
+        ratio(c.poison_would_converge_loose, c.poison_probed_loose),
+        c.cmfd_sweeps, ratio(c.cmfd_sweeps, c.outers_driver), c.cmfd_sweeps_charged,
+        c.cmfd_negative_retry_sweeps, ratio(c.cmfd_negative_retry_sweeps, c.cmfd_sweeps),
+        c.cmfd_sweeps - sweep_split,
+        c.cmfd_drives, c.cmfd_drives_converged, c.cmfd_drives_budget,
+        c.cmfd_drives_aborted, c.cmfd_drives_deferred,
+        ratio(c.cmfd_drives, drive_exits),
+        ratio(c.cmfd_drives_budget, c.cmfd_drives),
+        ratio(c.cmfd_sweeps_deferred, c.cmfd_drives_deferred),
+        sweep_budget, inner_budget, c.bicg_iters,
+        c.outers_driver * c.cmfd_sweeps * (1 + static_cast<long long>(inner_budget)),
+        c.flux_limit_retries, c.staged_relapses);
+}
+
+} // namespace outerbudget
 
 // In-core equilibrium-xenon mode (RASBERY_XE_MODE), resolved once per process.
 //
@@ -3885,6 +4105,17 @@ private:
         // every later cascade starts at a full step again.
         bool   xe_once_prime  = primeXeDamping;
         SolveExit exit_reason = SolveExit::ITER_EXHAUSTED;
+        // A2 S0's counterfactual, and nothing but a counterfactual.  `cf_eigv`
+        // is the eigenvalue the Xe handoff's `prev_inner = eigv + 1.0` sentinel
+        // overwrote; `cf_armed` says the NEXT outer is the one the sentinel
+        // guarantees cannot converge, and `cf_stage` remembers whether that
+        // handoff happened in the LOOSE stage, which is the only population S4
+        // proposes to change.  Read once, by the counter block beside the
+        // convergence test, and by nothing else -- the ladder never sees them,
+        // so the trajectory cannot move.
+        double cf_eigv  = 0.0;
+        bool   cf_armed = false;
+        bool   cf_stage_loose = false;
         // Telemetry only (plan Rev.4 Sec 8).  The cause of the segment the NEXT
         // outer belongs to; see the attribution rules in the sptelem comment.
         sptelem::Cause sp_cause = sptelem::CAUSE_INITIAL;
@@ -4103,6 +4334,12 @@ private:
                         static_cast<long long>(seg.device_outers);
                     outer_timing::buckets().outers.fetch_add(seg.device_outers,
                                                              std::memory_order_relaxed);
+                    // A2 S0: the segment publishes ONE verdict for
+                    // `device_outers` outers, so the outer the handoff's
+                    // sentinel was guaranteed to spoil is inside it and has no
+                    // host-side test to ride.  Disarm rather than mis-attribute;
+                    // the receipt reports the coverage this leaves.
+                    cf_armed = false;
                     outer_on_device = true;
                 } else {
                     // A launch or hook failure.  Every ELIGIBILITY refusal was
@@ -4157,6 +4394,24 @@ private:
             ++ctx.telemetry.outers_by_cause[sp_cause];
             outer_timing::buckets().outers.fetch_add(1, std::memory_order_relaxed);
             flux_converged = std::abs(prev_inner - eigv) < keff_tol_now && residual < flux_tol_now;
+            // A2 S0 counterfactual (Sec 3.1 S0, kill criterion for S4).  The
+            // SAME two terms, against the eigenvalue the Xe handoff's sentinel
+            // replaced instead of against the sentinel.  It answers the one
+            // question the design's Sec 1.4 dispute turns on -- would this
+            // outer have been allowed to converge if the handoff had carried
+            // the eigenvalue forward -- and it answers it for free, because
+            // `flux_converged` above is the value the ladder uses and this
+            // is a second expression nothing reads back.
+            const bool cf_probe = cf_armed;
+            const bool cf_hit   = cf_probe && std::abs(cf_eigv - eigv) < keff_tol_now &&
+                                  residual < flux_tol_now;
+            const bool cf_loose = cf_probe && cf_stage_loose;
+            const bool cf_loose_hit = cf_loose && cf_hit;
+            cf_armed = false;
+            if (cf_probe) ++ctx.telemetry.poison_probed;
+            if (cf_hit) ++ctx.telemetry.poison_would_converge;
+            if (cf_loose) ++ctx.telemetry.poison_probed_loose;
+            if (cf_loose_hit) ++ctx.telemetry.poison_would_converge_loose;
             prev_inner     = eigv;
 
             // 2. Nodal correction -> CNCC (d-hat) + rod cusping macro-XS update. The cusping blend
@@ -4461,6 +4716,16 @@ private:
                     // taking a search or T/H feedback step.
                     prev_inner  = eigv + 1.0;
                     clean_iters = 0;
+                    // A2 S0.  Arm the counterfactual with the eigenvalue the
+                    // line above just overwrote.  `eigv` is the pre-Xe value and
+                    // is ALREADY what prev_inner held (the convergence test set
+                    // it this outer), so `+ 1.0` is a sentinel written over a
+                    // carry that was already correct -- which is exactly what
+                    // makes the counterfactual well posed.
+                    cf_eigv        = eigv;
+                    cf_armed       = true;
+                    cf_stage_loose = !polishing;
+                    ++ctx.telemetry.poison_xe_step;
                     continue;
                 }
             }
@@ -4472,6 +4737,7 @@ private:
             // behavior must stay exactly as it was.
             if (xe_interim && !flux_converged) {
                 prev_inner = eigv + 1.0;
+                ++ctx.telemetry.poison_xe_interim;
                 continue;
             }
 
@@ -4523,6 +4789,16 @@ private:
                 // The next outer exists only because the gate refused this
                 // sample: that is Sec 8's "settling gate extra outer".
                 sp_cause = sptelem::CAUSE_SETTLE;
+                // A2 S0.  The gate's outers split LOOSE / POLISH, and the
+                // design trades against exactly that split: RASBERY_STAGED_
+                // LOOSE_SETTLE already exempts the loose stage, so what is left
+                // here while `!polishing` is the population a further exemption
+                // could still reach.  Sec 1.4's counter-argument names this site
+                // and the polish transition as the two where no cross section
+                // moved, so the sentinel is buying nothing.
+                const bool settle_loose = !polishing;
+                ++ctx.telemetry.poison_settle;
+                if (settle_loose) ++ctx.telemetry.settle_outers_loose;
                 continue;
             }
 
@@ -4583,6 +4859,7 @@ private:
                     polishing   = true;
                     prev_inner  = eigv + 1.0;
                     clean_iters = 0;
+                    ++ctx.telemetry.poison_polish;
                     if (has_eq_xe)
                         prev_xe_change = std::numeric_limits<double>::infinity();
                     if (trace_sl)
@@ -4806,6 +5083,19 @@ private:
         // ReconvergeFlux's sweeps included, since it ran above.
         ctx.telemetry.cmfd_sweeps += ctx.cmfd_solver.innerIterations();
         ctx.telemetry.bicg_iters  += ctx.cmfd_solver.bicgIterations();
+        // A2 S0.  The same reset point, so this is this SolveLoop's own split of
+        // the sweeps counted on the line above:
+        // `cmfd_sweeps == cmfd_sweeps_charged + cmfd_negative_retry_sweeps` is
+        // an identity BICGCMFD maintains at every site that advances `iter`.
+        const BICGCMFD::DriveExits de = ctx.cmfd_solver.driveExits();
+        ctx.telemetry.cmfd_drives           += de.drives;
+        ctx.telemetry.cmfd_drives_converged += de.converged;
+        ctx.telemetry.cmfd_drives_budget    += de.budget;
+        ctx.telemetry.cmfd_drives_aborted   += de.aborted;
+        ctx.telemetry.cmfd_drives_deferred  += de.deferred_drives;
+        ctx.telemetry.cmfd_sweeps_deferred  += de.deferred_sweeps;
+        ctx.telemetry.cmfd_sweeps_charged   += de.sweeps_charged;
+        ctx.telemetry.cmfd_negative_retry_sweeps += de.negative_retry_sweeps;
 
         if (trace_sl)
             std::cout << std::format(
@@ -5373,6 +5663,23 @@ public:
         std::string sp_job_id;
         int         sp_slot = -1;
         sptelem::Counters sp_run;
+        // A2 S0's run accumulator, and the reason it is not sp_run.
+        //
+        // ALWAYS ON, like the trajectory fold below it and for the same reason:
+        // the outer budget is what the whole A2 programme is measured against,
+        // and a budget receipt that only appeared under
+        // RASBERY_STATEPOINT_TELEMETRY could never be quoted beside a TIMING run
+        // -- the design forbids mixing the two (Sec 4.2: the telemetry costs
+        // ~2.5 % of a single deck's wall and destroys a batch).  sp_run is
+        // folded inside that gate and would be empty here.
+        //
+        // WHAT IT COSTS.  The counters it folds are advanced unconditionally
+        // already; ctx.telemetry.begin() is called on every statepoint whether
+        // the telemetry is on or not, so the per-statepoint values are valid at
+        // the boundary either way.  This adds one struct fold per statepoint
+        // (35-51 of them) and one formatted line per run.  Nothing per outer,
+        // nothing per sweep, and no clock.
+        sptelem::Counters ob_run;
         // The trajectory fold (always on; see the namespace comment).  Declared
         // beside the telemetry accumulator and armed by nothing: a receipt whose
         // presence depended on a flag could not answer a question ABOUT flags.
@@ -5830,6 +6137,19 @@ public:
                     schedule.search_last_dx));
                 sp_run.accumulate(c);
             }
+
+            // A2 S0.  OUTSIDE the telemetry gate, deliberately: see ob_run.
+            // The fold reads only counters SolveLoop advanced unconditionally,
+            // so a run with the telemetry off publishes the same budget as one
+            // with it on -- which is the property that lets the budget receipt
+            // be read beside a wall-clock arm.
+            // The Driver's own outer count, stated here rather than added to
+            // ob_run separately: the telemetry gate above sets the same field
+            // to the same value, and adding it twice on one path and once on
+            // the other is how a receipt starts disagreeing with the trajectory
+            // line four lines below it.
+            ctx.telemetry.outers_driver = total_outer;
+            ob_run.accumulate(ctx.telemetry);
 
             // Natural EOC (MASTER %EXE_DEP tgobj boron): while the converged critical
             // boron is still above the target, re-queue a copy of this entry right
@@ -6318,6 +6638,20 @@ public:
         _case_receipt.th_updates  = sp_traj.th;
         _case_receipt.slot        = cmfd_solver.batchSlot();
         _case_receipt.complete    = true;
+
+        // A2 S0: the outer-budget receipt, unconditionally, immediately before
+        // the trajectory line.
+        //
+        // BEFORE IT AND NOT AFTER IT, so the trajectory receipt stays the last
+        // line a run prints -- every consumer in tools/ tails for it, and the
+        // telemetry-neutrality comparison reads it positionally.  Outside the
+        // telemetry gate for the reason ob_run exists: a budget that could only
+        // be read on a run that had been slowed down to read it is a budget that
+        // can never be quoted beside a wall.
+        std::cout << outerbudget::line(ob_run, sp_traj.statepoints,
+                                       cmfd_solver.batchSlot(),
+                                       cmfd_solver.sweepBudget(),
+                                       cmfd_solver.innerBudget());
 
         // The trajectory receipt, unconditionally, as the last line of the run.
         //

@@ -514,6 +514,21 @@ bool BICGCMFD::absorbSweepLaunch(CudaBatchArena::CmfdSweepIO& io, double& eigv,
         const int attempts = io.icmfd_done - icmfd;
         icmfd              = io.icmfd_done;
         iout += io.sweeps_done;
+        // A2 S0 Sec 1.6: the sweeps nothing charges for.  `attempts` is every
+        // sweep this launch ran and `sweeps_done` is the subset that consumed
+        // the drive's budget, so the difference is the negative-flux retry tail
+        // -- real launches that appear in no outer-count receipt.
+        //
+        // GUARDED ON THE SAME WINDOW `attempts` MEASURES.  finishDeferredDrives
+        // charges a whole segment's attempts from the device accumulator and
+        // then re-enters here for the ABANDONED launch with `icmfd` seeded to
+        // that launch's own icmfd_done, so `attempts` is deliberately zero
+        // there and its sweeps are already in the accumulator's total.  Without
+        // the guard that call would subtract them twice.
+        if (attempts > 0) {
+            _drive_exits.sweeps_charged        += io.sweeps_done;
+            _drive_exits.negative_retry_sweeps += attempts - io.sweeps_done;
+        }
         _wiel_sweep += attempts;
         iter += attempts;
         // Each device sweep runs the same captured inner loop the host path
@@ -611,13 +626,18 @@ bool BICGCMFD::driveDeviceSweeps(double& eigv, double* flux, double& errl2) {
             // Nothing ran. Rebuild the host operator before allowing the
             // pristine host loop to take over; stale diag/cc is fail-closed.
             if (use_device_assembly) assembleHostLinearSystem(eigv);
+            ++_drive_exits.aborted;
             return false;
         }
         // The device now owns psi: it advanced it, and nothing on the host
         // touches it until the next drive's updpsi.
         psi_dirty = false;
-        if (absorbSweepLaunch(io, eigv, flux, errl2, reigv, reigvs, iout, icmfd)) return true;
+        if (absorbSweepLaunch(io, eigv, flux, errl2, reigv, reigvs, iout, icmfd)) {
+            chargeDriveExit(errl2);
+            return true;
+        }
     }
+    chargeDriveExit(errl2);
     return true;
 }
 
@@ -712,8 +732,10 @@ bool BICGCMFD::finishDrive(double& eigv, double* flux, double& errl2,
         throw std::runtime_error("CUDA BiCGSTAB detected a non-finite value");
 
     int iout = 0, icmfd = 0;
-    if (absorbSweepLaunch(d.io, eigv, flux, errl2, d.reigv, d.reigvs, iout, icmfd))
+    if (absorbSweepLaunch(d.io, eigv, flux, errl2, d.reigv, d.reigvs, iout, icmfd)) {
+        chargeDriveExit(errl2);
         return true;
+    }
 
     // THE DRIVE IS NOT OVER, and this is the one place the host still has to
     // spin: sweep state 0 (the launch's slot budget was spent on negative-flux
@@ -738,12 +760,16 @@ bool BICGCMFD::finishDrive(double& eigv, double* flux, double& errl2,
 
         if (!_ls->driveSweepsCuda(flux, io)) {
             if (d.use_device_assembly) assembleHostLinearSystem(eigv);
+            ++_drive_exits.aborted;
             return false;
         }
         psi_dirty = false;
-        if (absorbSweepLaunch(io, eigv, flux, errl2, d.reigv, d.reigvs, iout, icmfd))
+        if (absorbSweepLaunch(io, eigv, flux, errl2, d.reigv, d.reigvs, iout, icmfd)) {
+            chargeDriveExit(errl2);
             return true;
+        }
     }
+    chargeDriveExit(errl2);
     return true;
 }
 
@@ -790,6 +816,28 @@ bool BICGCMFD::finishDeferredDrives(
     iter += attempts;
     _bicg_iters += static_cast<long long>(attempts) * (1 + _nmaxbicg);
 
+    // A2 S0.  THE SEGMENT'S DRIVES, AND WHY THEIR EXITS ARE NOT SPLIT.  The
+    // verdict kernel sums a whole segment into one Accum and keeps only the
+    // LAST launch's `state`, so the exit of every earlier drive is gone before
+    // the host sees anything.  Recovering it means a per-state histogram in the
+    // accumulator, which is a .cu change this instrumentation deliberately does
+    // not make.  So they are reported as their own bucket rather than folded
+    // into `converged`/`budget`, and `deferred_sweeps / deferred_drives` is the
+    // proxy that answers S3's K0 gate anyway: a ratio sitting at `_ncmfd` is a
+    // segment whose drives all spent the budget.
+    //
+    // The exceptional launch is EXCLUDED from the count because the host tail
+    // below finishes that drive and charges its exit for real; its partial
+    // sweeps are excluded from `deferred_sweeps` with it, so the ratio is over
+    // whole drives.  Its ATTEMPTS stay in the totals above, which is why
+    // absorbSweepLaunch is re-entered for it with attempts deliberately zero.
+    const long long acc_sweeps   = static_cast<long long>(acc.sweeps);
+    const long long saved_sweeps = exceptional ? static_cast<long long>(saved.sweeps_done) : 0;
+    _drive_exits.sweeps_charged        += acc_sweeps;
+    _drive_exits.negative_retry_sweeps += static_cast<long long>(attempts) - acc_sweeps;
+    _drive_exits.deferred_drives += static_cast<long long>(acc.launches) - (exceptional ? 1 : 0);
+    _drive_exits.deferred_sweeps += acc_sweeps - saved_sweeps;
+
     _last_sweep_negative = (acc.negative != 0.0) ? 1 : 0;
     _last_sweep_state    = static_cast<int>(acc.state);
 
@@ -816,8 +864,10 @@ bool BICGCMFD::finishDeferredDrives(
     double reigv  = d.reigv;
     double reigvs = d.reigvs;
     _last_drive_device_flux = false;
-    if (absorbSweepLaunch(saved, eigv, flux, errl2, reigv, reigvs, iout, icmfd))
+    if (absorbSweepLaunch(saved, eigv, flux, errl2, reigv, reigvs, iout, icmfd)) {
+        chargeDriveExit(errl2);
         return true;
+    }
 
     host_continued = true;
     bool psi_dirty = false;
@@ -832,12 +882,16 @@ bool BICGCMFD::finishDeferredDrives(
 
         if (!_ls->driveSweepsCuda(flux, io)) {
             if (d.use_device_assembly) assembleHostLinearSystem(eigv);
+            ++_drive_exits.aborted;
             return false;
         }
         psi_dirty = false;
-        if (absorbSweepLaunch(io, eigv, flux, errl2, reigv, reigvs, iout, icmfd))
+        if (absorbSweepLaunch(io, eigv, flux, errl2, reigv, reigvs, iout, icmfd)) {
+            chargeDriveExit(errl2);
             return true;
+        }
     }
+    chargeDriveExit(errl2);
     return true;
 }
 
@@ -986,7 +1040,15 @@ void BICGCMFD::drive(double& eigv, double* flux, double& errl2) {
             negative = 0;
         }
 
-        if (negative != 0 && icmfd < 20 * _ncmfd) iout--;
+        if (negative != 0 && icmfd < 20 * _ncmfd) {
+            iout--;
+            // A2 S0 Sec 1.6.  This sweep ran and is not charged against the
+            // budget; `icmfd - sweeps_charged` on the device side is the same
+            // quantity, counted the same way.
+            ++_drive_exits.negative_retry_sweeps;
+        } else {
+            ++_drive_exits.sweeps_charged;
+        }
 
         PLOG(plog::debug) << "IOUT : " << iter << ", EIGV : " << eigv << ", ERRL2 : " << errl2 << ", NEGATIVE : " << negative;
 
@@ -1001,6 +1063,10 @@ void BICGCMFD::drive(double& eigv, double* flux, double& errl2) {
 
         if (errl2 < _epsl2) break;
     }
+    // A2 S0.  The host loop's only break IS `errl2 < _epsl2`, so re-reading it
+    // here separates a drive that stopped on tolerance from one that ran out of
+    // budget without a second flag to keep in step with the break.
+    chargeDriveExit(errl2);
     if (cap) g_cmfd_dump.close();
 }
 
@@ -1008,6 +1074,14 @@ void BICGCMFD::resetIteration() {
     iter                     = 0;
     _wiel_sweep              = 0;
     _bicg_iters              = 0;
+    _drive_exits             = DriveExits{};
     _device_assembly_pending = false;
 }
 
+void BICGCMFD::chargeDriveExit(double errl2) {
+    ++_drive_exits.drives;
+    if (errl2 < _epsl2)
+        ++_drive_exits.converged;
+    else
+        ++_drive_exits.budget;
+}
