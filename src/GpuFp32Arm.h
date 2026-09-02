@@ -224,6 +224,17 @@ inline bool strict() {
     return on;
 }
 
+/// THE ONE ANSWER to "is the pure-FP32 reduction arm engaged".
+///
+/// WP20.2 wired STRICT to real kernels, and the moment it had them it needed a
+/// single predicate for the same reason `routes()` exists: the receipt, the
+/// captured graph key and the launch site must not be able to disagree about
+/// which accumulator width this run is measuring.  `strict()` alone is the
+/// KNOB; this is the ARM, and it is the knob AND the arm it narrows, because
+/// narrowing the accumulator of an FP64 solve would just be an FP64 solve with
+/// a worse dot product.
+inline bool strictActive() { return armed() && strict(); }
+
 /// Extend the arm to CRAM depletion.  See the header note: default OFF even
 /// under RASBERY_GPU_FP32, because the partial-fraction sum cancels.
 inline bool cramExtended() {
@@ -508,7 +519,7 @@ inline const char* backendState(Backend which) {
 /// main.cpp, next to the other end-of-run receipts.
 inline void appendReceiptFields(std::ostream& out) {
     out << "\"arm\":\"" << (armed() ? "fp32" : "fp64") << "\"";
-    out << ",\"strict\":" << (armed() && strict() ? "true" : "false");
+    out << ",\"strict\":" << (strictActive() ? "true" : "false");
     out << ",\"backends\":{";
     for (int i = 0; i < static_cast<int>(Backend::Count); ++i) {
         const auto which = static_cast<Backend>(i);

@@ -2854,6 +2854,180 @@ __global__ void reduce_dot2_stage1_f32(const int n,
     }
 }
 
+// ---------------------------------------------------------------------------
+// WP20.2 -- RASBERY_GPU_FP32_STRICT: THE ARM WITH NO WIDE ACCUMULATOR.
+//
+// WHY IT EXISTS AT ALL, since it is expected to fail its gates.  The WP20
+// header asserts that the DOUBLE ACCUMULATOR in the FP32 dots is what keeps
+// the outer counts comparable between the two arms -- that BiCGSTAB's
+// breakdown modes are all scalar (rho to zero, omega to zero, a sign flip in
+// alpha) and that a float accumulator over 8,451 nodes x 2 groups manufactures
+// them out of nothing.  Until this arm existed that was an ASSERTION.  With it
+// the claim is a measurement: run the same deck on FP32 and FP32+STRICT and
+// read the outers, the restarts and kEarlyExitCount off the receipt.  An arm
+// that exists to be worse is still an arm, and it is not a production one.
+//
+// WHAT IT NARROWS, exactly, so the measurement means one thing:
+//   1. THE STAGE-1 ACCUMULATION.  __shared__ float, a float running sum, and
+//      float x float NOT widened before the add.
+//   2. THE STAGE-2 FOLD.  A float partials array folded in float, in the same
+//      strict index order, and `sqrtf` where the wide fold takes `sqrt`.
+//   3. THE THREE CONVERGENCE SCALARS the inner loop forms from those dots:
+//      beta = rho_new * alpha / (rho_old * omega), alpha = rho / r0v and
+//      omega = pts / ptt.  Each is computed in float on this arm at the ONE
+//      site that forms it.
+//
+// WHAT IT DELIBERATELY DOES NOT NARROW, and this is a scope statement, not a
+// hedge: the `scalars` array is still double STORAGE (a float value cast to
+// double round-trips exactly, so the storage width cannot flatter the arm),
+// the BREAKDOWN TESTS and their thresholds keep their FP64 form (a test that
+// changed with the arm would be measuring the test, not the accumulator), and
+// the FP64 residual reduction of the refinement loop is untouched, because it
+// reduces the FP64 residual `r` and is not an FP32 accumulator at all.
+//
+// It also takes the UNFUSED reduction tail: bit 4 (kFuseNorm) folds stage 1
+// and the accumulate into one node, and giving that node a strict twin would
+// put a second accumulator-width question inside the node whose width is being
+// measured.  One question at a time.
+// ---------------------------------------------------------------------------
+
+/// STRICT stage 1: reduce_dot_stage1_f32's partition, traversal and tree with
+/// the accumulator narrowed too.  Every structural property is character for
+/// character its twin's; the ONLY difference is the word `double`.
+__global__ void reduce_dot_stage1_f32_strict(const int n,
+                                             const long long vec_stride,
+                                             const float* __restrict__ a,
+                                             const float* __restrict__ b,
+                                             float* __restrict__ partial,
+                                             const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
+    HALT_GUARD(halt + m);
+    __shared__ float shared[kReduceThreads];
+
+    const float* am = a + m * vec_stride;
+    const float* bm = b + m * vec_stride;
+    float*       pm = partial + static_cast<long long>(m) * kMaxReduceBlocks;
+
+    const int chunk = (n + static_cast<int>(gridDim.x) - 1) / static_cast<int>(gridDim.x);
+    const int begin = static_cast<int>(blockIdx.x) * chunk;
+    const int end   = min(begin + chunk, n);
+
+    float sum = 0.0f;
+    for (int i = begin + static_cast<int>(threadIdx.x); i < end;
+         i += static_cast<int>(blockDim.x))
+        sum += am[i] * bm[i];
+
+    shared[threadIdx.x] = sum;
+    __syncthreads();
+
+    for (int stride = kReduceThreads / 2; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride)
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) pm[blockIdx.x] = shared[0];
+}
+
+/// STRICT twin of reduce_dot2_stage1_f32, on the same terms.
+__global__ void reduce_dot2_stage1_f32_strict(const int n,
+                                              const long long vec_stride,
+                                              const float* __restrict__ a0,
+                                              const float* __restrict__ b0,
+                                              const float* __restrict__ a1,
+                                              const float* __restrict__ b1,
+                                              float* __restrict__ partial0,
+                                              float* __restrict__ partial1,
+                                              const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    RASBERY_CMFD_SLOT(m);
+    HALT_GUARD(halt + m);
+    __shared__ float shared0[kReduceThreads];
+    __shared__ float shared1[kReduceThreads];
+
+    const float* a0m = a0 + m * vec_stride;
+    const float* b0m = b0 + m * vec_stride;
+    const float* a1m = a1 + m * vec_stride;
+    const float* b1m = b1 + m * vec_stride;
+    float*       p0m = partial0 + static_cast<long long>(m) * kMaxReduceBlocks;
+    float*       p1m = partial1 + static_cast<long long>(m) * kMaxReduceBlocks;
+
+    const int chunk = (n + static_cast<int>(gridDim.x) - 1) / static_cast<int>(gridDim.x);
+    const int begin = static_cast<int>(blockIdx.x) * chunk;
+    const int end   = min(begin + chunk, n);
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    for (int i = begin + static_cast<int>(threadIdx.x); i < end;
+         i += static_cast<int>(blockDim.x)) {
+        sum0 += a0m[i] * b0m[i];
+        sum1 += a1m[i] * b1m[i];
+    }
+
+    shared0[threadIdx.x] = sum0;
+    shared1[threadIdx.x] = sum1;
+    __syncthreads();
+
+    for (int stride = kReduceThreads / 2; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride) {
+            shared0[threadIdx.x] += shared0[threadIdx.x + stride];
+            shared1[threadIdx.x] += shared1[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        p0m[blockIdx.x] = shared0[0];
+        p1m[blockIdx.x] = shared1[0];
+    }
+}
+
+/// STRICT stage 2.  Same strict index order as reduce_dot_stage2; the fold and
+/// the square root are float, and the result is stored into the double
+/// `scalars` array because a float widened to double round-trips exactly -- the
+/// storage width cannot flatter an arm whose arithmetic is already float.
+__global__ void reduce_dot_stage2_strict(const int blocks,
+                                         const float* __restrict__ partial,
+                                         double* __restrict__ scalars,
+                                         const int slot,
+                                         const bool take_sqrt,
+                                         const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    if (threadIdx.x != 0) return;
+    RASBERY_CMFD_SLOT(m);
+    HALT_GUARD(halt + m);
+    const float* pm = partial + static_cast<long long>(m) * kMaxReduceBlocks;
+    float sum = 0.0f;
+    for (int i = 0; i < blocks; ++i) sum += pm[i];   // strict index order
+    scalars[static_cast<long long>(m) * kScalarCount + slot] =
+        static_cast<double>(take_sqrt ? sqrtf(sum) : sum);
+}
+
+/// STRICT twin of reduce_dot2_stage2.
+__global__ void reduce_dot2_stage2_strict(const int blocks,
+                                          const float* __restrict__ partial0,
+                                          const float* __restrict__ partial1,
+                                          double* __restrict__ scalars,
+                                          const int slot0,
+                                          const int slot1,
+                                          const std::uint32_t* __restrict__ halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    if (threadIdx.x != 0) return;
+    RASBERY_CMFD_SLOT(m);
+    HALT_GUARD(halt + m);
+    const float* p0m = partial0 + static_cast<long long>(m) * kMaxReduceBlocks;
+    const float* p1m = partial1 + static_cast<long long>(m) * kMaxReduceBlocks;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    for (int i = 0; i < blocks; ++i) {   // strict index order, one per reduction
+        sum0 += p0m[i];
+        sum1 += p1m[i];
+    }
+    scalars[static_cast<long long>(m) * kScalarCount + slot0] = static_cast<double>(sum0);
+    scalars[static_cast<long long>(m) * kScalarCount + slot1] = static_cast<double>(sum1);
+}
+
 /// FP32 twin of matvec_two_group, reading the float operator mirrors.
 __global__ void matvec_two_group_f32(const int nxyz,
                                      const long long vec_stride,
@@ -2940,6 +3114,7 @@ __global__ void colored_block_sweep_f32(const int nxyz,
 /// iteration hangs on and they cost one thread's worth of work -- and only the
 /// vector update runs narrowed.
 __global__ void prepare_p_jacobi_f32(const int nxyz,
+                                     const int strict_acc,
                                      const long long vec_stride,
                                      const long long mat_stride,
                                      double* scalars,
@@ -2974,7 +3149,15 @@ __global__ void prepare_p_jacobi_f32(const int nxyz,
         b0 = r_f[base + i0];
         b1 = r_f[base + i1];
     } else {
-        const float beta   = static_cast<float>(rho_new * alpha / denom);
+        // STRICT: beta is one of the three scalars the arm narrows, and this is
+        // the ONE site that forms it.  The breakdown test above keeps its FP64
+        // form and its FP64 threshold on both arms -- a test that moved with
+        // the arm would be measuring the test, not the accumulator.
+        const float beta =
+            strict_acc != 0
+                ? static_cast<float>(rho_new) * static_cast<float>(alpha) /
+                      static_cast<float>(denom)
+                : static_cast<float>(rho_new * alpha / denom);
         const float omegaf = static_cast<float>(omega);
         b0 = r_f[base + i0] + beta * (p_f[base + i0] - omegaf * v_f[base + i0]);
         b1 = r_f[base + i1] + beta * (p_f[base + i1] - omegaf * v_f[base + i1]);
@@ -2994,6 +3177,7 @@ __global__ void prepare_p_jacobi_f32(const int nxyz,
 /// and every test on them keeps its FP64 form and its FP64 threshold; alpha is
 /// narrowed once, at the point it multiplies a vector.
 __global__ void update_s_jacobi_f32(const int nxyz,
+                                    const int strict_acc,
                                     const long long vec_stride,
                                     const long long mat_stride,
                                     double* scalars,
@@ -3030,7 +3214,12 @@ __global__ void update_s_jacobi_f32(const int nxyz,
             b0 = r_f[base + i0];
             b1 = r_f[base + i1];
         } else {
-            const double alpha  = rho / r0v;
+            // STRICT narrows the DIVISION, not the test above it.
+            const double alpha =
+                strict_acc != 0
+                    ? static_cast<double>(static_cast<float>(rho) /
+                                          static_cast<float>(r0v))
+                    : rho / r0v;
             const float  alphaf = static_cast<float>(alpha);
             b0 = r_f[base + i0] - alphaf * v_f[base + i0];
             b1 = r_f[base + i1] - alphaf * v_f[base + i1];
@@ -3061,6 +3250,7 @@ __global__ void update_s_jacobi_f32(const int nxyz,
 /// with garbage.  That is what lets the host absorb one FP32 failure and fall
 /// back to the FP64 path instead of failing the deck (see BatchCore::drain).
 __global__ void update_solution_f32(const int n,
+                                    const int strict_acc,
                                     const long long vec_stride,
                                     double* scalars,
                                     std::uint32_t* flags,
@@ -3090,7 +3280,14 @@ __global__ void update_solution_f32(const int n,
         return;
     }
 
-    const double omega  = (ptt != 0.0) ? pts / ptt : 0.0;
+    // STRICT narrows omega at the ONE site that forms it.  The `ptt != 0.0`
+    // guard is the FP64 one on both arms.
+    const double omega =
+        (ptt != 0.0)
+            ? (strict_acc != 0 ? static_cast<double>(static_cast<float>(pts) /
+                                                     static_cast<float>(ptt))
+                               : pts / ptt)
+            : 0.0;
     const float  alphaf = static_cast<float>(alpha);
     const float  omegaf = static_cast<float>(omega);
 
@@ -4225,6 +4422,10 @@ public:
             // single-round topology it has always had, and this stays the ONE
             // routes() call the contract allows the CMFD TU.
             fp32_refine_cap = rasbery::fp32::refineRounds();
+            // STRICT implies nothing on its own -- it only narrows the
+            // accumulators of an arm that is already on -- so it is ANDed with
+            // the inner-solve gate rather than read as a second arm.
+            fp32_strict     = fp32_inner && rasbery::fp32::strictActive();
             telemetry.fp32_active = fp32_inner ? 1u : 0u;
             telemetry.fp32_refine_cap = static_cast<std::uint64_t>(fp32_refine_cap);
             // WP17.  Both are latched here, once, for the same reason the fuse
@@ -4251,6 +4452,7 @@ public:
                       // BiCGSTAB under an FP64 outer correction.
                       ", precision=" + (fp32_inner ? "mixed" : "fp64") +
                       ", refine=" + std::to_string(fp32_refine_cap) +
+                      ", strict=" + (fp32_strict ? "on" : "off") +
                       ", slots=" + std::to_string(slots) + ")";
 
             // -------------------------------------------------------------
@@ -4380,6 +4582,16 @@ public:
                 allocate(reinterpret_cast<void**>(&t_f), vec_f_bytes);
                 allocate(reinterpret_cast<void**>(&y_f), vec_f_bytes);
                 allocate(reinterpret_cast<void**>(&z_f), vec_f_bytes);
+                if (fp32_strict) {
+                    // The narrow partials exist only on the STRICT arm.  They
+                    // are the same element COUNT as the double pair they
+                    // replace -- S x kMaxReduceBlocks -- so the arm changes the
+                    // width of the fold and nothing about its shape.
+                    const size_t part_f_bytes =
+                        S * static_cast<size_t>(kMaxReduceBlocks) * sizeof(float);
+                    allocate(reinterpret_cast<void**>(&partials_f), part_f_bytes);
+                    allocate(reinterpret_cast<void**>(&partials2_f), part_f_bytes);
+                }
                 // WP20 `bytes_saved_est`.  A FOOTPRINT DELTA, not a traffic
                 // integral, and the receipt's field name says `_est` for that
                 // reason: it is the number of bytes the eight Krylov vectors,
@@ -5296,6 +5508,18 @@ public:
     /// with the FP64 path, which is why no _f32 stage 2 exists.
     void dot_f32(const float* a, const float* b, int scalar_slot) {
         const int blocks = reduce_blocks_for(n);
+        // WP20.2.  STRICT swaps BOTH stages for their narrow-accumulator twins
+        // and the partials array with them: a float stage 1 writing a double
+        // partials array would leave half the accumulation wide and make the
+        // measurement mean nothing.  Same node count, same grid, same order.
+        if (fp32_strict) {
+            reduce_dot_stage1_f32_strict<<<dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(lanes)),
+                                           kReduceThreads, 0, stream>>>(
+                n, vec_stride(), a, b, partials_f, device_halt, d_slot_map, lanes);
+            reduce_dot_stage2_strict<<<scalar_grid(), 1, 0, stream>>>(
+                blocks, partials_f, scalars, scalar_slot, false, device_halt, d_slot_map, lanes);
+            return;
+        }
         reduce_dot_stage1_f32<<<dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(lanes)),
                                 kReduceThreads, 0, stream>>>(
             n, vec_stride(), a, b, partials, device_halt, d_slot_map, lanes);
@@ -5306,6 +5530,14 @@ public:
     void dot2_f32(const float* a0, const float* b0, int scalar_slot0,
                   const float* a1, const float* b1, int scalar_slot1) {
         const int blocks = reduce_blocks_for(n);
+        if (fp32_strict) {
+            reduce_dot2_stage1_f32_strict<<<dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(lanes)),
+                                            kReduceThreads, 0, stream>>>(
+                n, vec_stride(), a0, b0, a1, b1, partials_f, partials2_f, device_halt, d_slot_map, lanes);
+            reduce_dot2_stage2_strict<<<scalar_grid(), 1, 0, stream>>>(
+                blocks, partials_f, partials2_f, scalars, scalar_slot0, scalar_slot1, device_halt, d_slot_map, lanes);
+            return;
+        }
         reduce_dot2_stage1_f32<<<dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(lanes)),
                                  kReduceThreads, 0, stream>>>(
             n, vec_stride(), a0, b0, a1, b1, partials, partials2, device_halt, d_slot_map, lanes);
@@ -5326,9 +5558,10 @@ public:
     /// switch are the SAME kernels the FP64 path launches, so the captured
     /// topology is identical and the counters mean the same thing.
     void enqueue_iteration_f32(int allow_halt, int force_halt = 0) {
+        const int strict_acc = fp32_strict ? 1 : 0;
         dot_f32(r0_f, r_f, kRhoNew);
         prepare_p_jacobi_f32<<<cmfd_node_grid(), cmfd_block_threads(), 0, stream>>>(
-            nxyz, vec_stride(), mat_stride(), scalars, iter_flags, dinv_f, r_f, v_f,
+            nxyz, strict_acc, vec_stride(), mat_stride(), scalars, iter_flags, dinv_f, r_f, v_f,
             p_f, y_f, device_halt, d_slot_map, lanes);
         precondition_sweeps_f32(p_f, y_f);
         matvec_two_group_f32<<<cmfd_node_grid(), cmfd_block_threads(), 0, stream>>>(
@@ -5337,7 +5570,7 @@ public:
 
         dot_f32(r0_f, v_f, kR0V);
         update_s_jacobi_f32<<<cmfd_node_grid(), cmfd_block_threads(), 0, stream>>>(
-            nxyz, vec_stride(), mat_stride(), scalars, iter_flags, dinv_f, r_f, v_f,
+            nxyz, strict_acc, vec_stride(), mat_stride(), scalars, iter_flags, dinv_f, r_f, v_f,
             s_f, z_f, device_halt, d_slot_map, lanes);
         precondition_sweeps_f32(s_f, z_f);
         matvec_two_group_f32<<<cmfd_node_grid(), cmfd_block_threads(), 0, stream>>>(
@@ -5347,9 +5580,25 @@ public:
         dot2_f32(s_f, t_f, kPts, t_f, t_f, kPtt);
 
         update_solution_f32<<<cmfd_vector_grid(), cmfd_block_threads(), 0, stream>>>(
-            n, vec_stride(), scalars, iter_flags, y_f, z_f, s_f, t_f, phi, r_f,
+            n, strict_acc, vec_stride(), scalars, iter_flags, y_f, z_f, s_f, t_f, phi, r_f,
             device_halt, d_slot_map, lanes);
         const int norm_blocks = reduce_blocks_for(n);
+        // WP20.2.  STRICT takes the UNFUSED tail.  Bit 4 folds stage 1 and the
+        // accumulate into one node, and giving that node a strict twin would
+        // put a second accumulator-width question inside the very node whose
+        // width is being measured.  One question at a time.
+        if (fp32_strict) {
+            reduce_dot_stage1_f32_strict<<<
+                dim3(static_cast<unsigned>(norm_blocks), static_cast<unsigned>(lanes)),
+                kReduceThreads, 0, stream>>>(
+                n, vec_stride(), r_f, r_f, partials_f, device_halt, d_slot_map, lanes);
+            reduce_dot_stage2_strict<<<scalar_grid(), 1, 0, stream>>>(
+                norm_blocks, partials_f, scalars, kInitialNorm, true, device_halt, d_slot_map, lanes);
+            accumulate_iteration<<<scalar_grid(), 1, 0, stream>>>(
+                allow_halt, force_halt, scalars, iter_flags, device_flags,
+                device_counters, device_halt, device_active, d_slot_map, lanes);
+            return;
+        }
         // FUSE bit 4, FP32 payload.  Same node count change, same tail.
         if (fuse_norm && scalar_fusion) {
             reduce_norm_accumulate_fused_f32<<<
@@ -6718,6 +6967,10 @@ public:
     /// WP20.2 refinement round cap, resolved once at stand-up from
     /// rasbery::fp32::refineRounds().  1 means the WP20 topology.
     int           fp32_refine_cap = 1;
+    /// WP20.2.  RASBERY_GPU_FP32_STRICT, resolved once at stand-up beside the
+    /// arm it narrows.  It selects a different kernel set and a different
+    /// partials ALLOCATION, so it is captured topology exactly as the arm is.
+    bool          fp32_strict = false;
     /// Sticky safety fallback: set by drain() when an FP32 launch reported a
     /// non-finite, never cleared.
     bool          fp32_latched_off = false;
@@ -6727,7 +6980,10 @@ public:
     /// kernel set does -- two topologies that differ by four nodes may not
     /// share one instantiation.
     [[nodiscard]] int precisionTag() const {
-        return fp32Active() ? refineRoundsActive() : 0;
+        if (!fp32Active()) return 0;
+        // STRICT is a different kernel set again, so it may not share an
+        // instantiation with the wide-accumulator arm at the same round count.
+        return refineRoundsActive() * (fp32_strict ? 2 : 1);
     }
     int           graph_precision = -1;
     // (the sweep graph's precision now lives in SweepGraphCapacity::precision)
@@ -6735,6 +6991,10 @@ public:
     /// refresh_operator_mirror_f32; the double diag/cc stay authoritative.
     float*        diag_f = nullptr;
     float*        cc_f   = nullptr;
+    /// WP20.2 STRICT: the narrow partials pair.  Null on every other arm, and
+    /// unreachable there -- no kernel that names them is launched.
+    float*        partials_f  = nullptr;
+    float*        partials2_f = nullptr;
     /// Narrowed inverted diagonal blocks, written by begin_outer_fused_f32.
     float*        dinv_f = nullptr;
     /// The FP32 Krylov working set.  The flux, the source and `r` (the FP64

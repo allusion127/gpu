@@ -484,6 +484,111 @@ check("noteBytesSaved" in ALLOC,
 
 
 # ---------------------------------------------------------------------------
+# 8b. WP20.2 -- THE REFINEMENT LOOP AND THE ARM THAT MEASURES THE ACCUMULATOR.
+#
+# WP20 left two claims resting on prose.  The first was that the FP32 arm's
+# extra outers were a CONVERGENCE-CRITERION effect and not a kernel defect; the
+# second was that the double accumulator in the FP32 dots is what keeps the
+# outer counts comparable.  WP20.2 turns both into arms, so what belongs here
+# is that each arm is (a) one cached answer, (b) OFF-identical, and (c) able to
+# be read off a receipt afterwards.
+#
+# tools/test_cmfd_fp32_contract.py owns the STRUCTURE of the refinement loop
+# inside enqueue_outer; what belongs HERE is the knob and the receipt.
+# ---------------------------------------------------------------------------
+try:
+    ROUNDS = body_after(ARM, "inline int refineRounds()")
+except LookupError:
+    ROUNDS = ""
+check('std::getenv("RASBERY_GPU_FP32_REFINE")' in ROUNDS,
+      "the refinement cap is read from RASBERY_GPU_FP32_REFINE")
+check("static const int rounds" in ROUNDS,
+      "and read ONCE into a cached static: the cap fixes the captured graph "
+      "DEPTH, so it may not move between two outers of a run")
+check("return armed() ? rounds : 1;" in ROUNDS,
+      "with the arm off the cap is 1 whatever the variable says -- a "
+      "refinement round is a round of an FP32 solve and there is no FP32 solve")
+check("kRefineRoundsDefault" in ROUNDS and "kRefineRoundsMax" in ROUNDS,
+      "the default and the clamp are named constants, not literals buried in "
+      "the parser")
+check(ARM_CODE.count('"RASBERY_GPU_FP32_REFINE"') == 1,
+      "RASBERY_GPU_FP32_REFINE is spelled exactly once in the arm header")
+check('"RASBERY_GPU_FP32_REFINE",' in DRIVER,
+      "RASBERY_GPU_FP32_REFINE is in kArmEnv -- it changes HOW MANY TIMES the "
+      "inner solve runs and what the outer accepts, which is a sharper claim "
+      "on that list than a rounding knob")
+check('return 1;' in ROUNDS,
+      "the OFF answer is 1 and never 0: one round IS the WP20 topology")
+check("refine" in ARM_CODE and 'out << ",\\"refine\\":" << refineRounds();' in ARM,
+      "the receipt carries the cap, so an A/B can be attributed to a round "
+      "count that was really captured")
+
+try:
+    STRICT = body_after(ARM, "inline bool strictActive()")
+except LookupError:
+    STRICT = ""
+check("armed()" in STRICT and "strict()" in STRICT,
+      "strictActive() is (the arm AND the knob): narrowing the accumulator of "
+      "an FP64 solve would just be an FP64 solve with a worse dot product")
+check("strictActive()" in RECEIPT.replace(" ", "") or "strictActive()" in ARM,
+      "the receipt reports the ARM and not the bare knob, so the receipt and "
+      "the launch site cannot disagree about which width was measured")
+
+BICG_CODE = strip_comments(BICG)
+for kernel in ("reduce_dot_stage1_f32_strict", "reduce_dot2_stage1_f32_strict",
+               "reduce_dot_stage2_strict", "reduce_dot2_stage2_strict"):
+    body = body_after(BICG, "__global__ void %s(" % kernel)
+    check("__shared__ double" not in body and "double sum" not in body,
+          "%s has NO wide accumulator anywhere in it -- that is the whole "
+          "point of the arm" % kernel)
+for stage1 in ("reduce_dot_stage1_f32_strict", "reduce_dot2_stage1_f32_strict"):
+    check("__shared__ float" in body_after(BICG, "__global__ void %s(" % stage1),
+          "%s accumulates in float shared memory" % stage1)
+STRICT_S2 = body_after(BICG, "__global__ void reduce_dot_stage2_strict(")
+check("float sum = 0.0f;" in STRICT_S2 and "sqrtf(sum)" in STRICT_S2,
+      "the strict stage-2 fold and its square root are float too; a float "
+      "stage 1 folded in double would leave half the accumulation wide")
+check("for (int i = 0; i < blocks; ++i) sum += pm[i];" in STRICT_S2,
+      "and the fold keeps the strict index order the wide one has, so the arm "
+      "changes the WIDTH of the reduction and nothing about its shape")
+
+check(BICG_CODE.count("rasbery::fp32::strictActive()") == 1,
+      "the CMFD backend asks the strict arm exactly once and caches it")
+STRICT_GATE = "fp32_strict     = fp32_inner && rasbery::fp32::strictActive();"
+check(STRICT_GATE in BICG,
+      "and it is ANDed with the inner-solve gate rather than read as a second "
+      "arm of its own")
+PREC = body_after(BICG, "int precisionTag() const")
+check("fp32_strict" in PREC and "refineRoundsActive()" in PREC,
+      "precisionTag() folds BOTH the round count and the strict kernel set: a "
+      "capture that differs in either is a different topology and may not "
+      "share an instantiation")
+for name in ("partials_f", "partials2_f"):
+    check("float*        %s" % name in BICG,
+          "%s is a float buffer" % name)
+check("if (fp32_strict) {" in body_after(BICG, "if (fp32_inner) {"),
+      "the narrow partials are allocated inside the FP32 block and gated on "
+      "the strict arm again, so the default configuration pays neither")
+
+for scalar, site in (("beta", "prepare_p_jacobi_f32"),
+                     ("alpha", "update_s_jacobi_f32"),
+                     ("omega", "update_solution_f32")):
+    body = body_after(BICG, "__global__ void %s(" % site)
+    check("strict_acc != 0" in body,
+          "%s narrows %s at the ONE site that forms it" % (site, scalar))
+    at = BICG.index("__global__ void %s(" % site)
+    signature = BICG[at:BICG.index("{", at)]
+    check("const int strict_acc," in signature,
+          "%s takes the arm as a launch PARAMETER rather than reading a "
+          "global: it is a capture-time constant of the graph it is in" % site)
+
+check("fabs(denom) < 1.0e-30" in body_after(BICG, "__global__ void prepare_p_jacobi_f32("),
+      "the breakdown test keeps its FP64 form and its FP64 threshold on BOTH "
+      "arms -- a test that moved with the arm would be measuring the test")
+check("fabs(r0v) < 1.0e-10" in body_after(BICG, "__global__ void update_s_jacobi_f32("),
+      "and so does the r0.v guard")
+
+# ---------------------------------------------------------------------------
 # 9. THE DOC CARRIES THE 238 RUNBOOK THIS FILE DEFERS TO.
 # ---------------------------------------------------------------------------
 for token in ("RASBERY_GPU_FP32", "RASBERY_GPU_FP32_STRICT", "RASBERY_GPU_FP32_CRAM",
