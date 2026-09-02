@@ -176,6 +176,7 @@ bool rasberyGpuFlatXsCtaEnabled() { return false; }
 bool     rasberyGpuFlatXsStreamEnabled() { return false; }
 int      rasberyGpuFlatXsStreamStride() { return 0; }
 unsigned rasberyGpuFlatXsStreamForms() { return 0u; }
+unsigned rasberyGpuFlatXsStreamLibm() { return 0u; }
 bool     rasberyGpuNodalConstsEnabled() { return false; }
 
 // The ladder's default, not 0: a caller that logs the value must not be told

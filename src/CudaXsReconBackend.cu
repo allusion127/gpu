@@ -4,6 +4,7 @@
 #include "CudaTransferMirror.h"
 #include "FlatXsCtaKernel.cuh"
 #include "FlatXsKernel.h"
+#include "FlatXsStreamFormMask.h" // WP23.1: the mined mask and the libm policy
 #include "FlatXsStreamKernel.h"  // WP23: the device branch-stream resolver
 #include "FlatXsStreamReceipt.h"
 #include "NodalConstantKernel.h" // WP23: the ONE spelling of the SENM coefficients
@@ -584,11 +585,12 @@ namespace fss = rasbery::flatxs_stream;
 // and a second spelling of one here would be a second opinion.
 __global__ void kFlatXsStreamBuild(fxs::FlatXsView v, fss::StreamLibView lib,
                                    fss::StreamNodeView nd, fss::StreamOutView out,
-                                   unsigned forms) {
+                                   unsigned forms, unsigned libm) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= v.n_nodes) return;
     fss::StreamForms spol;
     spol.mask = forms;
+    spol.libm = libm;
     fss::flatxsStreamResolveNode(v, lib, nd, out, i, fxs::StaticForms{}, spol);
 }
 
@@ -3843,9 +3845,10 @@ struct XsReconBackend::Impl {
         out.stride       = req.stride;
 
         const unsigned forms = rasberyGpuFlatXsStreamForms();
+        const unsigned libm  = rasberyGpuFlatXsStreamLibm();
         const int      B     = 128;
         kFlatXsStreamBuild<<<(v.n_nodes + B - 1) / B, B, 0, stream>>>(v, dlib, dnd, out,
-                                                                      forms);
+                                                                      forms, libm);
         if (cudaGetLastError() != cudaSuccess) {
             status = "buildStreamOnDevice: kernel launch failed";
             return false;
@@ -3896,6 +3899,14 @@ struct XsReconBackend::Impl {
         tally.stride.store(static_cast<unsigned long long>(req.stride),
                            std::memory_order_relaxed);
         tally.forms_mask.store(forms, std::memory_order_relaxed);
+        // The SOURCE and the SOUNDNESS travel with the value, because a mask
+        // alone cannot say whether it was measured on this host, typed by a
+        // human, or fallen back to after a failed derivation -- and those three
+        // carry different obligations for the run that reads the receipt.
+        tally.forms_source.store(fss::streamFormsSource(), std::memory_order_relaxed);
+        tally.forms_sound.store(fss::streamFormsSound() ? 1u : 0u,
+                                std::memory_order_relaxed);
+        tally.libm_name.store(fss::streamLibmName(), std::memory_order_relaxed);
         tally.forms_seen.fetch_add(1, std::memory_order_relaxed);
         // The device wrote node_off/node_cnt itself, so the host shadows of both
         // describe bytes nobody sent.
@@ -6896,17 +6907,14 @@ int rasberyGpuFlatXsStreamStride() {
 }
 
 unsigned rasberyGpuFlatXsStreamForms() {
-    // NOT MINED -- see src/FlatXsStreamReceipt.h.  Read once, hex or decimal,
-    // masked to the three bits that exist so a typo cannot select a site that
-    // does not.
-    static const unsigned forms = [] {
-        const char* v = std::getenv("RASBERY_FLATXS_STREAM_FORMS");
-        if (v == nullptr) return fss::kStreamFormsDefault;
-        return static_cast<unsigned>(std::strtoul(v, nullptr, 0)) &
-               static_cast<unsigned>(fss::FS_ALL);
-    }();
-    return forms;
+    // MINED -- WP23.1.  The env override, the mined value and the shipped record
+    // are ranked by rasbery::gpu::resolveCalibratedFormMask, and the whole
+    // decision lives in src/FlatXsStreamFormMiner.cpp so that this TU keeps ONE
+    // spelling of it.  A second getenv here would be a second answer.
+    return fss::streamFormMask();
 }
+
+unsigned rasberyGpuFlatXsStreamLibm() { return fss::streamLibmMode(); }
 
 bool rasberyGpuNodalConstsEnabled() {
     // WP23 item 3.  ABSENT MEANS OFF and it is a TRAJECTORY knob by

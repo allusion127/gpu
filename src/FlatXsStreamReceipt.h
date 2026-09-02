@@ -65,6 +65,16 @@ struct StreamTally {
     /// `forms_seen` says whether one was ever written.
     std::atomic<unsigned long long> forms_mask{0};
     std::atomic<unsigned long long> forms_seen{0};
+    /// WHERE THAT MASK CAME FROM, and whether the derivation behind it reached
+    /// zero mismatches -- WP23.1.  A value alone cannot distinguish "measured on
+    /// this host", "typed by a human" and "fallen back to after the mining
+    /// failed", and those three carry different obligations for whoever reads
+    /// the receipt.  String literals with static lifetime, written by the
+    /// backend at launch; null until then, exactly like `forms_seen`.
+    std::atomic<const char*>        forms_source{nullptr};
+    std::atomic<unsigned long long> forms_sound{0};
+    /// "exact" or "fast" -- which log/cbrt the seven libm forms evaluated.
+    std::atomic<const char*>        libm_name{nullptr};
     /// The per-node slot width the arm allocated.  Not a sum: a reader checks
     /// `entries <= nodes * stride`, which a sum could not support.
     std::atomic<unsigned long long> stride{0};
@@ -80,13 +90,19 @@ inline StreamTally& streamTally() {
 /// N1 WITH TWO INDEPENDENT REASONS, and the receipt's own fields say which is
 /// live on this run.  Neither is an intention dressed as a measurement.
 inline constexpr const char* kStreamPolicyNote =
-    "RASBERY_GPU_FLATXS_STREAM=1 is CLASS N1 for two independent reasons: (a) the "
-    "three burnup-lerp contraction sites (FS_REFDENS/FS_REFDENS0/FS_REFCOND) have "
-    "NO miner in this work package and default to unfused, which is a guess about "
-    "gcc and not a measurement; (b) seven of the twenty coordinate forms evaluate "
-    "log/cbrt, whose CUDA and glibc results differ by ~1 ulp, and forms_hit says "
-    "whether this deck touched one. Reason (a) alone keeps a libm-free deck out of "
-    "B0 until a miner in the shape of src/ThFormMiner.cpp pins those three bits "
+    "RASBERY_GPU_FLATXS_STREAM=1 is CLASS N1, and WP23.1 reduced the reasons from "
+    "two to one: (a) the three burnup-lerp contraction sites (FS_REFDENS/"
+    "FS_REFDENS0/FS_REFCOND) are now MINED against a verbatim quotation "
+    "(src/FlatXsStreamReference.cpp) and forms_source/forms_sound say whether this "
+    "run's mask is a measurement of this host -- reason (a) is retired when "
+    "forms_sound is 1 and LIVE when it is 0; (b) seven of the twenty coordinate "
+    "forms evaluate log/cbrt and this is NOT retired. The exact double-double "
+    "path (RASBERY_GPU_FLATXS_STREAM_LIBM=exact) is bit-identical across g++ and "
+    "nvcc by construction but still differs from the host, because the host calls "
+    "glibc and glibc is the side that is not correctly rounded: 242 of 10^6 "
+    "sampled log arguments (max 1 ulp) and 538003 of 10^6 cbrt arguments (max 3 "
+    "ulp). So the default is fast, forms_hit says whether this deck touched a libm "
+    "form at all, and a libm-free deck with forms_sound=1 is B0-capable "
     "(docs/WP23_FLATXS_STREAM_GPU_20260902_KO.md section 4)";
 
 inline bool streamReceiptWanted() {
@@ -155,6 +171,26 @@ inline void appendStreamReceiptFields(std::ostream& os) {
         os << "0x" << std::hex << t.forms_mask.load(std::memory_order_relaxed) << std::dec;
     else
         os << '~';
+    os << "\",\"forms_source\":\"";
+    {
+        const char* src = t.forms_source.load(std::memory_order_relaxed);
+        os << (src != nullptr ? src : "~");
+    }
+    // -1 IS NOT 0 HERE.  `forms_sound: 0` means the four-seed derivation ran and
+    // could not reach a bit-exact mask -- reason (a) is live and this run's
+    // rounding contract is unknown.  A run that never launched the arm has no
+    // such verdict, and printing 0 for it would report a failure that did not
+    // happen.
+    os << "\",\"forms_sound\":";
+    if (t.forms_seen.load(std::memory_order_relaxed) > 0)
+        os << t.forms_sound.load(std::memory_order_relaxed);
+    else
+        os << -1;
+    os << ",\"libm\":\"";
+    {
+        const char* lm = t.libm_name.load(std::memory_order_relaxed);
+        os << (lm != nullptr ? lm : "~");
+    }
     os << "\",\"policy_note\":\"" << kStreamPolicyNote << "\"";
 }
 

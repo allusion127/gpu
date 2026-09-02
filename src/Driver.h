@@ -675,6 +675,12 @@ inline constexpr const char* kArmEnv[] = {
     "RASBERY_GPU_FLATXS_STREAM",
     "RASBERY_FLATXS_STREAM_STRIDE",
     "RASBERY_FLATXS_STREAM_FORMS",
+    // WP23.1.  `exact` swaps every log/cbrt in the resolver for the
+    // double-double evaluation in src/FlatXsStreamExactMath.h, which is a
+    // DIFFERENT COORDINATE on the ~0.02 % of log arguments and the ~54 % of
+    // cbrt arguments where glibc is not correctly rounded.  That is a
+    // trajectory change with no other flag moved, so it belongs here.
+    "RASBERY_GPU_FLATXS_STREAM_LIBM",
     // WP23 item 3.  The nine SENM coefficient arrays computed on the device.
     // CLASS N1 BY MEASUREMENT: CUDA's exp differs from glibc's by 1 ulp on
     // 3.34 % of the arguments this body evaluates (src/NodalConstantKernel.h),

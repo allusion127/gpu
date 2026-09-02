@@ -5,12 +5,12 @@
 | 항목 | 값 |
 |---|---|
 | 대상 | `XSSet::BuildFlatXsStream`(≈1.0 s/단일 KNGR 런) · `XsReconBackend::solveNodal`의 상수 9배열 업로드(9,675회 / 3.9 GB) |
-| 플래그 | `RASBERY_GPU_FLATXS_STREAM=1`(기본 off, `RASBERY_GPU_FLATXS`의 하위 아름) · `RASBERY_FLATXS_STREAM_STRIDE` · `RASBERY_FLATXS_STREAM_FORMS` · `RASBERY_GPU_NODAL_CONSTS=1`(기본 off) |
-| 게이트 등급 | 스트림 = **N1**(이유 둘, §4) · 노달 상수 = **N1(측정됨)**(§6) |
-| 계약 테스트 | `tools/test_flatxs_stream_contract.py`(16 규칙) · `tools/test_nodal_consts_gpu_contract.py`(13 규칙), 각 규칙마다 negative control |
+| 플래그 | `RASBERY_GPU_FLATXS_STREAM=1`(기본 off, `RASBERY_GPU_FLATXS`의 하위 아름) · `RASBERY_FLATXS_STREAM_STRIDE` · `RASBERY_FLATXS_STREAM_FORMS`(**채굴됨**, WP23.1) · `RASBERY_GPU_FLATXS_STREAM_LIBM=exact\|fast`(기본 `fast`, WP23.1) · `RASBERY_GPU_NODAL_CONSTS=1`(기본 off) |
+| 게이트 등급 | 스트림 = **N1**(WP23.1 이후 이유 **하나**, §4) · 노달 상수 = **N1(측정됨)**(§6) |
+| 계약 테스트 | `tools/test_flatxs_stream_contract.py`(16 규칙) · `tools/test_flatxs_stream_forms_contract.py`(12 규칙, WP23.1) · `tools/test_nodal_consts_gpu_contract.py`(13 규칙), 각 규칙마다 negative control |
 | 동반 테스트 | `test_flatxs_cta_contract` · `test_micx_resident_contract` · `test_micx_layout_contract` · `test_xfer_ledger_contract` · `test_th_gpu_contract` · `test_gpu_full_fail_closed` · `test_enum_alias_contract` · `test_dependent_template_contract` — 전부 PASS |
-| 신규 소스 | `src/FlatXsStreamKernel.h` · `src/FlatXsStreamReceipt.h` · `src/NodalConstsReceipt.h` |
-| 수정 소스 | `src/XSSet.{h,cpp}` · `src/FlatXsKernel.h` · `src/CudaXsReconBackend.{h,cu}` · `CudaXsReconBackendStub.cpp` · `src/Nodal.cpp` · `src/Driver.h` · `src/GpuFullContract.h` |
+| 신규 소스 | `src/FlatXsStreamKernel.h` · `src/FlatXsStreamReceipt.h` · `src/NodalConstsReceipt.h` · **WP23.1**: `src/FlatXsStreamExactMath.h` · `src/FlatXsStreamReference.{h,cpp}` · `src/FlatXsStreamFormMine.h` · `src/FlatXsStreamFormMask.h` · `src/FlatXsStreamFormMiner.cpp` · `test/flatxs_stream_form_probe.cpp` |
+| 수정 소스 | `src/XSSet.{h,cpp}` · `src/FlatXsKernel.h` · `src/CudaXsReconBackend.{h,cu}` · `CudaXsReconBackendStub.cpp` · `src/Nodal.cpp` · `src/Driver.h` · `src/GpuFullContract.h` · **WP23.1**: `CMakeLists.txt` |
 | 기준 덱 | KNGR `kngr_238.json`, `nxyz = 8,451`, `NG = 2` |
 | 기준 digest | `1f36e75dc00ed2b4` / `4377` outers (플래그 off) |
 
@@ -138,25 +138,106 @@ Chiffon `SpectralCoordinate`는 열거자 20개다(6/10/11은 실험 빌드가 �
 | 스칼라 분기 ① | B0 **가능** | `+ − × sqrt`뿐. 수축 사이트 없음 |
 | 프로브 ② | **B0** | `flatxsProbeMicElement`를 **그대로** 부른다. 마스크는 이미 채굴된 `FLATXS_FORMS = 0x3FF` |
 | 소진 브래킷 탐색 | **B0** | `std::lower_bound` 의미를 정수 연산으로 전사. 반올림 자유도 없음 |
-| 기준 밀도/조건 보간 | B0 **가능** | `acc += f·(hi−lo)` 3사이트. **마스크 미채굴** → 이유 (a) |
+| 기준 밀도/조건 보간 | **B0**(WP23.1) | `acc += f·(hi−lo)` 3사이트. **마스크 채굴됨** → 이유 (a) 소멸(§4.1) |
 | libm 없는 13형태 좌표 | B0 **가능** | `+ − × ÷ sqrt`뿐 |
 | libm 7형태 좌표 | **N1** | glibc `log`/`cbrt` ≠ CUDA `log`/`cbrt`, ~1 ulp → 이유 (b) |
 | 고정 슬롯 패킹 | **B0** | 순열이 아니라 **주소**만 바꾼다. 노드 내부 순서 불변 |
 
-**따라서 아름 전체는 N1이고, 이유는 독립적으로 둘이다.**
+**WP23은 이유를 둘로 적었다. WP23.1이 하나를 갚고 하나를 측정했다.**
 
-- **(a) 수축 마스크가 채굴되지 않았다.** `FS_REFDENS` / `FS_REFDENS0` / `FS_REFCOND`
-  세 비트의 기본값은 `0`(아무것도 융합 안 함)이고, 그것은 gcc에 대한 **추측이지 측정이 아니다.**
-  `src/ThFormMiner.cpp` 모양의 채굴기가 이 셋을 고정하기 전까지는 libm을 하나도 안 쓰는
-  라이브러리에서도 B0가 아니다. `RASBERY_FLATXS_STREAM_FORMS=0x…`로 override 가능.
-  **세 비트인 이유**: 같은 모양의 lerp라도 gcc는 문장마다 독립적으로 고른다(xsrecon 캠페인의 발견).
-  `referenceDensity`(`value += fraction*(hi−lo)`)와 `referenceDensity0`(`v += f*(hi−v)`)은
-  **같은 수를 다르게 쓴 것**이며, 합치는 것은 비트를 바꾸는 단순화라 합치지 않았다.
-- **(b) 일곱 형태가 libm을 부른다.** `FlatXsKernel.h`가 애초에 좌표를 호스트에 남긴 이유가
-  이것이고, 이 WP는 그 문장을 **뒤집는 것이 아니라 한정한다.** 수신증의 `libm_form_hit`가
-  이번 런에 이 이유가 살아 있는지를 말한다.
+- **(a) 수축 마스크 — 갚음.** §4.1. 세 사이트는 이제 **채굴된다**. 수신증의
+  `forms_source` / `forms_sound`가 이번 런의 마스크가 **이 호스트의 측정**인지를 말하고,
+  `forms_sound == 0`일 때만 이유 (a)가 살아 있다.
+- **(b) 일곱 형태가 libm을 부른다 — 남음.** §4.2. `FlatXsKernel.h`가 애초에 좌표를 호스트에
+  남긴 이유가 이것이고, WP23.1은 그 문장을 **뒤집는 것이 아니라 숫자로 한정한다.**
+  수신증의 `libm_form_hit`가 이번 런에 이 이유가 살아 있는지를 말한다.
 
-두 이유는 **고쳐야 할 것이 다르다**. 하나의 등급으로 합치면 무엇을 갚아야 하는지가 사라진다.
+두 이유는 **고쳐야 할 것이 달랐다**. 하나의 등급으로 합쳤다면 (a)가 갚였다는 사실도,
+(b)가 남았다는 사실도 보이지 않았을 것이다.
+
+### 4.1 수축 마스크 — 채굴됨 (WP23.1)
+
+구조는 WP22의 T/H 채굴기와 **같다**. 다른 것은 무엇을 인용하느냐뿐이다.
+
+| 파일 | 역할 |
+|---|---|
+| `src/FlatXsStreamReference.{h,cpp}` | 세 람다의 **축어 인용** + 픽스처. **자기 TU**. `FlatXsStreamKernel.h`를 절대 include하지 않는다 |
+| `src/FlatXsStreamFormMine.h` | 출하 바디를 인용에 대해 채점(비트 단위) + 좌표 하강 |
+| `src/FlatXsStreamFormMask.h` / `FlatXsStreamFormMiner.cpp` | 프로덕션 해석. `rasbery::gpu::resolveCalibratedFormMask` 우선순위 |
+| `test/flatxs_stream_form_probe.cpp` | 게이트. 건전성·사이트 결정성·해석기 일치·libm 잔차 |
+
+**마스크 레이아웃 — 사이트당 2비트, `XE_SITE_*` 인코딩 그대로.**
+
+| 필드 | 오프셋 | 호스트 철자(`XSSet.cpp`) | 채굴값(WSL2 g++ 13.3 `-O3 -march=native`) |
+|---|---|---|---|
+| `FS_REFDENS` | 0 | `value += fraction * (hi − lo)` | `FS_SITE_P1` |
+| `FS_REFDENS0` | 2 | `v += f * (hi − v)` | `FS_SITE_P1` |
+| `FS_REFCOND` | 4 | `value += fraction * (hi − value)` | `FS_SITE_P1` |
+| — | — | `FS_ALL` = `0x3f` | **`FLATXS_STREAM_FORMS = 0x15`, sound = 1** |
+
+상태는 셋이다: `FS_SITE_NONE`(곱을 반올림한 뒤 더함) / `FS_SITE_P1`(`fma(f, d, acc)`) /
+`FS_SITE_P2`(`fma(d, f, acc)`). **`P2`는 이 세 사이트에서 증명 가능한 don't-care다** — 곱이
+하나뿐이므로 대안 철자는 인자를 바꾼 fma이고, IEEE-754 fma는 앞 두 인자에 대해 정확히
+교환법칙을 만족한다. 그래서 건전성(`sound`)의 정의는 **"모든 씨앗이 0에 도달"**이지
+"모든 씨앗이 같은 패턴"이 아니다(`ThFormMine.h`의 `TH_HAVG`와 같은 상황·같은 판정).
+2비트를 유지하는 이유는 형제 마스크와의 인코딩 통일, 그리고 곱이 둘인 사이트가 나중에
+생겨도 옆 필드를 재번호 매기지 않기 위해서다.
+
+**측정 (저작 호스트, `rasbery_flatxs_stream_form_probe`):**
+
+```
+FLATXS_STREAM_FORMS mined 0x15 (shipped record 0x0), sound=1
+  sites: FS_REFDENS=P1 FS_REFDENS0=P1 FS_REFCOND=P1
+  FS_REFDENS   P1 -> NONE : 994 mismatching words
+  FS_REFDENS0  P1 -> NONE : 1174 mismatching words
+  FS_REFCOND   P1 -> NONE : 70 mismatching words
+  resolver: mask 0x15 source mined sound 1 libm fast
+```
+
+세 사이트 모두 **결정적**이다(틀리게 놓으면 반드시 깨진다). `FS_REFCOND`가 70으로 가장 얇은
+것은 물리다 — 증분 `f·(hi−value)`가 누산기 `value`에 비해 작을수록 합의 반올림이 뒤집힐 확률이
+낮다. 픽스처의 노드 수(2048)는 **이 가장 얇은 사이트**가 결정적이 될 때까지 키운 값이지
+가장 두꺼운 사이트에 맞춘 값이 아니다.
+
+**인라이닝 문맥이 인용의 일부다.** WP22가 비싸게 배운 것: gcc는 어느 곱을 add에 접을지를
+**인라이닝 문맥마다 다시 정한다.** 그래서 인용은 표현식만이 아니라 호출 그래프를 복제한다 —
+`refBuildStream`(`#pragma omp parallel for schedule(dynamic, 64)`, 프로덕션과 같은 절)
+→ `refResolveNode`(노드 하나) → `refResolveSpectralHistoryDeltas`(세 람다를 **한 함수에**).
+그래서 이 TU는 **반드시 `-fopenmp`로 컴파일되어야 한다**(pragma가 무시되면 본문이 outline되지
+않고, 그것이 바로 다른 마스크를 고정하는 차이다). CMake가 그렇게 링크하고 계약 테스트가 고정한다.
+
+`kStreamFormsDefault = 0`은 **남는다.** 이제 런이 의존하는 값이 아니라 **출하 기록**이고,
+수신증이 그것과 채굴값을 비교해 "이 호스트는 다르다"를 한 줄로 말하게 하는 용도다
+(`TH_FORMS_DEFAULT`와 같은 취급).
+
+### 4.2 libm — 측정했고, 남는다 (WP23.1)
+
+`src/FlatXsStreamExactMath.h`는 `log`/`cbrt`를 **libm 없이** 계산한다: `+ − × ÷ fma`만으로 된
+double-double 평가라, **g++와 nvcc가 같은 비트를 낸다(구성상).** `RASBERY_GPU_FLATXS_STREAM_LIBM=exact`가
+일곱 형태의 모든 `log`/`cbrt`를 이것으로 바꾼다.
+
+**그런데 그것은 B0가 요구하는 것이 아니다.** 플래그 off 경로는 여전히 **glibc**를 부르므로,
+필요한 등식은 `device == glibc`이지 `device == host_exact`가 아니다. 그래서 잰다 —
+덱이 실제로 넘기는 인수 범위에서 10⁶ 샘플:
+
+| 함수 | mismatch / 10⁶ | max ulp | 누가 틀렸나 | 판정 근거 |
+|---|---|---|---|---|
+| `log` | **242** | 1 | **glibc가 242, 우리는 0** | double-double 값(≈2⁻¹⁰⁰)에 더 가까운 쪽 |
+| `cbrt` | **538,003** | 3 | **glibc가 538,003, 우리는 0** | 동일 |
+
+읽는 법. 우리 쪽은 샘플 전부에서 **정확히 반올림**되었고(`ours_not_CR == 0`,
+`undecidable == 0`), 차이는 전부 **glibc가 정확 반올림이 아니라서** 생긴다. glibc의 dbl-64
+`log`는 최악 ~0.519 ulp라 거의 항상 맞고 가끔 틀리며, `cbrt`는 애초에 그 수준이 아니다
+(x86_64 `libm-test-ulps`가 1 ulp로 기록).
+
+**따라서 기본값은 `fast`다.** 규칙대로다: mismatch가 0이 아니므로 기본은 `fast`, 아름은
+이유 (b)로 **N1을 유지**한다. 동시에 `exact`는 **호스트에 더 가까운** 아름이다(로그 인수의
+99.976 %에서 비트 일치). 238이 digest를 뜨기 전까지 기본을 바꾸지 않는 이유는 정확도가 아니라
+**A/B의 무결성**이다 — 기본을 바꾸면 아무 플래그도 안 옮긴 런의 궤적이 움직인다.
+`RASBERY_GPU_FLATXS_STREAM_LIBM`이 `trajectory::kArmEnv`에 있는 이유이기도 하다.
+
+**B0로 가는 유일한 길**은 §8-6에 적었다: 정확 반올림이 아니라 **glibc의 알고리즘 자체를
+재현**하는 것. 이 WP는 그것을 하지 않았다(라이선스·출처 문제가 코드 결정이 아니라 정책 결정이다).
 
 ---
 
@@ -249,10 +330,52 @@ RASBERY_GPU_FLATXS_STREAM=1 RASBERY_SPTELEM=1 \
    브래킷 표가 신규)이 WP13 그림자 아래 올라간다. **순증이 아님을 여기서 읽는다.**
 6. `[RASBERY][XFER]` 사이트 원장 — `stream_did`/`stream_x`/`stream_scale` 행이 A1에서 사라져야 한다.
 
-**정답 게이트**: `libm_form_hit == 0`이면 digest 동등성을 **시도해 볼 수는 있다**(이유 (a)만 남고,
-그것은 마스크가 우연히 맞았을 때 통과한다). `libm_form_hit == 1`이면 digest 비교는 무의미하고
-**Gate A**(FP64 호스트 궤적 대비, `tools/gate_a_compare.py`) + **Gate B**(MASTER 대비 핀 RMS,
-`tools/gate_b_pin_rms.py`) + `h5diff`의 정성 확인만 유효하다.
+**정답 게이트**: `libm_form_hit == 0` **그리고** `forms_sound == 1`이면 digest는 **같아야 한다**
+— 그때 아름은 **B0**이고, 다르면 그것은 버그이지 등급이 아니다. `libm_form_hit == 1`이면
+digest 비교는 무의미하고 **Gate A**(FP64 호스트 궤적 대비, `tools/gate_a_compare.py`) +
+**Gate B**(MASTER 대비 핀 RMS, `tools/gate_b_pin_rms.py`) + `h5diff`의 정성 확인만 유효하다.
+
+### 7.1.1 A1 이전에 먼저 — 마스크 채굴 (WP23.1)
+
+**빌드 호스트에서 30 ms.** 238에서 RASBERY를 돌리기 전에 게이트를 한 번 돌린다.
+
+```
+ctest -R flatxs_stream_form_probe --output-on-failure
+#   또는 직접:  ./rasbery_flatxs_stream_form_probe
+```
+
+읽을 것:
+
+1. `sound=1` — 아니면 **여기서 멈춘다.** 네 씨앗 중 하나도 0에 못 갔다는 뜻이고,
+   그때는 이 빌드의 반올림 계약을 아무도 모른다. A1을 돌려봐야 digest 비교가 무의미하다.
+2. **채굴된 마스크 값** — 저작 호스트(WSL2 / g++ 13.3 / `-march=native`)는 `0x15`.
+   238(Xeon Gold 5317, gcc 14.3)이 **다른 값을 낼 수 있고 그것이 정상이다.**
+   `CMFD_OUTER_FORMS`가 `0x6`(dev) vs `0x7`(238)이었던 것과 같은 종류의 차이다.
+   런 로그의 `[RASBERY][FORMS] {"mask":"FLATXS_STREAM_FORMS", ...}` 한 줄이 그것을 말하고,
+   `"source":"mined"`가 아니라 `"build_default_mining_failed"`면 (1)로 돌아간다.
+3. 세 사이트의 `-> NONE` 카운트가 모두 **0보다 큰가** — 아니면 픽스처가 사이트를 안 집고
+   있다는 뜻이므로 마스크가 아니라 픽스처를 고쳐야 한다.
+4. `libm ... mismatch / max_ulp` — §4.2의 표가 이 호스트에서도 같은 모양인지.
+   glibc 버전이 다르면 242가 움직일 수 있다. **움직여도 결론(기본 `fast`)은 안 바뀐다.**
+
+그리고 A1의 수신증에서 다음 세 필드를 §4.1 표와 대조한다:
+
+```
+"forms_mask":"0x15","forms_source":"mined","forms_sound":1,"libm":"fast"
+```
+
+`forms_source`가 `"env"`인데 그럴 의도가 없었다면 셸에 `RASBERY_FLATXS_STREAM_FORMS`가
+남아 있는 것이고, 그 런의 digest 비교는 무효다.
+
+### 7.1.2 선택 — `exact` libm A/B
+
+```
+RASBERY_GPU_FLATXS_STREAM=1 RASBERY_GPU_FLATXS_STREAM_LIBM=exact RASBERY_SPTELEM=1   ./RASBERY kngr_238.json --out E:/rasbery_runs/<date>/238/wp23/a1x_%d.h5
+```
+
+기대: `libm_form_hit == 1`인 덱에서 A1과 A1x의 digest는 **다르다**(그것이 §4.2의 차이다).
+값어치는 Gate A의 잔차가 **줄어드는지**에 있다 — 줄어들면 `exact`가 호스트에 더 가깝다는
+§4.2의 주장이 실측으로 확인된 것이고, 기본값을 바꿀 근거가 생긴다. 안 줄어들면 그 근거가 없다.
 
 ### 7.2 블록 B — 노달 상수 아름 단독
 
@@ -284,9 +407,13 @@ RASBERY_GPU_FLATXS_STREAM=1 python3 tools/run_multi_gpu_batch.py --decks 128 --s
 ### 7.4 실패 시 첫 확인
 
 - `device_calls == 0` → stderr의 `[RASBERY][WARN][flatxs.stream]` 이름. 대부분 `form` 또는 `model`.
-- digest가 움직였고 `libm_form_hit == 0` → **이유 (a)**. `RASBERY_FLATXS_STREAM_FORMS`를
-  `0x0 … 0x7` 8가지로 훑어 digest가 복구되는 마스크가 있는지 본다. 있으면 그것이 채굴기가
-  자동으로 찾아야 할 값이고, 없으면 다른 곳이 문제다.
+- digest가 움직였고 `libm_form_hit == 0` → 먼저 `forms_sound`를 본다.
+  **`forms_sound == 1`이면 이유 (a)가 아니다** — 마스크는 이 호스트에서 인용과 비트 일치가
+  검증된 값이므로, 원인은 다른 곳(패킹, 브래킷, 프로브)이다. 마스크를 훑는 것은 시간 낭비다.
+  `forms_sound == 0`이면 채굴이 실패한 것이고, 그때만 `RASBERY_FLATXS_STREAM_FORMS`를
+  `0x00 … 0x3f`(2비트×3사이트, 유효 상태 조합은 27가지)로 훑는다. digest가 복구되는 값이
+  있으면 픽스처가 그 사이트를 못 집은 것이므로 **픽스처를 고친다**(마스크를 하드코딩하지 않는다).
+- digest가 움직였고 `libm_form_hit == 1` → §4.2. 그것은 등급이지 버그가 아니다.
 - `RASBERY_GPU_FULL=1`에서 케이스가 죽음 → 그게 정상이다. 아름이 폴백했다는 뜻이고
   `Subsystem::flatxs_stream` / `nodal_consts` 카운터가 어느 심(seam)인지 말한다.
 
@@ -294,8 +421,8 @@ RASBERY_GPU_FLATXS_STREAM=1 python3 tools/run_multi_gpu_batch.py --decks 128 --s
 
 ## 8. 남은 부채 (다음 WP가 집을 것)
 
-1. **수축 마스크 채굴기.** `src/ThFormMiner.cpp` 모양으로 세 lerp 사이트를 프로덕션 철자에 대해
-   고정해야 이유 (a)가 사라진다. 그전까지 libm 없는 덱에서도 B0를 주장할 수 없다.
+1. ~~**수축 마스크 채굴기.**~~ **WP23.1에서 갚음** — §4.1. 남은 것은 238에서 채굴값을
+   한 번 확인하는 것뿐이고, 그것은 §7.1.1의 30 ms짜리 절차다.
 2. **오프라인 리플레이 게이트.** `RASBERY_FLATXS_DUMP` 캡처는 **해석된 스트림**을 담지만
    스펙트럴 히스토리 라이브러리 표는 담지 않아서, 디바이스 바디를 호스트 해석기에 대해
    오프라인으로 채점할 수 없다. 캡처 포맷에 §3의 평탄화 표를 추가하는 것이 그 게이트의 전제다.
@@ -306,3 +433,15 @@ RASBERY_GPU_FLATXS_STREAM=1 python3 tools/run_multi_gpu_batch.py --decks 128 --s
 5. **컴파일 검증.** `CudaXsReconBackend.cu`는 `tools/check_cuda_syntax.py`의 shim이 아직
    커버하지 못한다(graph API, `cudaHostRegister`, `cudaStreamBeginCapture`, `deviceBlockAlloc`,
    `FlatXsCtaKernel.cuh`의 device-only `#error`). 238에서 nvcc가 이 파일을 처음 본다.
+   WP23.1이 이 파일에 넣은 변경(마스크 위임, `libm` 인자)은 shim 통과 개수를 **바꾸지 않았다**
+   — HEAD와 동일한 202개 shim 결함, 새 오류 0.
+6. **libm 이유 (b) — B0로 가는 유일한 길.** 정확 반올림은 답이 아니다(§4.2가 잰 대로,
+   틀리는 쪽은 glibc다). 등식 `device == glibc`를 만들려면 **glibc의 알고리즘을 디바이스에
+   재현**해야 한다. `cbrt`는 짧다(`sysdeps/ieee754/dbl-64/s_cbrt.c`, 다항식 + Newton, 표 없음);
+   `log`는 128엔트리 표 + 다항(ARM optimized-routines). **코드 결정이 아니라 정책 결정**이므로
+   여기서 하지 않았다 — glibc는 LGPL, optimized-routines는 MIT이고, 어느 쪽이든 이 트리에
+   외부 수치 코드를 들이는 것은 승인이 필요한 일이다. 그 승인이 나면 `cbrt`부터가
+   비용 대비 효과가 가장 크다(§4.2의 538,003 vs 242).
+7. **`exact` 경로의 디바이스 실측.** `FlatXsStreamExactMath.h`는 g++에서만 돌아봤다.
+   "구성상 nvcc와 같은 비트"는 IEEE-754가 `+ − × ÷ fma`에 주는 보장에서 따라오는 주장이지
+   측정이 아니다. 238에서 `--fmad=false` TU로 컴파일된 뒤 §7.1.2가 첫 실측이다.

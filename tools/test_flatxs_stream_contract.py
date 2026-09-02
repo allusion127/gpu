@@ -45,9 +45,11 @@ keep passing right up until the day one of them mattered.
      XSSet.cpp is the one TU that sees both and static_asserts every one.  A
      drift applies a fitted coefficient to the wrong coordinate.
 
-  9. THE CLASS IS DECLARED, IT IS N1, AND IT CARRIES BOTH REASONS.  The
-     contraction mask is UNMINED (reason a) and seven forms call libm (reason b).
-     Collapsing them into one grade hides which fix is owed.
+  9. THE CLASS IS DECLARED, IT IS N1, AND IT CARRIES BOTH REASONS.  Since WP23.1
+     the contraction mask is MINED and `forms_sound` grades it (reason a, retired
+     when the derivation reaches zero); seven forms still call libm (reason b,
+     not retired).  Collapsing them into one grade hides which fix is owed.
+     tools/test_flatxs_stream_forms_contract.py pins the mining itself.
 
  10. THE libm FORM LIST IS THE SEVEN, and nothing else.  formUsesLibm() is what
      the receipt's `libm_form_hit` reads, so an eighth form quietly added to it
@@ -244,13 +246,23 @@ def r_class_declared(src: dict[str, str]) -> None:
     note = region(src["receipt"], "kStreamPolicyNote", "section 4)\";",
                   "kStreamPolicyNote")
     assert "CLASS N1" in note, "the receipt must declare the class"
-    assert "NO miner" in note or "no miner" in note, \
-        "reason (a) -- the unmined contraction mask -- must be stated"
+    # WP23.1 turned reason (a) from "no miner exists" into "a miner exists and
+    # this run's receipt says whether it worked", so what has to be stated moved
+    # with it: the note must name the mining AND the field that grades it.
+    assert "MINED" in note, \
+        "reason (a) -- the contraction mask -- must say it is mined"
+    assert "forms_sound" in note, \
+        ("reason (a) is now conditional on the derivation succeeding, so the note "
+         "must name the field that says whether it did")
     assert "log/cbrt" in note, "reason (b) -- the libm forms -- must be stated"
+    assert "NOT retired" in note, \
+        "reason (b) survived WP23.1 and the note must not let that be inferred"
     k = strip_comments(src["kernel"])
     assert "kStreamFormsDefault = 0u" in k, \
-        ("the default mask must be 0 (nothing fused) until a miner exists; a "
-         "non-zero baked default would be a guess presented as a measurement")
+        ("the per-build record must stay 0 (nothing fused): it is what an ISA "
+         "without FMA does and it is what the receipt compares the mined value "
+         "against, so a non-zero literal here would be another machine's "
+         "measurement presented as this one's")
 
 
 def r_libm_forms(src: dict[str, str]) -> None:
@@ -359,7 +371,8 @@ RULES = [
      ("static_assert(static_cast<int>(SpectralCoordinate::CubeRootRatio) == "
       "fss::kCubeRootRatio, \"\");", "")),
     ("class-declared", r_class_declared, "receipt",
-     ("CLASS N1 for two independent reasons", "class B0 by construction")),
+     ("RASBERY_GPU_FLATXS_STREAM=1 is CLASS N1",
+      "RASBERY_GPU_FLATXS_STREAM=1 is CLASS B0")),
     ("libm-forms", r_libm_forms, "kernel",
      ("coord == kCubeRootRatio;", "false;")),
     ("receipt-fields", r_receipt_fields, "receipt",

@@ -64,12 +64,30 @@
 //     The other thirteen are +, -, *, / and sqrt only -- sqrt is correctly
 //     rounded in IEEE-754 on both sides -- and are B0-CAPABLE.
 //   * B0-capable is not B0.  The three multiply-add sites below (the burnup
-//     interpolations) have a contraction choice, and this work package does NOT
-//     ship a miner for them; `kStreamFormsDefault` is 0 (nothing fused), which is
-//     a GUESS about what gcc did and not a measurement.  Until a miner in the
-//     shape of src/ThFormMiner.cpp pins these three bits against a quotation, the
-//     arm is N1 even on a libm-free library.  Said again in
-//     src/FlatXsStreamReceipt.h, in the string a gate script reads.
+//     interpolations) have a contraction choice.
+//
+// WP23.1 CLOSED THE SECOND OF THOSE AND MEASURED THE FIRST.
+//
+//   (a) The three contraction sites are now MINED, in the shape WP22 built for
+//       T/H: src/FlatXsStreamReference.cpp holds a verbatim quotation of the
+//       three lambdas in its own translation unit, src/FlatXsStreamFormMine.h
+//       scores the shipped bodies against it, and src/FlatXsStreamFormMiner.cpp
+//       resolves the mask once at startup with rasbery::gpu::
+//       resolveCalibratedFormMask.  `kStreamFormsDefault` stays 0 as the
+//       per-build RECORD; the run uses the mined value and the receipt says
+//       which, in `forms_source` and `forms_sound`.
+//   (b) The seven libm forms are still N1, and now with a number attached
+//       rather than an adjective.  RASBERY_GPU_FLATXS_STREAM_LIBM=exact swaps
+//       every log/cbrt here for src/FlatXsStreamExactMath.h's double-double
+//       evaluation, which is bit-identical under g++ and nvcc BY CONSTRUCTION
+//       -- and which still is not the host's answer, because the host calls
+//       glibc and glibc's log is not correctly rounded on 244 of 10^6 sampled
+//       arguments and its cbrt is off by up to 3 ulp on more than half of
+//       them.  The default is therefore `fast`, the arm stays N1 for reason
+//       (b) alone, and the route to B0 is named in the WP23 doc section 8.
+//
+// Both facts are said again in src/FlatXsStreamReceipt.h, in the string a gate
+// script reads.
 //
 // This header must stay compilable by both g++ and nvcc, and it must not include
 // anything from Chiffon: `Model.h` reaches HighFive and HDF5, which nvcc has no
@@ -78,6 +96,7 @@
 // src/XSSet.cpp -- the one translation unit that legitimately sees both.
 
 #include "FlatXsKernel.h" // FlatXsView, DeltaMeta, StaticForms, flatxsProbeMicElement
+#include "FlatXsStreamExactMath.h" // fsExactLog / fsExactCbrt -- WP23.1
 
 namespace rasbery::flatxs_stream {
 
@@ -240,31 +259,80 @@ inline const char* refusalName(int reason) {
 /// The three multiply-add sites in this body.  All three are the SAME shape --
 /// a burnup lerp `acc += f * (hi - lo)` -- and gcc still chooses per statement,
 /// which is the finding the xsrecon campaign paid for and the reason these are
-/// three bits and not one.
+/// three fields and not one.
+///
+/// THE VALUES ARE BIT OFFSETS, NOT BIT MASKS.  Each site owns a TWO-BIT field,
+/// the same width and the same FS_SITE_* encoding XeKernel.h's four WP7-C sites
+/// use, so a reader learns the encoding once.
 enum StreamFormBit : unsigned {
-    FS_REFDENS  = 1u << 0, ///< referenceDensity:   value += fraction * (hi - lo)
-    FS_REFDENS0 = 1u << 1, ///< referenceDensity0:  v     += f * (hi - v)
-    FS_REFCOND  = 1u << 2, ///< referenceCondition: value += fraction * (hi - value)
-    FS_ALL      = 0x7u,
+    FS_REFDENS   = 0u, ///< referenceDensity:   value += fraction * (hi - lo)
+    FS_REFDENS0  = 2u, ///< referenceDensity0:  v     += f * (hi - v)
+    FS_REFCOND   = 4u, ///< referenceCondition: value += fraction * (hi - value)
+    FS_BIT_COUNT = 6u,
 };
 
-/// NOT MINED.  Zero means "nothing fused", which is what gcc does on an ISA
-/// without FMA and what a reader must not mistake for a measurement -- see the
-/// header note and src/FlatXsStreamReceipt.h.  The value is carried at RUNTIME
-/// (not baked) so a miner can be added later without changing one call site.
+constexpr unsigned FS_ALL = (1u << FS_BIT_COUNT) - 1u; ///< 0x3f
+
+/// States of one site.  XE_SITE_* numbering, deliberately.
+///
+/// P2 IS A PROVEN DON'T-CARE AT ALL THREE OF THESE SITES, and saying so here is
+/// cheaper than a reader re-deriving it.  The XE_SITE_* encoding distinguishes
+/// WHICH of two products is folded into the add; these three statements have
+/// only ONE product (`fraction * delta`), so the alternative spelling is the
+/// commuted fma -- and IEEE-754 fma is exactly commutative in its first two
+/// arguments, so P1 and P2 return the same bits here.  The field is two bits
+/// wide anyway, for uniformity with the sibling masks and so a site that later
+/// grows a second product is representable without renumbering the ones beside
+/// it.  The miner reports P1/P2 as an indeterminate pair rather than pretending
+/// it measured something; thmine's TH_HAVG is the same situation and
+/// src/ThFormMine.h's `mineStable` note is the precedent for how it is graded.
+constexpr unsigned FS_SITE_NONE = 0u; ///< the product is rounded, then added
+constexpr unsigned FS_SITE_P1   = 1u; ///< fma(fraction, delta, acc)
+constexpr unsigned FS_SITE_P2   = 2u; ///< fma(delta, fraction, acc) -- see above
+
+/// The per-build record, and NOT the value a run depends on: this arm now MINES
+/// the host's mask at startup (src/FlatXsStreamFormMiner.cpp) and the mined
+/// value wins, exactly as TH_FORMS_DEFAULT is treated.  Zero is kept as the
+/// record because it is what an ISA without FMA does, and because the receipt
+/// compares against it -- a host whose contraction differs from the shipped
+/// record then says so in one line instead of being discovered as an
+/// unexplained ULP three campaigns later.
+///
+///     WSL2 / g++ 13.3, -O3 -march=native (FMA3)   FLATXS_STREAM_FORMS = 0x15
+///     (all three sites FS_SITE_P1; see section 4.1 of the WP23 doc)
 constexpr unsigned kStreamFormsDefault = 0u;
 
+/// The libm policy.  `exact` replaces every log/cbrt in this body with
+/// src/FlatXsStreamExactMath.h's double-double evaluation, which is built from
+/// correctly-rounded primitives only and therefore computes the SAME BITS under
+/// g++ and nvcc.  `fast` calls the vendor function on each side, which is what
+/// WP23 shipped.
+///
+/// THE DEFAULT IS `fast`, AND THAT IS A MEASUREMENT.  Bit equality with the
+/// FLAG-OFF path needs the device to match glibc, not to be correct; and on
+/// 10^6 sampled arguments the exact evaluation differs from glibc's `log` on
+/// 244 of them (glibc is the one that is not correctly rounded on all 244) and
+/// from glibc's `cbrt` on 538003 (glibc again, by up to 3 ulp).  So `exact` is
+/// measurably NEARER the host than any vendor pair, and still not equal to it.
+/// Section 4.2 of docs/WP23_FLATXS_STREAM_GPU_20260902_KO.md carries the run.
+constexpr unsigned FS_LIBM_FAST  = 0u;
+constexpr unsigned FS_LIBM_EXACT = 1u;
+constexpr unsigned kStreamLibmDefault = FS_LIBM_FAST;
+
 /// Runtime-mask contraction policy, same rounding guarantees per arm as
-/// flatxs::StaticForms.
+/// flatxs::StaticForms, plus the libm selector so one struct carries every
+/// rounding decision this body makes.
 struct StreamForms {
     unsigned mask = kStreamFormsDefault;
+    unsigned libm = kStreamLibmDefault;
+
+    RASBERY_XSR_HD unsigned site(unsigned bit) const { return (mask >> bit) & 3u; }
 
     RASBERY_XSR_HD double ma(unsigned bit, double a, double b, double c) const {
-#if defined(__CUDA_ARCH__)
-        return (mask & bit) ? fma(a, b, c) : a * b + c;
-#else
-        return (mask & bit) ? xsrFma(a, b, c) : xsrMul(a, b) + c;
-#endif
+        const unsigned st = site(bit);
+        if (st == FS_SITE_P1) return xsrFma(a, b, c);
+        if (st == FS_SITE_P2) return xsrFma(b, a, c);
+        return xsrMul(a, b) + c;
     }
 };
 
@@ -444,7 +512,11 @@ RASBERY_XSR_HD inline double fsSqrt(double a) {
 #endif
 }
 
-RASBERY_XSR_HD inline double fsLog(double a) {
+/// THE ONE PLACE `log` IS SPELLED, and the policy is a PARAMETER of it rather
+/// than a compile-time choice: the arm has to be able to run both ways in one
+/// binary so a 238 A/B can price the difference without a rebuild.
+RASBERY_XSR_HD inline double fsLog(double a, unsigned libm) {
+    if (libm == FS_LIBM_EXACT) return fsExactLog(a);
 #if defined(__CUDA_ARCH__)
     return log(a);
 #else
@@ -452,7 +524,8 @@ RASBERY_XSR_HD inline double fsLog(double a) {
 #endif
 }
 
-RASBERY_XSR_HD inline double fsCbrt(double a) {
+RASBERY_XSR_HD inline double fsCbrt(double a, unsigned libm) {
+    if (libm == FS_LIBM_EXACT) return fsExactCbrt(a);
 #if defined(__CUDA_ARCH__)
     return cbrt(a);
 #else
@@ -461,13 +534,14 @@ RASBERY_XSR_HD inline double fsCbrt(double a) {
 }
 
 /// Chiffon::RatioFormOf, transcribed.  `now` and `ref` arrive already floored.
-RASBERY_XSR_HD inline double fsRatioFormOf(int coord, double now, double ref) {
+RASBERY_XSR_HD inline double fsRatioFormOf(int coord, double now, double ref,
+                                           unsigned libm) {
     if (coord == kLogDeviationSquared) {
-        const double d = fsLog(now / ref);
+        const double d = fsLog(now / ref, libm);
         return d * d;
     }
     if (coord == kInverseRatio) return ref / now;
-    if (coord == kCubeRootRatio) return fsCbrt(now / ref);
+    if (coord == kCubeRootRatio) return fsCbrt(now / ref, libm);
     return now / (1.0 + now / ref);
 }
 
@@ -574,7 +648,8 @@ RASBERY_XSR_HD inline double fsNodeFluxShare(const StreamNodeView& nd, int l, bo
 /// and this body has them in registers.
 RASBERY_XSR_HD inline double fsNodeSpectralIndex(const flatxs::FlatXsView& v,
                                                  const StreamNodeView& nd, int l,
-                                                 double probe_pu, double probe_b) {
+                                                 double probe_pu, double probe_b,
+                                                 unsigned libm) {
     const int ng  = nd.ng;
     const int ith = ng - 1;
     const double num = probe_pu;
@@ -587,7 +662,7 @@ RASBERY_XSR_HD inline double fsNodeSpectralIndex(const flatxs::FlatXsView& v,
     if (!(fsAbs(bden) > 1.0e-30)) return 0.0;
     const double now  = num / den;
     const double base = bnum / bden;
-    return (now > 1.0e-30 && base > 1.0e-30) ? fsLog(now / base) : 0.0;
+    return (now > 1.0e-30 && base > 1.0e-30) ? fsLog(now / base, libm) : 0.0;
 }
 
 /// XSSet::FineRodThermalFluenceAverage, for the nodes this body serves.
@@ -776,7 +851,7 @@ RASBERY_XSR_HD inline int flatxsStreamResolveNode(const flatxs::FlatXsView& v,
                     const double nb = fsMax(v.iden[static_cast<long long>(partner_iso) * nxyz + l], fl);
                     const double ra = fsMax(fsReferenceDensity0(lib, m, isotope, burn, spol), fl);
                     const double rb = fsMax(fsReferenceDensity0(lib, m, partner_iso, burn, spol), fl);
-                    coordinate = fsLog(na / ra) - fsLog(nb / rb);
+                    coordinate = fsLog(na / ra, spol.libm) - fsLog(nb / rb, spol.libm);
                 }
             } else if (rodAgeAxis >= 0) {
                 coordinate = (nodeBranchX[rodAgeAxis] -
@@ -794,26 +869,28 @@ RASBERY_XSR_HD inline int flatxsStreamResolveNode(const flatxs::FlatXsView& v,
             } else if (ratioForm) {
                 coordinate = fsRatioFormOf(
                     coord, fsMax(density, fl),
-                    fsMax(fsReferenceDensity(lib, m, isotope, burn, spol), fl));
+                    fsMax(fsReferenceDensity(lib, m, isotope, burn, spol), fl),
+                    spol.libm);
             } else if (branchAxis >= 0) {
                 coordinate = (nodeBranchX[branchAxis] -
                               fsReferenceCondition(lib, m, branchAxis, burn, spol)) *
                              (density - fsReferenceDensity(lib, m, isotope, burn, spol));
             } else if (spectralCross) {
-                coordinate = fsNodeSpectralIndex(v, nd, l, probe_pu, probe_b) *
+                coordinate = fsNodeSpectralIndex(v, nd, l, probe_pu, probe_b, spol.libm) *
                              (density - fsReferenceDensity(lib, m, isotope, burn, spol));
             } else if (spectralIndex) {
-                coordinate = fsNodeSpectralIndex(v, nd, l, probe_pu, probe_b);
+                coordinate = fsNodeSpectralIndex(v, nd, l, probe_pu, probe_b, spol.libm);
             } else if (ratioInteraction) {
                 coordinate = fsLog(fsMax(fsNodeFluxShare(nd, l, true), 1.0e-30) /
-                                   fsMax(fsNodeFluxShare(nd, l, false), 1.0e-30)) *
+                                       fsMax(fsNodeFluxShare(nd, l, false), 1.0e-30),
+                                   spol.libm) *
                              (density - fsReferenceDensity(lib, m, isotope, burn, spol));
             } else if (fluxWeighted) {
                 coordinate = fsNodeFluxShare(nd, l, thermalWeighted) * fsMax(0.0, density);
             } else if (rooted) {
                 coordinate = fsSqrt(fsMax(0.0, density));
             } else if (logarithmic) {
-                coordinate = fsLog(fsMax(density, kSpectralLogDensityFloor));
+                coordinate = fsLog(fsMax(density, kSpectralLogDensityFloor), spol.libm);
             } else {
                 coordinate = fsMax(0.0, density);
             }
@@ -841,8 +918,10 @@ RASBERY_XSR_HD inline int flatxsStreamResolveNode(const flatxs::FlatXsView& v,
                         fsReferenceDensity(lib, m, isotope, burnups[idx], spol);
                     if (logarithmic) {
                         key = coordinate -
-                              fsLog(fsMax(referenceNow, kSpectralLogDensityFloor)) +
-                              fsLog(fsMax(referenceAtKey, kSpectralLogDensityFloor));
+                              fsLog(fsMax(referenceNow, kSpectralLogDensityFloor),
+                                    spol.libm) +
+                              fsLog(fsMax(referenceAtKey, kSpectralLogDensityFloor),
+                                    spol.libm);
                     } else if (rooted) {
                         key = coordinate - fsSqrt(fsMax(0.0, referenceNow)) +
                               fsSqrt(fsMax(0.0, referenceAtKey));

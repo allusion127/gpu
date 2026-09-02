@@ -227,16 +227,29 @@ if (RASBERY_ENABLE_TESTS)
         # mask as a kernel argument (XeFormMask.h).  Same two objects, and the
         # same separation, as rasbery_xe_form_probe below -- the verbatim
         # quotation keeps its own translation unit here too.
+        # FlatXsStreamReference/FlatXsStreamFormMiner come along for the same
+        # reason the Xe pair does: the backend TU now launches the WP23 stream
+        # kernel with a MINED contraction mask (FlatXsStreamFormMask.h), and the
+        # verbatim quotation keeps its own translation unit here too.
         add_executable(rasbery_xsrecon_device_consistency
                 "${CMAKE_CURRENT_SOURCE_DIR}/test/xsrecon_device_consistency_test.cpp"
                 "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaXsReconBackend.cu"
                 "${CMAKE_CURRENT_SOURCE_DIR}/src/XeAndersonReference.cpp"
                 "${CMAKE_CURRENT_SOURCE_DIR}/src/XeAlgebraReference.cpp"
-                "${CMAKE_CURRENT_SOURCE_DIR}/src/XeFormMiner.cpp")
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/XeFormMiner.cpp"
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/FlatXsStreamReference.cpp"
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/FlatXsStreamFormMiner.cpp")
         target_compile_features(rasbery_xsrecon_device_consistency PRIVATE cxx_std_20)
         target_include_directories(rasbery_xsrecon_device_consistency PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/src")
         target_link_libraries(rasbery_xsrecon_device_consistency PRIVATE CUDA::cudart)
+        # FlatXsStreamReference.cpp's quotation carries BuildFlatXsStream's
+        # `#pragma omp parallel for`; without -fopenmp the body is not outlined
+        # and the quotation is compiled in a context the production loop is not.
+        if (OpenMP_CXX_FOUND)
+            target_link_libraries(rasbery_xsrecon_device_consistency
+                    PRIVATE OpenMP::OpenMP_CXX)
+        endif ()
         set_target_properties(rasbery_xsrecon_device_consistency PROPERTIES
                 CUDA_STANDARD 17
                 CUDA_STANDARD_REQUIRED YES
@@ -346,6 +359,39 @@ if (RASBERY_ENABLE_TESTS)
     endif ()
 
     add_test(NAME xe_form_probe COMMAND rasbery_xe_form_probe 4096)
+
+    # WP23.1: the branch-stream contraction mask and the libm residual.  Same
+    # construction as the two gates above and for the same reason -- the
+    # verbatim quotation gets its OWN object file, because with the quotation
+    # and the shipped body in one translation unit gcc common-subexpressions
+    # across them and changes what the reference measures.
+    # FlatXsStreamFormMiner.cpp is linked in so the gate exercises the
+    # PRODUCTION resolver (streamFormMask) rather than a test-only copy of it.
+    add_executable(rasbery_flatxs_stream_form_probe
+            "${CMAKE_CURRENT_SOURCE_DIR}/test/flatxs_stream_form_probe.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/FlatXsStreamReference.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/FlatXsStreamFormMiner.cpp")
+    target_compile_features(rasbery_flatxs_stream_form_probe PRIVATE cxx_std_20)
+    target_include_directories(rasbery_flatxs_stream_form_probe PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test")
+    if (OpenMP_CXX_FOUND)
+        # The quotation carries BuildFlatXsStream's `#pragma omp parallel for`.
+        # Without -fopenmp gcc does not outline the body, and an un-outlined
+        # quotation is being compiled in a context the production loop is not --
+        # which is precisely the difference WP22 learned pins a different mask.
+        target_link_libraries(rasbery_flatxs_stream_form_probe
+                PRIVATE OpenMP::OpenMP_CXX)
+    endif ()
+    if (NOT MSVC)
+        # -march=native: with no FMA in the ISA gcc contracts nothing and the
+        # mined mask cannot be scored.  Same flag, same reason, as the two gates
+        # above.  -fno-lto keeps the quotation's translation unit its own.
+        target_compile_options(rasbery_flatxs_stream_form_probe
+                PRIVATE -march=native -O3 -fno-lto)
+    endif ()
+
+    add_test(NAME flatxs_stream_form_probe COMMAND rasbery_flatxs_stream_form_probe)
 
     # Canonical CMFD-Nodal device state (Rev.7.1 Task 7).  Pointer identity,
     # mixed-mode isolation, the materialize masks and generation ownership are

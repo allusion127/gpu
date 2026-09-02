@@ -637,6 +637,12 @@ bool rasberyGpuFlatXsStreamEnabled();
 int      rasberyGpuFlatXsStreamStride();
 unsigned rasberyGpuFlatXsStreamForms();
 
+/// FS_LIBM_FAST or FS_LIBM_EXACT -- WP23.1.  A second knob and not a second
+/// meaning of the mask: the contraction mask says which multiply-adds are
+/// fused, this says which log/cbrt the coordinate forms evaluate, and the two
+/// are graded separately because they have different fixes.
+unsigned rasberyGpuFlatXsStreamLibm();
+
 /// RASBERY_GPU_NODAL_CONSTS, read once per process: WP23 item 3's device
 /// computation of the nine SENM coefficient arrays, replacing their upload.
 /// DEFAULT OFF and CLASS N1 BY MEASUREMENT (CUDA exp vs glibc, 1 ulp on 3.34 %
