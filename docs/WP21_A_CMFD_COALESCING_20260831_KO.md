@@ -249,8 +249,22 @@ if (active[m] == 0u) return;               // stage 2의 첫 테스트, 배리�
 
 **기본 OFF다.** 소스의 규칙("a default is a claim")을 따른다: mask 15는 양쪽 호스트에서
 B0로 측정되고 0.2 s 채택 임계를 넘긴 값이다. bit 4는 텍스트 논증으로 B0지만 **238에서
-가격을 안 재봤다.** `kFuseAllBits`에는 들어가고(그래서 `RASBERY_GPU_CMFD_FUSE=31`이
-파싱된다) `kFuseDefaultMask`에는 안 들어간다.
+가격을 안 재봤다.**
+
+그래서 상수가 둘로 갈렸다. WP21-A 이전에는 `kFuseAllBits`가 "선언된 전부"이면서 동시에
+"가격 매긴 전부"였다 — 구성이 아니라 **우연히** 같은 집합이었다. bit 4를 선언하면서
+그 우연이 깨졌다:
+
+- **`kFusePricedBits` (= 15)** — *채택* 집합. 트리가 주장하는 것. `kFuseDefaultMask`가
+  이 이름 **하나**를 가리킨다(리터럴이 아니다 — `tools/test_v5_defaults_contract.py`가
+  그것을 검사한다).
+- **`kFuseAllBits` (= 31)** — *검증* 집합. `cmfdFuseMask()`가 파싱한 값을 이것으로
+  마스킹하므로, 선언되지 않은 비트가 선언되지 않은 경로를 켤 수 없다. 그래서
+  `RASBERY_GPU_CMFD_FUSE=31`이 파싱되고, 동시에 기본값은 15로 남는다.
+
+두 상수는 **다른 질문에 답한다**: "무엇을 요청할 수 있는가"는 "무엇을 주장하는가"가
+아니다. `kFuseAllBits ⊇ kFusePricedBits`는 계약 테스트가 강제한다 — 검증 집합이
+채택 집합보다 좁아지면 resolver가 기본값의 비트를 마스킹해 버린다.
 
 ---
 

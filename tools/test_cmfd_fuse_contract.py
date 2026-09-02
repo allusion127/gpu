@@ -198,9 +198,10 @@ def rule_flag_family(code: str) -> list:
     return problems
 
 
-# The four bits that were priced and adopted.  kFuseDefaultMask must be exactly
-# these, spelled by name -- never a literal, and never kFuseAllBits, which since
-# WP21-A also contains the unpriced bit 4.
+# The four bits that were priced and adopted.  kFuseDefaultMask must be the ONE
+# name that enumerates exactly these (kFusePricedBits) -- never a literal, and
+# never kFuseAllBits, which since WP21-A is the strictly larger VALIDATION set
+# (what a user may request) rather than the ADOPTION set (what the tree claims).
 ADOPTED_BITS = ("kFuseDot", "kFuseDot2", "kFuseWiel", "kFuseSweepPre")
 
 
@@ -223,27 +224,49 @@ def rule_default_mask_is_all_bits(code: str) -> list:
     constants deliberately differ now, and the gate has to say which is which.
     """
     problems = []
-    default = re.search(r"kFuseDefaultMask = ([^;]*);", code)
+    default = re.search(r"kFuseDefaultMask = ([^;}]*)", code)
     if not default:
         problems.append("kFuseDefaultMask is missing")
         return problems
-    spelling = default.group(1)
+    spelling = default.group(1).strip()
     if "kFuseAllBits" in spelling:
         problems.append(
-            "kFuseDefaultMask is kFuseAllBits, which now includes the unpriced "
-            "bit 4 (kFuseNorm): the default would become a wall claim nobody "
-            "measured")
-    for bit in ADOPTED_BITS:
-        if bit not in spelling:
-            problems.append(
-                "kFuseDefaultMask no longer names %s: the adopted default is the "
-                "four priced bits, spelled by name so a literal cannot change "
-                "the arm without changing the receipt's vocabulary" % bit)
-    if "kFuseNorm" in spelling:
+            "kFuseDefaultMask is kFuseAllBits, which since WP21-A also contains "
+            "the unpriced bit 4 (kFuseNorm): the default would become a wall "
+            "claim nobody measured")
+        return problems
+    if spelling != "kFusePricedBits":
         problems.append(
-            "kFuseNorm is in kFuseDefaultMask: bit 4 ships armed and OFF until "
+            "kFuseDefaultMask is %r rather than the named adopted set "
+            "kFusePricedBits: the default has to be ONE name, so a literal "
+            "cannot change the arm without changing the receipt's vocabulary"
+            % spelling)
+        return problems
+    # Follow the indirection.  kFusePricedBits is where the four adopted bits
+    # are actually enumerated, and it is the constant a rebase could hollow out.
+    priced = re.search(r"kFusePricedBits = ([^,;}]*)", code)
+    if not priced:
+        problems.append("kFusePricedBits is missing: the adopted set has no name")
+        return problems
+    members = priced.group(1)
+    for bit in ADOPTED_BITS:
+        if not re.search(r"(?<![A-Za-z0-9_])" + bit + r"(?![A-Za-z0-9_])", members):
+            problems.append(
+                "kFusePricedBits no longer names %s: the adopted default is the "
+                "four priced bits, spelled by name" % bit)
+    if re.search(r"(?<![A-Za-z0-9_])kFuseNorm(?![A-Za-z0-9_])", members):
+        problems.append(
+            "kFuseNorm is in kFusePricedBits: bit 4 ships armed and OFF until "
             "the 238 runbook in docs/WP21_A_CMFD_COALESCING_20260831_KO.md "
             "prices mask 31 against mask 15")
+    allbits = re.search(r"kFuseAllBits[ ]*=[ ]*([^,;}]*)", code)
+    if not allbits:
+        problems.append("kFuseAllBits is missing: nothing validates a parsed mask")
+    elif "kFusePricedBits" not in allbits.group(1):
+        problems.append(
+            "kFuseAllBits is not built from kFusePricedBits: the validation set "
+            "must be a superset of the adopted set, or cmfdFuseMask() could mask "
+            "away a bit the default claims")
     return problems
 
 
@@ -527,12 +550,32 @@ def self_test() -> list:
         "enum : unsigned { kFuseDefaultMask = 15u };\n",
         "kFuseDefaultMask spelled as a literal rather than the adopted bits",
     )
-    # 2d. The unpriced bit 4 folded into the default.
+    # 2d. The unpriced bit 4 folded into the ADOPTED set.
     expect_fail(
         rule_default_mask_is_all_bits,
-        "enum : unsigned { kFuseDefaultMask = kFuseDot | kFuseDot2 | kFuseWiel"
-        " | kFuseSweepPre | kFuseNorm };\n",
-        "the unpriced kFuseNorm adopted into kFuseDefaultMask",
+        "enum : unsigned { kFusePricedBits = kFuseDot | kFuseDot2 | kFuseWiel"
+        " | kFuseSweepPre | kFuseNorm,\n"
+        "                  kFuseAllBits = kFusePricedBits };\n"
+        "enum : unsigned { kFuseDefaultMask = kFusePricedBits };\n",
+        "the unpriced kFuseNorm adopted into kFusePricedBits",
+    )
+    # 2e. The default widened from the adopted set to the validation set.
+    expect_fail(
+        rule_default_mask_is_all_bits,
+        "enum : unsigned { kFusePricedBits = kFuseDot | kFuseDot2 | kFuseWiel"
+        " | kFuseSweepPre,\n"
+        "                  kFuseAllBits = kFusePricedBits | kFuseNorm };\n"
+        "enum : unsigned { kFuseDefaultMask = kFuseAllBits };\n",
+        "the fuse default widened to the validation set kFuseAllBits",
+    )
+    # 2f. The validation set narrowed until it no longer covers the default.
+    expect_fail(
+        rule_default_mask_is_all_bits,
+        "enum : unsigned { kFusePricedBits = kFuseDot | kFuseDot2 | kFuseWiel"
+        " | kFuseSweepPre,\n"
+        "                  kFuseAllBits = kFuseNorm };\n"
+        "enum : unsigned { kFuseDefaultMask = kFusePricedBits };\n",
+        "kFuseAllBits no longer a superset of the adopted set",
     )
     # 3. Fused kernel with no order note.
     expect_fail(
@@ -636,7 +679,7 @@ def main() -> int:
     print("    outer graph      FUSE=0 %3d nodes -> FUSE=7 %3d nodes" % (outer0, outer_f))
     print("    sweep graph      FUSE=0 %3d nodes/sweep -> FUSE=7 %3d nodes/sweep"
           % (sweep0, sweep_f))
-    print("  negative controls: %d, all fired" % 10)
+    print("  negative controls: %d, all fired" % 12)
     return 0
 
 

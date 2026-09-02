@@ -334,7 +334,18 @@ enum CmfdFuseBit : unsigned {
     /// kernel time over 47k launches, pricing block 39).  Requires the scalar
     /// fusion arm, which is what puts the accumulate body in stage 2 at all.
     kFuseNorm     = 1u << 4, ///< reduce_dot_stage1  + reduce_norm_accumulate_stage2
-    kFuseAllBits  = kFuseDot | kFuseDot2 | kFuseWiel | kFuseSweepPre | kFuseNorm
+    /// THE V5-ADOPTED SET (= 15).  The four bits measured B0 on both hosts and
+    /// the only mask that cleared the 0.2 s adoption threshold.  Named ONCE so
+    /// the default below can be a NAME rather than a literal -- which is what
+    /// kFuseAllBits used to do for it, and stopped being able to do the moment
+    /// WP21-A declared a fifth bit it had not priced.
+    kFusePricedBits = kFuseDot | kFuseDot2 | kFuseWiel | kFuseSweepPre,
+    /// EVERY DECLARED BIT.  This is the validation set -- what cmfdFuseMask()
+    /// masks a user's request against so an undeclared bit cannot arm an
+    /// undeclared path -- and it is a strict SUPERSET of the adopted set.  The
+    /// two constants answer different questions and must not be conflated:
+    /// "what may be asked for" is not "what is claimed".
+    kFuseAllBits  = kFusePricedBits | kFuseNorm
 };
 
 /// THE DEFAULT, since the v5 freeze.  Mask 15 was measured B0 against mask 0 on
@@ -346,13 +357,15 @@ enum CmfdFuseBit : unsigned {
 /// campaign has: the fused body is the two reference bodies concatenated
 /// character for character, so "same operations, same order, same rounding"
 /// is a property of the text, not of a measurement that could drift.
-/// NOT kFuseAllBits any more: WP21-A added bit 4 (kFuseNorm) and left it OUT
-/// of the default, because the paragraph above is a rule and not a habit --
-/// mask 15 is what was measured B0 and adopted on both hosts, and 31 has not
-/// been priced yet.  The 238 runbook in
+/// kFusePricedBits, NOT kFuseAllBits: WP21-A added bit 4 (kFuseNorm) and left
+/// it OUT of the default, because the paragraph above is a rule and not a habit
+/// -- mask 15 is what was measured B0 and adopted on both hosts, and 31 has not
+/// been priced yet.  Still ONE NAME and never a literal, so the default is
+/// checkable by the v5 defaults gate; the two constants simply stopped being
+/// the same set.  The 238 runbook in
 /// docs/WP21_A_CMFD_COALESCING_20260831_KO.md prices 31 against 15; until it
 /// does, `RASBERY_GPU_CMFD_FUSE=31` is how you ask for the fold.
-enum : unsigned { kFuseDefaultMask = kFuseDot | kFuseDot2 | kFuseWiel | kFuseSweepPre };
+enum : unsigned { kFuseDefaultMask = kFusePricedBits };
 
 /// Read ONCE, like every other RASBERY_* gate: the mask fixes the captured
 /// graph topology, so it must not be able to change between two outers of the

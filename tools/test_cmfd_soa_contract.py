@@ -456,16 +456,28 @@ def rule_fuse_norm(code: str) -> list:
     clean = strip_comments(code)
     if "kFuseNorm     = 1u << 4" not in clean and "kFuseNorm = 1u << 4" not in clean:
         problems.append("kFuseNorm (FUSE bit 4) is missing")
-    default = re.search(r"kFuseDefaultMask = ([^;]*);", clean)
+    # The default names the ADOPTED set (kFusePricedBits); kFuseAllBits is the
+    # strictly larger VALIDATION set that makes `RASBERY_GPU_CMFD_FUSE=31`
+    # parse.  Bit 4 belongs in the second and not the first, so both the
+    # default and the set it names are checked.
+    default = re.search(r"kFuseDefaultMask = ([^;}]*)", clean)
+    priced = re.search(r"kFusePricedBits = ([^,;}]*)", clean)
     if not default:
         problems.append("kFuseDefaultMask is missing")
+    elif "kFuseAllBits" in default.group(1):
+        problems.append(
+            "kFuseDefaultMask is kFuseAllBits, which includes bit 4: that adopts "
+            "an arm nobody priced on 238")
     elif "kFuseNorm" in default.group(1):
         problems.append(
             "kFuseNorm is in kFuseDefaultMask: a default is a claim, and bit 4 "
             "has not been priced on 238 -- it ships armed and OFF")
-    elif "kFuseAllBits" in default.group(1):
+    if not priced:
+        problems.append("kFusePricedBits is missing: the adopted set has no name")
+    elif "kFuseNorm" in priced.group(1):
         problems.append(
-            "kFuseDefaultMask is kFuseAllBits again, which now includes bit 4")
+            "kFuseNorm is in kFusePricedBits: the default names that set, so bit 4 "
+            "would be adopted through the indirection")
     for sig in ("__global__ void reduce_norm_accumulate_fused(",
                 "__global__ void reduce_norm_accumulate_fused_f32("):
         body = body_of(clean, sig)
@@ -547,10 +559,15 @@ CONTROLS = (
      "static void reportCmfdGraphCensus(const char* tag) {\n"
      '    line << "[RASBERY][CMFD][GRAPH] {\\"nodes\\":" << count;\n'
      "}\n"),
-    ("fuse bit 4",
+    ("fuse bit 4 adopted through the default",
      lambda s: rule_fuse_norm(s),
      "enum CmfdFuseBit : unsigned { kFuseNorm = 1u << 4 };\n"
      "enum : unsigned { kFuseDefaultMask = kFuseAllBits };\n"),
+    ("fuse bit 4 adopted through the priced set",
+     lambda s: rule_fuse_norm(s),
+     "enum CmfdFuseBit : unsigned { kFuseNorm = 1u << 4,\n"
+     "  kFusePricedBits = kFuseDot | kFuseNorm };\n"
+     "enum : unsigned { kFuseDefaultMask = kFusePricedBits };\n"),
 )
 
 DOC_CONTROL = "WP21-A moved some arrays around and it went fine."

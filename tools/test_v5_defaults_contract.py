@@ -116,17 +116,56 @@ DRIVER_SRC = read(DRIVER)
 # ===========================================================================
 #
 # The mask is not a bool, so "default on" has to be said as a VALUE.  It is said
-# once, as kFuseDefaultMask, and that constant is pinned to kFuseAllBits rather
+# once, as kFuseDefaultMask, and that constant is pinned to a NAMED SET rather
 # than to a literal: mask 15 is the member of the family that cleared the 0.2 s
 # adoption threshold (-0.396 s interleaved on 238 block 4b, where mask 4 managed
 # -0.183 s and was not adopted), so a default that quietly became a different
 # member would be a wall claim nobody measured.
+#
+# THE NAME USED TO BE kFuseAllBits AND IS NOW kFusePricedBits.  Until WP21-A the
+# two were the same set, so pinning the default to "every declared bit" was also
+# pinning it to "every priced bit" -- by coincidence, not by construction.  WP21-A
+# declared a fifth bit (kFuseNorm) that it deliberately did NOT price, and at that
+# moment the coincidence broke: kFuseAllBits is the VALIDATION set (what a user may
+# ask for, so an undeclared bit cannot arm an undeclared path) and kFusePricedBits
+# is the ADOPTION set (what the tree claims).  This rule follows the split rather
+# than papering over it -- it still refuses a literal, still refuses a silent
+# return to the reference mask, and now also refuses the reverse mistake of
+# adopting an unpriced bit by writing kFuseAllBits back into the default.
 def rule_fuse_default(src: str) -> list[str]:
     bad: list[str] = []
-    if "kFuseDefaultMask = kFuseAllBits" not in src:
-        bad.append("kFuseDefaultMask is not defined as kFuseAllBits -- the adopted "
-                   "default is mask 15 and it must be named once, not spelled as a "
-                   "literal in the resolver")
+    default = re.search(r"kFuseDefaultMask = ([^;}]*)", src)
+    if default is None:
+        bad.append("kFuseDefaultMask is gone -- the default is no longer said "
+                   "anywhere as a value")
+    else:
+        spelling = default.group(1).strip()
+        if spelling != "kFusePricedBits":
+            bad.append("kFuseDefaultMask is not defined as kFusePricedBits (found "
+                       "%r) -- the adopted default is mask 15 and it must be named "
+                       "once, not spelled as a literal in the resolver and not "
+                       "widened to the validation set" % spelling)
+    priced = re.search(r"kFusePricedBits = ([^,;}]*)", src)
+    if priced is None:
+        bad.append("kFusePricedBits is gone -- the adopted set has no name, so the "
+                   "default cannot be checked against anything")
+    else:
+        for bit in ("kFuseDot", "kFuseDot2", "kFuseWiel", "kFuseSweepPre"):
+            if not re.search(r"\b%s\b" % bit, priced.group(1)):
+                bad.append("kFusePricedBits no longer names %s -- the adopted set is "
+                           "the four bits both hosts measured at digest "
+                           "0d15abf29d222a02 / 1d897e3f77204799" % bit)
+        if re.search(r"\bkFuseNorm\b", priced.group(1)):
+            bad.append("kFuseNorm is inside kFusePricedBits -- bit 4 has not been "
+                       "priced on 238, so it may be REQUESTABLE but not ADOPTED")
+    allbits = re.search(r"kFuseAllBits\s*=\s*([^,;}]*)", src)
+    if allbits is None:
+        bad.append("kFuseAllBits is gone -- there is nothing to validate a parsed "
+                   "mask against")
+    elif not re.search(r"\bkFusePricedBits\b", allbits.group(1)):
+        bad.append("kFuseAllBits is not built from kFusePricedBits -- the validation "
+                   "set must be a superset of the adopted set, or a default the tree "
+                   "claims could be masked away by the resolver")
     gate = body_of(src, "unsigned cmfdFuseMask(")
     if not gate:
         return bad + ["cmfdFuseMask() is gone -- there is no latch for the mask"]
@@ -321,7 +360,9 @@ else:
 # is reported here as a failure rather than as a pass.
 # ===========================================================================
 CONTROL_FUSE_BACK_TO_ZERO = """
-enum : unsigned { kFuseDefaultMask = kFuseAllBits };
+enum : unsigned { kFusePricedBits = kFuseDot | kFuseDot2 | kFuseWiel | kFuseSweepPre,
+                  kFuseAllBits = kFusePricedBits | kFuseNorm };
+enum : unsigned { kFuseDefaultMask = kFusePricedBits };
 unsigned cmfdFuseMask() {
     static const unsigned mask = [] {
         const char* v = std::getenv("RASBERY_GPU_CMFD_FUSE");
@@ -333,11 +374,29 @@ unsigned cmfdFuseMask() {
 """
 
 CONTROL_FUSE_LITERAL_DEFAULT = """
+enum : unsigned { kFusePricedBits = kFuseDot | kFuseDot2 | kFuseWiel | kFuseSweepPre,
+                  kFuseAllBits = kFusePricedBits | kFuseNorm };
 enum : unsigned { kFuseDefaultMask = 15u };
 unsigned cmfdFuseMask() {
     static const unsigned mask = [] {
         const char* v = std::getenv("RASBERY_GPU_CMFD_FUSE");
         if (v == nullptr) return kFuseDefaultMask;
+        return 1u & kFuseAllBits;
+    }();
+    return mask;
+}
+"""
+
+# The reverse mistake WP21-A made possible: the default widened from the adopted
+# set to the validation set, which adopts a bit nobody priced.
+CONTROL_FUSE_UNPRICED_ADOPTED = """
+enum : unsigned { kFusePricedBits = kFuseDot | kFuseDot2 | kFuseWiel | kFuseSweepPre,
+                  kFuseAllBits = kFusePricedBits | kFuseNorm };
+enum : unsigned { kFuseDefaultMask = kFuseAllBits };
+unsigned cmfdFuseMask() {
+    static const unsigned mask = [] {
+        const char* v = std::getenv("RASBERY_GPU_CMFD_FUSE");
+        if (v == nullptr) return static_cast<unsigned>(kFuseDefaultMask);
         return 1u & kFuseAllBits;
     }();
     return mask;
@@ -396,8 +455,10 @@ inline bool resultAsyncEnabled() { return resultAsyncRequested(); }
 CONTROLS = (
     ("the fuse default silently back to the reference mask",
      lambda: rule_fuse_default(CONTROL_FUSE_BACK_TO_ZERO)),
-    ("the fuse default spelled as a literal, not kFuseAllBits",
+    ("the fuse default spelled as a literal, not kFusePricedBits",
      lambda: rule_fuse_default(CONTROL_FUSE_LITERAL_DEFAULT)),
+    ("the fuse default widened to the validation set, adopting an unpriced bit",
+     lambda: rule_fuse_default(CONTROL_FUSE_UNPRICED_ADOPTED)),
     ("a flipped boolean back to envFlagEnabled",
      lambda: rule_boolean_default_on(CONTROL_BOOL_BACK_TO_OPT_IN,
                                      "RASBERY_GPU_FLATXS_CTA",
