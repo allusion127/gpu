@@ -204,6 +204,15 @@ def check_receipt(r: dict) -> list[str]:
                        "that armed it")
         if cf["probed"] and abs(cf["hit_rate"] - cf["would_converge"] / cf["probed"]) > 5e-4:
             bad.append("counterfactual.hit_rate is not would_converge / probed")
+        # WHICH QUESTION THE COUNTERS ANSWERED.  Under `sentinel` they are the
+        # counterfactual -- outers the handoff spent that it did not have to.
+        # Under `carry` the sentinel is gone and the same counters are the
+        # REALISED saving: outers the sentinel would have added.  A consumer
+        # that averaged the two arms would be averaging two different
+        # quantities, so the arm is part of the reading.
+        if cf.get("arm") not in ("sentinel", "carry"):
+            bad.append(f"counterfactual.arm is {cf.get('arm')!r}; the receipt "
+                       "must name which arm produced these counters")
     return bad
 
 
@@ -226,9 +235,10 @@ FIXTURE = {
     "settle": {"outers": 53, "outers_loose": 0, "outers_polish": 53},
     "sentinel": {"xe_step": 964, "xe_interim": 0, "settle": 53, "polish": 69,
                  "total": 1086},
-    "counterfactual": {"probed": 964, "would_converge": 96, "hit_rate": 0.0996,
-                       "probe_coverage": 1.0, "loose_probed": 800,
-                       "loose_would_converge": 80, "loose_hit_rate": 0.1},
+    "counterfactual": {"arm": "sentinel", "probed": 964, "would_converge": 96,
+                       "hit_rate": 0.0996, "probe_coverage": 1.0,
+                       "loose_probed": 800, "loose_would_converge": 80,
+                       "loose_hit_rate": 0.1},
     "cmfd": {"sweeps": 18627, "sweeps_per_outer": 4.2556, "sweeps_charged": 18512,
              "negative_retry_sweeps": 115, "negative_retry_frac": 0.0062,
              "sweep_split_residual": 0, "drives": 4377, "exit_converged": 700,
@@ -281,6 +291,8 @@ def identity_half() -> None:
             mutated(**{"counterfactual.would_converge": 2000}),
         "a hit rate that does not match its two counters":
             mutated(**{"counterfactual.hit_rate": 0.5}),
+        "a counterfactual that does not say which arm produced it":
+            mutated(**{"counterfactual.arm": "?"}),
         "a receipt missing a whole section":
             {k: v for k, v in FIXTURE.items() if k != "cascade"},
     }
@@ -389,13 +401,44 @@ def source_half() -> None:
     # `double prev_inner = eigv + 1.0;`, which is the loop arming itself rather
     # than a handoff poisoning a converged carry, so the scan anchors on a line
     # that STARTS with the assignment.
-    sentinels = [m.start() for m in
-                 re.finditer(r"^\s*prev_inner\s*=\s*eigv \+ 1\.0;", solve_loop, re.M)]
+    #
+    # THE ARMED SITE COUNTS AS A SITE.  RASBERY_A2_PREV_INNER=carry turns the Xe
+    # handoff into a conditional expression whose FALSE arm is this same
+    # literal; the alternation is written so that removing the arm and removing
+    # the site are two different edits and only one of them passes.
+    SENTINEL = re.compile(
+        r"^\s*prev_inner\s*=\s*(?P<armed>a2_prev_inner_carry \? eigv : )?eigv \+ 1\.0;",
+        re.M)
+    matches = list(SENTINEL.finditer(solve_loop))
+    sentinels = [m.start() for m in matches]
     if len(sentinels) != 4:
         fail(f"SolveLoop has {len(sentinels)} `prev_inner = eigv + 1.0` sites, "
              "expected the four the design names (Xe handoff, interim probe, "
              "settling gate, polish transition). A new one needs a counter and "
              "a row in the receipt")
+    armed = [i for i, m in enumerate(matches) if m.group("armed")]
+    if armed != [0]:
+        fail(f"RASBERY_A2_PREV_INNER arms sentinel site(s) {armed}, expected only "
+             "the first (the Xe cascade handoff). The probe's whole claim is "
+             "about that one site: the other three poison a carry the design's "
+             "own counter-argument says was worthless anyway")
+    if DRIVER.count('std::getenv("RASBERY_A2_PREV_INNER")') != 2:
+        fail("RASBERY_A2_PREV_INNER must be read exactly twice -- once into the "
+             "cached SolveLoop static that decides the arm, and once by the "
+             "receipt that labels which question the counterfactual answered. A "
+             "third reader could resolve it differently")
+    if "static const bool a2_prev_inner_carry = [] {" not in solve_loop:
+        fail("the RASBERY_A2_PREV_INNER gate is not cached in a function-local "
+             "static; the loop would reach getenv per outer")
+    if '== "carry"' not in solve_loop:
+        fail("the arm no longer compares against the word `carry`; a knob whose "
+             "future may hold `secant` or `pre_xe` must not spend its name on a 1")
+    arm_env = region(code, "inline constexpr const char* kArmEnv[] = {", "\n};",
+                     "kArmEnv")
+    if '"RASBERY_A2_PREV_INNER"' not in arm_env:
+        fail("RASBERY_A2_PREV_INNER is not in kArmEnv. It is an N1 arm -- it "
+             "changes which outer the flux is declared converged on -- so a "
+             "`carry` answer could be served to a `sentinel` request")
     poison_counters = ("poison_xe_step", "poison_xe_interim", "poison_settle",
                        "poison_polish")
     for name in poison_counters:
@@ -484,7 +527,7 @@ def source_half() -> None:
                   "cascade", "predicted", "residual", "outers_per_cascade",
                   "trials_per_statepoint", "outers_per_trial_all_in",
                   "interim_steps", "outers_loose", "sentinel",
-                  "counterfactual", "probe_coverage", "loose_hit_rate",
+                  "counterfactual", "arm", "probe_coverage", "loose_hit_rate",
                   "sweeps_per_outer", "negative_retry_sweeps",
                   "sweep_split_residual", "exit_budget", "exit_deferred",
                   "budget_exhausted_frac", "deferred_sweeps_per_drive",
@@ -515,7 +558,7 @@ def source_half() -> None:
         # Re-run the scan the mutation is aimed at, on the broken source.
         sl = region(broken, "    static void SolveLoop(",
                     "    /// Where this run's restart_", "SolveLoop")
-        sites = len(re.findall(r"^\s*prev_inner\s*=\s*eigv \+ 1\.0;", sl, re.M))
+        sites = len(SENTINEL.findall(sl))
         if sites == 4 and all(sl.count(f"++ctx.telemetry.{n};") == 1
                               for n in poison_counters):
             fail(f"negative control {what!r} did not disturb the sentinel scan")
@@ -574,7 +617,7 @@ def main(argv: list[str]) -> int:
             print(f"  {message}")
         return 1
     print("outer budget receipt contract: PASS "
-          "(11 identity negative controls, 4 sentinel sites, "
+          "(12 identity negative controls, 4 sentinel sites, "
           f"{len(NEW_COUNTERS)} counters folded once each)")
     return 0
 

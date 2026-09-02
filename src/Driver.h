@@ -846,6 +846,15 @@ inline constexpr const char* kArmEnv[] = {
     // under `arm_env_additions`.
     "RASBERY_BICG_NMAX",
     "RASBERY_BICG_EPS",
+    // A2 S0 PROBE (docs/A2_S0_PROBE_20260903_KO.md).  `carry` drops the
+    // `prev_inner = eigv + 1.0` sentinel at the Xe cascade handoff and lets the
+    // next outer be tested against the eigenvalue the sentinel replaced.  That
+    // changes which outer the flux is declared converged on, and therefore the
+    // whole outer sequence of every statepoint with an equilibrium-Xe cascade:
+    // CLASS N1, gated by Gate A/B and never by the bit-golden gate.  It is here
+    // for the plainest reason on this list -- an answer produced under `carry`
+    // must never be served to a request made under `sentinel`.
+    "RASBERY_A2_PREV_INNER",
 };
 
 /// FNV-1a, one 64-bit word at a time.  Chosen because it is eight lines, has no
@@ -981,6 +990,15 @@ inline double ratio(long long x, long long y) {
 ///                     `outers * cmfd_sweeps * (1 + nmax)`, which is `nmax_work`.
 inline std::string line(const sptelem::Counters& c, int statepoints, int slot,
                         int sweep_budget, int inner_budget) {
+    // THE COUNTERFACTUAL'S ARM, published beside its counters because the same
+    // two counters answer two different questions depending on it.  With the
+    // sentinel in place `would_converge` is "outers the handoff spent that it
+    // did not have to"; with `carry` in place the sentinel is gone and the same
+    // number is "outers the sentinel WOULD have added" -- the realised saving,
+    // measured on the arm that took it.  A receipt that did not say which is a
+    // receipt whose headline number means either.
+    const char* arm = std::getenv("RASBERY_A2_PREV_INNER");
+    const bool  carry = arm != nullptr && std::string(arm) == "carry";
     const long long attributed = c.outers();
     const long long settle     = c.outers_by_cause[sptelem::CAUSE_SETTLE];
     // Sec 1.3.  Every term is counted at the site that causes it; the residual
@@ -1014,7 +1032,8 @@ inline std::string line(const sptelem::Counters& c, int statepoints, int slot,
         "\"settle\":{{\"outers\":{},\"outers_loose\":{},\"outers_polish\":{}}},"
         "\"sentinel\":{{\"xe_step\":{},\"xe_interim\":{},\"settle\":{},\"polish\":{},"
         "\"total\":{}}},"
-        "\"counterfactual\":{{\"probed\":{},\"would_converge\":{},\"hit_rate\":{:.4f},"
+        "\"counterfactual\":{{\"arm\":\"{}\",\"probed\":{},"
+        "\"would_converge\":{},\"hit_rate\":{:.4f},"
         "\"probe_coverage\":{:.4f},\"loose_probed\":{},\"loose_would_converge\":{},"
         "\"loose_hit_rate\":{:.4f}}},"
         "\"cmfd\":{{\"sweeps\":{},\"sweeps_per_outer\":{:.4f},\"sweeps_charged\":{},"
@@ -1040,7 +1059,7 @@ inline std::string line(const sptelem::Counters& c, int statepoints, int slot,
         settle, c.settle_outers_loose, settle - c.settle_outers_loose,
         c.poison_xe_step, c.poison_xe_interim, c.poison_settle, c.poison_polish,
         c.poison_xe_step + c.poison_xe_interim + c.poison_settle + c.poison_polish,
-        c.poison_probed, c.poison_would_converge,
+        carry ? "carry" : "sentinel", c.poison_probed, c.poison_would_converge,
         ratio(c.poison_would_converge, c.poison_probed),
         ratio(c.poison_probed, c.poison_xe_step),
         c.poison_probed_loose, c.poison_would_converge_loose,
@@ -4029,6 +4048,43 @@ private:
         double    xe_relax        = (xe_interim_damp && !xe_once_mode)
                                         ? XE_DAMPED_RELAX
                                         : 1.0;
+        // A2 S0 PROBE: RASBERY_A2_PREV_INNER (default `sentinel` = today's path).
+        //
+        // WHAT prev_inner IS.  It is the PREVIOUS OUTER'S EIGENVALUE, and the
+        // only thing it feeds is the keff half of the outer convergence test
+        // (Driver.h `flux_converged`, and its device twin at
+        // CmfdOuterKernel.h:502-504).  It is not the Wielandt shift -- that is
+        // `_eshift` / `reigvs` in BICGCMFD -- and it is not the inner solve's
+        // residual, which is `errl2`.  Every outer computes the test and then
+        // sets `prev_inner = eigv`, so at the Xe handoff below prev_inner
+        // ALREADY equals eigv: the `+ 1.0` is a sentinel written over a carry
+        // that was already correct, and its only effect is to make the next
+        // outer's test fail by construction.
+        //
+        // `carry` drops the `+ 1.0` at that ONE site, which asks the next outer
+        // the honest question -- did the Xe step move k by less than
+        // keff_tol_now, on a flux whose residual is under flux_tol_now -- rather
+        // than a question with a fixed answer.
+        //
+        // CLASS N1: it is a deterministic trajectory change and is gated by
+        // Gate A/B, never by the bit-golden gate.  Which is why it is on
+        // trajectory::kArmEnv and forks the case key.
+        //
+        // OFF IS THE LITERAL.  The site below is a conditional EXPRESSION whose
+        // false arm is `eigv + 1.0` character for character, not a call into a
+        // body: the `71092e2` precedent (a body spliced into SolveLoop moved the
+        // flag-OFF digest through inlining and -ffp-contract alone) is about
+        // bodies, and there is none here.
+        //
+        // A WORD, NOT A BOOLEAN.  The design's Sec 3.1 S6 keeps
+        // `RASBERY_XE_INTERIM_L2` alive as a diagnostic knob whose value is a
+        // tolerance; a knob whose future may hold `carry`, `secant` or
+        // `pre_xe` should not spend its name on a `1`.  Anything that is not
+        // exactly `carry` is `sentinel`, so a typo lands on today's path.
+        static const bool a2_prev_inner_carry = [] {
+            const char* value = std::getenv("RASBERY_A2_PREV_INNER");
+            return value != nullptr && std::string(value) == "carry";
+        }();
         // Per-cascade Xe budget (RASBERY_XE_CASCADE_BUDGET, default off = exact old
         // path).  See XE_CASCADE_TOTAL_MULTIPLIER for why one shared counter starves
         // the late cascades of a search-heavy statepoint.
@@ -4714,7 +4770,10 @@ private:
                 if (xe_change >= xe_tol_now || (xe_once_mode && !xe_once_done)) {
                     // Cross sections changed; re-converge the flux before
                     // taking a search or T/H feedback step.
-                    prev_inner  = eigv + 1.0;
+                    //
+                    // A2 S0 PROBE, the one site RASBERY_A2_PREV_INNER moves.
+                    // The false arm is the literal this line has always been.
+                    prev_inner  = a2_prev_inner_carry ? eigv : eigv + 1.0;
                     clean_iters = 0;
                     // A2 S0.  Arm the counterfactual with the eigenvalue the
                     // line above just overwrote.  `eigv` is the pre-Xe value and
