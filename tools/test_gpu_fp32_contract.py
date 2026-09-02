@@ -457,6 +457,79 @@ check("anyArmed()" in RECEIPT and '"partial"' in RECEIPT,
       "`arm` is three-valued: fp32 (device-wide), partial (a per-backend "
       "spelling only), fp64 (nothing) -- so it can never contradict `backends`")
 
+# ---------------------------------------------------------------------------
+# 3b. `declined` IS A STATE A RUN CAN REACH, AND THE REFUSAL IS COUNTED.
+#
+# Two failures hide behind one word here, and both make RASBERY_GPU_FP32_CRAM=1
+# INDISTINGUISHABLE from not asking -- while the two runs already carry two
+# different WP10.1 case keys and therefore cannot share a cache.
+#
+#   (a) REACHABILITY.  backendState() tests `!converted` -> "deferred" before it
+#       tests `!inScope` -> "declined".  If NO backend is converted-but-gated,
+#       the second test can never fire: `declined` becomes dead text and the
+#       inScope() branch that spells the gate becomes dead code.  So the rule is
+#       not "Cram is gated" -- it is the STRUCTURE: some backend converted()
+#       answers TRUE for is then gated by inScope() on a knob of its own.
+#   (b) THE COUNT.  src/GpuFp32Arm.h promises that the default refusal is
+#       COUNTED as a demotion "so the receipt says the arm was asked and
+#       declined rather than silently doing nothing".  A promise with no
+#       noteDemotion() behind it is the exact failure mode the receipt exists
+#       to prevent, one level up: the operator reads `demotions` and cannot
+#       tell an arm that declined from an arm nobody asked.
+#
+# The count is taken ONCE, in the constructor that resolves the width, and only
+# when the arm was actually armed -- a run without RASBERY_GPU_FP32 must not
+# count anything, which is the same feature-off rule the rest of this file
+# holds.
+# ---------------------------------------------------------------------------
+def rule_declined_is_reachable(arm: str) -> bool:
+    """Some backend converted() answers TRUE for is gated again by inScope(),
+    and backendState() still asks !inScope after !converted."""
+    try:
+        conv  = body_after(arm, "inline bool converted(Backend which)")
+        scope = body_after(arm, "inline bool inScope(Backend which)")
+        state = body_after(arm, "inline const char* backendState(Backend which)")
+    except LookupError:
+        return False
+    gated = re.findall(r"which == Backend::(\w+)\)\s*return\s+\w+\(\);", scope)
+    if not gated:
+        return False
+    if not any(re.search(r"case Backend::%s:\s*return true;" % g, conv)
+               for g in gated):
+        return False
+    return '!inScope(which)' in state and 'return "declined"' in state
+
+
+def rule_declined_is_counted(cram: str) -> bool:
+    """The site that resolves the CRAM width counts the refusal, gated on the
+    ARM and not on the extension: armed-and-not-routed is a demotion."""
+    try:
+        ctor = body_after(cram, "CramBackend::CramBackend()")
+    except LookupError:
+        return False
+    if "rasbery::fp32::noteDemotion(rasbery::fp32::Backend::Cram);" not in ctor:
+        return False
+    return re.search(r"rasbery::fp32::armed\(\)", ctor) is not None
+
+
+check(rule_declined_is_reachable(ARM),
+      "`declined` is a state a run can actually reach: converted() says TRUE "
+      "for a backend that inScope() then gates on its own knob, and "
+      "backendState() still asks !inScope after !converted.  A word no run can "
+      "print is not a receipt state")
+check(rule_declined_is_counted(CRAM),
+      "and the refusal is COUNTED: CramBackend::CramBackend() calls "
+      "noteDemotion(Backend::Cram) when the arm is armed and routes() came "
+      "back false, which is what src/GpuFp32Arm.h promises and what makes "
+      "RASBERY_GPU_FP32_CRAM=1 distinguishable from not asking")
+check("RASBERY_GPU_FP32_CRAM" not in strip_comments(CRAM),
+      "the count reads the ARM through the header and never the extension "
+      "environment variable itself -- one reader per knob, which is what keeps "
+      "a run with RASBERY_GPU_FP32 unset counting nothing at all")
+check("COUNTED as a demotion" in ARM and "CramBackend::CramBackend()" in ARM,
+      "src/GpuFp32Arm.h names the site its promise is kept at, so the promise "
+      "and the call cannot drift apart without this rule seeing it")
+
 check(MAIN.count('"[RASBERY][FP32] {"') == 3,
       "the receipt is printed from all three of main.cpp's exit branches")
 check(MAIN.count("rasbery::fp32::appendReceiptFields(std::cout);") == 3,
@@ -1199,6 +1272,31 @@ NEGATIVES: list[tuple[str, object]] = [
     ("the xsrecon reader goes back to the wide pointer",
      lambda: rule_no_bare_block_read(
          XSRK + "\n  double z = v.mic[xt][(iso * NG + ig) * nxyz + l];\n")),
+    # 3b (a): the state goes dead by the table rather than by the ordering --
+    # exactly how it was dead before WP20.2 converted CRAM.
+    ("the only gated backend stops being converted, so `declined` is dead text",
+     lambda: rule_declined_is_reachable(
+         ARM.replace("case Backend::Cram:   return true;",
+                     "case Backend::Cram:   return false;"))),
+    # 3b (a) again, the other way in: the ordering answers before scope is asked.
+    ("backendState stops asking !inScope at all",
+     lambda: rule_declined_is_reachable(
+         ARM.replace('if (!inScope(which)) return "declined";', ""))),
+    # 3b (a), the third way: the gate leaves inScope, so every converted backend
+    # routes and the receipt can only ever say fp32.
+    ("inScope loses the per-backend gate that makes `declined` possible",
+     lambda: rule_declined_is_reachable(
+         ARM.replace("if (which == Backend::Cram) return cramExtended();", ""))),
+    # 3b (b): the promise goes back to being prose with nothing behind it.
+    ("the CRAM refusal stops being counted",
+     lambda: rule_declined_is_counted(
+         CRAM.replace("rasbery::fp32::noteDemotion(rasbery::fp32::Backend::Cram);",
+                      ""))),
+    # 3b (b), the subtle one: counting only when the EXTENSION was given inverts
+    # the meaning -- a demotion would then mark the arm that was TAKEN.
+    ("the count moves off the arm and onto the extension",
+     lambda: rule_declined_is_counted(
+         CRAM.replace("rasbery::fp32::armed()", "_impl->fp32_pole"))),
 ]
 for label, probe in NEGATIVES:
     checks += 1

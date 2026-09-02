@@ -1386,7 +1386,29 @@ CramBackend::CramBackend() : _impl(new Impl) {
     // AND RASBERY_GPU_FP32_CRAM, because CRAM is the one backend the device-wide
     // arm does NOT extend to by default.
     _impl->fp32_pole = rasbery::fp32::routes(rasbery::fp32::Backend::Cram);
-    if (_impl->fp32_pole) _impl->status_text += " [fp32 pole sum]";
+    if (_impl->fp32_pole) {
+        _impl->status_text += " [fp32 pole sum]";
+    } else if (rasbery::fp32::armed()) {
+        // THE REFUSAL IS COUNTED, and this is the site src/GpuFp32Arm.h's
+        // "RASBERY_GPU_FP32_CRAM=1 extends the arm" note promises it at.  The
+        // device-wide arm WAS asked -- `armed()` -- and CRAM stayed FP64,
+        // either because the extension was not given by name (the default, and
+        // the whole reason that note exists) or because a non-finite latched
+        // the backend off.  Both are exactly what noteDemotion() is defined as
+        // ("a backend out of scope"), and leaving them uncounted is what made
+        // RASBERY_GPU_FP32=1 and RASBERY_GPU_FP32=1 RASBERY_GPU_FP32_CRAM=1
+        // produce the same `demotions` total from two runs that already have
+        // two different WP10.1 case keys.
+        //
+        // ONCE, HERE, AND NOT PER SOLVE.  The width is resolved once in this
+        // constructor and stored on the Impl, so the demotion is one mark that
+        // the arm was declined for the process -- not a per-node tally that
+        // would drown the nodal/flat-XS counts the G0 reading of `demotions`
+        // is about.  And it is taken where the arm is ASKED: a build or a run
+        // with no device CRAM at all returns above without counting, because
+        // there was no narrow path there to decline.
+        rasbery::fp32::noteDemotion(rasbery::fp32::Backend::Cram);
+    }
 }
 
 CramBackend::~CramBackend() = default;

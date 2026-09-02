@@ -113,7 +113,15 @@
 // sign and cancel catastrophically, and float has no headroom for that
 // cancellation.  Default: CRAM stays FP64 even with RASBERY_GPU_FP32=1, and the
 // refusal is COUNTED as a demotion so the receipt says the arm was asked and
-// declined rather than silently doing nothing.
+// declined rather than silently doing nothing.  The count is taken at the ONE
+// site that asks routes(Backend::Cram) -- CramBackend::CramBackend() in
+// src/CudaCramBackend.cu -- because that is where the arm is asked and where
+// the answer is fixed for the process.  It is therefore ONE mark per run, not
+// a per-node tally, and the receipt carries the same fact twice on purpose:
+// `backends.cram == "declined"` says WHICH backend stayed wide, `demotions`
+// says the run PAID for asking.  Without the second, RASBERY_GPU_FP32=1 and
+// RASBERY_GPU_FP32=1 RASBERY_GPU_FP32_CRAM=1 -- two different WP10.1 case keys
+// -- would hand an operator the same total.
 //
 // WP20.2 gave that flag something to turn on, and deliberately gave it the
 // SMALLEST thing that tests the claim above rather than the largest thing that
