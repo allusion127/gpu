@@ -22,7 +22,7 @@
 // that already exported it would be EIGHT PERCENT SLOWER under a receipt saying
 // screen100.  Pinning it off in the row is the whole fix.
 //
-// THE THREE ROWS.
+// THE FOUR ROWS.
 //
 //   strict     the production tolerances, i.e. every built-in constant this
 //              header restates.  Naming it CLEARS an A2 environment, which is
@@ -34,6 +34,11 @@
 //              tolerance (Driver.h `polishing`).
 //   screen100  the GA screening preset.  Target: MASTER-relative |dkeff| <=
 //              100 pcm and pin power error < 1 % RMS and max.
+//   screen100e4
+//              WP24.1.  screen100 with ONE knob moved -- cmfd_sweep_epsl2
+//              1e-5 -> 1e-4, the sweep Sec 2.3 of the WP24 doc names as the
+//              first one to take.  A ROW and not an overridable knob because
+//              the case key folds the NAME; see the row's own comment.
 //
 // WHY screen100 MOVES THE POLISH TOLERANCES AND A2 DOES NOT.  Under staging
 // only a convergence reached at the POLISH tolerance can end a solve
@@ -443,6 +448,69 @@ inline constexpr FidelityPresetSpec kFidelityPresets[] = {
         /*xe_tol*/                       1.0e-5,
         /*xe_oscillation_floor*/         kProdXeOscillationFloor,
         /*cmfd_sweep_epsl2*/             1.0e-5,
+        /*rodcrit_search_cap*/           kProdRodCritSearchCap,
+        /*rodcrit_search_floor_cusping*/ kProdRodCritFloorCusp,
+        /*staged_search_margin*/         2.0,
+        /*boron_bracket*/                PresetFlag::On,
+        /*carry_slope*/                  PresetFlag::Off,
+        /*warm_boron*/                   PresetFlag::Off,
+        /*max_trials*/                   0,
+        /*statepoint_grid*/              "",
+    },
+    // WP24.1.  THE FIRST SWEEP ARM: screen100 WITH THE CMFD SWEEP EXIT AT 1e-4.
+    //
+    // Byte-identical to the screen100 row above but for the name and
+    // `cmfd_sweep_epsl2`, which moves 1e-5 -> 1e-4.  That is precisely the knob
+    // the row above names as THE FIRST ONE TO SWEEP once screen100 has a
+    // measured outer count (and docs/WP24_SCREEN100_FIDELITY_20260902_KO.md
+    // Sec 2.3 with it), and this row is what makes taking that sweep an
+    // environment variable on the runner instead of a source edit on the host.
+    // Two builds are the one thing a campaign cannot compare.
+    //
+    // WHY A ROW AND NOT AN OVERRIDABLE KNOB.  armEnvValue() folds the preset's
+    // NAME and nothing behind it -- the seventeen values are compiled in, and
+    // `code_sha` is an operator-supplied token rather than a build fingerprint
+    // -- so an environment knob that moved epsl2 under the name `screen100`
+    // would give two different sweep exits ONE case key.  That is a wrong HIT,
+    // the single direction Driver.h's kArmEnv comment says the list must never
+    // allow, and tools/test_fidelity_preset_contract.py's row-digest check
+    // states the remedy in the imperative: a retune is a new arm and deserves a
+    // new name.  This row is that name, and the suffix says which knob and
+    // which value rather than `screen100_v2`.
+    //
+    // WHAT 1e-4 BUYS, AND THE HALF NOBODY HAS MEASURED.  Read the outer's L2
+    // half (`residual < flux_tol_now`) against BICGCMFD::drive(), which breaks
+    // on `errl2 < _epsl2` and otherwise exhausts _ncmfd = 5.  At
+    // epsl2 == flux_tol the outer test is EXACTLY "the sweep loop converged"
+    // (break -> pass, cap-exhaust -> fail): the strictest reading available,
+    // and the shipped tree's own 1:1 state, kProdCmfdSweepEpsl2 ==
+    // kProdFluxL2Tol.  So on the two axes that ARE decidable this arm is both
+    // cheaper per outer and stricter in its verdict than screen100's 1e-5.
+    // What it may cost is OUTERS -- a better-converged flux per outer is what
+    // lets the |dk| half be met in fewer of them, the cost model is
+    // outers x inner cost, and the sign of that product does not follow from
+    // the ratio.  The product is the measurement this row exists to take, so
+    // report outers/sp AND wall for both rows over one deck; quoting either
+    // alone answers a different question than the sweep asked.
+    //
+    // AND IT IS NOT ACCEPTANCE-ELIGIBLE, for screen100's reason and not a new
+    // one: it moves the PUBLISHED tolerances.  tools/gate_b_envelope.py maps
+    // this name onto the screen100 ENVELOPE rather than inventing a second one
+    // with the same numbers -- what the arm is allowed to be wrong by is not
+    // one of the things the sweep moves, and two spellings of one bar is the
+    // defect this table exists to end, restated in Python.
+    {
+        /*name*/                         "screen100e4",
+        /*staged_flux_mult*/             5.0,
+        /*staged_xe_mult*/               100.0,
+        /*loose_settle*/                 true,
+        /*keff_tol_mult*/                10.0,
+        /*search_tol_mult*/              10.0,
+        /*search_tol_cap*/               1.0e-4,
+        /*flux_l2_tol*/                  1.0e-4,
+        /*xe_tol*/                       1.0e-5,
+        /*xe_oscillation_floor*/         kProdXeOscillationFloor,
+        /*cmfd_sweep_epsl2*/             1.0e-4,
         /*rodcrit_search_cap*/           kProdRodCritSearchCap,
         /*rodcrit_search_floor_cusping*/ kProdRodCritFloorCusp,
         /*staged_search_margin*/         2.0,

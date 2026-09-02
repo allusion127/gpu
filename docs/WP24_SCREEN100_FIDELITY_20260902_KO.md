@@ -734,6 +734,46 @@ python tools/test_enum_alias_contract.py
 python tools/test_dependent_template_contract.py
 ```
 
+### 7.4 첫 번째 스윕 아암: `screen100e4` (WP24.1)
+
+§2.3이 "screen100의 실측 아우터 수가 나오면 **첫 번째로 스윕할 노브**"라고 지목한
+`cmfd_sweep_epsl2` 1e-5 → 1e-4를, **소스를 고치지 않고** 환경변수 하나로 잡을 수
+있게 표에 네 번째 행 `screen100e4`를 추가했다. 이 행은 `screen100`과 **이름과
+`cmfd_sweep_epsl2` 외의 모든 열이 문자 그대로 동일**하다 —
+`tools/test_fidelity_preset_contract.py`의 `check_sweep_arm`이 그것을 검사하므로,
+`check_screen100`이 부모 행에 대해 증명하는 모든 불변식이 이 아암에 대해서도
+구성상 성립한다. 1e-4는 `flux_l2_tol`과 **같은 값**이고(불변식 `epsl2 <= flux_tol`을
+등호로 만족), 그 지점에서 아우터의 L2 절반은 정확히 "스윕 루프가 수렴했는가"가
+된다 — §2.3 표의 가장 엄격한 읽기이자 출하 트리의 1:1 상태다. 아우터당 비용은
+싸지지만 **아우터 수**가 늘 수 있고 그 곱의 부호는 비만 보고 결정되지 않으므로,
+두 아암 모두에 대해 **outers/sp와 wall을 같이** 보고할 것. 한쪽만 인용하면 스윕이
+물은 것과 다른 질문에 답하게 된다.
+
+행이지 오버라이드 노브가 아닌 이유: 케이스 키는 프리셋의 **이름만** 접는다.
+`screen100`이라는 이름 아래에서 epsl2를 움직이는 환경 노브는 서로 다른 두 스윕
+종료값에 **하나의 케이스 키**를 주므로, 잘못된 캐시 HIT — `kArmEnv`가 절대 허용해서는
+안 되는 단 하나의 방향 — 이 된다. 행 다이제스트 검사의 문구 그대로 "재튜닝은 새 아암이고
+새 이름을 받을 자격이 있다"이며, `e4`라는 접미사가 어떤 노브를 어떤 값으로 옮겼는지
+말한다. 실제로 `screen100`과 `screen100e4`는 env 다이제스트가 **다르므로** 두 아암은
+캐시가 섞이지 않는다.
+
+```
+# C) screen100e4 — B와 완전히 같은 레시피에서 프리셋 이름만 바꾼다
+python tools/run_single_gpu_batch.py --gpu 0 --batch-width 1 \
+    --set RASBERY_FIDELITY=screen100e4 \
+    --set-unset RASBERY_STAGED_FLUX_TOL --set-unset RASBERY_STAGED_XE_TOL \
+    --set-unset RASBERY_STAGED_LOOSE_SETTLE \
+    -- RASBERY --rasi <kngr_238.json> --raso E:/run/wp24/s100e4 --batch-mode 1
+```
+
+`--set-unset` 세 줄은 §7.1과 **같은 이유로** 여기서도 필수다(그래야 B와 C의 키가
+비교된다). `[RASBERY][FIDELITY]` 영수증의 `fidelity_preset`이 `screen100e4`,
+`resolved_entry0`의 스윕 종료값이 `1e-4`로 찍히는지 확인할 것. 채점 봉투는 **부모와
+같다** — `tools/gate_b_envelope.py`가 이 이름을 `screen100` 봉투로 매핑하므로
+(별칭이지 두 번째 봉투가 아니다) Gate B는 §7.1의 두 명령에서 `--envelope screen100e4`로
+바꿔 그대로 돌린다. 스윕은 아암이 **얼마나 틀려도 되는지**를 바꾸지 않는다.
+`screen100`과 마찬가지로 승격 대상이 아니다(§5).
+
 ---
 
 ## 8. 예상 아우터 감소 — **추정이며, 측정이 아니다**

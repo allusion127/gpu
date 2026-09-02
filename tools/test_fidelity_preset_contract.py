@@ -474,6 +474,80 @@ def check_screen100(presets: dict) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# 2a. THE SWEEP ARM: screen100e4 IS screen100 WITH EXACTLY ONE KNOB MOVED
+# ---------------------------------------------------------------------------
+#
+# WHY THIS IS A CHECK AND NOT A COMMENT.  check_screen100 above judges the row
+# it is handed BY NAME, so a sweep arm added beside screen100 inherits none of
+# those seventeen judgements.  Re-running them here against `screen100e4` would
+# be a second copy of the argument; asserting that the row IS screen100 in every
+# column but the one being swept is the same statement made once -- every
+# invariant check_screen100 proves about the parent then holds for the arm by
+# construction, and the two rows cannot drift into two different presets inside
+# one campaign.
+#
+# So this check is exactly two claims: (1) nothing but the sweep knob moved, and
+# (2) the knob moved in the direction the row and docs/WP24 Sec 2.3 argue for,
+# to the value that satisfies the surviving invariant with equality.
+
+SWEPT_COLUMN = "cmfd_sweep_epsl2"
+
+
+def check_sweep_arm(presets: dict) -> list[str]:
+    problems: list[str] = []
+    row = presets.get("screen100e4")
+    base = presets.get("screen100")
+    if row is None:
+        return ["src/FidelityPreset.h has no `screen100e4` row"]
+    if base is None:
+        return ["src/FidelityPreset.h has no `screen100` row for the sweep arm to be "
+                "measured against"]
+
+    # (1) ONE KNOB.  Compared as the raw token TEXT the table is written in, so
+    # a column re-spelled to the same value (kProdXeTol against 1.0e-6) is still
+    # a divergence between the two rows and is still caught: the arm's claim is
+    # that it is the parent row, not that it is numerically equivalent to it.
+    for column in sorted(set(base) | set(row)):
+        if column in ("name", SWEPT_COLUMN, "_constants"):
+            continue
+        if base.get(column) != row.get(column):
+            problems.append(
+                f"`screen100e4` {column} is {row.get(column)!r} against `screen100`'s "
+                f"{base.get(column)!r}. The arm's entire meaning is that it is screen100 "
+                f"with ONE knob moved -- a second difference makes the measured outer "
+                f"delta a sum over two changes, which is the unnamed-arm defect at row "
+                f"granularity, and it silently voids every judgement check_screen100 "
+                f"makes about the parent on the arm's behalf.")
+
+    # (2) THE SWEEP ACTUALLY HAPPENED, and in the direction the row argues for.
+    if not (NUM(row, SWEPT_COLUMN) > NUM(base, SWEPT_COLUMN)):
+        problems.append(
+            f"`screen100e4` does not LOOSEN the CMFD sweep exit ({row[SWEPT_COLUMN]} "
+            f"against `screen100`'s {base[SWEPT_COLUMN]}). A sweep arm that did not move "
+            f"its knob is a duplicate row: two names, one physics, and a campaign that "
+            f"spends two cold runs to measure nothing.")
+
+    # ...to the value that makes the outer's L2 half EXACTLY "the sweep loop
+    # converged".  BICGCMFD::drive() breaks on `errl2 < _epsl2` and otherwise
+    # exhausts _ncmfd = 5, so at epsl2 == flux_tol a break implies the outer L2
+    # test passes and a cap-exhaust implies it fails -- the strictest reading
+    # available, and the shipped tree's own 1:1 kProdCmfdSweepEpsl2 ==
+    # kProdFluxL2Tol.  Looser than that and the sweep cap decides the published
+    # flux (check_screen100's surviving invariant); tighter and the arm is a
+    # smaller sweep than the one the doc asked for, at the price of a cold run.
+    flux_tol = max(NUM(row, "flux_l2_tol"), 1.0e-6 * NUM(row, "keff_tol_mult"))
+    if not approx(NUM(row, SWEPT_COLUMN), flux_tol):
+        problems.append(
+            f"`screen100e4`'s CMFD sweep exit is {row[SWEPT_COLUMN]} against an outer "
+            f"flux tolerance of {flux_tol:g}. The arm exists to take epsl2 to the 1:1 "
+            f"ratio the shipped tree carries, where the outer's L2 half is exactly "
+            f"`the sweep loop converged` (break -> pass, cap-exhaust -> fail); looser "
+            f"than that and the sweep cap decides the published flux, tighter and it is "
+            f"a different sweep than the one the row and docs/WP24 Sec 2.3 name.")
+    return problems
+
+
+# ---------------------------------------------------------------------------
 # 2b. THE TABLE-WIDE INVARIANT: A ROW THAT MOVES A POLISH TOLERANCE IS NOT
 #     ACCEPTANCE-ELIGIBLE
 # ---------------------------------------------------------------------------
@@ -510,9 +584,10 @@ POLISH_COLUMNS = ("keff_tol_mult", "search_tol_mult", "flux_l2_tol", "xe_tol",
 # costs one line to update when a row is deliberately retuned, and it makes the
 # silent-collision path impossible to take by accident.
 ROW_DIGESTS = {
-    "strict":    "1bb83a9f075f4ca4",
-    "A2":        "bc939817f0910505",
-    "screen100": "d8c8d41e50c0272e",
+    "strict":      "1bb83a9f075f4ca4",
+    "A2":          "bc939817f0910505",
+    "screen100":   "d8c8d41e50c0272e",
+    "screen100e4": "2031331549f82574",
 }
 
 
@@ -1120,6 +1195,37 @@ def check_envelopes() -> list[str]:
                 f"pin FAIL has to be able to see that only 0.20 pp of the 1 % limit was "
                 f"ever screening headroom, and the note is what the tools print.")
 
+    # WP24.1.  EVERY SCREENING ROW NEEDS AN ENVELOPE SPELLING.  A preset that
+    # moves a POLISH tolerance is not judged by `production` -- the runbook
+    # spells its Gate B as `--envelope <row name>` -- so a row with no envelope
+    # name is a row whose gate command is an argparse error on the runner, i.e.
+    # an arm that shipped with no gate at all.  Derived from the TABLE rather
+    # than listed here, so the next sweep arm cannot be added without one.
+    for name, row in sorted(PRESETS.items()):
+        if not [c for c in POLISH_COLUMNS
+                if not approx(NUM(row, c), NUM(PRESETS["strict"], c))]:
+            continue
+        if name not in gate_b_envelope.ENVELOPE_NAMES:
+            problems.append(
+                f"preset row {name!r} moves a published tolerance but gate_b_envelope "
+                f"has no envelope or alias of that name, so the runbook's "
+                f"`--envelope {name}` is an argparse error and the arm ships with no "
+                f"Gate B.")
+        elif gate_b_envelope.resolve(name) is prod:
+            problems.append(
+                f"`--envelope {name}` resolves to the ACCEPTANCE envelope. The row moves "
+                f"a published tolerance, so a number it produces judged by `production` "
+                f"is a screening number filed in an acceptance column.")
+    # ...and the sweep arm specifically is judged by its PARENT's bar, as the
+    # SAME object.  What the arm is allowed to be wrong by is not one of the
+    # things the sweep moves, so a second Envelope carrying the same five
+    # numbers would be two spellings of one bar and free to drift apart.
+    if gate_b_envelope.resolve("screen100e4") is not screen:
+        problems.append(
+            "`--envelope screen100e4` does not resolve to the screen100 Envelope "
+            "itself. The sweep arm is screen100 with one knob moved and none of the "
+            "five limits is that knob, so it has to be an ALIAS and not a copy.")
+
     # THE VERDICT ITSELF.  Pass, fail, advisory, and absent.
     ok, _ = gate_b_envelope.verdict(screen, {"keff_pcm": 42.0, "pin_rms_pct": 0.3,
                                              "pin_max_pct": 0.9})
@@ -1296,6 +1402,7 @@ def run(name: str, checker, *args) -> None:
 
 run("table", check_table_single_source, PRESET_H, DRIVER, SCHEDULER, BATCH)
 run("screen100", check_screen100, PRESETS)
+run("sweep-arm", check_sweep_arm, PRESETS)
 run("polish-invariant", check_polish_invariant, PRESETS)
 run("row-digest", check_row_digests, PRESETS)
 run("feature-off", check_feature_off, CONTRACT, FIDELITY, SCHEDULER, DRIVER, PRESET_H)
@@ -1386,6 +1493,15 @@ control("check_screen100 misses a search-tolerance CAP that eats the boron headr
 control("check_screen100 misses a search multiplier left UNCAPPED against a deck-stated "
         "tolerance",
         check_screen100, broken_preset("screen100", "search_tol_cap", "0.0"))
+control("check_sweep_arm misses an arm that moved a SECOND knob beside the sweep, so "
+        "the measured outer delta is a sum over two changes",
+        check_sweep_arm, broken_preset("screen100e4", "xe_tol", "1.0e-4"))
+control("check_sweep_arm misses an arm whose swept knob never moved -- two names for "
+        "one physics, and a cold run spent measuring nothing",
+        check_sweep_arm, broken_preset("screen100e4", "cmfd_sweep_epsl2", "1.0e-5"))
+control("check_sweep_arm misses a sweep exit LOOSER than the outer flux tolerance, "
+        "where the sweep cap and not the preset decides the published flux",
+        check_sweep_arm, broken_preset("screen100e4", "cmfd_sweep_epsl2", "1.0e-3"))
 control("check_row_digests misses a row retuned in place",
         check_row_digests, broken_preset("screen100", "xe_tol", "1.0e-4"))
 control("check_polish_invariant misses an acceptance-eligible row with moved polish "

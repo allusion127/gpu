@@ -210,6 +210,23 @@ ENVELOPES: dict[str, Envelope] = {
     ),
 }
 
+#: WP24.1.  A SWEEP ARM IS JUDGED BY ITS PARENT'S BAR, so it is an ALIAS and
+#: not a second Envelope.  `screen100e4` is the screen100 preset row with one
+#: knob moved (cmfd_sweep_epsl2 1e-5 -> 1e-4, src/FidelityPreset.h): what the
+#: arm is allowed to be WRONG by is not one of the things the sweep changes, so
+#: copying screen100's five numbers under a second name would be two spellings
+#: of one bar -- and the two would then be free to drift apart, which is the
+#: defect the single preset table exists to end, restated here in Python.  The
+#: name still has to RESOLVE, because the runbook's Gate B command for the arm
+#: spells `--envelope screen100e4`; without this it is an argparse error on the
+#: runner and the arm has no gate at all.
+ENVELOPE_ALIASES: dict[str, str] = {
+    "screen100e4": "screen100",
+}
+
+#: Every spelling `--envelope` accepts, aliases included.
+ENVELOPE_NAMES: tuple[str, ...] = tuple(sorted(set(ENVELOPES) | set(ENVELOPE_ALIASES)))
+
 DEFAULT_ENVELOPE = "production"
 
 #: The metric keys, in the order a verdict prints them.
@@ -220,22 +237,24 @@ def add_envelope_argument(parser) -> None:
     """`--envelope` on an argparse parser, spelled once for both Gate B tools."""
     parser.add_argument(
         "--envelope",
-        choices=sorted(ENVELOPES),
+        choices=list(ENVELOPE_NAMES),
         default=DEFAULT_ENVELOPE,
         help="acceptance envelope to judge against (default: %(default)s). "
              "`screen100` is the GA screening envelope (100 pcm / 33.5 ppm / "
              "pin 1 %% RMS and 1 %% max, AO advisory); its limits are ABSOLUTE "
              "and already contain the production baseline, and it is NOT "
-             "acceptance-eligible.",
+             "acceptance-eligible. `screen100e4` is the SAME envelope under the "
+             "sweep arm's name (src/FidelityPreset.h), not a looser one.",
     )
 
 
 def resolve(name: str) -> Envelope:
+    """The Envelope *name* judges against, following the sweep-arm aliases."""
     try:
-        return ENVELOPES[name]
+        return ENVELOPES[ENVELOPE_ALIASES.get(name, name)]
     except KeyError:
         raise SystemExit(
-            f"unknown envelope {name!r}; known: {', '.join(sorted(ENVELOPES))}"
+            f"unknown envelope {name!r}; known: {', '.join(ENVELOPE_NAMES)}"
         ) from None
 
 
