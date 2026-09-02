@@ -75,6 +75,13 @@ bool XsReconBackend::micxScatterPending() const { return false; }
 unsigned long long XsReconBackend::micxResidentGeneration() const { return 0; }
 
 const void* XsReconBackend::micxDeviceSlot(int) const { return nullptr; }
+
+// WP22 commit 2.  A CPU-only build has no resident block to broadcast into, so
+// the arm declines and XSSet::SetBoron runs the host loop it always ran.
+bool XsReconBackend::boronArmed() const { return false; }
+bool XsReconBackend::applyBoronDevice(double, int) { return false; }
+unsigned long long XsReconBackend::boronDeviceApplies() const { return 0; }
+unsigned long long XsReconBackend::boronBytesElided() const { return 0; }
 int XsReconBackend::micxDeviceElemBytes() const { return static_cast<int>(sizeof(double)); }
 
 void* XsReconBackend::micxReadyEvent() { return nullptr; }
@@ -150,6 +157,7 @@ unsigned long long XsReconBackend::canonicalDownloadsElided() const { return 0; 
 bool rasberyGpuXsReconEnabled() { return false; }
 
 bool rasberyGpuFlatXsEnabled() { return false; }
+bool rasberyGpuSearchEnabled() { return false; }
 
 bool rasberyGpuMicxResidentEnabled() { return false; }
 

@@ -296,6 +296,42 @@ public:
     /// consumer must not do the D2D.
     void* micxReadyEvent();
 
+    // --- WP22 commit 2: the boron apply (RASBERY_GPU_SEARCH) --------------
+    //
+    // WHY THIS LIVES HERE AND NOT IN A BACKEND OF ITS OWN.  The per-node boron
+    // block the reconstruction reads is `dev_pernode + 2 * nxyz`, which this
+    // backend allocates, sizes, uploads and shadow-guards.  A second object
+    // writing it would be a second opinion about a buffer with one owner, and
+    // the first time the two disagreed about whether a regrow had happened the
+    // symptom would be a core reconstructed at the previous trial's boron.  So
+    // the arm is a method on the owner: it writes the block with a broadcast
+    // kernel on the owner's own stream and commits the owner's own shadow, and
+    // the next solveFlatXs sees the bytes it would have uploaded.
+
+    /// True when RASBERY_GPU_SEARCH is set to a truthy value AND a device
+    /// exists.  Independent of the flat-XS arm's own flag: the two share a
+    /// buffer, not a knob.
+    [[nodiscard]] bool boronArmed() const;
+
+    /// Broadcast one boron concentration across the RESIDENT per-node block.
+    ///
+    /// Returns false -- having written nothing -- when the arm is off, no block
+    /// is resident yet (the first flat-XS solve of a case has not run), the
+    /// shape disagrees, or CUDA failed.  The caller then does exactly what it
+    /// did before: the host loop, and the flat-XS backend's guarded upload.
+    ///
+    /// B0 BY CONSTRUCTION.  The kernel evaluates nothing; every node receives
+    /// @p bppm itself.  The block afterwards holds the bytes the upload would
+    /// have written, which is the same argument the RASBERY_GPU_XFER_ELIDE arm
+    /// rests on -- and, like that arm, it means no kernel downstream can tell
+    /// the two runs apart.
+    bool applyBoronDevice(double bppm, int nxyz);
+
+    /// Boron applies this backend served on the device, and the upload bytes
+    /// they saved.  Read by the [RASBERY][SEARCH_GPU] receipt.
+    [[nodiscard]] unsigned long long boronDeviceApplies() const;
+    [[nodiscard]] unsigned long long boronBytesElided() const;
+
     /// WP15.1 receipts for the batch nodal arena's jnet upload shadow.
     /// `tests` is the denominator: 0 tests means the arm was never consulted,
     /// which reads very differently from consulted-and-always-missed.
@@ -550,6 +586,16 @@ bool rasberyGpuXsReconEnabled();
 
 /// RASBERY_GPU_FLATXS, read once per process.  Stub builds return false.
 bool rasberyGpuFlatXsEnabled();
+
+/// RASBERY_GPU_SEARCH, read once per process: WP22's device boron apply.
+///
+/// A FREE FUNCTION AND NOT ONLY THE BACKEND'S OWN boronArmed(), for one reason
+/// that is about the feature-OFF path.  XSSet::SetBoron must be able to ask
+/// "is this arm on" WITHOUT constructing an XsReconBackend: the constructor
+/// probes the CUDA device, and a CPU-only run that never set a single
+/// RASBERY_GPU_* flag must not acquire a device probe because a boron trial
+/// happened.  Stub builds return false.
+bool rasberyGpuSearchEnabled();
 
 /// RASBERY_GPU_MICX_RESIDENT, read once per process: WP15's deferred
 /// micx/lmpx download.  Default OFF until the 238 runbook in

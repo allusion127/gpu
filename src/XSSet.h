@@ -3,6 +3,7 @@
 #include "CudaThBackend.h"
 #include "CudaXsReconBackend.h"
 #include "FlatXsKernel.h"
+#include "SearchKernel.h"
 // For xsrecon::NISO and xsrecon::BatchView: the device Xe entry points
 // below take a view by reference and size the depTrans rows from the
 // kernel's own constant, rather than restating 39 here.

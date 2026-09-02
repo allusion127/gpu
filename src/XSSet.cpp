@@ -2,6 +2,7 @@
 
 #include "GpuFullContract.h"
 #include "Importer.h"
+#include "SearchGpuReceipt.h"
 #include "Sha256.h"
 #include "ThGpuReceipt.h"
 #include "XSTiming.h"
@@ -5809,8 +5810,52 @@ void XSSet::SetBoron(double bppm) {
                                static_cast<std::uint64_t>(_g.nxyz()));
     const int nxyz = _g.nxyz();
 
-    for (int l = 0; l < nxyz; ++l)
-        _g.bppm(l) = bppm;
+    // WP22 commit 2.  The boron trial's per-node write, on the device when the
+    // arm is armed and a block is resident.
+    //
+    // THE HOST MIRROR BELOW IS NOT A FALLBACK AND IS NOT SKIPPED ON THE DEVICE
+    // PATH, and that distinction is the whole shape of this seam.
+    // XSSet::BuildFlatXsStream resolves the branch stream on the host and reads
+    // `_g.bppm(l)` per node to form the boron coordinate, so the host array is a
+    // LIVE INPUT of the very next UpdateFlatXS -- not a stale copy the device
+    // made redundant.  What the arm removes is the nxyz-double HOST-TO-DEVICE
+    // COPY that flat-XS would otherwise make of it; what it does not remove is
+    // the array.  Moving BuildFlatXsStream is the next lever and is priced in
+    // docs/WP22_TH_SEARCH_GPU_20260902_KO.md.
+    auto& search_tally = rasbery::search::searchGpuTally();
+    search_tally.applies.fetch_add(1, std::memory_order_relaxed);
+    // THE FLAG IS ASKED BEFORE THE BACKEND IS BUILT, and that ordering is the
+    // feature-off path's whole guarantee.  EnsureBackend() constructs an
+    // XsReconBackend, whose constructor probes the CUDA device; a CPU-only run
+    // that set no RASBERY_GPU_* flag at all must not acquire a device probe
+    // because a boron trial happened.
+    XsReconBackend* backend   = rasberyGpuSearchEnabled() ? EnsureBackend() : nullptr;
+    bool            on_device = false;
+    if (backend != nullptr && backend->boronArmed())
+        on_device = backend->applyBoronDevice(bppm, nxyz);
+    if (on_device) {
+        search_tally.device_applies.fetch_add(1, std::memory_order_relaxed);
+        search_tally.bytes_elided.store(backend->boronBytesElided(),
+                                        std::memory_order_relaxed);
+    } else {
+        search_tally.host_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        // WP1 (plan Sec 6.3).  The device boron apply declined, so the trial's
+        // boron reaches the reconstruction the old way -- through the flat-XS
+        // backend's guarded upload of the host array.  Under RASBERY_GPU_FULL
+        // that is a case failure and not a silent fallback, for the same reason
+        // every other seam is: an arm that refused every apply and an arm that
+        // was never set produce the same numbers and the same log.
+        RASBERY_GPU_FULL_GUARD_IF(rasberyGpuSearchEnabled(), Search,
+                                  "XSSet::SetBoron",
+                                  "the device boron apply declined; the guarded host "
+                                  "upload carries the trial instead");
+    }
+
+    // ONE TEXT, BOTH ARMS.  The device kernel writes through
+    // rasbery::search::searchBoronBroadcastNode and so does this loop, so "the
+    // device wrote what the host would have" is a property of one function
+    // rather than of two spellings that agree today.
+    rasbery::search::searchBoronBroadcastHost(&_g.bppm(0), nxyz, bppm);
 
     UpdateFlatXS();
 }

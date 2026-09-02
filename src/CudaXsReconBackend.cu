@@ -5,6 +5,7 @@
 #include "FlatXsCtaKernel.cuh"
 #include "FlatXsKernel.h"
 #include "GpuCanonicalState.h"
+#include "SearchKernel.h"
 #include "GpuCaptureArbiter.h"
 #include "GpuDeviceBlockPool.h"
 #include "GpuFp32Arm.h" // WP20: RASBERY_GPU_FP32, the device-wide narrow arm
@@ -2385,6 +2386,27 @@ FlatXsLayoutReceipt g_flatxs_layout_receipt;
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// WP22 commit 2: the boron apply (RASBERY_GPU_SEARCH)
+// ---------------------------------------------------------------------------
+//
+// ONE STORE PER NODE, and the fact that it is only a store is the entire gate
+// class.  A boron trial's per-node write is `bppm[l] = x` for the x the host
+// secant proposed; the kernel evaluates nothing, so there is no rounding
+// decision, no contraction to mine and no form mask -- and the block afterwards
+// holds exactly the bytes the host-to-device copy would have written.  That is
+// the same B0 argument rasbery::xfer's elision arm rests on, one buffer to the
+// left of where that arm makes it.
+//
+// It writes through rasbery::search::searchBoronBroadcastNode, which is also
+// what XSSet::SetBoron's host loop writes through, so "the device wrote what the
+// host would have" is a property of ONE text rather than of two that agree today.
+__global__ void kernelBoronBroadcast(double* bppm, int nxyz, double value) {
+    const int l = blockIdx.x * blockDim.x + threadIdx.x;
+    if (l >= nxyz) return;
+    rasbery::search::searchBoronBroadcastNode(bppm, l, value);
+}
+
 struct XsReconBackend::Impl {
     bool          available = false;
     std::string   status    = "not initialised";
@@ -2479,6 +2501,18 @@ struct XsReconBackend::Impl {
     unsigned long long resident_ref_generation = 0;
 
     double*     dev_pernode = nullptr; // [wvfr | dmod | bppm], nx each
+    /// WP22 commit 2.  Boron applies this backend served on the device, and the
+    /// guarded-upload bytes they saved.  Instance-scoped like every other
+    /// counter on this Impl: in --batch-mode each deck has its own backend, and
+    /// a process-wide counter here would be the slot-0 bug class wearing a
+    /// receipt.
+    unsigned long long boron_device_applies = 0;
+    unsigned long long boron_bytes_elided   = 0;
+    /// Scratch the shadow is committed from -- nxyz doubles, allocated once and
+    /// reused.  It never crosses the bus; it exists because
+    /// ByteExactMirror::commit takes the bytes it is describing, and describing
+    /// a broadcast means having one.
+    std::vector<double> boron_shadow;
     int*        dev_nodes   = nullptr; // node list + off + cnt, grow-only
     int*        dev_off     = nullptr;
     int*        dev_cnt     = nullptr;
@@ -4530,6 +4564,83 @@ void* XsReconBackend::micxReadyEvent() {
     return static_cast<void*>(d.micx_ready_event);
 }
 
+bool XsReconBackend::boronArmed() const {
+    // ONE READER OF THE VARIABLE, and this asks it rather than re-reading the
+    // environment: two `static const bool` caches of the same name would agree
+    // today and would be two places to change the day the flag grows a value
+    // other than truthy.
+    return rasberyGpuSearchEnabled() && _impl->available;
+}
+
+bool XsReconBackend::applyBoronDevice(double bppm, int nxyz) {
+    Impl& d = *_impl;
+    if (!boronArmed()) return false;
+    if (d.stream == nullptr) return false;
+
+    // NO BLOCK, NO ARM.  dev_pernode is allocated by the first flat-XS solve of
+    // a case; before that there is nothing resident to broadcast into, and the
+    // host loop plus the usual guarded upload is exactly right.  A kernel
+    // launched at a null pointer would be the alternative.
+    if (d.dev_pernode == nullptr) {
+        d.status = "boron apply declined: no resident per-node block yet";
+        return false;
+    }
+
+    const rasbery::search::BoronApplyView v{bppm, nxyz};
+    if (!rasbery::search::searchBoronApplyServable(v, d.nxyz)) {
+        // A SHAPE MISMATCH DECLINES RATHER THAN CLAMPS.  A kernel that wrote a
+        // prefix of the block would leave its tail holding the PREVIOUS trial's
+        // boron, and a core reconstructed half at one concentration and half at
+        // another is plausible and wrong.
+        d.status = "boron apply declined: nxyz disagrees with the resident block";
+        return false;
+    }
+
+    // THE ARM COMPOSES WITH RASBERY_GPU_XFER_ELIDE, AND SAYS SO RATHER THAN
+    // PRETENDING OTHERWISE.  uploadGuarded consults the shadow only when the
+    // elision flag is on; with it off the next solveFlatXs would upload the
+    // host array over whatever this kernel wrote, so the arm would cost a
+    // launch and save nothing.  Declining here means the receipt reports a
+    // fallback with a reason, instead of reporting device_applies against
+    // bytes_elided:0 and letting a reader take the first number for a saving.
+    if (!xfer::elideEnabled()) {
+        d.status = "boron apply declined: RASBERY_GPU_XFER_ELIDE is off, so the "
+                   "guarded bppm upload would overwrite the kernel's block";
+        return false;
+    }
+
+    const std::size_t n     = static_cast<std::size_t>(nxyz);
+    const int         block = 256;
+    kernelBoronBroadcast<<<static_cast<int>((n + block - 1) / block), block, 0, d.stream>>>(
+        d.dev_pernode + 2 * n, nxyz, bppm);
+    if (cudaGetLastError() != cudaSuccess) {
+        d.status = "boron apply failed: kernel launch";
+        return false;
+    }
+
+    // COMMIT THE OWNER'S OWN SHADOW.  This is what turns the write into an
+    // elision rather than a duplicate: the next uploadGuarded("bppm", ...) sees
+    // a shadow that memcmp-equals the host array and skips the copy, and the
+    // device block it skipped writing already holds those bytes because this
+    // kernel put them there.  Committing at the ISSUE and not after a drain is
+    // the same rule uploadGuarded itself follows -- the next reader is ordered
+    // behind this launch on this stream.
+    d.boron_shadow.assign(n, bppm);
+    d.mir_bppm.commit(d.boron_shadow.data(), n);
+
+    ++d.boron_device_applies;
+    d.boron_bytes_elided += static_cast<unsigned long long>(n * sizeof(double));
+    return true;
+}
+
+unsigned long long XsReconBackend::boronDeviceApplies() const {
+    return _impl->boron_device_applies;
+}
+
+unsigned long long XsReconBackend::boronBytesElided() const {
+    return _impl->boron_bytes_elided;
+}
+
 unsigned long long XsReconBackend::nodalJnetElidedBytes() {
     return g_nodal_jnet_elided_bytes.load(std::memory_order_relaxed);
 }
@@ -6047,6 +6158,11 @@ bool rasberyGpuXsReconEnabled() {
 
 bool rasberyGpuFlatXsEnabled() {
     static const bool on = envFlagEnabled("RASBERY_GPU_FLATXS");
+    return on;
+}
+
+bool rasberyGpuSearchEnabled() {
+    static const bool on = envFlagEnabled("RASBERY_GPU_SEARCH");
     return on;
 }
 

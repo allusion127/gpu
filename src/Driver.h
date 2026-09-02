@@ -11,6 +11,7 @@
 #include "OuterTrace.h"
 #include "PPR.h"
 #include "Scheduler.h"
+#include "SearchGpuReceipt.h"
 #include "ThGpuReceipt.h"
 #include "WarmState.h"
 #include "XSTiming.h"
@@ -549,6 +550,24 @@ namespace trajectory {
 /// is deliberately absent: it is the thing under test, and it rides in its own
 /// field so an arm comparison can hold every OTHER knob equal.
 ///
+/// RASBERY_GPU_SEARCH is deliberately PRESENT, and it is the entry that is
+/// hardest to argue for -- which is why the argument is written down.  The arm
+/// is B0 by construction: the boron apply is a broadcast STORE of the host
+/// secant's own double into the resident per-node block, so the bytes the
+/// reconstruction reads are the bytes the elided upload would have written, and
+/// no kernel downstream can tell the two runs apart.  A knob that cannot move a
+/// trajectory does not belong on this list -- that is the rule RASBERY_GPU_PPR
+/// and RASBERY_GPU_XFER_ELIDE are kept off it by.
+///
+/// It is here anyway, and for a reason that is about the ARM and not about the
+/// kernel: it declines when RASBERY_GPU_XFER_ELIDE is off, it declines before
+/// the first flat-XS solve of a case has allocated the block, and a decline
+/// leaves the trial to the guarded upload.  So two runs that differ only in this
+/// knob differ in WHICH PATH carried each trial, and a case key that could not
+/// tell them apart would serve one path's answer to the other's request while
+/// the receipt said they were the same arm.  Conservative in the safe
+/// direction: a cache MISS, never a wrong hit.
+///
 /// RASBERY_GPU_TH is deliberately PRESENT, and it is the plainest entry on the
 /// list.  The T/H arm writes tful, tmod and dmod, and the UpdateFlatXS that runs
 /// on the very next line reconstructs EVERY macroscopic cross section of the
@@ -649,6 +668,9 @@ inline constexpr const char* kArmEnv[] = {
     // timing receipt.
     "RASBERY_GPU_TH",
     "RASBERY_TH_FORMS",
+    // WP22 commit 2.  The boron apply's device arm.  See the paragraph above
+    // the list for why a B0-by-construction knob is on it anyway.
+    "RASBERY_GPU_SEARCH",
     "RASBERY_GPU_XE",
     "RASBERY_GPU_XE_DOT_PARTITIONS",
     "RASBERY_GPU_XE_TXN",
@@ -4569,6 +4591,16 @@ private:
                     // the number WP9-D's trial-reduction options are priced
                     // against.
                     outer_timing::Scope propose_scope(sptelem::PH_SEARCH_PROPOSE);
+                    // WP22 commit 2.  Counted HERE, inside the propose bucket,
+                    // because the receipt's `proposals` is meant to be
+                    // comparable with `applies` -- and the only way that
+                    // comparison means anything is if the two are counted at the
+                    // two sites the loop actually visits.  Nothing else in this
+                    // scope touches the device: that is the arm's negative
+                    // property and tools/test_search_gpu_contract.py holds it
+                    // against the source.
+                    rasbery::search::searchGpuTally().proposals.fetch_add(
+                        1, std::memory_order_relaxed);
                     double      next_x = schedule.search_current_x;
                     std::string method;
                     bool        bracket_not_found = false;
@@ -5925,6 +5957,32 @@ public:
                       << cross_sections.th().deviceOrdinal() << ",";
             rasbery::th::appendThGpuReceiptFields(std::cout);
             std::cout << ",\"status\":\"" << cross_sections.th().status() << "\"}\n";
+        }
+
+        // WP22 commit 2 receipt -- the device boron apply (RASBERY_GPU_SEARCH).
+        //
+        // WHY A RECEIPT FOR SO SMALL AN ARM: precisely BECAUSE it is small.  The
+        // T/H arm moves 0.70 s per statepoint and a run that lost it would be
+        // visibly slower; this one moves an nxyz-double copy per boron trial,
+        // which is inside the noise of a single-deck wall.  There is therefore
+        // no timing signal that would notice the flag silently doing nothing,
+        // and `device_applies:0` beside `applies:N` is the only place that gets
+        // said.
+        //
+        // `proposals` AGAINST `applies` IS THE SECOND CHECK, and it is about the
+        // search rather than the device: they should be equal, because every
+        // committed trial is applied.  A gap means the loop proposed a point the
+        // cross sections never saw.
+        //
+        // `propose_transfers` MUST BE ZERO.  The secant reads a k_eff the solve
+        // already published to the host; a download appearing here would mean
+        // the arm had grown the round trip it exists to avoid.  Counted rather
+        // than asserted in a comment, so a run can be quoted for it.
+        if (rasbery::search::searchReceiptWanted()) {
+            std::cout << "  [RASBERY][SEARCH_GPU] {\"schema_version\":1,\"slot\":"
+                      << cmfd_solver.batchSlot() << ",";
+            rasbery::search::appendSearchGpuReceiptFields(std::cout);
+            std::cout << "}\n";
         }
 
         // WP15 receipt -- the micx/lmpx residency (RASBERY_GPU_MICX_RESIDENT).
