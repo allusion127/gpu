@@ -4,9 +4,9 @@
 - 증거: 238 GPU1, build `0054838`, `E:\rasbery_runs\2026-08-30\238\pricing_388e8f2.md` 블록 (38) Phase 2 (arm A)
 - 건드린 파일: `src/GpuFullContract.h`, `src/Driver.h`, `src/EvaluatorServer.h`,
   `tools/soak_run.py`, `tools/promotion_gate.py`, `tools/fake_rasbery_child.py`,
-  `tools/test_evaluator_residency_contract.py`, `docs/patches/wp10_7_xsset.patch`
-- 손대지 않은 파일: `src/XSSet.cpp` / `src/XSSet.h` (WP21-B/C가 동시 편집 중 —
-  §2.7의 패치로 넘김), `src/CudaXsReconBackend.*`, nodal kernel 헤더
+  `tools/test_evaluator_residency_contract.py`,
+  그리고 후속 커밋 WP10.7b에서 `src/XSSet.cpp` (§2.7)
+- 손대지 않은 파일: `src/XSSet.h`, `src/CudaXsReconBackend.*`, nodal kernel 헤더
 
 ---
 
@@ -186,13 +186,20 @@ screening 세대 안의 promotion이야말로 이 op가 쓰여진 바로 그 경
   필드이고, 그것이 arm A가 `outer_fallbacks:9`에 도달하고도 소크 판정이
   그 숫자를 보지 않은 경로다.
 
-### 2.7 넘긴 것 — `docs/patches/wp10_7_xsset.patch`
+### 2.7 `src/XSSet.cpp` — WP10.7b에서 적용됨
 
-`src/XSSet.cpp`는 WP21-B/C가 동시에 편집 중이라 **적용하지 않고 파일로
-넘긴다.** 내용은 `XSSet::UpdateFlatXS`의 fail-closed 가드가 백엔드 자신의
-`status()`를 이유로 싣게 하는 한 훅. WP10.7의 필수 경로는 아니다 — 문이 이미
-그보다 먼저 진짜 이유로 던진다 — 게이트 OFF 팔과 **런 중간의 decline**을 위한
-나머지 절반이다.
+처음에는 WP21-B/C가 같은 파일을 편집 중이라 `docs/patches/wp10_7_xsset.patch`로
+넘겼다. 그 잠금이 풀린 뒤 **WP10.7b에서 적용하고 패치 파일은 삭제했다.**
+
+내용: `XSSet::UpdateFlatXS`의 fail-closed 가드가 백엔드 자신의 `status()`를
+이유로 싣는다. WP10.7의 필수 경로는 아니다 — 게이트 하에서는 문이 이미 그보다
+먼저 진짜 이유로 던진다 — **게이트 OFF 팔**(영수증이 전부인 곳)과 문이
+`ready`라고 답한 뒤 **런 중간에 오는 decline**을 위한 나머지 절반이다.
+
+이유 문자열은 가드 호출 안이 아니라 seam 주석 **위**에서 만든다.
+`tools/test_gpu_full_fail_closed.py`의 WINDOW(seam 앵커 ±8줄)가 "가드가 다른
+분기로 흘러가지 않았다"를 고정하고 있고, 주석을 담으려고 그 창을 넓히는 것은
+그 성질을 조판과 맞바꾸는 일이다.
 
 ---
 

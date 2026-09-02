@@ -3435,14 +3435,28 @@ void XSSet::UpdateFlatXS(const XSUpdateOptions& options) {
                     ++_hoststate_generation;
                 return;
             }
+            // WP10.7.  THE REASON, NOT A RESTATEMENT OF THE SEAM.  The guard
+            // below used to say "the FlatXS device arm declined" and stop; four
+            // cases in the 238 arm-A soak died with that exact sentence and
+            // nothing else, while the backend's own status() -- "no CUDA
+            // device: ...", "stream: ...", "scalar buffer allocation failed" --
+            // went to a process-wide std::call_once warn, so in a resident
+            // evaluator the FIRST case printed a reason and the rest printed
+            // none.  Built ahead of the guard rather than inside it so the
+            // guard stays adjacent to the seam (test_gpu_full_fail_closed's
+            // WINDOW), and only on this path, which is already about to run the
+            // whole CPU reconstruction loop.
+            std::string flatxs_why =
+                "the FlatXS device arm declined (" +
+                (_xsrecon_backend ? _xsrecon_backend->status()
+                                  : std::string("no backend")) +
+                "); the reference reconstruction loop runs";
             // Device arm declined: fall through to the reference loop.
             // WP1 (plan Sec 6.3).  This seam had no counter of any kind: a
             // FlatXS arm that refused every node looked exactly like an arm
             // that was never set.
             RASBERY_GPU_FULL_GUARD_IF(rasberyGpuFlatXsEnabled() && !dump_this, FlatXs,
-                                      "XSSet::UpdateFlatXS",
-                                      "the FlatXS device arm declined; the reference "
-                                      "reconstruction loop runs");
+                                      "XSSet::UpdateFlatXS", flatxs_why.c_str());
         }
     }
 
