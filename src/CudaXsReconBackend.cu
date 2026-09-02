@@ -1015,6 +1015,31 @@ __global__ void kNodalJnet(ndl::NodalViewT<VT> base, const int* __restrict__ slo
     if (ls < v.nsurf) ndl::nodalCalculateJnet(v, ls, ndl::StaticForms{});
 }
 
+/// WP20.1: THE NARROW DRIVE'S ANSWER, JUDGED WHERE IT IS WRITTEN.
+///
+/// `jnet` is the whole of what a nodal drive hands forward, and on the arm this
+/// valve exists for it NEVER COMES BACK: inside a device outer segment the
+/// materialize mask is 0, both downloads are elided, and the drive's only
+/// consumer is a kernel on the segment's stream (CMFD::upddhat).  A verdict
+/// taken on `host.jnet` therefore could not be taken at all on the measured
+/// configuration -- so it is taken here, on the device, beside the data, by a
+/// node the same capture holds as the drive that produced it.
+///
+/// STICKY, AND SILENT WHEN THERE IS NOTHING TO SAY.  The word is zeroed once at
+/// allocation and never cleared, because ONE non-finite jnet is terminal for
+/// the device nodal arm (Impl::nodal_device_refused): there is nothing to reset
+/// between drives, no question about which drive raised it, and -- the property
+/// that matters -- a host which reads the word LATE still reads it correctly.
+/// A finite drive performs no store whatsoever, so the plain (non-atomic) write
+/// below is reached only on the path that is about to end the arm, and racing
+/// writers all write the same 1.
+__global__ void kNodalJnetFinite(const double* __restrict__ jnet, int n,
+                                 unsigned int* __restrict__ nonfinite) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (!isfinite(jnet[i])) *nonfinite = 1u;
+}
+
 // The 9 ACTIVE_XT slots of XSSet.cpp, as Chiffon::XSTYPE values.  The enum
 // order is pinned by the static_assert-style constants in XsReconKernel.h
 // (T_XSTF..T_XS3N); XSDF and XSRF are derived and skipped.
@@ -2661,6 +2686,78 @@ struct XsReconBackend::Impl {
     /// is the reference this arm is scored against: slower, correct, and loud.
     bool               nodal_device_refused = false;
 
+    /// WP20.1: the valve's word, written by kNodalJnetFinite and read here.
+    ///
+    /// MAPPED, NOT COPIED.  It is one page-locked word with a device alias, so
+    /// the drive needs no D2H for it and the transfer ledger does not gain a
+    /// four-byte entry per drive.  That is also what makes the valve
+    /// INDEPENDENT OF THE ELISION: whether jnet is materialised decides nothing
+    /// about whether the verdict reaches the host.
+    ///
+    /// ALLOCATED ONCE, BEFORE THE FIRST NARROW DRIVE, because `nodal_nfin_dev`
+    /// is a kernel argument the graph capture bakes in.  A narrow drive that
+    /// cannot arm it refuses itself to the CPU body rather than running
+    /// unvalved -- an unvalved narrow arm is exactly the defect this replaces.
+    unsigned int*      nodal_nfin_host = nullptr; ///< pinned+mapped, 1 word
+    unsigned int*      nodal_nfin_dev  = nullptr; ///< its device alias
+    /// A DEFERRED drive's verdict has been produced but not yet looked at.
+    bool               nodal_nfin_pending = false;
+
+    /// True when the device has flagged a non-finite jnet AND the host is
+    /// entitled to believe the word it is reading.
+    ///
+    /// `settled` is the caller's proof that the drive which wrote the word has
+    /// finished on this side of the stream -- the final drain returned.  When
+    /// it has not, the drive's completion event is QUERIED and never waited on:
+    /// the whole point of the deferred drain is that the host does not block.
+    /// A word that is not readable yet is simply read at the next drive or at
+    /// the segment exit, both of which ask, and the word is sticky, so a late
+    /// read is still a read.
+    [[nodiscard]] bool narrowNonFinite(bool settled) {
+        if (nodal_nfin_host == nullptr) return false;
+        if (!settled) {
+            if (nodal_done_event == nullptr) return false;
+            const cudaError_t q = cudaEventQuery(nodal_done_event);
+            cudaGetLastError(); // cudaErrorNotReady is a question, not a fault
+            if (q != cudaSuccess) return false;
+        }
+        nodal_nfin_pending = false;
+        return *nodal_nfin_host != 0u;
+    }
+
+    /// The one place a raised verdict becomes a refusal of the device arm.
+    ///
+    /// Reached only after the drive that raised the word has completed (a
+    /// returned drain, or an event that queried/synchronised complete), which
+    /// is what makes dropNodalGraph safe here: destroying an exec under an
+    /// in-flight replay is the failure setNodalHaltGate's comment describes.
+    void latchNarrowNodalOff() {
+        rasbery::fp32::latchOff(rasbery::fp32::Backend::Nodal, "nonfinite jnet");
+        dropNodalGraph();
+        nodal_device_refused = true;
+        nodal_nfin_pending   = false;
+        status = "WP20.1: narrow nodal drive produced a non-finite jnet";
+    }
+
+    /// Collect a deferred drive's verdict where blocking costs nothing.
+    ///
+    /// THE LATENCY BOUND.  Without this the valve fires "at some later drive";
+    /// with it, a non-finite produced by any drive of a host-free segment is
+    /// answered by the END OF THAT SEGMENT -- including the last segment of a
+    /// run, which has no later drive.  The wait is on an event the segment
+    /// itself has already waited on, so it returns immediately, and it runs
+    /// once per segment rather than once per drive.
+    void resolveNarrowVerdict() {
+        if (!nodal_nfin_pending || nodal_nfin_host == nullptr) return;
+        if (nodal_done_event != nullptr) {
+            xfer::eventSync("CudaXsReconBackend.cu:resolveNarrowVerdict",
+                            "nonfinite verdict", nodal_done_event);
+            cudaGetLastError();
+        }
+        if (narrowNonFinite(true)) latchNarrowNodalOff();
+        nodal_nfin_pending = false;
+    }
+
     // --- FULL-mode CUDA graph (RASBERY_GPU_NODAL_FULL) --------------------
     // The FULL drive is the same sequence of fixed-address operations every
     // time, so it is captured once and replayed.  `nodal_h_reigv` is the
@@ -2971,6 +3068,9 @@ struct XsReconBackend::Impl {
         // them here would free one entry twice and leak the rest.
         dropNodalGraph();
         if (nodal_h_reigv) cudaFreeHost(nodal_h_reigv);
+        // WP20.1: the valve's mapped word.  Freed beside the other lazily
+        // created nodal host resources, and the device alias dies with it.
+        if (nodal_nfin_host) cudaFreeHost(nodal_nfin_host);
         // W3 item 2: one event per backend, created lazily on the first
         // deferred drain.  Destroyed beside the other lazily-created nodal
         // resources for the same reason they are: this destructor is the only
@@ -5480,6 +5580,15 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     // WP20.1: a fired non-finite valve is sticky for the process.  See
     // Impl::nodal_device_refused.
     if (d.nodal_device_refused) return false;
+    // WP20.1: AND A DEFERRED DRIVE'S VERDICT IS COLLECTED BEFORE ANOTHER ONE
+    // IS ENQUEUED.  The previous drive handed the segment an event instead of
+    // draining, so its word could not be read at the end of that drive; by now
+    // it almost always can.  Reading it HERE is what stops an arm that has
+    // begun producing non-finite jnet from producing the next one.
+    if (d.nodal_nfin_pending && d.narrowNonFinite(false)) {
+        d.latchNarrowNodalOff();
+        return false;
+    }
 
     // WP20.1.  THE NODAL ARM EXISTS NOW, AND THIS IS WHERE A DRIVE THAT DID
     // NOT TAKE IT SAYS SO.
@@ -6112,6 +6221,49 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
             d.nodal_use_graph = false; // no stable staging slot -> no capture
         }
     }
+    // WP20.1: THE VALVE'S WORD, ARMED BEFORE ANY NARROW DRIVE CAN BE CAPTURED.
+    //
+    // ONE PAGE-LOCKED WORD WITH A DEVICE ALIAS.  The valve kernel writes the
+    // alias, the host reads the word, and nothing copies anything -- which is
+    // precisely why the verdict survives the download elision that made the
+    // old host-side check unreachable on the segment arm.
+    //
+    // HERE, AND ONLY ONCE, because `nodal_nfin_dev` is a kernel argument and a
+    // captured graph bakes those: an address that appeared after a capture
+    // would leave the replayed drive writing the previous one.
+    if (nnarrow && d.nodal_nfin_dev == nullptr) {
+        rasbery::AllocWindow _alloc_window("nodal.nonfinite.hostalloc");
+        d.nodal_nfin_host = nullptr;
+        d.nodal_nfin_dev  = nullptr;
+        if (cudaHostAlloc(reinterpret_cast<void**>(&d.nodal_nfin_host),
+                          sizeof(unsigned int), cudaHostAllocMapped) != cudaSuccess) {
+            cudaGetLastError();
+            d.nodal_nfin_host = nullptr;
+        } else if (cudaHostGetDevicePointer(reinterpret_cast<void**>(&d.nodal_nfin_dev),
+                                            d.nodal_nfin_host, 0) != cudaSuccess) {
+            cudaGetLastError();
+            cudaFreeHost(d.nodal_nfin_host);
+            d.nodal_nfin_host = nullptr;
+            d.nodal_nfin_dev  = nullptr;
+        } else {
+            *d.nodal_nfin_host = 0u;
+        }
+    }
+    if (nnarrow && d.nodal_nfin_dev == nullptr) {
+        // NO VALVE, NO NARROW DRIVE.  Declining hands the outer to
+        // `Nodal::TryDriveGpu`'s CPU body -- slower, correct and loud -- which
+        // is the same recovery the fired valve takes.  Running the narrow arm
+        // unvalved is the one option that is not on the table: it is exactly
+        // the state in which a non-finite jnet reaches CMFD and CMFD is blamed.
+        //
+        // DRAINED FIRST, for `fail_drained`'s reason one page down: the CPU body
+        // is about to write the very host arrays this stream's geometry and
+        // constants copies are still reading.
+        xfer::streamSync("CudaXsReconBackend.cu:solveNodal", "valve arm drain", d.stream);
+        cudaGetLastError();
+        d.status = "WP20.1: the narrow nodal non-finite valve could not be armed";
+        return false;
+    }
     // Rev.7.1 W3 item 3: WHO PUT THE RECIPROCAL IN THAT SLOT.
     //
     // Normally the host: it holds `eigv`, it divides, and the copy below carries
@@ -6235,6 +6387,19 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
             kNodalEven<false><<<gn, B, 0, d.stream>>>(v, nullptr, 0, nullptr);
         }
         kNodalJnet<false><<<gs, B, 0, d.stream>>>(v, nullptr, 0, nullptr);
+        // WP20.1: THE VALVE, AS A NODE OF THE DRIVE.
+        //
+        // It reads the jnet the line above just wrote, so it is captured with
+        // it and runs on EVERY narrow drive -- including the device outer
+        // segment's, where nothing is materialised and the old host-side check
+        // could not run at all.  `precision` is already a NodalGraphKey field,
+        // so this node can never appear in a graph the FP64 arm selects.
+        if (nnarrow) {
+            const int fb = 256;
+            const int nj = static_cast<int>(ns * ndl::NG);
+            kNodalJnetFinite<<<(nj + fb - 1) / fb, fb, 0, d.stream>>>(
+                v.jnet, nj, d.nodal_nfin_dev);
+        }
         // The drive just wrote jnet and phis on the device, so Nodal owns them.
         // The download back to the Geometry arrays happens only when a host
         // consumer has ASKED (materialize); otherwise the CMFD backend reads
@@ -6526,31 +6691,39 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     // ==================================================================
     //
     // WHERE IT LOOKS, AND WHY THERE.  `jnet` is the drive's answer and the
-    // only thing downstream reads on the very next line (CMFD::upddhat).  It
-    // is checked ONLY on a drive that actually materialised it -- i.e. when a
-    // host consumer was about to read it anyway -- so this adds no transfer
-    // and no synchronisation of its own, and it runs a few times per segment
-    // rather than once per outer.  A segment that never materialises never
-    // hands a non-finite to anybody either; the first materialisation after
-    // one catches it.
+    // only thing downstream reads: CMFD::upddhat, on the very next line of the
+    // host outer body, or on the SEGMENT's stream when the drive deferred its
+    // drain.  The verdict is taken ON THE DEVICE, by kNodalJnetFinite inside
+    // the drive, and NOT on `host.jnet` -- because on the arm this valve exists
+    // for, host.jnet is never written.  setCanonicalNodalSegmentMode(true)
+    // sets the materialize mask to 0, both downloads are elided, and a valve
+    // gated on the download having run could not fire on the one configuration
+    // the arm is measured on.  It ran a few times per segment; it now runs on
+    // every drive, and it still costs no transfer of its own.
+    //
+    // WHEN THE WORD IS READ.  Immediately whenever this drive drained -- which
+    // is every out-of-segment drive.  When the drive DEFERRED, the host may not
+    // block (that is what the event handover buys), so the word is read only if
+    // the drive's event has already completed, and otherwise at the next drive
+    // or at the segment exit; both ask, and the word is sticky, so a late read
+    // is still a read.  What is NOT claimed is prevention: on a host-free
+    // segment the non-finite that fires this valve has already been handed to
+    // upddhat, and no valve without a per-drive host rendezvous could have
+    // stopped it.  What the valve guarantees is that the arm which produced it
+    // is refused, by name, before it produces another.
     //
     // ENV-INDEPENDENT, LOUD, COUNTED, ONCE: the same three properties the CMFD
     // latch has (src/GpuFp32Arm.h).  What differs is the recovery -- see
     // Impl::nodal_device_refused for why a narrow nodal drive cannot demote in
     // place the way a narrow CMFD inner solve can.
-    if (nnarrow && !d.nodal_drain_deferred &&
-        !gpu::canonicalElidesDownload(canon, gpu::CanonicalRegion::Jnet,
-                                      d.canonical_materialize)) {
-        const std::size_t njnet = ns * ndl::NG;
-        bool              bad   = false;
-        for (std::size_t i = 0; i < njnet; ++i) {
-            if (!std::isfinite(host.jnet[i])) { bad = true; break; }
-        }
-        if (bad) {
-            rasbery::fp32::latchOff(rasbery::fp32::Backend::Nodal, "nonfinite jnet");
-            d.dropNodalGraph();
-            d.nodal_device_refused = true;
-            d.status = "WP20.1: narrow nodal drive produced a non-finite jnet";
+    if (nnarrow) {
+        // SET BEFORE THE READ, CLEARED BY IT.  narrowNonFinite() clears the
+        // flag exactly when it actually looked, so a deferred drive whose event
+        // happened to be complete leaves nothing outstanding and one whose
+        // event was not leaves the question for the next asker.
+        d.nodal_nfin_pending = true;
+        if (d.narrowNonFinite(!d.nodal_drain_deferred)) {
+            d.latchNarrowNodalOff();
             return false;
         }
     }
@@ -6745,6 +6918,16 @@ std::uint32_t XsReconBackend::materializeMask() const {
 
 void XsReconBackend::setCanonicalNodalSegmentMode(bool in_segment, bool device_owns_flux) {
     Impl& d = *_impl;
+    // WP20.1: THE SEGMENT IS OVER, SO THE DEFERRED VERDICTS ARE READABLE.
+    //
+    // This is the valve's latency bound.  Every drive inside a host-free
+    // segment defers its drain, so none of them could read their own word; this
+    // is the first host point after the segment where blocking is free, and it
+    // is also the LAST point in a run whose final segment produced a
+    // non-finite -- without it that run would end with the arm never refused
+    // and CMFD holding the blame.  Once per segment, on an event the segment
+    // has already waited on.
+    if (!in_segment) d.resolveNarrowVerdict();
     // A legacy instance borrows nothing, so there is no ownership to declare and
     // no download to suppress; answering here rather than at the call site is
     // what lets the segment call this unconditionally.

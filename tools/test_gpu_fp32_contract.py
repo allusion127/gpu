@@ -1597,29 +1597,115 @@ check("kNodalNarrowXs<<<" in BACKEND
 
 
 # ---------------------------------------------------------------------------
-# 15. WP20.1 -- THE NON-FINITE VALVE REACHES NODAL, AND ITS RECOVERY IS THE
-#     ONE THE ALLOCATION ALLOWS.
+# 15. WP20.1 -- THE NON-FINITE VALVE REACHES NODAL, ON THE ARM THE ARM IS
+#     MEASURED ON, AND ITS RECOVERY IS THE ONE THE ALLOCATION ALLOWS.
+#
+# The valve used to read `host.jnet` under a gate that asked whether the D2H
+# had been elided.  On the production segment arm
+# (RASBERY_GPU_OUTER_SEGMENT_V2, part of V6_ENV) it is ALWAYS elided --
+# setCanonicalNodalSegmentMode(true) sets the materialize mask to 0 -- so the
+# valve could not fire at all, while `upddhat` consumed the drive's answer
+# anyway and CMFD's own NONFINITE_DETECTED took the blame for it.  The rules
+# below are that defect, each one stated so it fails on the old shape.
 # ---------------------------------------------------------------------------
+
+
+def rule_valve_is_on_device(backend: str) -> bool:
+    """The verdict is produced by a kernel over the DEVICE jnet, launched from
+    inside the drive body, after the kernel that wrote it.  A valve that reads a
+    host array cannot run on an arm that never fills one."""
+    code = strip_comments(backend)
+    if "__global__ void kNodalJnetFinite(" not in code:
+        return False
+    kern = body_after(code, "__global__ void kNodalJnetFinite(")
+    if "isfinite(jnet[i])" not in kern or "*nonfinite = 1u;" not in kern:
+        return False
+    drive = body_after(code, "auto enqueue_full = [&](auto& v) -> bool {")
+    launch = drive.find("kNodalJnetFinite<<<")
+    writer = drive.find("kNodalJnet<false><<<")
+    return launch > 0 and 0 < writer < launch
+
+
+def rule_valve_survives_the_elision(backend: str) -> bool:
+    """Nothing between the arm test and the read may ask whether a download
+    happened.  This is the rule the shipped defect broke."""
+    code = strip_comments(backend)
+    at = code.find("d.narrowNonFinite(!d.nodal_drain_deferred)")
+    if at < 0:
+        return False
+    open_at = code.rfind("if (nnarrow", 0, at)
+    if open_at < 0:
+        return False
+    window = code[open_at:at]
+    return ("canonicalElidesDownload" not in window
+            and "canonical_materialize" not in window)
+
+
+def rule_valve_word_is_mapped(backend: str) -> bool:
+    """One page-locked word with a device alias: no D2H to keep in step with
+    the graph key, and -- the point -- nothing about the verdict's route to the
+    host that the download elision can switch off.  It is written once, at
+    allocation, and never reset: the word is STICKY, which is what lets a host
+    that must read it LATE read it correctly."""
+    code = strip_comments(backend)
+    return ("cudaHostAllocMapped" in code
+            and "cudaHostGetDevicePointer(reinterpret_cast<void**>(&d.nodal_nfin_dev)"
+                in code
+            and code.count("*d.nodal_nfin_host = 0u;") == 1)
+
+
+def rule_deferred_read_never_blocks(backend: str) -> bool:
+    """A deferred drive handed the segment an event precisely so the host would
+    not wait; the valve may QUERY that event but never wait on it."""
+    code = strip_comments(backend)
+    fn = body_after(code, "[[nodiscard]] bool narrowNonFinite(bool settled)")
+    return "cudaEventQuery(nodal_done_event)" in fn and "cudaEventSynchronize" not in fn
+
+
+check(rule_valve_is_on_device(BACKEND),
+      "the narrow drive's answer is judged ON THE DEVICE, by a node of the "
+      "drive that produced it -- jnet is the one array a consumer reads next, "
+      "and on the segment arm it is never copied to the host at all")
+check(rule_valve_survives_the_elision(BACKEND),
+      "and the valve is INDEPENDENT OF THE DOWNLOAD ELISION: a gate on "
+      "canonicalElidesDownload(Jnet) is exactly the defect where a NaN jnet "
+      "reached upddhat, CMFD latched, and the receipt blamed CMFD for a "
+      "failure the nodal arm caused")
+check(rule_valve_word_is_mapped(BACKEND),
+      "the verdict travels in a mapped page-locked word, written only when "
+      "there is something to say and never reset")
+check(rule_deferred_read_never_blocks(BACKEND),
+      "reading it costs the deferred drain nothing: the drive's event is "
+      "queried, never waited on")
+check("d.nodal_nfin_pending = true;" in BACKEND_CODE
+      and "if (d.nodal_nfin_pending && d.narrowNonFinite(false)) {" in BACKEND_CODE,
+      "a drive that could not read its own word leaves the question standing, "
+      "and the NEXT drive asks it before enqueueing anything")
+check("if (!in_segment) d.resolveNarrowVerdict();"
+      in body_after(BACKEND_CODE, "void XsReconBackend::setCanonicalNodalSegmentMode("),
+      "and the segment exit is the latency bound: every drive of a host-free "
+      "segment defers, so without this a run whose LAST segment went "
+      "non-finite would end with the arm never refused")
+check('d.status = "WP20.1: the narrow nodal non-finite valve could not be armed";'
+      in BACKEND_CODE,
+      "a narrow drive that cannot arm the valve refuses itself to the CPU body "
+      "-- running the narrow arm unvalved is the state this section exists to "
+      "make unreachable")
 check('rasbery::fp32::latchOff(rasbery::fp32::Backend::Nodal, "nonfinite jnet");'
       in BACKEND,
       "the narrow nodal drive latches on a non-finite jnet -- the one array a "
       "consumer reads on the very next line")
-check("d.nodal_device_refused = true;" in BACKEND
+check("nodal_device_refused = true;" in body_after(BACKEND, "void latchNarrowNodalOff()")
       and "if (d.nodal_device_refused) return false;" in BACKEND,
       "and the recovery is a REFUSAL of the device arm, sticky for the "
       "process: nodal's precision is an allocation, so there is no wide device "
       "arm to demote to without re-laying-out mid-run")
-check("d.dropNodalGraph();" in body_after(BACKEND, "if (bad) {"),
+check("dropNodalGraph();" in body_after(BACKEND, "void latchNarrowNodalOff()"),
       "the latch drops the graphs captured under the old precision")
-check("std::isfinite(host.jnet[i])" in BACKEND,
-      "the check is on the materialised host array, so it costs no transfer "
-      "and no synchronisation of its own")
-VALVE_AT = BACKEND.find("if (nnarrow && !d.nodal_drain_deferred &&")
-check(VALVE_AT > 0
-      and "gpu::canonicalElidesDownload(canon, gpu::CanonicalRegion::Jnet,"
-          in BACKEND[VALVE_AT:VALVE_AT + 400],
-      "and it runs only on a drive that actually materialised jnet, i.e. a few "
-      "times per segment rather than once per outer")
+check(BACKEND_CODE.count("latchNarrowNodalOff()") == 4,
+      "and there is ONE latch body with exactly three callers -- the drive, "
+      "the next drive's poll, and the segment exit -- so a caller cannot "
+      "half-refuse the arm")
 
 
 # ---------------------------------------------------------------------------
@@ -1806,6 +1892,25 @@ NEGATIVES: list[tuple[str, object]] = [
     ("the xsrecon reader goes back to the wide pointer",
      lambda: rule_no_bare_block_read(
          XSRK + "\n  double z = v.mic[xt][(iso * NG + ig) * nxyz + l];\n")),
+    # The shipped defect, restored four ways.
+    ("the valve is gated on the jnet D2H again",
+     lambda: rule_valve_survives_the_elision(
+         BACKEND.replace(
+             "if (nnarrow) {\n        // SET BEFORE THE READ",
+             "if (nnarrow && !gpu::canonicalElidesDownload(\n"
+             "                       canon, gpu::CanonicalRegion::Jnet,\n"
+             "                       d.canonical_materialize)) {\n"
+             "        // SET BEFORE THE READ"))),
+    ("the verdict goes back to a scan of the host array",
+     lambda: rule_valve_is_on_device(
+         BACKEND.replace("kNodalJnetFinite<<<", "kNodalJnetSkipped<<<"))),
+    ("the device word stops being mapped and needs a D2H again",
+     lambda: rule_valve_word_is_mapped(
+         BACKEND.replace("cudaHostAllocMapped", "cudaHostAllocDefault"))),
+    ("the deferred read starts blocking the drain it exists to preserve",
+     lambda: rule_deferred_read_never_blocks(
+         BACKEND.replace("const cudaError_t q = cudaEventQuery(nodal_done_event);",
+                         "const cudaError_t q = cudaEventSynchronize(nodal_done_event);"))),
     ("the PPR extension goes back to being declared everywhere and read nowhere",
      lambda: rule_flag_is_read(
          ARM_CODE.replace('envFlagOn("RASBERY_GPU_FP32_PPR")', "false"),
