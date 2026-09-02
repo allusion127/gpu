@@ -203,8 +203,64 @@ check("case Backend::Cram:   return true;" in CONVERTED,
 check("case Backend::Ppr:    return true;" in CONVERTED,
       "WP20.2 converted PPR, and converted it AS A VRAM ITEM -- which is what "
       "the WP20 deferral sentence already said it would be")
-check("case Backend::Xe:     return false;" in CONVERTED,
-      "xe is declared DEFERRED in the table rather than left to look converted")
+# ---------------------------------------------------------------------------
+# WP20.2 -- THE XE TRIPWIRE.
+#
+# Xe is the last `deferred` backend and its blocker is a MEASUREMENT CONTRACT
+# rather than a numeric one.  Bits 0..4 of the shipped form mask are mined ON
+# THE HOST, IN FP64, by comparing xe::xeDotChunk / xeCandidateOrdinal against
+# src/XeAndersonReference.cpp BIT FOR BIT.  If somebody converts Xe and leaves
+# the miner alone, `mineStable` goes on setting `sound = true` for a body the
+# device no longer runs -- a silent false negative of exactly the class
+# src/XeFormAudit.cpp exists to catch, and one that no amount of Gate A/Gate B
+# would surface, because both compare ANSWERS and this is a claim about CODE.
+#
+# So the rule is written CONDITIONALLY on the table, not on today's answer.  As
+# long as Xe is deferred it holds the deferral to stating its own reason; the
+# moment the table says otherwise it demands that the miner have been told, in
+# one of the two ways that are honest:
+#
+#   (a) mine and score the FP32 forms SEPARATELY, so `sound` is a verdict on
+#       the instantiation the device runs; or
+#   (b) report `sound = false` with the reason `fp32_arm` for that arm and skip
+#       the mask-dependence, which is what `algebra_sound` already does for the
+#       WP7-C channel: its own verdict, its own line, no effect on the value.
+#
+# What is NOT acceptable is the third option, and the rule exists to make it
+# fail loudly: leave the FP64 verdict in place and let it be read as covering
+# the device.  XE_HOST_FORMS -- the host Anderson algebra -- stays FP64 either
+# way, so its verdict is untouched by any of this.
+MINER = read("src", "XeFormMiner.cpp")
+MINE  = read("src", "XeFormMine.h")
+XE_CONVERTED = "case Backend::Xe:     return true;" in CONVERTED
+if XE_CONVERTED:
+    armed_separately = ("scoreShippedMaskF32" in MINE or "scoreShippedMask32" in MINE
+                        or "fp32" in strip_comments(MINE).lower())
+    armed_declared = ('"fp32_arm"' in MINER
+                      and "rasbery::fp32::routes(rasbery::fp32::Backend::Xe)" in MINER)
+    check(armed_separately or armed_declared,
+          "Xe is CONVERTED and the miner was not told.  Bits 0..4 are mined "
+          "against the FP64 bodies bit-for-bit, so `sound = true` would now "
+          "describe arithmetic the device does not perform.  Either mine the "
+          "FP32 forms separately, or report sound=false with the reason "
+          '"fp32_arm" for that arm and skip the mask-dependence -- the way '
+          "algebra_sound already carries its own verdict without touching the "
+          "shipped value.  Do not leave the FP64 verdict to be read as "
+          "covering the device.")
+    check("XE_HOST_FORMS" in MINER or "xeHostFormMask" in MINER,
+          "and XE_HOST_FORMS -- the host Anderson algebra -- stays FP64 and "
+          "keeps its own verdict whatever the device arm does")
+else:
+    check("case Backend::Xe:     return false;" in CONVERTED,
+          "xe is declared DEFERRED in the table rather than left to look "
+          "converted")
+    check("XeTripleConst" in ARM and "sound = true" in ARM,
+          "and the deferral states its own reason IN THE TABLE: that the "
+          "blocker is the miner's bit-for-bit contract against the FP64 "
+          "bodies, not a numeric objection.  A deferral without its reason is "
+          "the one a later package deletes as an oversight")
+    check("bits 0..4 of the shipped form mask" in ARM.lower(),
+          "and names the bits it is about")
 
 # WP20.2 -- PPR: THE TWO ARRAYS MASTER MODE OWNS, AND NOT ONE MORE.
 #
