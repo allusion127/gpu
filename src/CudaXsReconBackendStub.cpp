@@ -25,9 +25,15 @@ bool XsReconBackend::solve(const xsrecon::BatchView&, unsigned long long,
 
 bool XsReconBackend::solveFlatXs(const flatxs::FlatXsView&, const FlatXsLibShape&,
                                  unsigned long long, unsigned long long,
-                                 unsigned long long, unsigned long long, bool) {
+                                 unsigned long long, unsigned long long, bool,
+                                 const flatxs_stream::StreamRequest*) {
     return false;
 }
+
+// WP23 stub parity.  No device, so the stream phase never ran and there is no
+// refusal to attribute -- 0 is flatxs_stream::kRefusalNone, which is the honest
+// answer here and not a placeholder.
+int XsReconBackend::flatXsStreamRefusal() const { return 0; }
 
 // Rev.7.1 Task 13 stub parity: the split Xe arm fails open, which is exactly
 // what a no-CUDA build should do -- every one of these returning false means
@@ -113,7 +119,8 @@ unsigned long long XsReconBackend::nodesSolved() { return 0; }
 unsigned long long XsReconBackend::flatXsNodesSolved() { return 0; }
 
 bool XsReconBackend::solveNodal(const nodal::NodalView&, unsigned long long,
-                                unsigned long long, unsigned long long) {
+                                unsigned long long, unsigned long long,
+                                const double*) {
     return false;
 }
 
@@ -162,6 +169,14 @@ bool rasberyGpuSearchEnabled() { return false; }
 bool rasberyGpuMicxResidentEnabled() { return false; }
 
 bool rasberyGpuFlatXsCtaEnabled() { return false; }
+
+// WP23.  Both arms are device arms; a CUDA-less build has neither, and the
+// stride/forms accessors answer with the values that mean "nothing selected"
+// rather than with a number a log could mistake for a launched configuration.
+bool     rasberyGpuFlatXsStreamEnabled() { return false; }
+int      rasberyGpuFlatXsStreamStride() { return 0; }
+unsigned rasberyGpuFlatXsStreamForms() { return 0u; }
+bool     rasberyGpuNodalConstsEnabled() { return false; }
 
 // The ladder's default, not 0: a caller that logs the value must not be told
 // the arm would launch an empty block.  With the CUDA-less build there is no

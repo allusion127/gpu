@@ -857,6 +857,13 @@ void Nodal::drive() {
         RASBERY_GPU_FULL_GUARD_IF(rasberyGpuNodalEnabled(), Nodal, "Nodal::drive",
                                   "the device nodal arm declined; driveBody() runs "
                                   "the CPU nodal body");
+        // WP23 item 3.  ITS OWN SEAM, at the same point: the constants arm
+        // declines BY declining the drive, so without a subsystem of its own it
+        // reads as "the nodal arm fell back" while the nine uploads return.
+        RASBERY_GPU_FULL_GUARD_IF(rasberyGpuNodalConstsEnabled(), NodalConsts,
+                                  "Nodal::drive",
+                                  "the device nodal-constants arm declined; the nine "
+                                  "coefficient arrays are host-computed and uploaded");
         driveBody();
     }
 
@@ -956,8 +963,12 @@ bool Nodal::TryDriveGpu() {
     updateConstantsIfMoved();
 
     nodal::NodalView v = MakeView();
+    // WP23 item 3: xsdf travels beside the view, never inside it.  The host
+    // sweep above STILL RAN -- this arm removes the nine uploads, not the host
+    // arithmetic -- which is what keeps the CPU fallback correct and what makes
+    // the receipt's ULP self-check possible at all.
     if (!backend->solveNodal(v, _const_generation, xs.refGeneration(),
-                             xs.hoststateGeneration()))
+                             xs.hoststateGeneration(), xs.xsdfData()))
         return false;
 
     // Same predicate the backend uses (rasberyGpuNodalFullEnabled), so the two

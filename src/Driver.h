@@ -11,6 +11,8 @@
 #include "OuterTrace.h"
 #include "PPR.h"
 #include "Scheduler.h"
+#include "FlatXsStreamReceipt.h" // WP23: [RASBERY][FLATXS][STREAM]
+#include "NodalConstsReceipt.h"  // WP23: [RASBERY][NODAL_CONSTS]
 #include "SearchGpuReceipt.h"
 #include "ThGpuReceipt.h"
 #include "WarmState.h"
@@ -662,6 +664,23 @@ inline constexpr const char* kArmEnv[] = {
     "RASBERY_GPU_FLATXS",
     "RASBERY_GPU_FLATXS_CTA",
     "RASBERY_GPU_FLATXS_CTA_THREADS",
+    // WP23.  The device branch-stream resolver, its slot width and its
+    // contraction mask.  The stream IS every unrodded node's branch and history
+    // coordinate, so this is as trajectory-moving as a knob in this binary gets
+    // -- and the mask is UNMINED (src/FlatXsStreamReceipt.h), which makes the
+    // arm N1 even on a library with no libm-shaped coordinate form.  The stride
+    // is here for the case-key's sake rather than the trajectory's: it can only
+    // make the arm refuse, but a refused run and a served run are two different
+    // measurements and must not share a cache entry.
+    "RASBERY_GPU_FLATXS_STREAM",
+    "RASBERY_FLATXS_STREAM_STRIDE",
+    "RASBERY_FLATXS_STREAM_FORMS",
+    // WP23 item 3.  The nine SENM coefficient arrays computed on the device.
+    // CLASS N1 BY MEASUREMENT: CUDA's exp differs from glibc's by 1 ulp on
+    // 3.34 % of the arguments this body evaluates (src/NodalConstantKernel.h),
+    // so the nodal coefficients are not the host's bit for bit and the outer
+    // trajectory can diverge.  Gate A/B, never the bit-golden gate.
+    "RASBERY_GPU_NODAL_CONSTS",
     "RASBERY_GPU_CRAM",
     // WP22.  The T/H device arm and the contraction mask it runs under.  See
     // the paragraph above the list for why both are here rather than in a
@@ -5957,6 +5976,56 @@ public:
                       << cross_sections.th().deviceOrdinal() << ",";
             rasbery::th::appendThGpuReceiptFields(std::cout);
             std::cout << ",\"status\":\"" << cross_sections.th().status() << "\"}\n";
+        }
+
+        // WP23 receipt -- the device branch-stream resolver
+        // (RASBERY_GPU_FLATXS_STREAM).
+        //
+        // THE G0 FIELD IS `device_calls`, for the same reason `device_updates`
+        // is the T/H arm's: the flag set on a deck the arm refuses falls back to
+        // XSSet::BuildFlatXsStream silently and CORRECTLY, and then the "device"
+        // run and the "host" run are the same run and the 1.0 s was never moved.
+        // `calls == device_calls + host_calls` is an accounting identity a
+        // reader checks the receipt against itself with.
+        //
+        // `forms_hit` IS THE GRADE, and it is the field that makes this receipt
+        // different from the others.  Seven of the twenty coordinate forms
+        // evaluate log or cbrt, whose CUDA and glibc results differ by ~1 ulp;
+        // `libm_form_hit` says whether this deck touched one.  It being 0 does
+        // NOT make the run B0 -- the three burnup-lerp contraction sites have no
+        // miner in this work package -- and `policy_note` says exactly that, so
+        // the two obligations cannot be collapsed into one grade.
+        //
+        // `bytes_elided` AGAINST `bytes_h2d` IS THE THIRD.  The stream itself
+        // stops crossing in both directions; what replaces it is the per-node
+        // input columns (tful is new, the bracket tables are new) under WP13's
+        // byte-exact shadows, plus one n_nodes-int read-back that carries the
+        // refusal ladder.  Both are printed so the net is read off the run.
+        if (rasbery::flatxs_stream::streamReceiptWanted()) {
+            std::cout << "  [RASBERY][FLATXS][STREAM] {\"schema_version\":1,\"slot\":"
+                      << cmfd_solver.batchSlot() << ",";
+            rasbery::flatxs_stream::appendStreamReceiptFields(std::cout);
+            std::cout << "}\n";
+        }
+
+        // WP23 item 3 receipt -- the device nodal constants
+        // (RASBERY_GPU_NODAL_CONSTS).
+        //
+        // `max_ulp` IS THE POINT OF THIS ONE.  The arm is N1 by a MEASUREMENT
+        // taken elsewhere (test/nodal_constant_exp_probe.cu: CUDA exp differs
+        // from glibc by exactly 1 ulp on 3.34 % of the arguments this body
+        // evaluates), and the honest question a run can answer for itself is
+        // whether it behaved like that measurement.  `max_ulp <= 1` with
+        // `over_1ulp == 0` is the spike reproduced on the deck; anything larger
+        // is a DIFFERENT phenomenon -- a contraction --fmad=false did not stop, a
+        // stale xsdf, a layout disagreement -- and it is far better read here
+        // than discovered as a Gate B pin-power miss.  `-1` means no sample was
+        // taken, which is not the same fact as `0`.
+        if (rasbery::nodalconsts::nodalConstsReceiptWanted()) {
+            std::cout << "  [RASBERY][NODAL_CONSTS] {\"schema_version\":1,\"slot\":"
+                      << cmfd_solver.batchSlot() << ",";
+            rasbery::nodalconsts::appendNodalConstsReceiptFields(std::cout);
+            std::cout << "}\n";
         }
 
         // WP22 commit 2 receipt -- the device boron apply (RASBERY_GPU_SEARCH).

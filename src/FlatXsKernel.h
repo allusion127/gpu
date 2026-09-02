@@ -510,13 +510,20 @@ RASBERY_XSR_HD inline void flatxsSolveNode(const FlatXsView& v, int i,
     }
 }
 
-/// Host-side helper for the NodeSpectralIndex workspace probe: the value of
-/// ONE micx scalar element after a prefix of the node's delta stream, using
-/// the same forms the full loop uses.  NodeSpectralIndex reads exactly two
-/// such elements (XSAF Pu-239/B-10 thermal), and the history resolution needs
-/// them before the kernel runs.
+/// Helper for the NodeSpectralIndex workspace probe: the value of ONE micx
+/// scalar element after a prefix of the node's delta stream, using the same
+/// forms the full loop uses.  NodeSpectralIndex reads exactly two such elements
+/// (XSAF Pu-239/B-10 thermal), and the history resolution needs them before the
+/// kernel runs.
+///
+/// WP23 made it RASBERY_XSR_HD.  It was host-only because its only caller was
+/// XSSet::BuildFlatXsStream; the device stream builder
+/// (src/FlatXsStreamKernel.h) is the same call at the same point of the same
+/// per-node sequence, and giving it a SECOND spelling of this prefix walk is
+/// precisely the drift the header's determinism contract forbids.  The body was
+/// not touched.
 template <class POL>
-inline double flatxsProbeMicElement(const FlatXsView& v, int l, int t, int e,
+RASBERY_XSR_HD inline double flatxsProbeMicElement(const FlatXsView& v, int l, int t, int e,
                                     const int* dids, const double* xs_,
                                     const double* scales, int count,
                                     const POL& pol) {

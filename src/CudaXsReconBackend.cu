@@ -4,6 +4,10 @@
 #include "CudaTransferMirror.h"
 #include "FlatXsCtaKernel.cuh"
 #include "FlatXsKernel.h"
+#include "FlatXsStreamKernel.h"  // WP23: the device branch-stream resolver
+#include "FlatXsStreamReceipt.h"
+#include "NodalConstantKernel.h" // WP23: the ONE spelling of the SENM coefficients
+#include "NodalConstsReceipt.h"
 #include "GpuCanonicalState.h"
 #include "SearchKernel.h"
 #include "GpuCaptureArbiter.h"
@@ -567,6 +571,27 @@ __global__ void kernelFlatXs(fxs::FlatXsView v) {
     fxs::flatxsSolveNode(v, i, fxs::StaticForms{});
 }
 
+namespace fss = rasbery::flatxs_stream;
+
+// WP23.  ONE THREAD PER TARGET NODE, and the mapping is not a choice: the host
+// resolver's per-node work is INDEPENDENT (src/FlatXsStreamKernel.h's opening
+// note), so a lane per node is the whole parallelism, and node `i` writes only
+// its own fixed slot of the three stream arrays.  No shared memory, no
+// reduction, no atomic -- nothing here can make two runs of the same inputs
+// differ, which is the determinism obligation an N1 arm still owes.
+//
+// It is a FIVE-LINE WRAPPER by contract: every formula lives in the shared body
+// and a second spelling of one here would be a second opinion.
+__global__ void kFlatXsStreamBuild(fxs::FlatXsView v, fss::StreamLibView lib,
+                                   fss::StreamNodeView nd, fss::StreamOutView out,
+                                   unsigned forms) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= v.n_nodes) return;
+    fss::StreamForms spol;
+    spol.mask = forms;
+    fss::flatxsStreamResolveNode(v, lib, nd, out, i, fxs::StaticForms{}, spol);
+}
+
 namespace ndl = rasbery::nodal;
 
 /// WP21-C2: THE ONE PERMUTATION KERNEL, AND IT KNOWS NOTHING ABOUT NODAL.
@@ -605,6 +630,69 @@ inline void nodalPermuteLaunch(T* dst, const T* src, int rows, int cols,
     const int b = 256;
     kNodalPermute<T><<<static_cast<int>((n + b - 1) / b), b, 0, stream>>>(
         dst, src, rows, cols, d_row, d_col, s_row, s_col);
+}
+
+// ---------------------------------------------------------------------------
+// WP23 item 3: the nine SENM constants, computed where they are read
+// ---------------------------------------------------------------------------
+//
+// WHY THIS IS NOT src/CudaNodalConstantKernel.h's LAUNCHER.  That launcher's
+// kernel addresses the BATCH ARENA's slot regions, and CudaOuterGraph.cu:1713
+// records in detail why it is inert and may not simply be turned on: its inputs
+// (SlotRegion::Xs / ConstantXs) are never written on the production path, and
+// its output packing has kNcDiagDI = 7 / kNcDiagD = 8 where this backend's
+// reader has diagD = 7 / diagDI = 8 -- binding one to the other swaps D and 1/D
+// on every node and direction, finitely and plausibly.  So this arm reuses the
+// one thing that must never be duplicated -- the ARITHMETIC,
+// nodal::nodalConstantCoefficients -- and writes into THIS backend's packing,
+// which the reader twenty lines below already agrees with.
+//
+// NO EARLY-OUT, and it is not a shortcut.  Nodal::updateConstant skips a node
+// whose xsrf/xsdf did not move; this kernel recomputes every node whenever the
+// generation advanced.  For a node that did not move, the inputs are identical
+// and the body is deterministic, so the value written is the value that was
+// already there.  What the host's cache buys is time, and the device does not
+// need it; what it would cost here is a second device-resident cache that
+// nothing else keeps coherent.
+//
+// The destination strides are DATA because WP21-C2 made them data: `c_node` /
+// `c_grp` are the same two the consts upload permutes into, so this kernel
+// writes the SoA arm's layout directly instead of writing AoS and permuting.
+template <class DstT>
+__global__ void kNodalConstsDevice(DstT* __restrict__ dst,
+                                   const double* __restrict__ xsrf,
+                                   const double* __restrict__ xsdf,
+                                   const double* __restrict__ hmesh, int nxyz, int ng,
+                                   long long ndg, int hm_node, int hm_dir,
+                                   long long c_node, long long c_grp,
+                                   unsigned long long forms) {
+    const int i = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= nxyz * ng) return;
+    const int lk = i / ng;
+    const int ig = i - lk * ng;
+
+    const double r = xsrf[static_cast<long long>(ig) * nxyz + lk];
+    const double d = xsdf[static_cast<long long>(ig) * nxyz + lk];
+
+    for (int idir = 0; idir < ndl::NDIR; ++idir) {
+        const double h =
+            hmesh[static_cast<long long>(lk) * hm_node + static_cast<long long>(idir) * hm_dir];
+        const ndl::NodalConstantCoefficients c =
+            ndl::nodalConstantCoefficients(r, d, h, forms);
+        const long long idx = static_cast<long long>(lk) * c_node +
+                              (static_cast<long long>(idir) * ng + ig) * c_grp;
+        // The order IS the upload's order: eta1, eta2, m260, m251, m253, m262,
+        // m264, diagD, diagDI.  See the swap warning above.
+        dst[0 * ndg + idx] = static_cast<DstT>(c.eta1);
+        dst[1 * ndg + idx] = static_cast<DstT>(c.eta2);
+        dst[2 * ndg + idx] = static_cast<DstT>(c.m260);
+        dst[3 * ndg + idx] = static_cast<DstT>(c.m251);
+        dst[4 * ndg + idx] = static_cast<DstT>(c.m253);
+        dst[5 * ndg + idx] = static_cast<DstT>(c.m262);
+        dst[6 * ndg + idx] = static_cast<DstT>(c.m264);
+        dst[7 * ndg + idx] = static_cast<DstT>(c.diagD);
+        dst[8 * ndg + idx] = static_cast<DstT>(c.diagDI);
+    }
 }
 
 /// The NODE-MAJOR reference strides, taken from NodalViewT's OWN DEFAULTS.
@@ -2869,6 +2957,13 @@ struct XsReconBackend::Impl {
         if (dev_sdid) rasbery::gpu::deviceBlockFree(dev_sdid);
         if (dev_sx) rasbery::gpu::deviceBlockFree(dev_sx);
         if (dev_sscale) rasbery::gpu::deviceBlockFree(dev_sscale);
+        // WP23: the stream builder's two residency classes.
+        if (sb_lib) rasbery::gpu::deviceBlockFree(sb_lib);
+        if (sb_libi) rasbery::gpu::deviceBlockFree(sb_libi);
+        if (sb_libll) rasbery::gpu::deviceBlockFree(sb_libll);
+        if (sb_node_i) rasbery::gpu::deviceBlockFree(sb_node_i);
+        if (sb_node_d) rasbery::gpu::deviceBlockFree(sb_node_d);
+        if (nc_xsdf) rasbery::gpu::deviceBlockFree(nc_xsdf);
         // THE CACHE, NOT THE SELECTION.  `nodal_graph` / `nodal_graph_src` are
         // aliases into nodal_graphs since Rev.7.1 Task 10 part 4, so destroying
         // them here would free one entry twice and leak the rest.
@@ -3398,6 +3493,59 @@ struct XsReconBackend::Impl {
     cuda_transfer::ByteExactMirror<double> mir_stream_x;
     cuda_transfer::ByteExactMirror<double> mir_stream_scale;
 
+    // -----------------------------------------------------------------------
+    // WP23: the device branch-stream resolver's own residency
+    // -----------------------------------------------------------------------
+    //
+    // TWO CLASSES, TWO LIFETIMES, and keeping them apart is the point.
+    //
+    //  * `sb_lib` is the flattened CHIFFON tables.  They are immutable for the
+    //    life of a run, so they upload ONCE, keyed by a generation the caller
+    //    derives from the library identity -- not from a statepoint counter,
+    //    which would re-send 20-odd MB every boron trial.
+    //  * `sb_node` is the per-node input columns.  They move with burnup, rod
+    //    state and T/H, and every one of them is READ-ONLY to the kernel, so
+    //    they go through the same byte-exact shadow WP13 built for wvfr/dmod/
+    //    bppm -- an unchanged column costs a memcmp and no bus traffic.
+    //
+    // Both blocks are freed by ~Impl through the same deviceBlockFree path as
+    // every other allocation here.
+    double*    sb_lib   = nullptr; ///< lib_iden | lib_burn | lib_ref_branch_x
+    int*       sb_libi  = nullptr; ///< the eight int tables, concatenated
+    long long* sb_libll = nullptr; ///< refr0_base | refr_burn_stride
+    std::size_t sb_lib_dbl = 0, sb_lib_int = 0, sb_lib_ll = 0;
+    unsigned long long sb_lib_generation = 0;
+    // offsets into sb_libi, in ints
+    std::size_t sb_i_model_off = 0, sb_i_iso = 0, sb_i_partner = 0, sb_i_coord = 0;
+    std::size_t sb_i_delta_base = 0, sb_i_rod_scaled = 0, sb_i_burn_off = 0;
+    std::size_t sb_i_burn_cnt = 0, sb_i_burnups = 0, sb_i_key_off = 0;
+    std::size_t sb_i_key_cnt = 0, sb_i_present = 0, sb_i_keys = 0;
+    std::size_t sb_i_partner_model = 0, sb_i_model_ok = 0;
+    // offsets into sb_lib, in doubles
+    std::size_t sb_d_iden = 0, sb_d_burn = 0, sb_d_branch_x = 0;
+
+    int*    sb_node_i = nullptr; ///< comp | burn | delta_lo | delta_hi | (_p)
+    double* sb_node_d = nullptr; ///< hw | rodfrac | tful | frac | frac_p | phif
+    std::size_t sb_node_i_len = 0, sb_node_d_len = 0;
+    int sb_node_nxyz = 0, sb_node_ng = 0;
+    bool sb_have_partner_cols = false;
+    cuda_transfer::ByteExactMirror<int>    mir_sb_comp, mir_sb_burn;
+    cuda_transfer::ByteExactMirror<int>    mir_sb_dlo, mir_sb_dhi, mir_sb_dlo_p, mir_sb_dhi_p;
+    cuda_transfer::ByteExactMirror<double> mir_sb_hw, mir_sb_rodfrac, mir_sb_tful;
+    cuda_transfer::ByteExactMirror<double> mir_sb_frac, mir_sb_frac_p, mir_sb_phif;
+    /// Slots per node the stream arrays were last sized for.  A change makes
+    /// every stream offset a different address, so the stream mirrors go too.
+    int sb_stride = 0;
+
+    void invalidateStreamBuildMirrors() {
+        mir_sb_comp.invalidate();    mir_sb_burn.invalidate();
+        mir_sb_dlo.invalidate();     mir_sb_dhi.invalidate();
+        mir_sb_dlo_p.invalidate();   mir_sb_dhi_p.invalidate();
+        mir_sb_hw.invalidate();      mir_sb_rodfrac.invalidate();
+        mir_sb_tful.invalidate();    mir_sb_frac.invalidate();
+        mir_sb_frac_p.invalidate();  mir_sb_phif.invalidate();
+    }
+
     void invalidateNodeMirrors() {
         mir_nodes.invalidate();
         mir_node_off.invalidate();
@@ -3434,6 +3582,467 @@ struct XsReconBackend::Impl {
         // time it could skip one, this one has landed.  It is also the rule
         // CudaBICGBackend's push_pending settled on, for the same reason.
         if (xfer::elideEnabled()) mirror.commit(src, count);
+        return true;
+    }
+
+    // -----------------------------------------------------------------------
+    // WP23: the stream-build phase of solveFlatXs
+    // -----------------------------------------------------------------------
+    //
+    // Called with `v` ALREADY REBOUND onto the device blocks -- reference micx,
+    // coefficient tables, knots, deltas, iden, wvfr/dmod/bppm and the node list.
+    // That is the whole reason this is a phase and not a public entry point; see
+    // the ordering note on flatxs_stream::StreamRequest.
+    //
+    // On success the three stream arrays and node_off/node_cnt hold the resolved
+    // stream and NOTHING was uploaded into them.  On failure `sb_last_refusal`
+    // says why and the caller falls back to XSSet::BuildFlatXsStream, which is
+    // the flag-off path.
+    bool buildStreamOnDevice(const fxs::FlatXsView& v, const fss::StreamRequest& req) {
+        fss::StreamTally& tally = fss::streamTally();
+        sb_last_refusal = 0;
+        const std::size_t nx      = static_cast<std::size_t>(v.nxyz);
+        const std::size_t n_nodes = static_cast<std::size_t>(v.n_nodes);
+        const std::size_t need    = n_nodes * static_cast<std::size_t>(req.stride);
+        const std::size_t nmodel  = static_cast<std::size_t>(req.shape.nmodel);
+        if (req.stride <= 0 || nmodel == 0 || req.nodes.ng <= 0) return false;
+        // THE ALLOCATION IS THE CALLER'S, AND THIS IS WHERE THAT IS CHECKED.
+        // solveFlatXs sizes the three stream arrays from `n_nodes * stride`
+        // before it binds the view; a phase that wrote past a shorter allocation
+        // would corrupt whatever the pool put next to it, silently.
+        if (stream_cap < need || nodes_cap < n_nodes || dev_sdid == nullptr ||
+            dev_off == nullptr || dev_cnt == nullptr) {
+            status = "buildStreamOnDevice: the stream arrays are not sized for "
+                     "n_nodes * stride";
+            return false;
+        }
+
+        // --- the library, once per run ---------------------------------------
+        if (sb_lib == nullptr || sb_lib_generation != req.lib_generation) {
+            const std::size_t ncorr = static_cast<std::size_t>(req.shape.n_corr);
+            std::size_t io = 0;
+            sb_i_model_off = io;    io += nmodel + 1;
+            sb_i_iso = io;          io += ncorr;
+            sb_i_partner = io;      io += ncorr;
+            sb_i_coord = io;        io += ncorr;
+            sb_i_delta_base = io;   io += ncorr;
+            sb_i_rod_scaled = io;   io += ncorr;
+            sb_i_burn_off = io;     io += ncorr;
+            sb_i_burn_cnt = io;     io += ncorr;
+            sb_i_burnups = io;      io += static_cast<std::size_t>(req.shape.n_burnups);
+            sb_i_key_off = io;      io += nmodel;
+            sb_i_key_cnt = io;      io += nmodel;
+            sb_i_present = io;      io += nmodel;
+            sb_i_keys = io;         io += static_cast<std::size_t>(req.shape.n_refr0_key);
+            sb_i_partner_model = io; io += nmodel;
+            sb_i_model_ok = io;     io += nmodel;
+            std::size_t doff = 0;
+            sb_d_iden = doff;       doff += static_cast<std::size_t>(req.shape.n_iden);
+            sb_d_burn = doff;       doff += static_cast<std::size_t>(req.shape.n_rows);
+            sb_d_branch_x = doff;   doff += static_cast<std::size_t>(req.shape.n_rows) * 3;
+
+            rasbery::AllocWindow _alloc_window("xsrecon.streamlib");
+            if (sb_lib) rasbery::gpu::deviceBlockFree(sb_lib);
+            if (sb_libi) rasbery::gpu::deviceBlockFree(sb_libi);
+            if (sb_libll) rasbery::gpu::deviceBlockFree(sb_libll);
+            sb_lib = nullptr; sb_libi = nullptr; sb_libll = nullptr;
+            // A zero-length class would leave a null pointer in the view that a
+            // bounds-respecting body never dereferences -- but "never" is a
+            // claim about the body, not about the allocator.  One element makes
+            // every pointer a real address.
+            sb_lib_dbl = doff > 0 ? doff : 1;
+            sb_lib_int = io > 0 ? io : 1;
+            sb_lib_ll  = 2 * nmodel;
+            if (rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&sb_lib),
+                                               sb_lib_dbl * sizeof(double)) != cudaSuccess ||
+                rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&sb_libi),
+                                               sb_lib_int * sizeof(int)) != cudaSuccess ||
+                rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&sb_libll),
+                                               sb_lib_ll * sizeof(long long)) != cudaSuccess) {
+                cudaGetLastError();
+                status = "buildStreamOnDevice: library allocation failed";
+                return false;
+            }
+
+            auto up_i = [&](const char* leaf, std::size_t off, const int* src,
+                            std::size_t count) -> bool {
+                if (count == 0 || src == nullptr) return true;
+                if (xfer::memcpyAsync("CudaXsReconBackend.cu:buildStreamOnDevice", leaf,
+                                      sb_libi + off, src, count * sizeof(int),
+                                      cudaMemcpyHostToDevice, stream) != cudaSuccess)
+                    return false;
+                tally.bytes_h2d.fetch_add(count * sizeof(int), std::memory_order_relaxed);
+                return true;
+            };
+            auto up_d = [&](const char* leaf, std::size_t off, const double* src,
+                            std::size_t count) -> bool {
+                if (count == 0 || src == nullptr) return true;
+                if (xfer::memcpyAsync("CudaXsReconBackend.cu:buildStreamOnDevice", leaf,
+                                      sb_lib + off, src, count * sizeof(double),
+                                      cudaMemcpyHostToDevice, stream) != cudaSuccess)
+                    return false;
+                tally.bytes_h2d.fetch_add(count * sizeof(double), std::memory_order_relaxed);
+                return true;
+            };
+            const fss::StreamLibView& L = req.lib;
+            std::vector<long long> ll(2 * nmodel);
+            for (std::size_t m = 0; m < nmodel; ++m) {
+                ll[m]          = L.refr0_base[m];
+                ll[nmodel + m] = L.refr_burn_stride[m];
+            }
+            const bool ok =
+                up_i("sh.model_off", sb_i_model_off, L.model_sh_off, nmodel + 1) &&
+                up_i("sh.iso", sb_i_iso, L.sh_iso, ncorr) &&
+                up_i("sh.partner", sb_i_partner, L.sh_partner, ncorr) &&
+                up_i("sh.coord", sb_i_coord, L.sh_coord, ncorr) &&
+                up_i("sh.delta_base", sb_i_delta_base, L.sh_delta_base, ncorr) &&
+                up_i("sh.rod_scaled", sb_i_rod_scaled, L.sh_rod_scaled, ncorr) &&
+                up_i("sh.burn_off", sb_i_burn_off, L.sh_burn_off, ncorr) &&
+                up_i("sh.burn_cnt", sb_i_burn_cnt, L.sh_burn_cnt, ncorr) &&
+                up_i("sh.burnups", sb_i_burnups, L.sh_burnups,
+                     static_cast<std::size_t>(req.shape.n_burnups)) &&
+                up_i("refr0.key_off", sb_i_key_off, L.refr0_key_off, nmodel) &&
+                up_i("refr0.key_cnt", sb_i_key_cnt, L.refr0_key_cnt, nmodel) &&
+                up_i("refr0.present", sb_i_present, L.refr0_present, nmodel) &&
+                up_i("refr0.keys", sb_i_keys, L.refr0_keys,
+                     static_cast<std::size_t>(req.shape.n_refr0_key)) &&
+                up_i("lib.partner", sb_i_partner_model, L.history_partner, nmodel) &&
+                up_i("lib.model_ok", sb_i_model_ok, L.model_ok, nmodel) &&
+                up_d("lib.iden", sb_d_iden, L.lib_iden,
+                     static_cast<std::size_t>(req.shape.n_iden)) &&
+                up_d("lib.burn", sb_d_burn, L.lib_burn,
+                     static_cast<std::size_t>(req.shape.n_rows)) &&
+                up_d("lib.branch_x", sb_d_branch_x, L.lib_ref_branch_x,
+                     static_cast<std::size_t>(req.shape.n_rows) * 3) &&
+                xfer::memcpyAsync("CudaXsReconBackend.cu:buildStreamOnDevice",
+                                  "refr0.base", sb_libll, ll.data(),
+                                  ll.size() * sizeof(long long), cudaMemcpyHostToDevice,
+                                  stream) == cudaSuccess;
+            // `ll` dies at the closing brace, so the async copy that reads it
+            // must have completed.  ONE drain, once per run.
+            if (!ok || xfer::streamSync("CudaXsReconBackend.cu:buildStreamOnDevice",
+                                        "libdrain", stream) != cudaSuccess) {
+                cudaGetLastError();
+                status = "buildStreamOnDevice: library upload failed";
+                return false;
+            }
+            tally.bytes_h2d.fetch_add(ll.size() * sizeof(long long),
+                                      std::memory_order_relaxed);
+            sb_lib_generation = req.lib_generation;
+        }
+
+        // --- the per-node columns, under WP13's shadows ------------------------
+        const std::size_t ng = static_cast<std::size_t>(req.nodes.ng);
+        const bool want_partner = req.nodes.delta_lo_p != nullptr;
+        const std::size_t need_i = 2 * nx + (want_partner ? 4u : 2u) * 3 * nx;
+        const std::size_t need_d = 3 * nx + (want_partner ? 2u : 1u) * 3 * nx + nx * ng;
+        if (sb_node_i == nullptr || sb_node_i_len != need_i || sb_node_d_len != need_d ||
+            sb_node_nxyz != v.nxyz || sb_node_ng != req.nodes.ng ||
+            sb_have_partner_cols != want_partner) {
+            rasbery::AllocWindow _alloc_window("xsrecon.streamnode");
+            if (sb_node_i) rasbery::gpu::deviceBlockFree(sb_node_i);
+            if (sb_node_d) rasbery::gpu::deviceBlockFree(sb_node_d);
+            sb_node_i = nullptr; sb_node_d = nullptr;
+            if (rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&sb_node_i),
+                                               need_i * sizeof(int)) != cudaSuccess ||
+                rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&sb_node_d),
+                                               need_d * sizeof(double)) != cudaSuccess) {
+                cudaGetLastError();
+                status = "buildStreamOnDevice: per-node column allocation failed";
+                return false;
+            }
+            sb_node_i_len = need_i;
+            sb_node_d_len = need_d;
+            sb_node_nxyz  = v.nxyz;
+            sb_node_ng    = req.nodes.ng;
+            sb_have_partner_cols = want_partner;
+            invalidateStreamBuildMirrors();
+        }
+        int* const    dev_comp  = sb_node_i;
+        int* const    dev_burn  = sb_node_i + nx;
+        int* const    dev_dlo   = sb_node_i + 2 * nx;
+        int* const    dev_dhi   = dev_dlo + 3 * nx;
+        int* const    dev_dlo_p = want_partner ? dev_dhi + 3 * nx : nullptr;
+        int* const    dev_dhi_p = want_partner ? dev_dlo_p + 3 * nx : nullptr;
+        double* const dev_hw    = sb_node_d;
+        double* const dev_rod   = sb_node_d + nx;
+        double* const dev_tful  = sb_node_d + 2 * nx;
+        double* const dev_frac  = sb_node_d + 3 * nx;
+        double* const dev_frac_p = want_partner ? dev_frac + 3 * nx : nullptr;
+        double* const dev_phif  = (want_partner ? dev_frac_p : dev_frac) + 3 * nx;
+
+        if (!uploadGuarded("sb.comp", dev_comp, req.nodes.comp, nx, mir_sb_comp) ||
+            !uploadGuarded("sb.burn", dev_burn, req.nodes.burn, nx, mir_sb_burn) ||
+            !uploadGuarded("sb.dlo", dev_dlo, req.nodes.delta_lo, 3 * nx, mir_sb_dlo) ||
+            !uploadGuarded("sb.dhi", dev_dhi, req.nodes.delta_hi, 3 * nx, mir_sb_dhi) ||
+            !uploadGuarded("sb.frac", dev_frac, req.nodes.delta_frac, 3 * nx, mir_sb_frac) ||
+            !uploadGuarded("sb.rodfrac", dev_rod, req.nodes.rodfrac, nx, mir_sb_rodfrac) ||
+            !uploadGuarded("sb.tful", dev_tful, req.nodes.tful, nx, mir_sb_tful) ||
+            !uploadGuarded("sb.phif", dev_phif, req.nodes.phif, nx * ng, mir_sb_phif))
+            return false;
+        if (want_partner &&
+            (!uploadGuarded("sb.dlo_p", dev_dlo_p, req.nodes.delta_lo_p, 3 * nx,
+                            mir_sb_dlo_p) ||
+             !uploadGuarded("sb.dhi_p", dev_dhi_p, req.nodes.delta_hi_p, 3 * nx,
+                            mir_sb_dhi_p) ||
+             !uploadGuarded("sb.frac_p", dev_frac_p, req.nodes.delta_frac_p, 3 * nx,
+                            mir_sb_frac_p)))
+            return false;
+        // `hw` is EMPTY on a deck with no history twin.  A null column is not
+        // uploaded from and the VIEW's pointer stays null -- the body then reads
+        // 0.0, which is exactly what `_node_hw.empty() ? 0.0 : ...` does.
+        if (req.nodes.hw != nullptr &&
+            !uploadGuarded("sb.hw", dev_hw, req.nodes.hw, nx, mir_sb_hw))
+            return false;
+
+        // --- rebind and launch ------------------------------------------------
+        fss::StreamLibView dlib{};
+        dlib.model_sh_off     = sb_libi + sb_i_model_off;
+        dlib.sh_iso           = sb_libi + sb_i_iso;
+        dlib.sh_partner       = sb_libi + sb_i_partner;
+        dlib.sh_coord         = sb_libi + sb_i_coord;
+        dlib.sh_delta_base    = sb_libi + sb_i_delta_base;
+        dlib.sh_rod_scaled    = sb_libi + sb_i_rod_scaled;
+        dlib.sh_burn_off      = sb_libi + sb_i_burn_off;
+        dlib.sh_burn_cnt      = sb_libi + sb_i_burn_cnt;
+        dlib.sh_burnups       = sb_libi + sb_i_burnups;
+        dlib.refr0_key_off    = sb_libi + sb_i_key_off;
+        dlib.refr0_key_cnt    = sb_libi + sb_i_key_cnt;
+        dlib.refr0_present    = sb_libi + sb_i_present;
+        dlib.refr0_keys       = sb_libi + sb_i_keys;
+        dlib.refr0_base       = sb_libll;
+        dlib.refr_burn_stride = sb_libll + nmodel;
+        dlib.history_partner  = sb_libi + sb_i_partner_model;
+        dlib.model_ok         = sb_libi + sb_i_model_ok;
+        dlib.lib_iden         = sb_lib + sb_d_iden;
+        dlib.lib_burn         = sb_lib + sb_d_burn;
+        dlib.lib_ref_branch_x = sb_lib + sb_d_branch_x;
+        dlib.nmodel           = req.shape.nmodel;
+        dlib.niso             = req.lib.niso;
+
+        fss::StreamNodeView dnd = req.nodes;
+        dnd.comp    = dev_comp;
+        dnd.burn    = dev_burn;
+        dnd.hw      = req.nodes.hw != nullptr ? dev_hw : nullptr;
+        dnd.rodfrac = dev_rod;
+        dnd.tful    = dev_tful;
+        dnd.phif    = dev_phif;
+        dnd.delta_lo     = dev_dlo;
+        dnd.delta_hi     = dev_dhi;
+        dnd.delta_frac   = dev_frac;
+        dnd.delta_lo_p   = dev_dlo_p;
+        dnd.delta_hi_p   = dev_dhi_p;
+        dnd.delta_frac_p = dev_frac_p;
+
+        fss::StreamOutView out{};
+        out.node_off     = dev_off;
+        out.node_cnt     = dev_cnt;
+        out.stream_did   = dev_sdid;
+        out.stream_x     = dev_sx;
+        out.stream_scale = dev_sscale;
+        out.stride       = req.stride;
+
+        const unsigned forms = rasberyGpuFlatXsStreamForms();
+        const int      B     = 128;
+        kFlatXsStreamBuild<<<(v.n_nodes + B - 1) / B, B, 0, stream>>>(v, dlib, dnd, out,
+                                                                      forms);
+        if (cudaGetLastError() != cudaSuccess) {
+            status = "buildStreamOnDevice: kernel launch failed";
+            return false;
+        }
+
+        // --- the refusal ladder comes home ------------------------------------
+        //
+        // n_nodes ints -- 34 KB on the KNGR deck, against the ~1.4 MB of stream
+        // this phase stops uploading.  NOT elidable and not optional: a refusal
+        // the host cannot see is a node whose cross sections were built from a
+        // truncated stream, finite and plausible and wrong.
+        if (sb_cnt_host.size() < n_nodes) sb_cnt_host.resize(n_nodes);
+        if (xfer::memcpyAsync("CudaXsReconBackend.cu:buildStreamOnDevice", "node_cnt",
+                              sb_cnt_host.data(), dev_cnt, n_nodes * sizeof(int),
+                              cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+            xfer::streamSync("CudaXsReconBackend.cu:buildStreamOnDevice", "cnt",
+                             stream) != cudaSuccess) {
+            cudaGetLastError();
+            status = "buildStreamOnDevice: node_cnt readback failed";
+            return false;
+        }
+        tally.bytes_d2h.fetch_add(n_nodes * sizeof(int), std::memory_order_relaxed);
+
+        unsigned long long entries = 0;
+        for (std::size_t i = 0; i < n_nodes; ++i) {
+            const int c = sb_cnt_host[i];
+            if (c < 0) {
+                // ONE refused node declines the WHOLE call.  Every refusal
+                // reason in the ladder is decidable on the host BEFORE the
+                // launch (see XSSet::FlatXsStreamEligible), so reaching this is
+                // a disagreement between the host pre-check and the device --
+                // and the honest response to that is to stop using the arm for
+                // this call, not to stitch the two answers together.
+                sb_last_refusal = fss::decodeRefusal(c);
+                tally.refusals[sb_last_refusal].fetch_add(1, std::memory_order_relaxed);
+                invalidateStreamMirrors();
+                invalidateNodeMirrors();
+                return false;
+            }
+            entries += static_cast<unsigned long long>(c);
+        }
+        tally.entries.fetch_add(entries, std::memory_order_relaxed);
+        // The three stream arrays and node_off did not cross the bus at all.
+        tally.bytes_elided.fetch_add(
+            entries * (sizeof(int) + 2 * sizeof(double)) + n_nodes * sizeof(int),
+            std::memory_order_relaxed);
+        sb_stride = req.stride;
+        tally.stride.store(static_cast<unsigned long long>(req.stride),
+                           std::memory_order_relaxed);
+        tally.forms_mask.store(forms, std::memory_order_relaxed);
+        tally.forms_seen.fetch_add(1, std::memory_order_relaxed);
+        // The device wrote node_off/node_cnt itself, so the host shadows of both
+        // describe bytes nobody sent.
+        invalidateStreamMirrors();
+        mir_node_off.invalidate();
+        mir_node_cnt.invalidate();
+        return true;
+    }
+
+    std::vector<int> sb_cnt_host;
+    int              sb_last_refusal = 0;
+
+    // -----------------------------------------------------------------------
+    // WP23 item 3: the nine SENM constants, on the device
+    // -----------------------------------------------------------------------
+    //
+    // `xsdf` is uploaded into a block of THIS ARM'S OWN, not appended to
+    // ndev_dbl -- the WP21-C2 note on that block says a flag must not change one
+    // address in it, and an arm-conditional region at the end would do exactly
+    // that between an ON run and an OFF run of the same deck.
+    double*     nc_xsdf = nullptr;
+    std::size_t nc_xsdf_len = 0;
+    cuda_transfer::ByteExactMirror<double> mir_nc_xsdf;
+    /// Self-check staging: one contiguous run per array, host side.
+    std::vector<double>       nc_chk_d;
+    std::vector<float>        nc_chk_f;
+    unsigned long long        nc_builds = 0;
+
+    bool nodalConstsOnDevice(const double* host_xsdf, const double* const consts[9],
+                             std::size_t nx, std::size_t ndg, bool nsoa,
+                             const ndl::NodalView& n_soa, const ndl::NodalView& n_aos) {
+        nodalconsts::NodalConstsTally& t = nodalconsts::nodalConstsTally();
+        const std::size_t lmp = static_cast<std::size_t>(ndl::NG) * nx;
+        if (nc_xsdf == nullptr || nc_xsdf_len != lmp) {
+            rasbery::AllocWindow _alloc_window("nodal.consts.xsdf");
+            if (nc_xsdf) rasbery::gpu::deviceBlockFree(nc_xsdf);
+            nc_xsdf = nullptr;
+            if (rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&nc_xsdf),
+                                               lmp * sizeof(double)) != cudaSuccess) {
+                cudaGetLastError();
+                status = "nodalConstsOnDevice: xsdf allocation failed";
+                return false;
+            }
+            nc_xsdf_len = lmp;
+            mir_nc_xsdf.invalidate();
+        }
+        // ONE upload of ONE array where nine used to go.  Shadow-guarded, so a
+        // generation that moved for a reason other than xsdf costs a memcmp.
+        if (!uploadGuarded("nodal xsdf", nc_xsdf, host_xsdf, lmp, mir_nc_xsdf))
+            return false;
+        t.bytes_h2d.fetch_add(lmp * sizeof(double), std::memory_order_relaxed);
+
+        const long long c_node = nsoa ? n_soa.ndg_node : n_aos.ndg_node;
+        const long long c_grp  = nsoa ? n_soa.ndg_grp : n_aos.ndg_grp;
+        const int       hm_node = nsoa ? n_soa.hm_node : n_aos.hm_node;
+        const int       hm_dir  = nsoa ? n_soa.hm_dir : n_aos.hm_dir;
+        const double* const dev_xsrf = dev_block + off_xs[xsr::T_XSRF];
+        const double* const dev_hmesh = ndev_dbl + n_off_hmesh;
+        const unsigned long long forms = ndl::nodalConstFormsRuntime();
+
+        const int B = 128;
+        const int g = (static_cast<int>(nx) * ndl::NG + B - 1) / B;
+        if (ndev_flt != nullptr)
+            kNodalConstsDevice<float><<<g, B, 0, stream>>>(
+                ndev_flt + n_off_consts, dev_xsrf, nc_xsdf, dev_hmesh,
+                static_cast<int>(nx), ndl::NG, static_cast<long long>(ndg), hm_node,
+                hm_dir, c_node, c_grp, forms);
+        else
+            kNodalConstsDevice<double><<<g, B, 0, stream>>>(
+                ndev_dbl + n_off_consts, dev_xsrf, nc_xsdf, dev_hmesh,
+                static_cast<int>(nx), ndl::NG, static_cast<long long>(ndg), hm_node,
+                hm_dir, c_node, c_grp, forms);
+        if (cudaGetLastError() != cudaSuccess) {
+            status = "nodalConstsOnDevice: kernel launch failed";
+            return false;
+        }
+        const std::size_t elem = ndev_flt != nullptr ? sizeof(float) : sizeof(double);
+        t.device_builds.fetch_add(1, std::memory_order_relaxed);
+        t.uploads_elided.fetch_add(9, std::memory_order_relaxed);
+        t.bytes_elided.fetch_add(9ULL * ndg * elem, std::memory_order_relaxed);
+
+        // --- the self-check ---------------------------------------------------
+        //
+        // WHAT IS SAMPLED AND WHY A CONTIGUOUS RUN.  Element-by-element sampling
+        // would be one cudaMemcpy per element; a whole-array download would move
+        // exactly the 3.6 MB the arm exists to stop moving.  A contiguous run of
+        // 4,096 elements per array is 288 KB, one copy each, and its inverse
+        // mapping back to (node, direction, group) is exact in BOTH layouts --
+        // which is the only reason a run is admissible as a sample here.
+        ++nc_builds;
+        const bool sample = (nc_builds == 1) || (nc_builds % 256 == 0);
+        if (!sample) return true;
+        const std::size_t nsample = ndg < 4096 ? ndg : 4096;
+        // In node-major (AoS) `c_grp == 1`, so run index e is
+        // (lk = e/(NDIR*NG), c = e%(NDIR*NG)) and the host index is e itself.
+        // In node-innermost (SoA) `c_node == 1`, so for e < nxyz the run is
+        // (lk = e, c = 0) and the host index is e*(NDIR*NG).  Anything else is a
+        // layout this check does not claim to invert, and it says so by not
+        // counting itself rather than by reporting a zero.
+        const bool aos = (c_grp == 1);
+        const bool soa = (c_node == 1);
+        if (!aos && !soa) return true;
+        const std::size_t run = soa && !aos ? (nsample < nx ? nsample : nx) : nsample;
+        if (ndev_flt != nullptr) nc_chk_f.resize(run);
+        else                     nc_chk_d.resize(run);
+
+        unsigned long long worst = 0, worst_arr = 0, over = 0;
+        for (int i = 0; i < 9; ++i) {
+            const void* src = ndev_flt != nullptr
+                                  ? static_cast<const void*>(ndev_flt + n_off_consts +
+                                                             static_cast<std::size_t>(i) * ndg)
+                                  : static_cast<const void*>(ndev_dbl + n_off_consts +
+                                                             static_cast<std::size_t>(i) * ndg);
+            void* dst = ndev_flt != nullptr ? static_cast<void*>(nc_chk_f.data())
+                                            : static_cast<void*>(nc_chk_d.data());
+            if (xfer::memcpy("CudaXsReconBackend.cu:nodalConstsOnDevice", "selfcheck",
+                             dst, src, run * elem, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                cudaGetLastError();
+                return true; // a check that could not run is not a build that failed
+            }
+            t.bytes_d2h.fetch_add(run * elem, std::memory_order_relaxed);
+            for (std::size_t e = 0; e < run; ++e) {
+                const std::size_t h = aos ? e : e * (ndl::NDIR * ndl::NG);
+                const double hv = consts[i][h];
+                // Under the narrow arm the host value is compared AT THE ARM'S
+                // WIDTH: the narrowing is WP20.1's error, already priced, and
+                // folding it in here would report it as this arm's.
+                const double a = ndev_flt != nullptr
+                                     ? static_cast<double>(static_cast<float>(hv))
+                                     : hv;
+                const double b = ndev_flt != nullptr
+                                     ? static_cast<double>(nc_chk_f[e])
+                                     : nc_chk_d[e];
+                const unsigned long long u = nodalconsts::ulpDistance(a, b);
+                if (u > worst) { worst = u; worst_arr = static_cast<unsigned long long>(i); }
+                if (u > 1) ++over;
+            }
+        }
+        t.checks.fetch_add(1, std::memory_order_relaxed);
+        t.checked_elems.fetch_add(9ULL * run, std::memory_order_relaxed);
+        t.over_1ulp.fetch_add(over, std::memory_order_relaxed);
+        unsigned long long prev = t.max_ulp.load(std::memory_order_relaxed);
+        while (worst > prev &&
+               !t.max_ulp.compare_exchange_weak(prev, worst, std::memory_order_relaxed))
+            ;
+        if (worst >= t.max_ulp.load(std::memory_order_relaxed))
+            t.max_ulp_array.store(worst_arr, std::memory_order_relaxed);
         return true;
     }
 };
@@ -3994,6 +4603,8 @@ bool XsReconBackend::xeTransaction(const xsr::BatchView& host,
     return true;
 }
 
+int XsReconBackend::flatXsStreamRefusal() const { return _impl->sb_last_refusal; }
+
 unsigned long long XsReconBackend::xeEvaluations() {
     return g_xe_evaluations.load(std::memory_order_relaxed);
 }
@@ -4008,9 +4619,14 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
                                  unsigned long long micx_generation_next,
                                  unsigned long long ref_generation,
                                  unsigned long long state_generation,
-                                 bool mark_micx_resident) {
+                                 bool mark_micx_resident,
+                                 const fss::StreamRequest* stream) {
     Impl& d = *_impl;
     if (!d.available || host.n_nodes <= 0 || host.nxyz <= 0) return false;
+    // WP23.  ONE BOOL, RESOLVED ONCE.  With it false every line below is the
+    // text that shipped -- that is what "feature-off is the old path" has to
+    // mean for a phase inserted into an existing function.
+    const bool dev_stream = stream != nullptr && stream->stride > 0;
     // Reuse ensure() so the mic/lmp/xs/iden regions exist; keep the resident
     // fuel-count contract of the xsrecon solve intact by passing its current
     // value (or the node count on first contact).
@@ -4245,7 +4861,13 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
         d.invalidateNodeMirrors();
     }
     std::size_t stream_len = 0;
-    if (host.n_nodes > 0)
+    if (dev_stream)
+        // WP23: the device arm's packing is FIXED-SLOT, so the length is a
+        // product and not a scan -- and `host.node_off` / `host.node_cnt` are
+        // stale host scratch on this arm, so reading them here would size the
+        // allocation from the PREVIOUS call's stream.
+        stream_len = n_nodes * static_cast<std::size_t>(stream->stride);
+    else if (host.n_nodes > 0)
         stream_len = static_cast<std::size_t>(host.node_off[host.n_nodes - 1]) +
                      static_cast<std::size_t>(host.node_cnt[host.n_nodes - 1]);
     if (stream_len > d.stream_cap) {
@@ -4269,6 +4891,12 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     // in fxs::FlatXsView), so the shadow means what it says.
     if (!d.uploadGuarded("nodes", d.dev_nodes, host.nodes, n_nodes, d.mir_nodes))
         return false;
+    // WP23.  THE FOUR COPIES THE ARM EXISTS TO REMOVE.  node_off, node_cnt and
+    // the three stream arrays are what BuildFlatXsStream produced on the host;
+    // on the device arm the kernel below writes them in place and none of them
+    // crosses the bus.  `nodes` above is NOT one of them -- the target list is
+    // the caller's choice, not the resolver's output.
+    if (!dev_stream) {
     if (!d.uploadGuarded("node_off", d.dev_off, host.node_off, n_nodes, d.mir_node_off))
         return false;
     if (!d.uploadGuarded("node_cnt", d.dev_cnt, host.node_cnt, n_nodes, d.mir_node_cnt))
@@ -4284,6 +4912,7 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
                              d.mir_stream_scale))
             return false;
     }
+    } // !dev_stream
 
     // --- repoint the view at the device copies ----------------------------
     fxs::FlatXsView v = host;
@@ -4343,6 +4972,31 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     v.node_off     = d.dev_off;
     v.node_cnt     = d.dev_cnt;
     v.nodes        = d.dev_nodes;
+
+    // WP23: THE STREAM PHASE, and it sits exactly here for a reason.  Every
+    // pointer it reads -- the reference micx block, the coefficient tables, the
+    // knots, the delta metadata, iden and the three per-node coordinate columns
+    // -- was bound by the lines above; a phase placed one block earlier would
+    // read host addresses on the first call of a run.  And it must precede the
+    // dispatch below, which consumes what it writes.
+    //
+    // A false return is a REFUSAL, not a failure: the caller runs
+    // XSSet::BuildFlatXsStream and calls again with a null request, which is the
+    // flag-off path.
+    if (dev_stream) {
+        const auto sb_t0 = std::chrono::steady_clock::now();
+        const bool sb_ok = d.buildStreamOnDevice(v, *stream);
+        // TIMED ON BOTH OUTCOMES.  A refusal that cost a library upload and a
+        // kernel launch is time this arm spent; excluding it would make the
+        // receipt flatter than the run.
+        fss::streamTally().wall_us.fetch_add(
+            static_cast<unsigned long long>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - sb_t0)
+                    .count()),
+            std::memory_order_relaxed);
+        if (!sb_ok) return false;
+    }
 
     // WP5 stage B.  ONE dispatch point, ONE flag, read once into a cached
     // bool: the reference arm below is the code the CTA arm is scored against,
@@ -4746,7 +5400,8 @@ unsigned long long XsReconBackend::nodalConstBytes() {
 bool XsReconBackend::solveNodal(const ndl::NodalView& host,
                                 unsigned long long const_generation,
                                 unsigned long long ref_generation,
-                                unsigned long long state_generation) {
+                                unsigned long long state_generation,
+                                const double* host_xsdf) {
     // calculateEven stays on the host until its 1-ULP residual class is
     // mined out (RASBERY_GPU_NODAL_FULL=1 forces the all-device path).
     // Shared with Nodal::TryDriveGpu through the one inline flag reader, so
@@ -4999,10 +5654,28 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         d.nodal_geom_uploaded = true;
     }
 
+    // WP23 item 3.  ONE BOOL, RESOLVED ONCE, and with it false every line of
+    // the block below is the text that shipped.  `host_xsdf` is the arm's other
+    // half: the device body needs xsdf and the view never carried it, so a null
+    // pointer is "the arm cannot run", not an error.
+    const bool nc_arm = rasberyGpuNodalConstsEnabled() && host_xsdf != nullptr &&
+                        d.ndev_dbl != nullptr;
+    bool       nc_pending = false;
     if (const_generation != d.resident_const_generation) {
         const double* consts[9] = {host.eta1, host.eta2, host.m260,
                                    host.m251, host.m253, host.m262,
                                    host.m264, host.diagD, host.diagDI};
+        if (nc_arm) {
+            // DEFERRED, NOT DONE HERE.  The device body reads xsrf and xsdf out
+            // of the resident macroscopic block, and the block's own upload gate
+            // is ~120 lines below -- so a build issued at this point would read
+            // the PREVIOUS statepoint's cross sections whenever the state
+            // generation had moved.  The nine uploads are skipped here and the
+            // build is issued after that gate, which is the only place both
+            // inputs are known current.
+            nc_pending = true;
+            nodalconsts::nodalConstsTally().gates.fetch_add(1, std::memory_order_relaxed);
+        } else {
         // WP20.1.  THE MEASURED NODAL CARRIER: nine arrays of `nxyz*NDIR*NG`
         // doubles re-sent every time the Xe device step moves the macroscopic
         // xs -- 3.9 GB over a KNGR run.  Narrowing the block halves the wire
@@ -5095,6 +5768,13 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
             9ULL * static_cast<unsigned long long>(ndg) *
                 (d.ndev_flt != nullptr ? sizeof(float) : sizeof(double)),
             std::memory_order_relaxed);
+        } // !nc_arm
+        // ADVANCED IN BOTH ARMS, and it has to be: on the device arm the build
+        // below is what makes the resident copy current, and a generation left
+        // behind would re-issue it every drive.  A failed build declines the
+        // whole drive (the host arrays are still correct, so the CPU nodal is
+        // the right fallback), so there is no path where this advances over
+        // constants that were never written.
         d.resident_const_generation = const_generation;
     }
 
@@ -5134,6 +5814,25 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         if (!d.upload("nodal xsrf", host.xsrf, d.off_xs[xsr::T_XSRF], lmp)) return false;
         if (!d.upload("nodal xsnf", host.xsnf, d.off_xs[xsr::T_XSNF], lmp)) return false;
         if (!d.upload("nodal xssm", host.xssm, d.off_xs_ssm, ssm)) return false;
+    }
+
+    // WP23 item 3: the deferred build, at the one point where BOTH the
+    // macroscopic block and the geometry table are known current.
+    if (nc_pending) {
+        const double* consts[9] = {host.eta1, host.eta2, host.m260,
+                                   host.m251, host.m253, host.m262,
+                                   host.m264, host.diagD, host.diagDI};
+        if (!d.nodalConstsOnDevice(host_xsdf, consts, nx, ndg, nsoa, n_soa, n_aos)) {
+            // The nine host arrays are untouched and correct, so declining the
+            // drive puts the caller on the CPU nodal -- which is the fallback
+            // this backend has always had.  Better than uploading here: an
+            // upload after a failed build would leave `resident_const_generation`
+            // describing a mixture of two epochs.
+            d.resident_const_generation = 0;
+            nodalconsts::nodalConstsTally().host_uploads.fetch_add(
+                1, std::memory_order_relaxed);
+            return false;
+        }
     }
 
     const bool nnarrow = nodalNarrowState() && d.ndev_flt != nullptr;
@@ -6163,6 +6862,59 @@ bool rasberyGpuFlatXsEnabled() {
 
 bool rasberyGpuSearchEnabled() {
     static const bool on = envFlagEnabled("RASBERY_GPU_SEARCH");
+    return on;
+}
+
+bool rasberyGpuFlatXsStreamEnabled() {
+    // WP23.  ABSENT MEANS OFF, and it is a TRAJECTORY knob: the stream this
+    // builds is every unrodded node's branch and history coordinate, so a bit
+    // that moves here moves the answer.  It is in trajectory::kArmEnv beside
+    // RASBERY_GPU_TH for that reason.
+    //
+    // AND IT IS A SUB-ARM: with RASBERY_GPU_FLATXS off there is no device kernel
+    // for the stream to feed, and resolving a stream on the device to copy it
+    // back for a host loop is strictly worse than not resolving it there.  The
+    // conjunction is spelled HERE rather than at the call site so that one
+    // reader of one function can see the whole gate.
+    static const bool on =
+        envFlagEnabled("RASBERY_GPU_FLATXS_STREAM") && rasberyGpuFlatXsEnabled();
+    return on;
+}
+
+int rasberyGpuFlatXsStreamStride() {
+    // 0 means "the caller's own static upper bound", which is what XSSet
+    // computes from the library (12 scalar-branch slots plus two per spectral
+    // term per pass).  An explicit value is for a bisect: it can only make the
+    // arm refuse with kRefusalCapacity, never make it wrong.
+    static const int stride = [] {
+        const char* v = std::getenv("RASBERY_FLATXS_STREAM_STRIDE");
+        if (v == nullptr) return 0;
+        const int n = std::atoi(v);
+        return n > 0 ? n : 0;
+    }();
+    return stride;
+}
+
+unsigned rasberyGpuFlatXsStreamForms() {
+    // NOT MINED -- see src/FlatXsStreamReceipt.h.  Read once, hex or decimal,
+    // masked to the three bits that exist so a typo cannot select a site that
+    // does not.
+    static const unsigned forms = [] {
+        const char* v = std::getenv("RASBERY_FLATXS_STREAM_FORMS");
+        if (v == nullptr) return fss::kStreamFormsDefault;
+        return static_cast<unsigned>(std::strtoul(v, nullptr, 0)) &
+               static_cast<unsigned>(fss::FS_ALL);
+    }();
+    return forms;
+}
+
+bool rasberyGpuNodalConstsEnabled() {
+    // WP23 item 3.  ABSENT MEANS OFF and it is a TRAJECTORY knob by
+    // MEASUREMENT, not by caution: CUDA's exp differs from glibc's by 1 ulp on
+    // 3.34 % of the arguments nodalConstantCoefficients evaluates
+    // (src/NodalConstantKernel.h), so the nine coefficient arrays this produces
+    // are not the host's bit for bit and the outer trajectory can diverge.
+    static const bool on = envFlagEnabled("RASBERY_GPU_NODAL_CONSTS");
     return on;
 }
 

@@ -1,5 +1,6 @@
 #include "XSSet.h"
 
+#include "FlatXsStreamReceipt.h" // WP23: the [RASBERY][FLATXS][STREAM] tally
 #include "GpuFullContract.h"
 #include "Importer.h"
 #include "SearchGpuReceipt.h"
@@ -3047,19 +3048,21 @@ static void flatxsDumpState(const char* path, const flatxs::FlatXsView& v,
 // history resolution is the very ResolveSpectralHistoryDeltas the CPU arm
 // calls, fed a two-element workspace probe for NodeSpectralIndex (computed
 // with the mined contraction forms, see FlatXsKernel.h).
-void XSSet::BuildFlatXsStream(const std::vector<int>& nodes) {
+// ONE NODE'S APPLICATIONS, lifted out of BuildFlatXsStream's OpenMP body
+// verbatim (WP23).  Nothing here moved, was reordered or was rewritten: the
+// function boundary is the only change, and it exists because the WP23 device
+// arm needs the SAME resolution for the nodes it refuses.  Two spellings of this
+// sequence would be two answers, and the refused nodes are exactly the ones
+// nobody would think to check.
+//
+// `hv` is hoisted by the caller because MakeFlatXsHostView takes eleven
+// addresses and a per-node call would take them n times.
+void XSSet::ResolveNodeApplications(int l, const flatxs::FlatXsView& hv,
+                                    std::vector<DeltaApplication>& apps) const {
     namespace fxs = flatxs;
-    const int    ng  = _g.ng();
-    const int    ith = ng - 1;
-    const size_t n   = nodes.size();
-    if (_flatxs_node_apps.size() < n)
-        _flatxs_node_apps.resize(n);
-    const fxs::FlatXsView hv = MakeFlatXsHostView();
-
-#pragma omp parallel for schedule(dynamic, 64) if (static_cast<int>(n) > OMP_THRESHOLD)
-    for (int i = 0; i < static_cast<int>(n); ++i) {
-        const int l    = nodes[i];
-        auto&     apps = _flatxs_node_apps[static_cast<size_t>(i)];
+    const int ng  = _g.ng();
+    const int ith = ng - 1;
+    {
         apps.clear();
 
         const double boron_dmod = BoronDmod(_g, _boron_dmod_average, l);
@@ -3130,6 +3133,19 @@ void XSSet::BuildFlatXsStream(const std::vector<int>& nodes) {
             }
         }
     }
+}
+
+void XSSet::BuildFlatXsStream(const std::vector<int>& nodes) {
+    namespace fxs = flatxs;
+    const size_t n = nodes.size();
+    if (_flatxs_node_apps.size() < n)
+        _flatxs_node_apps.resize(n);
+    const fxs::FlatXsView hv = MakeFlatXsHostView();
+
+#pragma omp parallel for schedule(dynamic, 64) if (static_cast<int>(n) > OMP_THRESHOLD)
+    for (int i = 0; i < static_cast<int>(n); ++i)
+        ResolveNodeApplications(nodes[static_cast<size_t>(i)], hv,
+                                _flatxs_node_apps[static_cast<size_t>(i)]);
 
     // Serial concatenation keeps the stream in node order.
     _flatxs_off.resize(n);
@@ -3146,6 +3162,303 @@ void XSSet::BuildFlatXsStream(const std::vector<int>& nodes) {
         }
         _flatxs_cnt[i] = static_cast<int>(_flatxs_stream_did.size()) - _flatxs_off[i];
     }
+}
+
+// ===========================================================================
+// WP23: the device branch-stream arm's host half
+// ===========================================================================
+//
+// src/FlatXsStreamKernel.h restates Chiffon's coordinate enumerators as plain
+// ints so that nvcc never has to parse Model.h (which reaches HighFive and
+// HDF5).  THIS is the one translation unit that legitimately sees both, so this
+// is where the restatement is held to the original.  A drift here would apply a
+// fitted coefficient to the wrong coordinate -- finite, plausible, wrong.
+namespace {
+namespace fss = rasbery::flatxs_stream;
+using Chiffon::SpectralCoordinate;
+static_assert(static_cast<int>(SpectralCoordinate::Density) == fss::kDensity, "");
+static_assert(static_cast<int>(SpectralCoordinate::LogDensity) == fss::kLogDensity, "");
+static_assert(static_cast<int>(SpectralCoordinate::ThermalWeighted) == fss::kThermalWeighted, "");
+static_assert(static_cast<int>(SpectralCoordinate::FastWeighted) == fss::kFastWeighted, "");
+static_assert(static_cast<int>(SpectralCoordinate::FluxRatioInteraction) ==
+                  fss::kFluxRatioInteraction, "");
+static_assert(static_cast<int>(SpectralCoordinate::SqrtDensity) == fss::kSqrtDensity, "");
+static_assert(static_cast<int>(SpectralCoordinate::SpectralIndex) == fss::kSpectralIndex, "");
+static_assert(static_cast<int>(SpectralCoordinate::SpectralIndexInteraction) ==
+                  fss::kSpectralIndexInteraction, "");
+static_assert(static_cast<int>(SpectralCoordinate::RelativeBurnRatio) ==
+                  fss::kRelativeBurnRatio, "");
+static_assert(static_cast<int>(SpectralCoordinate::BppmInteraction) == fss::kBppmInteraction, "");
+static_assert(static_cast<int>(SpectralCoordinate::TfulInteraction) == fss::kTfulInteraction, "");
+static_assert(static_cast<int>(SpectralCoordinate::DmodInteraction) == fss::kDmodInteraction, "");
+static_assert(static_cast<int>(SpectralCoordinate::LogDeviationSquared) ==
+                  fss::kLogDeviationSquared, "");
+static_assert(static_cast<int>(SpectralCoordinate::FissileFraction) == fss::kFissileFraction, "");
+static_assert(static_cast<int>(SpectralCoordinate::InverseRatio) == fss::kInverseRatio, "");
+static_assert(static_cast<int>(SpectralCoordinate::CubeRootRatio) == fss::kCubeRootRatio, "");
+static_assert(static_cast<int>(SpectralCoordinate::SaturatingRatio) == fss::kSaturatingRatio, "");
+static_assert(static_cast<int>(SpectralCoordinate::BppmRodAge) == fss::kBppmRodAge, "");
+static_assert(static_cast<int>(SpectralCoordinate::TfulRodAge) == fss::kTfulRodAge, "");
+static_assert(static_cast<int>(SpectralCoordinate::DmodRodAge) == fss::kDmodRodAge, "");
+static_assert(Chiffon::SPECTRAL_LOG_DENSITY_FLOOR == fss::kSpectralLogDensityFloor, "");
+static_assert(Chiffon::ROD_AGE_SCALE == fss::kRodAgeScale, "");
+static_assert(NUM_SCALAR_BRANCHES == fss::kNumScalarBranches, "");
+
+/// The one refusal that is a PROCESS property rather than a library property:
+/// XSSet::RodBlendWeight's two probe modes read RoddedPuFraction, which is not
+/// in the device body.  Refuse the arm rather than port a probe.
+bool flatxsStreamProbeBlocks() {
+    const char* env = std::getenv("CHIFFON_PROBE_BLEND");
+    if (env == nullptr) return false;
+    const std::string v(env);
+    return v == "pu" || v == "both";
+}
+} // namespace
+
+bool XSSet::FlatXsStreamEligible() {
+    if (_fss_state != 0) return _fss_state > 0;
+
+    auto refuse = [&](const std::string& why) {
+        _fss_state = -1;
+        std::cerr << "[RASBERY][WARN][flatxs.stream] RASBERY_GPU_FLATXS_STREAM set but "
+                     "this deck is not served: "
+                  << why << " -- XSSet::BuildFlatXsStream runs on the host\n";
+        return false;
+    };
+
+    if (!_lib) return refuse("the library is not loaded yet");
+    if (_g.ng() != xsrecon::NG || static_cast<int>(Isotope::niso) != xsrecon::NISO)
+        return refuse("deck shape (ng/niso) is outside the kernel's compile-time NG/NISO");
+    if (flatxsStreamProbeBlocks())
+        return refuse("CHIFFON_PROBE_BLEND selects a rod-blend probe the device body "
+                      "does not implement (RoddedPuFraction)");
+
+    const size_t nmodel = _lib->models.size();
+    if (nmodel == 0) return refuse("the library carries no models");
+    const int nxyz = _g.nxyz();
+
+    // --- 1. the corrections, concatenated over models ------------------------
+    _fss_model_sh_off.assign(nmodel + 1, 0);
+    _fss_iso.clear(); _fss_partner.clear(); _fss_coord.clear();
+    _fss_delta_base.clear(); _fss_rod_scaled.clear();
+    _fss_burn_off.clear(); _fss_burn_cnt.clear(); _fss_burnups.clear();
+    bool needs_branch_x = false;
+    for (size_t m = 0; m < nmodel; ++m) {
+        _fss_model_sh_off[m] = static_cast<int>(_fss_coord.size());
+        if (m >= _lib->lib_spectral_history.size()) continue;
+        for (const auto& c : _lib->lib_spectral_history[m]) {
+            const int coord = static_cast<int>(c.term.coordinate);
+            if (!fss::formImplemented(coord))
+                return refuse(std::string("coordinate form ") + fss::formName(coord) +
+                              " (" + std::to_string(coord) +
+                              ") has no device body; the arm is incremental by "
+                              "design and refuses BY NAME rather than approximating");
+            if (fss::branchAxisOf(coord) >= 0 || fss::rodAgeAxisOf(coord) >= 0)
+                needs_branch_x = true;
+            _fss_iso.push_back(static_cast<int>(c.term.isotope));
+            _fss_partner.push_back(c.term.partner >= Isotope::niso
+                                       ? static_cast<int>(Isotope::niso)
+                                       : static_cast<int>(c.term.partner));
+            _fss_coord.push_back(coord);
+            _fss_delta_base.push_back(static_cast<int>(c.delta_base));
+            _fss_rod_scaled.push_back(c.rod_scaled ? 1 : 0);
+            _fss_burn_off.push_back(static_cast<int>(_fss_burnups.size()));
+            _fss_burn_cnt.push_back(static_cast<int>(c.burnups.size()));
+            _fss_burnups.insert(_fss_burnups.end(), c.burnups.begin(), c.burnups.end());
+        }
+    }
+    _fss_model_sh_off[nmodel] = static_cast<int>(_fss_coord.size());
+
+    // --- 2. the ctype-0 reference trajectory, per model ----------------------
+    //
+    // ONLY ctype 0, and src/FlatXsStreamKernel.h's StreamLibView note says why:
+    // BuildFlatXsStream is called with the UNRODDED node list, so the host
+    // resolver's `currentCtype` is 0 for every node it will ever see.
+    _fss_key_off.assign(nmodel, 0);
+    _fss_key_cnt.assign(nmodel, 0);
+    _fss_present.assign(nmodel, 0);
+    _fss_model_ok.assign(nmodel, 1);
+    _fss_refr0_base.assign(nmodel, 0);
+    _fss_burn_stride.assign(nmodel, 0);
+    _fss_partner_model.assign(nmodel, -1);
+    _fss_keys.clear();
+    for (size_t m = 0; m < nmodel; ++m) {
+        _fss_burn_stride[m] = static_cast<long long>(
+            m < _lib->refr_burn_stride.size() ? _lib->refr_burn_stride[m] : 0);
+        _fss_partner_model[m] = m < _lib->lib_history_partner.size()
+                                    ? _lib->lib_history_partner[m]
+                                    : -1;
+        const int ci = (m < _lib->refr_ctyp.size()) ? findCtype(_lib->refr_ctyp[m], 0) : -1;
+        _fss_key_off[m] = static_cast<int>(_fss_keys.size());
+        if (ci < 0) continue; // findCtype(...) < 0: the host returns with no terms
+        if (m >= _lib->refr_burn.size() ||
+            static_cast<size_t>(ci) >= _lib->refr_burn[m].size()) {
+            _fss_model_ok[m] = 0;
+            continue;
+        }
+        _fss_present[m] = 1;
+        _fss_refr0_base[m] =
+            static_cast<long long>(_lib->refr_base[m]) +
+            static_cast<long long>(ci) * static_cast<long long>(_lib->refr_ctyp_stride[m]);
+        const auto& keys = _lib->refr_burn[m][static_cast<size_t>(ci)];
+        _fss_key_cnt[m] = static_cast<int>(keys.size());
+        _fss_keys.insert(_fss_keys.end(), keys.begin(), keys.end());
+    }
+
+    const size_t n_rows = _lib->lib_burn.size();
+    if (needs_branch_x && _lib->lib_ref_branch_x.size() < n_rows)
+        return refuse("a centered condition cross term is fitted but "
+                      "lib_ref_branch_x is shorter than the reference table");
+
+    // --- 3. the per-node slot bound ------------------------------------------
+    //
+    // A STATIC UPPER BOUND, so flatxs_stream::kRefusalCapacity is unreachable
+    // rather than unlikely: three scalar branches contribute at most four
+    // entries each (two brackets, own arm and twin arm), and each spectral term
+    // of each of the two passes contributes at most two.
+    int stride = 0;
+    for (size_t m = 0; m < nmodel; ++m) {
+        const int own = _fss_model_sh_off[m + 1] - _fss_model_sh_off[m];
+        int       twin = 0;
+        const int p = _fss_partner_model[m];
+        if (p >= 0 && static_cast<size_t>(p) < nmodel)
+            twin = _fss_model_sh_off[p + 1] - _fss_model_sh_off[p];
+        const int bound = 4 * NUM_SCALAR_BRANCHES + 2 * (own + twin);
+        if (bound > stride) stride = bound;
+    }
+    const int forced = rasberyGpuFlatXsStreamStride();
+    _fss_stride = forced > 0 ? forced : stride;
+    if (_fss_stride <= 0) return refuse("the computed per-node slot bound is zero");
+
+    // --- 4. the per-form census, counted from the library --------------------
+    //
+    // NODES whose library carries the form, not terms and not applications: it
+    // is the number a reader wants when asking "did this deck touch a form that
+    // makes the arm N1", and it costs one pass over `_comp` rather than an
+    // atomic per term per node per call.
+    {
+        std::vector<unsigned long long> per_model(nmodel, 0);
+        for (int l = 0; l < nxyz; ++l)
+            if (_comp[static_cast<size_t>(l)] < nmodel)
+                ++per_model[_comp[static_cast<size_t>(l)]];
+        fss::StreamTally& tally = fss::streamTally();
+        for (size_t m = 0; m < nmodel; ++m) {
+            std::array<bool, fss::kFormCount> seen{};
+            for (int c = _fss_model_sh_off[m]; c < _fss_model_sh_off[m + 1]; ++c) {
+                const int coord = _fss_coord[static_cast<size_t>(c)];
+                if (coord >= 0 && coord < fss::kFormCount) seen[coord] = true;
+            }
+            for (int f = 0; f < fss::kFormCount; ++f)
+                if (seen[f])
+                    tally.forms_hit[f].fetch_add(per_model[m], std::memory_order_relaxed);
+        }
+    }
+
+    _fss_comp.assign(static_cast<size_t>(nxyz), 0);
+    for (int l = 0; l < nxyz; ++l)
+        _fss_comp[static_cast<size_t>(l)] = static_cast<int>(_comp[static_cast<size_t>(l)]);
+
+    static std::atomic<unsigned long long> g_fss_lib_gen{0};
+    _fss_lib_generation = g_fss_lib_gen.fetch_add(1, std::memory_order_relaxed) + 1;
+    _fss_flat_ready = true;
+    _fss_state      = 1;
+    return true;
+}
+
+bool XSSet::MakeFlatXsStreamRequest(flatxs_stream::StreamRequest& req) {
+    if (!FlatXsStreamEligible()) return false;
+    const int    nxyz = _g.nxyz();
+    const size_t nx   = static_cast<size_t>(nxyz);
+    const int    ng   = _g.ng();
+
+    // The bracket tables are vector<vector<>> on the host; flatten them
+    // branch-major into the layout the device body indexes as
+    // [branch*nxyz + l].  ~150 K element copies against the ~1.0 s of resolver
+    // this replaces, and the shadow in the backend elides the upload when the
+    // bytes did not move.
+    const bool twin = !_node_delta_lo_p.empty();
+    _fss_dlo.resize(3 * nx);
+    _fss_dhi.resize(3 * nx);
+    _fss_frac.resize(3 * nx);
+    if (twin) {
+        _fss_dlo_p.resize(3 * nx);
+        _fss_dhi_p.resize(3 * nx);
+        _fss_frac_p.resize(3 * nx);
+    }
+    for (int b = 0; b < NUM_SCALAR_BRANCHES; ++b) {
+        std::copy(_node_delta_lo[b].begin(), _node_delta_lo[b].end(),
+                  _fss_dlo.begin() + static_cast<ptrdiff_t>(b) * nxyz);
+        std::copy(_node_delta_hi[b].begin(), _node_delta_hi[b].end(),
+                  _fss_dhi.begin() + static_cast<ptrdiff_t>(b) * nxyz);
+        std::copy(_node_delta_frac[b].begin(), _node_delta_frac[b].end(),
+                  _fss_frac.begin() + static_cast<ptrdiff_t>(b) * nxyz);
+        if (twin) {
+            std::copy(_node_delta_lo_p[b].begin(), _node_delta_lo_p[b].end(),
+                      _fss_dlo_p.begin() + static_cast<ptrdiff_t>(b) * nxyz);
+            std::copy(_node_delta_hi_p[b].begin(), _node_delta_hi_p[b].end(),
+                      _fss_dhi_p.begin() + static_cast<ptrdiff_t>(b) * nxyz);
+            std::copy(_node_delta_frac_p[b].begin(), _node_delta_frac_p[b].end(),
+                      _fss_frac_p.begin() + static_cast<ptrdiff_t>(b) * nxyz);
+        }
+    }
+    _fss_rodfrac.resize(nx);
+    _fss_tful.resize(nx);
+    for (int l = 0; l < nxyz; ++l) {
+        _fss_rodfrac[static_cast<size_t>(l)] = _g.rod_fraction(l);
+        _fss_tful[static_cast<size_t>(l)]    = _g.tful(l);
+    }
+
+    req = flatxs_stream::StreamRequest{};
+    req.lib.model_sh_off  = _fss_model_sh_off.data();
+    req.lib.sh_iso        = _fss_iso.data();
+    req.lib.sh_partner    = _fss_partner.data();
+    req.lib.sh_coord      = _fss_coord.data();
+    req.lib.sh_delta_base = _fss_delta_base.data();
+    req.lib.sh_rod_scaled = _fss_rod_scaled.data();
+    req.lib.sh_burn_off   = _fss_burn_off.data();
+    req.lib.sh_burn_cnt   = _fss_burn_cnt.data();
+    req.lib.sh_burnups    = _fss_burnups.data();
+    req.lib.refr0_key_off = _fss_key_off.data();
+    req.lib.refr0_key_cnt = _fss_key_cnt.data();
+    req.lib.refr0_present = _fss_present.data();
+    req.lib.refr0_keys    = _fss_keys.data();
+    req.lib.refr0_base    = _fss_refr0_base.data();
+    req.lib.refr_burn_stride = _fss_burn_stride.data();
+    req.lib.history_partner  = _fss_partner_model.data();
+    req.lib.model_ok         = _fss_model_ok.data();
+    req.lib.lib_iden         = _lib->lib_iden.data();
+    req.lib.lib_burn         = _lib->lib_burn.data();
+    req.lib.lib_ref_branch_x = _lib->lib_ref_branch_x.empty()
+                                   ? nullptr
+                                   : _lib->lib_ref_branch_x[0].data();
+    req.lib.nmodel = static_cast<int>(_lib->models.size());
+    req.lib.niso   = static_cast<int>(Isotope::niso);
+
+    req.shape.n_corr      = static_cast<long long>(_fss_coord.size());
+    req.shape.n_burnups   = static_cast<long long>(_fss_burnups.size());
+    req.shape.n_refr0_key = static_cast<long long>(_fss_keys.size());
+    req.shape.n_rows      = static_cast<long long>(_lib->lib_burn.size());
+    req.shape.n_iden      = static_cast<long long>(_lib->lib_iden.size());
+    req.shape.nmodel      = req.lib.nmodel;
+    req.lib_generation    = _fss_lib_generation;
+
+    req.nodes.comp    = _fss_comp.data();
+    req.nodes.burn    = _burn.data();
+    req.nodes.hw      = _node_hw.empty() ? nullptr : _node_hw.data();
+    req.nodes.rodfrac = _fss_rodfrac.data();
+    req.nodes.tful    = _fss_tful.data();
+    req.nodes.phif    = _g.Phif();
+    req.nodes.delta_lo     = _fss_dlo.data();
+    req.nodes.delta_hi     = _fss_dhi.data();
+    req.nodes.delta_frac   = _fss_frac.data();
+    req.nodes.delta_lo_p   = twin ? _fss_dlo_p.data() : nullptr;
+    req.nodes.delta_hi_p   = twin ? _fss_dhi_p.data() : nullptr;
+    req.nodes.delta_frac_p = twin ? _fss_frac_p.data() : nullptr;
+    req.nodes.ng      = ng;
+    req.nodes.i_pu239 = static_cast<int>(Isotope::iPu239);
+    req.nodes.i_b10   = static_cast<int>(Isotope::iB10);
+    req.stride        = _fss_stride;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -3256,7 +3569,8 @@ bool XSSet::FillCramMicDevice(const void** dev, void*& ready, int& elem_bytes) {
     return true;
 }
 
-bool XSSet::TryUpdateFlatXSGpu(const std::vector<int>& unrodded, bool any_rodded) {
+bool XSSet::TryUpdateFlatXSGpu(const std::vector<int>& unrodded, bool any_rodded,
+                               const flatxs_stream::StreamRequest* stream) {
     namespace fxs = flatxs;
     if (_g.ng() != xsrecon::NG || static_cast<int>(Isotope::niso) != xsrecon::NISO)
         return false;
@@ -3328,7 +3642,7 @@ bool XSSet::TryUpdateFlatXSGpu(const std::vector<int>& unrodded, bool any_rodded
     noteMacroXsWrite();
     if (!_xsrecon_backend->solveFlatXs(v, MakeFlatXsLibShape(), _micx_generation,
                                        _micx_generation + 1, _ref_generation,
-                                       _hoststate_generation, !any_rodded))
+                                       _hoststate_generation, !any_rodded, stream))
         return false;
 
     // WP15.  THE DEBT IS READ BACK FROM THE BACKEND, not assumed from the flag.
@@ -3385,14 +3699,78 @@ void XSSet::UpdateFlatXS(const XSUpdateOptions& options) {
             // the same values.
             for (int l : unrodded)
                 _node_wvfr[l] = _ref_wvfr[l];
-            BuildFlatXsStream(unrodded);
 
-            // A capture forces the CPU reference loop so the .out file is the
-            // ground truth the replay gate scores against.
+            // WP23.  THE ONE PLACE THE 1.0 s IS EITHER SPENT OR NOT.
+            //
+            // With the arm eligible the host resolver is not called at all --
+            // that is the whole saving, and it is why the flag has to be read
+            // here rather than inside BuildFlatXsStream, where the function
+            // would already have been entered.  A capture (RASBERY_FLATXS_DUMP)
+            // always takes the host path: the .in file's stream field IS the
+            // host resolution, and a capture of a device-built stream would be a
+            // capture of the thing under test.
             const bool dump_this = want_dump && rodded.empty();
+            fss::StreamRequest stream_req{};
+            const bool want_stream = rasberyGpuFlatXsStreamEnabled() && !dump_this &&
+                                     MakeFlatXsStreamRequest(stream_req);
+            if (rasberyGpuFlatXsStreamEnabled()) {
+                fss::StreamTally& tally = fss::streamTally();
+                tally.calls.fetch_add(1, std::memory_order_relaxed);
+                tally.nodes.fetch_add(unrodded.size(), std::memory_order_relaxed);
+            }
+            if (!want_stream) {
+                if (rasberyGpuFlatXsStreamEnabled()) {
+                    fss::StreamTally& tally = fss::streamTally();
+                    tally.host_calls.fetch_add(1, std::memory_order_relaxed);
+                    tally.host_fallback_nodes.fetch_add(unrodded.size(),
+                                                        std::memory_order_relaxed);
+                }
+                // The eligibility refusal names itself once, on stderr, in
+                // FlatXsStreamEligible; the GPU_FULL seam is HERE, adjacent to
+                // the call it is about, because that is where the host resolver
+                // actually runs.
+                RASBERY_GPU_FULL_GUARD_IF(
+                    rasberyGpuFlatXsStreamEnabled() && !dump_this, FlatXsStream,
+                    "XSSet::UpdateFlatXS",
+                    "the device stream arm is not eligible for this deck (see the "
+                    "[RASBERY][WARN][flatxs.stream] line for the named reason); "
+                    "the host resolver runs");
+                BuildFlatXsStream(unrodded);
+            }
+
             bool       gpu_ok    = false;
             if (rasberyGpuFlatXsEnabled() && !dump_this)
-                gpu_ok = TryUpdateFlatXSGpu(unrodded, !rodded.empty());
+                gpu_ok = TryUpdateFlatXSGpu(unrodded, !rodded.empty(),
+                                            want_stream ? &stream_req : nullptr);
+            // ONE RETRY, AND ONLY ON THE STREAM ARM.  A device stream phase that
+            // refused left the rest of the solve untouched, so the correct and
+            // cheap answer is to resolve on the host and go again -- NOT to fall
+            // through to the whole CPU reconstruction loop, which is 8,451 nodes
+            // of work for a refusal that cost one kernel.  The refusal is counted
+            // by reason so a run cannot look like an arm that never fired.
+            if (!gpu_ok && want_stream) {
+                fss::StreamTally& tally = fss::streamTally();
+                const int reason = _xsrecon_backend
+                                       ? _xsrecon_backend->flatXsStreamRefusal()
+                                       : fss::kRefusalNone;
+                tally.host_calls.fetch_add(1, std::memory_order_relaxed);
+                tally.host_fallback_nodes.fetch_add(unrodded.size(),
+                                                    std::memory_order_relaxed);
+                const std::string stream_why =
+                    std::string("XSSet::UpdateFlatXS: the device stream phase refused (") +
+                    fss::refusalName(reason) + "); the host resolver runs for this call";
+                std::cerr << "[RASBERY][WARN][flatxs.stream] " << stream_why << "\n";
+                // WP1 Sec 6.3.  Under RASBERY_GPU_FULL a stream arm that refuses
+                // every call must fail the case, not look exactly like an arm
+                // nobody set -- the answers are identical either way, and the
+                // 1.0 s is either paid or it is not.
+                RASBERY_GPU_FULL_GUARD_IF(true, FlatXsStream, "XSSet::UpdateFlatXS",
+                                          stream_why.c_str());
+                BuildFlatXsStream(unrodded);
+                gpu_ok = TryUpdateFlatXSGpu(unrodded, !rodded.empty(), nullptr);
+            } else if (gpu_ok && want_stream) {
+                fss::streamTally().device_calls.fetch_add(1, std::memory_order_relaxed);
+            }
 
             if (gpu_ok || dump_this) {
                 if (dump_this) {

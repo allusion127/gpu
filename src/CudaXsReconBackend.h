@@ -48,6 +48,10 @@ namespace flatxs {
 struct FlatXsView;
 }
 
+namespace flatxs_stream {
+struct StreamRequest;
+}
+
 namespace nodal {
 /// WP20.1: `NodalView` is an ALIAS now (NodalViewT<double>, src/NodalKernel.h),
 /// so it cannot be forward-declared as a struct -- the alias and the
@@ -236,7 +240,8 @@ public:
                      unsigned long long micx_generation,
                      unsigned long long micx_generation_next,
                      unsigned long long ref_generation,
-                     unsigned long long state_generation, bool mark_micx_resident);
+                     unsigned long long state_generation, bool mark_micx_resident,
+                     const flatxs_stream::StreamRequest* stream = nullptr);
 
     // --- WP15: the deferred micx/lmpx download (RASBERY_GPU_MICX_RESIDENT) --
     //
@@ -370,6 +375,15 @@ public:
     /// Same receipt for the flat-XS kernel (RASBERY_GPU_FLATXS).
     static unsigned long long flatXsNodesSolved();
 
+    // --- WP23: the branch stream, built where it is consumed ----------------
+    //
+    // The reason the LAST solveFlatXs declined the stream phase, as a
+    // flatxs_stream::Refusal ordinal (0 = it did not).  The caller reads it to
+    // attribute its fallback in the receipt, and a caller that ignored it would
+    // be reporting a fallback with no cause -- which is how an arm that never
+    // fires comes to look like an arm that was never set.
+    [[nodiscard]] int flatXsStreamRefusal() const;
+
     /// Run one nodal drive() (the five per-outer phases) on the device.
     /// Geometry tables upload once; the nine updateConstant arrays re-upload
     /// on `const_generation`; chif on `ref_generation`; the working arrays
@@ -377,10 +391,19 @@ public:
     /// when `state_generation` matches, else uploaded for this call (without
     /// advancing the residency -- iden may still be stale).  Per call: jnet
     /// and flux upload, jnet and phis download.  Fail-open to the CPU body.
+    ///
+    /// WP23: @p host_xsdf is the host `xsdf` column, and it is a PARAMETER
+    /// rather than a NodalView field on purpose.  Only RASBERY_GPU_NODAL_CONSTS
+    /// reads it -- the device constants kernel needs xsdf, which the view never
+    /// carried because nothing on the nodal critical path reads it -- and
+    /// growing the view would have put a new field through nodalWideShell, the
+    /// FP32 narrowing census and three replay tools for one optional arm.  Null
+    /// (the default) is "the arm cannot run", not an error.
     bool solveNodal(const nodal::NodalView& host,
                     unsigned long long const_generation,
                     unsigned long long ref_generation,
-                    unsigned long long state_generation);
+                    unsigned long long state_generation,
+                    const double* host_xsdf = nullptr);
 
     /// Hybrid tail: after the caller ran the host calculateEven on the
     /// arrays solveNodal downloaded, upload dsncff and finish with the jnet
@@ -596,6 +619,30 @@ bool rasberyGpuFlatXsEnabled();
 /// RASBERY_GPU_* flag must not acquire a device probe because a boron trial
 /// happened.  Stub builds return false.
 bool rasberyGpuSearchEnabled();
+
+/// RASBERY_GPU_FLATXS_STREAM, read once per process: WP23's device branch-stream
+/// resolver.  DEFAULT OFF, and it IS an arm knob -- the stream it builds is
+/// every unrodded node's cross section, so a bit that moves here moves the
+/// trajectory.  Stub builds return false.
+///
+/// It is a SUB-ARM of RASBERY_GPU_FLATXS and refuses on its own when that flag
+/// is off: there would be no device kernel for the stream to feed, and building
+/// a stream on the device to copy it back to a host loop is strictly worse than
+/// not building it there.
+bool rasberyGpuFlatXsStreamEnabled();
+
+/// Slots reserved per node by that arm (RASBERY_FLATXS_STREAM_STRIDE), and the
+/// contraction mask its three burnup lerps use (RASBERY_FLATXS_STREAM_FORMS,
+/// hex or decimal).  The mask is NOT MINED -- see src/FlatXsStreamReceipt.h.
+int      rasberyGpuFlatXsStreamStride();
+unsigned rasberyGpuFlatXsStreamForms();
+
+/// RASBERY_GPU_NODAL_CONSTS, read once per process: WP23 item 3's device
+/// computation of the nine SENM coefficient arrays, replacing their upload.
+/// DEFAULT OFF and CLASS N1 BY MEASUREMENT (CUDA exp vs glibc, 1 ulp on 3.34 %
+/// of arguments -- src/NodalConstantKernel.h), so it is an arm knob and is
+/// priced with Gate A/B.  Stub builds return false.
+bool rasberyGpuNodalConstsEnabled();
 
 /// RASBERY_GPU_MICX_RESIDENT, read once per process: WP15's deferred
 /// micx/lmpx download.  Default OFF until the 238 runbook in

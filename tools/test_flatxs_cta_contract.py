@@ -106,7 +106,7 @@ def body_of(text: str, start_marker: str, end_marker: str) -> str:
 # The two bodies being compared, sliced so a site in a neighbouring helper
 # cannot be mistaken for a site in the kernel.
 REF_BODY = body_of(REF, "inline void flatxsSolveNode(const FlatXsView& v, int i,",
-                   "/// Host-side helper for the NodeSpectralIndex")
+                   "/// Helper for the NodeSpectralIndex")
 CTA_BODY = body_of(CTA, "flatxsSolveNodeCta(const FlatXsView& v, int i,",
                    "/// One CTA per node.")
 # The delta-stream loop alone: P3's "no barriers in here" is about this region.

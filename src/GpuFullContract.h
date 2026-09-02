@@ -82,6 +82,16 @@ enum class Subsystem : int {
     // That is exactly the condition the GPU_FULL counters exist to tell apart.
     Th,
     Search,
+    // WP23.  The device branch-stream resolver and the device nodal constants.
+    // Both are subsystems on the same terms as Th and Search: each replaces a
+    // HOST producer of numbers a later phase of the same statepoint reads -- the
+    // branch/history coordinate stream every unrodded cross section is rebuilt
+    // from, and the nine SENM coefficients every nodal drive uses -- so an arm
+    // that refuses every call and an arm that was never set produce the same
+    // numbers and the same log.  Telling those two apart is what these counters
+    // are for.
+    FlatXsStream,
+    NodalConsts,
     Count
 };
 
@@ -96,6 +106,8 @@ inline const char* subsystemName(Subsystem s) {
         case Subsystem::Cram:   return "cram";
         case Subsystem::Th:     return "th";
         case Subsystem::Search: return "search";
+        case Subsystem::FlatXsStream: return "flatxs_stream";
+        case Subsystem::NodalConsts:  return "nodal_consts";
         case Subsystem::Count:  break;
     }
     return "unknown";

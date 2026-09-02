@@ -94,7 +94,8 @@ GUARD = "RASBERY_GPU_FULL_GUARD"
 header = read("src/GpuFullContract.h")
 check("enum class Subsystem" in header,
       "src/GpuFullContract.h does not declare the subsystem enum")
-for member in ("Cmfd", "Outer", "Nodal", "FlatXs", "Xe", "Ppr", "Cram"):
+for member in ("Cmfd", "Outer", "Nodal", "FlatXs", "Xe", "Ppr", "Cram",
+               "Th", "Search", "FlatXsStream", "NodalConsts"):
     check(re.search(rf"\b{member}\b", header) is not None,
           f"src/GpuFullContract.h: Subsystem is missing {member} (plan Sec 6.3)")
 check("class Violation" in header, "src/GpuFullContract.h declares no Violation type")
@@ -204,12 +205,23 @@ SEAMS = [
      "if (!ppr_on_device) {",
      "Ppr",
      "GPU PPR declined and the host reset+drive runs"),
+    # WP23.  The device nodal-CONSTANTS arm declines by declining the whole
+    # drive, so without its own guard at the same seam it is reported as "the
+    # nodal arm fell back" and the nine coefficient uploads quietly return.
+    ("src/Nodal.cpp",
+     "if (!TryDriveGpu())",
+     "NodalConsts",
+     "the device nodal-constants arm declined and the nine arrays are uploaded again"),
 ]
 
 # Every one of these tokens, wherever it appears, is a fallback: the CRAM
 # predictor/corrector seams and the three places the outer segment stops
 # delegating.  A count is not an allowlist -- each occurrence is checked.
 SEAM_TOKENS = [
+    # WP23.  Both host-resolver calls under the stream arm: the deck the arm
+    # cannot serve, and the call whose device phase refused.  Either one is
+    # 1.0 s of host work that the arm's whole claim is about not doing.
+    ("src/XSSet.cpp", "BuildFlatXsStream(unrodded);", "FlatXsStream", 2),
     ("src/XSSet.cpp", "++_cram_host_fallbacks;", "Cram", 2),
     ("src/Driver.h", "gpu_outer_armed = false;", "Outer", 3),
     ("src/Driver.h", "gpu::noteOuterSegmentRefusal(gpu_outer_why);", "Outer", 2),

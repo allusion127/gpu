@@ -3,6 +3,7 @@
 #include "CudaThBackend.h"
 #include "CudaXsReconBackend.h"
 #include "FlatXsKernel.h"
+#include "FlatXsStreamKernel.h" // WP23: the device branch-stream resolver's views
 #include "SearchKernel.h"
 // For xsrecon::NISO and xsrecon::BatchView: the device Xe entry points
 // below take a view by reference and size the depTrans rows from the
@@ -395,9 +396,51 @@ private:
     std::vector<flatxs::DeltaMeta>             _flatxs_deltas; // flattened _lib_deltas
     flatxs::FlatXsView MakeFlatXsHostView();
     FlatXsLibShape     MakeFlatXsLibShape() const;
+    /// WP23: ONE node's applications, the body BuildFlatXsStream's OpenMP loop
+    /// used to spell inline.  The device stream arm resolves the same sequence,
+    /// so the host side must have exactly one spelling of it.
+    void ResolveNodeApplications(int l, const flatxs::FlatXsView& hv,
+                                 std::vector<DeltaApplication>& apps) const;
     void               BuildFlatXsStream(const std::vector<int>& nodes);
     bool               TryUpdateFlatXSGpu(const std::vector<int>& unrodded,
-                                          bool any_rodded);
+                                          bool any_rodded,
+                                          const flatxs_stream::StreamRequest* stream);
+
+    // --- WP23: the device branch-stream arm (RASBERY_GPU_FLATXS_STREAM) -----
+    //
+    // THE ELIGIBILITY DECISION IS A HOST DECISION, TAKEN ONCE.  Every reason the
+    // device body can refuse -- an unimplemented coordinate form, a model whose
+    // reference trajectory did not flatten, a per-node slot count the stride
+    // cannot hold, the CHIFFON_PROBE_BLEND probe -- is a static property of the
+    // LIBRARY, not of a statepoint.  Deciding it up front means the refusal is
+    // named ONCE with a form name rather than discovered per node per call, and
+    // it means the kernel's own ladder is a check that must never fire rather
+    // than a routine path.
+    std::vector<int>       _fss_model_sh_off, _fss_iso, _fss_partner, _fss_coord;
+    std::vector<int>       _fss_delta_base, _fss_rod_scaled, _fss_burn_off, _fss_burn_cnt;
+    std::vector<int>       _fss_burnups, _fss_key_off, _fss_key_cnt, _fss_present;
+    std::vector<int>       _fss_keys, _fss_partner_model, _fss_model_ok;
+    std::vector<long long> _fss_refr0_base, _fss_burn_stride;
+    /// Branch-major flattenings of the per-branch bracket tables, which live as
+    /// vector<vector<>> on the host and must be contiguous to upload.
+    std::vector<int>       _fss_dlo, _fss_dhi, _fss_dlo_p, _fss_dhi_p;
+    std::vector<double>    _fss_frac, _fss_frac_p;
+    std::vector<int>       _fss_comp, _fss_burn;
+    std::vector<double>    _fss_rodfrac, _fss_tful;
+    /// 0 = not yet decided, 1 = eligible, -1 = refused (and said why once).
+    int  _fss_state  = 0;
+    int  _fss_stride = 0;
+    bool _fss_flat_ready = false;
+    /// Bumped once per flatten, process-wide, so the backend's "have I already
+    /// uploaded this library" test is an integer compare and not a pointer
+    /// identity that a recycled allocation could make lie.
+    unsigned long long _fss_lib_generation = 0;
+    /// Prepare (once) and answer whether this deck's library can be resolved on
+    /// the device.  Fills the flattened tables and the per-form census.
+    bool FlatXsStreamEligible();
+    /// Refresh the per-node columns that move with the statepoint and hand the
+    /// backend a request.  Returns false when the arm is not eligible.
+    bool MakeFlatXsStreamRequest(flatxs_stream::StreamRequest& req);
     /// @brief Blend weight toward the rodded-depletion twin, 0 when there is none.
     [[nodiscard]] double HistoryBlendWeight(int l) const {
         return _node_hw.empty() ? 0.0 : _node_hw[static_cast<size_t>(l)];
@@ -724,6 +767,10 @@ public:
     // Raw SoA pointers for the nodal device arm (same arrays the accessors
     // above index; chif may legitimately be absent).
     [[nodiscard]] const double* xsrfData() const { return _xs.xsrf.data(); }
+    /// WP23 item 3: the OTHER input of Nodal::updateConstant.  It has no place
+    /// in NodalView -- no nodal phase reads it -- so RASBERY_GPU_NODAL_CONSTS
+    /// takes it as a parameter of solveNodal instead of growing the view.
+    [[nodiscard]] const double* xsdfData() const { return _xs.xsdf.data(); }
     [[nodiscard]] const double* xsnfData() const { return _xs.xsnf.data(); }
     [[nodiscard]] const double* xssmData() const { return _xs.xssm.data(); }
     [[nodiscard]] const double* chifData() const {
