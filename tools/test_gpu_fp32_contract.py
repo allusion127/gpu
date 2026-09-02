@@ -642,6 +642,68 @@ for kernel in ("kernelFlatXsCta", "kernelFlatXsCtaF32"):
           "%s is a __launch_bounds__(T) kernel like its twin" % kernel)
 
 
+# 5b. THE WORKSPACE IS THE STATE; `v.iden` IS THE ANSWER.  THE ANSWER IS NEVER
+#     WRITTEN FROM THE STATE.
+#
+# The arm's whole claim is that it narrows the shared-memory WORKSPACE and
+# leaves the outputs alone -- section 4 of the doc says `xs`/`xs_ssm`/`iden`
+# stay double, and the struct rules above are what hold the workspace half of
+# it.  This is the other half, and it is not implied by them: `w` and `v.iden`
+# are BOTH in scope inside RefreshLightIsotopes, so `v.iden[..] = w.iden[..]`
+# type-checks, reads as a copy, and is a float round-trip on this arm.
+#
+# It is worth saying WHICH rounding, because the arm already declares one.  The
+# A2 analysis in src/FlatXsCtaKernel.cuh is about the delta-stream accumulator
+# `dst[e] = scale*val + dst[e]` re-rounding to float per entry.  These three
+# rows are pure products with no delta stream at all, they are not in that
+# analysis, and the array they land in is the FP64 authority CRAM reads as
+# `x.iden_in` and XSSet materialises on the host.  The B-10 row is the quantity
+# the critical-boron search drives and the quantity CRAM depletes.  So the
+# shape is fixed: form the row in a NAMED DOUBLE, store that double to the
+# authority, then convert the same local into the workspace for the macro fold.
+# Both refresh sites obey it -- the untiled flatxsSolveNodeCta and the WP21-B2
+# tiled flatxsSolveTileCta -- which is what the counts of 2 are.
+IDEN_ROWS = (("IH1", "nden_h1"), ("IB10", "nden_b10"), ("IO16", "nden_o16"))
+
+
+def rule_iden_authority_is_published_wide(cta: str) -> bool:
+    flat = re.sub(r"\s+", " ", strip_comments(cta))
+    # (a) no row of the authority may be written FROM the workspace, in either
+    #     body's spelling (`w.iden[..]` untiled, `w[j].iden[..]` tiled).
+    if re.search(r"v\.iden\s*\[[^\]]*\]\s*=\s*w\s*(\[[^\]]*\]\s*)?\.\s*iden\s*\[",
+                 flat) is not None:
+        return False
+    for row, local in IDEN_ROWS:
+        # (b) the row is formed in a double local, once per body.
+        if flat.count("const double %s =" % local) != 2:
+            return False
+        # (c) and THAT local is what the authority gets, once per body.
+        if flat.count("v.iden[%s * nxyz + l] = %s;" % (row, local)) != 2:
+            return False
+        # (d) and the workspace gets the SAME local, so the two cannot drift
+        #     into two different expressions of the same density.
+        if flat.count("w.iden[%s] = %s;" % (row, local)) != 1:
+            return False
+        if flat.count("w[j].iden[%s] = %s;" % (row, local)) != 1:
+            return False
+    return True
+
+
+check(rule_iden_authority_is_published_wide(CTA),
+      "both RefreshLightIsotopes sites in src/FlatXsCtaKernel.cuh publish H-1, "
+      "B-10 and O-16 to `v.iden` from a DOUBLE local and only then convert into "
+      "the workspace.  `v.iden[..] = w.iden[..]` would route the authoritative "
+      "FP64 densities through the float workspace -- silently, with no receipt "
+      "field, no finite check and no fallback -- and the B-10 row is what the "
+      "critical-boron search drives and what CRAM depletes")
+check(re.search(r"double\s+iden\[NISO\];", FXK) is not None
+      and re.search(r"v\.iden\[IB10 \* nxyz \+ l\]\s*=\s*iden\[IB10\];", FXK)
+          is not None,
+      "and the thread-per-node reference still publishes the same three rows "
+      "from its own `double iden[NISO]` -- if IT narrowed, the CTA arm would be "
+      "matching the wrong thing")
+
+
 def rule_narrow_defaults_off(cta: str) -> bool:
     """Every caller that predates the arm -- the replay gate included -- must
     keep launching exactly the kernel it launched before.
@@ -1297,6 +1359,19 @@ NEGATIVES: list[tuple[str, object]] = [
     ("the count moves off the arm and onto the extension",
      lambda: rule_declined_is_counted(
          CRAM.replace("rasbery::fp32::armed()", "_impl->fp32_pole"))),
+    ("the untiled body publishes an iden row FROM the float workspace again",
+     lambda: rule_iden_authority_is_published_wide(
+         CTA + "\n  v.iden[IB10 * nxyz + l] = w.iden[IB10];\n")),
+    ("the TILED body publishes an iden row from the float workspace",
+     lambda: rule_iden_authority_is_published_wide(
+         CTA + "\n  v.iden[IH1 * nxyz + l] = w[j].iden[IH1];\n")),
+    ("the density local stops being double",
+     lambda: rule_iden_authority_is_published_wide(
+         CTA.replace("const double nden_b10", "const float nden_b10"))),
+    ("the workspace copy drifts to its own expression of the same density",
+     lambda: rule_iden_authority_is_published_wide(
+         CTA.replace("w.iden[IH1]             = nden_h1;",
+                     "w.iden[IH1]             = 2.0 * nH2O;"))),
 ]
 for label, probe in NEGATIVES:
     checks += 1

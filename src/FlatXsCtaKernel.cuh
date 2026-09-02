@@ -320,12 +320,33 @@ __device__ inline void flatxsSolveNodeCta(const FlatXsView& v, int i,
     if (tid == 0) {
         const double nH2O       = v.dmod[l] * v.wvfr[l] * WATER_NUMBER_DENSITY;
         const double boron_dmod = fxsBoronDmod(v, l);
-        w.iden[IH1]             = 2.0 * nH2O;
-        w.iden[IO16]            = nH2O;
-        w.iden[IB10] = boron_dmod * v.wvfr[l] * v.bppm[l] * BORON_DENSITY_FACTOR;
-        v.iden[IH1 * nxyz + l]  = w.iden[IH1];
-        v.iden[IB10 * nxyz + l] = w.iden[IB10];
-        v.iden[IO16 * nxyz + l] = w.iden[IO16];
+        // FORM IN DOUBLE, PUBLISH THE DOUBLE, THEN CONVERT INTO THE WORKSPACE.
+        // The order matters and it is the ONLY thing that does here.  `v.iden`
+        // is the FP64 AUTHORITY -- the shared XS device block CRAM reads as
+        // `x.iden_in` and the host XSSet readers materialise -- while `w` is the
+        // shared-memory workspace, and that workspace is `float` on the WP20
+        // arm.  Publishing a row as `v.iden[..] = w.iden[..]` would therefore
+        // round-trip it through the arm's element type and quantise the
+        // authority to float: ~9 decimal digits gone from every node's H-1,
+        // B-10 and O-16 number density.  The B-10 row is the quantity the
+        // critical-boron search drives and the quantity CRAM depletes, and NONE
+        // of the three is covered by the arm's A2 rounding analysis above --
+        // that analysis is about `dst[e] = scale*val + dst[e]` in the delta
+        // stream, and these are pure products with no delta stream at all.  The
+        // thread-per-node reference (src/FlatXsKernel.h) holds them in a local
+        // `double iden[NISO]` for exactly this reason; these three locals are
+        // that local, one row at a time.  The FP64 arm is unmoved: `w.iden` is
+        // double there and receives the same bits it received before.
+        const double nden_h1  = 2.0 * nH2O;
+        const double nden_o16 = nH2O;
+        const double nden_b10 =
+            boron_dmod * v.wvfr[l] * v.bppm[l] * BORON_DENSITY_FACTOR;
+        v.iden[IH1 * nxyz + l]  = nden_h1;
+        v.iden[IB10 * nxyz + l] = nden_b10;
+        v.iden[IO16 * nxyz + l] = nden_o16;
+        w.iden[IH1]             = nden_h1;
+        w.iden[IO16]            = nden_o16;
+        w.iden[IB10]            = nden_b10;
     }
 
     // --- 4. Scatter the workspace back to the SoA arrays (plain copies) ----
@@ -674,12 +695,19 @@ __device__ inline void flatxsSolveTileCta(const FlatXsView& v, int i0,
         const int    l          = sh_l[j];
         const double nH2O       = v.dmod[l] * v.wvfr[l] * WATER_NUMBER_DENSITY;
         const double boron_dmod = fxsBoronDmod(v, l);
-        w[j].iden[IH1]          = 2.0 * nH2O;
-        w[j].iden[IO16]         = nH2O;
-        w[j].iden[IB10] = boron_dmod * v.wvfr[l] * v.bppm[l] * BORON_DENSITY_FACTOR;
-        v.iden[IH1 * nxyz + l]  = w[j].iden[IH1];
-        v.iden[IB10 * nxyz + l] = w[j].iden[IB10];
-        v.iden[IO16 * nxyz + l] = w[j].iden[IO16];
+        // Same rule as the untiled body, and it is a rule about WHICH ARRAY IS
+        // THE ANSWER, not about the tiling: the authority is published in
+        // double and only the workspace copy narrows.  See flatxsSolveNodeCta.
+        const double nden_h1  = 2.0 * nH2O;
+        const double nden_o16 = nH2O;
+        const double nden_b10 =
+            boron_dmod * v.wvfr[l] * v.bppm[l] * BORON_DENSITY_FACTOR;
+        v.iden[IH1 * nxyz + l]  = nden_h1;
+        v.iden[IB10 * nxyz + l] = nden_b10;
+        v.iden[IO16 * nxyz + l] = nden_o16;
+        w[j].iden[IH1]          = nden_h1;
+        w[j].iden[IO16]         = nden_o16;
+        w[j].iden[IB10]         = nden_b10;
     }
 
     // Publish the workspace and sh_iden: the scatter and the macro rebuild
