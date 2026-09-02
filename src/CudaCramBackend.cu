@@ -697,8 +697,14 @@ struct CramBackend::Impl {
         // RASBERY_GPU_CRAM=1 in the production arm this is the second
         // instance of the CudaPprBackend.cu gap, found by the same scan.
         rasbery::AllocWindow _alloc_window("cram.shape.standup");
-        cudaError_t rc = cudaStreamCreate(&stream);
-        if (rc != cudaSuccess) return fail("cudaStreamCreate", rc);
+        // WP19.2: cudaStreamNonBlocking.  This stream is never captured, but a
+        // LEGACY-BLOCKING stream is joined by -- and joins -- the NULL stream
+        // process-wide, which is precisely the coupling that invalidates a
+        // sibling lane's in-flight capture.  Two of the tree's three blocking
+        // streams were the PPR WHILE's own; this was the third, and leaving it
+        // behind would leave the contract test a permanent exception.
+        cudaError_t rc = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+        if (rc != cudaSuccess) return fail("cudaStreamCreateWithFlags", rc);
         if ((rc = cudaEventCreate(&ev_start)) != cudaSuccess) return fail("cudaEventCreate", rc);
         if ((rc = cudaEventCreate(&ev_stop)) != cudaSuccess) return fail("cudaEventCreate", rc);
 

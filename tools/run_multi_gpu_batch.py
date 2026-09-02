@@ -983,6 +983,58 @@ CAPTURE_RACE_EVENT = re.compile(
 # `[EVALUATOR] {` with WHITESPACE after the tag -- the once-per-process receipt.
 # The wave/case/refused tags are each followed by `[`, so this cannot match one.
 EVALUATOR_PROCESS = re.compile(r"\[RASBERY\]\[EVALUATOR\]\s+(\{.*\})")
+# WP19.2.  The worker's own crash record, printed by src/CrashReport.h's signal
+# handler straight to fd 2 -- which this dispatcher already merges into the
+# child's pipe (`stderr=subprocess.STDOUT`), so no new plumbing carries it.
+# Block 38's two SIGSEGVs produced a FATAL record whose entire content was
+# `completed:0`; these three patterns are what turns the next one into a case
+# id, a lane, a slot, a phase and a frame list.
+CRASH_RECORD = re.compile(r"\[RASBERY\]\[CRASH\]\s*(\{.*\})")
+CRASH_FRAME = re.compile(r"\[RASBERY\]\[CRASH\]\[FRAME\]")
+CRASH_END = re.compile(r"\[RASBERY\]\[CRASH\]\[END\]\s*(\{.*\})")
+
+#: How many trailing lines of a dead child's output the FATAL record keeps.
+#: Big enough for a 64-frame backtrace plus the record that introduces it, and
+#: small enough that a chunk full of [WARN][th] lines cannot bury it.
+CRASH_TAIL_LINES = 120
+
+
+def crash_evidence(text: str) -> dict:
+    """What a dead child said on its way out, as a JSON-able dict.
+
+    THREE FIELDS, AND WHY NOT ONE.  `crash` is the structured record the handler
+    printed (case, lane, slot, phase, deck, capture_open) -- the thing an
+    analyst greps for.  `backtrace` is the frame list, kept verbatim because a
+    symbol line is evidence and reformatting it loses the offsets.
+    `stderr_tail` is the raw tail REGARDLESS of whether a crash record exists,
+    because the failure mode this exists to close is precisely the one where
+    the child said something nobody kept -- an OOM killer note, a CUDA error, a
+    glibc `free(): invalid pointer`, or nothing at all, which is itself a fact.
+    """
+    lines = [line for line in text.splitlines() if line.strip()]
+    tail = lines[-CRASH_TAIL_LINES:]
+    records: list[dict] = []
+    for match in CRASH_RECORD.finditer(text):
+        record = _json_or_none(match.group(1))
+        if record is not None:
+            records.append(record)
+    frames: list[str] = []
+    capturing = False
+    for line in lines:
+        if CRASH_END.search(line):
+            capturing = False
+            continue
+        if CRASH_FRAME.search(line):
+            capturing = True
+            continue
+        if capturing:
+            frames.append(line)
+    evidence: dict = {"stderr_tail": tail}
+    if records:
+        evidence["crash"] = records
+    if frames:
+        evidence["backtrace"] = frames
+    return evidence
 
 
 def _json_or_none(text: str) -> dict | None:
@@ -1838,6 +1890,14 @@ def _run_wave_chunk(
             "requeued": bool(unfinished) and attempt == 1,
             "restarts": session.restarts,
         }
+        # WP19.2.  THE RESTART RECORD KEEPS WHAT THE DEAD CHILD SAID.  Block
+        # 38's two SIGSEGVs were unreconstructable not because the worker was
+        # silent but because this record threw its last words away: `outcome.text`
+        # was appended to `texts` for the throughput scrape and never looked at
+        # again, and the FATAL line -- the one thing a reader greps -- carried
+        # `completed:0` and nothing else.  A crashed worker's tail belongs ON
+        # the record that says it crashed.
+        record.update(crash_evidence(outcome.text))
         result.fatal_waves.append(record)
         print("[RASBERY][MULTI_GPU][EVALUATOR][FATAL] "
               + json.dumps(record, separators=(",", ":")))

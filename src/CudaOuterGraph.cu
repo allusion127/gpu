@@ -106,6 +106,7 @@
 // vocabulary (CmfdSweepProbeSink::Accum), so the runner has to see it.
 #include "CudaBICGBackend.h"
 
+#include "CrashReport.h"
 #include "CudaTransferMirror.h"
 #include "GpuCaptureArbiter.h"
 #include "GpuGraphSplice.h"
@@ -944,6 +945,12 @@ bool CudaOuterSegment::initialize(const DeviceArenaView& arena, int slot_count, 
     _impl->arena      = arena;
     _impl->slot_count = slot_count;
     _impl->slot       = slot;
+    // WP19.2.  THE ONE FACT THE EVALUATOR'S CRASH RECORD CANNOT SUPPLY.  Its
+    // [ERROR] receipts print `"slot":-1` because the server layer never learns
+    // the arena slot; this runner is fixed to one at initialize() and never
+    // re-aimed, so this is the earliest honest place to say which.  A no-op on
+    // a thread with no case open (single-shot mode, ctest).
+    rasbery::crash::noteSlot(slot);
 
     // A PARTIAL initialise MUST NOT KEEP ITS ALLOCATIONS.  The runner is
     // unavailable either way, so nothing will ever free them through the normal

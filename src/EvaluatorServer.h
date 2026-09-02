@@ -94,6 +94,7 @@
 #include "BatchRefill.h"
 #include "CaseFidelity.h"
 #include "CohortContext.h"
+#include "CrashReport.h"
 #include "CudaXsReconBackend.h"
 #include "Driver.h"
 #include "GpuDeviceBlockPool.h"
@@ -1000,6 +1001,16 @@ public:
     /// nonzero if any case failed or any request was refused, because a
     /// generation that silently lost four candidates is not a generation.
     int run() {
+        // WP19.2.  BEFORE THE FIRST REQUEST, because a worker that dies with no
+        // record is exactly what block 38's two SIGSEGVs were: `completed:0`,
+        // no [CASE] receipt, no core (ulimit -c 0, coredumpctl unreadable), and
+        // a forensic dead end.  The handler costs five sigaction calls and one
+        // warm-up backtrace() at stand-up and nothing at all afterwards; it
+        // re-raises, so the dispatcher still sees returncode -11.  This is the
+        // worker's entry point, which is why it is installed here and not in
+        // main.cpp: every batch process the dispatcher starts comes through
+        // `--evaluator-jsonl`.
+        rasbery::crash::install();
         RequestStream stream(_options.request_path, _options.idle_timeout_s);
         if (!stream.ok()) {
             _out << "[RASBERY][EVALUATOR][FAIL] {\"what\":\"cannot open request stream\","
@@ -1501,6 +1512,16 @@ private:
 #endif
             lanes[static_cast<std::size_t>(i)] = lane;
             refill::ledger().jobStarted(i, lane);
+            // WP19.2.  The four facts a SIGSEGV record needs, published before
+            // the case runs and cleared by the Scope's destructor.
+            const rasbery::crash::Scope _crumb(
+                lane, i, jobs.inputs[static_cast<std::size_t>(i)].c_str(),
+                rasbery::crash::kPhaseDrive);
+            // WP19.2.  The capture-race counter across THIS case.  See
+            // captureRaceEvents(): the belt below is no longer first-case-only,
+            // because the PPR WHILE's graph cache dies with the Driver and its
+            // build window therefore opens on every case, not on a lane's first.
+            const unsigned long long races_before = rasbery::captureRaceEvents();
             runOneCase(jobs.inputs[static_cast<std::size_t>(i)],
                        jobs.outputs[static_cast<std::size_t>(i)],
                        jobs.modes[static_cast<std::size_t>(i)],
@@ -1517,7 +1538,10 @@ private:
                                        : 0u;
             const bool lane_first_case = lane_first[li] != 0;
             lane_first[li] = 0;
-            retryAfterCaptureRace(wave.wave_id, i, lane, lane_first_case,
+            const bool race_spanned =
+                rasbery::captureRaceEvents() != races_before;
+            _crumb.phase(rasbery::crash::kPhaseRetry);
+            retryAfterCaptureRace(wave.wave_id, i, lane, lane_first_case, race_spanned,
                                   jobs.inputs[static_cast<std::size_t>(i)],
                                   jobs.outputs[static_cast<std::size_t>(i)],
                                   jobs.modes[static_cast<std::size_t>(i)],
@@ -1922,11 +1946,20 @@ private:
             Driver::CaseReceipt receipt;
             double              seconds  = 0.0;
             double              teardown = 0.0;
+            // WP19.2: the same two lines as the wave path, for the same two
+            // reasons -- a crash record that names the case, and a capture-race
+            // delta that is not a guess about which case can be corrupted.
+            const rasbery::crash::Scope _crumb(lane, job.index, job.deck.c_str(),
+                                               rasbery::crash::kPhaseDrive);
+            const unsigned long long    races_before = rasbery::captureRaceEvents();
             runOneCase(job.deck, job.output, job.mode, job.warm_from, job.warm_save,
                        job.fidelity, status, failure, receipt, seconds, teardown);
             const bool lane_first_case = lane_first;
             lane_first                 = false;
+            const bool race_spanned    = rasbery::captureRaceEvents() != races_before;
+            _crumb.phase(rasbery::crash::kPhaseRetry);
             retryAfterCaptureRace(_roll.session, job.index, lane, lane_first_case,
+                                  race_spanned,
                                   job.deck, job.output, job.mode, job.warm_from,
                                   job.warm_save, job.fidelity, status, failure, receipt,
                                   seconds, teardown);
@@ -2171,13 +2204,35 @@ private:
     /// arena slot is released, whole-struct reset and audited between the two
     /// runs -- the same door a refill goes through.
     void retryAfterCaptureRace(long long wave_id, int index, int lane,
-                               bool lane_first_case, const std::string& deck,
+                               bool lane_first_case, bool race_spanned,
+                               const std::string& deck,
                                const std::string& output, ResultMode mode,
                                const std::string& warm_from, const std::string& warm_save,
                                const CaseFidelity& fidelity, int& status,
                                std::string& failure, Driver::CaseReceipt& receipt,
                                double& seconds, double& teardown_ms) {
-        if (status == 0 || !lane_first_case || !captureRaceCorruptionSuspect(failure))
+        // WP19.2.  THE HOLE THIS OR CLOSES, AND WHY IT IS AN OR AND NOT A
+        // REPLACEMENT.
+        //
+        // WP19.1 gated on `lane_first_case` alone, reasoning that the graph
+        // caches a build feeds are per-slot and process-lived.  That is true of
+        // the outer WHILE's cache; it is NOT true of the PPR WHILE's.
+        // `s.graph_valid` lives on the PprBackend, the PprBackend lives on the
+        // Driver, and the Driver lives for exactly one case -- which is why
+        // every [RASBERY][PPR_GPU] receipt in the block-38 logs reads
+        // `"graph_builds":1`, once per case rather than once per lane.  A
+        // capture race can therefore corrupt a lane's EIGHTH case, and on 238
+        // run3 proc5 it did: candidate_0060, case 8, lane 5, preceded by a
+        // second `ppr.while` EndCapture(root)/901 retry on tid 1 -- and the
+        // first-case-only belt never fired.
+        //
+        // `race_spanned` is the honest widening: the process's capture-race
+        // counter moved WHILE THIS CASE RAN.  In a quiet process it is always
+        // false, so this cannot launder a physics failure into a lucky rerun --
+        // which is the property the first-case rule was protecting and which is
+        // kept here by a measurement instead of by a proxy.
+        if (status == 0 || (!lane_first_case && !race_spanned) ||
+            !captureRaceCorruptionSuspect(failure))
             return;
         _capture_race_case_retries.fetch_add(1, std::memory_order_relaxed);
         {
@@ -2185,7 +2240,13 @@ private:
             line << "[RASBERY][EVALUATOR][CAPTURE_RACE] {\"wave_id\":" << wave_id
                  << ",\"case\":" << index << ",\"lane\":" << lane
                  << ",\"deck\":" << detail::quoted(deck)
-                 << ",\"lane_first_case\":true,\"error\":" << detail::quoted(failure)
+                 // WP19.2: no longer a constant.  The two reasons the belt can
+                 // fire are now different facts and the receipt says which one
+                 // did -- a `race_spanned` retry on a lane's fifth case is the
+                 // evidence WP19.1's log could not produce.
+                 << ",\"lane_first_case\":" << (lane_first_case ? "true" : "false")
+                 << ",\"race_spanned\":" << (race_spanned ? "true" : "false")
+                 << ",\"error\":" << detail::quoted(failure)
                  << ",\"action\":\"retry_once_clean_slot\","
                  << rasbery::captureArbiterProvenance() << "}";
             // BOTH streams, for the same reason the [ERROR] line takes both:
@@ -2219,6 +2280,8 @@ private:
         line << "[RASBERY][EVALUATOR][CAPTURE_RACE][RESULT] {\"wave_id\":" << wave_id
              << ",\"case\":" << index << ",\"lane\":" << lane
              << ",\"deck\":" << detail::quoted(deck)
+             << ",\"lane_first_case\":" << (lane_first_case ? "true" : "false")
+             << ",\"race_spanned\":" << (race_spanned ? "true" : "false")
              << ",\"recovered\":" << (retry_status == 0 ? "true" : "false")
              << ",\"error\":"
              << (retry_failure.empty() ? std::string("null") : detail::quoted(retry_failure))

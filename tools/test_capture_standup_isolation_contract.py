@@ -59,6 +59,29 @@ So the rules:
      private: Driver.h adopts the arena stream only on the SOLO arm.
   6. THE STRING THE LOUD PATH MATCHES is the string the tree throws.
 
+WP19.2 ADDS TWO MORE, and they are what block 38 (0054838, six 8xM16 runs)
+turned up.  Every capture-race receipt in all six runs -- five of them -- reads
+`"tag":"ppr.while"`.  Not one reads `outer.while`.  The reason is one flag:
+
+  7. EVERY STREAM IN src/ IS cudaStreamNonBlocking.  `cudaStreamCreate` makes a
+     LEGACY-BLOCKING stream, one that implicitly synchronises with the NULL
+     stream process-wide.  Three of them existed, and two were the PPR WHILE's
+     own root and body streams -- so while that capture was open, ANY thread's
+     default-stream work implicitly joined it and CUDA invalidated the capture,
+     which is the 901-at-EndCapture(root) signature every one of those receipts
+     carries.  The arbiter cannot serialise that away: a NULL-stream launch is
+     not an AllocWindow site.  The fix is the flag, and this rule holds it.
+
+  8. THE LOUD PATH IS NOT FIRST-CASE-ONLY ANY MORE.  WP19.1 gated on
+     `lane_first_case` because the graph caches it reasoned about are per-slot
+     and process-lived.  The PPR WHILE's is not -- it lives on the Driver, so
+     the [PPR_GPU] receipts read `"graph_builds":1` for EVERY case -- and 238
+     run3 proc5 lost candidate_0060 as case 8 on lane 5, after a second
+     `ppr.while` 901 retry, with the belt structurally unable to fire.  The
+     widening is a MEASUREMENT and not a proxy: the process capture-race
+     counter is snapshotted across each case, and a case that SPANNED a race is
+     retried too.  In a quiet process the delta is zero and nothing changes.
+
 Every rule is re-run against a MUTATED copy that breaks it (the negative
 controls at the bottom); a check that cannot fail is not a check.
 
@@ -330,6 +353,19 @@ def check_first_case_loud_path(files: dict[str, str]) -> list[str]:
         bad.append("retryAfterCaptureRace's early return does not read "
                    "lane_first_case -- a lane's LATER case replays a graph the "
                    "first one built, so retrying it launders physics into luck")
+    # WP19.2: and the OR that lets a NON-first case in when the process actually
+    # raced.  Without it the belt cannot see a ppr.while race, whose build
+    # window opens on every case rather than on a lane's first.
+    if "!race_spanned" not in guard:
+        bad.append("retryAfterCaptureRace's early return does not read "
+                   "race_spanned -- the PPR WHILE rebuilds its graph on EVERY "
+                   "case, so a first-case-only belt cannot see the race that "
+                   "killed 238 run3's candidate_0060 (case 8, lane 5)")
+    if "&&" not in guard:
+        bad.append("retryAfterCaptureRace's gate is not "
+                   "(!lane_first_case && !race_spanned) -- the two reasons have to "
+                   "be an OR of causes, i.e. an AND of their negations, or the "
+                   "second one can never fire")
     if "captureRaceCorruptionSuspect(" not in body:
         bad.append("retryAfterCaptureRace retries on any failure, not on the "
                    "non-finite signature")
@@ -354,6 +390,63 @@ def check_first_case_loud_path(files: dict[str, str]) -> list[str]:
         if ('\\"%s\\":' % term) not in ev:
             bad.append("src/EvaluatorServer.h: the process receipt does not report "
                        "%s" % term)
+    # WP19.2.  The delta is TAKEN, in both lane loops, and the receipt says
+    # which of the two reasons fired.
+    if ev.count("rasbery::captureRaceEvents()") < 4:
+        bad.append("src/EvaluatorServer.h snapshots captureRaceEvents() %d time(s); "
+                   "the wave path and the rolling path each need a before and an "
+                   "after" % ev.count("rasbery::captureRaceEvents()"))
+    if '\\"race_spanned\\":' not in ev:
+        bad.append("src/EvaluatorServer.h: the CAPTURE_RACE receipt does not say "
+                   "which of the two reasons fired -- a race_spanned retry on a "
+                   "lane's fifth case is the evidence WP19.1's log could not "
+                   "produce")
+    if 'lane_first_case\\":true' in ev.replace(" ", ""):
+        bad.append("src/EvaluatorServer.h prints lane_first_case as a constant "
+                   "true; it is now a fact about the case and not a precondition")
+    if "captureRaceEvents" not in files["GpuCaptureArbiter.h"]:
+        bad.append("GpuCaptureArbiter.h exposes no captureRaceEvents() -- the "
+                   "evaluator has nothing to take a delta of")
+    return bad
+
+
+# ---------------------------------------------------------------------------
+# rule 7 (WP19.2) -- no legacy-blocking stream anywhere in src/
+# ---------------------------------------------------------------------------
+
+#: `cudaStreamCreate(` with no `WithFlags`: the default flag is
+#: cudaStreamDefault, i.e. a stream that implicitly synchronises with the legacy
+#: NULL stream across the whole process.
+BLOCKING_CREATE = re.compile(r"\bcudaStreamCreate\s*\(")
+
+
+def check_streams_are_nonblocking(files: dict[str, str]) -> list[str]:
+    """Every stream in src/, not only this contract's TARGETS list.
+
+    WHY THE WHOLE TREE.  The defect is not "the PPR capture stream was
+    blocking"; it is "a blocking stream anywhere is joined by every NULL-stream
+    operation anywhere, and any capture open at that moment dies".  A rule that
+    covered only the two streams that happened to be captured in block 38 would
+    be re-broken by the next backend that creates one.
+    """
+    bad: list[str] = []
+    hits = 0
+    for name in sorted(os.listdir(SRC)):
+        if not name.endswith((".cu", ".cuh", ".h", ".cpp")):
+            continue
+        code = files.get(name) or read(os.path.join(SRC, name))
+        for line in strip_comments(code).splitlines():
+            if BLOCKING_CREATE.search(line):
+                hits += 1
+                bad.append("src/%s: %s -- a LEGACY-BLOCKING stream.  It implicitly "
+                           "synchronises with the NULL stream process-wide, so any "
+                           "capture open anywhere dies with 901 the moment any "
+                           "thread touches the default stream.  Use "
+                           "cudaStreamCreateWithFlags(..., cudaStreamNonBlocking)."
+                           % (name, line.strip()[:90]))
+    if hits == 0 and "cudaStreamNonBlocking" not in "".join(files.values()):
+        bad.append("no cudaStreamNonBlocking anywhere in the checked sources -- "
+                   "this rule has lost its subject")
     return bad
 
 
@@ -419,6 +512,7 @@ CHECKS = (
     ("a lane's first case is loud and retried once", check_first_case_loud_path),
     ("the shared arena stream stays out of a captured body", check_shared_stream_not_captured),
     ("the loud path matches the thrown message", check_nonfinite_spelling),
+    ("every stream in src/ is non-blocking", check_streams_are_nonblocking),
 )
 
 
@@ -457,12 +551,25 @@ def controls(files: dict[str, str]):
          mutate(files, "GpuCaptureArbiter.h",
                 '"[RASBERY][CUDA][CAPTURE_RACE][RETRY] {\\"tag\\":\\""',
                 '"[RASBERY][CUDA][CAPTURE_RACE][RETRYX] {\\"tag\\":\\""')),
-        ("the loud path drops its first-case gate",
+        ("the loud path drops its gate entirely",
          check_first_case_loud_path,
          mutate(files, "EvaluatorServer.h",
-                "if (status == 0 || !lane_first_case || "
-                "!captureRaceCorruptionSuspect(failure))",
-                "if (status == 0 || !captureRaceCorruptionSuspect(failure))")),
+                "if (status == 0 || (!lane_first_case && !race_spanned) ||",
+                "if (status == 0 ||")),
+        # WP19.2's OWN regression, put back: the belt narrows to first-case-only
+        # again and 238 run3's candidate_0060 dies unretried.
+        ("the loud path narrows back to first-case-only",
+         check_first_case_loud_path,
+         mutate(files, "EvaluatorServer.h",
+                "if (status == 0 || (!lane_first_case && !race_spanned) ||",
+                "if (status == 0 || !lane_first_case ||")),
+        # THE CHANNEL ITSELF, put back: the WHILE root becomes legacy-blocking
+        # again and every NULL-stream op in the process can invalidate it.
+        ("the PPR WHILE root goes back to a blocking stream",
+         check_streams_are_nonblocking,
+         mutate(files, "CudaPprBackend.cu",
+                "cudaStreamCreateWithFlags(&s.graph_root_stream,",
+                "cudaStreamCreate(&s.graph_root_stream, ")),
         ("the loud path retries in a loop",
          check_first_case_loud_path,
          mutate(files, "EvaluatorServer.h",

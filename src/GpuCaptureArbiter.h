@@ -299,6 +299,31 @@ inline void noteCaptureRaceAbandoned(const char* tag, const char* stage, int cud
     std::cerr << line.str() << std::endl;
 }
 
+/// WP19.2.  HOW MANY CAPTURE-RACE EVENTS HAS THIS PROCESS SEEN, EVER.
+///
+/// WHY A SINGLE NUMBER AND NOT A PREDICATE.  The evaluator's belt (WP19.1)
+/// asked "is this a lane's first case", because the graph caches it was
+/// reasoning about are per-slot and process-lived.  The PPR WHILE's cache is
+/// NOT: `s.graph_valid` lives on the PprBackend, which lives on the Driver,
+/// which lives for exactly one case -- the PPR_GPU receipts say `graph_builds:1`
+/// for EVERY case, not for a lane's first.  So a build window, and with it a
+/// capture race, opens on every case, and a first-case-only belt structurally
+/// cannot see the ones that do not.  It did not: 238 run3 proc5's
+/// candidate_0060 was case 8 on lane 5, preceded by a second `ppr.while`
+/// EndCapture(root)/901 retry, and was never retried.
+///
+/// The honest replacement is a DELTA, not a heuristic: snapshot this counter
+/// before a case and after it, and a case that spans a capture-race event is
+/// the case that may have been corrupted by one.  It cannot launder a real
+/// physics failure, because in a quiet process the delta is zero and the belt
+/// never fires.
+inline unsigned long long captureRaceEvents() {
+    const auto& s = captureArbiterStats();
+    return s.capture_race_retry.load(std::memory_order_relaxed) +
+           s.capture_race_abandoned.load(std::memory_order_relaxed) +
+           s.capture_race_unrecovered.load(std::memory_order_relaxed);
+}
+
 /// The arbiter's standing-up provenance, as one compact JSON object body.
 ///
 /// WP19.1.  Printed beside a first-case death so the receipt that says WHAT

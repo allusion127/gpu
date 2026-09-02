@@ -1567,8 +1567,24 @@ struct PprBackend::Impl {
         // name GPU 0 for every slot in a multi-GPU batch.
         cudaGetDevice(&device);
 
-        cudaError_t rc = cudaStreamCreate(&stream);
-        if (rc != cudaSuccess) return fail("cudaStreamCreate", rc);
+        // WP19.2, AND THIS FLAG IS THE WHOLE RESIDUAL RACE.  `cudaStreamCreate`
+        // makes a LEGACY-BLOCKING stream: one that implicitly synchronises with
+        // the NULL stream, process-wide.  This stream is the WHILE's
+        // `body_stream` (buildPprWhile does BeginCaptureToGraph on it), so while
+        // it is capturing, ANY thread's NULL-stream work implicitly joins it,
+        // CUDA answers that thread cudaErrorStreamCaptureImplicit and
+        // INVALIDATES this capture -- surfacing here as 901
+        // (cudaErrorStreamCaptureInvalidated) at EndCapture.  The arbiter cannot
+        // serialise that away: a default-stream launch is not an AllocWindow
+        // site.  Every other stream in this tree is already
+        // cudaStreamNonBlocking (CudaOuterGraph.cu:967/2894,
+        // CudaXsReconBackend.cu:1266/2845, GpuPhysicsArenaCuda.cu:136,
+        // CudaBICGBackend.cu:4081), which is exactly why `outer.while` has never
+        // appeared in a capture-race receipt and `ppr.while` is the only tag
+        // that ever has.  tools/test_capture_standup_isolation_contract.py holds
+        // the whole tree to the non-blocking spelling.
+        cudaError_t rc = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+        if (rc != cudaSuccess) return fail("cudaStreamCreateWithFlags", rc);
         if ((rc = cudaEventCreate(&ev_start)) != cudaSuccess) return fail("cudaEventCreate", rc);
         if ((rc = cudaEventCreate(&ev_stop)) != cudaSuccess) return fail("cudaEventCreate", rc);
 
@@ -2143,9 +2159,17 @@ bool PprBackend::resetAndDrive(const ppr::GeomView& geom, const ppr::StepView& s
                     // WP19.  Stream creation is a stand-up call like any other
                     // and it happens once, on the first statepoint -- the same
                     // window the PPR buffers are allocated in.
+                    //
+                    // WP19.2: cudaStreamNonBlocking, not the default.  This is
+                    // the stream the WHILE ROOT is captured on; a legacy-
+                    // blocking root is joined by every NULL-stream operation in
+                    // the process and the capture dies at EndCapture(root) with
+                    // 901.  Same flag, same reason, as the body stream above and
+                    // as CudaOuterGraph.cu:2894's root.
                     rasbery::AllocWindow _alloc_window("ppr.graph.root_stream");
-                    if ((rc = cudaStreamCreate(&s.graph_root_stream)) != cudaSuccess)
-                        return s.fail("cudaStreamCreate(graph root)", rc);
+                    if ((rc = cudaStreamCreateWithFlags(&s.graph_root_stream,
+                                                        cudaStreamNonBlocking)) != cudaSuccess)
+                        return s.fail("cudaStreamCreateWithFlags(graph root)", rc);
                 }
                 const char* stage = "?";
                 cudaGraph_t root  = nullptr;
