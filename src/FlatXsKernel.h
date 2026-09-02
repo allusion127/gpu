@@ -166,6 +166,44 @@ struct FlatXsView {
     double* xs_ssm;
     double* iden;
 
+    // -------------------------------------------------------------------
+    // WP20.1: THE NARROW (float) TWIN OF THE FOUR micx/lmpx BLOCKS
+    // -------------------------------------------------------------------
+    //
+    // RASBERY_GPU_FP32 (src/GpuFp32Arm.h) narrows the four blocks this kernel
+    // reads its reference state from and writes its live state to.  They are
+    // THE measured bandwidth carrier of this backend: 59.5 MB per solve of
+    // resident block, ~8.7 GB of residual D2H on a single KNGR run and ~2 GB
+    // per case in a batch, plus the reference re-upload on every branch
+    // rebuild.  Halving the ELEMENT halves every one of those.
+    //
+    // WHY A PARALLEL POINTER GROUP AND A RUNTIME FLAG rather than a templated
+    // view.  The block width and the CTA WORKSPACE width are two different
+    // decisions and must be able to disagree: the thread-per-node reference
+    // arm (kernelFlatXs) keeps its 7,388 B of per-thread LOCAL workspace in
+    // double -- that is what it is the reference FOR -- while still having to
+    // write whatever the blocks are.  A single template parameter would have
+    // tied them together and made the reference arm unreachable under the arm.
+    // The flag is BLOCK-UNIFORM and loop-invariant at every site below, so it
+    // costs a predicate, not divergence; what it buys is that both arms and
+    // both bodies are compiled from ONE text and cannot drift.
+    //
+    // xs / xs_ssm / iden are NOT here and that is deliberate: they are the
+    // macroscopic answer the nodal drive, the CMFD operator and the host all
+    // read as the FP64 authority, and they are 2 % of these bytes.
+    const float* ref_lmp_f[N_ACTIVE];
+    const float* ref_lsm_f;
+    const float* ref_mic_f[N_ACTIVE];
+    const float* ref_msm_f;
+    float*       lmp_f[N_ACTIVE];
+    float*       lsm_f;
+    float*       mic_f[N_ACTIVE];
+    float*       msm_f;
+    /// 1 = the `_f` pointers above are the authority and the `double*` ones
+    /// are null.  DEFAULTS TO 0 through the `FlatXsView v{}` every builder in
+    /// the tree uses, which is what the feature-off byte identity rests on.
+    int narrow_blocks;
+
     // per-node inputs
     const double* wvfr; ///< _node_wvfr, already refreshed to _ref_wvfr by the host
     const double* dmod;
@@ -198,6 +236,58 @@ RASBERY_XSR_HD inline double fxsBoronDmod(const FlatXsView& v, int l) {
     return v.use_average_dmod ? v.boron_dmod_average : v.dmod[l];
 }
 
+// ---------------------------------------------------------------------------
+// WP20.1: THE EIGHT SITES WHERE THE BLOCK WIDTH IS ALLOWED TO MATTER
+// ---------------------------------------------------------------------------
+//
+// Every read of a reference block and every write of a live block in this
+// tree -- the thread-per-node body below, the CTA body in
+// src/FlatXsCtaKernel.cuh -- goes through one of these eight, and NOTHING
+// ELSE names `v.ref_mic` / `v.mic` / `v.lmp` / `v.msm` / `v.lsm` inside a
+// kernel.  That is the property tools/test_gpu_fp32_contract.py holds: a
+// ninth spelling would be a second opinion about which block is authoritative
+// and would read the wide block on the narrow arm -- garbage that is finite,
+// plausible and wrong.
+//
+// THE ARITHMETIC IS UNCHANGED.  A load widens to double and every operation
+// downstream is the double it always was; a store rounds once, at the same
+// place `CtaWorkspaceF32` already rounds.  This is the "narrow the STATE,
+// keep the OPERATIONS" split the arm claims, and it is why the FormBit census
+// (F_ACC_LMP, F_MACRO_SCAL, ...) is untouched: the contraction sites still see
+// double operands, so the mined masks still describe the code that runs.
+//
+// The index expression is passed in ALREADY COMPUTED and as an `int`, exactly
+// as the call sites spelled it before, so the addressing arithmetic is the
+// same instruction sequence on both arms.
+RASBERY_XSR_HD inline double fxsRefLmp(const FlatXsView& v, int t, int e) {
+    return v.narrow_blocks ? static_cast<double>(v.ref_lmp_f[t][e]) : v.ref_lmp[t][e];
+}
+RASBERY_XSR_HD inline double fxsRefLsm(const FlatXsView& v, int e) {
+    return v.narrow_blocks ? static_cast<double>(v.ref_lsm_f[e]) : v.ref_lsm[e];
+}
+RASBERY_XSR_HD inline double fxsRefMic(const FlatXsView& v, int t, int e) {
+    return v.narrow_blocks ? static_cast<double>(v.ref_mic_f[t][e]) : v.ref_mic[t][e];
+}
+RASBERY_XSR_HD inline double fxsRefMsm(const FlatXsView& v, int e) {
+    return v.narrow_blocks ? static_cast<double>(v.ref_msm_f[e]) : v.ref_msm[e];
+}
+RASBERY_XSR_HD inline void fxsStoreLmp(const FlatXsView& v, int t, int e, double x) {
+    if (v.narrow_blocks) v.lmp_f[t][e] = static_cast<float>(x);
+    else                 v.lmp[t][e]   = x;
+}
+RASBERY_XSR_HD inline void fxsStoreLsm(const FlatXsView& v, int e, double x) {
+    if (v.narrow_blocks) v.lsm_f[e] = static_cast<float>(x);
+    else                 v.lsm[e]   = x;
+}
+RASBERY_XSR_HD inline void fxsStoreMic(const FlatXsView& v, int t, int e, double x) {
+    if (v.narrow_blocks) v.mic_f[t][e] = static_cast<float>(x);
+    else                 v.mic[t][e]   = x;
+}
+RASBERY_XSR_HD inline void fxsStoreMsm(const FlatXsView& v, int e, double x) {
+    if (v.narrow_blocks) v.msm_f[e] = static_cast<float>(x);
+    else                 v.msm[e]   = x;
+}
+
 /// One unrodded node: the full UpdateUnroddedNodeXS body minus what the host
 /// already did (wvfr refresh, delta resolution).  Workspace layout and pass
 /// order match the CPU function statement for statement.
@@ -215,14 +305,14 @@ RASBERY_XSR_HD inline void flatxsSolveNode(const FlatXsView& v, int i,
     // 1. Gather the reference state into the workspace (plain copies).
     for (int t = 0; t < N_ACTIVE; ++t)
         for (int ig = 0; ig < NG; ++ig)
-            bl[t * NG + ig] = v.ref_lmp[t][ig * nxyz + l];
+            bl[t * NG + ig] = fxsRefLmp(v, t, ig * nxyz + l);
     for (int sm = 0; sm < NLSM; ++sm)
-        bls[sm] = v.ref_lsm[sm * nxyz + l];
+        bls[sm] = fxsRefLsm(v, sm * nxyz + l);
     for (int t = 0; t < N_ACTIVE; ++t)
         for (int e = 0; e < NMIC; ++e)
-            bm[t * NMIC + e] = v.ref_mic[t][e * nxyz + l];
+            bm[t * NMIC + e] = fxsRefMic(v, t, e * nxyz + l);
     for (int e = 0; e < NMSM; ++e)
-        bms[e] = v.ref_msm[e * nxyz + l];
+        bms[e] = fxsRefMsm(v, e * nxyz + l);
 
     // 2. Apply the resolved delta stream in CPU call order.
     const int s0 = v.node_off[i];
@@ -307,14 +397,14 @@ RASBERY_XSR_HD inline void flatxsSolveNode(const FlatXsView& v, int i,
     // 4. Scatter the workspace back to the SoA arrays (plain copies).
     for (int t = 0; t < N_ACTIVE; ++t)
         for (int ig = 0; ig < NG; ++ig)
-            v.lmp[t][ig * nxyz + l] = bl[t * NG + ig];
+            fxsStoreLmp(v, t, ig * nxyz + l, bl[t * NG + ig]);
     for (int sm = 0; sm < NLSM; ++sm)
-        v.lsm[sm * nxyz + l] = bls[sm];
+        fxsStoreLsm(v, sm * nxyz + l, bls[sm]);
     for (int t = 0; t < N_ACTIVE; ++t)
         for (int e = 0; e < NMIC; ++e)
-            v.mic[t][e * nxyz + l] = bm[t * NMIC + e];
+            fxsStoreMic(v, t, e * nxyz + l, bm[t * NMIC + e]);
     for (int e = 0; e < NMSM; ++e)
-        v.msm[e * nxyz + l] = bms[e];
+        fxsStoreMsm(v, e * nxyz + l, bms[e]);
 
     // 5. Rebuild this node's macroscopic XS from the workspace.  The CPU
     //    reads _iden from memory here; rows 0..2 of the local copy hold
@@ -363,7 +453,7 @@ inline double flatxsProbeMicElement(const FlatXsView& v, int l, int t, int e,
                                     const int* dids, const double* xs_,
                                     const double* scales, int count,
                                     const POL& pol) {
-    double acc = v.ref_mic[t][e * v.nxyz + l];
+    double acc = fxsRefMic(v, t, e * v.nxyz + l);
     if (!v.has_coeff_micx) return acc;
     for (int s = 0; s < count; ++s) {
         const int    did   = dids[s];

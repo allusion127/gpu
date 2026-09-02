@@ -146,7 +146,35 @@ struct RuntimeForms {
 ///   jnet/phis:             arr[ls*NG + ig]
 ///   xs arrays:             arr[ig*nxyz + lk]  (SoA, shared with the xs arms)
 ///   xssm:                  arr[(igs*NG + ige)*nxyz + lk]
-struct NodalView {
+/// WP20.1: `ValueT` IS THE NARROWED HALF OF THIS VIEW, AND ONLY THAT HALF.
+///
+/// Under RASBERY_GPU_FP32 (src/GpuFp32Arm.h) the nodal drive own state -- the
+/// nine updateConstant products, the four cross-section inputs, and the twelve
+/// private working arrays -- is float.  Everything else here stays `double`
+/// and each exclusion is a REASON, not an oversight:
+///
+///   hmesh / albedo    geometry, `nxyz*NDIR + NDIR*NLR` elements, uploaded
+///                     ONCE per run.  Narrowing them saves 200 KB and buys a
+///                     conversion of a table nothing re-sends.
+///   flux / jnet / phis
+///                     THE CANONICAL STATE (src/GpuCanonicalState.h).  In
+///                     shared mode these three pointers ARE the CMFD backend
+///                     buffers, and Geometry::Jnet / Phif are the D2H
+///                     destinations.  Narrowing them would break the
+///                     byte-sharing that makes canonical mode a pointer swap
+///                     instead of a copy, and would trip HostPinRegistry rule
+///                     that one host base is pinned at one width by every arm.
+///   reigv / reigv_dev the eigenvalue.  FP64 for the reason CMFD one is
+///                     (src/GpuFp32Arm.h): k_eff is judged at pcm and one ULP
+///                     of a bare float near 1.0 is ~12 pcm.
+///
+/// So the split is the one the rest of this arm makes -- narrow the STATE,
+/// keep the OPERATIONS -- and it is why every body below still computes in
+/// `double` and every mined NODAL_FORMS contraction site still sees double
+/// operands.  A float load widens at the read; a double result rounds at the
+/// write, once, exactly where CtaWorkspaceF32 rounds.
+template <class ValueT>
+struct NodalViewT {
     // geometry (immutable; device copy uploaded once)
     const double* hmesh;   // [lk*NDIR + dir]
     const int*    lktosfc; // [(lk*NDIR + dir)*NLR + side]
@@ -156,37 +184,42 @@ struct NodalView {
     const int*    sgnlr;   // [ls*NLR + side]
     const double* albedo;  // [dir*NLR + side]
 
-    // xs inputs (device-resident via the shared backend block)
-    const double* xsrf; // [ig*nxyz + lk]
-    const double* xsnf;
-    const double* xssm; // [(igs*NG+ige)*nxyz + lk]
-    const double* chif; // [ig*nxyz + lk]; ignored when chif_empty
+    // xs inputs.  On the FP64 arm these alias the flat-XS / CMFD device block
+    // directly.  Under RASBERY_GPU_FP32 they are the drive OWN narrowed copy,
+    // written once per drive by the boundary kernel in
+    // CudaXsReconBackend.cu -- because the producer of those bytes (the
+    // macroscopic rebuild) stays FP64 and its block may not be narrowed under
+    // it.
+    const ValueT* xsrf; // [ig*nxyz + lk]
+    const ValueT* xsnf;
+    const ValueT* xssm; // [(igs*NG+ige)*nxyz + lk]
+    const ValueT* chif; // [ig*nxyz + lk]; ignored when chif_empty
     int           chif_empty;
 
     // updateConstant products (host-computed, uploaded on generation change)
-    const double* eta1;
-    const double* eta2;
-    const double* m260;
-    const double* m251;
-    const double* m253;
-    const double* m262;
-    const double* m264;
-    const double* diagD;
-    const double* diagDI;
+    const ValueT* eta1;
+    const ValueT* eta2;
+    const ValueT* m260;
+    const ValueT* m251;
+    const ValueT* m253;
+    const ValueT* m262;
+    const ValueT* m264;
+    const ValueT* diagD;
+    const ValueT* diagDI;
 
     // device-resident working arrays
-    double* trlcff0;
-    double* trlcff1;
-    double* trlcff2;
-    double* mu;
-    double* tau;
-    double* matM;
-    double* matMI;
-    double* matMs;
-    double* matMf;
-    double* dsncff2;
-    double* dsncff4;
-    double* dsncff6;
+    ValueT* trlcff0;
+    ValueT* trlcff1;
+    ValueT* trlcff2;
+    ValueT* mu;
+    ValueT* tau;
+    ValueT* matM;
+    ValueT* matMI;
+    ValueT* matMs;
+    ValueT* matMf;
+    ValueT* dsncff2;
+    ValueT* dsncff4;
+    ValueT* dsncff6;
 
     // per-call inputs/outputs
     const double* flux; // phif
@@ -233,6 +266,62 @@ struct NodalView {
     int                 halt_slot = 0;
 };
 
+/// A NON-DEDUCED SPELLING OF `NodalViewT<T>`, and it exists for exactly one
+/// reason.
+///
+/// The phase kernels take the view TWICE: once by value as `base`, and once as
+/// the per-slot table `views`, which the per-instance arm passes as `nullptr`.
+/// With both spelled `NodalViewT<VT>` the compiler tries to deduce VT from a
+/// `std::nullptr_t` too, fails, and rejects every non-batched launch in the
+/// tree.  Routing the second one through this alias makes it a NON-DEDUCED
+/// context: VT comes from `base` alone and `nullptr` simply converts, which is
+/// what it did before the view became a template.
+template <class ValueT>
+struct NodalViewOf {
+    using type = NodalViewT<ValueT>;
+};
+
+/// THE FP64 VIEW KEEPS ITS NAME.  Every host caller, every replay tool, every
+/// signature outside the FP32 arm still says `NodalView` and still means
+/// exactly what it meant -- which is what makes the feature-off arm textual
+/// rather than argued.
+using NodalView    = NodalViewT<double>;
+/// WP20.1's narrow twin.  Same field names, same layout order, half the state.
+using NodalViewF32 = NodalViewT<float>;
+
+/// The half of a view that is NOT narrowed, copied from the FP64 host view.
+///
+/// The narrow arm cannot write `NodalViewF32 v = host;` -- the types differ --
+/// so this is the one place the non-narrowed fields are enumerated, and the
+/// contract test counts them against `NodalViewT`'s own declaration.  Getting
+/// this list wrong is the failure mode that matters here: a field silently
+/// left null is a kernel reading address zero, and a field silently left at
+/// the HOST pointer is a kernel reading host memory.  Both fail loudly; a
+/// field left at a stale DEVICE pointer would not, which is why nothing in
+/// this function is conditional.
+template <class ValueT>
+RASBERY_XSR_HD inline NodalViewT<ValueT> nodalWideShell(const NodalView& h) {
+    NodalViewT<ValueT> v{};
+    v.hmesh      = h.hmesh;
+    v.lktosfc    = h.lktosfc;
+    v.neib       = h.neib;
+    v.lklr       = h.lklr;
+    v.idirlr     = h.idirlr;
+    v.sgnlr      = h.sgnlr;
+    v.albedo     = h.albedo;
+    v.chif_empty = h.chif_empty;
+    v.flux       = h.flux;
+    v.jnet       = h.jnet;
+    v.phis       = h.phis;
+    v.reigv      = h.reigv;
+    v.reigv_dev  = h.reigv_dev;
+    v.nxyz       = h.nxyz;
+    v.nsurf      = h.nsurf;
+    v.halt       = h.halt;
+    v.halt_slot  = h.halt_slot;
+    return v;
+}
+
 /// Rebase a batch arena's SLOT-0 view onto slot `m`.
 ///
 /// The arena (CudaXsReconBackend.cu) allocates every per-instance array as one
@@ -250,7 +339,8 @@ struct NodalView {
 /// whole bit-identity argument for the batched launches -- thread (lk, ig) of
 /// slot m executes the identical instruction sequence on the identical bytes
 /// that the per-instance launch executed for that instance.
-RASBERY_XSR_HD inline NodalView nodalSlotView(NodalView v, int m) {
+template <class ValueT>
+RASBERY_XSR_HD inline NodalViewT<ValueT> nodalSlotView(NodalViewT<ValueT> v, int m) {
     const long long s   = m;
     const long long nx  = v.nxyz;
     const long long ns  = v.nsurf;
@@ -295,12 +385,14 @@ RASBERY_XSR_HD inline NodalView nodalSlotView(NodalView v, int m) {
     return v;
 }
 
-// Accessor helpers mirroring the Nodal.cpp macros.
-RASBERY_XSR_HD inline double nvTrl0(const NodalView& v, int ig, int lkd) { return v.trlcff0[lkd * NG + ig]; }
-RASBERY_XSR_HD inline double nvMatM(const NodalView& v, int i, int j, int lk) { return v.matM[lk * NG2 + j * NG + i]; }
-RASBERY_XSR_HD inline double nvMatMI(const NodalView& v, int i, int j, int lk) { return v.matMI[lk * NG2 + j * NG + i]; }
-RASBERY_XSR_HD inline double nvMu(const NodalView& v, int i, int j, int lkd) { return v.mu[lkd * NG2 + j * NG + i]; }
-RASBERY_XSR_HD inline double nvTau(const NodalView& v, int i, int j, int lkd) { return v.tau[lkd * NG2 + j * NG + i]; }
+// Accessor helpers mirroring the Nodal.cpp macros.  They return `double` on
+// BOTH arms: a float load widens here and every arithmetic site downstream is
+// the double it always was.
+template <class VT> RASBERY_XSR_HD inline double nvTrl0(const NodalViewT<VT>& v, int ig, int lkd) { return v.trlcff0[lkd * NG + ig]; }
+template <class VT> RASBERY_XSR_HD inline double nvMatM(const NodalViewT<VT>& v, int i, int j, int lk) { return v.matM[lk * NG2 + j * NG + i]; }
+template <class VT> RASBERY_XSR_HD inline double nvMatMI(const NodalViewT<VT>& v, int i, int j, int lk) { return v.matMI[lk * NG2 + j * NG + i]; }
+template <class VT> RASBERY_XSR_HD inline double nvMu(const NodalViewT<VT>& v, int i, int j, int lkd) { return v.mu[lkd * NG2 + j * NG + i]; }
+template <class VT> RASBERY_XSR_HD inline double nvTau(const NodalViewT<VT>& v, int i, int j, int lkd) { return v.tau[lkd * NG2 + j * NG + i]; }
 
 // ---------------------------------------------------------------------------
 // Phase caltrlcff0 (per node): products, divides and adds only -- no
@@ -313,7 +405,8 @@ RASBERY_XSR_HD inline double nvTau(const NodalView& v, int i, int j, int lkd) { 
 // calls it in the original ig order so the host/replay path is textually the
 // same math in the same order, while the device launches lk*NG+ig threads.
 // ---------------------------------------------------------------------------
-RASBERY_XSR_HD inline void nodalTrlcff0Group(const NodalView& v, int lk, int ig) {
+template <class VT>
+RASBERY_XSR_HD inline void nodalTrlcff0Group(const NodalViewT<VT>& v, int lk, int ig) {
     const int lkd0 = lk * NDIR;
     double    avgjnet[NDIR];
 
@@ -328,7 +421,8 @@ RASBERY_XSR_HD inline void nodalTrlcff0Group(const NodalView& v, int lk, int ig)
     v.trlcff0[(lkd0 + C_ZDIR) * NG + ig] = avgjnet[C_XDIR] + avgjnet[C_YDIR];
 }
 
-RASBERY_XSR_HD inline void nodalTrlcff0(const NodalView& v, int lk) {
+template <class VT>
+RASBERY_XSR_HD inline void nodalTrlcff0(const NodalViewT<VT>& v, int lk) {
     for (int ig = 0; ig < NG; ig++)
         nodalTrlcff0Group(v, lk, ig);
 }
@@ -348,8 +442,8 @@ RASBERY_XSR_HD inline void nodalTrlcff0(const NodalView& v, int lk) {
 // same cells.  lkl/lkr/lkd move inside the cell: integer index loads only, no
 // floating-point site is added, removed or reordered.
 // ---------------------------------------------------------------------------
-template <class POL>
-RASBERY_XSR_HD inline void nodalTrlcff12Cell(const NodalView& v, int lk, int idir,
+template <class VT, class POL>
+RASBERY_XSR_HD inline void nodalTrlcff12Cell(const NodalViewT<VT>& v, int lk, int idir,
                                              int ig, const POL& pol) {
     const int lkd = lk * NDIR + idir;
 
@@ -382,8 +476,13 @@ RASBERY_XSR_HD inline void nodalTrlcff12Cell(const NodalView& v, int lk, int idi
     }
 
     // --- trlcffbyintg, inlined verbatim ---
-    double& out1 = v.trlcff1[lkd * NG + ig];
-    double& out2 = v.trlcff2[lkd * NG + ig];
+    // `auto&`, not `double&`: WP20.1 made the workspace element type a
+    // parameter of the view.  These are the two ELEMENTS the phase writes, so
+    // the reference has to be to the stored type; the arithmetic that produces
+    // the value below is still double either way, and the rounding happens
+    // once, at the assignment, exactly as CtaWorkspaceF32 rounds.
+    auto& out1 = v.trlcff1[lkd * NG + ig];
+    auto& out2 = v.trlcff2[lkd * NG + ig];
     double  sh[4];
     const double rh =
         (1 / ((hmesh3[C_LEFT] + hmesh3[C_CENTER] + hmesh3[C_RIGHT]) *
@@ -414,15 +513,15 @@ RASBERY_XSR_HD inline void nodalTrlcff12Cell(const NodalView& v, int lk, int idi
     }
 }
 
-template <class POL>
-RASBERY_XSR_HD inline void nodalTrlcff12(const NodalView& v, int lk, const POL& pol) {
+template <class VT, class POL>
+RASBERY_XSR_HD inline void nodalTrlcff12(const NodalViewT<VT>& v, int lk, const POL& pol) {
     for (int idir = 0; idir < NDIR; idir++)
         for (int ig = 0; ig < NG; ig++)
             nodalTrlcff12Cell(v, lk, idir, ig, pol);
 }
 
-template <class POL>
-RASBERY_XSR_HD inline void nodalTrlcff12Group(const NodalView& v, int lk, int ig,
+template <class VT, class POL>
+RASBERY_XSR_HD inline void nodalTrlcff12Group(const NodalViewT<VT>& v, int lk, int ig,
                                               const POL& pol) {
     for (int idir = 0; idir < NDIR; idir++)
         nodalTrlcff12Cell(v, lk, idir, ig, pol);
@@ -435,8 +534,8 @@ RASBERY_XSR_HD inline void nodalTrlcff12Group(const NodalView& v, int lk, int ig
 //  2: tempz accumulate  += m251*tau
 //  3: mu row contraction MI0*t0 + MI1*t1
 // ---------------------------------------------------------------------------
-template <class POL>
-RASBERY_XSR_HD inline void nodalUpdateMatrix(const NodalView& v, int lk, const POL& pol) {
+template <class VT, class POL>
+RASBERY_XSR_HD inline void nodalUpdateMatrix(const NodalViewT<VT>& v, int lk, const POL& pol) {
     const int lkd0 = lk * NDIR;
     const int nxyz = v.nxyz;
     // Same double either way (see NodalView::reigv_dev); the load exists only
@@ -534,8 +633,8 @@ RASBERY_XSR_HD inline void nodalUpdateMatrix(const NodalView& v, int lk, const P
 //   40,41     (ma1) at2[igd][igd] = (m022*rm220*mu2)*matM + m022*rm220*m240
 //                   -- gcc fuses this only for igd=1; see the mask comment.
 // ---------------------------------------------------------------------------
-template <class POL>
-RASBERY_XSR_HD inline void nodalCalculateEven(const NodalView& v, int lk, const POL& pol) {
+template <class VT, class POL>
+RASBERY_XSR_HD inline void nodalCalculateEven(const NodalViewT<VT>& v, int lk, const POL& pol) {
     const int lkd0 = lk * NDIR;
 
     for (int idir = 0; idir < NDIR; idir++) {
@@ -624,8 +723,8 @@ RASBERY_XSR_HD inline void nodalCalculateEven(const NodalView& v, int lk, const 
 // Phase calculateJnet (per surface): 1n boundary or 2n interior.
 // jnet1n sites (phase 3), jnet2n sites (phase 4) -- enumerated inline.
 // ---------------------------------------------------------------------------
-template <class POL>
-RASBERY_XSR_HD inline void nodalJnet1n(const NodalView& v, int ls, int lr,
+template <class VT, class POL>
+RASBERY_XSR_HD inline void nodalJnet1n(const NodalViewT<VT>& v, int ls, int lr,
                                        double alb, const POL& pol) {
     const int lk   = v.lklr[ls * NLR + lr];
     const int idir = v.idirlr[ls * NLR + lr];
@@ -745,8 +844,8 @@ RASBERY_XSR_HD inline void nodalJnet1n(const NodalView& v, int ls, int lr,
     }
 }
 
-template <class POL>
-RASBERY_XSR_HD inline void nodalJnet2n(const NodalView& v, int ls, const POL& pol) {
+template <class VT, class POL>
+RASBERY_XSR_HD inline void nodalJnet2n(const NodalViewT<VT>& v, int ls, const POL& pol) {
     const int lkl   = v.lklr[ls * NLR + C_LEFT];
     const int lkr   = v.lklr[ls * NLR + C_RIGHT];
     const int idirl = v.idirlr[ls * NLR + C_LEFT];
@@ -916,8 +1015,8 @@ RASBERY_XSR_HD inline void nodalJnet2n(const NodalView& v, int ls, const POL& po
     }
 }
 
-template <class POL>
-RASBERY_XSR_HD inline void nodalCalculateJnet(const NodalView& v, int ls,
+template <class VT, class POL>
+RASBERY_XSR_HD inline void nodalCalculateJnet(const NodalViewT<VT>& v, int ls,
                                               const POL& pol) {
     const int lkl = v.lklr[ls * NLR + C_LEFT];
     const int lkr = v.lklr[ls * NLR + C_RIGHT];
@@ -940,8 +1039,8 @@ RASBERY_XSR_HD inline void nodalCalculateJnet(const NodalView& v, int ls,
 /// [0..1]=rm4464, [2..5]=at2, [6..9]=a, [10..11]=bt2, [12..13]=bt1,
 /// [14..15]=b, [16]=rdet_raw, [17..18]=c4, [19..20]=c6, [21..22]=c2,
 /// [23..24]=mu2, [25..26]=mu1, [27..30]=matM(copy)
-template <class POL>
-RASBERY_XSR_HD inline void nodalEvenProbe(const NodalView& v, int lk, int idir,
+template <class VT, class POL>
+RASBERY_XSR_HD inline void nodalEvenProbe(const NodalViewT<VT>& v, int lk, int idir,
                                           const POL& pol, double* out) {
     const int lkd = lk * NDIR + idir;
     double    at2[2][2], a[2][2], rm4464[2], bt1[2], bt2[2], b[2];

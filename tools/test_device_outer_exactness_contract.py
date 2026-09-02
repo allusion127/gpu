@@ -925,8 +925,13 @@ def check_device_reigv_has_one_writer(problems: list[str]) -> None:
         )
 
     solve = body_of(xsrecon, "bool XsReconBackend::solveNodal")
-    enqueue_full_at = solve.index("auto enqueue_full = [&]() -> bool")
-    enqueue_full = body_of(solve[enqueue_full_at:], "auto enqueue_full = [&]() -> bool")
+    # WP20.1 made the drive body a GENERIC lambda over the view's element type
+    # (`auto& v`), so the FP32 and FP64 arms are two instantiations of one text.
+    # The invariant this check is about -- the reigv upload stays OUTSIDE the
+    # capture -- is unchanged, so the anchor moves and the rule does not.
+    enqueue_anchor = "auto enqueue_full = [&](auto& v) -> bool"
+    enqueue_full_at = solve.index(enqueue_anchor)
+    enqueue_full = body_of(solve[enqueue_full_at:], enqueue_anchor)
     if "n_off_reigv" in strip_comments(enqueue_full):
         problems.append(
             "XsReconBackend::solveNodal: the reigv upload is back inside enqueue_full, "
@@ -1301,7 +1306,10 @@ def check_deferred_observation_moved_its_writers(problems: list[str]) -> None:
             "so an outer enqueued past a latched exit would re-solve on its own output"
         )
     guard = xsrecon[xsrecon.index("#define RASBERY_NODAL_SLOT_GUARD"):]
-    guard = guard[: guard.index("template <bool BATCHED>")]
+    # WP20.1 added the view's element type to the phase kernels
+    # (`template <bool BATCHED, class VT>`); the guard itself is unchanged and
+    # still ends where the first kernel begins.
+    guard = guard[: guard.index("template <bool BATCHED, class VT>")]
     if "(v).halt" not in guard:
         problems.append(
             "the nodal slot guard does not test NodalView::halt, so the halt reaches "

@@ -49,7 +49,14 @@ struct FlatXsView;
 }
 
 namespace nodal {
-struct NodalView;
+/// WP20.1: `NodalView` is an ALIAS now (NodalViewT<double>, src/NodalKernel.h),
+/// so it cannot be forward-declared as a struct -- the alias and the
+/// declaration would conflict at the first TU that sees both.  The template is
+/// forward-declared instead and the alias restated, which is the same promise
+/// to a caller that only takes a reference.
+template <class ValueT>
+struct NodalViewT;
+using NodalView = NodalViewT<double>;
 }
 
 /// Element counts of the flat coefficient tables, so the backend can size the
@@ -272,7 +279,16 @@ public:
 
     /// Device address of one of the eleven micro-XS slots inside the resident
     /// block, or nullptr when nothing is resident (or the backend is a stub).
-    [[nodiscard]] const double* micxDeviceSlot(int xt) const;
+    ///
+    /// WP20.1: `const void*`, not `const double*`.  Under RASBERY_GPU_FP32 the
+    /// block is float, and a typed pointer would let a consumer copy
+    /// `count * sizeof(double)` bytes out of it -- half of them the next
+    /// slot's.  Ask micxDeviceElemBytes() and either memcpy or widen.
+    [[nodiscard]] const void* micxDeviceSlot(int xt) const;
+
+    /// 8 on the FP64 arm, 4 under RASBERY_GPU_FP32.  A consumer that ignores
+    /// this and assumes 8 reads twice the block it was given.
+    [[nodiscard]] int micxDeviceElemBytes() const;
 
     /// A cudaEvent_t (as void*) recorded NOW on this backend's stream, which a
     /// consumer's stream must wait on before reading what micxDeviceSlot

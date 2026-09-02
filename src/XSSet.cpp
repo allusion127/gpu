@@ -3233,10 +3233,8 @@ bool XSSet::FillCramMicDevice(const void** dev, void*& ready, int& elem_bytes) {
     if (_xsrecon_backend->micxResidentGeneration() != _micx_generation) return false;
     for (int xt = 0; xt < static_cast<int>(N_XS_SCALAR); ++xt) {
         // WP20.1: the view carries `const void*` because the block's ELEMENT
-        // WIDTH is the FP32 arm's decision, not this file's.  Until the flat-XS
-        // backend actually narrows the block it hands out a `const double*` and
-        // this reports eight, which is what the consumer then copies.
-        dev[xt] = static_cast<const void*>(_xsrecon_backend->micxDeviceSlot(xt));
+        // WIDTH is the FP32 arm's decision, not this file's.
+        dev[xt] = _xsrecon_backend->micxDeviceSlot(xt);
         if (dev[xt] == nullptr) {
             for (int j = 0; j < static_cast<int>(N_XS_SCALAR); ++j) dev[j] = nullptr;
             return false;
@@ -3250,6 +3248,9 @@ bool XSSet::FillCramMicDevice(const void** dev, void*& ready, int& elem_bytes) {
         for (int j = 0; j < static_cast<int>(N_XS_SCALAR); ++j) dev[j] = nullptr;
         return false;
     }
+    // WP20.1: asked, not assumed.  Under RASBERY_GPU_FP32 the block is float
+    // and the consumer must widen rather than memcpy.
+    elem_bytes = _xsrecon_backend->micxDeviceElemBytes();
     return true;
 }
 

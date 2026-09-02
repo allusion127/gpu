@@ -105,6 +105,31 @@ struct BatchView {
     const double* mic_ssm;
     const double* lmp[NXS];
     const double* lmp_ssm;
+
+    // -------------------------------------------------------------------
+    // WP20.1: THE NARROW (float) TWIN OF THE FOUR micx/lmpx BLOCKS
+    // -------------------------------------------------------------------
+    //
+    // Under RASBERY_GPU_FP32 (src/GpuFp32Arm.h) the flat-XS backend writes the
+    // micro/lumped blocks as float, and this view is the SECOND reader of the
+    // very same device bytes (the xsrecon condense/reconstruct arm and the Xe
+    // evaluate/commit kernels).  Both readers must agree about the width or
+    // one of them reads the wide block on the narrow arm, so the flag and the
+    // pointers travel together in the view rather than through a global.
+    //
+    // READ-ONLY HERE.  This arm never writes micx/lmpx -- it condenses them
+    // into `iden`/`xs`, which stay double.  So there is no store accessor and
+    // no rounding decision on this side: a load widens, and every operation
+    // downstream is the double it always was, which is why the mined xsrFma /
+    // xsrMul form choices below are untouched.
+    const float* mic_f[NXS];
+    const float* mic_ssm_f;
+    const float* lmp_f[NXS];
+    const float* lmp_ssm_f;
+    /// 1 = the `_f` pointers are the authority.  Defaults to 0 through the
+    /// `BatchView v{}` every builder uses.
+    int narrow_blocks;
+
     double*       iden;
     double*       xs[NXS];
     double*       xs_ssm;
@@ -117,6 +142,28 @@ struct BatchView {
     const double* dep_i135;    ///< depTrans(iI135, j),  j = 0..NISO-1
     const double* dep_xe135;   ///< depTrans(iXe135, j), j = 0..NISO-1
 };
+
+// ---------------------------------------------------------------------------
+// WP20.1: THE FOUR SITES WHERE THE BLOCK WIDTH IS ALLOWED TO MATTER
+// ---------------------------------------------------------------------------
+//
+// Nothing else in this header or in src/XeKernel.h names `v.mic` / `v.lmp` /
+// `v.mic_ssm` / `v.lmp_ssm`, so "which block did this read come from" has one
+// answer per view.  The index expression is passed in already computed and as
+// an `int`, exactly as the call sites spelled it, so the addressing arithmetic
+// is the same instruction sequence on both arms.
+RASBERY_XSR_HD inline double xsrMic(const BatchView& v, int xt, int e) {
+    return v.narrow_blocks ? static_cast<double>(v.mic_f[xt][e]) : v.mic[xt][e];
+}
+RASBERY_XSR_HD inline double xsrLmp(const BatchView& v, int xt, int e) {
+    return v.narrow_blocks ? static_cast<double>(v.lmp_f[xt][e]) : v.lmp[xt][e];
+}
+RASBERY_XSR_HD inline double xsrMicSsm(const BatchView& v, int e) {
+    return v.narrow_blocks ? static_cast<double>(v.mic_ssm_f[e]) : v.mic_ssm[e];
+}
+RASBERY_XSR_HD inline double xsrLmpSsm(const BatchView& v, int e) {
+    return v.narrow_blocks ? static_cast<double>(v.lmp_ssm_f[e]) : v.lmp_ssm[e];
+}
 
 /// The closed-form equilibrium image of one node's I-135/Xe-135/Xe-135m chain.
 struct XeNodeImage {
@@ -164,7 +211,7 @@ RASBERY_XSR_HD inline int xsreconImageNode(const BatchView& v, int l, double* id
         for (int xt = 0; xt < NXS; ++xt) {
             double sum = 0.0;
             for (int ig = 0; ig < NG; ++ig)
-                sum += xsrMul(v.mic[xt][(iso * NG + ig) * nxyz + l], absflux[ig]);
+                sum += xsrMul(xsrMic(v, xt, (iso * NG + ig) * nxyz + l), absflux[ig]);
             cond[iso * NXS + xt] = sum * invflux;
         }
         iden_out[iso] = v.iden[iso * nxyz + l];
@@ -230,23 +277,21 @@ RASBERY_XSR_HD inline void xsreconReconstructNode(const BatchView& v, int l,
     const int active_xt[9] = {T_XSTF, T_XSAF, T_XSFF, T_XSNF, T_XSKF,
                               T_XSSF, T_FYLD, T_XS2N, T_XS3N};
     for (int a = 0; a < 9; ++a) {
-        const int     xt  = active_xt[a];
-        const double* lmp = v.lmp[xt];
-        const double* mic = v.mic[xt];
-        double*       dst = v.xs[xt];
+        const int xt  = active_xt[a];
+        double*   dst = v.xs[xt];
         for (int ig = 0; ig < NG; ++ig) {
-            double val = lmp[ig * nxyz + l];
+            double val = xsrLmp(v, xt, ig * nxyz + l);
             for (int iso = 0; iso < NISO; ++iso)
-                val = xsrFma(mic[(iso * NG + ig) * nxyz + l], iden[iso], val);
+                val = xsrFma(xsrMic(v, xt, (iso * NG + ig) * nxyz + l), iden[iso], val);
             dst[ig * nxyz + l] = val;
         }
     }
 
     for (int igs = 0; igs < NG; ++igs) {
         for (int ige = 0; ige < NG; ++ige) {
-            double val = v.lmp_ssm[(igs * NG + ige) * nxyz + l];
+            double val = xsrLmpSsm(v, (igs * NG + ige) * nxyz + l);
             for (int iso = 0; iso < NISO; ++iso)
-                val = xsrFma(v.mic_ssm[(iso * NG * NG + igs * NG + ige) * nxyz + l],
+                val = xsrFma(xsrMicSsm(v, (iso * NG * NG + igs * NG + ige) * nxyz + l),
                              iden[iso], val);
             v.xs_ssm[(igs * NG + ige) * nxyz + l] = val;
         }

@@ -87,6 +87,17 @@ ARM_CODE = strip_comments(ARM)
 CTA = read("src", "FlatXsCtaKernel.cuh")
 CTA_CODE = strip_comments(CTA)
 BACKEND = read("src", "CudaXsReconBackend.cu")
+BACKEND_CODE = strip_comments(BACKEND)
+FXK = read("src", "FlatXsKernel.h")
+FXK_CODE = strip_comments(FXK)
+XSRK = read("src", "XsReconKernel.h")
+XSRK_CODE = strip_comments(XSRK)
+NODK = read("src", "NodalKernel.h")
+NODK_CODE = strip_comments(NODK)
+CRAM = read("src", "CudaCramBackend.cu")
+CRAM_H = read("src", "CudaCramBackend.h")
+XSR_H = read("src", "CudaXsReconBackend.h")
+XSSET = read("src", "XSSet.cpp")
 BICG = read("src", "CudaBICGBackend.cu")
 DRIVER = read("src", "Driver.h")
 MAIN = read("src", "main.cpp")
@@ -180,13 +191,14 @@ for name in ("Cmfd", "Nodal", "FlatXs", "Xe", "Cram", "Ppr"):
           "converted() answers for %s explicitly -- a backend that falls "
           "through to a default is a backend nobody decided about" % name)
 check("case Backend::Cmfd:   return true;" in CONVERTED
-      and "case Backend::FlatXs: return true;" in CONVERTED,
-      "CMFD and flat-XS are the two backends WP20 actually narrows")
-check("case Backend::Nodal:  return false;" in CONVERTED
-      and "case Backend::Xe:     return false;" in CONVERTED
+      and "case Backend::FlatXs: return true;" in CONVERTED
+      and "case Backend::Nodal:  return true;" in CONVERTED,
+      "CMFD, flat-XS and nodal are the three backends the tree narrows "
+      "(WP20 landed the first two, WP20.1 the blocks and nodal)")
+check("case Backend::Xe:     return false;" in CONVERTED
       and "case Backend::Cram:   return false;" in CONVERTED
       and "case Backend::Ppr:    return false;" in CONVERTED,
-      "nodal / xe / cram / ppr are declared DEFERRED in the table rather than "
+      "xe / cram / ppr are declared DEFERRED in the table rather than "
       "left to look converted")
 
 
@@ -249,6 +261,21 @@ check('envFlagEnabled("RASBERY_GPU_CMFD_FP32")' in CMFD_GATE,
       "the historical per-backend knob still reaches the same path")
 check("static const bool enabled" in CMFD_GATE,
       "the joined gate is still resolved once and cached")
+check(BACKEND_CODE.count("rasbery::fp32::routes(") == 2,
+      "the xsrecon/nodal TU asks the arm exactly twice -- once in "
+      "flatxsNarrowBlocks(), once in nodalNarrowState() -- and both cache it")
+for fn, knob in (("flatxsNarrowBlocks", "Backend::FlatXs"),
+                 ("nodalNarrowState", "Backend::Nodal")):
+    body = body_after(BACKEND, "inline bool %s()" % fn)
+    check("static const bool on" in body and knob in body,
+          "%s() resolves routes(%s) ONCE into a cached static: the width fixes "
+          "a device allocation and a captured graph topology, so it may not "
+          "move between two calls of a run" % (fn, knob))
+check("rasberyGpuNodalFullEnabled()" in body_after(BACKEND, "inline bool nodalNarrowState()"),
+      "the narrow nodal drive requires the FULL arm -- the hybrid drive ships "
+      "trlcff/matM back to FP64 host arrays mid-drive, so it stays wide and is "
+      "counted as a demotion")
+
 check(strip_comments(BICG).count("rasbery::fp32::routes(") == 1,
       "CMFD asks the arm exactly once; a per-launch predicate could disagree "
       "with the graph it is inside")
@@ -342,12 +369,16 @@ try:
     SOLVE = body_after(BACKEND, "bool XsReconBackend::solveFlatXs(")
 except LookupError:
     SOLVE = ""
-check("static const bool narrow = rasbery::fp32::routes(rasbery::fp32::Backend::FlatXs);"
-      in SOLVE,
-      "solveFlatXs resolves the arm ONCE into a cached bool, for the same "
-      "reason it caches the CTA flag")
-check(strip_comments(SOLVE).count("rasbery::fp32::routes(") == 1,
-      "there is exactly ONE precision dispatch point in solveFlatXs")
+try:
+    SOLVE_NODAL_BINDS = body_after(BACKEND, "bool XsReconBackend::solveNodal(")
+except LookupError:
+    SOLVE_NODAL_BINDS = ""
+check(strip_comments(SOLVE).count("rasbery::fp32::routes(") == 0
+      and "const bool narrow = narrow_blocks;" in SOLVE,
+      "solveFlatXs no longer asks the arm itself: WP20.1 moved the question to "
+      "flatxsNarrowBlocks(), because the answer now fixes an ALLOCATION made "
+      "in ensure() and a per-call read could disagree with the block that "
+      "exists")
 check("fxs::flatxsCtaLaunch(v, rasberyGpuFlatXsCtaThreads(), d.stream, narrow);" in SOLVE,
       "the precision travels with the launch rather than through a global")
 check("kernelFlatXs<<<grid, block, 0, d.stream>>>(v);" in SOLVE,
@@ -412,9 +443,24 @@ check("fp32_latched_off = true;" in body_after(BICG, "void latchFp32Off()")
 # ---------------------------------------------------------------------------
 # 8. BYTES SAVED IS ACCOUNTED WHERE IT IS TRUE, AND NOWHERE ELSE.
 # ---------------------------------------------------------------------------
-check(strip_comments(BICG).count("rasbery::fp32::noteBytesSaved(") == 1
-      and strip_comments(BACKEND).count("rasbery::fp32::noteBytesSaved(") == 1,
-      "each converted backend accounts its own footprint delta exactly once")
+check(strip_comments(BICG).count("rasbery::fp32::noteBytesSaved(") == 1,
+      "CMFD accounts its footprint delta exactly once")
+check(BACKEND_CODE.count("rasbery::fp32::noteBytesSaved(") == 6,
+      "the xsrecon/nodal TU accounts SIX deltas and no more: the CTA "
+      "workspace, the live micx H2D, the micx D2H, the reference-block H2D, "
+      "the nodal consts H2D and the nodal chif H2D.  One per conversion site, "
+      "so a byte is counted once and only where it was really not moved")
+for site, what in (
+        ("uploadMicx", "the live micx/lmpx H2D"),
+        ("downloadMicx", "the micx/lmpx D2H"),
+):
+    body = body_after(BACKEND, "bool %s(const char* leaf" % site)
+    check("noteBytesSaved(count * (sizeof(double) - sizeof(float)))" in body,
+          "%s counts the delta from the SAME count it copied, so the receipt "
+          "and the ledger cannot disagree" % what)
+    check("count * sizeof(float)" in body,
+          "%s hands the ledger the FLOAT byte count -- a copy quoted in "
+          "doubles would hide exactly the saving this arm exists for" % what)
 check("sizeof(fxs::CtaWorkspaceF32)" in SOLVE,
       "the flat-XS estimate is derived from the struct, not from a copied 3,676")
 try:
@@ -439,10 +485,299 @@ for token in ("RASBERY_GPU_FP32", "RASBERY_GPU_FP32_STRICT", "RASBERY_GPU_FP32_C
     check(token in DOC, "docs/WP20_GPU_FP32_20260831_KO.md names %s" % token)
 check("A2" in DOC and "Gate A" in DOC and "Gate B" in DOC,
       "the doc states the gate class and the two gates that decide acceptance")
+
+# WP20.1: the doc carries the NUMBERS, because "it should be faster" is not a
+# runbook.  Each of these is a figure a reader is expected to check a 238 run
+# against, so a doc that lost one has lost the ability to falsify the arm.
+for token in ("8.7 GB", "4.35 GB", "1 GB/케이스", "3.9 GB", "1.96 GB",
+              "70.3 MB", "35.2 MB", "59.5 MB", "29.7 MB", "64.9 MB", "66.8 MB",
+              "8,789,040", "7,436,880", "50,706",
+              "RASBERY_GPU_MICX_RESIDENT", "kCramWidenMic", "NodalGraphKey",
+              "drainMicxWiden", "narrow_blocks", "NodalViewT",
+              "RASBERY_XFER_LEDGER", "d2h_bytes", "nodal_const_mb",
+              "bytes_saved_est", "vram_mb", "HostPinRegistry"):
+    check(token in DOC,
+          "docs/WP20_GPU_FP32_20260831_KO.md names %s -- WP20.1's savings and "
+          "runbook are numbers a reader can check, not a claim" % token)
+check('"nodal":"fp32"' in DOC,
+      "the doc shows the receipt shape WP20.1 actually produces")
+check('"demotions":0' in DOC,
+      "and says that a NON-zero demotion count is the G0 failure, not a detail")
 for deferred in ("nodal", "xe", "cram", "ppr"):
     check(deferred in DOC.lower(),
           "the doc says what happened to %s" % deferred)
 
+
+
+# ---------------------------------------------------------------------------
+# 10. WP20.1 -- THE micx/lmpx BLOCKS: ONE SPELLING PER READ, ONE PER WRITE.
+#
+# The blocks have four device readers (the two flat-XS kernels, the xsrecon
+# condense/reconstruct arm, the Xe evaluate/commit pair) and one device writer.
+# If ANY of them names `v.mic` / `v.lmp` / `v.ref_mic` / `v.msm` directly, it
+# reads the WIDE pointer -- which on the narrow arm is null, and in the shared
+# `dev_block` layout the wide offsets point at the MACROSCOPIC region.  Finite,
+# plausible, and not the cross-sections.  So the rule is that the accessors are
+# the only spelling, and it is checked on the stripped source of all three
+# bodies.
+# ---------------------------------------------------------------------------
+FXS_LOADS  = ("fxsRefLmp", "fxsRefLsm", "fxsRefMic", "fxsRefMsm")
+FXS_STORES = ("fxsStoreLmp", "fxsStoreLsm", "fxsStoreMic", "fxsStoreMsm")
+for name in FXS_LOADS + FXS_STORES:
+    check(("%s(const FlatXsView& v" % name) in FXK,
+          "src/FlatXsKernel.h defines the %s accessor" % name)
+for name in FXS_LOADS:
+    check("v.narrow_blocks ?" in body_after(FXK, "double %s(const FlatXsView& v" % name),
+          "%s branches on the view's OWN narrow_blocks flag rather than on a "
+          "global, so the width travels with the pointers it describes" % name)
+for name in FXS_STORES:
+    check("if (v.narrow_blocks)" in body_after(FXK, "void %s(const FlatXsView& v" % name),
+          "%s rounds to the block's width at the ONE place the value crosses "
+          "into memory" % name)
+for name in ("xsrMic", "xsrLmp", "xsrMicSsm", "xsrLmpSsm"):
+    check("v.narrow_blocks ?" in body_after(XSRK, "double %s(const BatchView& v" % name),
+          "%s asks the same flag, carried in the same view" % name)
+
+
+def rule_no_bare_block_read(text: str) -> bool:
+    """No body outside the accessors may name a micx/lmpx pointer directly."""
+    stripped = strip_comments(text)
+    # The accessor bodies are the only legal spellings; drop them, then look.
+    for probe in ("v.ref_lmp[t][e]", "v.ref_lsm[e]", "v.ref_mic[t][e]",
+                  "v.ref_msm[e]", "v.lmp[t][e]", "v.lsm[e]", "v.mic[t][e]",
+                  "v.msm[e]", "v.mic[xt][e]", "v.lmp[xt][e]", "v.mic_ssm[e]",
+                  "v.lmp_ssm[e]"):
+        stripped = stripped.replace(probe, "")
+    return not re.search(
+        r"v\.(ref_lmp|ref_lsm|ref_mic|ref_msm|lmp|lsm|mic|msm|mic_ssm|lmp_ssm)\s*\[",
+        stripped)
+
+
+check(rule_no_bare_block_read(FXK),
+      "src/FlatXsKernel.h reaches the four blocks ONLY through the accessors")
+check(rule_no_bare_block_read(CTA),
+      "src/FlatXsCtaKernel.cuh reaches the four blocks ONLY through the "
+      "accessors -- both arms of the CTA kernel share that one text")
+check(rule_no_bare_block_read(XSRK),
+      "src/XsReconKernel.h (and therefore src/XeKernel.h, which consumes the "
+      "same BatchView) reaches the blocks ONLY through xsrMic/xsrLmp/"
+      "xsrMicSsm/xsrLmpSsm")
+
+for field in ("const float* ref_lmp_f[N_ACTIVE]", "const float* ref_mic_f[N_ACTIVE]",
+              "float*       lmp_f[N_ACTIVE]", "float*       mic_f[N_ACTIVE]",
+              "int narrow_blocks"):
+    check(field in FXK, "FlatXsView declares %s" % field)
+for field in ("const float* mic_f[NXS]", "const float* lmp_f[NXS]",
+              "const float* mic_ssm_f", "const float* lmp_ssm_f",
+              "int narrow_blocks"):
+    check(field in XSRK, "BatchView declares %s" % field)
+
+check("v.narrow_blocks = narrow_blocks ? 1 : 0;" in SOLVE
+      and "v.narrow_blocks = (dev_block_f != nullptr) ? 1 : 0;"
+          in body_after(BACKEND, "bool stage(const xsr::BatchView& host"),
+      "BOTH view builders stamp the flag from the block they actually bound, "
+      "so a view can never describe a width its pointers do not have")
+check("v.mic[t]       = nullptr;" in SOLVE and "v.mic[xt]   = nullptr;"
+      in body_after(BACKEND, "bool stage(const xsr::BatchView& host"),
+      "the wide pointers are NULLED on the narrow arm: a reader that skipped "
+      "the accessors faults instead of computing something plausible")
+
+
+# ---------------------------------------------------------------------------
+# 11. WP20.1 -- THE HOST MATERIALISATION IS ONE SITE, AND IT IS PAID AFTER A
+#     DRAIN.
+#
+# `_micx` / `_lmpx` are milk::Vector<double> and every host reader in the tree
+# takes them as double, so the narrow arm owes a widening.  The rule is that
+# the widening exists in exactly ONE function, that it is QUEUED at the
+# asynchronous D2H rather than performed there, and that both callers pay it
+# immediately after their stream drain -- a drain that forgot it would leave
+# the host array holding the previous flat-XS epoch, which is the WP15 failure
+# this arm may not reintroduce.
+# ---------------------------------------------------------------------------
+check(BACKEND_CODE.count("static_cast<double>(src[i])") == 1,
+      "the float -> double widening is spelled ONCE in the whole backend")
+WIDEN = body_after(BACKEND, "void drainMicxWiden()")
+check("micx_widen.clear();" in WIDEN,
+      "drainMicxWiden clears the debt it just paid, so a second call is a "
+      "no-op rather than a second widening of stale staging")
+check(BACKEND_CODE.count("d.drainMicxWiden();") == 2,
+      "exactly two callers pay the widening: solveFlatXs's eager download and "
+      "downloadFlatXsMicx's lazy one -- the same two call sites the copy list "
+      "itself has")
+for scope in ("CudaXsReconBackend.cu:solveFlatXs", "CudaXsReconBackend.cu:downloadFlatXsMicx"):
+    idx = BACKEND.find('xfer::streamSync("%s"' % scope)
+    check(idx > 0 and 0 < BACKEND.find("d.drainMicxWiden();", idx) - idx < 900,
+          "the widening in %s runs AFTER that scope's streamSync -- the D2H is "
+          "asynchronous, so widening at the issue would read staging bytes the "
+          "device has not written" % scope)
+check("micx_widen.push_back" in body_after(BACKEND, "bool downloadMicx(const char* leaf"),
+      "downloadMicx QUEUES the widening instead of performing it")
+check("EnsureMicxHost" in XSSET and "downloadFlatXsMicx" in XSSET,
+      "XSSet::EnsureMicxHost is still the single host-side payer")
+
+
+# ---------------------------------------------------------------------------
+# 12. WP20.1 -- THE BYTE COUNTS AND THE MICX RECEIPT STAY TRUTHFUL.
+#
+# `micxBytesSaved()` is (deferred - paid).  Both halves must be quoted at the
+# arm's width or the WP15 receipt reports a saving the arm did not make -- and
+# WP15's number is the one a batch A/B is read against.
+# ---------------------------------------------------------------------------
+check("inline std::size_t flatxsMicxElemBytes()" in BACKEND,
+      "the block's element width has a name, so it can be used rather than "
+      "re-derived at each byte count")
+check("flatxsNarrowBlocks() ? sizeof(float) : sizeof(double)"
+      in body_after(BACKEND, "inline std::size_t flatxsMicxElemBytes()"),
+      "and that name resolves through the SAME cached predicate the "
+      "allocation used")
+check("flatxsMicxBlockElems(nx) * flatxsMicxElemBytes()"
+      in body_after(BACKEND, "inline unsigned long long flatxsMicxBlockBytes(std::size_t nx)"),
+      "the deferred half of the MICX receipt is elements x the arm's width")
+check("const std::size_t   ebytes = flatxsMicxElemBytes();" in
+      body_after(BACKEND, "bool XsReconBackend::downloadFlatXsMicx("),
+      "the paid half uses the same width, so the difference is a saving and "
+      "not an artefact of two units")
+check("d.ndev_flt != nullptr ? sizeof(float) : sizeof(double)" in BACKEND,
+      "the nodal const-upload receipt is quoted at the arm's width too")
+
+
+# ---------------------------------------------------------------------------
+# 13. WP20.1 -- CRAM IS TOLD THE WIDTH; IT DOES NOT ASSUME ONE.
+#
+# The WP15.1 handover gives CRAM a device address inside the flat-XS block.
+# Under the arm that block is float and CRAM's own state is not (the
+# partial-fraction sum cancels).  A memcpy of `nmic * sizeof(double)` out of a
+# float block is half the next slot's data: finite, plausible, wrong.
+# ---------------------------------------------------------------------------
+check("const void* micxDeviceSlot(int xt) const" in XSR_H,
+      "micxDeviceSlot hands out an untyped address -- a typed one would let a "
+      "consumer pick the wrong element width without saying so")
+check("int micxDeviceElemBytes() const" in XSR_H,
+      "and the width is a separate, explicit question")
+check("int           mic_device_elem_bytes" in CRAM_H,
+      "the CRAM views carry the width beside the addresses")
+check(CRAM_H.count("const void*   mic_device[11]") == 2,
+      "both the predictor and the corrector view carry untyped addresses")
+FILLMIC = body_after(CRAM, "bool fillMic(const double* const* host_mic")
+check("elem_bytes == static_cast<int>(sizeof(float))" in FILLMIC,
+      "fillMic decides from the caller's word, not from a guess")
+check("kCramWidenMic<<<" in FILLMIC,
+      "a narrow source is WIDENED on the device rather than memcpy'd -- CRAM "
+      "stays FP64 because its partial-fraction sum cancels")
+check("nmic * sizeof(float)" in FILLMIC,
+      "and the D2D byte tally is the float count that actually moved")
+
+
+# ---------------------------------------------------------------------------
+# 14. WP20.1 -- NODAL: ONE BODY, TWO INSTANTIATIONS, AND A KEY THAT KNOWS.
+# ---------------------------------------------------------------------------
+check("template <class ValueT>\nstruct NodalViewT {" in NODK,
+      "the nodal view is ONE template, so the narrow and wide drives are two "
+      "instantiations of one text and cannot drift")
+check("using NodalView    = NodalViewT<double>;" in NODK
+      and "using NodalViewF32 = NodalViewT<float>;" in NODK,
+      "the FP64 view keeps its name, which is what makes every host caller "
+      "and every replay tool textually unchanged")
+for narrowed in ("const ValueT* xsrf", "const ValueT* eta1", "const ValueT* diagDI",
+                 "ValueT* trlcff0", "ValueT* mu", "ValueT* matM", "ValueT* dsncff6"):
+    check(narrowed in NODK, "NodalViewT narrows %s" % narrowed)
+for wide in ("const double* hmesh", "const double* albedo", "const double* flux",
+             "double*       jnet", "double*       phis", "double        reigv"):
+    check(wide in NODK,
+          "NodalViewT keeps %s FP64 -- geometry, the canonical state shared "
+          "with CMFD, and the eigenvalue" % wide)
+
+SHELL = body_after(NODK, "inline NodalViewT<ValueT> nodalWideShell(const NodalView& h)")
+for f in ("hmesh", "albedo", "lktosfc", "neib", "lklr", "idirlr", "sgnlr",
+          "chif_empty", "flux", "jnet", "phis", "reigv", "reigv_dev",
+          "nxyz", "nsurf", "halt", "halt_slot"):
+    check(("v.%s " % f) in SHELL or ("v.%s  " % f) in SHELL or ("v.%s=" % f) in SHELL
+          or ("v.%s " % f) in SHELL.replace("=", " "),
+          "nodalWideShell copies %s -- a field left null here is a kernel "
+          "reading address zero" % f)
+check(not re.search(r"v\.(eta1|xsrf|trlcff0|matM|mu|tau|dsncff2|chif)\s*=", SHELL),
+      "and it copies NONE of the narrowed fields: those are bound from the "
+      "float block by the caller, and a copy here would leave the narrow view "
+      "pointing at the wide block")
+
+for kern in ("kNodalTrl0", "kNodalTrl12", "kNodalMat", "kNodalEven",
+             "kNodalMatEven", "kNodalJnet"):
+    check("template <bool BATCHED, class VT>\n__global__ void %s(ndl::NodalViewT<VT> base"
+          % kern in BACKEND,
+          "%s is templated on the view's element type" % kern)
+check("const ndl::NodalViewT<VT> v =" in BACKEND,
+      "the slot guard resolves the view at the arm's precision")
+
+KEY = body_after(BACKEND, "struct NodalGraphKey {")
+check("int           precision = 0;" in KEY,
+      "NodalGraphKey carries the PRECISION: a narrow drive has three more "
+      "kernel nodes (the xs boundary conversion) and half-size memcpy nodes, "
+      "so the two graphs may never alias")
+check("precision == o.precision" in KEY,
+      "and the longhand operator== compares it -- a field the key declares but "
+      "does not compare is not a key field at all")
+check("want.precision   = nnarrow ? 1 : 0;" in BACKEND,
+      "the lookup asks for the precision this drive is about to enqueue")
+
+check("auto enqueue_full = [&](auto& v) -> bool {" in BACKEND,
+      "the drive body is a GENERIC lambda: not one statement moved, and the "
+      "two arms are two instantiations of one text")
+check("return nnarrow ? enqueue_full(v32) : enqueue_full(v);" in BACKEND,
+      "and there is exactly ONE place that chooses between them")
+check(BACKEND_CODE.count("enqueueDrive();") == 4,
+      "all four enqueue sites go through that one chooser")
+check("kNodalNarrowXs<<<" in BACKEND
+      and BACKEND_CODE.count("kNodalNarrowXs<<<") == 3,
+      "the three macroscopic inputs are narrowed by a captured kernel, once "
+      "per drive -- they are rewritten every outer, so a residency-gated copy "
+      "would hand the drive the previous outer's cross-sections")
+
+
+# ---------------------------------------------------------------------------
+# 15. WP20.1 -- THE NON-FINITE VALVE REACHES NODAL, AND ITS RECOVERY IS THE
+#     ONE THE ALLOCATION ALLOWS.
+# ---------------------------------------------------------------------------
+check('rasbery::fp32::latchOff(rasbery::fp32::Backend::Nodal, "nonfinite jnet");'
+      in BACKEND,
+      "the narrow nodal drive latches on a non-finite jnet -- the one array a "
+      "consumer reads on the very next line")
+check("d.nodal_device_refused = true;" in BACKEND
+      and "if (d.nodal_device_refused) return false;" in BACKEND,
+      "and the recovery is a REFUSAL of the device arm, sticky for the "
+      "process: nodal's precision is an allocation, so there is no wide device "
+      "arm to demote to without re-laying-out mid-run")
+check("d.dropNodalGraph();" in body_after(BACKEND, "if (bad) {"),
+      "the latch drops the graphs captured under the old precision")
+check("std::isfinite(host.jnet[i])" in BACKEND,
+      "the check is on the materialised host array, so it costs no transfer "
+      "and no synchronisation of its own")
+VALVE_AT = BACKEND.find("if (nnarrow && !d.nodal_drain_deferred &&")
+check(VALVE_AT > 0
+      and "gpu::canonicalElidesDownload(canon, gpu::CanonicalRegion::Jnet,"
+          in BACKEND[VALVE_AT:VALVE_AT + 400],
+      "and it runs only on a drive that actually materialised jnet, i.e. a few "
+      "times per segment rather than once per outer")
+
+
+# ---------------------------------------------------------------------------
+# 16. WP20.1 -- FEATURE-OFF IS STILL UNREACHABLE, NOT MERELY UNTAKEN.
+# ---------------------------------------------------------------------------
+ENSURE = body_after(BACKEND, "bool ensure(int want_nxyz, int want_fuel)")
+check("if (narrow) off = 0;" in ENSURE,
+      "the FP64 arm's dev_block layout is the one that shipped: micx/lmpx are "
+      "laid out first and `off` continues past them, so off_iden / off_xs land "
+      "exactly where they always did")
+check("if (nnarrow) { d.n_off_consts = foff; foff += 9 * ndg0; }" in BACKEND
+      and "else         { d.n_off_consts = off;  off  += 9 * ndg0; }" in BACKEND,
+      "and the nodal block splits the same way, so with the flag off its "
+      "sequence is literally the layout that shipped")
+check("if (!nnarrow) {" in SOLVE_NODAL_BINDS,
+      "the FP64 nodal bind block is intact and guarded, not rewritten")
+check("int narrow_blocks;" in FXK and "int narrow_blocks;" in XSRK,
+      "both narrow flags are plain ints that the `View v{}` every builder in "
+      "the tree uses zero-initialises -- which is what the feature-off claim "
+      "rests on")
 
 # ---------------------------------------------------------------------------
 # NEGATIVE CONTROLS.  Each probe is the rule applied to a mutation that MUST
@@ -469,6 +804,12 @@ NEGATIVES: list[tuple[str, object]] = [
     ("a second copy of the CTA body appears",
      lambda: rule_one_body_for_both_arms(
          CTA + "\nflatxsSolveNodeCta(const FlatXsView& v, int i,\n")),
+    ("a kernel body names a micx block pointer directly again",
+     lambda: rule_no_bare_block_read(
+         CTA + "\n  double z = v.ref_mic[t][q * nxyz + l];\n")),
+    ("the xsrecon reader goes back to the wide pointer",
+     lambda: rule_no_bare_block_read(
+         XSRK + "\n  double z = v.mic[xt][(iso * NG + ig) * nxyz + l];\n")),
 ]
 for label, probe in NEGATIVES:
     checks += 1

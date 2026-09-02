@@ -151,10 +151,17 @@ struct CtaWorkspace {
 /// under one of them and not the other -- and half the bytes: **3,676 B/CTA
 /// against 7,352**.
 ///
-/// WHAT THIS BUYS, precisely.  It is NOT a transfer saving: the node's inputs
-/// still arrive as doubles in global memory and its outputs still leave as
-/// doubles (`v.lmp`, `v.mic`, `v.xs`, `v.iden` are unchanged).  It is a
-/// SHARED-MEMORY OCCUPANCY saving, and the arithmetic is worth doing HONESTLY
+/// WHAT THIS BUYS, precisely.  WP20 landed it as a SHARED-MEMORY OCCUPANCY
+/// saving and said out loud that it saved no transfer, because the node's
+/// inputs still arrived as doubles in global memory and its outputs still left
+/// as doubles.  **WP20.1 removed that caveat for the four micx/lmpx blocks**:
+/// `FlatXsView::narrow_blocks` makes `ref_lmp/ref_lsm/ref_mic/ref_msm` and
+/// `lmp/lsm/mic/msm` float on the same arm, so the gather below reads half the
+/// bytes and the scatter writes half.  `v.xs` / `v.xs_ssm` / `v.iden` are
+/// still double and still the FP64 authority -- they are the macroscopic
+/// answer the nodal drive, the CMFD operator and the host read.  What follows
+/// is therefore the occupancy half of the story; the bandwidth half is in
+/// src/FlatXsKernel.h's accessor note.  The arithmetic is worth doing HONESTLY
 /// because the tempting version of it is wrong.  At 7,352 B/CTA a 100 KiB
 /// shared budget seats floor(102400/7352) = 13 blocks per SM; at 3,676 it seats
 /// 27.  It does NOT get 27: at T=128 that would be 108 warps and the SM caps at
@@ -214,15 +221,15 @@ __device__ inline void flatxsSolveNodeCta(const FlatXsView& v, int i,
     for (int q = tid; q < Q_LMP; q += T) {
         const int t  = q / NG;
         const int ig = q - t * NG;
-        w.bl[q]      = v.ref_lmp[t][ig * nxyz + l];
+        w.bl[q]      = fxsRefLmp(v, t, ig * nxyz + l);
     }
-    for (int q = tid; q < Q_LSM; q += T) w.bls[q] = v.ref_lsm[q * nxyz + l];
+    for (int q = tid; q < Q_LSM; q += T) w.bls[q] = fxsRefLsm(v, q * nxyz + l);
     for (int q = tid; q < Q_MIC; q += T) {
         const int t = q / NMIC;
         const int e = q - t * NMIC;
-        w.bm[q]     = v.ref_mic[t][e * nxyz + l];
+        w.bm[q]     = fxsRefMic(v, t, e * nxyz + l);
     }
-    for (int q = tid; q < Q_MSM; q += T) w.bms[q] = v.ref_msm[q * nxyz + l];
+    for (int q = tid; q < Q_MSM; q += T) w.bms[q] = fxsRefMsm(v, q * nxyz + l);
 
     // NO BARRIER HERE, AND THAT IS DELIBERATE: by (P1) the lane that wrote
     // element q is the lane that reads it below.  A barrier would be free
@@ -324,15 +331,15 @@ __device__ inline void flatxsSolveNodeCta(const FlatXsView& v, int i,
     for (int q = tid; q < Q_LMP; q += T) {
         const int t             = q / NG;
         const int ig            = q - t * NG;
-        v.lmp[t][ig * nxyz + l] = w.bl[q];
+        fxsStoreLmp(v, t, ig * nxyz + l, w.bl[q]);
     }
-    for (int q = tid; q < Q_LSM; q += T) v.lsm[q * nxyz + l] = w.bls[q];
+    for (int q = tid; q < Q_LSM; q += T) fxsStoreLsm(v, q * nxyz + l, w.bls[q]);
     for (int q = tid; q < Q_MIC; q += T) {
         const int t            = q / NMIC;
         const int e            = q - t * NMIC;
-        v.mic[t][e * nxyz + l] = w.bm[q];
+        fxsStoreMic(v, t, e * nxyz + l, w.bm[q]);
     }
-    for (int q = tid; q < Q_MSM; q += T) v.msm[q * nxyz + l] = w.bms[q];
+    for (int q = tid; q < Q_MSM; q += T) fxsStoreMsm(v, q * nxyz + l, w.bms[q]);
 
     // Publish the workspace and sh_iden: from here on lanes read elements they
     // did not write.

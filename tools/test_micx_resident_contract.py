@@ -381,10 +381,15 @@ def check_m7_ledger_wrappers(src: dict[str, str]) -> list[str]:
     body = body_of(cu, "bool XsReconBackend::downloadFlatXsMicx(", "\nunsigned long long")
     if not body:
         return ["M7: XsReconBackend::downloadFlatXsMicx is gone"]
-    if "d.download(" not in body:
+    # WP20.1: `downloadMicx` is `download` plus the arm's width decision -- it
+    # still issues exactly one xfer::memcpyAsync per block and nothing else in
+    # this file moves micx bytes.  Naming both spellings keeps the rule about
+    # THE LEDGER rather than about one function's name.
+    if "d.download(" not in body and "d.downloadMicx(" not in body:
         problems.append(
-            "M7: the lazy download no longer goes through Impl::download, so its "
-            "bytes are outside [RASBERY][XFER][LEDGER]"
+            "M7: the lazy download no longer goes through Impl::download / "
+            "Impl::downloadMicx, so its bytes are outside "
+            "[RASBERY][XFER][LEDGER]"
         )
     if re.search(r"(?<!xfer::)cudaMemcpy", body):
         problems.append(
@@ -512,12 +517,22 @@ def check_m10_batch_path_covered(src: dict[str, str]) -> list[str]:
             "batch arm for free.  A second path needs its own deferral."
         )
     # The two copy lists, and only two: solveFlatXs (eager) and the payer.
-    if cu.count('d.download("flatxs micx mic"') != 2:
+    if cu.count('d.downloadMicx("flatxs micx mic"') != 2:
         problems.append(
             "M10: expected exactly two call sites of the "
             "micx download list (solveFlatXs's eager one and "
             "downloadFlatXsMicx's lazy one).  A third is a third opinion about "
             "what the block is."
+        )
+    # WP20.1: and BOTH must be the width-aware spelling.  A `d.download` left on
+    # a micx offset reads the WIDE block on the narrow arm -- and because the
+    # offsets are shared between the two layouts, that is the macroscopic
+    # region: finite, plausible, and not the cross-sections.
+    if 'd.download("flatxs micx' in cu or 'd.download("flatxs lmpx' in cu:
+        problems.append(
+            "M10: a micx/lmpx copy still goes through the width-blind "
+            "Impl::download.  Under RASBERY_GPU_FP32 those offsets index "
+            "dev_block_f, and `dev_block + off` is a different array."
         )
     return problems
 
@@ -688,17 +703,17 @@ NEGATIVE_CONTROLS = (
         "the lazy download bypasses the ledger wrappers",
         XSR,
         lambda t: t.replace(
-            '            if (!d.download("flatxs micx mic", host.mic[t], d.off_mic[ACTIVE_XT9[t]],\n'
-            "                            mic))\n"
+            '            if (!d.downloadMicx("flatxs micx mic", host.mic[t],\n'
+            "                                d.off_mic[ACTIVE_XT9[t]], mic))\n"
             "                return false;\n"
             "        }\n"
-            "        moved += static_cast<unsigned long long>(fxs::N_ACTIVE) * (lmp + mic) *",
+            "        moved += static_cast<unsigned long long>(fxs::N_ACTIVE) * (lmp + mic) * ebytes;",
             "            if (cudaMemcpyAsync(host.mic[t], d.dev_block + d.off_mic[ACTIVE_XT9[t]],\n"
             "                                mic * sizeof(double), cudaMemcpyDeviceToHost,\n"
             "                                d.stream) != cudaSuccess)\n"
             "                return false;\n"
             "        }\n"
-            "        moved += static_cast<unsigned long long>(fxs::N_ACTIVE) * (lmp + mic) *",
+            "        moved += static_cast<unsigned long long>(fxs::N_ACTIVE) * (lmp + mic) * ebytes;",
             1,
         ),
     ),

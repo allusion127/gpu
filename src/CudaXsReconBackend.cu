@@ -22,6 +22,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -457,15 +458,83 @@ std::atomic<unsigned long long> g_micx_downloaded_bytes{0};
 std::atomic<unsigned long long> g_nodal_const_uploads{0};
 std::atomic<unsigned long long> g_nodal_const_bytes{0};
 
-/// Bytes of one flat-XS micx/lmpx result block: 9 (lmp + mic) + lsm + msm.
-inline unsigned long long flatxsMicxBlockBytes(std::size_t nx) {
+/// WP20.1.  THE ONE PLACE THIS FILE ASKS THE FP32 ARM, AND IT IS A
+/// STAND-UP DECISION, NOT A PER-CALL ONE.
+///
+/// The width of the micx/lmpx device blocks fixes an ALLOCATION and a
+/// LAYOUT -- `ensure()` lays the block out once and every offset in this file
+/// is relative to it -- so it must be resolved before the first solve and may
+/// never move again.  A cached static is what makes "the arm can only be read
+/// once" a property of the code rather than a discipline.
+///
+/// AND IT IS WHY THE FLAT-XS BACKEND HAS NO NON-FINITE LATCH.  `routes()`
+/// includes `!latched(FlatXs)`, so a latch would flip this predicate; but
+/// honouring the flip would mean re-laying-out and re-uploading 59.5 MB
+/// mid-run, and NOT honouring it would mean float kernels writing a block the
+/// readers think is double.  Neither is acceptable, so the flat-XS arm simply
+/// does not latch: it is declared here rather than discovered in a trace.
+/// Nodal and Xe, whose narrow state is per-drive, do latch -- see
+/// src/GpuFp32Arm.h.
+inline bool flatxsNarrowBlocks() {
+    static const bool on = rasbery::fp32::routes(rasbery::fp32::Backend::FlatXs);
+    return on;
+}
+
+/// WP20.1.  THE NODAL DRIVE ARM, resolved once for the same reason the
+/// flat-XS one is: it fixes an allocation, a layout, and -- unlike flat-XS --
+/// a captured GRAPH TOPOLOGY, because the narrow drive has three extra kernel
+/// nodes (the xs boundary conversion) and its memcpy nodes carry half the
+/// bytes.  Precision is therefore a field of NodalGraphKey, not an assumption.
+///
+/// AND IT REQUIRES THE **FULL** DRIVE.  The hybrid arm
+/// (RASBERY_GPU_NODAL_FULL unset) runs calculateEven on the HOST and ships
+/// trlcff0 / trlcff2 / matM back to double host arrays mid-drive -- three D2H
+/// copies whose destinations are `Nodal`'s own FP64 buffers.  Narrowing under
+/// it would mean a widening pass on the critical path of an arm that exists
+/// only as the validated fallback, so the hybrid arm stays FP64 and the
+/// request is COUNTED as a demotion rather than silently honoured.
+inline bool nodalNarrowState() {
+    static const bool on = rasbery::fp32::routes(rasbery::fp32::Backend::Nodal) &&
+                           rasberyGpuNodalFullEnabled();
+    return on;
+}
+
+/// WP20.1: the FP64 -> FP32 boundary, elementwise.
+///
+/// Three of the nodal drive's inputs (xsrf, xsnf, xssm) are produced by the
+/// MACROSCOPIC rebuild, which stays FP64 -- its output is the authority the
+/// host, the CMFD operator and the Xe commit all read.  So the narrow drive
+/// does not narrow the producer; it takes a narrowed COPY at the boundary,
+/// once per drive, inside the captured graph.  No arithmetic, no reduction,
+/// no order to argue about: a convert is a convert.
+__global__ void kNodalNarrowXs(float* __restrict__ dst,
+                               const double* __restrict__ src, std::size_t n) {
+    const std::size_t i =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = static_cast<float>(src[i]);
+}
+
+/// Element width of the four micx/lmpx blocks, in bytes: 8 on the FP64 arm,
+/// 4 under RASBERY_GPU_FP32.  Every byte count that describes those blocks
+/// multiplies by THIS and not by `sizeof(double)`, or the receipt over-quotes
+/// the saving by exactly the factor the arm was supposed to buy.
+inline std::size_t flatxsMicxElemBytes() {
+    return flatxsNarrowBlocks() ? sizeof(float) : sizeof(double);
+}
+
+/// Element count of one flat-XS micx/lmpx result block: 9 (lmp + mic) + lsm + msm.
+inline unsigned long long flatxsMicxBlockElems(std::size_t nx) {
     const std::size_t mic = static_cast<std::size_t>(xsr::NISO) * xsr::NG * nx;
     const std::size_t lmp = static_cast<std::size_t>(xsr::NG) * nx;
     const std::size_t msm = static_cast<std::size_t>(xsr::NISO) * xsr::NG * xsr::NG * nx;
     const std::size_t ssm = static_cast<std::size_t>(xsr::NG) * xsr::NG * nx;
     return static_cast<unsigned long long>(
-               (static_cast<std::size_t>(fxs::N_ACTIVE) * (lmp + mic) + ssm + msm)) *
-           sizeof(double);
+        static_cast<std::size_t>(fxs::N_ACTIVE) * (lmp + mic) + ssm + msm);
+}
+
+/// Bytes of one flat-XS micx/lmpx result block AT THE ARM'S WIDTH.
+inline unsigned long long flatxsMicxBlockBytes(std::size_t nx) {
+    return flatxsMicxBlockElems(nx) * flatxsMicxElemBytes();
 }
 
 // One thread per target node; the shared body does the rest.  StaticForms
@@ -644,7 +713,7 @@ std::atomic<unsigned long long> g_nodal_batch_xs_h2d_skipped_bytes{0};
         _m = (slot_map)[_logical];                                             \
         if (_m < 0) return;                                                    \
     }                                                                          \
-    const ndl::NodalView v =                                                   \
+    const ndl::NodalViewT<VT> v =                                              \
         !BATCHED                 ? (base)                                      \
         : ((views) != nullptr)   ? (views)[_m]                                 \
                                  : ndl::nodalSlotView(base, _m);               \
@@ -655,42 +724,47 @@ std::atomic<unsigned long long> g_nodal_batch_xs_h2d_skipped_bytes{0};
     /* why the drive may not simply be re-run past a decided exit.           */ \
     if ((v).halt != nullptr && (v).halt[(v).halt_slot] != 0u) return
 
-template <bool BATCHED>
-__global__ void kNodalTrl0(ndl::NodalView base, const int* __restrict__ slot_map,
-                             int lanes, const ndl::NodalView* __restrict__ views) {
+template <bool BATCHED, class VT>
+__global__ void kNodalTrl0(ndl::NodalViewT<VT> base, const int* __restrict__ slot_map,
+                             int lanes,
+                           const typename ndl::NodalViewOf<VT>::type* __restrict__ views) {
     RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, views, v);
     const int i  = blockIdx.x * blockDim.x + threadIdx.x;
     const int lk = i / ndl::NG;
     const int ig = i - lk * ndl::NG;
     if (lk < v.nxyz) ndl::nodalTrlcff0Group(v, lk, ig);
 }
-template <bool BATCHED>
-__global__ void kNodalTrl12(ndl::NodalView base, const int* __restrict__ slot_map,
-                             int lanes, const ndl::NodalView* __restrict__ views) {
+template <bool BATCHED, class VT>
+__global__ void kNodalTrl12(ndl::NodalViewT<VT> base, const int* __restrict__ slot_map,
+                             int lanes,
+                           const typename ndl::NodalViewOf<VT>::type* __restrict__ views) {
     RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, views, v);
     const int i  = blockIdx.x * blockDim.x + threadIdx.x;
     const int lk = i / ndl::NG;
     const int ig = i - lk * ndl::NG;
     if (lk < v.nxyz) ndl::nodalTrlcff12Group(v, lk, ig, ndl::StaticForms{});
 }
-template <bool BATCHED>
-__global__ void kNodalMat(ndl::NodalView base, const int* __restrict__ slot_map,
-                             int lanes, const ndl::NodalView* __restrict__ views) {
+template <bool BATCHED, class VT>
+__global__ void kNodalMat(ndl::NodalViewT<VT> base, const int* __restrict__ slot_map,
+                             int lanes,
+                           const typename ndl::NodalViewOf<VT>::type* __restrict__ views) {
     RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, views, v);
     const int lk = blockIdx.x * blockDim.x + threadIdx.x;
     if (lk < v.nxyz) ndl::nodalUpdateMatrix(v, lk, ndl::StaticForms{});
 }
-template <bool BATCHED>
-__global__ void kNodalEven(ndl::NodalView base, const int* __restrict__ slot_map,
-                             int lanes, const ndl::NodalView* __restrict__ views) {
+template <bool BATCHED, class VT>
+__global__ void kNodalEven(ndl::NodalViewT<VT> base, const int* __restrict__ slot_map,
+                             int lanes,
+                           const typename ndl::NodalViewOf<VT>::type* __restrict__ views) {
     RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, views, v);
     const int lk = blockIdx.x * blockDim.x + threadIdx.x;
     if (lk < v.nxyz) ndl::nodalCalculateEven(v, lk, ndl::StaticForms{});
 }
 
-template <bool BATCHED>
-__global__ void kNodalMatEven(ndl::NodalView base, const int* __restrict__ slot_map,
-                              int lanes, const ndl::NodalView* __restrict__ views) {
+template <bool BATCHED, class VT>
+__global__ void kNodalMatEven(ndl::NodalViewT<VT> base, const int* __restrict__ slot_map,
+                              int lanes,
+                           const typename ndl::NodalViewOf<VT>::type* __restrict__ views) {
     RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, views, v);
     const int lk = blockIdx.x * blockDim.x + threadIdx.x;
     if (lk >= v.nxyz) return;
@@ -698,9 +772,10 @@ __global__ void kNodalMatEven(ndl::NodalView base, const int* __restrict__ slot_
     ndl::nodalUpdateMatrix(v, lk, forms);
     ndl::nodalCalculateEven(v, lk, forms);
 }
-template <bool BATCHED>
-__global__ void kNodalJnet(ndl::NodalView base, const int* __restrict__ slot_map,
-                             int lanes, const ndl::NodalView* __restrict__ views) {
+template <bool BATCHED, class VT>
+__global__ void kNodalJnet(ndl::NodalViewT<VT> base, const int* __restrict__ slot_map,
+                             int lanes,
+                           const typename ndl::NodalViewOf<VT>::type* __restrict__ views) {
     RASBERY_NODAL_SLOT_GUARD(base, slot_map, lanes, views, v);
     const int ls = blockIdx.x * blockDim.x + threadIdx.x;
     if (ls < v.nsurf) ndl::nodalCalculateJnet(v, ls, ndl::StaticForms{});
@@ -2041,6 +2116,46 @@ struct XsReconBackend::Impl {
 
     double*             dev_block   = nullptr;
     std::size_t         block_doubles = 0;
+
+    // --- WP20.1: the NARROW half of the block (RASBERY_GPU_FP32) ----------
+    //
+    // The micx/lmpx region is not a slice of `dev_block` under the arm -- it
+    // is its own float allocation, and `dev_block` is laid out WITHOUT it.
+    // Two consequences, both deliberate:
+    //
+    //   * the offsets `off_mic/off_mic_ssm/off_lmp/off_lmp_ssm` index THIS
+    //     block and the offsets `off_iden/off_xs/off_xs_ssm/off_phif` index
+    //     `dev_block`, so no arithmetic in this file changed shape;
+    //   * the VRAM saving is real rather than notional: the arm allocates
+    //     29.7 MB instead of 59.5 MB at KNGR size, not 59.5 + 29.7.
+    //
+    // On the FP64 arm `dev_block_f` is null, `micx_elems` still holds the
+    // region's element count, and `dev_block` is laid out exactly as it was
+    // before this work -- micx first, at offset zero -- so the feature-off
+    // byte identity is a property of the layout and not of a branch.
+    float*              dev_block_f = nullptr;
+    std::size_t         micx_elems  = 0; ///< elements in the micx/lmpx region
+
+    /// Pinned host staging for the width conversion, [micx | ref], allocated
+    /// only under the arm.  ONE buffer with TWO REGIONS rather than two
+    /// buffers, and they may not overlap: the live-block H2D and the
+    /// reference H2D are issued back to back on the same stream in one
+    /// solveFlatXs call, so a shared region would let the second conversion
+    /// overwrite bytes the first copy has not read yet.
+    float*              stage_host   = nullptr;
+    std::size_t         stage_floats = 0;
+    std::size_t         stage_ref_at = 0; ///< where the reference region starts
+
+    /// A D2H that landed floats in `stage_host` and still owes the host array
+    /// its widening.  Queued at the issue and paid after the drain, because
+    /// the copy is ASYNCHRONOUS -- widening at the issue would read staging
+    /// bytes the device has not written.
+    struct MicxWiden {
+        double*     dst;
+        std::size_t off;
+        std::size_t count;
+    };
+    std::vector<MicxWiden> micx_widen;
     int*                dev_fuel    = nullptr;
     unsigned long long* dev_scalars = nullptr; // [0]=max bits, [1]=solved
     double*             dev_dep     = nullptr; // depTrans rows: [0..38]=I135, [39..77]=Xe135
@@ -2074,6 +2189,10 @@ struct XsReconBackend::Impl {
 
     // --- flat-XS extension (RASBERY_GPU_FLATXS) ---------------------------
     double*            dev_ref = nullptr; // [9 mic | msm | 9 lmp | lsm]
+    /// WP20.1: the narrow twin of the block above, same offsets, half the
+    /// bytes.  Exactly one of the two is non-null.
+    float*             dev_ref_f = nullptr;
+    std::size_t        ref_elems  = 0;
     std::size_t        off_ref_mic[fxs::N_ACTIVE] = {};
     std::size_t        off_ref_msm = 0;
     std::size_t        off_ref_lmp[fxs::N_ACTIVE] = {};
@@ -2102,6 +2221,40 @@ struct XsReconBackend::Impl {
                 n_off_reigv = 0, n_off_work = 0;
     std::size_t n_ioff_lktosfc = 0, n_ioff_neib = 0, n_ioff_lklr = 0,
                 n_ioff_idirlr = 0, n_ioff_sgnlr = 0;
+
+    // --- WP20.1: the narrow nodal block (RASBERY_GPU_FP32 + NODAL_FULL) ----
+    //
+    // `ndev_flt` carries the nine updateConstant products, chif, the narrowed
+    // copies of the three xs inputs, and the twelve private working arrays.
+    // `ndev_dbl` then carries only hmesh / albedo / jnet / flux / phis / reigv
+    // -- the geometry and the canonical state, which stay FP64 for the reasons
+    // src/NodalKernel.h states.  Exactly as in the flat-XS split, the offsets
+    // say which block they index and the FP64 arm's layout is unchanged.
+    float*             ndev_flt   = nullptr;
+    std::size_t        n_off_nxsrf = 0, n_off_nxsnf = 0, n_off_nxssm = 0;
+
+    /// Pinned host staging for the consts + chif conversion, and the event
+    /// that says the previous conversion's copies have READ it.  Without the
+    /// event a re-conversion could overwrite bytes an in-flight H2D has not
+    /// consumed -- and the consts upload is not inside any drain.  It fires
+    /// ~1,075 times in a 4,377-outer run and will essentially always find the
+    /// event already complete.
+    float*             nodal_stage        = nullptr;
+    std::size_t        nodal_stage_floats = 0;
+    cudaEvent_t        nodal_stage_event  = nullptr;
+
+    /// WP20.1: the narrow nodal drive's non-finite valve has fired and this
+    /// backend refuses the DEVICE nodal arm for the rest of the process.
+    ///
+    /// WHY REFUSAL AND NOT A DEMOTION TO THE WIDE DEVICE ARM, which is what
+    /// CMFD's latch does.  CMFD's precision is a KERNEL SET selected per
+    /// solve; nodal's is an ALLOCATION and a LAYOUT -- `ndev_flt` holds the
+    /// consts, chif and the whole working set, and `ndev_dbl` was laid out
+    /// without them.  Falling back in place would mean re-laying-out and
+    /// re-uploading mid-run, from inside a drive whose graph is captured.  So
+    /// the valve hands the drive back to `Nodal::TryDriveGpu`, whose CPU body
+    /// is the reference this arm is scored against: slower, correct, and loud.
+    bool               nodal_device_refused = false;
 
     // --- FULL-mode CUDA graph (RASBERY_GPU_NODAL_FULL) --------------------
     // The FULL drive is the same sequence of fixed-address operations every
@@ -2244,6 +2397,18 @@ struct XsReconBackend::Impl {
     struct NodalGraphKey {
         const void*   ndev = nullptr;
         const void*   dblk = nullptr;
+        /// WP20.1.  THE SEVENTEENTH FIELD, and the one that is not a pointer.
+        ///
+        /// A narrow drive is not the wide drive with different numbers in it:
+        /// it has THREE MORE KERNEL NODES (the xs boundary conversion) and its
+        /// consts/chif memcpy nodes carry half the bytes.  Replaying one graph
+        /// under the other precision would run float kernels over a double
+        /// block, or skip the conversion entirely and read the previous
+        /// outer's cross-sections.  Both are finite and plausible.  It is
+        /// constant for a run -- nodalNarrowState() is a cached static -- so
+        /// this costs no extra entries; it is here so that "the graph and the
+        /// arm agree" is a lookup rather than an assumption.
+        int           precision = 0;
         const void*   jnet = nullptr;
         const void*   phis = nullptr;
         const void*   flux = nullptr;
@@ -2265,7 +2430,8 @@ struct XsReconBackend::Impl {
         /// `= default` for operator==), and every field here is one a captured
         /// graph would silently move the wrong bytes without.
         bool operator==(const NodalGraphKey& o) const {
-            return ndev == o.ndev && dblk == o.dblk && jnet == o.jnet &&
+            return ndev == o.ndev && dblk == o.dblk && precision == o.precision &&
+                   jnet == o.jnet &&
                    phis == o.phis && flux == o.flux && nxyz == o.nxyz &&
                    nsurf == o.nsurf && chif_empty == o.chif_empty &&
                    canon_jnet == o.canon_jnet && canon_flux == o.canon_flux &&
@@ -2374,6 +2540,9 @@ struct XsReconBackend::Impl {
         }
         xeRelease();
         if (dev_block) rasbery::gpu::deviceBlockFree(dev_block);
+        if (dev_block_f) rasbery::gpu::deviceBlockFree(dev_block_f);
+        if (dev_ref_f) rasbery::gpu::deviceBlockFree(dev_ref_f);
+        if (stage_host) cudaFreeHost(stage_host);
         if (dev_fuel) rasbery::gpu::deviceBlockFree(dev_fuel);
         if (dev_scalars) rasbery::gpu::deviceBlockFree(dev_scalars);
         if (dev_dep) rasbery::gpu::deviceBlockFree(dev_dep);
@@ -2396,6 +2565,9 @@ struct XsReconBackend::Impl {
         // place that knows the backend is going away.
         if (nodal_done_event != nullptr) cudaEventDestroy(nodal_done_event);
         if (ndev_dbl) rasbery::gpu::deviceBlockFree(ndev_dbl);
+        if (ndev_flt) rasbery::gpu::deviceBlockFree(ndev_flt);
+        if (nodal_stage) cudaFreeHost(nodal_stage);
+        if (nodal_stage_event != nullptr) cudaEventDestroy(nodal_stage_event);
         if (ndev_int) rasbery::gpu::deviceBlockFree(ndev_int);
         if (stream) cudaStreamDestroy(stream);
     }
@@ -2419,8 +2591,15 @@ struct XsReconBackend::Impl {
         // instead of an inference from a board-level memory trace.
         if (dev_block != nullptr) rasbery::gpu::blockpool::noteArenaRebuild();
         if (dev_block) { rasbery::gpu::deviceBlockFree(dev_block); dev_block = nullptr; }
+        if (dev_block_f) { rasbery::gpu::deviceBlockFree(dev_block_f); dev_block_f = nullptr; }
         if (dev_fuel) { rasbery::gpu::deviceBlockFree(dev_fuel); dev_fuel = nullptr; }
         if (dev_ref) { rasbery::gpu::deviceBlockFree(dev_ref); dev_ref = nullptr; }
+        if (dev_ref_f) { rasbery::gpu::deviceBlockFree(dev_ref_f); dev_ref_f = nullptr; }
+        // BEFORE the staging buffer goes: an unpaid widening describes staging
+        // bytes in the allocation the next line releases, and a geometry
+        // change has invalidated the host destinations anyway.
+        micx_widen.clear();
+        if (stage_host) { cudaFreeHost(stage_host); stage_host = nullptr; stage_floats = 0; }
         if (dev_pernode) { rasbery::gpu::deviceBlockFree(dev_pernode); dev_pernode = nullptr; }
         resident_micx_generation  = 0;
         resident_state_generation = 0;
@@ -2447,11 +2626,22 @@ struct XsReconBackend::Impl {
         const std::size_t msm = static_cast<std::size_t>(xsr::NISO) * xsr::NG * xsr::NG * nx;
         const std::size_t ssm = static_cast<std::size_t>(xsr::NG) * xsr::NG * nx;
 
-        std::size_t off = 0;
+        // WP20.1.  THE MICX/LMPX REGION IS LAID OUT FIRST AND SEPARATELY, and
+        // then the rest of the block is laid out either AFTER it (FP64 arm,
+        // one allocation, byte-identical to what shipped) or FROM ZERO (FP32
+        // arm, micx/lmpx living in `dev_block_f` instead).  Writing it this
+        // way rather than as two layouts is what keeps the OFF arm's offsets
+        // provably the ones it had: `narrow` false makes `off` start at
+        // `micx_elems`, which is exactly where `off_iden` was.
+        const bool  narrow = flatxsNarrowBlocks();
+        std::size_t off    = 0;
         for (int xt = 0; xt < xsr::NXS; ++xt) { off_mic[xt] = off; off += mic; }
         off_mic_ssm = off; off += msm;
         for (int xt = 0; xt < xsr::NXS; ++xt) { off_lmp[xt] = off; off += lmp; }
         off_lmp_ssm = off; off += ssm;
+        micx_elems = off;
+
+        if (narrow) off = 0;
         off_iden = off; off += static_cast<std::size_t>(xsr::NISO) * nx;
         for (int xt = 0; xt < xsr::NXS; ++xt) { off_xs[xt] = off; off += lmp; }
         off_xs_ssm = off; off += ssm;
@@ -2460,6 +2650,33 @@ struct XsReconBackend::Impl {
 
         RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&dev_block),
                                           block_doubles * sizeof(double)), status);
+        if (narrow) {
+            RASBERY_CUDA_TRY_ALLOC(
+                rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&dev_block_f),
+                                               micx_elems * sizeof(float)),
+                status);
+            // The reference block's own element count, laid out by solveFlatXs
+            // on first contact; sized here so ONE staging buffer covers both
+            // regions and neither conversion can tread on the other.
+            ref_elems = static_cast<std::size_t>(fxs::N_ACTIVE) * (mic + lmp) + msm + ssm;
+            stage_ref_at = micx_elems;
+            stage_floats = micx_elems + ref_elems;
+            // Pinned, because the whole point of the conversion is that the
+            // copy it feeds is a DMA and not a pageable bounce.  It is host
+            // memory bought with device memory: the arm frees 29.7 MB of VRAM
+            // on the live block and 29.7 MB on the reference block at KNGR
+            // size, and spends 64.9 MB of pinned host on the staging.  The
+            // trade is stated in docs/WP20_GPU_FP32_20260831_KO.md Sec 3.
+            rasbery::AllocWindow _alloc_window("xsrecon.micx.stage");
+            if (cudaMallocHost(reinterpret_cast<void**>(&stage_host),
+                               stage_floats * sizeof(float)) != cudaSuccess) {
+                cudaGetLastError();
+                stage_host   = nullptr;
+                stage_floats = 0;
+                status = "WP20.1: pinned micx staging allocation failed";
+                return false;
+            }
+        }
         RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&dev_fuel),
                                           static_cast<std::size_t>(nxyz) * sizeof(int)), status);
         return true;
@@ -2587,14 +2804,14 @@ struct XsReconBackend::Impl {
                 micx_scatter_pending = false;
             }
             for (int xt = 0; xt < xsr::NXS; ++xt)
-                if (!upload("xsrecon micx mic", host.mic[xt], off_mic[xt], mic))
+                if (!uploadMicx("xsrecon micx mic", host.mic[xt], off_mic[xt], mic))
                     return false;
-            if (!upload("xsrecon micx mic_ssm", host.mic_ssm, off_mic_ssm, msm))
+            if (!uploadMicx("xsrecon micx mic_ssm", host.mic_ssm, off_mic_ssm, msm))
                 return false;
             for (int xt = 0; xt < xsr::NXS; ++xt)
-                if (!upload("xsrecon micx lmp", host.lmp[xt], off_lmp[xt], lmp))
+                if (!uploadMicx("xsrecon micx lmp", host.lmp[xt], off_lmp[xt], lmp))
                     return false;
-            if (!upload("xsrecon micx lmp_ssm", host.lmp_ssm, off_lmp_ssm, ssm))
+            if (!uploadMicx("xsrecon micx lmp_ssm", host.lmp_ssm, off_lmp_ssm, ssm))
                 return false;
             resident_micx_generation = micx_generation;
         }
@@ -2622,13 +2839,33 @@ struct XsReconBackend::Impl {
             return false;
 
         v = host;
+        // WP20.1: the micx/lmpx pointers come from whichever block is the
+        // authority, and `narrow_blocks` travels WITH them so the kernel
+        // cannot consult a different opinion.  The wide pointers are left null
+        // on the narrow arm on purpose: a reader that skipped the accessors
+        // faults instead of quietly reading the macroscopic region.
+        v.narrow_blocks = (dev_block_f != nullptr) ? 1 : 0;
         for (int xt = 0; xt < xsr::NXS; ++xt) {
-            v.mic[xt] = dev_block + off_mic[xt];
-            v.lmp[xt] = dev_block + off_lmp[xt];
+            if (dev_block_f != nullptr) {
+                v.mic_f[xt] = dev_block_f + off_mic[xt];
+                v.lmp_f[xt] = dev_block_f + off_lmp[xt];
+                v.mic[xt]   = nullptr;
+                v.lmp[xt]   = nullptr;
+            } else {
+                v.mic[xt] = dev_block + off_mic[xt];
+                v.lmp[xt] = dev_block + off_lmp[xt];
+            }
             v.xs[xt]  = dev_block + off_xs[xt];
         }
-        v.mic_ssm = dev_block + off_mic_ssm;
-        v.lmp_ssm = dev_block + off_lmp_ssm;
+        if (dev_block_f != nullptr) {
+            v.mic_ssm_f = dev_block_f + off_mic_ssm;
+            v.lmp_ssm_f = dev_block_f + off_lmp_ssm;
+            v.mic_ssm   = nullptr;
+            v.lmp_ssm   = nullptr;
+        } else {
+            v.mic_ssm = dev_block + off_mic_ssm;
+            v.lmp_ssm = dev_block + off_lmp_ssm;
+        }
         v.iden    = dev_block + off_iden;
         v.xs_ssm  = dev_block + off_xs_ssm;
         v.phif    = dev_block + off_phif;
@@ -2746,6 +2983,70 @@ struct XsReconBackend::Impl {
                                             cudaMemcpyDeviceToHost, stream),
                          status);
         return true;
+    }
+
+    // -----------------------------------------------------------------------
+    // WP20.1: the micx/lmpx half, at the arm's width
+    // -----------------------------------------------------------------------
+    //
+    // TWO ENTRY POINTS, NOT TWENTY.  Every micx/lmpx transfer in this file --
+    // the xsrecon stage, the flat-XS live-block re-upload, the eager download,
+    // the lazy WP15 materialisation -- goes through exactly these, so the byte
+    // count that reaches the [RASBERY][XFER] ledger is the count that moved on
+    // BOTH arms, and there is one place where the conversion can be wrong.
+    //
+    // THE HOST ARRAYS STAY DOUBLE, ALWAYS.  `_micx` / `_lmpx` are
+    // milk::Vector<double> and every host reader in the tree -- depletion, Xe,
+    // CRAM's H2D fallback, the result writer -- reads them as double.  So the
+    // arm does not narrow the host side at all; it narrows the WIRE and the
+    // DEVICE, and pays a conversion at each end.
+    bool uploadMicx(const char* leaf, const double* src, std::size_t off,
+                    std::size_t count) {
+        if (dev_block_f == nullptr) return upload(leaf, src, off, count);
+        float* stage = stage_host + off;
+        for (std::size_t i = 0; i < count; ++i)
+            stage[i] = static_cast<float>(src[i]);
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:DeviceBlock::uploadMicx",
+                                            leaf, dev_block_f + off, stage,
+                                            count * sizeof(float),
+                                            cudaMemcpyHostToDevice, stream),
+                         status);
+        rasbery::fp32::noteBytesSaved(count * (sizeof(double) - sizeof(float)));
+        return true;
+    }
+
+    /// Issues the D2H and RECORDS A DEBT; the widening happens in
+    /// drainMicxWiden(), which every caller must run after its stream drain.
+    bool downloadMicx(const char* leaf, double* dst, std::size_t off,
+                      std::size_t count) {
+        if (dev_block_f == nullptr) return download(leaf, dst, off, count);
+        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:DeviceBlock::downloadMicx",
+                                            leaf, stage_host + off, dev_block_f + off,
+                                            count * sizeof(float),
+                                            cudaMemcpyDeviceToHost, stream),
+                         status);
+        micx_widen.push_back(MicxWiden{dst, off, count});
+        rasbery::fp32::noteBytesSaved(count * (sizeof(double) - sizeof(float)));
+        return true;
+    }
+
+    /// Pay every widening this call queued.  A no-op on the FP64 arm and on
+    /// any call that downloaded nothing, so it is safe to call unconditionally
+    /// after a drain -- which is how it is called, because a drain that
+    /// forgets it leaves the host array holding the PREVIOUS epoch and that is
+    /// precisely the WP15 failure this arm must not reintroduce.
+    ///
+    /// NO OpenMP HERE, deliberately: this TU is compiled by nvcc and the
+    /// widening runs on the WP15 lazy path, which fires a few dozen times a
+    /// run, not per outer.  The eager path (RASBERY_GPU_MICX_RESIDENT unset)
+    /// pays it per solve and the cost is stated in the doc rather than hidden.
+    void drainMicxWiden() {
+        for (const MicxWiden& w : micx_widen) {
+            const float* src = stage_host + w.off;
+            for (std::size_t i = 0; i < w.count; ++i)
+                w.dst[i] = static_cast<double>(src[i]);
+        }
+        micx_widen.clear();
     }
 
     // -----------------------------------------------------------------------
@@ -3488,41 +3789,63 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     }
 
     // --- per-instance reference block (re-upload on ref generation) -------
-    if (d.dev_ref == nullptr) {
+    //
+    // WP20.1: under RASBERY_GPU_FP32 this block is float, and the four copies
+    // below become CONVERT-THEN-COPY through the pinned staging region
+    // `ensure()` reserved for them.  Same offsets, same order, half the wire.
+    const bool narrow_blocks = d.dev_block_f != nullptr;
+    if (d.dev_ref == nullptr && d.dev_ref_f == nullptr) {
         std::size_t off = 0;
         for (int t = 0; t < fxs::N_ACTIVE; ++t) { d.off_ref_mic[t] = off; off += mic; }
         d.off_ref_msm = off; off += msm;
         for (int t = 0; t < fxs::N_ACTIVE; ++t) { d.off_ref_lmp[t] = off; off += lmp; }
         d.off_ref_lsm = off; off += ssm;
-        RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&d.dev_ref),
-                                          off * sizeof(double)), d.status);
+        d.ref_elems = off;
+        if (narrow_blocks) {
+            RASBERY_CUDA_TRY_ALLOC(
+                rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&d.dev_ref_f),
+                                               off * sizeof(float)),
+                d.status);
+        } else {
+            RASBERY_CUDA_TRY_ALLOC(
+                rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&d.dev_ref),
+                                               off * sizeof(double)),
+                d.status);
+        }
         d.resident_ref_generation = 0;
     }
     if (ref_generation != d.resident_ref_generation) {
-        for (int t = 0; t < fxs::N_ACTIVE; ++t) {
-            RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveFlatXs", "ref mic",
-                                         d.dev_ref + d.off_ref_mic[t], host.ref_mic[t],
-                                         mic * sizeof(double), cudaMemcpyHostToDevice,
-                                         d.stream),
+        // ONE LAMBDA FOR ALL FOUR, so the width decision is spelled once and
+        // the four copies cannot disagree about it.
+        auto ref_upload = [&](const char* leaf, const double* src,
+                              std::size_t off, std::size_t count) -> bool {
+            if (!narrow_blocks) {
+                RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveFlatXs",
+                                                   leaf, d.dev_ref + off, src,
+                                                   count * sizeof(double),
+                                                   cudaMemcpyHostToDevice, d.stream),
+                                 d.status);
+                return true;
+            }
+            float* stage = d.stage_host + d.stage_ref_at + off;
+            for (std::size_t i = 0; i < count; ++i)
+                stage[i] = static_cast<float>(src[i]);
+            RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveFlatXs", leaf,
+                                               d.dev_ref_f + off, stage,
+                                               count * sizeof(float),
+                                               cudaMemcpyHostToDevice, d.stream),
                              d.status);
-        }
-        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveFlatXs", "ref msm",
-                                     d.dev_ref + d.off_ref_msm, host.ref_msm,
-                                     msm * sizeof(double), cudaMemcpyHostToDevice,
-                                     d.stream),
-                         d.status);
-        for (int t = 0; t < fxs::N_ACTIVE; ++t) {
-            RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveFlatXs", "ref lmp",
-                                         d.dev_ref + d.off_ref_lmp[t], host.ref_lmp[t],
-                                         lmp * sizeof(double), cudaMemcpyHostToDevice,
-                                         d.stream),
-                             d.status);
-        }
-        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveFlatXs", "ref lsm",
-                                     d.dev_ref + d.off_ref_lsm, host.ref_lsm,
-                                     ssm * sizeof(double), cudaMemcpyHostToDevice,
-                                     d.stream),
-                         d.status);
+            rasbery::fp32::noteBytesSaved(count * (sizeof(double) - sizeof(float)));
+            return true;
+        };
+        for (int t = 0; t < fxs::N_ACTIVE; ++t)
+            if (!ref_upload("ref mic", host.ref_mic[t], d.off_ref_mic[t], mic))
+                return false;
+        if (!ref_upload("ref msm", host.ref_msm, d.off_ref_msm, msm)) return false;
+        for (int t = 0; t < fxs::N_ACTIVE; ++t)
+            if (!ref_upload("ref lmp", host.ref_lmp[t], d.off_ref_lmp[t], lmp))
+                return false;
+        if (!ref_upload("ref lsm", host.ref_lsm, d.off_ref_lsm, ssm)) return false;
         d.resident_ref_generation = ref_generation;
     }
 
@@ -3546,13 +3869,13 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
             d.micx_scatter_pending = false;
         }
         for (int xt = 0; xt < xsr::NXS; ++xt)
-            if (!d.upload("flatxs micx mic", host.mic_all[xt], d.off_mic[xt], mic))
+            if (!d.uploadMicx("flatxs micx mic", host.mic_all[xt], d.off_mic[xt], mic))
                 return false;
-        if (!d.upload("flatxs micx msm", host.msm, d.off_mic_ssm, msm)) return false;
+        if (!d.uploadMicx("flatxs micx msm", host.msm, d.off_mic_ssm, msm)) return false;
         for (int xt = 0; xt < xsr::NXS; ++xt)
-            if (!d.upload("flatxs micx lmp", host.lmp_all[xt], d.off_lmp[xt], lmp))
+            if (!d.uploadMicx("flatxs micx lmp", host.lmp_all[xt], d.off_lmp[xt], lmp))
                 return false;
-        if (!d.upload("flatxs micx lsm", host.lsm, d.off_lmp_ssm, ssm)) return false;
+        if (!d.uploadMicx("flatxs micx lsm", host.lsm, d.off_lmp_ssm, ssm)) return false;
         d.resident_micx_generation = micx_generation;
     }
 
@@ -3649,22 +3972,49 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
 
     // --- repoint the view at the device copies ----------------------------
     fxs::FlatXsView v = host;
+    // WP20.1: the four micx/lmpx blocks are repointed at whichever allocation
+    // the arm made authoritative, and `narrow_blocks` travels with them.  The
+    // wide pointers are nulled on the narrow arm so a body that skipped the
+    // accessors faults rather than reading the wrong region.
+    v.narrow_blocks = narrow_blocks ? 1 : 0;
     for (int t = 0; t < fxs::N_ACTIVE; ++t) {
         v.coeff_lmp[t] = d.lib->block + d.lib->off_lmp[t];
         v.coeff_mic[t] = d.lib->block + d.lib->off_mic[t];
-        v.ref_lmp[t]   = d.dev_ref + d.off_ref_lmp[t];
-        v.ref_mic[t]   = d.dev_ref + d.off_ref_mic[t];
-        v.lmp[t]       = d.dev_block + d.off_lmp[ACTIVE_XT9[t]];
-        v.mic[t]       = d.dev_block + d.off_mic[ACTIVE_XT9[t]];
+        if (narrow_blocks) {
+            v.ref_lmp_f[t] = d.dev_ref_f + d.off_ref_lmp[t];
+            v.ref_mic_f[t] = d.dev_ref_f + d.off_ref_mic[t];
+            v.lmp_f[t]     = d.dev_block_f + d.off_lmp[ACTIVE_XT9[t]];
+            v.mic_f[t]     = d.dev_block_f + d.off_mic[ACTIVE_XT9[t]];
+            v.ref_lmp[t]   = nullptr;
+            v.ref_mic[t]   = nullptr;
+            v.lmp[t]       = nullptr;
+            v.mic[t]       = nullptr;
+        } else {
+            v.ref_lmp[t] = d.dev_ref + d.off_ref_lmp[t];
+            v.ref_mic[t] = d.dev_ref + d.off_ref_mic[t];
+            v.lmp[t]     = d.dev_block + d.off_lmp[ACTIVE_XT9[t]];
+            v.mic[t]     = d.dev_block + d.off_mic[ACTIVE_XT9[t]];
+        }
     }
     v.coeff_lsm = d.lib->block + d.lib->off_lsm;
     v.coeff_msm = d.lib->block + d.lib->off_msm;
     v.knots     = d.lib->block + d.lib->off_knots;
     v.deltas    = d.lib->deltas;
-    v.ref_lsm   = d.dev_ref + d.off_ref_lsm;
-    v.ref_msm   = d.dev_ref + d.off_ref_msm;
-    v.lsm       = d.dev_block + d.off_lmp_ssm;
-    v.msm       = d.dev_block + d.off_mic_ssm;
+    if (narrow_blocks) {
+        v.ref_lsm_f = d.dev_ref_f + d.off_ref_lsm;
+        v.ref_msm_f = d.dev_ref_f + d.off_ref_msm;
+        v.lsm_f     = d.dev_block_f + d.off_lmp_ssm;
+        v.msm_f     = d.dev_block_f + d.off_mic_ssm;
+        v.ref_lsm   = nullptr;
+        v.ref_msm   = nullptr;
+        v.lsm       = nullptr;
+        v.msm       = nullptr;
+    } else {
+        v.ref_lsm = d.dev_ref + d.off_ref_lsm;
+        v.ref_msm = d.dev_ref + d.off_ref_msm;
+        v.lsm     = d.dev_block + d.off_lmp_ssm;
+        v.msm     = d.dev_block + d.off_mic_ssm;
+    }
     for (int xt = 0; xt < xsr::NXS; ++xt)
         v.xs[xt] = d.dev_block + d.off_xs[xt];
     v.xs_ssm       = d.dev_block + d.off_xs_ssm;
@@ -3695,8 +4045,15 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     // thread-per-node reference keeps its 7,388 B of LOCAL memory in double --
     // so an FP32 request that lands on the reference arm is a DEMOTION, and it
     // is counted as one rather than silently ignored.
+    //
+    // WP20.1 SEPARATES THE TWO WIDTHS THE ARM CONTROLS and the demotion above
+    // is now precisely scoped: the BLOCK width (`v.narrow_blocks`, set at the
+    // repoint above) is honoured by BOTH kernels, because both write the same
+    // blocks and one of them writing double into a float block would be a
+    // silent corruption rather than a slower answer.  What the reference arm
+    // demotes is only the WORKSPACE.
     static const bool cta = rasberyGpuFlatXsCtaEnabled();
-    static const bool narrow = rasbery::fp32::routes(rasbery::fp32::Backend::FlatXs);
+    const bool narrow = narrow_blocks;
     if (cta) {
         fxs::flatxsCtaLaunch(v, rasberyGpuFlatXsCtaThreads(), d.stream, narrow);
         if (narrow)
@@ -3748,15 +4105,17 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     const bool        micx_resident     = micx_resident_arm && mark_micx_resident;
     if (!skip_micx_dl && !micx_resident) {
         for (int t = 0; t < fxs::N_ACTIVE; ++t) {
-            if (!d.download("flatxs lmpx lmp", host.lmp[t], d.off_lmp[ACTIVE_XT9[t]],
-                            lmp))
+            if (!d.downloadMicx("flatxs lmpx lmp", host.lmp[t],
+                                d.off_lmp[ACTIVE_XT9[t]], lmp))
                 return false;
-            if (!d.download("flatxs micx mic", host.mic[t], d.off_mic[ACTIVE_XT9[t]],
-                            mic))
+            if (!d.downloadMicx("flatxs micx mic", host.mic[t],
+                                d.off_mic[ACTIVE_XT9[t]], mic))
                 return false;
         }
-        if (!d.download("flatxs lmpx lsm", host.lsm, d.off_lmp_ssm, ssm)) return false;
-        if (!d.download("flatxs micx msm", host.msm, d.off_mic_ssm, msm)) return false;
+        if (!d.downloadMicx("flatxs lmpx lsm", host.lsm, d.off_lmp_ssm, ssm))
+            return false;
+        if (!d.downloadMicx("flatxs micx msm", host.msm, d.off_mic_ssm, msm))
+            return false;
     } else if (!skip_micx_dl) {
         // The kernel has already written the block; the debt is recorded BEFORE
         // the drain below so a caller that inspects the backend between the
@@ -3776,8 +4135,18 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     RASBERY_CUDA_TRY(xfer::streamSync("CudaXsReconBackend.cu:solveFlatXs", "drain",
                                        d.stream),
                      d.status);
+    // WP20.1: the staged floats are readable now.  Unconditional and a no-op
+    // on the wide arm and on any call that downloaded nothing -- a drain that
+    // forgot this would leave `_micx`/`_lmpx` holding the previous epoch,
+    // which is exactly the WP15 failure mode this must not reintroduce.
+    d.drainMicxWiden();
 
-    // After the download the host and device copies are bit-identical, so the
+    // After the download the host and device copies are BIT-IDENTICAL TO WHAT
+    // THE SAME ARM WOULD HAVE PRODUCED LAZILY -- which is the invariant WP15
+    // rests on, and it is unchanged: on the narrow arm both the eager and the
+    // lazy path round through the same float block, so "eager == lazy" still
+    // holds.  It is "narrow == wide" that does not, and that is what makes
+    // this A2.  So the
     // caller's post-call generation bump can be marked already-resident and
     // the next xsrecon call skips its ~70 MB re-upload.  A rodded CPU pass
     // after this call invalidates that (mark_micx_resident=false).
@@ -3808,7 +4177,7 @@ unsigned long long XsReconBackend::micxResidentGeneration() const {
     return _impl->resident_micx_generation;
 }
 
-const double* XsReconBackend::micxDeviceSlot(int xt) const {
+const void* XsReconBackend::micxDeviceSlot(int xt) const {
     const Impl& d = *_impl;
     // resident_micx_generation == 0 is the "nothing is resident" sentinel this
     // file has used since the xsrecon solve: without it a caller would be handed
@@ -3816,7 +4185,20 @@ const double* XsReconBackend::micxDeviceSlot(int xt) const {
     if (!d.available || d.dev_block == nullptr || d.resident_micx_generation == 0)
         return nullptr;
     if (xt < 0 || xt >= xsr::NXS) return nullptr;
-    return d.dev_block + d.off_mic[xt];
+    // WP20.1: the return type is `const void*` because the ELEMENT WIDTH is no
+    // longer a property of this tree, it is a property of the arm, and a
+    // `const double*` handed to CRAM under RASBERY_GPU_FP32 would let a D2D
+    // copy `count * sizeof(double)` bytes out of a float block -- finite,
+    // plausible, and half of it another slot's data.  The consumer asks
+    // micxDeviceElemBytes() and either memcpys (8) or widens (4).
+    if (d.dev_block_f != nullptr)
+        return static_cast<const void*>(d.dev_block_f + d.off_mic[xt]);
+    return static_cast<const void*>(d.dev_block + d.off_mic[xt]);
+}
+
+int XsReconBackend::micxDeviceElemBytes() const {
+    return _impl->dev_block_f != nullptr ? static_cast<int>(sizeof(float))
+                                         : static_cast<int>(sizeof(double));
 }
 
 void* XsReconBackend::micxReadyEvent() {
@@ -3876,23 +4258,29 @@ bool XsReconBackend::downloadFlatXsMicx(const fxs::FlatXsView& host, bool scalar
     // array the flag-off arm downloaded eagerly.  That identity is the whole
     // B0 claim, and it is why this is a second CALL SITE of one copy list and
     // not a second copy list.
+    // WP20.1: `moved` is the DEBT PAID and it is netted against
+    // `g_micx_deferred_bytes`, which flatxsMicxBlockBytes() now quotes at the
+    // arm's width.  Both sides must use the same width or micxBytesSaved()
+    // reports a saving the arm did not make.
+    const std::size_t   ebytes = flatxsMicxElemBytes();
     unsigned long long moved = 0;
     if (want_scalars) {
         for (int t = 0; t < fxs::N_ACTIVE; ++t) {
-            if (!d.download("flatxs lmpx lmp", host.lmp[t], d.off_lmp[ACTIVE_XT9[t]],
-                            lmp))
+            if (!d.downloadMicx("flatxs lmpx lmp", host.lmp[t],
+                                d.off_lmp[ACTIVE_XT9[t]], lmp))
                 return false;
-            if (!d.download("flatxs micx mic", host.mic[t], d.off_mic[ACTIVE_XT9[t]],
-                            mic))
+            if (!d.downloadMicx("flatxs micx mic", host.mic[t],
+                                d.off_mic[ACTIVE_XT9[t]], mic))
                 return false;
         }
-        moved += static_cast<unsigned long long>(fxs::N_ACTIVE) * (lmp + mic) *
-                 sizeof(double);
+        moved += static_cast<unsigned long long>(fxs::N_ACTIVE) * (lmp + mic) * ebytes;
     }
     if (want_scatter) {
-        if (!d.download("flatxs lmpx lsm", host.lsm, d.off_lmp_ssm, ssm)) return false;
-        if (!d.download("flatxs micx msm", host.msm, d.off_mic_ssm, msm)) return false;
-        moved += static_cast<unsigned long long>(ssm + msm) * sizeof(double);
+        if (!d.downloadMicx("flatxs lmpx lsm", host.lsm, d.off_lmp_ssm, ssm))
+            return false;
+        if (!d.downloadMicx("flatxs micx msm", host.msm, d.off_mic_ssm, msm))
+            return false;
+        moved += static_cast<unsigned long long>(ssm + msm) * ebytes;
     }
     // The caller is a HOST READER: it is about to dereference these arrays, so
     // the copies have to have landed, not merely been issued.  Same drain
@@ -3901,6 +4289,10 @@ bool XsReconBackend::downloadFlatXsMicx(const fxs::FlatXsView& host, bool scalar
     RASBERY_CUDA_TRY(xfer::streamSync("CudaXsReconBackend.cu:downloadFlatXsMicx",
                                       "micx drain", d.stream),
                      d.status);
+    // WP20.1: the widening the narrow arm owes the host arrays.  It runs HERE,
+    // after the drain and before the flags are cleared, so no host reader can
+    // observe a cleared flag over an unwidened array.
+    d.drainMicxWiden();
     if (want_scalars) d.micx_scalars_pending = false;
     if (want_scatter) d.micx_scatter_pending = false;
     g_micx_downloaded_bytes.fetch_add(moved, std::memory_order_relaxed);
@@ -3952,21 +4344,31 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     // very end, and only when this drive actually deferred.
     d.nodal_drain_deferred = false;
     if (!d.available || host.nxyz <= 0 || host.nsurf <= 0) return false;
+    // WP20.1: a fired non-finite valve is sticky for the process.  See
+    // Impl::nodal_device_refused.
+    if (d.nodal_device_refused) return false;
 
-    // WP20.  THE NODAL ARM IS DEFERRED, AND THIS IS WHERE IT SAYS SO.  With
-    // RASBERY_GPU_FP32 on, this drive still runs every kernel in FP64, so the
-    // end-of-run [RASBERY][FP32] receipt reports `nodal:"deferred"` and counts
-    // one demotion per drive.  Without this line a reader could only learn that
-    // nodal stayed wide by reading src/GpuFp32Arm.h's `converted()` table --
-    // and a wall-clock A/B nobody could attribute is exactly the failure this
-    // receipt exists to prevent.  Why it is deferred rather than done: NodalView
-    // is thirty double* fields, four of which (xsrf/xsnf/xssm/chif) are SHARED
-    // with the flat-XS and CMFD device block, and the kernel set is captured
-    // into a graph cached under a key with no precision in it.  A narrow arm is
-    // therefore a parallel view, a parallel block, a narrowing pass on the
-    // shared inputs and a wider key -- a work package, not a template
-    // parameter.  See docs/WP20_GPU_FP32_20260831_KO.md Sec 7.
-    if (rasbery::fp32::armed())
+    // WP20.1.  THE NODAL ARM EXISTS NOW, AND THIS IS WHERE A DRIVE THAT DID
+    // NOT TAKE IT SAYS SO.
+    //
+    // WP20 counted one demotion per drive here, unconditionally, because
+    // nothing was narrowed.  Two things can still send a drive down the wide
+    // path with the arm on, and both are counted rather than argued:
+    //
+    //   * the HYBRID arm (RASBERY_GPU_NODAL_FULL unset).  It runs
+    //     calculateEven on the host and ships trlcff0 / trlcff2 / matM back to
+    //     `Nodal`'s FP64 buffers mid-drive, so narrowing it would put a
+    //     widening pass on the critical path of the validated fallback.
+    //   * the BATCH ARENA.  Its per-slot view table is a baked kernel argument
+    //     and its bucket graphs are keyed on (bucket, fusion, geometry) with
+    //     no precision -- a second, parallel narrowing, and it is the next
+    //     work package rather than this one.  The arena branch below counts
+    //     its own demotion when it takes the drive.
+    //
+    // The receipt therefore reads `nodal:"fp32"` with a demotion count that is
+    // ZERO on the single-deck production arm and one-per-drive on either of
+    // those, which is exactly the distinction a wall-clock A/B needs.
+    if (rasbery::fp32::armed() && !nodalNarrowState())
         rasbery::fp32::noteDemotion(rasbery::fp32::Backend::Nodal);
 
     // ---- multi-instance batch arena ---------------------------------------
@@ -4002,6 +4404,11 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
             if (d.nodal_slot >= 0) {
                 if (arena->drive(d.nodal_slot, host, const_generation, ref_generation,
                                  d.canonical, d.canonical_materialize)) {
+                    // WP20.1: the arena drive is FP64.  Counted here, at the
+                    // moment it takes the work, so a batch run cannot look
+                    // like a narrow one in the receipt.
+                    if (rasbery::fp32::armed() && nodalNarrowState())
+                        rasbery::fp32::noteDemotion(rasbery::fp32::Backend::Nodal);
                     // Rev.7.1 Task 18: the batch drive just wrote jnet and phis
                     // on the device, exactly as the per-instance FULL path does
                     // at the bottom of this function -- so the ownership moves
@@ -4030,26 +4437,67 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         d.dropNodalGraph(); // baked ndev_dbl-relative pointers
         rasbery::AllocWindow _alloc_window("nodal.instance.regrow");
         if (d.ndev_dbl) { rasbery::gpu::deviceBlockFree(d.ndev_dbl); d.ndev_dbl = nullptr; }
+        if (d.ndev_flt) { rasbery::gpu::deviceBlockFree(d.ndev_flt); d.ndev_flt = nullptr; }
+        if (d.nodal_stage) {
+            cudaFreeHost(d.nodal_stage);
+            d.nodal_stage        = nullptr;
+            d.nodal_stage_floats = 0;
+        }
         if (d.ndev_int) { rasbery::gpu::deviceBlockFree(d.ndev_int); d.ndev_int = nullptr; }
         d.nodal_geom_uploaded       = false;
         d.resident_const_generation = 0;
         d.resident_chif_generation  = 0;
         d.nodal_nsurf               = host.nsurf;
         const std::size_t ndg0 = nx * ndl::NDIR * ndl::NG;
-        std::size_t off = 0;
+        const std::size_t nwork = 3 * ndg0 + 2 * nx * ndl::NDIR * ndl::NG2 +
+                                  4 * nx * ndl::NG2 + 3 * ndg0;
+        // WP20.1.  ONE LAYOUT, TWO DESTINATIONS.  `nnarrow` moves the nine
+        // constants, chif and the whole working set into the float block and
+        // adds the three narrowed xs copies; everything it does not move keeps
+        // the offset it had, and with `nnarrow` false the sequence below is
+        // literally the layout that shipped.
+        const bool  nnarrow = nodalNarrowState();
+        std::size_t off  = 0; // into ndev_dbl, in doubles
+        std::size_t foff = 0; // into ndev_flt, in floats
         d.n_off_hmesh = off; off += nx * ndl::NDIR;
         d.n_off_albedo = off; off += ndl::NDIR * ndl::NLR;
-        d.n_off_consts = off; off += 9 * ndg0;
-        d.n_off_chif = off; off += ndl::NG * nx;
+        if (nnarrow) { d.n_off_consts = foff; foff += 9 * ndg0; }
+        else         { d.n_off_consts = off;  off  += 9 * ndg0; }
+        if (nnarrow) { d.n_off_chif = foff; foff += ndl::NG * nx; }
+        else         { d.n_off_chif = off;  off  += ndl::NG * nx; }
         d.n_off_jnet = off; off += ns * ndl::NG;
         d.n_off_flux = off; off += nx * ndl::NG;
         d.n_off_phis = off; off += ns * ndl::NG;
         d.n_off_reigv = off; off += 1;
-        d.n_off_work = off;
-        off += 3 * ndg0 + 2 * nx * ndl::NDIR * ndl::NG2 + 4 * nx * ndl::NG2 +
-               3 * ndg0;
+        if (nnarrow) {
+            // The drive's own narrowed copies of the three macroscopic inputs.
+            // They exist ONLY on this arm -- the FP64 drive reads dev_block
+            // directly and takes no copy at all.
+            d.n_off_nxsrf = foff; foff += ndl::NG * nx;
+            d.n_off_nxsnf = foff; foff += ndl::NG * nx;
+            d.n_off_nxssm = foff; foff += ndl::NG * ndl::NG * nx;
+            d.n_off_work  = foff; foff += nwork;
+        } else {
+            d.n_off_work = off; off += nwork;
+        }
         RASBERY_CUDA_TRY_ALLOC(rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&d.ndev_dbl),
                                           off * sizeof(double)), d.status);
+        if (nnarrow) {
+            RASBERY_CUDA_TRY_ALLOC(
+                rasbery::gpu::deviceBlockAlloc(reinterpret_cast<void**>(&d.ndev_flt),
+                                               foff * sizeof(float)),
+                d.status);
+            d.nodal_stage_floats = 9 * ndg0 + ndl::NG * nx;
+            rasbery::AllocWindow _stage_window("nodal.stage.hostalloc");
+            if (cudaMallocHost(reinterpret_cast<void**>(&d.nodal_stage),
+                               d.nodal_stage_floats * sizeof(float)) != cudaSuccess) {
+                cudaGetLastError();
+                d.nodal_stage        = nullptr;
+                d.nodal_stage_floats = 0;
+                d.status = "WP20.1: pinned nodal consts staging allocation failed";
+                return false;
+            }
+        }
         std::size_t ioff = 0;
         d.n_ioff_lktosfc = ioff; ioff += nx * ndl::NDIR * ndl::NLR;
         d.n_ioff_neib = ioff; ioff += nx * ndl::NEWSB;
@@ -4111,13 +4559,48 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         const double* consts[9] = {host.eta1, host.eta2, host.m260,
                                    host.m251, host.m253, host.m262,
                                    host.m264, host.diagD, host.diagDI};
-        for (int i = 0; i < 9; ++i)
-            RASBERY_CUDA_TRY(
-                xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal", "consts",
-                                    d.ndev_dbl + d.n_off_consts + i * ndg, consts[i],
-                                    ndg * sizeof(double), cudaMemcpyHostToDevice,
-                                    d.stream),
-                d.status);
+        // WP20.1.  THE MEASURED NODAL CARRIER: nine arrays of `nxyz*NDIR*NG`
+        // doubles re-sent every time the Xe device step moves the macroscopic
+        // xs -- 3.9 GB over a KNGR run.  Narrowing the block halves the wire
+        // and the VRAM, and the conversion is host arithmetic over 456 K
+        // elements, which is nothing beside the copy it replaces.
+        if (d.ndev_flt != nullptr) {
+            // The previous conversion's copies must have READ the staging
+            // before this one overwrites it.  See Impl::nodal_stage_event.
+            if (d.nodal_stage_event != nullptr)
+                xfer::eventSync("CudaXsReconBackend.cu:solveNodal",
+                                "consts stage reuse", d.nodal_stage_event);
+            for (int i = 0; i < 9; ++i) {
+                float* stg = d.nodal_stage + static_cast<std::size_t>(i) * ndg;
+                for (std::size_t e = 0; e < ndg; ++e)
+                    stg[e] = static_cast<float>(consts[i][e]);
+                RASBERY_CUDA_TRY(
+                    xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal", "consts",
+                                        d.ndev_flt + d.n_off_consts + i * ndg, stg,
+                                        ndg * sizeof(float), cudaMemcpyHostToDevice,
+                                        d.stream),
+                    d.status);
+            }
+            rasbery::fp32::noteBytesSaved(9 * ndg * (sizeof(double) - sizeof(float)));
+            if (d.nodal_stage_event == nullptr) {
+                rasbery::AllocWindow _ev_window("nodal.stage.event");
+                if (cudaEventCreateWithFlags(&d.nodal_stage_event,
+                                             cudaEventDisableTiming) != cudaSuccess) {
+                    cudaGetLastError();
+                    d.nodal_stage_event = nullptr;
+                }
+            }
+            if (d.nodal_stage_event != nullptr)
+                cudaEventRecord(d.nodal_stage_event, d.stream);
+        } else {
+            for (int i = 0; i < 9; ++i)
+                RASBERY_CUDA_TRY(
+                    xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal", "consts",
+                                        d.ndev_dbl + d.n_off_consts + i * ndg, consts[i],
+                                        ndg * sizeof(double), cudaMemcpyHostToDevice,
+                                        d.stream),
+                    d.status);
+        }
         // WP15 §2.  NOT ELIDED, and the census says why.  These nine arrays are
         // recomputed on the HOST by Nodal::updateConstant every time xsrf/xsdf
         // move, and what moves them ~1,075 times in a 4,377-outer run is the Xe
@@ -4131,18 +4614,40 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         // arguments this body evaluates.  The counters below are what makes the
         // "1,075 tracks the 1,117 Xe steps" claim checkable on the next run.
         g_nodal_const_uploads.fetch_add(9, std::memory_order_relaxed);
+        // AT THE ARM'S WIDTH.  The [RASBERY][MICX] receipt prints this as
+        // `nodal_const_bytes`, and a figure quoted in doubles on a run that
+        // moved floats would hide exactly the saving this arm exists for.
         g_nodal_const_bytes.fetch_add(
-            9ULL * static_cast<unsigned long long>(ndg) * sizeof(double),
+            9ULL * static_cast<unsigned long long>(ndg) *
+                (d.ndev_flt != nullptr ? sizeof(float) : sizeof(double)),
             std::memory_order_relaxed);
         d.resident_const_generation = const_generation;
     }
 
     if (!host.chif_empty && ref_generation != d.resident_chif_generation) {
-        RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal", "chif",
-                                     d.ndev_dbl + d.n_off_chif, host.chif,
-                                     ndl::NG * nx * sizeof(double),
-                                     cudaMemcpyHostToDevice, d.stream),
-                         d.status);
+        if (d.ndev_flt != nullptr) {
+            if (d.nodal_stage_event != nullptr)
+                xfer::eventSync("CudaXsReconBackend.cu:solveNodal",
+                                "chif stage reuse", d.nodal_stage_event);
+            const std::size_t nchif = ndl::NG * nx;
+            float* stg = d.nodal_stage + 9 * ndg; // the region past the consts
+            for (std::size_t e = 0; e < nchif; ++e)
+                stg[e] = static_cast<float>(host.chif[e]);
+            RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal", "chif",
+                                         d.ndev_flt + d.n_off_chif, stg,
+                                         nchif * sizeof(float),
+                                         cudaMemcpyHostToDevice, d.stream),
+                             d.status);
+            rasbery::fp32::noteBytesSaved(nchif * (sizeof(double) - sizeof(float)));
+            if (d.nodal_stage_event != nullptr)
+                cudaEventRecord(d.nodal_stage_event, d.stream);
+        } else {
+            RASBERY_CUDA_TRY(xfer::memcpyAsync("CudaXsReconBackend.cu:solveNodal", "chif",
+                                         d.ndev_dbl + d.n_off_chif, host.chif,
+                                         ndl::NG * nx * sizeof(double),
+                                         cudaMemcpyHostToDevice, d.stream),
+                             d.status);
+        }
         d.resident_chif_generation = ref_generation;
     }
 
@@ -4157,6 +4662,8 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         if (!d.upload("nodal xssm", host.xssm, d.off_xs_ssm, ssm)) return false;
     }
 
+    const bool nnarrow = nodalNarrowState() && d.ndev_flt != nullptr;
+
     ndl::NodalView v = host;
     v.hmesh   = d.ndev_dbl + d.n_off_hmesh;
     v.albedo  = d.ndev_dbl + d.n_off_albedo;
@@ -4165,42 +4672,55 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     v.lklr    = d.ndev_int + d.n_ioff_lklr;
     v.idirlr  = d.ndev_int + d.n_ioff_idirlr;
     v.sgnlr   = d.ndev_int + d.n_ioff_sgnlr;
-    v.eta1   = d.ndev_dbl + d.n_off_consts + 0 * ndg;
-    v.eta2   = d.ndev_dbl + d.n_off_consts + 1 * ndg;
-    v.m260   = d.ndev_dbl + d.n_off_consts + 2 * ndg;
-    v.m251   = d.ndev_dbl + d.n_off_consts + 3 * ndg;
-    v.m253   = d.ndev_dbl + d.n_off_consts + 4 * ndg;
-    v.m262   = d.ndev_dbl + d.n_off_consts + 5 * ndg;
-    v.m264   = d.ndev_dbl + d.n_off_consts + 6 * ndg;
-    v.diagD  = d.ndev_dbl + d.n_off_consts + 7 * ndg;
-    v.diagDI = d.ndev_dbl + d.n_off_consts + 8 * ndg;
-    v.chif   = d.ndev_dbl + d.n_off_chif;
-    v.xsrf = d.dev_block + d.off_xs[xsr::T_XSRF];
-    v.xsnf = d.dev_block + d.off_xs[xsr::T_XSNF];
-    v.xssm = d.dev_block + d.off_xs_ssm;
     // Rev.7.1 Task 7: CANONICAL STATE.  In shared mode jnet/flux/phis are the
     // arena's buffers, which the CMFD backend also holds -- so the three
     // per-drive uploads and the two downloads below are copies of data that is
     // already where it needs to be.  A null borrowed pointer means this slot is
     // legacy and the private block is used, which is what lets one slot share
     // while another does not (mixed mode) with no third code path.
+    //
+    // WP20.1 leaves all three FP64 on BOTH arms, which is why this bind is
+    // outside the split below: they are the bytes CMFD and the host Geometry
+    // arrays share, and a narrow nodal drive that reinterpreted them would
+    // have turned a pointer swap into a silent type pun.
     const gpu::CanonicalSlotBuffers& canon = d.canonical.buffers;
     v.jnet = canon.jnet != nullptr ? canon.jnet : d.ndev_dbl + d.n_off_jnet;
     v.flux = canon.flux != nullptr ? canon.flux : d.ndev_dbl + d.n_off_flux;
     v.phis = canon.phis != nullptr ? canon.phis : d.ndev_dbl + d.n_off_phis;
-    double* wk = d.ndev_dbl + d.n_off_work;
-    v.trlcff0 = wk; wk += ndg;
-    v.trlcff1 = wk; wk += ndg;
-    v.trlcff2 = wk; wk += ndg;
-    v.mu = wk; wk += nx * ndl::NDIR * ndl::NG2;
-    v.tau = wk; wk += nx * ndl::NDIR * ndl::NG2;
-    v.matM = wk; wk += nx * ndl::NG2;
-    v.matMI = wk; wk += nx * ndl::NG2;
-    v.matMs = wk; wk += nx * ndl::NG2;
-    v.matMf = wk; wk += nx * ndl::NG2;
-    v.dsncff2 = wk; wk += ndg;
-    v.dsncff4 = wk; wk += ndg;
-    v.dsncff6 = wk; wk += ndg;
+    // WP20.1: the narrowed half.  On the FP64 arm it is bound HERE, out of
+    // `ndev_dbl` and (for the three xs inputs) straight out of the flat-XS
+    // block, exactly as it always was.  On the narrow arm these pointers stay
+    // NULL and `v32` below carries the drive instead -- null rather than
+    // stale, so a path that reached a kernel with the wrong view faults
+    // instead of computing something plausible out of the geometry table.
+    if (!nnarrow) {
+        v.eta1   = d.ndev_dbl + d.n_off_consts + 0 * ndg;
+        v.eta2   = d.ndev_dbl + d.n_off_consts + 1 * ndg;
+        v.m260   = d.ndev_dbl + d.n_off_consts + 2 * ndg;
+        v.m251   = d.ndev_dbl + d.n_off_consts + 3 * ndg;
+        v.m253   = d.ndev_dbl + d.n_off_consts + 4 * ndg;
+        v.m262   = d.ndev_dbl + d.n_off_consts + 5 * ndg;
+        v.m264   = d.ndev_dbl + d.n_off_consts + 6 * ndg;
+        v.diagD  = d.ndev_dbl + d.n_off_consts + 7 * ndg;
+        v.diagDI = d.ndev_dbl + d.n_off_consts + 8 * ndg;
+        v.chif   = d.ndev_dbl + d.n_off_chif;
+        v.xsrf   = d.dev_block + d.off_xs[xsr::T_XSRF];
+        v.xsnf   = d.dev_block + d.off_xs[xsr::T_XSNF];
+        v.xssm   = d.dev_block + d.off_xs_ssm;
+        double* wk = d.ndev_dbl + d.n_off_work;
+        v.trlcff0 = wk; wk += ndg;
+        v.trlcff1 = wk; wk += ndg;
+        v.trlcff2 = wk; wk += ndg;
+        v.mu = wk; wk += nx * ndl::NDIR * ndl::NG2;
+        v.tau = wk; wk += nx * ndl::NDIR * ndl::NG2;
+        v.matM = wk; wk += nx * ndl::NG2;
+        v.matMI = wk; wk += nx * ndl::NG2;
+        v.matMs = wk; wk += nx * ndl::NG2;
+        v.matMf = wk; wk += nx * ndl::NG2;
+        v.dsncff2 = wk; wk += ndg;
+        v.dsncff4 = wk; wk += ndg;
+        v.dsncff6 = wk; wk += ndg;
+    }
 
     const int B  = 128;
     const int gn = (host.nxyz + B - 1) / B;
@@ -4332,10 +4852,74 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     const double* reigv_src =
         d.nodal_h_reigv != nullptr ? d.nodal_h_reigv : &host.reigv;
 
+    // WP20.1: THE NARROW TWIN, built from the fully-bound wide view so the
+    // canonical pointers, the halt gate and the reigv indirection are the same
+    // objects on both arms -- `nodalWideShell` enumerates exactly the fields
+    // that are NOT narrowed, and the contract test holds that list against
+    // NodalViewT's own declaration.
+    ndl::NodalViewF32 v32 = ndl::nodalWideShell<float>(v);
+    if (nnarrow) {
+        v32.eta1   = d.ndev_flt + d.n_off_consts + 0 * ndg;
+        v32.eta2   = d.ndev_flt + d.n_off_consts + 1 * ndg;
+        v32.m260   = d.ndev_flt + d.n_off_consts + 2 * ndg;
+        v32.m251   = d.ndev_flt + d.n_off_consts + 3 * ndg;
+        v32.m253   = d.ndev_flt + d.n_off_consts + 4 * ndg;
+        v32.m262   = d.ndev_flt + d.n_off_consts + 5 * ndg;
+        v32.m264   = d.ndev_flt + d.n_off_consts + 6 * ndg;
+        v32.diagD  = d.ndev_flt + d.n_off_consts + 7 * ndg;
+        v32.diagDI = d.ndev_flt + d.n_off_consts + 8 * ndg;
+        v32.chif   = d.ndev_flt + d.n_off_chif;
+        v32.xsrf   = d.ndev_flt + d.n_off_nxsrf;
+        v32.xsnf   = d.ndev_flt + d.n_off_nxsnf;
+        v32.xssm   = d.ndev_flt + d.n_off_nxssm;
+        float* fwk = d.ndev_flt + d.n_off_work;
+        v32.trlcff0 = fwk; fwk += ndg;
+        v32.trlcff1 = fwk; fwk += ndg;
+        v32.trlcff2 = fwk; fwk += ndg;
+        v32.mu = fwk; fwk += nx * ndl::NDIR * ndl::NG2;
+        v32.tau = fwk; fwk += nx * ndl::NDIR * ndl::NG2;
+        v32.matM = fwk; fwk += nx * ndl::NG2;
+        v32.matMI = fwk; fwk += nx * ndl::NG2;
+        v32.matMs = fwk; fwk += nx * ndl::NG2;
+        v32.matMf = fwk; fwk += nx * ndl::NG2;
+        v32.dsncff2 = fwk; fwk += ndg;
+        v32.dsncff4 = fwk; fwk += ndg;
+        v32.dsncff6 = fwk; fwk += ndg;
+    }
+
     // One drive's worth of device work, all fixed addresses -- this is what
     // gets captured.  No host callbacks, no allocation, no synchronisation
     // inside: every one of those is illegal or capture-breaking.
-    auto enqueue_full = [&]() -> bool {
+    //
+    // WP20.1 made it a GENERIC lambda over the view type.  Not one statement of
+    // the body moved: `v` is now the parameter, the FP64 arm passes the same
+    // object it always did, and the narrow arm passes `v32`.  One text, two
+    // instantiations -- the same rule flatxsSolveNodeCta follows, and the
+    // reason the two arms cannot drift under maintenance.
+    auto enqueue_full = [&](auto& v) -> bool {
+        // WP20.1: THE FP64 -> FP32 BOUNDARY, INSIDE THE CAPTURE.
+        //
+        // xsrf / xsnf / xssm are rewritten by the macroscopic rebuild on
+        // (almost) every outer, so the narrowed copy is not a residency item
+        // -- it is part of the drive, and it has to be a captured node or a
+        // replayed graph would read the previous outer's cross-sections.
+        // Three launches rather than one because the sources are three
+        // separate regions of the flat-XS block.
+        if (nnarrow) {
+            const int cb = 256;
+            const std::size_t n1 = static_cast<std::size_t>(ndl::NG) * nx;
+            const std::size_t n2 = static_cast<std::size_t>(ndl::NG) * ndl::NG * nx;
+            const int g1 = static_cast<int>((n1 + cb - 1) / cb);
+            const int g2 = static_cast<int>((n2 + cb - 1) / cb);
+            kNodalNarrowXs<<<g1, cb, 0, d.stream>>>(
+                d.ndev_flt + d.n_off_nxsrf,
+                d.dev_block + d.off_xs[xsr::T_XSRF], n1);
+            kNodalNarrowXs<<<g1, cb, 0, d.stream>>>(
+                d.ndev_flt + d.n_off_nxsnf,
+                d.dev_block + d.off_xs[xsr::T_XSNF], n1);
+            kNodalNarrowXs<<<g2, cb, 0, d.stream>>>(
+                d.ndev_flt + d.n_off_nxssm, d.dev_block + d.off_xs_ssm, n2);
+        }
         // Task 7: elided when the region is canonical AND a device side wrote it
         // last.  When the HOST wrote last -- a perturbation, a rod move, a
         // restart -- the upload is still required, which is why the predicate
@@ -4403,6 +4987,12 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         return true;
     };
 
+    /// The one place the arm chooses which instantiation runs, so the four
+    /// enqueue sites below cannot disagree with the graph key.
+    auto enqueueDrive = [&]() -> bool {
+        return nnarrow ? enqueue_full(v32) : enqueue_full(v);
+    };
+
     // Anything the capture baked in that could have moved since.  host.jnet /
     // host.phis / host.flux are Geometry-owned and stable per backend
     // instance, but a re-bound Nodal::reset would silently orphan the graph,
@@ -4425,6 +5015,7 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
     XsReconBackend::Impl::NodalGraphKey want;
     want.ndev        = d.ndev_dbl;
     want.dblk        = d.dev_block;
+    want.precision   = nnarrow ? 1 : 0;
     want.jnet        = host.jnet;
     want.phis        = host.phis;
     want.flux        = host.flux;
@@ -4481,7 +5072,7 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
 
     bool ok = true;
     if (!d.nodal_use_graph) {
-        ok = enqueue_full();
+        ok = enqueueDrive();
     } else if (d.nodal_graph != nullptr) {
         // Rev.7.1 Task 10: LAUNCHED, OR SPLICED IF d.stream IS RECORDING.
         //
@@ -4512,7 +5103,7 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         //
         // COUNTED rather than silent: graph_warmup_misses is a gate at 0.
         rasbery::graphWarmupMiss();
-        ok = enqueue_full();
+        ok = enqueueDrive();
     } else {
         // Capture once, then replay for the rest of the run.  The conditional
         // uploads above are already queued on this stream; drain them so the
@@ -4532,7 +5123,7 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         cudaError_t rc =
             cudaStreamBeginCapture(d.stream, cudaStreamCaptureModeThreadLocal);
         if (rc == cudaSuccess) {
-            enq_ok = enqueue_full();
+            enq_ok = enqueueDrive();
             // Must be called even when the enqueue failed: it is what takes
             // the stream back out of capture mode.
             rc = cudaStreamEndCapture(d.stream, &graph);
@@ -4559,7 +5150,7 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
             d.nodal_graph_src = nullptr;
             d.nodal_use_graph = false;
             g_nodal_graph_fallbacks.fetch_add(1, std::memory_order_relaxed);
-            ok = enqueue_full();
+            ok = enqueueDrive();
         } else {
             // INTO THE CACHE UNDER THE KEY IT WAS ASKED FOR.  `want` was built
             // before the capture and nothing between here and there can have
@@ -4651,6 +5242,40 @@ bool XsReconBackend::solveNodal(const ndl::NodalView& host,
         d.status = std::string("nodal FULL -> ") + cudaGetErrorString(syncrc);
         cudaGetLastError();
         return false;
+    }
+
+    // ==================================================================
+    // WP20.1: THE NON-FINITE VALVE FOR THE NARROW NODAL DRIVE
+    // ==================================================================
+    //
+    // WHERE IT LOOKS, AND WHY THERE.  `jnet` is the drive's answer and the
+    // only thing downstream reads on the very next line (CMFD::upddhat).  It
+    // is checked ONLY on a drive that actually materialised it -- i.e. when a
+    // host consumer was about to read it anyway -- so this adds no transfer
+    // and no synchronisation of its own, and it runs a few times per segment
+    // rather than once per outer.  A segment that never materialises never
+    // hands a non-finite to anybody either; the first materialisation after
+    // one catches it.
+    //
+    // ENV-INDEPENDENT, LOUD, COUNTED, ONCE: the same three properties the CMFD
+    // latch has (src/GpuFp32Arm.h).  What differs is the recovery -- see
+    // Impl::nodal_device_refused for why a narrow nodal drive cannot demote in
+    // place the way a narrow CMFD inner solve can.
+    if (nnarrow && !d.nodal_drain_deferred &&
+        !gpu::canonicalElidesDownload(canon, gpu::CanonicalRegion::Jnet,
+                                      d.canonical_materialize)) {
+        const std::size_t njnet = ns * ndl::NG;
+        bool              bad   = false;
+        for (std::size_t i = 0; i < njnet; ++i) {
+            if (!std::isfinite(host.jnet[i])) { bad = true; break; }
+        }
+        if (bad) {
+            rasbery::fp32::latchOff(rasbery::fp32::Backend::Nodal, "nonfinite jnet");
+            d.dropNodalGraph();
+            d.nodal_device_refused = true;
+            d.status = "WP20.1: narrow nodal drive produced a non-finite jnet";
+            return false;
+        }
     }
 
     // Task 7: the FULL drive wrote jnet and phis on the device.  Recording it

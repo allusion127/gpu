@@ -74,7 +74,8 @@ bool XsReconBackend::micxScatterPending() const { return false; }
 
 unsigned long long XsReconBackend::micxResidentGeneration() const { return 0; }
 
-const double* XsReconBackend::micxDeviceSlot(int) const { return nullptr; }
+const void* XsReconBackend::micxDeviceSlot(int) const { return nullptr; }
+int XsReconBackend::micxDeviceElemBytes() const { return static_cast<int>(sizeof(double)); }
 
 void* XsReconBackend::micxReadyEvent() { return nullptr; }
 

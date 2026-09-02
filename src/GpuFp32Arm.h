@@ -50,6 +50,16 @@
 //     solve (diag/cc float mirrors, the inverted diagonal blocks dinv), the
 //     Krylov vectors r/r0/p/v/s/t/y/z, the colour Gauss-Seidel sweeps and the
 //     A*y / A*z applications.
+//   * the flat-XS CTA workspace (WP20) AND, since WP20.1, THE FOUR micx/lmpx
+//     DEVICE BLOCKS THEMSELVES -- live and reference, 59.5 MB each at KNGR
+//     size.  This is the measured BANDWIDTH carrier of the whole run: ~8.7 GB
+//     of residual D2H on a single deck, ~2 GB per case in a batch, and a
+//     reference re-upload on every branch rebuild.  Halving the element halves
+//     every one of them.
+//   * the nodal drive's own state (WP20.1): the nine updateConstant products
+//     (3.9 GB of H2D over a KNGR run, the nodal per-outer carrier), chif, the
+//     three macroscopic inputs as a narrowed per-drive COPY, and the twelve
+//     private working arrays.
 //
 // DOUBLE, AND WHY -- this is the DECLARED DEVIATION from "everything FP32":
 //
@@ -76,6 +86,21 @@
 //      is FP64 residual -> FP32 inner solve for the correction -> FP64
 //      correction accumulation, i.e. iterative refinement, which is what makes
 //      the FP32 error a correction error rather than a solution error.
+//   4. THE MACROSCOPIC CROSS-SECTIONS (WP20.1).  `xs` / `xs_ssm` / `iden` stay
+//      double.  They are the answer the nodal drive, the CMFD operator, the Xe
+//      commit and every host reader take as authoritative, they are 2 % of the
+//      bytes the micx/lmpx blocks are, and narrowing them would put a
+//      conversion on the ONE path in this tree that has a bit-golden gate.
+//      The nodal drive takes a narrowed COPY of the three it reads instead.
+//   5. THE CANONICAL STATE (WP20.1).  jnet / flux / phis stay double on the
+//      nodal arm because in shared mode those pointers ARE the CMFD backend's
+//      buffers and the host's Geometry arrays are the D2H destinations.
+//      Narrowing them would turn a pointer swap into a type pun and would trip
+//      HostPinRegistry's rule that one host base is pinned at one width.
+//   6. CRAM's INPUT (WP20.1).  CRAM still consumes the four condensation slots
+//      as double -- the partial-fraction sum cancels -- so the WP15.1 D2D
+//      handover becomes a WIDENING KERNEL under the arm rather than a memcpy.
+//      Half the DRAM read, none of the cancellation.
 //
 // RASBERY_GPU_FP32_STRICT=1 is the pure-FP32 reduction arm: it narrows (1) and
 // (2) as well, and exists so the claim "the double accumulator is what keeps the
@@ -249,16 +274,36 @@ inline Tally& tally() {
 ///           inverted diagonal blocks, all eight Krylov vectors, the colour
 ///           Gauss-Seidel sweeps and both matvecs.  src/CudaBICGBackend.cu.
 ///   flatxs  TRUE.  The per-node workspace the CTA kernel holds in __shared__
-///           (919 elements: 7,352 -> 3,676 B/CTA).  src/FlatXsCtaKernel.cuh.
-///   nodal   DEFERRED.  NodalView is ~25 double* fields consumed by a kernel
-///           set that is CAPTURED INTO A GRAPH and cached under a key that does
-///           not carry a precision; a float arm needs a parallel view, a
-///           parallel device block and a precision in that key.  See
-///           docs/WP20_GPU_FP32_20260831_KO.md Sec 7.
-///   xe      DEFERRED.  Same shape, plus the Anderson normal equations, whose
-///           conditioning is exactly what RASBERY_XE_HOST_FORMS already sweeps
-///           -- narrowing them without re-running that sweep would confound two
-///           variables.
+///           (919 elements: 7,352 -> 3,676 B/CTA) AND, since WP20.1, the four
+///           micx/lmpx device blocks -- live and reference -- with the host
+///           materialisation widening at ONE site (XSSet::EnsureMicxHost ->
+///           XsReconBackend::downloadFlatXsMicx -> Impl::drainMicxWiden).
+///           src/FlatXsCtaKernel.cuh, src/FlatXsKernel.h,
+///           src/CudaXsReconBackend.cu.
+///   nodal   TRUE since WP20.1: NodalViewT<ValueT> narrows the nine
+///           updateConstant products, chif, a per-drive copy of the three
+///           macroscopic inputs, and the twelve working arrays; PRECISION IS A
+///           FIELD OF NodalGraphKey so the two graphs cannot alias.  TWO ARMS
+///           STILL DEMOTE and are counted: the hybrid drive
+///           (RASBERY_GPU_NODAL_FULL unset), which round-trips trlcff/matM to
+///           FP64 host arrays mid-drive, and the multi-deck batch arena, whose
+///           per-slot view table and bucket graphs are a second narrowing.
+///   xe      DEFERRED, and the reason is a MEASUREMENT contract rather than a
+///           numeric one.  Bits 0..4 of the shipped form mask
+///           (XE_DOT_FIRST/XE_DOT_THIRD/XE_CAND1/XE_CAND2) are mined ON THE
+///           HOST, in FP64, by comparing xe::xeDotChunk / xeCandidateOrdinal
+///           against src/XeAndersonReference.cpp BIT FOR BIT
+///           (src/XeFormMine.h).  Narrowing XeTripleConst changes the signature
+///           of the body being mined, so the miner would go on reporting
+///           `sound = true` for a computation the device no longer performs --
+///           a silent false negative of exactly the class src/XeFormAudit.cpp
+///           exists to catch.  Two more would have to be re-argued rather than
+///           cast: xsrFma/xsrMul have no float overload, and the atomicMax
+///           monotonicity trick on __double_as_longlong
+///           (CudaXsReconBackend.cu) would become __float_as_int.  Xe's XS
+///           INPUTS are nevertheless narrowed by the flat-XS item above -- the
+///           Xe kernels read the same BatchView micx/lmpx blocks -- and that
+///           saving is attributed to `flatxs`, where the conversion happens.
 ///   cram    DEFERRED **AND FLAGGED** (RASBERY_GPU_FP32_CRAM).  See the header
 ///           note: the partial-fraction sum cancels catastrophically.
 ///   ppr     DEFERRED.  Strictly downstream of the iteration and therefore
@@ -268,7 +313,7 @@ inline bool converted(Backend which) {
     switch (which) {
         case Backend::Cmfd:   return true;
         case Backend::FlatXs: return true;
-        case Backend::Nodal:  return false;
+        case Backend::Nodal:  return true;
         case Backend::Xe:     return false;
         case Backend::Cram:   return false;
         case Backend::Ppr:    return false;
@@ -325,6 +370,25 @@ inline void noteBytesSaved(std::size_t bytes) {
 /// than accepted, and the backend moves to FP64 for the rest of the process.
 /// The caller is responsible for dropping any cached graph captured under the
 /// old precision -- this function cannot do it, because it does not own one.
+///
+/// WP20.1: THERE ARE NOW TWO RECOVERY SHAPES BEHIND ONE LATCH, and the
+/// difference is not a policy choice, it is what each backend's precision IS.
+///
+///   cmfd   a KERNEL SET selected per solve.  The latch demotes the next solve
+///          to the wide kernels in place; nothing is reallocated.
+///   nodal  an ALLOCATION and a LAYOUT: `ndev_flt` holds the constants, chif
+///          and the whole working set, and `ndev_dbl` was laid out WITHOUT
+///          them.  There is no wide device arm to fall back to without
+///          re-laying-out and re-uploading mid-run, from inside a drive whose
+///          kernels are captured.  So the valve REFUSES the device nodal arm
+///          for the rest of the process and hands the drive back to
+///          Nodal::TryDriveGpu's CPU body -- which is the reference this arm
+///          is scored against.  Slower, correct, and loud.
+///   flatxs the same allocation-shaped precision, and it therefore has NO
+///          latch at all: the block width is a stand-up decision and every
+///          reader in the tree -- CRAM, xsrecon, Xe, the host materialisation
+///          -- is bound to it.  Declared in
+///          CudaXsReconBackend.cu::flatxsNarrowBlocks() rather than discovered.
 ///
 /// Returns true the FIRST time it fires for a backend, so a caller can do its
 /// own one-shot work (graph invalidation) without a second flag.
