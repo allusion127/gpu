@@ -525,11 +525,19 @@ def run_evaluator(argv: list[str]) -> int:
              % (_injected("FAKE_RASBERY_ALLOC_IN_CAPTURE"),
                 _injected("FAKE_RASBERY_CAPTURES_UNWOUND")))
     fallbacks = _injected("FAKE_RASBERY_HOST_FALLBACKS")
-    emit('[RASBERY][GPU_FULL] {"gpu_full":%s,"cmfd_fallbacks":%d,"nodal_fallbacks":0,'
+    # WP10.7: `outer_fallbacks` is emitted because tools/soak_run.py now asserts
+    # it like every other subsystem.  A field the real binary prints and this
+    # stand-in does not is a field no test in this tree ever drives -- which is
+    # exactly how the 238 arm-A run reached `outer_fallbacks:9` with the soak's
+    # verdict never looking at the number.  It rides FAKE_RASBERY_HOST_FALLBACKS
+    # with cmfd so one knob still exercises the whole gated list.
+    emit('[RASBERY][GPU_FULL] {"gpu_full":%s,"cmfd_fallbacks":%d,"outer_fallbacks":%d,'
+         '"nodal_fallbacks":0,'
          '"xsrecon_fallbacks":0,"flatxs_fallbacks":0,"xe_fallbacks":0,'
          '"ppr_fallbacks":0,"cram_fallbacks":0,"contract_pass":%s}'
          % ("true" if os.environ.get("RASBERY_GPU_FULL") not in (None, "", "0")
-            else "false", fallbacks, "false" if fallbacks else "true"))
+            else "false", fallbacks, fallbacks,
+            "false" if fallbacks else "true"))
     emit("[RASBERY][EVALUATOR] " + json.dumps({
         "cases": cases, "ok": cases - failed, "failed": failed, "refused": refused,
         "generations": waves, "batch_width": width, "process_uptime_s": 0.1,

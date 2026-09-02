@@ -1792,6 +1792,128 @@ private:
         out.sweep_will_enqueue = h.ctx->cmfd_solver.canEnqueueDrive();
     }
 
+    // =======================================================================
+    // WP10.7: THE ADMISSION DOOR -- device residency, established per case
+    // =======================================================================
+    //
+    // WHAT WAS MISSING, AND THE RUN THAT SHOWED IT.  238 GPU1, build 0054838,
+    // 20 generations x width 16, PROD + RASBERY_GPU_FULL=1, arm A (no
+    // RASBERY_ARENA_PERSIST).  Four cases died at ZERO statepoints in
+    // 0.18-0.43 s -- generations 6, 9 and 12's once-per-generation `promote`
+    // step and generation 19's case 14 -- every one of them with
+    //
+    //   [RASBERY][GPU_FULL][VIOLATION] subsystem=flatxs site=XSSet::UpdateFlatXS
+    //   reason=the FlatXS device arm declined; the reference reconstruction
+    //   loop runs
+    //
+    // The timing is the whole diagnosis: 0.2 s is a deck parse and nothing
+    // else, so the case died at its FIRST UpdateFlatXS -- the one InitXS makes
+    // (:InitXS below) -- and never ran a statepoint.
+    //
+    // THE SKIPPED STEP IS THAT THERE WAS NO STEP.  Run() establishes the OUTER
+    // segment's residency at the stand-up call below, per admission, and has
+    // since Task 9 link 1.  The FlatXS arm has no such door at all: the
+    // XsReconBackend is constructed on FIRST TOUCH, inside
+    // XSSet::TryUpdateFlatXSGpu (src/XSSet.cpp:3262-3271), which is inside the
+    // fail-closed seam's own call.  So the very first thing that ever asks
+    // whether this case's flat-XS device residency exists is the guard that
+    // kills the case for it not existing, and the guard cannot say why: the
+    // backend's own reason (XsReconBackend::status() -- "no CUDA device: ...",
+    // "stream: ...", "scalar buffer allocation failed") goes to a
+    // PROCESS-WIDE std::call_once warn.  In a resident evaluator process
+    // spanning twenty generations that means the first case to hit it printed
+    // a reason and the other three printed nothing at all, which is exactly
+    // what the 16k-line arm-A log contains.
+    //
+    // WHICH HYPOTHESIS THE EVIDENCE SUPPORTS.  (c): a per-case, first-touch
+    // establishment with no door, no reason and no receipt -- and, in the
+    // no-persist arm, one full free/re-lay-out of the flat-XS blocks per case
+    // (`arena_rebuilds` deltas +17/generation = 16 cases + 1 promote, i.e. one
+    // per case executed) feeding it.  The other three are refused HERE, from
+    // this tree, not from the log:
+    //
+    //   (a) "the promote case carries a different CaseFidelity/StatepointGrid
+    //       and the residency plan is not rebuilt for it" -- REFUSED.  No
+    //       device arm reads CaseFidelity: `_fidelity` reaches ReadInput (the
+    //       burnup grid) and SolverContext (the tolerances) and nothing else,
+    //       and neither TryUpdateFlatXSGpu nor armOuterSegment can see it.  The
+    //       fourth death was g0019c0014, a REGULAR strict case with the same
+    //       grid as its fifteen siblings, so the grid cannot be the
+    //       discriminator either.
+    //
+    //   (b) "the WP18 slot reset on recycle clears residency flags only the
+    //       first admission sets" -- REFUSED.  The FlatXS backend is per XSSet,
+    //       per Driver, per case: it has no per-slot flag for a reset to clear.
+    //       And the outer half re-binds on EVERY SolveLoop and ReconvergeFlux
+    //       entry (armOuterSegment -> bindResidency, which re-patches the slot
+    //       table and re-seeds dhat/psi), not on the first only.
+    //
+    //   (d) "the nine outer/no_residency events are the same root" -- SAME
+    //       CLASS, DIFFERENT MECHANISM, and the second half of this work
+    //       package.  armOuterSegment's return value was DISCARDED at both of
+    //       its call sites, so a bind that failed -- clearing residency_bound
+    //       on its way out (CudaOuterGraph.cu:1118) and leaving its reason in
+    //       CudaOuterSegment::status() -- was re-derived one line later by the
+    //       post-arm ladder as the generic `no_residency`.  The receipt named
+    //       the symptom and threw the cause away.  Both call sites now read the
+    //       return and name the step.
+    //
+    // WHAT THIS DOOR DOES.  It runs UNCONDITIONALLY, once per admission,
+    // BEFORE any physics -- there is no first-admission special case, and a
+    // recycled slot goes through the identical call -- and it asks each
+    // REQUESTED arm whether its residency is established, in the layer that
+    // knows.  EnsureBackend() is idempotent by construction (XSSet.h:705), so
+    // "establish" and "re-establish" are one call and a second admission on the
+    // same lane cannot skip it.  When an arm was asked for and cannot be
+    // established the contract still raises -- fail-closed is unchanged -- but
+    // now at the door, with the establishing layer's OWN reason on the line
+    // instead of the seam describing itself.
+    //
+    // WITH EVERY ARM OFF THIS IS TWO CACHED getenv READS AND A RETURN.
+    static void establishDeviceResidency(XSSet& cross_sections, bool outer_stood_up,
+                                         std::ostream& receipt) {
+        const bool want_outer  = gpu::outerGpuEnabled();
+        const bool want_flatxs = rasberyGpuFlatXsEnabled();
+        if (!want_outer && !want_flatxs) return;
+
+        // --- the FlatXS arm: construct-or-reuse, and ASK ---------------------
+        //
+        // Called whether or not the arm is on, because EnsureBackend() is the
+        // one place the backend is built and a door that only built it for the
+        // armed run would make the two arms differ in construction order.  The
+        // backend refuses cheaply with every arm unset (its constructor returns
+        // early on exactly that predicate), so this costs one allocation of an
+        // empty Impl on the OFF path.
+        XsReconBackend* flatxs = cross_sections.EnsureBackend();
+        const bool      flatxs_ready = flatxs != nullptr && flatxs->available();
+        const std::string flatxs_status =
+            flatxs != nullptr ? flatxs->status() : std::string("no backend");
+
+        // --- the receipt, printed on both outcomes --------------------------
+        //
+        // THE SAME G0 RULE THE REST OF THIS TREE FOLLOWS.  A door that only
+        // spoke on failure would leave "the arm was on and established" and
+        // "the arm was never asked" looking identical, which is the reading
+        // that cost the arm-A investigation its first day.  One line per
+        // admission, and it names the case's own status string, so the
+        // resident process's Nth case is as diagnosable as its first -- the
+        // property the process-wide std::call_once warn does not have.
+        receipt << "[RASBERY][RESIDENCY] {\"outer\":" << (want_outer ? "true" : "false")
+                << ",\"outer_stood_up\":" << (outer_stood_up ? "true" : "false")
+                << ",\"flatxs\":" << (want_flatxs ? "true" : "false")
+                << ",\"flatxs_ready\":" << (flatxs_ready ? "true" : "false")
+                << ",\"flatxs_status\":\"" << flatxs_status << "\"}" << std::endl;
+
+        // --- fail-closed, at the door, with the refusal NAMED ---------------
+        if (want_flatxs && !flatxs_ready)
+            RASBERY_GPU_FULL_REQUIRE_RESIDENCY(FlatXs, "Driver: admission residency",
+                                               flatxs_status.c_str());
+        if (want_outer && !outer_stood_up)
+            RASBERY_GPU_FULL_REQUIRE_RESIDENCY(
+                Outer, "Driver: admission residency",
+                gpu::rasberyOuterSegment().status().c_str());
+    }
+
     /// Everything the refusal ladder needs that only a Driver can see.
     ///
     /// Rev.7.1 Task 18-lite.  Two of the ladder's reasons became per-Driver when
@@ -2291,7 +2413,23 @@ private:
                                            gpu_outer_claim.arena_slots,
                                            gpu_outer_claim.admitted) ==
                 gpu::OuterSegmentRefusal::None;
-        if (gpu_outer_may_arm) armOuterSegment(ctx, eigv, residual);
+        // WP10.7.  THE RETURN IS READ.  It was discarded here, and that is
+        // how nine cases in the 238 arm-A soak came to die naming
+        // `no_residency`: armOuterSegment binds residency, bindResidency
+        // clears `residency_bound` on its way in (CudaOuterGraph.cu:1118) and
+        // leaves its real reason in CudaOuterSegment::status(), and the
+        // post-arm ladder one line down then re-derived the failure as the
+        // generic "nobody handed this runner its buffers".  The ladder still
+        // decides -- the throw below is unchanged and so are the counters --
+        // but the step that actually failed is named first, so the receipt
+        // carries the cause and not only the symptom.
+        const bool gpu_outer_arm_ok =
+            gpu_outer_may_arm && armOuterSegment(ctx, eigv, residual);
+        if (gpu_outer_may_arm && !gpu_outer_arm_ok)
+            gpufull::nameFirstFallback(gpufull::Subsystem::Outer,
+                                       "Driver: outer segment arm",
+                                       gpu::rasberyOuterSegment(gpu_outer_claim.slot)
+                                           .status().c_str());
 
         // ReconvergeFlux runs no critical search by construction, so the
         // search refusal cannot apply here.
@@ -3681,7 +3819,23 @@ private:
                                            gpu_outer_claim.arena_slots,
                                            gpu_outer_claim.admitted) ==
                 gpu::OuterSegmentRefusal::None;
-        if (gpu_outer_may_arm) armOuterSegment(ctx, eigv, residual);
+        // WP10.7.  THE RETURN IS READ.  It was discarded here, and that is
+        // how nine cases in the 238 arm-A soak came to die naming
+        // `no_residency`: armOuterSegment binds residency, bindResidency
+        // clears `residency_bound` on its way in (CudaOuterGraph.cu:1118) and
+        // leaves its real reason in CudaOuterSegment::status(), and the
+        // post-arm ladder one line down then re-derived the failure as the
+        // generic "nobody handed this runner its buffers".  The ladder still
+        // decides -- the throw below is unchanged and so are the counters --
+        // but the step that actually failed is named first, so the receipt
+        // carries the cause and not only the symptom.
+        const bool gpu_outer_arm_ok =
+            gpu_outer_may_arm && armOuterSegment(ctx, eigv, residual);
+        if (gpu_outer_may_arm && !gpu_outer_arm_ok)
+            gpufull::nameFirstFallback(gpufull::Subsystem::Outer,
+                                       "Driver: outer segment arm",
+                                       gpu::rasberyOuterSegment(gpu_outer_claim.slot)
+                                           .status().c_str());
 
         // A CRITICAL SEARCH IS NO LONGER REFUSED HERE.
         //
@@ -4814,6 +4968,10 @@ public:
         // flag per node and no count beside it.  nxyz loads once per run, next
         // to an HDF5 parse; a cached count that could disagree with the flags
         // would be the more expensive mistake.
+        // WP10.7: witnessed by the admission door below, so a stand-up that
+        // refused cannot look like one that never ran.  True with the arm off
+        // -- nothing was promised, so nothing failed to be established.
+        bool outer_stood_up = !gpu::outerGpuEnabled();
         if (gpu::outerGpuEnabled()) {
             gpu::OuterSegmentDeck deck;
             deck.nxyz  = geometry.nxyz();
@@ -4838,8 +4996,23 @@ public:
             // The arena receipt goes to stdout beside every other [RASBERY]
             // receipt; a VRAM admission that only appeared on failure would be
             // the one number nobody could quote when a run did fit.
-            gpu::rasberyStandUpOuterSegment(deck, std::cout);
+            //
+            // WP10.7.  THE RETURN IS NO LONGER DISCARDED.  A stand-up that
+            // refuses -- an arena Sec 4.4 admission that did not fit, a runner
+            // that would not initialise, a deck whose shape is not the one the
+            // arena was stood on -- used to be answered later and generically
+            // by the post-arm ladder, and the reason it printed to stderr on
+            // the way out was the only copy.
+            outer_stood_up = gpu::rasberyStandUpOuterSegment(deck, std::cout);
         }
+
+        // WP10.7.  THE ADMISSION DOOR.  Unconditional, once per admission, and
+        // BEFORE InitXS -- which is the call whose UpdateFlatXS was the first
+        // and only thing that ever asked whether this case's flat-XS device
+        // residency existed.  See establishDeviceResidency above for the run
+        // that made this necessary and for why the promote step was three of
+        // its four deaths.
+        establishDeviceResidency(cross_sections, outer_stood_up, std::cout);
 
         // 2. Initialize run state
         const bool is_restart_run = input_output.has_restart() && !input_output.has_shuffle();

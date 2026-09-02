@@ -143,9 +143,20 @@ ZERO_RECEIPTS: tuple[tuple[str, str, str], ...] = (
 #: Only a zero-assertion under RASBERY_GPU_FULL=1.  Without the gate a fallback
 #: is a legal thing for the binary to do and failing the soak on one would make
 #: it refuse an arm nobody said was wrong.
+#: WP10.7.  `outer_fallbacks` JOINED THIS LIST, and its absence was not an
+#: oversight anybody had argued for.  The 238 GPU1 arm-A soak reported
+#: `outer_fallbacks:9` -- NINE cases killed by the fail-closed outer seam, a
+#: materially larger category than the four `flatxs_fallbacks` the same receipt
+#: carried -- and the soak's verdict never looked at the number, because the
+#: only counter it did not read was that one.  Every other subsystem in the
+#: GPU_FULL receipt was asserted; the outer is not a special case, and the
+#: allowance list (gpufull::kGpuFullAllowedOuterRefusals) is exactly the
+#: mechanism that keeps its legitimate host regions -- the Wielandt warm-up --
+#: out of this counter in the first place.
 GPU_FULL_FALLBACKS: tuple[str, ...] = (
-    "cmfd_fallbacks", "nodal_fallbacks", "xsrecon_fallbacks", "flatxs_fallbacks",
-    "xe_fallbacks", "ppr_fallbacks", "cram_fallbacks", "graph_fallbacks",
+    "cmfd_fallbacks", "outer_fallbacks", "nodal_fallbacks", "xsrecon_fallbacks",
+    "flatxs_fallbacks", "xe_fallbacks", "ppr_fallbacks", "cram_fallbacks",
+    "graph_fallbacks",
 )
 
 
@@ -996,6 +1007,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif worst != 0:
             problems.append(f"{field_name} = {worst} under RASBERY_GPU_FULL=1")
 
+    # WP10.7.  THE RECEIPT'S OWN VERDICT, read at last.
+    #
+    # `contract_pass` has been in the [RASBERY][GPU_FULL] receipt since WP1(b)
+    # and this soak has never read it.  On 238 arm A that cost nothing only
+    # because the counters happened to catch the same failure -- but the run
+    # ALSO printed `first_violation` naming a site, and the soak's report,
+    # which is what a campaign quotes, carried neither.  Reading the verdict
+    # instead of only re-deriving it from the counters is also how a future
+    # count-only seam (the WP1 defect, which gpufull::enforceExitCode exists to
+    # backstop) shows up here rather than passing.
+    gpu_full_receipts = receipts_of(transcript, "[RASBERY][GPU_FULL]")
+    contract: dict = {}
+    if gpu_full_receipts:
+        last = gpu_full_receipts[-1]
+        contract = {
+            "contract_pass": last.get("contract_pass"),
+            "first_violation": last.get("first_violation"),
+            # WP10.7 fields; absent from a binary that predates them, which is
+            # why they are read with .get and reported as None rather than
+            # asserted into existence.
+            "first_violation_seq": last.get("first_violation_seq"),
+            "violations": last.get("violations"),
+            "allowed_refusals": last.get("allowed_refusals"),
+        }
+        if gpu_full and last.get("contract_pass") is False:
+            problems.append(
+                "the [RASBERY][GPU_FULL] receipt reports contract_pass:false under "
+                "RASBERY_GPU_FULL=1, first_violation="
+                f"{last.get('first_violation')!r}. A fail-closed contract that the "
+                "run itself declares broken is not a soak this campaign may quote.")
+
     # RESTARTS ARE BOUNDED BY WHAT WAS INJECTED, and this soak's injection is
     # zero.  The poison it plants is a deck that does not PARSE: the real binary
     # reaches that through IO::ReadInput throwing inside runOneCase's try, which
@@ -1154,6 +1196,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "vram_scopes": sorted(vram_scopes),
         "zero_receipts": zero_values,
         "not_asserted": not_asserted,
+        # WP10.7.  The GPU_FULL receipt's own verdict and the site it names, so
+        # the report a campaign quotes answers "which seam, first" without a
+        # 16k-line log.
+        "gpu_full_contract": contract,
         "throughput": {
             "median": median,
             "min": min(rates) if rates else 0.0,

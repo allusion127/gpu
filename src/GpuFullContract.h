@@ -266,11 +266,106 @@ inline std::atomic<unsigned long long>& allowedCounter(std::size_t index) {
     return counters[index];
 }
 
+// ===========================================================================
+// WP10.7: WHICH SEAM WAS FIRST, AND WHERE EACH SEAM WAS
+// ===========================================================================
+//
+// THE DEFECT THIS CLOSES, in the receipt that showed it.  The 238 GPU1 20-gen
+// soak at 0054838 (arm A, no ARENA_PERSIST) printed
+//
+//   {"outer_fallbacks":9,"flatxs_fallbacks":4,"contract_pass":false,
+//    "first_violation":"subsystem=outer site=Driver: outer segment pre-arm
+//                       reason=no_residency"}
+//
+// and NOTHING in that line can be checked.  Two separate things were wrong:
+//
+//   (a) `first_violation` was whichever thread won a CAS on ONE process-wide
+//       string, and the CAS is taken where the TEXT is built -- not where the
+//       fallback happened.  Sixteen lanes fall back inside microseconds of each
+//       other; the thread that got descheduled between count() and the string
+//       loses the latch even though its event was first.  So the field names
+//       "a violation", never provably "the first violation", and a reader who
+//       treats it as the first -- which is what it is called -- chases the
+//       wrong subsystem.  Here the four flatxs deaths and the nine outer
+//       refusals both start at generation 6, and the receipt gave no way to
+//       tell which of the two came first in that generation.
+//
+//   (b) the counters say a subsystem fired N times and say NOTHING about
+//       where.  `flatxs_fallbacks:4` sent the reader to the raw 16k-line log to
+//       recover a site string the process already had in its hand.
+//
+// THE FIX IS ONE ORDINAL, TAKEN WHERE THE EVENT IS.  count() -- the raw
+// increment every seam ends at -- stamps a monotonic ordinal, and the
+// per-subsystem first-site record keeps it.  `first_violation` is then the
+// record with the SMALLEST ordinal across subsystems, computed at receipt time
+// (post-join, single-threaded, exactly as this header already required of
+// every first-violation reader).  A total order over the events, not over the
+// string builders.
+
+/// A monotonic ordinal per fallback EVENT, 1-based so 0 can mean "none".
+inline unsigned long long nextOrdinal() {
+    static std::atomic<unsigned long long> seq{0};
+    return seq.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+/// The ordinal of the fallback THIS thread is in the middle of reporting.
+/// Written by count(), read by the naming step a few instructions later, so
+/// the ordinal a site is filed under is the one its event took -- not the one
+/// the string builder happened to reach.
+inline unsigned long long& pendingOrdinal() {
+    static thread_local unsigned long long ordinal = 0;
+    return ordinal;
+}
+
+/// Consume this thread's stamp.  CONSUMING IS THE POINT: a stamp left behind by
+/// an earlier event on the same thread would file a LATER site under an EARLIER
+/// ordinal, which is the one way this table could lie about order.  A caller
+/// that names without counting gets a fresh ordinal instead.
+inline unsigned long long takePendingOrdinal() {
+    unsigned long long& slot = pendingOrdinal();
+    const unsigned long long ordinal = slot != 0 ? slot : nextOrdinal();
+    slot = 0;
+    return ordinal;
+}
+
+/// The first site each subsystem reported, and when.  One slot per subsystem;
+/// written at most once each (the CAS), read post-join.
+struct SubsystemFirst {
+    std::atomic<bool>               armed{false};
+    std::atomic<bool>               ready{false};
+    std::atomic<unsigned long long> ordinal{0};
+    std::string                     site;
+    std::string                     reason;
+};
+
+inline SubsystemFirst& subsystemFirst(Subsystem which) {
+    static std::array<SubsystemFirst, static_cast<std::size_t>(Subsystem::Count)> slots;
+    return slots[static_cast<std::size_t>(which)];
+}
+
+/// File this subsystem's FIRST site, under the ordinal its event took.
+inline void recordSubsystemFirst(Subsystem which, const char* where, const char* why,
+                                 unsigned long long ordinal) {
+    SubsystemFirst& slot     = subsystemFirst(which);
+    bool            expected = false;
+    if (!slot.armed.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return;
+    slot.ordinal.store(ordinal, std::memory_order_relaxed);
+    slot.site   = (where != nullptr ? where : "?");
+    slot.reason = (why != nullptr ? why : "?");
+    slot.ready.store(true, std::memory_order_release);
+}
+
 /// The first violation of the RUN, for the run-level exit code.  Written at
 /// most once (the CAS), and READ ONLY AFTER EVERY DRIVER HAS JOINED -- main.cpp
 /// prints it beside the receipt, past both the batch parallel region and the
 /// evaluator's server.run().  A reader that raced the writer could see a
 /// half-assigned string; nothing reads it before the join.
+///
+/// KEPT BESIDE THE ORDERED TABLE ABOVE, not replaced by it: this latch is the
+/// cheap guard that keeps the steady path from building a string per fallback,
+/// and it is the fallback answer when a caller named a violation without going
+/// through a subsystem slot.  `firstViolation()` prefers the ordered table.
 inline std::atomic<bool>& firstViolationArmed() {
     static std::atomic<bool> armed{false};
     return armed;
@@ -317,9 +412,70 @@ inline unsigned long long totalAllowedRefusals() {
     return sum;
 }
 
+/// How many times this subsystem fell back, and where it first did.
+struct SubsystemViolations {
+    unsigned long long count   = 0;
+    unsigned long long ordinal = 0; ///< 0 when this subsystem never fired
+    const char*        site    = nullptr;
+    const char*        reason  = nullptr;
+};
+
+/// WP10.7.  The per-subsystem half of the receipt: the counter that already
+/// existed, joined to the site that produced it.  Post-join readers only, for
+/// the same reason firstViolation() is.
+inline SubsystemViolations violations(Subsystem which) {
+    SubsystemViolations out;
+    out.count = fallbacks(which);
+    detail::SubsystemFirst& slot = detail::subsystemFirst(which);
+    if (!slot.ready.load(std::memory_order_acquire)) return out;
+    out.ordinal = slot.ordinal.load(std::memory_order_relaxed);
+    out.site    = slot.site.c_str();
+    out.reason  = slot.reason.c_str();
+    return out;
+}
+
+/// WP10.7.  THE SUBSYSTEM THAT FELL BACK FIRST, by ordinal -- Subsystem::Count
+/// when nothing did.  This is a real chronological answer: the ordinal is
+/// stamped by count(), i.e. at the event, so a lane that was descheduled
+/// between its fallback and its receipt string no longer loses the race to a
+/// later event on another lane.
+inline Subsystem firstViolationSubsystem() {
+    Subsystem          winner = Subsystem::Count;
+    unsigned long long best   = 0;
+    for (int i = 0; i < static_cast<int>(Subsystem::Count); ++i) {
+        const SubsystemViolations v = violations(static_cast<Subsystem>(i));
+        if (v.ordinal == 0) continue;
+        if (best == 0 || v.ordinal < best) {
+            best   = v.ordinal;
+            winner = static_cast<Subsystem>(i);
+        }
+    }
+    return winner;
+}
+
+/// The ordinal of that first violation, or 0.
+inline unsigned long long firstViolationOrdinal() {
+    const Subsystem which = firstViolationSubsystem();
+    return which == Subsystem::Count ? 0ULL : violations(which).ordinal;
+}
+
 /// The first violation this RUN recorded, or nullptr.  See the note on
 /// detail::firstViolationText: post-join readers only.
+///
+/// WP10.7.  BUILT FROM THE ORDERED TABLE when there is one, so the string a
+/// reader quotes as "the first violation" is the smallest ordinal across every
+/// subsystem rather than whichever thread won the latch.  The one-shot latch is
+/// the answer only when nothing filed a subsystem slot at all.
 inline const char* firstViolation() {
+    const Subsystem which = firstViolationSubsystem();
+    if (which != Subsystem::Count) {
+        static thread_local std::string rendered;
+        const SubsystemViolations v = violations(which);
+        rendered = std::string("subsystem=") + subsystemName(which) +
+                   " site=" + (v.site != nullptr ? v.site : "?") +
+                   " reason=" + (v.reason != nullptr ? v.reason : "?");
+        return rendered.c_str();
+    }
     return detail::firstViolationArmed().load(std::memory_order_acquire)
                ? detail::firstViolationText().c_str()
                : nullptr;
@@ -336,7 +492,16 @@ inline unsigned long long totalFallbacks() {
 /// directly any more.  A seam that cannot throw where it stands uses
 /// noteDeferred(), which counts HERE and raises at the next safe point --
 /// "counted and the case still runs" was the WP1 gap, not the design.
+///
+/// WP10.7.  IT ALSO STAMPS THE EVENT'S ORDINAL.  The ordinal is what makes
+/// `first_violation` a chronological claim rather than a race between string
+/// builders, and it has to be taken HERE -- at the increment, which is the
+/// moment the fallback happened -- because the naming step that files it runs
+/// afterwards and can be descheduled in between.  One relaxed fetch_add and one
+/// thread-local store, on a path that was already about to run a whole CPU
+/// physics body.
 inline void count(Subsystem which) {
+    detail::pendingOrdinal() = detail::nextOrdinal();
     detail::counter(which).fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -354,7 +519,16 @@ inline void count(Subsystem which) {
 /// very first fallback of a run builds a string; every one after it is one
 /// acquire load on a path that was already about to run a whole CPU physics
 /// body.
+///
+/// WP10.7.  IT ALSO FILES THE SUBSYSTEM'S OWN FIRST SITE, under the ordinal
+/// count() stamped.  Same cheapness rule, one level down: the per-subsystem
+/// slot is guarded by its own armed flag, so a subsystem that has already named
+/// its first site pays one acquire load and builds nothing.  Seven slots, seven
+/// strings, for the whole run.
 inline void nameFirstFallback(Subsystem which, const char* where, const char* why) {
+    const unsigned long long ordinal = detail::takePendingOrdinal();
+    if (!detail::subsystemFirst(which).armed.load(std::memory_order_acquire))
+        detail::recordSubsystemFirst(which, where, why, ordinal);
     if (detail::firstViolationArmed().load(std::memory_order_acquire)) return;
     detail::recordFirstViolation(std::string("subsystem=") + subsystemName(which) +
                                  " site=" + (where != nullptr ? where : "?") +
@@ -443,6 +617,42 @@ inline void noteIf(bool arm_requested, Subsystem which, const char* where, const
     if (arm_requested) note(which, where, why);
 }
 
+// ===========================================================================
+// WP10.7: THE ADMISSION GATE -- residency, asked at the door
+// ===========================================================================
+//
+// WHAT IT IS AND WHY IT IS NOT `note()`.  A seam guard fires where the HOST
+// BODY IS ENTERED, after the device declined a call that was already underway.
+// This one fires BEFORE any physics: at the admission door, where a case's
+// device residency is either established or provably cannot be.  The
+// difference matters for exactly one reason -- the REASON is still in hand
+// here.  The 238 arm-A soak killed four cases with
+//
+//   subsystem=flatxs site=XSSet::UpdateFlatXS reason=the FlatXS device arm
+//   declined; the reference reconstruction loop runs
+//
+// which is the seam describing itself.  The backend knew the actual reason
+// (XsReconBackend::status(): "no CUDA device: ...", "stream: ...", "scalar
+// buffer allocation failed") and printed it through a process-wide
+// std::call_once warn -- so in a RESIDENT evaluator process the first case to
+// hit it printed a reason and the other three printed nothing at all.
+//
+// THE COUNTER RULE, AND WHY IT IS NOT `note()`'s.  With the gate ON this
+// counts and throws exactly once, at the door, and the case never reaches the
+// seam -- so a run's per-subsystem counts are what they were.  With the gate
+// OFF it counts NOTHING: the seam downstream is still going to fall back and
+// still going to count, and a door that counted too would double every
+// gate-off tally and break the feature-off identity the campaign reads these
+// numbers under.  It still NAMES, because naming is free of that problem and
+// is the whole point: the reason reaches the receipt either way.
+inline void requireResidency(Subsystem which, const char* where, const char* why) {
+    if (!required()) {
+        nameFirstFallback(which, where, why);
+        return;
+    }
+    note(which, where, why);
+}
+
 /// True when nothing fell back.  Under the gate this is the only value a
 /// completed run can report, which is the point: a run that reports
 /// `contract_pass:false` with the gate OFF is telling you what the gate would
@@ -488,6 +698,31 @@ inline void appendReceiptFields(std::ostream& out) {
         out << "\"" << firstViolation() << "\"";
     else
         out << "null";
+    // WP10.7.  THE ORDINAL, so `first_violation` is a checkable claim.  A
+    // reader can now see that the named site really is the smallest ordinal in
+    // `violations` below rather than taking the field's name on trust -- which
+    // is what the 238 arm-A receipt asked them to do, with two subsystems
+    // firing in the same generation and no way to order them.
+    out << ",\"first_violation_seq\":" << firstViolationOrdinal();
+    // WP10.7.  PER SUBSYSTEM: the count that already existed, joined to the
+    // site that produced it and the ordinal it happened at.  Printed for every
+    // subsystem, zeros included, for the same reason `allowed_refusals` is:
+    // "this arm never fell back" and "this arm has no counter" must not look
+    // the same.  `flatxs_fallbacks:4` used to send a reader to a 16k-line log
+    // for a string the process already held.
+    out << ",\"violations\":{";
+    for (int i = 0; i < static_cast<int>(Subsystem::Count); ++i) {
+        const auto                which = static_cast<Subsystem>(i);
+        const SubsystemViolations v     = violations(which);
+        if (i > 0) out << ",";
+        out << "\"" << subsystemName(which) << "\":{\"count\":" << v.count
+            << ",\"seq\":" << v.ordinal << ",\"site\":";
+        if (v.site != nullptr) out << "\"" << v.site << "\""; else out << "null";
+        out << ",\"reason\":";
+        if (v.reason != nullptr) out << "\"" << v.reason << "\""; else out << "null";
+        out << "}";
+    }
+    out << "}";
 }
 
 /// THE RUN-LEVEL HALF OF THE GATE.
@@ -547,3 +782,12 @@ inline int enforceExitCode(std::ostream& out, int exit_code) {
 /// Throw whatever a deferring seam latched on this thread.  A no-op when
 /// nothing is latched, which is every call with the gate off.
 #define RASBERY_GPU_FULL_RAISE_PENDING() ::rasbery::gpufull::raisePending()
+
+/// WP10.7: THE ADMISSION GATE.  One token, so
+/// tools/test_evaluator_residency_contract.py can scan for the door the way
+/// tools/test_gpu_full_fail_closed.py scans for the seams.  @p why must be the
+/// establishing layer's OWN reason string (XsReconBackend::status(),
+/// CudaOuterSegment::status()) and not a restatement of the guard -- a door
+/// that described itself would be the seam's defect moved one level up.
+#define RASBERY_GPU_FULL_REQUIRE_RESIDENCY(which, where, why) \
+    ::rasbery::gpufull::requireResidency(::rasbery::gpufull::Subsystem::which, (where), (why))

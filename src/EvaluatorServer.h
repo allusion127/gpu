@@ -782,7 +782,33 @@ inline bool parseFidelityFields(const nlohmann::json& object, FidelityRequest& o
 /// retroactively restate what sixty-four cases had already declared, and the
 /// case that asked for strict inside a screening generation would silently
 /// become a screening case.  So: a case that named a field keeps it.
-inline void applyWaveFidelityDefault(const FidelityRequest& wave, FidelityRequest& request) {
+///
+/// WP10.7.  A PROMOTION TAKES NO WAVE DEFAULT AT ALL, and `promoted` is the
+/// whole of the rule.
+///
+/// THE ASYMMETRY THIS REMOVES.  `op":"promote"` is one op with two admission
+/// doors today.  In ROLLING mode the request is resolved the instant it is read
+/// (Server::run, `if (detail::rollingEnabled())`), against
+/// processCaseFidelity() -- there is no wave to take a default from.  In WAVE
+/// mode the same line waits for the `wave` line and is resolved against THAT,
+/// so the identical request means two different things depending on which mode
+/// the process is in.  The op exists precisely so that a promotion's defaults
+/// are "the ones a promotion must have rather than the ones the process happens
+/// to carry"; a wave-mode default is that same accident wearing a wave's name.
+///
+/// AND IT IS NOT A THEORETICAL ONE.  `promote` flips three fields at parse time
+/// -- `strict`, `full` output, the full burnup grid -- and does NOT flip
+/// `flux_mult`, `xe_mult` or `loose_settle`.  So a wave that declares staged
+/// tolerances (RunContract.h: PhysicsFidelity::StagedA2, `acceptance_eligible`
+/// FALSE) used to hand them to the promotion inside it, and the acceptance
+/// lane's re-run -- the one row in a GA generation whose entire job is to be
+/// acceptance-eligible -- silently converged at screening tolerances while
+/// reporting `policy:"strict"`.  Refusing the wave instead would be worse: a
+/// mixed wave is legal by construction (WP10.3) and a promotion inside a
+/// staged screening generation is exactly the case the op was written for.
+inline void applyWaveFidelityDefault(const FidelityRequest& wave, FidelityRequest& request,
+                                     bool promoted) {
+    if (promoted) return;
     if (request.fidelity.empty()) request.fidelity = wave.fidelity;
     if (!request.has_grid && wave.has_grid) {
         request.statepoint_grid = wave.statepoint_grid;
@@ -1159,7 +1185,10 @@ public:
                 }
                 bool wave_refused = false;
                 for (CaseRequest& c : pending) {
-                    applyWaveFidelityDefault(wave_fidelity, c.request_fidelity);
+                    // WP10.7.  ONE DOOR FOR `promote`, whichever mode this
+                    // process is in: `c.promoted` is what rolling mode's
+                    // admission implies by resolving before any wave exists.
+                    applyWaveFidelityDefault(wave_fidelity, c.request_fidelity, c.promoted);
                     if (!resolveCaseFidelity(c.request_fidelity, processCaseFidelity(),
                                              c.resolved_fidelity, error)) {
                         // ONE case's refusal fails the WAVE, deliberately.  A

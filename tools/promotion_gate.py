@@ -282,7 +282,32 @@ def evaluate(block: dict) -> Verdict:
     elif soak.get("pass") is not True:
         result.blockers.append(f"the soak did not pass ({soak.get('pass')!r})")
     else:
-        result.reasons.append(f"soak clean ({soak.get('report', 'inline')})")
+        # WP10.7.  A SOAK THAT PASSED IS NOT A SOAK WHOSE CONTRACT HELD.
+        #
+        # The 238 arm-A soak carried `contract_pass:false` with
+        # `outer_fallbacks:9` and `flatxs_fallbacks:4` beside it, and until
+        # WP10.7 the soak's own verdict did not read either the outer counter or
+        # the receipt's verdict -- so a block could arrive here with
+        # `soak.pass:true` over a run in which thirteen cases were killed by the
+        # fail-closed gate.  The soak now reports `gpu_full_contract`; a block
+        # that carries it and says false is refused HERE too, because a flag
+        # promoted on a run whose GPU arms were not engaged is a flag promoted
+        # on the CPU's numbers.  A block that predates the field says nothing
+        # and is neither credited nor blamed for it -- the same rule as every
+        # other unstated fact in this file.
+        contract = soak.get("gpu_full_contract")
+        contract_pass = contract.get("contract_pass") if isinstance(contract, dict) else None
+        if contract_pass is False:
+            result.blockers.append(
+                "the soak passed but its [RASBERY][GPU_FULL] receipt reports "
+                "contract_pass:false"
+                + (f", first_violation={contract.get('first_violation')!r}"
+                   if isinstance(contract, dict) and contract.get("first_violation")
+                   else "")
+                + ". A default promoted on a run whose GPU arms fell back to CPU "
+                  "numerics is a default promoted on the wrong measurement.")
+        else:
+            result.reasons.append(f"soak clean ({soak.get('report', 'inline')})")
 
     # -- rollback ----------------------------------------------------------
     if block.get("env_rollback") is not True:
