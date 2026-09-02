@@ -24,6 +24,12 @@ Neither is survivable by accident, so the tree's rule is mechanical:
      the shared side of the same lock.  This is the half that was open: the
      capture sites were guarded and CudaPprBackend.cu's ENTIRE stand-up was not
      (see docs/WP19_CAPTURE_RACE_20260831_KO.md).
+  3b. AND WHERE NO CALLER CAN HOLD ONE, THE CALLEE DOES.  WP10.8's device block
+     pool evicts past its cap by draining victims through a reclaimer, out of
+     the PURE-HOST half of GpuDeviceBlockPool.h -- a half that cannot name
+     rasbery::AllocWindow, called from a wrapper that opens its window only on
+     the other branch.  So the reclaimer the CUDA half installs takes the
+     window itself, before its free.
   4. A capture-illegal error is RETRIED ONCE with the arbiter held, counted,
      and -- if the retry loses too -- said out loud.
   5. A case that dies says so on its own line, and the dispatcher lifts that
@@ -122,6 +128,29 @@ ALLOC_ALLOW: list[tuple[str, str, str]] = []
 #: Files the rules do not apply to.  The arbiter's own header defines the
 #: windows; the stub backends have no CUDA in them at all.
 EXEMPT_FILES = ("GpuCaptureArbiter.h",)
+
+# --- rule 3b --------------------------------------------------------------
+#: THE ONE DRIVER FREE NO CALLER CAN GUARD.  src/GpuDeviceBlockPool.h is split:
+#: the free list is PURE HOST (EvaluatorServer.h compiles it with no CUDA
+#: runtime, so it cannot name rasbery::AllocWindow at all) and the cudaMalloc /
+#: cudaFree wrappers live in the `#ifdef __CUDACC__` half.  WP10.8 gave the host
+#: half a CAP, and a park that would exceed it now EVICTS -- `give()` gathers
+#: victims under the pool mutex, releases it, and drains them through a
+#: RECLAIMER function pointer the CUDA half installed.  That drain runs on the
+#: calling thread with nothing held: `deviceBlockFree()` opens its AllocWindow
+#: only on the path where `give()` returned FALSE, so the eviction free is
+#: outside every window, and in --batch-mode with RASBERY_ARENA_PERSIST=1 it is
+#: deck A's teardown thread calling cudaFree while deck B's lane is inside
+#: cudaStreamBeginCapture..EndCapture.  Rule 3 catches the shape only while the
+#: free is written inline; this rule states the REASON, so a reclaimer moved to a
+#: helper, or a window written after the free it is meant to serialise, is caught
+#: as well.
+POOL_HEADER = "GpuDeviceBlockPool.h"
+#: The install site, either spelling.  The DECLARATION `setReclaimer(Reclaimer
+#: fn)` is skipped by its argument, below.
+RECLAIMER_INSTALL = re.compile(r"(?<![\w])(?:[\w:]*::)?setReclaimer\s*\(")
+#: Driver frees a reclaimer could plausibly make.
+RECLAIMER_FREES = ("cudaFree", "cudaFreeAsync", "cudaFreeHost")
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +441,94 @@ def check_allocs_inside_arbiter(files: dict[str, str]) -> list[str]:
     return bad
 
 
+def _call_argument(code: str, paren: int) -> str:
+    """Text between the parentheses of the call whose '(' is at `paren`."""
+    depth = 0
+    for j in range(paren, len(code)):
+        if code[j] == "(":
+            depth += 1
+        elif code[j] == ")":
+            depth -= 1
+            if depth == 0:
+                return code[paren + 1:j]
+    return code[paren + 1:]
+
+
+def _first_free(text: str) -> int:
+    """Offset of the first driver free in `text`, or -1."""
+    hits = [text.find(name) for name in RECLAIMER_FREES]
+    hits = [h for h in hits if h != -1]
+    return min(hits) if hits else -1
+
+
+def check_pool_eviction_window(files: dict[str, str]) -> list[str]:
+    """Rule 3b: the block pool's eviction reclaimer holds its OWN AllocWindow.
+
+    Two halves, and both have to hold or the rule is describing a tree that no
+    longer exists:
+
+      (a) THE PREMISE.  `give()` really does drain evictions with no window --
+          it is the host-only half, so it cannot open one.  Checked rather than
+          assumed, because a future `give()` that DID take a window would make
+          this rule redundant and it should be retired rather than left lying.
+      (b) THE OBLIGATION.  Every reclaimer installed anywhere in src/ that makes
+          a driver free opens a rasbery::AllocWindow BEFORE that free.
+    """
+    bad: list[str] = []
+    hits = [p for p in files if os.path.basename(p) == POOL_HEADER]
+    if not hits:
+        return ["src/%s is gone -- rule 3b now defends nothing; retarget it or take "
+                "it out" % POOL_HEADER]
+    pool = "\n".join(strip_noncode(files[hits[0]]))
+
+    # (a) the premise
+    if "reclaim(victim)" not in pool or "inline bool give(" not in pool:
+        bad.append(
+            "src/%s no longer drains cap evictions through a reclaimer out of "
+            "give(); rule 3b is describing a pool that is gone" % POOL_HEADER)
+    else:
+        give = pool[pool.index("inline bool give("):pool.index("reclaim(victim)")]
+        if "AllocWindow" in give:
+            bad.append(
+                "src/%s: give() names rasbery::AllocWindow, but give() is in the "
+                "pure-host half that EvaluatorServer.h compiles with no CUDA "
+                "runtime -- that cannot compile, so it cannot be the guard it "
+                "looks like" % POOL_HEADER)
+
+    # (b) the obligation
+    installs = 0
+    for path, text in sorted(files.items()):
+        code = "\n".join(strip_noncode(text))
+        for m in RECLAIMER_INSTALL.finditer(code):
+            arg = _call_argument(code, m.end() - 1)
+            if re.match(r"\s*Reclaimer\b", arg):
+                continue  # the declaration, not an install
+            installs += 1
+            free_at = _first_free(arg)
+            if free_at == -1:
+                continue  # a reclaimer that makes no driver call needs no window
+            window_at = arg.find("rasbery::AllocWindow")
+            if window_at == -1:
+                bad.append(
+                    "%s:%d installs a block-pool reclaimer that frees a device "
+                    "block with no rasbery::AllocWindow of its own -- give() drains "
+                    "evictions from the host-only half with nothing held, so this "
+                    "free runs beside a sibling lane's stream capture and does not "
+                    "even reach the MEM receipt's alloc_* counters"
+                    % (rel(path), code.count("\n", 0, m.start()) + 1))
+            elif window_at > free_at:
+                bad.append(
+                    "%s:%d installs a block-pool reclaimer whose "
+                    "rasbery::AllocWindow is opened AFTER the free it is meant to "
+                    "serialise" % (rel(path), code.count("\n", 0, m.start()) + 1))
+    if installs == 0:
+        bad.append(
+            "nothing in src/ installs a block-pool reclaimer: either the WP10.8 "
+            "eviction path is gone (in which case the pool is unbounded again) or "
+            "rule 3b has stopped being able to find it")
+    return bad
+
+
 def check_retry_path(files: dict[str, str]) -> list[str]:
     """Rule 4: the capture-illegal retry exists, is counted, and is loud."""
     bad = []
@@ -517,6 +634,7 @@ CHECKS = (
     ("every capture pair is inside the arbiter", check_capture_inside_arbiter),
     ("every capture helper's callers hold the window", check_capture_helper_callers),
     ("every allocation is inside the arbiter", check_allocs_inside_arbiter),
+    ("the pool's eviction reclaimer holds its own window", check_pool_eviction_window),
     ("the capture-illegal retry exists and is counted", check_retry_path),
     ("a dead case propagates its error text", check_error_propagation),
     ("the batch workdir is per-run", check_workdir_is_per_run),
@@ -571,6 +689,22 @@ def controls(files: dict[str, str]):
          mutate(files, "CudaCramBackend.cu",
                 'rasbery::AllocWindow _alloc_window("cram.shape.standup");',
                 "")),
+        # WP10.8 x WP19.  The eviction cudaFree that no caller can guard.  The
+        # first control is the defect as it shipped; the second is the one a
+        # line-order edit would reintroduce and that a "is the window present"
+        # check would wave through.
+        ("the block-pool eviction reclaimer loses its window",
+         check_pool_eviction_window,
+         mutate(files, "GpuDeviceBlockPool.h",
+                '            rasbery::AllocWindow _alloc_window("blockpool.evict");\n',
+                "")),
+        ("the block-pool eviction reclaimer takes its window after the free",
+         check_pool_eviction_window,
+         mutate(files, "GpuDeviceBlockPool.h",
+                '            rasbery::AllocWindow _alloc_window("blockpool.evict");\n'
+                "            (void)cudaFree(block);\n",
+                "            (void)cudaFree(block);\n"
+                '            rasbery::AllocWindow _alloc_window("blockpool.evict");\n')),
         ("the retry stops being counted",
          check_retry_path,
          mutate(files, "GpuCaptureArbiter.h",

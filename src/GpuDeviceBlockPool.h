@@ -341,6 +341,15 @@ inline void noteAllocated(const void* block, std::size_t bytes, bool poolable) {
 /// cap makes room by returning the least-recently-parked block to the driver
 /// first.  The eviction runs with the lock RELEASED, because `cudaFree` is a
 /// synchronising call and holding a mutex across it would serialise every lane.
+///
+/// WP19.  The drain below is a DEVICE FREE MADE FROM THE PURE-HOST HALF: this
+/// function cannot name `rasbery::AllocWindow` (GpuCaptureArbiter.h is included
+/// only under `__CUDACC__`) and its callers do not hold one either -- the
+/// `deviceBlockFree()` wrapper opens its window on the path where this returns
+/// FALSE.  So the reclaimer the CUDA half installs opens the window itself; see
+/// `ensureBlockPoolReclaimer()` below.  Do not "simplify" that away: an eviction
+/// with no window is a `cudaFree` running beside a sibling lane's
+/// `cudaStreamBeginCapture`, which is the exact race the arbiter exists to close.
 inline bool give(const void* block) {
     if (block == nullptr) return true; // nothing to free, and cudaFree(nullptr) is a no-op
     detail::State&     s       = detail::state();
@@ -489,9 +498,28 @@ namespace rasbery::gpu {
 /// WP10.8.  Hand the pure-host free list the device free it needs to EVICT.
 /// Called from every allocation path so a process that ever pooled a block can
 /// always give one back; `setReclaimer` ignores every call after the first.
+///
+/// WP19 -- THE WINDOW BELONGS TO THE RECLAIMER, NOT TO ITS CALLER.  `give()`
+/// drains its evictions from the PURE-HOST half of this header, after releasing
+/// the pool mutex and with nothing else held: it cannot open a
+/// `rasbery::AllocWindow` (that type does not exist in a host TU) and
+/// `deviceBlockFree()` below opens one only on the path where `give()` returned
+/// false.  An eviction is therefore the one `cudaFree` in this file that no
+/// caller can guard, and in `--batch-mode` with `RASBERY_ARENA_PERSIST=1` it is
+/// deck A's teardown thread calling the driver while deck B's lane sits inside
+/// `cudaStreamBeginCapture..EndCapture` -- the WP19 race, and invisible in the
+/// `[RASBERY][EVALUATOR][MEM]` receipt besides, because `alloc_windows`,
+/// `alloc_overlapped` and `alloc_in_capture` are only moved by `AllocWindow`'s
+/// constructor.  Opening it HERE covers every present and future caller of
+/// `give()` at once, and nests for free (AllocWindow counts depth and locks only
+/// at depth 0) under the callers that already hold one, such as
+/// `GpuPhysicsArena::release()`.
 inline void ensureBlockPoolReclaimer() {
     static const bool installed = [] {
-        blockpool::setReclaimer([](void* block) { (void)cudaFree(block); });
+        blockpool::setReclaimer([](void* block) {
+            rasbery::AllocWindow _alloc_window("blockpool.evict");
+            (void)cudaFree(block);
+        });
         return true;
     }();
     (void)installed;
@@ -536,7 +564,10 @@ inline cudaError_t deviceBlockAllocOnce(void** pp, std::size_t bytes) {
 /// in `device_frees` beside the frees this line makes.
 inline cudaError_t deviceBlockFree(void* block) {
     ensureBlockPoolReclaimer();
-    // Parked, or nullptr: no driver call, so no window, for the same reason.
+    // Parked, or nullptr: no driver call ON THIS PATH, so no window here, for
+    // the same reason.  An eviction inside `give()` DOES reach the driver, and
+    // carries its own window because `give()` is the host-only half and cannot
+    // open one -- see `ensureBlockPoolReclaimer()` above.
     if (blockpool::give(block)) return cudaSuccess;
     rasbery::AllocWindow _alloc_window("blockpool.cudaFree");
     return cudaFree(block);
