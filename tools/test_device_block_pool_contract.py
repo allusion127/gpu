@@ -60,6 +60,19 @@ def read(rel: str) -> str:
 
 POOL = read("src/GpuDeviceBlockPool.h")
 SERVER = read("src/EvaluatorServer.h")
+XSRECON = read("src/CudaXsReconBackend.cu")
+ARENA = read("src/GpuPhysicsArenaCuda.cu")
+
+
+def code_only(text: str) -> str:
+    """The text with whole-line `//` comments dropped.
+
+    The naming rule below is about what the code CALLS, not about what a comment
+    is allowed to name.  A comment explaining why the arena-shaped spelling was
+    retired has to be able to write that spelling down.
+    """
+    return "".join(line + "\n" for line in text.splitlines()
+                   if not line.lstrip().startswith("//"))
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +161,60 @@ def check_receipt(server: str) -> list[str]:
         bad.append("the MEM receipt still prints a raw counter as `arena_rebuilds`; "
                    "WP10.8 makes that field process-lifetime regions handed back, "
                    "which is what its name always promised")
+    return bad
+
+
+# ---------------------------------------------------------------------------
+# 2b. NO CALL SITE MAY PUT A PER-CASE EVENT BEHIND AN ARENA-SHAPED NAME
+# ---------------------------------------------------------------------------
+#
+# THE DEFECT THIS CLOSES.  Before WP10.8 one counter, `arena_rebuilds`, was
+# incremented from four places: three per-case device-block regrows inside
+# `XsReconBackend::Impl` (per XSSet, per Driver, per deck) and one arena
+# stand-up.  The MEM receipt documented the field as "MUST be 0 in steady
+# state", so a HEALTHY width-16 soak reported it climbing by +17 every
+# generation -- 16 cases plus the promote -- and the 238 block-38 report read
+# that as "the arena is torn down and rebuilt per generation" and convicted
+# `RASBERY_ARENA_PERSIST=1` for it.
+#
+# Renaming the receipt field was only half the repair.  While ANY call site can
+# still spell a per-case event `noteArenaRebuild()`, the next reader makes the
+# same mistake straight from the source.  So the alias is gone, and this is the
+# rule that keeps it gone.  Three claims:
+#
+#   * nothing declares or calls an arena-named reshape counter, anywhere;
+#   * the three XsRecon per-case regrows DO count, into `block_reshapes`;
+#   * the physics arena counts into NEITHER by hand -- its stand-up and its
+#     teardown are derived from the `poolable=false` registration flag, and that
+#     is what makes the receipt's `arena_rebuilds` un-fakeable by a call site.
+
+
+def check_counter_names(pool: str, xsrecon: str, arena: str) -> list[str]:
+    bad: list[str] = []
+    for name, text in (("src/GpuDeviceBlockPool.h", pool),
+                       ("src/CudaXsReconBackend.cu", xsrecon),
+                       ("src/GpuPhysicsArenaCuda.cu", arena)):
+        if "noteArenaRebuild(" in code_only(text):
+            bad.append(f"{name} still declares or calls `noteArenaRebuild()`. That "
+                       "spelling puts a PER-CASE device-block regrow behind an "
+                       "arena-shaped name, which is why the 238 block-38 soak read "
+                       "+17/generation as an arena teardown and convicted the arm")
+    reshapes = code_only(xsrecon).count("blockpool::noteBlockReshape()")
+    if reshapes != 3:
+        bad.append(f"CudaXsReconBackend.cu counts {reshapes} block reshapes, not 3; the "
+                   "instance, nodes and stream regrows are the per-case re-layouts, and "
+                   "a receipt that stops counting them cannot tell a steady state from "
+                   "a geometry that keeps changing under it")
+    if "noteBlockReshape(" in code_only(arena):
+        bad.append("GpuPhysicsArenaCuda.cu counts an arena event into `block_reshapes`, "
+                   "which GpuDeviceBlockPool.h defines as a live PER-INSTANCE region "
+                   "re-laid-out under a shape change. An arena stand-up is not one, and "
+                   "one counter carrying both is a counter no reader can act on")
+    if "if (!reg.poolable) s.stats.arena_teardowns" not in pool:
+        bad.append("the arena teardown the receipt prints as `arena_rebuilds` is no "
+                   "longer derived from the registration flag inside give(), so it is "
+                   "back to depending on a call site remembering to cooperate -- which "
+                   "is the property that made the old field wrong")
     return bad
 
 
@@ -266,9 +333,9 @@ int main(int argc, char** argv) {
     // ---- 5. THE COUNTERS MEAN WHAT THEY ARE CALLED ------------------------
     bp::resetForTest();
     bp::noteBlockReshape();
-    bp::noteArenaRebuild();  // deprecated alias -- same counter
+    bp::noteBlockReshape();
     s = bp::snapshot();
-    std::printf("reshape_alias %d\n",
+    std::printf("reshapes_are_not_arena %d\n",
                 s.block_reshapes == 2 && bp::arenaRebuilds(s) == 0);
     void* once = fake(9000);
     bp::noteAllocated(once, 4096, false);
@@ -302,10 +369,10 @@ EXPECTED_BOUNDED = {
     "bookkeeping_is_small": "200 parked blocks weigh more than a megabyte of "
                             "bookkeeping; either the accounting is wrong or the pool "
                             "really is an RSS suspect",
-    "reshape_alias": "noteArenaRebuild() no longer lands in block_reshapes, so the two "
-                     ".cu files that still call it by that name are counting into "
-                     "nothing -- or it is still moving arena_rebuilds, which is the "
-                     "mislabel WP10.8 exists to close",
+    "reshapes_are_not_arena": "noteBlockReshape() did not land in block_reshapes, or it "
+                              "moved arena_rebuilds as well -- and one number carrying "
+                              "both a per-case regrow and an arena teardown is the "
+                              "mislabel WP10.8 exists to close",
     "standup_counted": "a process-lifetime registration did not move arena_standups, or "
                        "moved arena_rebuilds before anything was handed back",
     "singleton_never_parked": "a process-lifetime block was parked on a free list that "
@@ -448,6 +515,35 @@ def controls() -> list[str]:
     if not check_receipt(SERVER.replace('\\"pool_bookkeeping_bytes\\"',
                                         '\\"nothing\\"')):
         broken.append("check_receipt passes a receipt that cannot weigh the pool")
+    if not check_counter_names(
+            POOL + "\ninline void noteArenaRebuild() { noteBlockReshape(); }\n",
+            XSRECON, ARENA):
+        broken.append("check_counter_names passes a tree that has brought the "
+                      "arena-named alias back")
+    if not check_counter_names(POOL,
+                               XSRECON.replace("blockpool::noteBlockReshape()",
+                                               "blockpool::noteArenaRebuild()"),
+                               ARENA):
+        broken.append("check_counter_names passes per-case regrows counted under an "
+                      "arena-shaped name -- the exact source-level mislabel the 238 "
+                      "block-38 report then read off the receipt")
+    if not check_counter_names(POOL,
+                               XSRECON.replace("blockpool::noteBlockReshape()",
+                                               "blockpool::nothing()", 1),
+                               ARENA):
+        broken.append("check_counter_names passes a tree where one of the three per-case "
+                      "regrows stopped counting")
+    if not check_counter_names(
+            POOL, XSRECON,
+            ARENA + "\nvoid x() { rasbery::gpu::blockpool::noteBlockReshape(); }\n"):
+        broken.append("check_counter_names passes an arena that counts its own stand-up "
+                      "as a per-instance block reshape")
+    if not check_counter_names(
+            POOL.replace("if (!reg.poolable) s.stats.arena_teardowns",
+                         "if (false) s.stats.arena_teardowns"),
+            XSRECON, ARENA):
+        broken.append("check_counter_names passes a pool where arena_rebuilds is no "
+                      "longer derived from the registration flag")
     if not check_receipt(SERVER.replace("blockpool::arenaRebuilds(dev)",
                                         "dev.block_reshapes")):
         broken.append("check_receipt passes a receipt that prints the per-case reshape "
@@ -459,6 +555,7 @@ def controls() -> list[str]:
 failures += check_bounded(POOL)
 failures += check_exact_still(POOL)
 failures += check_receipt(SERVER)
+failures += check_counter_names(POOL, XSRECON, ARENA)
 run_compiled()
 
 broken_controls = controls()
@@ -474,4 +571,4 @@ if failures:
 
 print(f"device block pool: PASS ({len(CAP_ENVS)} operator caps, "
       f"{len(REQUIRED_FIELDS)} receipt fields, {len(EXPECTED_BOUNDED) + len(EXPECTED_EVICT)} compiled assertions x 2 arms, "
-      f"8 negative controls)")
+      f"13 negative controls)")

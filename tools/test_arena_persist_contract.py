@@ -82,7 +82,7 @@ SOAK = read("tools/soak_run.py")
 
 def check_pool(pool: str) -> list[str]:
     bad: list[str] = []
-    for symbol in ("take(", "give(", "noteAllocated(", "noteArenaRebuild(",
+    for symbol in ("take(", "give(", "noteAllocated(",
                    "noteBlockReshape(", "arenaRebuilds(", "setReclaimer(",
                    "capBytes(", "capBlocks(", "capClassDepth(",
                    "snapshot(", "enabled(", "deviceBlockAlloc(",
@@ -150,10 +150,11 @@ def check_sites(xsrecon: str) -> list[str]:
         bad.append("the process-lifetime singletons (nodal arena, flat-XS library) do "
                    "not use the once-allocator, so they would be counted as poolable "
                    "and parked on a free list that will never be asked for them")
-    # WP10.8.  EITHER SPELLING.  `noteArenaRebuild()` is now a deprecated alias
-    # of `noteBlockReshape()`; docs/patches/wp10_8_xsrecon.patch converts these
-    # three sites, and this tree has to pass before and after that patch lands.
-    if "noteArenaRebuild(" not in xsrecon and "noteBlockReshape(" not in xsrecon:
+    # WP10.8.  ONE SPELLING, AND IT IS THE HONEST ONE.  These three sites count a
+    # per-CASE re-layout; the arena-named alias they used to call is gone, and
+    # tools/test_device_block_pool_contract.py holds the naming rule that keeps
+    # it gone.  Here we only insist that the counting still happens.
+    if "noteBlockReshape(" not in xsrecon:
         bad.append("nothing counts a device block reshape in CudaXsReconBackend.cu, so "
                    "'was a live region re-laid-out per case' stays a question a receipt "
                    "cannot answer")
@@ -294,6 +295,9 @@ def controls() -> list[str]:
     if not check_sites(XSRECON.replace("deviceBlockAllocOnce(", "deviceBlockAlloc(")):
         broken.append("check_sites passes a tree where the process-lifetime singletons "
                       "are registered as poolable")
+    if not check_sites(XSRECON.replace("blockpool::noteBlockReshape", "nothing")):
+        broken.append("check_sites passes a tree where the per-case regrows count no "
+                      "reshape at all")
     if not check_arena(ARENA.replace("blockpool::noteAllocated", "nothing")):
         broken.append("check_arena passes an arena that never registers its block")
     if not check_soak_source(SOAK.replace("query-compute-apps", "query-nothing")):
@@ -366,15 +370,17 @@ int main() {
     std::printf("allocs_counted %d\n", st.device_allocs == 2);
     std::printf("frees_counted %d\n", st.device_frees == (on ? 0u : 2u));
 
-    // WP10.8.  THE COUNTER THAT WAS MISNAMED.  `noteArenaRebuild()` always
-    // counted a per-INSTANCE device block re-laid-out under a shape change --
-    // one per case, in BOTH arms of the 238 block-38 soak -- and never an arena
-    // teardown.  It is now `noteBlockReshape()` and lands in `block_reshapes`;
-    // the old spelling is a deprecated alias and must go to the same place, or
-    // the two .cu files that still call it would be counting into nothing.
+    // WP10.8.  THE COUNTER THAT WAS MISNAMED.  What it counts is a per-INSTANCE
+    // device block re-laid-out under a shape change -- one per case, in BOTH
+    // arms of the 238 block-38 soak -- and never an arena teardown.  It lands
+    // in `block_reshapes`, and it must leave untouched the number the receipt
+    // prints as `arena_rebuilds`; one field carrying both is what let the 238
+    // report convict RASBERY_ARENA_PERSIST for +17 per generation.
     bp::noteBlockReshape();
-    bp::noteArenaRebuild();
-    std::printf("reshapes_counted %d\n", bp::snapshot().block_reshapes == 2);
+    bp::noteBlockReshape();
+    std::printf("reshapes_counted %d\n",
+                bp::snapshot().block_reshapes == 2 &&
+                bp::arenaRebuilds(bp::snapshot()) == 0);
 
     // And the number `arena_rebuilds` now carries is derived from the
     // registration flag with no call site cooperating: a process-lifetime
@@ -430,8 +436,9 @@ EXPECTED = {
     "allocs_counted": "device_allocs did not count the driver allocations",
     "frees_counted": "device_frees counted a free that never reached the driver (or "
                      "missed one that did)",
-    "reshapes_counted": "noteBlockReshape(), or its deprecated alias "
-                        "noteArenaRebuild(), did not move block_reshapes",
+    "reshapes_counted": "noteBlockReshape() did not move block_reshapes, or it moved "
+                        "the number the receipt prints as arena_rebuilds -- which is "
+                        "the mislabel WP10.8 exists to close",
     "arena_rebuilds_zero_until_teardown":
         "a process-lifetime region was registered and arena_rebuilds was already "
         "nonzero, or arena_standups did not count it -- the field would then still "
@@ -551,6 +558,6 @@ if not compiled:
     print("arena persist: NOTE -- no C++ compiler found; the free list was checked "
           "by source scan only", file=sys.stderr)
 print(f"arena persist: PASS ({len(REQUIRED_MEM_FIELDS)} receipt fields, "
-      f"{len(PER_CASE_BLOCKS)} per-case blocks, {len(broken_controls) == 0 and 8 or 0} "
+      f"{len(PER_CASE_BLOCKS)} per-case blocks, {len(broken_controls) == 0 and 9 or 0} "
       f"negative controls"
       + (f", {len(EXPECTED)} compiled x2 arms" if compiled else "") + ")")

@@ -67,9 +67,12 @@
 //
 //   block_reshapes   a live per-instance device region freed and re-laid-out
 //                    under a shape change.  This is what the old counter
-//                    counted.  `noteBlockReshape()` is the spelling;
-//                    `noteArenaRebuild()` survives as a deprecated alias only
-//                    because two .cu files call it by that name.
+//                    counted.  `noteBlockReshape()` is the ONLY spelling: the
+//                    deprecated `noteArenaRebuild()` alias is gone, so no call
+//                    site can put a per-case event behind an arena-shaped name
+//                    again.  The three XsRecon regrow sites are the only
+//                    callers; the physics arena needs none, because its
+//                    stand-up and teardown are derived (below).
 //   arena_standups   process-lifetime (`poolable=false`) regions REGISTERED --
 //                    the nodal arena, the flat-XS library, the physics arena.
 //   arena_teardowns  process-lifetime regions DEREGISTERED.  These are taken
@@ -409,13 +412,6 @@ inline void noteBlockReshape() {
     std::lock_guard<std::mutex> lock(s.mutex);
     s.stats.block_reshapes += 1;
 }
-
-/// DEPRECATED SPELLING of noteBlockReshape(), kept because
-/// CudaXsReconBackend.cu and GpuPhysicsArenaCuda.cu call it by this name and
-/// this header cannot rename their call sites.
-/// docs/patches/wp10_8_xsrecon.patch converts the three XsRecon sites; nothing
-/// behaves differently either way, because this IS that function.
-inline void noteArenaRebuild() { noteBlockReshape(); }
 
 inline Stats snapshot() {
     detail::State& s = detail::state();

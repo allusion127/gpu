@@ -191,11 +191,16 @@ bool GpuPhysicsArena::reserve(const ArenaDims& dims) {
     // the receipt's `arena_rebuilds` exists to keep honest.
     rasbery::gpu::blockpool::noteAllocated(d.base, d.offsets.total_bytes,
                                            /*poolable=*/false);
-    {
-        // Second and later stand-ups only.  The first is not a rebuild.
-        static int standups = 0;
-        if (++standups > 1) rasbery::gpu::blockpool::noteArenaRebuild();
-    }
+    // WP10.8.  NO MANUAL COUNTER HERE, and that is the point.  The registration
+    // above already moves `arena_standups` (it is the `poolable=false` flag that
+    // does it), and `release()` below already moves `arena_teardowns` through
+    // `give()` -- which is the quantity the receipt prints as `arena_rebuilds`.
+    // A second stand-up therefore reports itself, with no site cooperating.  The
+    // hand-rolled counter this replaces incremented `block_reshapes`, which the
+    // pool header defines as a live PER-INSTANCE region re-laid-out under a
+    // shape change: an arena stand-up is not one, and mixing the two is the
+    // mislabel that made the 238 block-38 report convict `RASBERY_ARENA_PERSIST`
+    // for +17 per generation that was never about the arena.
 
     // Every region offset is a multiple of 256, so the whole layout is only
     // 256-aligned if the BASE is.  cudaMallocFromPoolAsync gives at least 256

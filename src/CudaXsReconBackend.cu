@@ -2996,12 +2996,17 @@ struct XsReconBackend::Impl {
         // kernels; a geometry change invalidates both.
         xeRelease();
         rasbery::AllocWindow _alloc_window("xsrecon.instance.regrow");
-        // WP10.6.  A REBUILD is a live region freed and re-laid-out under a
-        // shape change; a first stand-up is not one.  The distinction is the
-        // whole question the VRAM sawtooth raised -- "is the arena torn down
-        // per generation?" -- and it is now a counter in the MEM receipt
-        // instead of an inference from a board-level memory trace.
-        if (dev_block != nullptr) rasbery::gpu::blockpool::noteArenaRebuild();
+        // WP10.8.  A RESHAPE is a live PER-INSTANCE region freed and re-laid-out
+        // under a shape change; a first stand-up is not one.  `Impl` is per
+        // XSSet, per Driver, per deck, so one of these per case is normal and
+        // expected -- which is why this site counts into `block_reshapes` and
+        // must never count into an arena-named field.  WP10.6 let it, the 238
+        // block-38 soak read the resulting +17/generation as "the arena is torn
+        // down per generation", and the arm it convicted was innocent.  The
+        // arena question is answered by the receipt's own `arena_rebuilds`,
+        // which is derived from the registration flag and which no call site in
+        // this file can move.
+        if (dev_block != nullptr) rasbery::gpu::blockpool::noteBlockReshape();
         if (dev_block) { rasbery::gpu::deviceBlockFree(dev_block); dev_block = nullptr; }
         if (dev_block_f) { rasbery::gpu::deviceBlockFree(dev_block_f); dev_block_f = nullptr; }
         if (dev_fuel) { rasbery::gpu::deviceBlockFree(dev_fuel); dev_fuel = nullptr; }
@@ -4903,7 +4908,7 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     const std::size_t n_nodes = static_cast<std::size_t>(host.n_nodes);
     if (n_nodes > d.nodes_cap) {
         rasbery::AllocWindow _alloc_window("xsrecon.nodes.regrow");
-        if (d.dev_nodes != nullptr) rasbery::gpu::blockpool::noteArenaRebuild();
+        if (d.dev_nodes != nullptr) rasbery::gpu::blockpool::noteBlockReshape();
         if (d.dev_nodes) rasbery::gpu::deviceBlockFree(d.dev_nodes);
         if (d.dev_off) rasbery::gpu::deviceBlockFree(d.dev_off);
         if (d.dev_cnt) rasbery::gpu::deviceBlockFree(d.dev_cnt);
@@ -4929,7 +4934,7 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
                      static_cast<std::size_t>(host.node_cnt[host.n_nodes - 1]);
     if (stream_len > d.stream_cap) {
         rasbery::AllocWindow _alloc_window("xsrecon.stream.regrow");
-        if (d.dev_sdid != nullptr) rasbery::gpu::blockpool::noteArenaRebuild();
+        if (d.dev_sdid != nullptr) rasbery::gpu::blockpool::noteBlockReshape();
         if (d.dev_sdid) rasbery::gpu::deviceBlockFree(d.dev_sdid);
         if (d.dev_sx) rasbery::gpu::deviceBlockFree(d.dev_sx);
         if (d.dev_sscale) rasbery::gpu::deviceBlockFree(d.dev_sscale);
