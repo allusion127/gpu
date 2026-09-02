@@ -185,7 +185,10 @@ private:
     /// generation does not match `_micx_generation`, or no event is available --
     /// in which case the caller must materialise the host copy and let the
     /// backend upload it.  All eleven or none: see the definition.
-    bool FillCramMicDevice(const double** dev, void*& ready);
+    /// WP20.1: `const void**` and an out `elem_bytes`, because the resident
+    /// block's element width is now the FP32 arm's decision and the consumer
+    /// must be told rather than assume.
+    bool FillCramMicDevice(const void** dev, void*& ready, int& elem_bytes);
     bool CorrectorStepGpu(double dt, double power, bool xe_transient,
                           bool density_average, bool xe_equilibrium_fix,
                           int substeps);

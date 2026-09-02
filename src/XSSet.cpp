@@ -3225,13 +3225,18 @@ void XSSet::EnsureMicxHost(MicxNeed need) const {
 // ALL ELEVEN OR NONE: the view's contract is that mic_device[] parallels mic[],
 // and a half-filled table would let the backend take two slots from the device
 // and two from the host -- two epochs in one condensation.
-bool XSSet::FillCramMicDevice(const double** dev, void*& ready) {
+bool XSSet::FillCramMicDevice(const void** dev, void*& ready, int& elem_bytes) {
     for (int xt = 0; xt < static_cast<int>(N_XS_SCALAR); ++xt) dev[xt] = nullptr;
     ready = nullptr;
+    elem_bytes = static_cast<int>(sizeof(double));
     if (!_xsrecon_backend || !_xsrecon_backend->available()) return false;
     if (_xsrecon_backend->micxResidentGeneration() != _micx_generation) return false;
     for (int xt = 0; xt < static_cast<int>(N_XS_SCALAR); ++xt) {
-        dev[xt] = _xsrecon_backend->micxDeviceSlot(xt);
+        // WP20.1: the view carries `const void*` because the block's ELEMENT
+        // WIDTH is the FP32 arm's decision, not this file's.  Until the flat-XS
+        // backend actually narrows the block it hands out a `const double*` and
+        // this reports eight, which is what the consumer then copies.
+        dev[xt] = static_cast<const void*>(_xsrecon_backend->micxDeviceSlot(xt));
         if (dev[xt] == nullptr) {
             for (int j = 0; j < static_cast<int>(N_XS_SCALAR); ++j) dev[j] = nullptr;
             return false;
@@ -5371,8 +5376,10 @@ bool XSSet::DepleteGpu(double dt, double power, bool xe_transient) {
     // so the materialisation is skipped too, not merely the upload.  When it
     // does not take, this is a host read like any other and the debt is paid.
     void*      mic_ready = nullptr;
-    const bool mic_d2d   = FillCramMicDevice(v.mic_device, mic_ready);
-    v.mic_device_ready   = mic_ready;
+    int        mic_bytes = static_cast<int>(sizeof(double));
+    const bool mic_d2d   = FillCramMicDevice(v.mic_device, mic_ready, mic_bytes);
+    v.mic_device_ready     = mic_ready;
+    v.mic_device_elem_bytes = mic_bytes;
     if (!mic_d2d) EnsureMicxHost(MicxNeed::Scalars);
 
     // ADDRESSES ONLY when mic_d2d is true: the eleven stay filled because the
@@ -5431,8 +5438,10 @@ bool XSSet::CorrectorStepGpu(double dt, double power, bool xe_transient,
 
     // WP15.1: same offer, same fallback, same reason as the predictor's.
     void*      mic_ready = nullptr;
-    const bool mic_d2d   = FillCramMicDevice(v.mic_device, mic_ready);
-    v.mic_device_ready   = mic_ready;
+    int        mic_bytes = static_cast<int>(sizeof(double));
+    const bool mic_d2d   = FillCramMicDevice(v.mic_device, mic_ready, mic_bytes);
+    v.mic_device_ready     = mic_ready;
+    v.mic_device_elem_bytes = mic_bytes;
     if (!mic_d2d) EnsureMicxHost(MicxNeed::Scalars);
 
     const double* mic_ptrs[N_XS_SCALAR] = {
