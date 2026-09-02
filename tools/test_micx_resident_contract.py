@@ -75,6 +75,22 @@ M10 THE BATCH ARM REACHES THE DEFERRAL THROUGH THE SAME solveFlatXs.  WP15's
     nodal arena is nodal-only, so the per-instance deferral covers 8x M8 for
     free.  A micx path growing inside the arena would silently need its own.
 
+WP20.1 narrowed the handover's element type, which added one more:
+
+M11 THE VIEW AND ITS PRODUCER AGREE ON THE POINTER TYPE, AND THE WIDTH IS
+    CARRIED.  cram::PredictorView/CorrectorView::mic_device is `const void*`
+    because the resident block may be float (RASBERY_GPU_FP32) and a typed
+    pointer would let a consumer copy `nmic * sizeof(double)` bytes out of a
+    float block.  XSSet::FillCramMicDevice is the ONLY producer of that table
+    and CudaCramBackend::fillMic the only consumer, so all three declarations
+    have to move together: `const void**` has no implicit conversion to
+    `const double**`, and a half-applied narrowing does not fail a run, it
+    fails the BUILD -- which is worse, because every contract test and every
+    ncu number in such a commit then rests on a tree that produced no binary.
+    Narrowing the pointer without also carrying `elem_bytes` is the same
+    defect wearing a different hat: the consumer would be handed an untyped
+    address and no width, and its only remaining option is to assume 8.
+
 NEGATIVE CONTROLS.  Each check is run a second time against a MUTATED copy of
 the source that breaks exactly the property it tests, and the check must fail.
 A gate that cannot fail is not a gate.
@@ -537,6 +553,141 @@ def check_m10_batch_path_covered(src: dict[str, str]) -> list[str]:
     return problems
 
 
+def _squash(text: str) -> str:
+    """Whitespace-insensitive form, so `const void *` and `const void*` are one."""
+    return re.sub(r"\s+", "", text)
+
+
+MIC_DEVICE_DECL = re.compile(
+    r"((?:const\s+)?[A-Za-z_][A-Za-z0-9_:]*)\s*\*\s*mic_device\s*\[\s*11\s*\]"
+)
+FILL_DECL = re.compile(r"bool\s+FillCramMicDevice\s*\(([^)]*)\)\s*;")
+FILL_DEF = re.compile(r"bool\s+XSSet::FillCramMicDevice\s*\(([^)]*)\)\s*\{")
+FILLMIC_DEF = re.compile(r"bool\s+fillMic\s*\(([^)]*)\)")
+
+
+def _params(text: str) -> list[str]:
+    return [p for p in text.split(",") if p.strip()]
+
+
+def check_m11_view_producer_types(src: dict[str, str]) -> list[str]:
+    """WP20.1: the view, its producer and its consumer share ONE pointer type.
+
+    This is the only check in this file that guards a COMPILE, and it is here
+    because the compile is what every other check silently assumes.
+    """
+    problems: list[str] = []
+    cram_h = strip_comments(src[CRAM_H])
+    elems = MIC_DEVICE_DECL.findall(cram_h)
+    if len(elems) != 2:
+        return [
+            f"M11: found {len(elems)} `mic_device[11]` declarations in {CRAM_H}; "
+            "the predictor and the corrector views carry exactly one each, and "
+            "this check cannot compare types it did not find"
+        ]
+    if _squash(elems[0]) != _squash(elems[1]):
+        problems.append(
+            f"M11: PredictorView::mic_device is `{elems[0].strip()}*` and "
+            f"CorrectorView::mic_device is `{elems[1].strip()}*`.  One handover, "
+            "one type: fillMic reads both through the same parameter."
+        )
+    elem = _squash(elems[0])                 # e.g. "constvoid"
+    want_first = elem + "**"                 # what the producer must write through
+
+    decl = FILL_DECL.search(strip_comments(src[XSSET_H]))
+    if decl is None:
+        return problems + [
+            f"M11: XSSet::FillCramMicDevice is not declared in {XSSET_H}; the "
+            "views' device table has no producer and this check is void"
+        ]
+    dpar = _params(decl.group(1))
+    # THE TWO HALVES ARE TESTED APART, and deliberately so: the WP21-D defect
+    # arrived as both at once (the views narrowed, the producer untouched), and
+    # a check that reported only the arity would name the smaller half of it.
+    if not dpar or not _squash(dpar[0]).startswith(want_first):
+        shown = dpar[0].strip() if dpar else "<no parameters>"
+        problems.append(
+            f"M11: the cram views hand out `{elems[0].strip()}*` slots but "
+            f"{XSSET_H} declares FillCramMicDevice's first parameter as "
+            f"`{shown}`.  These do not convert -- a `const void**` is not a "
+            "`const double**` -- so this is not a wrong answer, it is a "
+            "translation unit that does not compile, and a commit that does not "
+            "compile cannot have produced the numbers it reports."
+        )
+    if len(dpar) < 3:
+        problems.append(
+            f"M11: FillCramMicDevice takes {len(dpar)} parameter(s).  It must "
+            "also hand back the element WIDTH: `const void*` says nothing about "
+            "how wide an element is, and a consumer left to assume 8 reads twice "
+            "the block it was given under RASBERY_GPU_FP32."
+        )
+    elif not _squash(dpar[2]).startswith("int&"):
+        problems.append(
+            f"M11: FillCramMicDevice's third parameter is `{dpar[2].strip()}`, "
+            "not an `int&` out-parameter.  The width must be ASKED for; the "
+            "producer is the only side that knows whether the resident block "
+            "is float."
+        )
+
+    define = FILL_DEF.search(strip_comments(src[XSSET]))
+    if define is None:
+        problems.append(
+            f"M11: XSSet::FillCramMicDevice has no out-of-line definition in {XSSET}"
+        )
+    elif _squash(define.group(1)) != _squash(decl.group(1)):
+        problems.append(
+            f"M11: the FillCramMicDevice signatures disagree -- {XSSET_H} says "
+            f"`({decl.group(1).strip()})`, {XSSET} defines "
+            f"`({define.group(1).strip()})`.  One of them is an overload nobody "
+            "calls and the other is an undefined symbol at link time."
+        )
+
+    consumer = FILLMIC_DEF.search(strip_comments(src[CRAM]))
+    if consumer is None:
+        problems.append(
+            f"M11: CudaCramBackend's fillMic is gone from {CRAM}; the consumer "
+            "side of the type agreement cannot be checked"
+        )
+    else:
+        cpar = _params(consumer.group(1))
+        dev = next((p for p in cpar if "dev_mic" in p), None)
+        if dev is None:
+            problems.append(
+                "M11: fillMic no longer takes a `dev_mic` parameter, so the "
+                "views' device table has no consumer"
+            )
+        elif _squash(dev) != elem + "*const*dev_mic":
+            problems.append(
+                f"M11: fillMic takes `{dev.strip()}` while the views carry "
+                f"`{elems[0].strip()}* mic_device[11]`.  The consumer must read "
+                "the table at the width the producer wrote it."
+            )
+        if not any("elem_bytes" in p for p in cpar):
+            problems.append(
+                "M11: fillMic no longer takes `elem_bytes`.  Without it the only "
+                "thing it can do with a `const void*` is assume 8 bytes, and on "
+                "the FP32 arm that memcpys `nmic * sizeof(double)` out of a "
+                "`nmic * sizeof(float)` block -- half of it the next slot's."
+            )
+
+    # The width has to survive the trip: set on both views, forwarded at both
+    # fillMic calls.  A view field that is declared and never assigned is the
+    # same defect one step later.
+    for path, why in (
+        (XSSET, "set on the predictor and the corrector view"),
+        (CRAM, "forwarded to fillMic from both entry points"),
+    ):
+        seen = strip_comments(src[path]).count("v.mic_device_elem_bytes")
+        if seen != 2:
+            problems.append(
+                f"M11: `v.mic_device_elem_bytes` appears {seen} time(s) in "
+                f"{path}; it must be {why}.  A width that is defaulted rather "
+                "than carried is a silent assumption of FP64 at exactly the site "
+                "WP20.1 narrowed."
+            )
+    return problems
+
+
 CHECKS = (
     ("M1", check_m1_not_an_arm_knob),
     ("M2", check_m2_every_reader_materialises),
@@ -549,6 +700,7 @@ CHECKS = (
     ("M8", check_m8_cram_d2d),
     ("M9", check_m9_jnet_shadow),
     ("M10", check_m10_batch_path_covered),
+    ("M11", check_m11_view_producer_types),
 )
 
 NEGATIVE_CONTROLS = (
@@ -697,6 +849,32 @@ NEGATIVE_CONTROLS = (
             "    int acquireSlot(const ndl::NodalView& p) {",
             1,
         ),
+    ),
+    (
+        "M11",
+        "one cram view is narrowed back to const double* and the other is not",
+        CRAM_H,
+        lambda t: t.replace(
+            "const void*   mic_device[11]  = {};",
+            "const double* mic_device[11]  = {};",
+            1,
+        ),
+    ),
+    (
+        "M11",
+        "the producer keeps the pre-WP20.1 const double** signature",
+        XSSET_H,
+        lambda t: t.replace(
+            "bool FillCramMicDevice(const void** dev, void*& ready, int& elem_bytes);",
+            "bool FillCramMicDevice(const double** dev, void*& ready);",
+            1,
+        ),
+    ),
+    (
+        "M11",
+        "one call site stops carrying the element width",
+        XSSET,
+        lambda t: t.replace("    v.mic_device_elem_bytes = mic_bytes;\n", "", 1),
     ),
     (
         "M7",
