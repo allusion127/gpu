@@ -59,7 +59,16 @@ would keep passing right up until the day one of them mattered.
      or burnup increment -- leaves the host inventory untouched and the host
      loop throws the same exception at the same node.
 
- 11. THE STUB KEEPS CPU-ONLY BUILDS COMPILING.
+ 11. THE STUB KEEPS CPU-ONLY BUILDS COMPILING, AND IT IS SYMBOL-COMPLETE.
+     CudaCramBackendStub.cpp stands in for CudaCramBackend.cu whenever
+     RASBERY_ENABLE_CUDA is OFF, so it must define EVERY member the header
+     declares out of line -- and the member list is MINED FROM THE HEADER rather
+     than kept by hand here, because a hand-kept list is exactly what was
+     missing: WP21-D added kernelVariant/lanesPerNode/launches/launchUsMean to
+     the header and the .cu, Driver.h called all four from the [RASBERY][CRAM_GPU]
+     receipt with no `#ifdef RASBERY_HAS_CUDA`, the stub was never touched, and
+     nothing in the tree noticed because the only configuration that links the
+     stub is the one nobody builds.
 
  12. RASBERY_GPU_CRAM *IS* AN ARM KNOB, AND SAYS WHY.  The mirror image of
      test_ppr_gpu_contract.py's rule 10.  Depletion output feeds the next
@@ -282,6 +291,48 @@ def r_stub(src: dict[str, str]) -> None:
                      stub, re.S), "the stub corrector must return false"
 
 
+def _declared_members(hdr: str) -> list[str]:
+    """Every member CramBackend declares OUT OF LINE, mined from the header.
+
+    Mined and not hand-listed, because a hand-kept list is exactly what was
+    missing.  A declaration with an inline body does not match (after its `)`
+    comes a `{`, not a `;`), and neither does a `= delete` (the `= delete` sits
+    between the `)` and the `;`), which is right in both cases: those need no
+    definition in the stub.
+    """
+    body = region(hdr, "class CramBackend {", "\n};", "CudaCramBackend.h")
+    body = strip_comments(body).split("private:")[0]
+    names: list[str] = []
+    for m in re.finditer(r"(\w+)\s*\([^;{()]*\)\s*(?:const\s*)?;", body, re.S):
+        name = m.group(1)
+        # The constructor and destructor share the class name and are defined in
+        # the stub anyway; skipping them keeps the message about the accessors.
+        if name == "CramBackend" or name in names:
+            continue
+        names.append(name)
+    return names
+
+
+def r_stub_symbol_complete(src: dict[str, str]) -> None:
+    names = _declared_members(src["hdr"])
+    assert len(names) >= 15, (
+        f"the header member scan found only {len(names)} declarations -- the SCAN is "
+        "broken, not the class, and a broken scan reports PASS")
+    for required in ("micxD2dBytes", "kernelVariant", "lanesPerNode", "launches",
+                     "launchUsMean"):
+        assert required in names, (
+            f"the header member scan missed {required}; the scan is broken")
+    stub = strip_comments(src["stub"])
+    missing = [n for n in names
+               if not re.search(r"\bCramBackend::" + re.escape(n) + r"\s*\(", stub)]
+    assert not missing, (
+        "CudaCramBackendStub.cpp does not define " + ", ".join(missing) + ".  Its own "
+        "first line promises 'same symbols as CudaCramBackend.cu', Driver.h calls the "
+        "receipt accessors with no #ifdef RASBERY_HAS_CUDA, and CMakeLists.txt drops the "
+        "stub only when RASBERY_ENABLE_CUDA is ON -- so a -DRASBERY_ENABLE_CUDA=OFF link "
+        "fails with one undefined reference per name above")
+
+
 def r_arm_knob(src: dict[str, str]) -> None:
     raw = src["driver"]
     code = strip_comments(raw)
@@ -353,6 +404,13 @@ RULES = [
     ("stub", r_stub, "stub",
      ("                            unsigned long long*) {\n    return false;\n}",
       "                            unsigned long long*) {\n    return true;\n}")),
+    # The control renames ONE definition rather than deleting it, so the file it
+    # produces is the shape the defect actually had: a stub that still compiles
+    # on its own and only fails at link, against a header that still declares
+    # the name.
+    ("stub-symbol-complete", r_stub_symbol_complete, "stub",
+     ("unsigned long long CramBackend::bosReuses() const { return 0; }",
+      "unsigned long long CramBackend::bosReusesRenamed() const { return 0; }")),
     ("arm-knob", r_arm_knob, "driver",
      ('    "RASBERY_GPU_CRAM",\n', "")),
     ("receipt", r_receipt, "driver",
