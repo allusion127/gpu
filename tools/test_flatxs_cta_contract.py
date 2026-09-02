@@ -716,31 +716,64 @@ check(
     "the dispatch sites",
 )
 check(
-    TILE_D * WS_ELEMS * 8 <= SMEM_MAX,
-    "the FP64 default tile fits the static ceiling (%d x %d B = %d <= %d)"
-    % (TILE_D, WS_ELEMS * 8, TILE_D * WS_ELEMS * 8, SMEM_MAX),
+    TILE_D * WS_ELEMS * 8 <= SMEM_MAX and TILE_F * WS_ELEMS * 4 <= SMEM_MAX,
+    "both default tiles fit the static ceiling (FP64 %d x %d B, FP32 %d x %d B, "
+    "against %d)" % (TILE_D, WS_ELEMS * 8, TILE_F, WS_ELEMS * 4, SMEM_MAX),
+)
+
+# --- and the budget that actually picks the default ------------------------
+#
+# 238 block 40 (ddd0ccc): the FP32 arm of THIS kernel ran 280 -> 379 us with
+# occupancy 62.4 -> 39.8 % on HALF the shared memory.  Under a shared-memory
+# model that cannot happen; under a register model it is arithmetic.  So the
+# tile ladder is scored against REGISTERS, and the default is the entry that
+# leaves the resident thread count where the untiled arm left it -- because the
+# one thing this campaign will not repeat is guessing this kernel's occupancy
+# from the wrong resource.
+REGS_PER_SM = 65536      # sm_80..sm_120
+THREADS_PER_SM = 2048
+REGS_FP64 = 48           # tools/flatxs_resource_report.py, and 62.4 % confirms it
+REGS_FP32 = 80           # implied by the measured 39.8 %
+BLOCK = 128              # CTA_THREADS_DEFAULT
+
+
+def resident_threads(tile: int, regs: int, block: int = BLOCK) -> int:
+    per_block = block * tile * regs
+    blocks = REGS_PER_SM // per_block
+    return min(blocks * block * tile, THREADS_PER_SM)
+
+
+def rule_tile_is_occupancy_neutral(tile_d: int, tile_f: int) -> bool:
+    return (resident_threads(tile_d, REGS_FP64) >= resident_threads(1, REGS_FP64)
+            and resident_threads(tile_f, REGS_FP32) >= resident_threads(1, REGS_FP32))
+
+
+check(
+    rule_tile_is_occupancy_neutral(TILE_D, TILE_F),
+    "the default tiles are REGISTER-occupancy neutral: FP64 %d -> %d resident "
+    "threads/SM at %d regs, FP32 %d -> %d at %d.  A default that lowered either "
+    "would be WP20's mistake made again with a different resource"
+    % (resident_threads(1, REGS_FP64), resident_threads(TILE_D, REGS_FP64),
+       REGS_FP64, resident_threads(1, REGS_FP32),
+       resident_threads(TILE_F, REGS_FP32), REGS_FP32),
 )
 check(
-    2 * TILE_D * WS_ELEMS * 8 > SMEM_MAX,
-    "the FP64 default tile is the LARGEST power of two that fits -- a smaller "
-    "one would leave sector count on the table for nothing",
+    not rule_tile_is_occupancy_neutral(2 * TILE_D, 2 * TILE_F),
+    "and the NEXT rung is not neutral -- if it were, the default would be "
+    "leaving store coalescing on the table for nothing",
 )
 check(
-    TILE_F * WS_ELEMS * 4 <= SMEM_MAX and 2 * TILE_F * WS_ELEMS * 4 > SMEM_MAX,
-    "the FP32 default tile is the largest power of two that fits (%d x %d B)"
-    % (TILE_F, WS_ELEMS * 4),
-)
-check(
-    TILE_D * WS_ELEMS * 8 == TILE_F * WS_ELEMS * 4,
-    "the two defaults spend the SAME shared budget (%d B/CTA) -- they differ "
-    "only because the FP32 slot is half the FP64 one, which is what keeps the "
-    "precision A/B and the tile A/B independent"
-    % (TILE_D * WS_ELEMS * 8),
-)
-check(
-    TILE_D * 128 <= 1024 and TILE_F * 128 <= 1024,
+    TILE_D * BLOCK <= 1024 and TILE_F * BLOCK <= 1024,
     "both defaults keep blockDim.x = TILE * 128 inside the 1,024-thread block "
     "cap at the default block size",
+)
+# The register finding is a claim about __launch_bounds__ as much as about the
+# tile, and the header has to carry it or the next reader repeats the analysis.
+check(
+    "minBlocksPerMultiprocessor" in CTA
+    and "maxThreadsPerBlock and NOTHING ELSE" in CTA,
+    "the header records WHY __launch_bounds__(T) alone cannot deliver the block "
+    "count a shared-memory argument predicts",
 )
 
 
@@ -774,11 +807,20 @@ check(
     "the tail nodes go to the untiled body through kernelFlatXsCtaAt -- the "
     "certified single-node path, offset, not a partially-masked tile",
 )
+TAIL = body_of(CTA, "kernelFlatXsCtaAt(FlatXsView v, int node_base)",
+               "/// WP21-B2 tile ladder.")
 check(
-    "flatxsSolveNodeCta<T>(v, i, StaticForms{}, w);" in
-    body_of(CTA, "kernelFlatXsCtaAt(FlatXsView v, int node_base)", "\n}\n"),
+    "flatxsSolveNodeCta<T>(v, i, StaticForms{}, w);" in TAIL,
     "kernelFlatXsCtaAt calls the SAME untiled body -- the tail is not a third "
     "copy of the arithmetic",
+)
+check(
+    "__shared__ WS w;" in TAIL
+    and "template <int T, class WS>" in CTA
+    and "kernelFlatXsCtaAt<T, WS>" in CTA,
+    "the tail carries the TILE'S workspace type: on the narrow arm it keeps the "
+    "float workspace and the float block accessors, so it cannot reintroduce "
+    "the per-element widening 238 block 40 is measuring",
 )
 
 # --- the knob, the receipt and the gate ------------------------------------
@@ -829,7 +871,9 @@ check(
 )
 DOC_B2 = read("docs", "WP21_B2C2_COALESCING_20260831_KO.md")
 for token in ("RASBERY_GPU_FLATXS_CTA_TILE", "1f36e75dc00ed2b4", "4377", "25.2",
-              "29,408", "h5diff", "1,321", "16.7"):
+              "h5diff", "1,321", "16.7",
+              # 238 block 40: the FP32 regression and its register diagnosis.
+              "379", "39.8", "65,536", "__launch_bounds__"):
     check(token in DOC_B2,
           "docs/WP21_B2C2_COALESCING_20260831_KO.md names %s" % token)
 
@@ -878,6 +922,8 @@ NEGATIVES: list[tuple[str, object]] = [
          "if (RASBERY_PTXAS_VERBOSE)\n"
          '    set(RASBERY_BITEXACT_CUDA_OPTS "--ptxas-options=-v")\n'
          "endif ()\n")),
+    ("a tile default that costs resident threads (WP20 mistake, new resource)",
+     lambda: rule_tile_is_occupancy_neutral(8, 8)),
     ("a tile phase that puts the ORDINAL innermost -- the transpose undone",
      lambda: rule_tile_decomposes_node_innermost(
          "const int j = p / TILE;\n" "const int q = p - j * TILE;\n")),

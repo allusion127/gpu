@@ -459,14 +459,55 @@ __global__ void __launch_bounds__(T) kernelFlatXsCtaF32(FlatXsView v) {
 //     consecutive `l` at a FIXED component ordinal and the address is
 //     `c*nxyz + l0 + j` -- contiguous.
 //
-// WHY OCCUPANCY DOES NOT COLLAPSE (the objection this WP had to answer).  The
-// tile multiplies the shared workspace by TILE, but it multiplies the THREAD
-// COUNT by TILE as well: `blockDim.x = T * TILE`.  Shared bytes PER THREAD are
-// therefore unchanged -- 7,352/128 = 57.4 B on the FP64 arm and 3,676/128 =
-// 28.7 B on the FP32 one, exactly as before -- and shared memory constrains
-// resident THREADS, not resident blocks.  What the tile costs is block
-// granularity, not per-thread footprint.  The budget table is in
-// docs/WP21_B2C2_COALESCING_20260831_KO.md.
+// WHAT ACTUALLY LIMITS THIS KERNEL, AND IT IS NOT SHARED MEMORY.
+//
+// The tile multiplies the shared workspace by TILE and the THREAD COUNT by
+// TILE too (`blockDim.x = T * TILE`), so shared bytes PER THREAD are unchanged
+// -- 57.4 B on the FP64 arm, 28.7 B on the FP32 one.  That was the first
+// answer, and it was answering the wrong question.  **238 block 40 settled the
+// right one: the binding constraint is REGISTERS.**
+//
+//   FP64, 48 registers/thread (tools/flatxs_resource_report.py), 128 threads:
+//     6,144 registers/block -> floor(65,536 / 6,144) = 10 blocks -> 1,280 of
+//     2,048 threads = 62.5 %.  ncu measured **62.4 %**.  Shared memory would
+//     have allowed 13 blocks; it never got the chance.
+//
+//   FP32 (RASBERY_GPU_FP32=1), same kernel, half the workspace: ncu measured
+//     **39.8 %** occupancy and 280 -> 379 us, +35 %.  Under a shared-memory
+//     model that is impossible -- half the smem cannot lower occupancy.  Under
+//     the register model it is arithmetic: 39.8 % is ~6 blocks, i.e. ~80
+//     registers/thread.  WP20's own note in CtaWorkspaceF32 below predicted
+//     "13 -> 16 blocks/SM" from the shared budget; the measurement says the
+//     narrow arm bought no blocks at all and PAID about 32 registers a thread
+//     for the float<->double traffic through the workspace.
+//
+// SO THE TILE LADDER IS SET BY REGISTERS, and the default is the entry that is
+// occupancy-NEUTRAL rather than the largest one that fits 48 KiB of shared:
+//
+//   arm    T    TILE  threads/blk  regs/blk  blocks/SM  threads/SM  vs today
+//   FP64  128    1        128        6,144      10        1,280      (today)
+//   FP64  128    2        256       12,288       5        1,280      = NEUTRAL
+//   FP64  128    4        512       24,576       2        1,024      -20 %
+//   FP32  128    1        128       10,240        6          768     (today)
+//   FP32  128    2        256       20,480        3          768     = NEUTRAL
+//   FP32  128    4        512       40,960        1          512     -33 %
+//
+// TILE = 2 is therefore the default on BOTH arms.  4 and 8 stay on the ladder
+// because the trade is real and only 238 can price it: the store goes 25.2 ->
+// ~4 at TILE 2 and ~2-3 at TILE 4, and a bandwidth-leaning kernel may well
+// prefer 1,024 threads with coalesced stores to 1,280 with scattered ones.
+// What this WP will not do is GUESS that, having just watched WP20 guess the
+// occupancy of this exact kernel from the wrong resource.  The full budget
+// table is in docs/WP21_B2C2_COALESCING_20260831_KO.md.
+//
+// ONE MORE THING THE MEASUREMENT TAUGHT.  `__launch_bounds__(T)` sets
+// maxThreadsPerBlock and NOTHING ELSE -- it lets ptxas use up to 65,536/T
+// registers a thread, which at T = 128 is 512.  It therefore cannot deliver
+// the block count a shared-memory argument predicts, and it did not.  Bounding
+// registers needs the SECOND argument (minBlocksPerMultiprocessor), which buys
+// occupancy by spilling to local memory -- the exact traffic this whole arm
+// exists to remove.  That is a measurement, not an edit, and it is not made
+// here.
 //
 // WHY IT IS STILL B0.  Structural properties (P1)/(P2)/(P3) are untouched:
 //
@@ -739,8 +780,9 @@ constexpr int CTA_MAX_THREADS = 1024;
 /// `if constexpr` on this predicate rather than trusting a runtime clamp.
 ///
 /// On the KNGR deck this evaluates to: FP64 (7,352 B/slot) TILE <= 6, FP32
-/// (3,676 B/slot) TILE <= 13 -- and the ladder below rounds those down to the
-/// powers of two 4 and 8, which is where both arms land on 29,408 B/CTA.
+/// (3,676 B/slot) TILE <= 13.  Those are the SHARED-memory limits and they are
+/// not what picks the default -- see CTA_TILE_DEFAULT.  They are what stops an
+/// A/B point on the ladder from being a compile error.
 template <int T, int TILE, class WS>
 constexpr bool ctaTileFits() {
     return TILE >= 1 && T * TILE <= CTA_MAX_THREADS
@@ -767,6 +809,12 @@ __global__ void __launch_bounds__(T * TILE) kernelFlatXsCtaTile(FlatXsView v) {
 /// `kernelFlatXsCta` with a base offset: the tail of a tiled launch, and the
 /// only new text is `node_base +`.  It calls the SAME `flatxsSolveNodeCta` the
 /// untiled arm calls, so the tail nodes are computed by the certified body.
+///
+/// `WS` IS THE TILE'S WORKSPACE TYPE, passed through by the launcher.  On the
+/// narrow arm the tail therefore keeps the FLOAT workspace, and `v.narrow_blocks`
+/// still routes its stores through the float block accessors -- the tail cannot
+/// reintroduce the per-element widening the FP32 arm is being measured for.
+/// tools/test_flatxs_cta_contract.py holds that pairing.
 template <int T, class WS>
 __global__ void __launch_bounds__(T) kernelFlatXsCtaAt(FlatXsView v, int node_base) {
     __shared__ WS w;
@@ -784,14 +832,23 @@ constexpr int CTA_THREADS_DEFAULT = 128;
 /// bisectable reference; `CTA_TILE_DEFAULT` / `CTA_TILE_DEFAULT_F32` are what
 /// the backend asks for when RASBERY_GPU_FLATXS_CTA_TILE is unset.
 ///
-/// THE TWO DEFAULTS ARE THE SAME SHARED BUDGET, not two different bets:
-/// 4 x 7,352 = 8 x 3,676 = 29,408 B/CTA.  They differ because the FP64 slot is
-/// twice the FP32 one, and they are the largest powers of two that fit the
-/// 48 KiB static ceiling (FP64 admits 6, FP32 admits 13).  Under both, shared
-/// bytes per THREAD are exactly what the untiled arm spends, because
-/// blockDim.x scales with the tile.
-constexpr int CTA_TILE_DEFAULT     = 4;
-constexpr int CTA_TILE_DEFAULT_F32 = 8;
+/// BOTH DEFAULTS ARE 2, AND THE REASON IS REGISTERS, NOT SHARED MEMORY.  The
+/// 48 KiB static ceiling admits 6 FP64 slots and 13 FP32 ones, so a
+/// shared-memory argument would pick 4 and 8 -- and 238 block 40 is the
+/// measurement that says that argument is the wrong one for this kernel (see
+/// the register table in the WP21-B2 block above: 48 regs/thread caps the FP64
+/// arm at 10 blocks of 128, which is the 62.4 % ncu reported, and the FP32
+/// arm's 39.8 % is ~80 regs/thread rather than any shared budget).  TILE = 2
+/// doubles the threads per block and halves the blocks per SM, so the resident
+/// thread count is UNCHANGED on both arms.  4 and 8 stay on the ladder for the
+/// 238 A/B, where the store-vs-occupancy trade can be priced instead of
+/// guessed.
+///
+/// THE TWO CONSTANTS STAY SEPARATE even though they are equal today: the arms
+/// have different register pressure (48 against ~80) and will not stay equal
+/// once that is fixed.
+constexpr int CTA_TILE_DEFAULT     = 2;
+constexpr int CTA_TILE_DEFAULT_F32 = 2;
 constexpr int CTA_TILE_MAX         = 8;
 
 /// A tiled launch: `n_nodes / TILE` full tiles plus a `n_nodes % TILE` tail on
