@@ -61,6 +61,7 @@ if (RASBERY_ENABLE_CUDA)
             "${CMAKE_CURRENT_SOURCE_DIR}/src/GpuPhysicsBackendStub.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaPprBackendStub.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaCramBackendStub.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaThBackendStub.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaHostScheduleStub.cpp"
     )
     list(APPEND RASBERY_SOURCES
@@ -72,6 +73,7 @@ if (RASBERY_ENABLE_CUDA)
             "${CMAKE_CURRENT_SOURCE_DIR}/src/GpuPhysicsBackendCuda.cu"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaPprBackend.cu"
             "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaCramBackend.cu"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/CudaThBackend.cu"
             # WP16 host-spin.  One cudaSetDeviceFlags, no kernels, no bit-exact
             # flags to scope: this TU must create nothing, because it runs before
             # the primary context exists (src/CudaHostSchedule.h).
@@ -101,6 +103,14 @@ if (RASBERY_ENABLE_CUDA)
     # contracted multiply-add would compound across 256 sweeps before the result
     # is compared, and the depletion output feeds the NEXT statepoint.
     set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/CudaCramBackend.cu"
+            PROPERTIES COMPILE_OPTIONS "${RASBERY_BITEXACT_CUDA_OPTS}")
+    # WP22 (GPU thermal hydraulics).  The kernels ARE src/ThKernel.h, the same
+    # text the host mining harness compiles, and every multiply-add in it reads
+    # its form from a mask mined against a verbatim CPU quotation.  Letting nvcc
+    # contract anything on its own would make the mask a lie: the device would
+    # round in places the mining measured it did not, and the B0 target would be
+    # unreachable for a reason no receipt could name.
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/src/CudaThBackend.cu"
             PROPERTIES COMPILE_OPTIONS "${RASBERY_BITEXACT_CUDA_OPTS}")
 endif ()
 

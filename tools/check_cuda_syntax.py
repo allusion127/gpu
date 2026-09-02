@@ -49,6 +49,9 @@ SHIM = r'''
 // same call shapes nvcc will see.
 using std::copysign;
 using std::hypot;
+using std::isfinite;
+using std::isinf;
+using std::isnan;
 using std::logb;
 using std::scalbn;
 
@@ -96,6 +99,13 @@ inline cudaError_t cudaEventCreate(cudaEvent_t*) { return cudaSuccess; }
 inline cudaError_t cudaEventDestroy(cudaEvent_t) { return cudaSuccess; }
 inline cudaError_t cudaEventRecord(cudaEvent_t, cudaStream_t) { return cudaSuccess; }
 inline cudaError_t cudaEventElapsedTime(float* ms, cudaEvent_t, cudaEvent_t) { *ms = 0.0f; return cudaSuccess; }
+inline cudaError_t cudaEventSynchronize(cudaEvent_t) { return cudaSuccess; }
+inline cudaError_t cudaStreamWaitEvent(cudaStream_t, cudaEvent_t, unsigned = 0) { return cudaSuccess; }
+inline cudaError_t cudaDeviceSynchronize() { return cudaSuccess; }
+
+// Block-level barrier.  A single-threaded shim cannot MODEL one; what this gate
+// checks -- and all it claims to check -- is that the call resolves.
+inline void __syncthreads() {}
 
 // Built-in variables.  Values are irrelevant to a syntax check; the shape is not.
 struct RasberyDim3 { unsigned x = 0, y = 0, z = 0; };
@@ -203,7 +213,8 @@ def main() -> int:
             out = work / (src.stem + "_syntax.cpp")
             out.write_text(rewrite(src.read_text(encoding="utf-8")), encoding="utf-8")
 
-            cmd = [args.cxx, "-fsyntax-only", f"-std={args.std}", f"-I{work}"]
+            cmd = [args.cxx, "-fsyntax-only", f"-std={args.std}", f"-I{work}",
+                   "-DRASBERY_XFER_HAS_CUDA"]
             cmd += [f"-I{p}" for p in args.include]
             cmd += [f"-D{d}" for d in args.define]
             cmd.append(str(out))

@@ -1,5 +1,6 @@
 #pragma once
 #include "CudaCramBackend.h"
+#include "CudaThBackend.h"
 #include "CudaXsReconBackend.h"
 #include "FlatXsKernel.h"
 // For xsrecon::NISO and xsrecon::BatchView: the device Xe entry points
@@ -175,6 +176,34 @@ private:
     std::vector<double> _cram_dfac;
     std::vector<double> _cram_vol;
     unsigned long long  _cram_lib_generation = 0;
+
+    // WP22.  The T/H device arm (RASBERY_GPU_TH, default off).  Created on
+    // first use like _cram_backend, and owned here for the same reason: one
+    // XSSet, one Driver, one batch slot.
+    //
+    // THIS ONE MOVES THE TRAJECTORY, on the same footing RASBERY_GPU_CRAM does
+    // and more directly: its outputs are tful/tmod/dmod, which the very next
+    // UpdateFlatXS reconstructs every macroscopic cross section from.  So
+    // RASBERY_GPU_TH is listed in trajectory::kArmEnv (Driver.h), and an A/B
+    // that changes it is an arm change and not a timing change.
+    std::unique_ptr<ThBackend> _th_backend;
+    /// T/H updates that ran on the host because the device declined or failed.
+    /// With the arm off this is every one of them.
+    unsigned long long _th_host_fallbacks = 0;
+    /// The hmesh X/Y columns, gathered once.  Geometry stores hmesh node-major
+    /// and direction-minor (`_hmesh[lk * NDIRMAX + dir]`), so neither column is
+    /// contiguous and neither can be uploaded as-is.  Built on first use and
+    /// never rebuilt: the mesh does not move inside a run, which is what
+    /// `_th_geom_generation` asserts rather than assumes.
+    std::vector<double> _th_hmesh_x;
+    std::vector<double> _th_hmesh_y;
+    unsigned long long  _th_geom_generation = 0;
+
+    /// The device T/H arm.  Returns false -- WITHOUT having touched tful, tmod,
+    /// dmod or `delta_dop` -- when the arm is off, the device refused, or the
+    /// deck is one the kernel does not serve, and the caller must then run the
+    /// unchanged host body.
+    bool TryUpdateTHGpu(double power_rate, double& delta_dop);
 
     /// True and the views filled when the device arm can run this deck at all.
     bool PrepareCramLib(cram::LibView& lib);
@@ -723,6 +752,23 @@ public:
     /// `host_fallbacks`; non-zero with the arm on means the device declined.
     [[nodiscard]] unsigned long long cramHostFallbacks() const {
         return _cram_host_fallbacks;
+    }
+
+    /// WP22 device T/H backend, created on first use.  Never null, so the
+    /// receipt in Driver.h can read its counters without asking whether the arm
+    /// was ever reached.
+    ThBackend& th() {
+        if (!_th_backend) _th_backend = std::make_unique<ThBackend>();
+        return *_th_backend;
+    }
+    [[nodiscard]] const ThBackend& th() const {
+        const_cast<XSSet*>(this)->th();
+        return *_th_backend;
+    }
+    /// T/H updates that ran on the host.  The receipt's `host_fallbacks`;
+    /// non-zero with the arm on means the device declined.
+    [[nodiscard]] unsigned long long thHostFallbacks() const {
+        return _th_host_fallbacks;
     }
     [[nodiscard]] unsigned long long hoststateGeneration() const {
         return _hoststate_generation;

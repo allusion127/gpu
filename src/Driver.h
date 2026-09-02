@@ -11,6 +11,7 @@
 #include "OuterTrace.h"
 #include "PPR.h"
 #include "Scheduler.h"
+#include "ThGpuReceipt.h"
 #include "WarmState.h"
 #include "XSTiming.h"
 #include "XeFormAudit.h"
@@ -548,6 +549,18 @@ namespace trajectory {
 /// is deliberately absent: it is the thing under test, and it rides in its own
 /// field so an arm comparison can hold every OTHER knob equal.
 ///
+/// RASBERY_GPU_TH is deliberately PRESENT, and it is the plainest entry on the
+/// list.  The T/H arm writes tful, tmod and dmod, and the UpdateFlatXS that runs
+/// on the very next line reconstructs EVERY macroscopic cross section of the
+/// statepoint from them.  So the knob does not merely change where a number is
+/// computed; if the device and the host ever disagree in the last bit, that bit
+/// reaches the flux, the k_eff, the critical boron and the axial offset of this
+/// statepoint and of every one after it.  RASBERY_TH_FORMS rides beside it for
+/// the reason RASBERY_XE_HOST_FORMS does: it selects the ROUNDING of eight
+/// expressions on that arm's own critical path, so two runs that disagree about
+/// it are two different trajectories.  tools/test_th_gpu_contract.py asserts
+/// both, the way test_cram_gpu_contract.py asserts RASBERY_GPU_CRAM.
+///
 /// RASBERY_GPU_CRAM is deliberately PRESENT, and it is the counterexample that
 /// makes the PPR rule below mean something.  The device depletion arm (Task 16)
 /// writes the isotope inventory the NEXT statepoint reconstructs its cross
@@ -631,6 +644,11 @@ inline constexpr const char* kArmEnv[] = {
     "RASBERY_GPU_FLATXS_CTA",
     "RASBERY_GPU_FLATXS_CTA_THREADS",
     "RASBERY_GPU_CRAM",
+    // WP22.  The T/H device arm and the contraction mask it runs under.  See
+    // the paragraph above the list for why both are here rather than in a
+    // timing receipt.
+    "RASBERY_GPU_TH",
+    "RASBERY_TH_FORMS",
     "RASBERY_GPU_XE",
     "RASBERY_GPU_XE_DOT_PARTITIONS",
     "RASBERY_GPU_XE_TXN",
@@ -5871,6 +5889,42 @@ public:
                     c.launchUsMean(),
                     c.bosReuses(), c.poleSumPrecision(), c.wallMs(), c.status());
             }
+        }
+
+        // WP22 receipt -- the device T/H arm (RASBERY_GPU_TH).
+        //
+        // PRINTED ONLY WHEN THE ARM WAS ASKED FOR OR ACTUALLY FIRED, so a
+        // flag-off log is the log of a build without this feature.  That is what
+        // "feature-off identity" has to mean for a receipt as well as a result.
+        //
+        // THE G0 FIELD IS `device_updates`.  `RASBERY_GPU_TH=1` on a machine
+        // whose device refused falls back to XSSet::SolveTH silently and
+        // correctly -- and then the "device" run and the "host" run are the same
+        // run, and every second quoted from them is void.  `th_updates ==
+        // device_updates + host_fallbacks` is an accounting identity, so a
+        // reader can check the receipt against itself.
+        //
+        // `channels` x `nodes` IS THE SECOND CHECK, and it is about the MAPPING
+        // rather than the arm: the sweep is one lane per radial position, so a
+        // run whose `channels` is not the deck's nxy covered a fraction of the
+        // core.  `forms_mask` is the contraction contract the kernels ran under
+        // and is `~` when the arm never launched -- printing thFormMask() here
+        // instead would MINE the mask in a run that never armed the feature and
+        // add a [RASBERY][FORMS] line to a flag-off log.
+        //
+        // `bytes_elided` AGAINST `bytes_h2d` IS THE THIRD, and it is the one
+        // that is currently unflattering: the flux and the live macroscopic
+        // block are still uploaded because no canonical owner exports them as
+        // device addresses (src/XSSet.cpp TryUpdateTHGpu says so at the site),
+        // and tful/tmod/dmod still come back because their reader,
+        // BuildFlatXsStream, is still on the host.  Both numbers are printed so
+        // the residual is read off the run rather than off a plan.
+        if (rasbery::th::thReceiptWanted()) {
+            std::cout << "  [RASBERY][TH_GPU] {\"schema_version\":1,\"slot\":"
+                      << cmfd_solver.batchSlot() << ",\"device\":"
+                      << cross_sections.th().deviceOrdinal() << ",";
+            rasbery::th::appendThGpuReceiptFields(std::cout);
+            std::cout << ",\"status\":\"" << cross_sections.th().status() << "\"}\n";
         }
 
         // WP15 receipt -- the micx/lmpx residency (RASBERY_GPU_MICX_RESIDENT).

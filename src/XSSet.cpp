@@ -3,6 +3,7 @@
 #include "GpuFullContract.h"
 #include "Importer.h"
 #include "Sha256.h"
+#include "ThGpuReceipt.h"
 #include "XSTiming.h"
 #include "XeGpuReceipt.h"
 #include "XeKernel.h"
@@ -6077,6 +6078,127 @@ void XSSet::NormalizeFluxSign() {
         _g.Psi()[lk] = -_g.Psi()[lk];
 }
 
+/// WP22.  The T/H device arm.  Builds the three views, calls the backend and
+/// returns what it said; on false NOTHING has been written, which is what makes
+/// the fall-through byte-identical to a build without the feature.
+///
+/// EVERY SCALAR SolveTH DERIVES BEFORE ITS CHANNEL LOOP IS DERIVED HERE, in the
+/// host's own expressions, and shipped as a number.  The alternative -- letting
+/// the kernel re-derive `inlet_h`, `actual_power` and `total_flow` from
+/// Geometry -- would put four table reads and two divisions in two places, and
+/// the day they disagreed the arm would produce a plausible core.  The two folds
+/// the kernel DOES own (`total_raw_power`, `total_area`) are the ones whose
+/// operands only exist on the device.
+bool XSSet::TryUpdateTHGpu(double power_rate, double& delta_dop) {
+    ThBackend& backend = th();
+    if (!backend.available()) return false;
+
+    const int nxyz = _g.nxyz();
+    const int nxy  = _g.nxy();
+    const int nz   = _g.nz();
+
+    // The hmesh columns, gathered once.  Geometry stores hmesh node-major and
+    // direction-minor, so neither column is contiguous and neither can be
+    // uploaded as-is.  `_th_geom_generation` is 0 until the first gather; a deck
+    // whose mesh changed mid-run would have to bump it, and there is no such
+    // deck -- Geometry's mesh arrays are built at load and never move.
+    if (_th_geom_generation == 0) {
+        _th_hmesh_x.assign(static_cast<size_t>(nxyz), 0.0);
+        _th_hmesh_y.assign(static_cast<size_t>(nxyz), 0.0);
+        for (int l = 0; l < nxyz; ++l) {
+            _th_hmesh_x[static_cast<size_t>(l)] = _g.hmesh(XDIR, l);
+            _th_hmesh_y[static_cast<size_t>(l)] = _g.hmesh(YDIR, l);
+        }
+        _th_geom_generation = 1;
+    }
+
+    thgpu::TableView tables{};
+    tables.generation = 1; // the CSVs are read once at load and never reread
+    tables.mod_t_x    = _mod_t_table.x_axis.data();
+    tables.mod_t_y    = _mod_t_table.y_axis.data();
+    tables.mod_t_v    = _mod_t_table.values.data();
+    tables.mod_t_nx   = static_cast<int>(_mod_t_table.x_axis.size());
+    tables.mod_t_ny   = static_cast<int>(_mod_t_table.y_axis.size());
+    tables.mod_rho_x  = _mod_rho_table.x_axis.data();
+    tables.mod_rho_y  = _mod_rho_table.y_axis.data();
+    tables.mod_rho_v  = _mod_rho_table.values.data();
+    tables.mod_rho_nx = static_cast<int>(_mod_rho_table.x_axis.size());
+    tables.mod_rho_ny = static_cast<int>(_mod_rho_table.y_axis.size());
+    tables.tf_x       = _tf_table.x_axis.data();
+    tables.tf_y       = _tf_table.y_axis.data();
+    tables.tf_v       = _tf_table.values.data();
+    tables.tf_nx      = static_cast<int>(_tf_table.x_axis.size());
+    tables.tf_ny      = static_cast<int>(_tf_table.y_axis.size());
+
+    thgpu::GeomView geom{};
+    geom.generation = _th_geom_generation;
+    geom.vol        = &_g.vol(0);
+    geom.hmesh_x    = _th_hmesh_x.data();
+    geom.hmesh_y    = _th_hmesh_y.data();
+    geom.hz         = &_g.hz(0);
+
+    const double inlet_temp          = _g.inlet_temp();
+    const double outlet_temp         = _g.outlet_temp();
+    const double pressure            = _g.pressure();
+    const double rated_power         = _g.rated_power();
+    const double input_mass_flux     = _g.mass_flow_rate();
+    const double inlet_h             = GetHmod(inlet_temp, pressure);
+    const double outlet_h            = GetHmod(outlet_temp, pressure);
+    const bool   use_input_mass_flux = _g.use_mass_flow_rate() && input_mass_flux > 0.0;
+
+    thgpu::UpdateView v{};
+    v.nxy                  = nxy;
+    v.nz                   = nz;
+    v.nxyz                 = nxyz;
+    v.ng                   = _g.ng();
+    v.kbc                  = _g.kbc();
+    v.kec                  = _g.kec();
+    v.pressure             = pressure;
+    v.inlet_h              = inlet_h;
+    v.actual_power         = 1000.0 * rated_power * power_rate;
+    v.total_flow           = use_input_mass_flux ? 0.0
+                                                 : v.actual_power / (outlet_h - inlet_h);
+    v.input_mass_flux      = input_mass_flux;
+    v.use_input_mass_flux  = use_input_mass_flux ? 1 : 0;
+    v.fuel_temp_rise_scale = _g.fuel_temp_rise_scale();
+    v.th_relaxation        = _th_relaxation;
+    v.h_table_max          = _mod_t_table.y_axis[_mod_t_table.y_axis.size() - 1];
+
+    // THE ROUND TRIP THAT IS STILL HERE, NAMED RATHER THAN IMPLIED.  xskf and
+    // phif are uploaded because no canonical owner publishes them as device
+    // addresses today: GpuCanonicalState.h's Flux and LiveXs regions exist and
+    // ThBackend takes `xskf_device` / `phif_device` for exactly this, but the
+    // producer side does not export a pointer for either yet.  Leaving these
+    // null is the honest reading -- the arm's `bytes_elided` then reports 0
+    // against a non-zero elision-test count, which is "the borrow was consulted
+    // and missed" and not "there was nothing to save".
+    v.xskf = _xs.xskf.data();
+    v.phif = _g.Phif();
+    v.burn = _burn.data();
+    v.tful = &_g.tful(0);
+    v.tmod = &_g.tmod(0);
+    v.dmod = &_g.dmod(0);
+
+    if (!backend.solveTh(tables, geom, v, delta_dop)) return false;
+
+    // The device wrote the host tful/tmod/dmod arrays directly, so the flat-XS
+    // stream that reads them next sees the same bytes the host body would have
+    // left.  noteMacroXsWrite() is NOT called: no macroscopic cross section moved
+    // here -- UpdateFlatXS, which the caller runs next, is what moves them.
+    auto& tally = rasbery::th::thGpuTally();
+    tally.device_updates.fetch_add(1, std::memory_order_relaxed);
+    tally.channels.store(static_cast<unsigned long long>(nxy), std::memory_order_relaxed);
+    tally.nodes.store(static_cast<unsigned long long>(nxyz), std::memory_order_relaxed);
+    tally.bytes_elided.store(backend.bytesElided(), std::memory_order_relaxed);
+    tally.bytes_h2d.store(backend.bytesH2d(), std::memory_order_relaxed);
+    tally.bytes_d2h.store(backend.bytesD2h(), std::memory_order_relaxed);
+    tally.wall_us.store(static_cast<unsigned long long>(backend.wallMs() * 1000.0),
+                        std::memory_order_relaxed);
+    tally.forms_mask.store(backend.formsMask(), std::memory_order_relaxed);
+    tally.forms_seen.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 double XSSet::UpdateTH(double power_rate) {
     xsphase::Scope th_scope(xsphase::tallies().update_th,
                             static_cast<std::uint64_t>(_g.nxyz()));
@@ -6084,6 +6206,28 @@ double XSSet::UpdateTH(double power_rate) {
     const int nxyz       = _g.nxyz();
     auto&     node_power = _node_power_scratch;
     _current_power_rate  = power_rate;
+
+    // WP22.  The device arm, and its seam.  EVERY T/H update is counted here, so
+    // `th_updates == device_updates + host_fallbacks` is an accounting identity
+    // and a receipt that says the arm never fired can be told apart from one that
+    // says the arm was never reached.
+    rasbery::th::thGpuTally().th_updates.fetch_add(1, std::memory_order_relaxed);
+    {
+        double gpu_delta_dop = 0.0;
+        if (TryUpdateTHGpu(power_rate, gpu_delta_dop)) {
+            UpdateFlatXS();
+            return gpu_delta_dop;
+        }
+    }
+    ++_th_host_fallbacks;
+    rasbery::th::thGpuTally().host_fallbacks.fetch_add(1, std::memory_order_relaxed);
+    // WP1 (plan Sec 6.3).  The device T/H arm declined and the whole host SolveTH
+    // body below runs.  Under RASBERY_GPU_FULL that is a case failure and not a
+    // silent fallback: T/H output is the input of every macroscopic cross section
+    // of this statepoint, so an arm that refused every update and an arm that was
+    // never set produce the same numbers and the same log.
+    RASBERY_GPU_FULL_GUARD_IF(th().available(), Th, "XSSet::UpdateTH",
+                              "the device T/H arm declined; the host SolveTH body runs");
 
     if (node_power.size() != static_cast<size_t>(nxyz))
         node_power.assign(nxyz, 0.0);

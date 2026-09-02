@@ -73,6 +73,15 @@ enum class Subsystem : int {
     Xe,
     Ppr,
     Cram,
+    // WP22.  The T/H and critical-search device arms.  They are subsystems on
+    // the list's own terms: both write state a later phase of the SAME
+    // statepoint reads -- T/H writes tful/tmod/dmod, which UpdateFlatXS
+    // reconstructs every cross section from, and the search writes the boron
+    // the same reconstruction applies -- so an arm that refuses every call and
+    // an arm that was never set produce the same numbers and the same log.
+    // That is exactly the condition the GPU_FULL counters exist to tell apart.
+    Th,
+    Search,
     Count
 };
 
@@ -85,6 +94,8 @@ inline const char* subsystemName(Subsystem s) {
         case Subsystem::Xe:     return "xe";
         case Subsystem::Ppr:    return "ppr";
         case Subsystem::Cram:   return "cram";
+        case Subsystem::Th:     return "th";
+        case Subsystem::Search: return "search";
         case Subsystem::Count:  break;
     }
     return "unknown";
