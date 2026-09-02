@@ -611,6 +611,14 @@ inline constexpr const char* kArmEnv[] = {
     "RASBERY_GPU_FP32",
     "RASBERY_GPU_FP32_STRICT",
     "RASBERY_GPU_FP32_CRAM",
+    // WP20.2.  The refinement ROUND CAP, and it belongs here for a sharper
+    // reason than the other three: it does not merely change the rounding of a
+    // kernel, it changes HOW MANY TIMES the inner solve runs and what the outer
+    // loop accepts, so two runs that differ only in this knob are two different
+    // trajectories with the same digest inputs.  Default 2 under the arm and 1
+    // without it, so an unset value and an explicit "0" are two different
+    // payloads -- deliberately, exactly as for the other knobs on this list.
+    "RASBERY_GPU_FP32_REFINE",
     "RASBERY_GPU_NODAL",
     "RASBERY_GPU_NODAL_FULL",
     "RASBERY_GPU_XSRECON",

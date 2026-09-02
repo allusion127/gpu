@@ -116,7 +116,28 @@ FP32_ENQUEUE = ("dot_f32", "dot2_f32", "precondition_sweeps_f32", "enqueue_itera
 guarded = "".join(body_after(f"void {name}(") for name in FP32_ENQUEUE)
 
 outer = body_after("void enqueue_outer(int nmax)")
-fp32_arm = body_after("if (fp32Active()) {", text=outer)
+
+
+def fp32_arms(text: str) -> str:
+    """EVERY `if (fp32Active()) {` block of the body, concatenated.
+
+    WP20.2 gave enqueue_outer TWO of them and the split is structural rather
+    than cosmetic: the operator mirror is refreshed ONCE per outer (the
+    refinement loop moves phi, not diag/cc), while the FP32 prologue that
+    recomputes the FP64 residual and narrows it runs ONCE PER ROUND.  A rule
+    that took only the first block would have stopped seeing the prologue, and
+    would have called that a pass."""
+    out = []
+    at = 0
+    while True:
+        at = text.find("if (fp32Active()) {", at)
+        if at < 0:
+            return "".join(out)
+        out.append(body_after("if (fp32Active()) {", text=text[at:]))
+        at += 1
+
+
+fp32_arm = fp32_arms(outer)
 fp64_arm = body_after("} else {", text=outer)
 if "refresh_operator_mirror_f32<<<" not in fp32_arm or "begin_outer_fused_f32<<<" not in fp32_arm:
     fail("the FP32 prologue is not inside the fp32Active() arm of enqueue_outer")
@@ -124,10 +145,76 @@ if "begin_outer_fused<<<" not in fp64_arm:
     fail("the FP64 prologue arm no longer launches begin_outer_fused")
 if "_f32" in fp64_arm:
     fail("FP32 code leaked into the FP64 arm of enqueue_outer")
-if "if (fp32Active())\n                enqueue_iteration_f32(" not in outer:
+if "if (fp32Active())\n                    enqueue_iteration_f32(" not in outer:
     fail("the iteration loop does not select the FP32 body through fp32Active()")
 if "enqueue_iteration(allow_halt, force_halt);" not in outer:
     fail("the FP64 iteration body is no longer reachable")
+
+# ---------------------------------------------------------------------------
+# WP20.2: THE REFINEMENT LOOP.
+#
+# The round count is a CAP and not a `while`, because the inner solve is a
+# captured graph and its depth is topology.  What this file can settle is the
+# structure: the loop exists, it is bounded by the arm's own cached answer, its
+# trip count is 1 on every path that is not the refinement arm, the reference
+# norm is frozen at round 0, and the round boundary re-establishes the TRUE
+# FP64 residual rather than reusing the FP32 recursive one.
+# ---------------------------------------------------------------------------
+if "for (int round = 0; round < rounds; ++round) {" not in outer:
+    fail("enqueue_outer has no refinement round loop")
+if "const int rounds = refineRoundsActive();" not in outer:
+    fail("the round count does not come from refineRoundsActive()")
+if "refineRounds()" in outer:
+    fail("enqueue_outer asks the arm header directly; the cap is a cached "
+         "member because it fixes the captured graph depth")
+if "if (round == 0) {" not in outer:
+    fail("round 0 is not distinguished; the reference norm r20 must be frozen "
+         "there and never restored by a later round")
+store_ref_at = outer.find("store_reference_norm<<<")
+round_test_at = outer.find("refine_round_test<<<")
+if store_ref_at < 0 or round_test_at < 0 or store_ref_at > round_test_at:
+    fail("store_reference_norm must belong to round 0 and precede the round "
+         "test that reads the r20 it froze")
+if outer.count("reduce_norm_store_reference_stage2<<<") != 1:
+    fail("the store-reference stage 2 is launched more than once; a round > 0 "
+         "that restored r20 would test the refinement against the residual the "
+         "refinement itself produced")
+if "refine_round_open<<<full_scalar_grid()" not in outer:
+    fail("refine_round_open is not launched at full width; it writes the halt "
+         "every kernel of the round consults")
+
+rr_active = body_after("int refineRoundsActive() const")
+if "fp32Active()" not in rr_active or "fp32_refine_cap" not in rr_active:
+    fail("refineRoundsActive() is not (the FP32 arm AND the cached cap); a "
+         "latched arm must collapse to the single-round FP64 topology")
+prec = body_after("int precisionTag() const")
+if "refineRoundsActive()" not in prec:
+    fail("precisionTag() does not fold the round count; two captures that "
+         "differ by four nodes may not share one graph instantiation")
+
+open_body = body_after("__global__ void refine_round_open(")
+for token, why in (
+        ("active[m] == 0u || sweep_halt[m] != 0u",
+         "refine_round_open must reproduce initialize_solver_state's "
+         "participation test rather than trust counters it never zeroed"),
+        ("cm[kRefineDone] != 0u",
+         "a slot whose FP64 residual already met eps must not be re-opened"),
+        ("NONFINITE_DETECTED",
+         "a slot the FP32 attempt broke must not get another FP32 round"),
+        ("sm[kRho]         = 1.0;",
+         "a new round is a new Krylov space and rho must return to its seed"),
+        ("halt[m]       = 0u;",
+         "the round has to CLEAR the halt its predecessor raised, or nothing "
+         "below it runs")):
+    if token not in open_body:
+        fail("refine_round_open: " + why)
+
+test_body = body_after("__global__ void refine_round_test(")
+if "rnorm / r20 < sm[kEps]" not in test_body:
+    fail("the round test is not the FP64 path's own relative test against the "
+         "frozen r20 and eps")
+if "cm[kRefineDone] = 1u;" not in test_body or "halt[m]         = 1u;" not in test_body:
+    fail("a converged round does not halt the slot and mark it done")
 
 reachable = guarded + fp32_arm
 for kernel in FP32_KERNELS:

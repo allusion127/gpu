@@ -75,7 +75,14 @@ from cmfd_compact_receipt import (  # noqa: E402
     parse_compact_receipts,
 )
 
-FULL_WIDTH_KERNELS = ("initialize_solver_state", "finalize_status")
+# WP20.2 adds the third, refine_round_open, for initialize_solver_state's
+# reason and no other: it WRITES `halt[m]`, and `halt` is what every kernel of
+# the round it opens consults, so a slot it skipped would keep the previous
+# round's mask.  It also reproduces initialize_solver_state's participation
+# test (`active && !sweep_halt`) rather than trusting the counters, because a
+# slot that test masked never had its counters zeroed.
+FULL_WIDTH_KERNELS = ("initialize_solver_state", "finalize_status",
+                      "refine_round_open")
 
 # Rev.7.1 Task 10 part 2/3: the THREE kernels of the STREAM-ORDERED sweep enqueue.
 #

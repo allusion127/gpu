@@ -402,8 +402,15 @@ EXPECTED_STRUCTURE = {
         "<<<": 10,
     },
     "void enqueue_outer(": {
-        "<<<": 9,         # init, fp32 mirror, 2 begin variants, stage1, 3 stage2
-                          # variants, finalize_status
+        # init, fp32 mirror, 2 begin variants, stage1, 3 round-0 stage2
+        # variants, finalize_status -- and WP20.2's three: refine_round_open,
+        # the round > 0 reduce_dot_stage2 (which may NOT be the
+        # store-reference variant, because r20 is frozen at round 0) and
+        # refine_round_test.  All three sit inside a loop whose trip count is
+        # 1 unless RASBERY_GPU_FP32_REFINE arms it, so the DEFAULT node census
+        # below is unchanged: at one round the loop enqueues exactly the
+        # prologue it always did.
+        "<<<": 12,
         # The status D2H.  Spelled `xfer::memcpyAsync(` since WP13.1 routed
         # every transfer in src/ through the site-tagged wrapper; the token is
         # the SUFFIX so this counts the call whichever of the two it is, because

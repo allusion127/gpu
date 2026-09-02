@@ -63,9 +63,18 @@ domain 위에서 인접한 두 커널의 본문을 이어 붙이는 것**이다.
 | I14 | `reduce_dot_stage1` (잔차 norm) | kernel | 1 | |
 | I15 | `reduce_norm_accumulate_stage2` | kernel | 1 | scalar fusion ON. OFF이면 2 |
 | **iteration 소계** | | | **21** | scalar fusion OFF: 22 |
+| R1 | `refine_round_open` | kernel | 0 또는 (rounds-1) | WP20.2. `full_scalar_grid()`. round>0에서만 |
+| R2 | `refine_round_test` | kernel | 0 또는 (rounds-1) | WP20.2. round>0의 FP64 잔차 판정 |
 | E1 | `finalize_status` | kernel | 1 | `full_scalar_grid()` |
 | E2 | `host_status` D2H | **memcpy** | 1 | §3.2 |
 | **epilogue 소계** | | | **2** | |
+
+> **WP20.2 — refinement round의 node 곱셈.** `RASBERY_GPU_FP32_REFINE`이 켜지면 prologue(P3~P5)와
+> iteration 소계(I1~I15)가 **round 수만큼 반복**되고, round>0마다 R1·R2 두 scalar node가 추가된다.
+> 즉 outer node 수 = `rounds x (prologue + captured x iteration) + (rounds-1) x 2 + epilogue`.
+> 기본값은 `rounds = 1`이고 그때 R1·R2는 0개이므로 **아래 census는 그대로 성립한다** — 즉 이 표는
+> refinement가 꺼진(=기본) 구성의 census다. `tools/test_cmfd_fuse_contract.py`의 node model도
+> 같은 구성을 모델링하며, `enqueue_outer`의 `<<<` 개수만 9 -> 12로 올라간다(loop 안의 세 site).
 
 `captured = 1 + nmax = 4`이므로
 

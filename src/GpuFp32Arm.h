@@ -231,6 +231,66 @@ inline bool cramExtended() {
     return on;
 }
 
+/// WP20.2 -- THE REFINEMENT ROUND CAP, and the one knob in this header whose
+/// value is a NUMBER rather than a bit.
+///
+/// WHY IT EXISTS.  WP20 measured Gate A 0.017 pcm / Gate B 0.238 % PASS on the
+/// FP32 arm and still lost time: outers went 4377 -> 4502 (+2.9 %).  That is the
+/// classic mixed-precision symptom and it is not a bug in any kernel.  The FP32
+/// inner BiCGSTAB's ATTAINABLE residual is ~1e-7 relative -- float's own eps --
+/// and the outer Wielandt/convergence logic was written against an inner solve
+/// that could go further, so the outer loop pays for the shortfall in extra
+/// sweeps.  Halving the bytes and then buying the saving back in outers is a
+/// wash, which is exactly what the +6.8 % wall said.
+///
+/// THE FIX IS THE TEXTBOOK ONE and it is already half-built: WP20's outer is
+/// FP64 residual -> FP32 inner -> FP64 correction, i.e. ONE round of iterative
+/// refinement.  WP20.2 makes the round count a LOOP: after each round the TRUE
+/// FP64 residual r = b - A*x is recomputed from the FP64 operator and the FP64
+/// flux (the arithmetic begin_outer_fused_f32 already performs), its FP64 norm
+/// is taken, and it is tested against the SAME frozen reference r20 and the
+/// SAME eps the FP64 path uses.  A slot that meets the test halts and costs
+/// nothing further; a slot that does not gets another FP32 solve for the
+/// correction.  The bandwidth-heavy sweeps stay FP32 and the ACCEPTANCE
+/// CRITERION goes back to being the FP64 one, which is what the outer count is
+/// a function of.
+///
+/// WHY THE VALUE IS A CAP AND NOT A `while`.  The inner loop is a CAPTURED
+/// GRAPH.  Its depth is topology, so "repeat until converged" is spelled the
+/// way this tree has always spelled it: capture a fixed number of rounds and
+/// let the trailing ones find `halt` already raised and self-cancel on their
+/// first instruction, exactly as the captured iterations past `1 + nmax` do.
+///
+///   unset (and the arm on)  2 -- the default, and the one WP20.2 measures
+///   "1" / "on" / "true"     2 -- the same, spelled as a bit
+///   an integer >= 2         that many rounds, clamped to kRefineRoundsMax
+///   "0" / "off" / "false"   1 -- ONE round, which IS the WP20 topology, node
+///                           for node.  This is how the arm is turned off, and
+///                           it is why the OFF answer is 1 and never 0.
+///
+/// With RASBERY_GPU_FP32 unset this returns 1 whatever the variable says: a
+/// refinement round is a round of an FP32 solve, and there is no FP32 solve.
+constexpr int kRefineRoundsMax     = 8;
+constexpr int kRefineRoundsDefault = 2;
+
+inline int refineRounds() {
+    static const int rounds = [] {
+        const char* value = std::getenv("RASBERY_GPU_FP32_REFINE");
+        if (value == nullptr) return kRefineRoundsDefault;
+        const std::string s(value);
+        if (s.empty() || s == "0" || s == "off" || s == "OFF" || s == "false" ||
+            s == "FALSE")
+            return 1;
+        const int n = std::atoi(value);
+        if (n >= 2) return n < kRefineRoundsMax ? n : kRefineRoundsMax;
+        return kRefineRoundsDefault;
+    }();
+    return armed() ? rounds : 1;
+}
+
+/// Is the refinement LOOP engaged, as opposed to WP20's single round?
+inline bool refine() { return refineRounds() > 1; }
+
 namespace detail {
 
 /// Per-backend sticky latch, set by the non-finite fallback.  Process-wide,
@@ -456,6 +516,7 @@ inline void appendReceiptFields(std::ostream& out) {
         out << "\"" << backendName(which) << "\":\"" << backendState(which) << "\"";
     }
     out << "}";
+    out << ",\"refine\":" << refineRounds();
     out << ",\"demotions\":" << demotions();
     out << ",\"nonfinite_fallbacks\":" << fallbackTotal();
     out << ",\"bytes_saved_est\":" << bytesSavedEst();

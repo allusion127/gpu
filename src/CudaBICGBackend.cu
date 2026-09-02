@@ -130,6 +130,17 @@ enum CounterSlot : int {
     /// Captured iterations that found `halt` already raised and did nothing.
     /// Appended last so the existing slot indices are untouched.
     kOverrunCount,
+    /// WP20.2.  The 0-BASED INDEX of the last refinement round this slot
+    /// ENTERED, so the rounds it actually ran are `kRefineRounds + 1`.  Zero on
+    /// every path that has no refinement loop -- the FP64 arm and the FP32 arm
+    /// with RASBERY_GPU_FP32_REFINE=0 -- which reads as "one round", and one
+    /// round IS the WP20 topology.
+    kRefineRounds,
+    /// Sticky per slot for the duration of ONE outer: the slot's FP64 residual
+    /// met the test (or its flux went non-finite) and no later round may
+    /// re-open it.  It has to be a device value rather than the halt flag
+    /// itself, because the halt is what a round CLEARS in order to run.
+    kRefineDone,
     kCounterSlots
 };
 
@@ -2369,7 +2380,8 @@ __global__ void bicg_iteration_persistent(PersistentBicgParams a,
                                 a.sticky_flags, a.counters, a.halt);
 }
 
-__global__ void finalize_status(const double* scalars,
+__global__ void finalize_status(const int refine_rounds,
+                                const double* scalars,
                                 const std::uint32_t* flags,
                                 const std::uint32_t* counters,
                                 DeviceSolveStatus* status,
@@ -2399,7 +2411,14 @@ __global__ void finalize_status(const double* scalars,
     status[m].flux_l2         = value;
     status[m].dhat_defect_max = unavailable;
     status[m].dhat_update_max = unavailable;
-    status[m].search_residual = unavailable;
+    // WP20.2.  `search_residual` has never had an owner on this path -- the
+    // linear solver has no search residual to report and the field has no
+    // reader in the tree -- so it is the transport for the refinement round
+    // count, which is the one number the receipt cannot get any other way (the
+    // status packet is exactly one cache line and full).  It stays NaN when
+    // there is no refinement loop, so the FP64 arm reports what it always did.
+    status[m].search_residual =
+        refine_rounds > 1 ? static_cast<double>(cm[kRefineRounds] + 1u) : unavailable;
     status[m].flags           = sticky;
     status[m].outer_iter      = cm[kOverrunCount];
     status[m].linear_iter     = cm[kSolveCount];
@@ -2597,6 +2616,148 @@ __global__ void begin_outer_fused_f32(const int nxyz,
     r0_f[base + 2 * l + 1] = f1;
     p_f[base + 2 * l + 1]  = 0.0f;
     v_f[base + 2 * l + 1]  = 0.0f;
+}
+
+// ---------------------------------------------------------------------------
+// WP20.2 -- THE REFINEMENT LOOP.
+//
+// WHAT WP20 MEASURED AND WHY IT IS NOT A KERNEL BUG.  The FP32 arm passed both
+// numeric gates (Gate A 0.017 pcm, Gate B 0.238 %) and still lost 6.8 % of the
+// wall, because the OUTERS went 4377 -> 4502.  An FP32 BiCGSTAB stagnates at a
+// relative residual of ~1e-7 -- float's own eps -- and the outer Wielandt loop
+// was tuned against an inner solve that could go further.  It therefore pays
+// the shortfall in extra sweeps, and halving the bytes of a sweep is worth
+// nothing if you then buy 2.9 % more sweeps.
+//
+// THE STRUCTURE WAS ALREADY HALF THERE.  WP20's outer is FP64 residual ->
+// FP32 inner -> FP64 correction: ONE round of iterative refinement.  All WP20.2
+// does is let that round REPEAT while the FP64 residual is still above the FP64
+// path's own tolerance:
+//
+//    r_k = b - A*x_k        FP64, from the FP64 operator and the FP64 flux --
+//                           this is begin_outer_fused_f32's existing arithmetic,
+//                           not new arithmetic
+//    ||r_k||                FP64, reduce_dot_stage1/2 on the double `r`
+//    test                   ||r_k|| / r20 < eps, against the SAME r20 frozen at
+//                           round 0 and the SAME eps the FP64 path uses
+//    A*d = r_k              FP32 BiCGSTAB, `1 + nmax` iterations -- the
+//                           bandwidth-heavy part, unchanged
+//    x_{k+1} = x_k + d      FP64, update_solution_f32's existing accumulation
+//
+// so the ACCEPTANCE CRITERION is FP64 again while every sweep that moves bytes
+// stays FP32.  That is the whole point: the outer loop is a function of the
+// criterion, not of the arithmetic that met it.
+//
+// WHY IT IS A CAP AND NOT A `while`.  The inner solve is a CAPTURED GRAPH, so
+// its depth is topology.  "Repeat until converged" is therefore spelled the way
+// this file has always spelled it -- capture a fixed number of rounds and let a
+// round that finds `halt` already raised return on its first instruction, which
+// is exactly what the captured iterations past `1 + nmax` already do.  The cap
+// is rasbery::fp32::refineRounds(); one round IS the WP20 topology, node for
+// node, which is why the OFF answer is 1 and never 0.
+//
+// TWO SCALAR NODES PER EXTRA ROUND, and they are the whole cost of the loop.
+// ---------------------------------------------------------------------------
+
+/// OPEN a refinement round: decide which slots run it, and re-arm them.
+///
+/// FULL WIDTH and `blockIdx.y` addressed, for initialize_solver_state's reason
+/// and no other: it WRITES `halt[m]`, which every later kernel of the round
+/// consults, so a slot it skipped would keep the previous round's mask.
+///
+/// It reproduces initialize_solver_state's participation test EXACTLY --
+/// `active && !sweep_halt` -- rather than trusting the counters, because a slot
+/// that test masked never had its counters zeroed and `kRefineDone` there is
+/// whatever the previous outer left.
+///
+/// The three ways a slot does NOT get another round:
+///   * it is not participating in this launch at all;
+///   * kRefineDone: an earlier round's test said its FP64 residual met eps;
+///   * NONFINITE_DETECTED is sticky on it -- the FP32 attempt is discarded and
+///     the arena is about to latch to FP64, so re-opening it would be running
+///     more of the arithmetic that already failed.
+///
+/// Everything else is re-armed to the state initialize_solver_state hands round
+/// 0: rho/alpha/omega back to their seeds (a new Krylov space starts from the
+/// new residual, so carrying the old rho would make the first beta meaningless)
+/// and the scratch flags cleared.  The STICKY flags are deliberately NOT
+/// cleared: a breakdown or a converged flux that happened in round 0 is part of
+/// this outer's history and finalize_status still has to report it.
+__global__ void refine_round_open(const int round,
+                                  double* scalars,
+                                  const std::uint32_t* __restrict__ sticky_flags,
+                                  std::uint32_t* iter_flags,
+                                  std::uint32_t* counters,
+                                  std::uint32_t* halt,
+                                  const std::uint32_t* __restrict__ active,
+                                  const std::uint32_t* __restrict__ sweep_halt) {
+    if (threadIdx.x != 0) return;
+    const int m = static_cast<int>(blockIdx.y);
+
+    if (active[m] == 0u || sweep_halt[m] != 0u) {
+        halt[m] = 1u;
+        return;
+    }
+
+    std::uint32_t* cm = counters + static_cast<long long>(m) * kCounterSlots;
+    if (cm[kRefineDone] != 0u ||
+        (sticky_flags[m] & static_cast<std::uint32_t>(NONFINITE_DETECTED)) != 0u) {
+        cm[kRefineDone] = 1u;
+        halt[m]         = 1u;
+        return;
+    }
+
+    halt[m]       = 0u;
+    iter_flags[m] = 0u;
+
+    double* sm       = scalars + static_cast<long long>(m) * kScalarCount;
+    sm[kRhoNew]      = 1.0;
+    sm[kR0V]         = 0.0;
+    sm[kPts]         = 0.0;
+    sm[kPtt]         = 0.0;
+    sm[kRho]         = 1.0;
+    sm[kAlpha]       = 1.0;
+    sm[kOmega]       = 1.0;
+    sm[kInitialNorm] = 0.0;
+    cm[kRefineRounds] = static_cast<std::uint32_t>(round);
+}
+
+/// CLOSE the decision half of a refinement round: the slot has just had its
+/// TRUE FP64 residual recomputed and reduced into kInitialNorm, so this is the
+/// point where the FP64 acceptance test is applied.
+///
+/// It is the SAME test accumulate_iteration applies to the recursive residual
+/// -- `rnorm / r20 < eps`, against the r20 frozen at round 0 -- which is the
+/// property that makes this refinement rather than a longer FP32 solve: the
+/// number the outer loop is a function of is measured in FP64 either way.
+///
+/// Compacted and halt-guarded, unlike its opener: refine_round_open has already
+/// written every slot's mask, so a slot that reaches here is one that is
+/// genuinely running this round.
+__global__ void refine_round_test(double* scalars,
+                                  std::uint32_t* sticky_flags,
+                                  std::uint32_t* counters,
+                                  std::uint32_t* halt,
+                                   RASBERY_CMFD_SLOT_ARGS) {
+    if (threadIdx.x != 0) return;
+    RASBERY_CMFD_SLOT(m);
+    HALT_GUARD(halt + m);
+
+    double*        sm = scalars + static_cast<long long>(m) * kScalarCount;
+    std::uint32_t* cm = counters + static_cast<long long>(m) * kCounterSlots;
+
+    const double rnorm = sm[kInitialNorm];
+    const double r20   = sm[kR20];
+    if (!isfinite(rnorm)) {
+        sticky_flags[m] |= static_cast<std::uint32_t>(NONFINITE_DETECTED);
+        cm[kRefineDone] = 1u;
+        halt[m]         = 1u;
+        return;
+    }
+    if (r20 <= 0.0 || rnorm / r20 < sm[kEps]) {
+        cm[kRefineDone] = 1u;
+        halt[m]         = 1u;
+    }
 }
 
 /// FP32 payload, FP64 accumulator.  Partition, traversal order and reduction
@@ -4056,7 +4217,16 @@ public:
             fuse_sweep_pre = (fuse_mask & kFuseSweepPre) != 0u;
             fuse_norm      = (fuse_mask & kFuseNorm) != 0u;
             fp32_inner    = cmfdFp32InnerEnabled();
+            // WP20.2.  Cached with the arm for the same reason the arm is: the
+            // round count is captured graph DEPTH and may not move between two
+            // outers.  refineRounds() is 1 whenever RASBERY_GPU_FP32 is unset,
+            // so the historical RASBERY_GPU_CMFD_FP32 knob -- which can arm the
+            // inner solve without arming rasbery::fp32 -- keeps exactly the
+            // single-round topology it has always had, and this stays the ONE
+            // routes() call the contract allows the CMFD TU.
+            fp32_refine_cap = rasbery::fp32::refineRounds();
             telemetry.fp32_active = fp32_inner ? 1u : 0u;
+            telemetry.fp32_refine_cap = static_cast<std::uint64_t>(fp32_refine_cap);
             // WP17.  Both are latched here, once, for the same reason the fuse
             // mask is: the block width and the persistent arm are part of the
             // captured topology and may not change between two outers.
@@ -4080,6 +4250,7 @@ public:
                       // fp64 = the historical all-double path; mixed = FP32 inner
                       // BiCGSTAB under an FP64 outer correction.
                       ", precision=" + (fp32_inner ? "mixed" : "fp64") +
+                      ", refine=" + std::to_string(fp32_refine_cap) +
                       ", slots=" + std::to_string(slots) + ")";
 
             // -------------------------------------------------------------
@@ -5109,6 +5280,17 @@ public:
     /// the kernels inside it can never disagree.
     [[nodiscard]] bool fp32Active() const { return fp32_inner && !fp32_latched_off; }
 
+    /// WP20.2.  How many refinement rounds THIS outer will capture.
+    ///
+    /// A pure function of fp32Active() and the process-wide cap, and it has to
+    /// be: the cap fixes the captured graph DEPTH, so it may not move between
+    /// two outers of one run -- and when the non-finite latch fires, the arm it
+    /// refines is gone, so the answer collapses to the single round the FP64
+    /// topology has.  precisionTag() folds it for exactly that reason.
+    [[nodiscard]] int refineRoundsActive() const {
+        return fp32Active() ? fp32_refine_cap : 1;
+    }
+
     /// FP32-payload counterpart of dot(): _f32 stage 1, unmodified double
     /// stage 2.  The partial array, its stride and the fold order are shared
     /// with the FP64 path, which is why no _f32 stage 2 exists.
@@ -5312,34 +5494,12 @@ public:
             // that makes a stale operator mirror impossible: it dominates every
             // write to the double diag/cc -- the H2D pushes, the device
             // assembly and the per-sweep cmfd_updls all precede this point.
+            //
+            // WP20.2: still ONCE per outer and not once per refinement round.
+            // The refinement loop moves `phi`; it does not touch diag or cc, so
+            // the mirror refreshed here is the one every round consumes.
             refresh_operator_mirror_f32<<<node_grid(), block_size, 0, stream>>>(
                 nxyz, mat_stride(), cpl_stride(), diag, cc, diag_f, cc_f, device_halt, d_slot_map, lanes);
-            // Same three fused steps as below, but only the RESULTS narrow: the
-            // block inversion, A*phi and b - A*phi are FP64, and `r` still
-            // receives the FP64 residual so the reference norm harvested by the
-            // unmodified reduction below is the FP64 one.
-            begin_outer_fused_f32<<<node_grid(), block_size, 0, stream>>>(
-                nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag, cc,
-                phi, src, dinv_f, ax, r, r_f, r0_f, p_f, v_f, device_halt, d_slot_map, lanes);
-        } else {
-            // One node for what used to be three: the block inversion (independent
-            // of the other two), the A*phi matvec and the residual it feeds.
-            begin_outer_fused<<<node_grid(), block_size, 0, stream>>>(
-                nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag, cc, phi,
-                src, dinv, ax, r, r0, p, v, device_halt, d_slot_map, lanes);
-        }
-        const int reference_blocks = reduce_blocks_for(n);
-        reduce_dot_stage1<<<
-            dim3(static_cast<unsigned>(reference_blocks), static_cast<unsigned>(lanes)),
-            kReduceThreads, 0, stream>>>(
-            n, vec_stride(), r, r, partials, device_halt, d_slot_map, lanes);
-        if (scalar_fusion) {
-            reduce_norm_store_reference_stage2<<<scalar_grid(), 1, 0, stream>>>(
-                reference_blocks, partials, scalars, device_halt, d_slot_map, lanes);
-        } else {
-            reduce_dot_stage2<<<scalar_grid(), 1, 0, stream>>>(
-                reference_blocks, partials, scalars, kInitialNorm, true, device_halt, d_slot_map, lanes);
-            store_reference_norm<<<scalar_grid(), 1, 0, stream>>>(scalars, device_halt, d_slot_map, lanes);
         }
 
         // The algorithmic budget is `1 + nmax`; the capture may be deeper.
@@ -5356,14 +5516,78 @@ public:
                             persistent_armed ? 1 : launchesPerIteration(),
                             persistent_armed, persistent_blocks,
                             cooperative_supported, persistent_refusal);
-        for (int i = 0; i < captured; ++i) {
-            const int allow_halt = i == 0 ? 0 : 1;
-            const int force_halt =
-                (i == algorithmic - 1 && captured > algorithmic) ? 1 : 0;
-            if (fp32Active())
-                enqueue_iteration_f32(allow_halt, force_halt);
-            else
-                enqueue_iteration(allow_halt, force_halt);
+
+        // WP20.2 -- THE REFINEMENT ROUNDS.  `refine_rounds` is 1 on every path
+        // that is not the FP32 refinement arm -- the FP64 arm, and the FP32 arm
+        // with RASBERY_GPU_FP32_REFINE=0 -- and at 1 this loop enqueues the
+        // pre-WP20.2 body, node for node, in the same order.  That is what the
+        // feature-off byte-identity claim rests on here: not a branch that is
+        // never taken, a loop that runs once.
+        const int rounds = refineRoundsActive();
+        for (int round = 0; round < rounds; ++round) {
+            if (round > 0) {
+                // Re-open the slots whose FP64 residual has not met eps yet and
+                // re-arm their Krylov scalars.  Full width, because it writes
+                // the halt every kernel below consults.
+                refine_round_open<<<full_scalar_grid(), 1, 0, stream>>>(
+                    round, scalars, device_flags, iter_flags, device_counters,
+                    device_halt, device_active, sweep_halt);
+            }
+            if (fp32Active()) {
+                // Same three fused steps as below, but only the RESULTS narrow:
+                // the block inversion, A*phi and b - A*phi are FP64, and `r`
+                // still receives the FP64 residual so the reference norm
+                // harvested by the unmodified reduction below is the FP64 one.
+                //
+                // On round > 0 this IS the refinement residual: `phi` is the
+                // iterate the previous round left, so b - A*phi is the true
+                // FP64 residual of the refined solution and the FP32 loop below
+                // solves for the next correction to it.
+                begin_outer_fused_f32<<<node_grid(), block_size, 0, stream>>>(
+                    nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag, cc,
+                    phi, src, dinv_f, ax, r, r_f, r0_f, p_f, v_f, device_halt, d_slot_map, lanes);
+            } else {
+                // One node for what used to be three: the block inversion (independent
+                // of the other two), the A*phi matvec and the residual it feeds.
+                begin_outer_fused<<<node_grid(), block_size, 0, stream>>>(
+                    nxyz, vec_stride(), mat_stride(), cpl_stride(), neighbors, diag, cc, phi,
+                    src, dinv, ax, r, r0, p, v, device_halt, d_slot_map, lanes);
+            }
+            const int reference_blocks = reduce_blocks_for(n);
+            reduce_dot_stage1<<<
+                dim3(static_cast<unsigned>(reference_blocks), static_cast<unsigned>(lanes)),
+                kReduceThreads, 0, stream>>>(
+                n, vec_stride(), r, r, partials, device_halt, d_slot_map, lanes);
+            if (round == 0) {
+                if (scalar_fusion) {
+                    reduce_norm_store_reference_stage2<<<scalar_grid(), 1, 0, stream>>>(
+                        reference_blocks, partials, scalars, device_halt, d_slot_map, lanes);
+                } else {
+                    reduce_dot_stage2<<<scalar_grid(), 1, 0, stream>>>(
+                        reference_blocks, partials, scalars, kInitialNorm, true, device_halt, d_slot_map, lanes);
+                    store_reference_norm<<<scalar_grid(), 1, 0, stream>>>(scalars, device_halt, d_slot_map, lanes);
+                }
+            } else {
+                // NOT reduce_norm_store_reference_stage2: r20 is the reference
+                // frozen at round 0 and a later round may not move it.  A
+                // moving denominator would make the exit test relative to the
+                // residual the refinement itself produced, which is the one way
+                // an iterative-refinement loop can declare victory over nothing.
+                reduce_dot_stage2<<<scalar_grid(), 1, 0, stream>>>(
+                    reference_blocks, partials, scalars, kInitialNorm, true, device_halt, d_slot_map, lanes);
+                refine_round_test<<<scalar_grid(), 1, 0, stream>>>(
+                    scalars, device_flags, device_counters, device_halt, d_slot_map, lanes);
+            }
+
+            for (int i = 0; i < captured; ++i) {
+                const int allow_halt = i == 0 ? 0 : 1;
+                const int force_halt =
+                    (i == algorithmic - 1 && captured > algorithmic) ? 1 : 0;
+                if (fp32Active())
+                    enqueue_iteration_f32(allow_halt, force_halt);
+                else
+                    enqueue_iteration(allow_halt, force_halt);
+            }
         }
         // A property of the capture, not a tally: assigned, never accumulated.
         // Set here rather than at launch so it is right on the graph-off path
@@ -5372,7 +5596,7 @@ public:
         telemetry.iter_batch = static_cast<std::uint64_t>(captured);
 
         finalize_status<<<full_scalar_grid(), 1, 0, stream>>>(
-            scalars, device_flags, device_counters, device_status, device_active);
+            rounds, scalars, device_flags, device_counters, device_status, device_active);
         // WP13.1: launch_outer CAPTURES this body when use_graph, so on that
         // arm the ledger sees one call per capture and the replays are
         // invisible to it.  The scope says so rather than leaving a reader
@@ -6179,6 +6403,15 @@ public:
             telemetry.bicg_restarts += host_status[m].material_gen;
             telemetry.bicg_early_convergence_exits += host_status[m].operator_gen;
             telemetry.overrun_iterations += host_status[m].outer_iter;
+            // WP20.2.  NaN on every arm without a refinement loop, so the two
+            // sums stay at zero there and the receipt's mean is undefined
+            // rather than 1 -- which is the honest answer for a run that never
+            // ran a round.
+            const double rr = host_status[m].search_residual;
+            if (rr == rr && rr > 0.0) {
+                telemetry.fp32_refine_rounds += static_cast<std::uint64_t>(rr);
+                ++telemetry.fp32_refine_solves;
+            }
             // A non-finite flux is THAT instance's failure, not the batch's:
             // recorded per slot here, thrown from the owning thread on its way
             // out of solve().  The old batch-fatal throw took every batch-mate
@@ -6482,11 +6715,20 @@ public:
     // ---- mixed-precision inner loop (RASBERY_GPU_CMFD_FP32) ----
     /// The env gate, resolved once in the constructor.
     bool          fp32_inner = false;
+    /// WP20.2 refinement round cap, resolved once at stand-up from
+    /// rasbery::fp32::refineRounds().  1 means the WP20 topology.
+    int           fp32_refine_cap = 1;
     /// Sticky safety fallback: set by drain() when an FP32 launch reported a
     /// non-finite, never cleared.
     bool          fp32_latched_off = false;
     /// Which kernel set the cached graphs were captured with.
-    [[nodiscard]] int precisionTag() const { return fp32Active() ? 1 : 0; }
+    /// 0 = the FP64 kernel set; N >= 1 = the FP32 set with N refinement rounds.
+    /// The round count is CAPTURE DEPTH, so it keys the graph exactly as the
+    /// kernel set does -- two topologies that differ by four nodes may not
+    /// share one instantiation.
+    [[nodiscard]] int precisionTag() const {
+        return fp32Active() ? refineRoundsActive() : 0;
+    }
     int           graph_precision = -1;
     // (the sweep graph's precision now lives in SweepGraphCapacity::precision)
     /// Float mirrors of the operator.  Written ONLY by
@@ -7664,6 +7906,9 @@ void rasberyReleaseBatchArena() {
               << "\"batched_graph_launches\":" << c.batched_graph_launches << ','
               << "\"overrun_iterations\":" << c.overrun_iterations << ','
               << "\"fp32_active\":" << c.fp32_active << ','
+              << "\"fp32_refine_cap\":" << c.fp32_refine_cap << ','
+              << "\"fp32_refine_rounds\":" << c.fp32_refine_rounds << ','
+              << "\"fp32_refine_solves\":" << c.fp32_refine_solves << ','
               << "\"fp32_fallbacks\":" << c.fp32_fallbacks << '}' << std::endl;
     g_arena.reset();
 }

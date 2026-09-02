@@ -121,6 +121,21 @@ struct BackendCounters {
     /// FP64 kernels for the rest of the process, so a nonzero value means the
     /// run FINISHED in fp64 whatever fp32_active says.
     std::uint64_t fp32_fallbacks                       = 0;
+    /// WP20.2.  The captured refinement round CAP (rasbery::fp32::refineRounds()
+    /// as the CMFD arm resolved it).  1 is the WP20 topology -- one FP64
+    /// residual, one FP32 inner solve, one FP64 correction -- and it is what
+    /// every arm without the refinement loop reports.
+    std::uint64_t fp32_refine_cap                      = 0;
+    /// Refinement rounds ACTUALLY entered, summed over slot-solves.  Divided by
+    /// fp32_refine_solves this is the mean round count the receipt quotes; a run
+    /// whose mean sits at the cap has a cap that is too small, and one whose
+    /// mean sits at 1 is paying two scalar nodes per outer for nothing.
+    std::uint64_t fp32_refine_rounds                   = 0;
+    /// Slot-solves that reported a round count, i.e. the denominator of that
+    /// mean.  Zero on every arm without a refinement loop, which is why the
+    /// receipt reports the two sums and not a pre-divided figure: 0/0 is a
+    /// missing measurement, not a mean of one.
+    std::uint64_t fp32_refine_solves                   = 0;
 };
 
 /**
