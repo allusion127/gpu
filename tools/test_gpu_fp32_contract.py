@@ -245,6 +245,140 @@ check("case Backend::Cram:   return true;" in CONVERTED,
 check("case Backend::Ppr:    return true;" in CONVERTED,
       "WP20.2 converted PPR, and converted it AS A VRAM ITEM -- which is what "
       "the WP20 deferral sentence already said it would be")
+
+
+# ---------------------------------------------------------------------------
+# 2b. THE SECOND GATE INSIDE inScope() MUST BE LIVE, NOT SHADOWED.
+#
+# `inScope()` answers `!converted(which)` FIRST.  So a backend it gates a SECOND
+# time -- today CRAM, behind RASBERY_GPU_FP32_CRAM -- is only really gated if
+# converted() says TRUE for it.  Say `false` there instead and the extension
+# test becomes dead text: inScope is false via the converted line, so
+# `backendState()` returns `deferred` before it can ever return `declined` --
+# for CRAM and therefore, CRAM being the only backend gated twice, for every
+# backend -- while the knob goes on forking the WP10.1 case key and changing
+# nothing the binary does.  Two runs that behave identically then cannot share a
+# cached answer, and a reader looking for the documented `declined` never sees
+# it in any run of any build.
+#
+# The rule is written on the STRUCTURE and not on today's backend list, so it
+# holds for whichever backend is gated next.
+# ---------------------------------------------------------------------------
+def scope_gated_backends(arm: str) -> list[str]:
+    """The backends inScope() tests a SECOND time, by name."""
+    try:
+        scope = body_after(arm, "inline bool inScope(Backend which)")
+    except LookupError:
+        return []
+    return re.findall(r"which\s*==\s*Backend::(\w+)", scope)
+
+
+def rule_scope_gate_is_live(arm: str) -> bool:
+    """Every specially gated backend must be converted(), or its gate is dead
+    code and `declined` is a word no run can print."""
+    names = scope_gated_backends(arm)
+    if not names:
+        return False          # a gate that gates nothing can decline nothing
+    try:
+        conv = body_after(arm, "inline bool converted(Backend which)")
+    except LookupError:
+        return False
+    for name in names:
+        hit = re.search(r"case Backend::%s:\s*return\s+(true|false)\s*;" % name,
+                        conv)
+        if hit is None or hit.group(1) != "true":
+            return False
+    return True
+
+
+check(rule_scope_gate_is_live(ARM),
+      "every backend inScope() gates a second time is converted() == true -- "
+      "otherwise the `!converted(which)` line above shadows the gate, the "
+      "extension flag becomes unobservable, and `declined` becomes unreachable "
+      "for all six backends")
+check(scope_gated_backends(ARM) == ["Cram"],
+      "and CRAM is the ONE backend with a second gate, which is what the "
+      "receipt's `declined` word and the header's CRAM paragraph both describe")
+check(rule_scope_gate_is_live(ARM)
+      and "rasbery::fp32::routes(rasbery::fp32::Backend::Cram)" in CRAM
+      and "if (s.fp32_pole) kPredictor<true><<<" in CRAM,
+      "RASBERY_GPU_FP32_CRAM is on kArmEnv, so it MUST be able to move the "
+      "binary: the gate is live, the backend asks routes() once, and a "
+      "different kernel instantiation launches because of it.  A knob that "
+      "forks the case key without changing what runs makes two identical "
+      "answers uncacheable and buys nothing for it")
+
+
+# ---------------------------------------------------------------------------
+# 2c. THE DEMOTION COUNTER IS A LIST OF CALL SITES, NOT A CLAIM IN PROSE.
+#
+# `demotions` counts SITES that asked for FP32 and ran FP64 anyway.  A backend
+# that inScope() withholds by POLICY is NOT one of those: it is reported once,
+# per backend, by backendState() as `declined`, and folding it into the counter
+# would put `"demotions"` above zero on every correct default run -- the one
+# number Sec 9.1 of the doc reads as G0.  The header used to claim the CRAM
+# refusal was counted while `git grep noteDemotion` showed sites for FlatXs and
+# Nodal only, so the header now carries the LIST and this rule compares it to
+# the tree in BOTH directions: a claimed site that does not exist fails, and an
+# existing site nobody declared fails too.
+# ---------------------------------------------------------------------------
+def src_corpus() -> str:
+    """Every C/C++/CUDA source in src/, comments stripped.  A rule about where a
+    counter is incremented has to look at the whole tree: one call site anywhere
+    makes the claim true and its absence everywhere makes it false."""
+    parts = []
+    src_dir = os.path.join(ROOT, "src")
+    for name in sorted(os.listdir(src_dir)):
+        if name.endswith((".h", ".hh", ".hpp", ".cuh", ".c", ".cc", ".cpp", ".cu")):
+            with open(os.path.join(src_dir, name), encoding="utf-8-sig",
+                      errors="replace") as fh:
+                parts.append(fh.read())
+    return strip_comments("\n".join(parts))
+
+
+SRC_ALL = src_corpus()
+
+
+def declared_demotion_sites(arm: str) -> set:
+    """The backends the header CLAIMS are counted, read off the list beside
+    noteDemotion() rather than out of its prose."""
+    at = arm.find("/// COUNTED AT")
+    if at < 0:
+        return set()
+    end = arm.find("inline void noteDemotion(", at)
+    if end < 0:
+        return set()
+    # Only the list ITEMS -- a `Backend::` that appears mid-sentence (in
+    # `XsReconBackend::solveFlatXs`, say) is prose and not an entry.
+    return set(re.findall(r"^///\s+Backend::(\w+)", arm[at:end], re.M))
+
+
+def counted_demotion_sites(sources: str) -> set:
+    return set(re.findall(r"noteDemotion\(rasbery::fp32::Backend::(\w+)\)",
+                          sources))
+
+
+def rule_demotion_claim_matches_call_sites(arm: str, sources: str) -> bool:
+    declared = declared_demotion_sites(arm)
+    return bool(declared) and declared == counted_demotion_sites(sources)
+
+
+check(rule_demotion_claim_matches_call_sites(ARM, SRC_ALL),
+      "the header's COUNTED AT list and the tree's noteDemotion() call sites "
+      "are the same set -- a demotion claimed in prose but never incremented "
+      "makes `demotions` unreadable as a G0, and an increment nobody declared "
+      "makes a correct run look demoted")
+check(declared_demotion_sites(ARM) == {"FlatXs", "Nodal", "Cram"},
+      "and that set is {FlatXs, Nodal, Cram}: the flat-XS reference arm, the "
+      "hybrid nodal drive and the batch arena, plus the CRAM policy refusal -- "
+      "which IS counted, once per process, so that RASBERY_GPU_FP32_CRAM=1 and "
+      "not asking are distinguishable in the receipt as well as in the case key")
+check("Cram" in counted_demotion_sites(SRC_ALL),
+      "and the CRAM policy refusal really is one of the call sites, which is "
+      "what makes Sec 9.1's G0 baseline a function of RASBERY_GPU_CRAM rather "
+      "than a flat zero")
+
+
 # ---------------------------------------------------------------------------
 # WP20.2 -- THE XE TRIPWIRE.
 #
@@ -530,6 +664,29 @@ check("RASBERY_GPU_FP32_CRAM" not in strip_comments(CRAM),
 check("COUNTED as a demotion" in ARM and "CramBackend::CramBackend()" in ARM,
       "src/GpuFp32Arm.h names the site its promise is kept at, so the promise "
       "and the call cannot drift apart without this rule seeing it")
+
+def rule_declined_is_reachable_ordered(state: str, arm: str) -> bool:
+    """`declined` is the receipt's word for "this tree HAS the narrow path and
+    withheld it".  Naming the word is not enough: it has to be TESTED, on
+    !inScope, between `deferred` and `fp32`, AND some backend has to be able to
+    reach it -- which is only true while inScope()'s second gate is live."""
+    for word in ('"deferred"', '"declined"', '"fp32"'):
+        if ("return %s" % word) not in state:
+            return False
+    if "!inScope(which)" not in state:
+        return False
+    if not (state.index('return "deferred"') < state.index('return "declined"')
+            < state.index('return "fp32"')):
+        return False
+    return rule_scope_gate_is_live(arm)
+
+
+check(rule_declined_is_reachable_ordered(STATE, ARM),
+      "`declined` is REACHABLE and not merely spelled: it is tested on "
+      "!inScope(which) after `deferred` and before `fp32`, and the backend that "
+      "second gate names is converted().  A run with RASBERY_GPU_FP32=1 and no "
+      "RASBERY_GPU_FP32_CRAM must therefore print `\"cram\":\"declined\"` and "
+      "not `\"cram\":\"deferred\"`")
 
 check(MAIN.count('"[RASBERY][FP32] {"') == 3,
       "the receipt is printed from all three of main.cpp's exit branches")
@@ -1510,6 +1667,34 @@ NEGATIVES: list[tuple[str, object]] = [
      lambda: rule_widen_arm_is_on_the_xfer_ledger(
          CRAM.replace("rasbery::xfer::XferDir::kD2D, moved);",
                       "rasbery::xfer::XferDir::kD2D, bytes);"))),
+    ("converted() defers CRAM again, so inScope()'s cramExtended() test is "
+     "shadowed by the !converted line above it and `declined` goes dead",
+     lambda: rule_scope_gate_is_live(
+         ARM.replace("case Backend::Cram:   return true;",
+                     "case Backend::Cram:   return false;"))),
+    ("inScope() stops gating CRAM at all, so RASBERY_GPU_FP32_CRAM forks the "
+     "case key without being able to withhold anything",
+     lambda: rule_scope_gate_is_live(
+         ARM.replace("    if (which == Backend::Cram) return cramExtended();\n",
+                     ""))),
+    ("backendState() returns fp32 before it tests !inScope, so a withheld "
+     "backend reports the conversion it did not get",
+     lambda: rule_declined_is_reachable_ordered(
+         '{ if (!armed()) return "fp64";\n'
+         '  if (!converted(which)) return "deferred";\n'
+         '  if (latched(which)) return "latched";\n'
+         '  return "fp32";\n'
+         '  if (!inScope(which)) return "declined"; }', ARM)),
+    ("the header claims a demotion the tree never counts",
+     lambda: rule_demotion_claim_matches_call_sites(
+         ARM.replace("///   Backend::FlatXs",
+                     "///   Backend::Xe       the refusal, allegedly\n"
+                     "///   Backend::FlatXs"),
+         SRC_ALL)),
+    ("a demotion is counted for a backend the header never declared",
+     lambda: rule_demotion_claim_matches_call_sites(
+         ARM,
+         SRC_ALL + "\nrasbery::fp32::noteDemotion(rasbery::fp32::Backend::Xe);\n")),
 ]
 for label, probe in NEGATIVES:
     checks += 1

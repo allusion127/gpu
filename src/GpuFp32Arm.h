@@ -123,6 +123,16 @@
 // RASBERY_GPU_FP32=1 RASBERY_GPU_FP32_CRAM=1 -- two different WP10.1 case keys
 // -- would hand an operator the same total.
 //
+// THAT WORD IS REACHABLE ONLY BECAUSE `converted(Cram)` IS TRUE.  `inScope()`
+// answers `!converted(which)` FIRST, so a backend the table defers can never
+// reach its own extension test: were CRAM `false` there, `inScope(Cram)` would
+// be false via the WRONG test, `backendState()` would return `deferred` before
+// it could ever return `declined` -- for CRAM and therefore for every backend,
+// since CRAM is the only one gated twice -- and this knob would fork the WP10.1
+// case key while changing nothing the binary does.  WP20.2 is what makes the
+// pair honest: the pole sum below is a real narrow path, and this flag is what
+// withholds it.  tools/test_gpu_fp32_contract.py holds the pair structurally.
+//
 // WP20.2 gave that flag something to turn on, and deliberately gave it the
 // SMALLEST thing that tests the claim above rather than the largest thing that
 // would compile: the pole sum, compensated, and nothing else.  See the `cram`
@@ -537,10 +547,39 @@ inline bool routes(Backend which) {
     return armedFor(which) && inScope(which) && !latched(which);
 }
 
-/// A site that was asked for FP32 and stayed FP64: a shape the narrow kernel
-/// does not serve, a backend out of scope, a path that has not been converted
-/// yet.  Counted rather than silent, because an arm that quietly does nothing is
-/// the failure mode this whole receipt exists to make impossible.
+/// A SITE that was asked for FP32 and ran FP64 anyway: a shape the narrow
+/// kernel does not serve, an arm another knob withheld at the launch, a path
+/// that has not been converted yet.  Counted rather than silent, because an arm
+/// that quietly does nothing is the failure mode this whole receipt exists to
+/// make impossible.
+///
+/// A backend `inScope()` withholds by POLICY -- CRAM without
+/// RASBERY_GPU_FP32_CRAM -- IS one of those, and is counted once per process at
+/// the constructor that resolves the width.  The receipt then carries the fact
+/// twice on purpose: `backendState()` says WHICH backend stayed wide, this
+/// counter says the run PAID for asking, and without the second the two runs
+/// either side of that knob hand an operator the same total.  The G0 baseline
+/// is therefore a function of RASBERY_GPU_CRAM rather than a flat zero; see the
+/// CRAM paragraph at the top of this header and Sec 9.1 of
+/// docs/WP20_GPU_FP32_20260831_KO.md.
+///
+/// COUNTED AT, as a LIST rather than as a sentence, because a claim in prose
+/// can outrun its call sites and this one did:
+///
+///   Backend::FlatXs  the thread-per-node reference arm (RASBERY_GPU_FLATXS_CTA
+///                    =0): the narrow workspace exists only on the CTA arm.
+///                    CudaXsReconBackend.cu, XsReconBackend::solveFlatXs.
+///   Backend::Nodal   the hybrid drive (RASBERY_GPU_NODAL_FULL unset), which
+///                    round-trips trlcff/matM through FP64 host arrays
+///                    mid-drive, and the multi-deck batch arena, whose per-slot
+///                    view table and bucket graphs are a second narrowing.
+///                    CudaXsReconBackend.cu, two sites.
+///   Backend::Cram    the policy refusal above (RASBERY_GPU_FP32_CRAM unset, or
+///                    a latch): armed and not routed, once per process.
+///                    CudaCramBackend.cu, CramBackend::CramBackend().
+///
+/// tools/test_gpu_fp32_contract.py compares that list to the call sites this
+/// tree really has, in both directions.
 inline void noteDemotion(Backend which) {
     detail::tally().demotions[static_cast<int>(which)].fetch_add(
         1, std::memory_order_relaxed);
