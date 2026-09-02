@@ -115,6 +115,11 @@
 // refusal is COUNTED as a demotion so the receipt says the arm was asked and
 // declined rather than silently doing nothing.
 //
+// WP20.2 gave that flag something to turn on, and deliberately gave it the
+// SMALLEST thing that tests the claim above rather than the largest thing that
+// would compile: the pole sum, compensated, and nothing else.  See the `cram`
+// row of the table below for what stays wide and the number behind each.
+//
 // ---------------------------------------------------------------------------
 // FEATURE-OFF BYTE IDENTITY
 // ---------------------------------------------------------------------------
@@ -375,8 +380,25 @@ inline Tally& tally() {
 ///           INPUTS are nevertheless narrowed by the flat-XS item above -- the
 ///           Xe kernels read the same BatchView micx/lmpx blocks -- and that
 ///           saving is attributed to `flatxs`, where the conversion happens.
-///   cram    DEFERRED **AND FLAGGED** (RASBERY_GPU_FP32_CRAM).  See the header
-///           note: the partial-fraction sum cancels catastrophically.
+///   cram    CONVERTED SINCE WP20.2 **AND STILL FLAGGED**
+///           (RASBERY_GPU_FP32_CRAM), which is why `inScope()` keeps its own
+///           test for it and the receipt says `declined` rather than `fp32`
+///           unless the extension is asked for by name.  WP20.2 narrowed
+///           EXACTLY ONE THING: `accr`, the accumulator of the four-pole
+///           partial-fraction sum, in float with a NEUMAIER COMPENSATION --
+///           Neumaier and not Kahan because the residues are (+1.83, -2.44,
+///           +0.63, -0.028) and the addend is routinely larger than the running
+///           sum, which is the case plain Kahan loses.  Everything else in
+///           src/CudaCramBackend.cu stays FP64 with a number behind it: the
+///           alpha_0 term (kAlpha0 = 1.17e-08 times iden[row] is ~8 decades
+///           below its addend and would round to nothing), and the Gauss-Seidel
+///           solve, whose break test is kRelTol = 1.0e-13 -- SIX DECADES below
+///           float eps, so a float solve could not satisfy it and would fail
+///           open on every node in the core rather than being slower-but-close.
+///           The arm therefore costs no bytes and claims none: accr as float
+///           plus its compensation is the same 312 B/thread, and 144 additions
+///           per node is not a bandwidth item.  It is a NUMERICAL PROBE of the
+///           WP20 cancellation claim, with a receipt.
 ///   ppr     DEFERRED.  Strictly downstream of the iteration and therefore
 ///           worth nothing to the trajectory; it is a VRAM item, not a
 ///           throughput one.
@@ -386,7 +408,7 @@ inline bool converted(Backend which) {
         case Backend::FlatXs: return true;
         case Backend::Nodal:  return true;
         case Backend::Xe:     return false;
-        case Backend::Cram:   return false;
+        case Backend::Cram:   return true;
         case Backend::Ppr:    return false;
         case Backend::Count:  break;
     }

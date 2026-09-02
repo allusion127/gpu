@@ -195,11 +195,62 @@ check("case Backend::Cmfd:   return true;" in CONVERTED
       and "case Backend::Nodal:  return true;" in CONVERTED,
       "CMFD, flat-XS and nodal are the three backends the tree narrows "
       "(WP20 landed the first two, WP20.1 the blocks and nodal)")
+check("case Backend::Cram:   return true;" in CONVERTED,
+      "WP20.2 converted CRAM: the four-pole partial-fraction sum accumulates "
+      "in float with a Neumaier compensation.  It is still gated behind "
+      "RASBERY_GPU_FP32_CRAM by inScope(), so the arm reports `declined` and "
+      "not `fp32` unless the extension is asked for explicitly")
 check("case Backend::Xe:     return false;" in CONVERTED
-      and "case Backend::Cram:   return false;" in CONVERTED
       and "case Backend::Ppr:    return false;" in CONVERTED,
-      "xe / cram / ppr are declared DEFERRED in the table rather than "
+      "xe / ppr are declared DEFERRED in the table rather than "
       "left to look converted")
+
+# WP20.2 -- CRAM: EXACTLY ONE ACCUMULATOR NARROWS, AND EVERY OTHER DOUBLE IN
+# THAT FILE HAS A NUMBER BEHIND IT.
+#
+# WP20 deferred CRAM with a reason -- "the partial-fraction terms alternate in
+# sign and cancel catastrophically" -- and an arm that narrowed the SOLVE would
+# not be testing that reason, it would be replacing it with a worse one.  So
+# what this section holds is the SCOPE: the pole sum and nothing else, with the
+# compensation that makes the cancellation question a fair one.
+CRAM_CODE = strip_comments(CRAM)
+check(CRAM_CODE.count("rasbery::fp32::routes(") == 1
+      and "rasbery::fp32::routes(rasbery::fp32::Backend::Cram)" in CRAM,
+      "the CRAM backend asks the arm exactly once, through routes(), which is "
+      "what folds RASBERY_GPU_FP32 AND RASBERY_GPU_FP32_CRAM into one answer")
+check('#include "GpuFp32Arm.h"' in CRAM, "src/CudaCramBackend.cu includes the arm header")
+check("_impl->fp32_pole = " in CRAM,
+      "and stores it on the Impl rather than in a function-local static -- that "
+      "TU has no process state by contract, and a width that could change "
+      "between a statepoint's predictor and its corrector would be two "
+      "arithmetics inside one depletion step")
+FOLD = body_after(CRAM, "__device__ inline void cramFoldPole(")
+check("*comp +=" in FOLD and "*acc = t;" in FOLD,
+      "cramFoldPole carries the bits the add could not hold instead of "
+      "discarding them")
+FINISH = body_after(CRAM, "__device__ inline unsigned int cramFinish(")
+check("kAlpha0 * iden[row]" in FINISH and "static_cast<float>" not in FINISH,
+      "the alpha_0 term stays DOUBLE on both arms: at 1.17e-08 x iden[row] it "
+      "is ~8 decades below its addend and would round to nothing in float, "
+      "which makes it the term with the least headroom in the expression")
+check("1.0e-13" in CRAM,
+      "kRelTol is still 1.0e-13 -- six decades below float eps -- which is the "
+      "proof that the Gauss-Seidel solve may not narrow: a float solve could "
+      "never satisfy the break test and would fail open on every node")
+for kern in ("kPredictor", "kCorrector", "kPredictorP4", "kCorrectorP4"):
+    check("template <bool FP32>\n__global__ void %s(DevCtx x)" % kern in CRAM,
+          "%s is templated on the width, so the two precisions are two "
+          "instantiations of one text" % kern)
+check(CRAM_CODE.count("<true><<<") == 4 and CRAM_CODE.count("<false><<<") == 4,
+      "four launches per width and no more: the mapping (serial/pole4) and the "
+      "width are independent, and neither may be read inside a kernel")
+check("const char* CramBackend::poleSumPrecision() const" in CRAM
+      and '"fp32" : "fp64"' in CRAM,
+      "the backend reports the width as a WORD, because a receipt that said "
+      "`true` would leave a reader to guess which of that file's many doubles "
+      "it was true about")
+check('\\"pole_sum\\":\\"{}\\"' in DRIVER and "c.poleSumPrecision()" in DRIVER,
+      "and the [RASBERY][CRAM_GPU] receipt prints it")
 
 
 # ---------------------------------------------------------------------------

@@ -159,7 +159,7 @@ def r_pole_sum_order(src: dict[str, str]) -> None:
     for body, what in ((serial, "serial"), (par, "pole-parallel")):
         assert "for (int row = 0; row < n; ++row) accr[row] = 0.0;" in body, \
             f"{what}: the accumulator must start at 0.0 for every row, as milk.h's std::fill does"
-        assert "return cramFinish(x, iden, accr);\n}" in body, \
+        assert "return cramFinish(x, iden, accr, FP32 ? accc : nullptr);\n}" in body, \
             f"{what}: the closing alpha0*N + 2*accum must go through the shared cramFinish"
 
     assert "for (int row = first; row < n; ++row) accr[row] += xr[row];" in serial, \
@@ -179,8 +179,32 @@ def r_pole_sum_order(src: dict[str, str]) -> None:
         "ascending row inside.  Any other nesting or any other source lane is a "
         "different sequence of double additions, and the arm stops being B0."
     )
-    assert cu.count("return cramFinish(x, iden, accr);") == 2, \
+    assert cu.count("return cramFinish(x, iden, accr, FP32 ? accc : nullptr);") == 2, \
         "cramFinish must be the ONE closing loop both arms run"
+
+    # WP20.2.  The pole-sum WIDTH is a third arm, and it must not become a
+    # fourth body: cramFinish is templated on the accumulator, cramFoldPole is
+    # the only compensated add, and the FP64 nest below is the one that shipped.
+    assert cu.count("template <bool FP32>\n__device__ unsigned int cramSolveNode") == 2, \
+        "the two mappings must each be ONE text with the width as a template " \
+        "parameter; a fourth copied body is a body that drifts"
+    assert "Acc accc[FP32 ? kNiso : 1];" in serial and "Acc accc[FP32 ? kNiso : 1];" in par, (
+        "the Neumaier compensation array must be SIZED by the template "
+        "parameter.  A runtime flag would make the FP64 arm carry 156 B/thread "
+        "it never touches, on the one kernel whose stated problem is "
+        "per-thread local state"
+    )
+    for body, what in ((serial, "serial"), (par, "pole-parallel")):
+        assert "if constexpr (FP32)" in body, \
+            f"{what}: the width branch must be compile-time, not a runtime test"
+        assert "cramFoldPole(&accr[row], &accc[row]," in body, \
+            f"{what}: the FP32 arm must fold through the compensated add"
+    fold = region(cu, "void cramFoldPole(", "\n}\n", "cramFoldPole")
+    assert "(cramMag(a) >= cramMag(v))" in fold, (
+        "cramFoldPole is plain Kahan, not Neumaier.  The four residues are "
+        "(+1.83, -2.44, +0.63, -0.028): the addend is routinely LARGER than the "
+        "running sum, which is exactly the case plain Kahan loses"
+    )
 
 
 def r_first_failing_pole(src: dict[str, str]) -> None:

@@ -5857,14 +5857,14 @@ public:
                     "\"gs_solves\":{},\"micx_h2d_mb\":{:.1f},"
                     "\"kernel_variant\":\"{}\",\"lanes_per_node\":{},"
                     "\"launches\":{},\"launch_us_mean\":{:.1f},"
-                    "\"bos_reuse\":{},\"wall_ms\":{:.3f},\"status\":\"{}\"}}\n",
+                    "\"bos_reuse\":{},\"pole_sum\":\"{}\",\"wall_ms\":{:.3f},\"status\":\"{}\"}}\n",
                     cmfd_solver.batchSlot(), c.predictorCalls(), c.predictorCalls(),
                     c.correctorCalls(), c.nodesSolved(), c.deviceOrdinal(),
                     cross_sections.cramHostFallbacks(), gs_mean, c.gsSolves(),
                     static_cast<double>(c.micxH2dBytes()) / (1024.0 * 1024.0),
                     c.kernelVariant(), c.lanesPerNode(), c.launches(),
                     c.launchUsMean(),
-                    c.bosReuses(), c.wallMs(), c.status());
+                    c.bosReuses(), c.poleSumPrecision(), c.wallMs(), c.status());
             }
         }
 

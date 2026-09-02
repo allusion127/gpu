@@ -35,5 +35,8 @@ double             CramBackend::wallMs() const { return 0.0; }
 int                CramBackend::deviceOrdinal() const { return -1; }
 unsigned long long CramBackend::micxH2dBytes() const { return 0; }
 unsigned long long CramBackend::bosReuses() const { return 0; }
+// WP20.2.  A CPU-only build ran no pole sum at all, so the honest word is
+// the one that says nothing was narrowed.
+const char*        CramBackend::poleSumPrecision() const { return "fp64"; }
 
 } // namespace rasbery

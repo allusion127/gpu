@@ -329,6 +329,15 @@ public:
     /// transfers, status drain and all -- which is not the number ncu prints
     /// for block 39; this one is, and -1 is "never measured" rather than 0.
     [[nodiscard]] double launchUsMean() const;
+    /// WP20.2.  "fp32" when the four-pole partial-fraction sum accumulated
+    /// in float with a Neumaier compensation, "fp64" otherwise.  A WORD and
+    /// not a bool because that is what the receipt prints, and because a
+    /// receipt that said `true` would leave a reader to guess which of this
+    /// backend's many doubles it was true ABOUT.  It is exactly one of them:
+    /// the accumulator `accr`.  Everything else -- the Gauss-Seidel solve,
+    /// its 1.0e-13 break test, the matrix split and the alpha_0 term -- stays
+    /// FP64 with a reason each, stated above cramFoldPole in the .cu.
+    [[nodiscard]] const char* poleSumPrecision() const;
 
 private:
     struct Impl;

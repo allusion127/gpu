@@ -12,6 +12,7 @@
 
 #include "CudaCramBackend.h"
 #include "GpuCaptureArbiter.h"
+#include "GpuFp32Arm.h"      // WP20.2: RASBERY_GPU_FP32_CRAM, the pole-sum arm
 #include "XferLedger.h"
 
 #include <cuda_runtime.h>
@@ -207,6 +208,104 @@ __device__ inline double cmagnitude(double re, double im) {
 }
 
 /// std::max for doubles: `(a < b) ? b : a`.  fmax is NOT the same function.
+// ---------------------------------------------------------------------------
+// WP20.2 -- RASBERY_GPU_FP32_CRAM: THE PARTIAL-FRACTION SUM, AND NOTHING ELSE.
+//
+// WP20 deferred CRAM with a reason rather than a shrug: "the partial-fraction
+// terms alternate in sign and cancel catastrophically, and float has no
+// headroom for that cancellation."  WP20.2 does not overturn that.  It narrows
+// the ONE place the claim is actually about and leaves every other double in
+// this file alone, so the arm answers the question WP20 asked instead of a
+// different one.
+//
+// WHAT IS NARROWED
+//
+//   accr[], the accumulator of `sum_p Re(x_p[row])` over the four poles.  Four
+//   addends whose residues are (+1.83, -2.44, +0.63, -0.028): alternating in
+//   sign, spanning two decades, and summing to something many decades smaller
+//   than any of them.  That is textbook catastrophic cancellation, and it is
+//   also textbook COMPENSATED-SUMMATION territory: Neumaier's variant of
+//   Kahan carries the lost low-order bits in a second float and adds them back,
+//   which recovers essentially the whole double-width sum for a four-term
+//   series.  Without the compensation the arm would measure float addition;
+//   with it, it measures whether the CANCELLATION is what actually needs the
+//   width.  That is the WP20 claim, so that is what this arm tests.
+//
+// WHAT STAYS DOUBLE, AND THE PROOF FOR EACH -- these are not hedges, each has
+// a number behind it:
+//
+//   1. kAlpha0 * iden[row], the alpha_0 term of the matrix exponential.  It is
+//      the ONE term that is not part of the pole sum, kAlpha0 is 1.17e-08, and
+//      it is added to a quantity of order iden[row]: the product is ~8 decades
+//      below its addend, so in float it would round to nothing at all.  It is
+//      the term with the LEAST headroom in the whole expression and it is
+//      cheap -- one multiply per row per node -- so it stays wide.
+//   2. THE GAUSS-SEIDEL SOLVE (cramPole), its residual sweep and its break
+//      test.  kRelTol is 1.0e-13, which is SIX DECADES below float eps
+//      (1.19e-07).  A float solve could never satisfy `max_residual <=
+//      kAbsTol + kRelTol * rhs_norm`, so it would burn all kMaxIter = 64
+//      sweeps on every node and then return kNoConverge -- the arm would not
+//      be slower-but-close, it would fail open on every node in the core.
+//      Widening the tolerance to match the arithmetic would change the answer,
+//      not the precision of the answer.  So the solve stays FP64 and this is
+//      an accumulator arm, not a solver arm.
+//   3. THE MATRIX SPLIT (cval / mdiag / the diagonal shift mdiag[row] - th_r).
+//      It is the solve's input; narrowing it would narrow the solve.
+//   4. CRAM'S CONDENSATION INPUTS.  The WP20.1 handover still WIDENS the
+//      flat-XS float block into d_mic (kCramWidenMic).  That decision belongs
+//      to the solve, and the solve is not what this arm narrows.
+//
+// SO THE ARM COSTS NO BYTES, and the doc says so rather than implying a
+// throughput claim it cannot make: accr as float plus its float compensation
+// is the same 312 B/thread the double accr was, and 144 additions per node is
+// not a bandwidth item.  This arm is a NUMERICAL PROBE with a receipt, which
+// is exactly why it is behind its own flag and off even under RASBERY_GPU_FP32.
+// ---------------------------------------------------------------------------
+
+/// The partial-fraction accumulator's type, selected at COMPILE time.
+///
+/// A trait rather than a runtime field of DevCtx because it sizes per-thread
+/// local arrays: with a runtime flag the FP64 arm would carry the compensation
+/// array's 156 B/thread it never touches, on the one kernel in this tree whose
+/// stated problem is per-thread local state.
+template <bool FP32>
+struct CramAcc { using type = double; };
+template <>
+struct CramAcc<true> { using type = float; };
+
+/// Two NON-TEMPLATE helpers, and they exist for a language reason rather than
+/// a numerical one.
+///
+/// `isfinite` and `fabs` are found by ORDINARY lookup at the point a template
+/// is DEFINED, not at the point it is instantiated -- there is no argument
+/// whose namespace could pull them in by ADL, because `double` has none.  In a
+/// non-template function they resolve against whichever math header the
+/// translation unit has; inside a template body they must resolve at phase 1,
+/// which is a portability question and not an arithmetic one.  Wrapping them
+/// here keeps every math name in this file resolved the way the pre-WP20.2
+/// non-template `cramFinish` resolved it, and it is the same discipline
+/// tools/test_dependent_template_contract.py holds the rest of the tree to.
+__device__ inline bool  cramFinite(double v) { return isfinite(v); }
+__device__ inline float cramMag(float v)     { return fabsf(v); }
+__device__ inline double cramMag(double v)   { return fabs(v); }
+
+/// Neumaier compensated add: `*acc += value`, with the bits the add could not
+/// hold accumulated in `*comp` instead of discarded.
+///
+/// Neumaier's variant rather than plain Kahan because the addends here are NOT
+/// small relative to the running sum -- pole 1's residue is larger than pole
+/// 0's partial -- and plain Kahan loses the compensation in exactly that case.
+/// The branch is on magnitudes, so it is uniform in neither direction and costs
+/// a select, not a divergence: every lane runs both sides of one fmax anyway.
+template <class Acc>
+__device__ inline void cramFoldPole(Acc* acc, Acc* comp, double value) {
+    const Acc a = *acc;
+    const Acc v = static_cast<Acc>(value);
+    const Acc t = a + v;
+    *comp += (cramMag(a) >= cramMag(v)) ? ((a - t) + v) : ((v - t) + a);
+    *acc = t;
+}
+
 __device__ inline double dmax(double a, double b) { return (a < b) ? b : a; }
 
 // ---------------------------------------------------------------------------
@@ -419,13 +518,24 @@ __device__ unsigned int cramPole(const DevCtx& x, const double* iden,
 /// `.real()` is the only projection taken -- so it is not carried here either;
 /// dropping a sum nothing reads changes no result and saves 312 B of local
 /// memory per thread on a kernel whose problem is per-thread state.
+///
+/// WP20.2: templated on the ACCUMULATOR type so both precisions close through
+/// ONE loop.  `comp` is the Neumaier compensation and is null on the FP64 arm,
+/// where there is nothing to add back; the alpha_0 term is evaluated in double
+/// on BOTH arms, because at 1.17e-08 x iden[row] it is the term with the least
+/// headroom in the expression and it costs one multiply per row.
+template <class Acc>
 __device__ inline unsigned int cramFinish(const DevCtx& x, double* iden,
-                                          const double* accr) {
+                                          const Acc* accr, const Acc* comp) {
     unsigned int status = kOk;
     for (int row = x.first; row < x.niso; ++row) {
-        double value = kAlpha0 * iden[row] + 2.0 * accr[row];
-        if (value < 0.0 && fabs(value) < 1.0e-12) value = 0.0;
-        if (!isfinite(value)) status |= kNonFinite;
+        const double sum = comp != nullptr
+                               ? static_cast<double>(accr[row]) +
+                                     static_cast<double>(comp[row])
+                               : static_cast<double>(accr[row]);
+        double value = kAlpha0 * iden[row] + 2.0 * sum;
+        if (value < 0.0 && cramMag(value) < 1.0e-12) value = 0.0;
+        if (!cramFinite(value)) status |= kNonFinite;
         iden[row] = value;
     }
     return status;
@@ -436,9 +546,15 @@ __device__ inline unsigned int cramFinish(const DevCtx& x, double* iden,
 /// exactly as every host call site passes it.  Returns a status mask; on
 /// anything non-zero `iden` is left in whatever state the partial solve reached,
 /// which is why the caller writes to staging.
+template <bool FP32>
 __device__ unsigned int cramSolveNode(const DevCtx& x, double* iden,
                                       const double* cond4, double sumflux,
                                       double dt, unsigned long long* gs_iters) {
+    // WP20.2.  The accumulator width is a TEMPLATE parameter and not a field of
+    // DevCtx, because it sizes per-thread local arrays on the kernel whose
+    // whole problem is per-thread local state: a runtime flag would make the
+    // FP64 arm pay for the compensation array it never touches.
+    using Acc = typename CramAcc<FP32>::type;
     const int n     = x.niso;
     const int first = x.first;
 
@@ -448,8 +564,11 @@ __device__ unsigned int cramSolveNode(const DevCtx& x, double* iden,
     double        mdiag[kNiso];
     cramBuildSplit(x, cond4, sumflux, dt, cval, ccol, cend, mdiag);
 
-    double accr[kNiso];
+    Acc accr[kNiso];
+    Acc accc[FP32 ? kNiso : 1];
     for (int row = 0; row < n; ++row) accr[row] = 0.0;
+    if constexpr (FP32)
+        for (int row = 0; row < n; ++row) accc[row] = 0.0;
 
     double xr[kNiso], xi[kNiso];
 
@@ -465,10 +584,14 @@ __device__ unsigned int cramSolveNode(const DevCtx& x, double* iden,
         *gs_iters += static_cast<unsigned long long>(iters);
         if (st != kOk) return st;
 
+        if constexpr (FP32) {
+            for (int row = first; row < n; ++row)
+                cramFoldPole(&accr[row], &accc[row], xr[row]);
+        } else
         for (int row = first; row < n; ++row) accr[row] += xr[row];
     }
 
-    return cramFinish(x, iden, accr);
+    return cramFinish(x, iden, accr, FP32 ? accc : nullptr);
 }
 
 /// The SAME solve with the four poles on four lanes of one warp (WP21-D).
@@ -486,10 +609,12 @@ __device__ unsigned int cramSolveNode(const DevCtx& x, double* iden,
 ///     __shfl_sync supplying pole p's value.  That is the serial loop nest with
 ///     ONE substitution, so it is the same sequence of double additions and not
 ///     merely an equivalent one -- which is what makes this arm B0, not N1.
+template <bool FP32>
 __device__ unsigned int cramSolveNodePole4(const DevCtx& x, double* iden,
                                            const double* cond4, double sumflux,
                                            double dt, unsigned long long* gs_iters,
                                            int pole, unsigned int mask, int base) {
+    using Acc = typename CramAcc<FP32>::type;
     const int n     = x.niso;
     const int first = x.first;
 
@@ -532,14 +657,28 @@ __device__ unsigned int cramSolveNodePole4(const DevCtx& x, double* iden,
     // `for (pole) for (row) accr[row] += xr[row]` with pole p's `xr[row]` fetched
     // from the lane that owns pole p.  Same nesting, same direction, same four
     // addends in the same order into the same zero-initialised accumulator.
-    double accr[kNiso];
+    Acc accr[kNiso];
+    Acc accc[FP32 ? kNiso : 1];
     for (int row = 0; row < n; ++row) accr[row] = 0.0;
+    if constexpr (FP32)
+        for (int row = 0; row < n; ++row) accc[row] = 0.0;
+    // The shuffles are OUTSIDE the precision branch in both arms -- same source
+    // lane, same p-outside/row-inside nesting, same four addends in the same
+    // order.  Only what is done WITH the fetched value differs, which is what
+    // keeps the FP32 arm the FP64 arm's sequence and not a different one.
+    if constexpr (FP32) {
+        for (int p = 0; p < kPoleCount; ++p) {
+            for (int row = first; row < n; ++row)
+                cramFoldPole(&accr[row], &accc[row],
+                             __shfl_sync(mask, xr[row], base + p));
+        }
+    } else
     for (int p = 0; p < kPoleCount; ++p) {
         for (int row = first; row < n; ++row)
             accr[row] += __shfl_sync(mask, xr[row], base + p);
     }
 
-    return cramFinish(x, iden, accr);
+    return cramFinish(x, iden, accr, FP32 ? accc : nullptr);
 }
 
 /// ComputeXeEquilibrium + ApplyXeEquilibrium, transcribed.
@@ -639,6 +778,7 @@ __device__ inline void predictorEpilogue(const DevCtx& x, int l, double* iden,
 }
 
 /// XSSet::Deplete's per-node body (DepleteNode, ngrp == 2 branch), serial arm.
+template <bool FP32>
 __global__ void kPredictor(DevCtx x) {
     const int l = blockIdx.x * blockDim.x + threadIdx.x;
     if (l >= x.nxyz) return;
@@ -649,12 +789,14 @@ __global__ void kPredictor(DevCtx x) {
     predictorPrologue(x, l, cond4, iden, &sumflux);
 
     unsigned long long gs     = 0;
-    const unsigned int status = cramSolveNode(x, iden, cond4, sumflux, x.dt, &gs);
+    const unsigned int status =
+        cramSolveNode<FP32>(x, iden, cond4, sumflux, x.dt, &gs);
 
     predictorEpilogue(x, l, iden, cond4, sumflux, status, gs);
 }
 
 /// The same body with kLanesPerNode lanes per node, lane == pole (WP21-D).
+template <bool FP32>
 __global__ void kPredictorP4(DevCtx x) {
     const int gtid = blockIdx.x * blockDim.x + threadIdx.x;
     const int l    = gtid / kLanesPerNode;
@@ -676,7 +818,7 @@ __global__ void kPredictorP4(DevCtx x) {
 
     unsigned long long gs = 0;
     const unsigned int status =
-        cramSolveNodePole4(x, iden, cond4, sumflux, x.dt, &gs, pole, mask, base);
+        cramSolveNodePole4<FP32>(x, iden, cond4, sumflux, x.dt, &gs, pole, mask, base);
 
     if (pole == 0) predictorEpilogue(x, l, iden, cond4, sumflux, status, gs);
 }
@@ -792,6 +934,7 @@ __device__ inline void correctorEpilogue(const DevCtx& x, int l, double* iden,
 }
 
 /// XSSet::CorrectorStep's per-node body, pcSubsteps == 1, serial arm.
+template <bool FP32>
 __global__ void kCorrector(DevCtx x) {
     const int l = blockIdx.x * blockDim.x + threadIdx.x;
     if (l >= x.nxyz) return;
@@ -803,12 +946,14 @@ __global__ void kCorrector(DevCtx x) {
     correctorPrologue(x, l, cond4, iden, &sumflux, &burn);
 
     unsigned long long gs     = 0;
-    const unsigned int status = cramSolveNode(x, iden, cond4, sumflux, x.dt, &gs);
+    const unsigned int status =
+        cramSolveNode<FP32>(x, iden, cond4, sumflux, x.dt, &gs);
 
     correctorEpilogue(x, l, iden, cond4, sumflux, burn, status, gs);
 }
 
 /// The same body with kLanesPerNode lanes per node, lane == pole (WP21-D).
+template <bool FP32>
 __global__ void kCorrectorP4(DevCtx x) {
     const int gtid = blockIdx.x * blockDim.x + threadIdx.x;
     const int l    = gtid / kLanesPerNode;
@@ -826,7 +971,7 @@ __global__ void kCorrectorP4(DevCtx x) {
 
     unsigned long long gs = 0;
     const unsigned int status =
-        cramSolveNodePole4(x, iden, cond4, sumflux, x.dt, &gs, pole, mask, base);
+        cramSolveNodePole4<FP32>(x, iden, cond4, sumflux, x.dt, &gs, pole, mask, base);
 
     if (pole == 0) correctorEpilogue(x, l, iden, cond4, sumflux, burn, status, gs);
 }
@@ -848,6 +993,11 @@ struct CramBackend::Impl {
     /// so the A/B has a same-binary control arm and so a regression can be
     /// bisected to the mapping rather than to the build.
     Variant     variant      = Variant::kPole4;
+    /// WP20.2.  RASBERY_GPU_FP32 + RASBERY_GPU_FP32_CRAM: the four-pole
+    /// partial-fraction sum accumulates in float with a Neumaier compensation.
+    /// Nothing else in this file narrows -- see the note above cramFoldPole for
+    /// the proof behind each term that stays wide.
+    bool        fp32_pole    = false;
     std::string variant_text = "pole4";
     /// RASBERY_GPU_CRAM_TIMING: bracket the KERNEL with a second event pair.
     bool        timing = false;
@@ -1226,6 +1376,17 @@ CramBackend::CramBackend() : _impl(new Impl) {
         }
     }
     _impl->timing = truthy(std::getenv("RASBERY_GPU_CRAM_TIMING"));
+    // WP20.2.  The pole-sum width, resolved ONCE here and stored on the Impl
+    // rather than in a function-local static -- this TU has no process state by
+    // contract (tools/test_cram_gpu_contract.py's r_no_process_state), and a
+    // width that could change between the predictor and the corrector of one
+    // statepoint would be two arithmetics inside one depletion step.
+    //
+    // routes() already folds the double gate the arm declares: RASBERY_GPU_FP32
+    // AND RASBERY_GPU_FP32_CRAM, because CRAM is the one backend the device-wide
+    // arm does NOT extend to by default.
+    _impl->fp32_pole = rasbery::fp32::routes(rasbery::fp32::Backend::Cram);
+    if (_impl->fp32_pole) _impl->status_text += " [fp32 pole sum]";
 }
 
 CramBackend::~CramBackend() = default;
@@ -1251,6 +1412,10 @@ double CramBackend::launchUsMean() const {
     // -1 is "never measured", which reads very differently from "measured 0".
     if (!_impl->timing || _impl->n_launches == 0) return -1.0;
     return _impl->kernel_ms * 1000.0 / static_cast<double>(_impl->n_launches);
+}
+
+const char* CramBackend::poleSumPrecision() const {
+    return _impl->fp32_pole ? "fp32" : "fp64";
 }
 
 namespace {
@@ -1364,10 +1529,16 @@ bool CramBackend::predictor(const cram::LibView& lib, const cram::PredictorView&
     const int blocks = s.gridFor(v.nxyz);
     cudaEventRecord(s.ev_start, s.stream);
     if (s.timing) cudaEventRecord(s.ev_k0, s.stream);
-    if (s.variant == Variant::kPole4)
-        kPredictorP4<<<blocks, s.block, 0, s.stream>>>(x);
-    else
-        kPredictor<<<blocks, s.block, 0, s.stream>>>(x);
+    // WP20.2.  Four instantiations of two texts: the mapping (serial / pole4)
+    // and the pole-sum width are independent, and neither may be read inside a
+    // kernel -- the width sizes a local array and the mapping sizes the grid.
+    if (s.variant == Variant::kPole4) {
+        if (s.fp32_pole) kPredictorP4<true><<<blocks, s.block, 0, s.stream>>>(x);
+        else             kPredictorP4<false><<<blocks, s.block, 0, s.stream>>>(x);
+    } else {
+        if (s.fp32_pole) kPredictor<true><<<blocks, s.block, 0, s.stream>>>(x);
+        else             kPredictor<false><<<blocks, s.block, 0, s.stream>>>(x);
+    }
     if (s.timing) cudaEventRecord(s.ev_k1, s.stream);
     if ((rc = cudaGetLastError()) != cudaSuccess) return s.fail("kPredictor launch", rc);
 
@@ -1473,10 +1644,13 @@ bool CramBackend::corrector(const cram::LibView& lib, const cram::CorrectorView&
     const int blocks = s.gridFor(v.nxyz);
     cudaEventRecord(s.ev_start, s.stream);
     if (s.timing) cudaEventRecord(s.ev_k0, s.stream);
-    if (s.variant == Variant::kPole4)
-        kCorrectorP4<<<blocks, s.block, 0, s.stream>>>(x);
-    else
-        kCorrector<<<blocks, s.block, 0, s.stream>>>(x);
+    if (s.variant == Variant::kPole4) {
+        if (s.fp32_pole) kCorrectorP4<true><<<blocks, s.block, 0, s.stream>>>(x);
+        else             kCorrectorP4<false><<<blocks, s.block, 0, s.stream>>>(x);
+    } else {
+        if (s.fp32_pole) kCorrector<true><<<blocks, s.block, 0, s.stream>>>(x);
+        else             kCorrector<false><<<blocks, s.block, 0, s.stream>>>(x);
+    }
     if (s.timing) cudaEventRecord(s.ev_k1, s.stream);
     if ((rc = cudaGetLastError()) != cudaSuccess) return s.fail("kCorrector launch", rc);
 
