@@ -337,13 +337,19 @@ for kernel in ("kernelFlatXsCta", "kernelFlatXsCtaF32"):
 
 def rule_narrow_defaults_off(cta: str) -> bool:
     """Every caller that predates the arm -- the replay gate included -- must
-    keep launching exactly the kernel it launched before."""
-    return "bool narrow = false)" in cta
+    keep launching exactly the kernel it launched before.
+
+    WP21-B2 appended a second optional parameter (the node tile) on the same
+    terms, so the defaults are checked TOGETHER: `narrow = false` selects the
+    FP64 workspace and `tile = 1` selects the untiled body, which between them
+    are the pre-WP20 / pre-WP21-B2 launch exactly."""
+    return "bool narrow = false, int tile = 1)" in cta
 
 
 check(rule_narrow_defaults_off(CTA),
-      "flatxsCtaLaunch's precision parameter DEFAULTS TO FALSE, which is what "
-      "the feature-off byte-identity claim rests on")
+      "flatxsCtaLaunch's precision parameter DEFAULTS TO FALSE and its tile "
+      "parameter DEFAULTS TO 1, which is what the feature-off byte-identity "
+      "claim rests on")
 
 try:
     LAUNCH = body_after(CTA, "inline void flatxsCtaLaunch(")
@@ -379,8 +385,13 @@ check(strip_comments(SOLVE).count("rasbery::fp32::routes(") == 0
       "flatxsNarrowBlocks(), because the answer now fixes an ALLOCATION made "
       "in ensure() and a per-call read could disagree with the block that "
       "exists")
-check("fxs::flatxsCtaLaunch(v, rasberyGpuFlatXsCtaThreads(), d.stream, narrow);" in SOLVE,
-      "the precision travels with the launch rather than through a global")
+check("fxs::flatxsCtaLaunch(v, cta_threads, d.stream, narrow, tile);" in SOLVE
+      and "const bool narrow = narrow_blocks;" in SOLVE,
+      "the precision travels with the launch rather than through a global "
+      "(WP21-B2 put the node tile on the same argument list for the same "
+      "reason: both are compile-time properties of the kernel that is about to "
+      "run, so both have to be decided before the launch and neither may wobble "
+      "between two calls of one run)")
 check("kernelFlatXs<<<grid, block, 0, d.stream>>>(v);" in SOLVE,
       "the thread-per-node reference arm is untouched and still reachable")
 check("rasbery::fp32::noteDemotion(rasbery::fp32::Backend::FlatXs);" in SOLVE,

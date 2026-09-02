@@ -432,6 +432,26 @@ namespace fxs = rasbery::flatxs;
 
 std::atomic<unsigned long long> g_flatxs_nodes_solved{0};
 
+// --- WP21-B2: the flat-XS CTA TILE receipt ([RASBERY][FLATXS][GPU]) -------
+//
+// PROCESS-WIDE, like g_flatxs_nodes_solved beside it and for the same reason:
+// the number a reader wants is what the RUN did.
+//
+//   g_flatxs_cta_tile        nodes per CTA the launcher RESOLVED to (not what
+//                            was asked for -- the ladder clamps by shared
+//                            memory and by the 1,024-thread block cap, and a
+//                            receipt that printed the request would let a
+//                            clamped run be read as an unclamped one).  0 until
+//                            the first tiled launch; 1 means the untiled arm.
+//   g_flatxs_cta_tiles       full tiles launched, summed over calls.
+//   g_flatxs_cta_tail_nodes  nodes that fell to the untiled tail kernel.
+//
+// tiles*tile + tail == nodes_solved is the identity a reader can check on the
+// receipt line without knowing the deck.
+std::atomic<int>                g_flatxs_cta_tile{0};
+std::atomic<unsigned long long> g_flatxs_cta_tiles{0};
+std::atomic<unsigned long long> g_flatxs_cta_tail_nodes{0};
+
 // --- WP15: the micx/lmpx residency receipt ([RASBERY][MICX]) --------------
 //
 // PROCESS-WIDE, for the same reason g_nodal_drives is: the number a reader
@@ -4188,10 +4208,34 @@ bool XsReconBackend::solveFlatXs(const fxs::FlatXsView& host,
     // blocks and one of them writing double into a float block would be a
     // silent corruption rather than a slower answer.  What the reference arm
     // demotes is only the WORKSPACE.
+    //
+    // WP21-B2 ADDS THE TILE ON THE SAME TERMS AGAIN, and again without a second
+    // dispatch point.  `tile` is how many consecutive entries of `v.nodes` one
+    // CTA takes; the transposed store it buys is the whole subject of
+    // docs/WP21_B2C2_COALESCING_20260831_KO.md.  It is resolved HERE rather
+    // than inside the launcher because the receipt has to state the tile that
+    // RAN: the ladder clamps by shared memory and by the block cap, and the
+    // FP64 and FP32 arms clamp to different entries (4 and 8) at the same
+    // 29,408 B/CTA.  Like the block size, and by the same (P1), every entry
+    // writes the same bytes -- so a bad value is clamped down the ladder and
+    // never fails a run.
     static const bool cta = rasberyGpuFlatXsCtaEnabled();
     const bool narrow = narrow_blocks;
     if (cta) {
-        fxs::flatxsCtaLaunch(v, rasberyGpuFlatXsCtaThreads(), d.stream, narrow);
+        const int cta_threads = rasberyGpuFlatXsCtaThreads();
+        const int tile_req    = rasberyGpuFlatXsCtaTile();
+        const int tile_ask    = tile_req > 0 ? tile_req
+                                             : (narrow ? fxs::CTA_TILE_DEFAULT_F32
+                                                       : fxs::CTA_TILE_DEFAULT);
+        const int tile = fxs::flatxsCtaTileResolved(cta_threads, narrow, tile_ask);
+        fxs::flatxsCtaLaunch(v, cta_threads, d.stream, narrow, tile);
+        g_flatxs_cta_tile.store(tile, std::memory_order_relaxed);
+        g_flatxs_cta_tiles.fetch_add(
+            static_cast<unsigned long long>(host.n_nodes / tile),
+            std::memory_order_relaxed);
+        g_flatxs_cta_tail_nodes.fetch_add(
+            static_cast<unsigned long long>(host.n_nodes % tile),
+            std::memory_order_relaxed);
         if (narrow)
             // The shared workspace is 919 elements per CTA and there is one CTA
             // per node: this is the footprint delta of THIS launch, in the same
@@ -5815,6 +5859,25 @@ int rasberyGpuFlatXsCtaThreads() {
     return threads;
 }
 
+int rasberyGpuFlatXsCtaTile() {
+    // WP21-B2.  Read once, UNCLAMPED, and 0 means "the arm's own default" --
+    // which differs between the FP64 and FP32 workspaces (4 and 8, the same
+    // 29,408 B/CTA), so the default cannot be resolved here where the arm is
+    // not yet known.  fxs::flatxsCtaTileResolved does the clamping at the
+    // dispatch point, and the receipt prints what it returned.
+    //
+    // A NEGATIVE OR ZERO REQUEST IS THE DEFAULT, not the untiled arm: the way
+    // to ask for the untiled arm is RASBERY_GPU_FLATXS_CTA_TILE=1, which is
+    // also the pre-WP21-B2 text and the A/B reference.
+    static const int tile = [] {
+        const char* v = std::getenv("RASBERY_GPU_FLATXS_CTA_TILE");
+        if (v == nullptr) return 0;
+        const int n = std::atoi(v);
+        return n > 0 ? n : 0;
+    }();
+    return tile;
+}
+
 bool rasberyGpuNodalEnabled() {
     static const bool on = envFlagEnabled("RASBERY_GPU_NODAL");
     return on;
@@ -5897,6 +5960,18 @@ unsigned long long rasberyGpuXsReconNodes() {
 
 unsigned long long rasberyGpuFlatXsNodes() {
     return g_flatxs_nodes_solved.load(std::memory_order_relaxed);
+}
+
+int rasberyGpuFlatXsCtaTileRan() {
+    return g_flatxs_cta_tile.load(std::memory_order_relaxed);
+}
+
+unsigned long long rasberyGpuFlatXsCtaTilesLaunched() {
+    return g_flatxs_cta_tiles.load(std::memory_order_relaxed);
+}
+
+unsigned long long rasberyGpuFlatXsCtaTailNodes() {
+    return g_flatxs_cta_tail_nodes.load(std::memory_order_relaxed);
 }
 
 } // namespace rasbery

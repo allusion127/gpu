@@ -52,9 +52,24 @@ def main(argv: list[str] | None = None) -> int:
         if token not in source:
             fail(f"rollback token removed: {token}")
 
-    sync = source.find('const cudaError_t src = cudaStreamSynchronize(_stream);')
-    commit = source.find('sl.xsrf_mirror.commit', sync)
-    if sync < 0 or commit < sync:
+    # STALE ANCHOR, REPAIRED (WP21-B2).  This rule was written against the raw
+    # `cudaStreamSynchronize(_stream)`; WP13.1 (914f6b3) routed every sync in
+    # the tree through `rasbery::xfer::streamSync` so the transfer ledger could
+    # name it, and the literal here was never moved -- so the rule has been
+    # failing since that commit while the INVARIANT it guards stayed true.
+    #
+    # The invariant is unchanged and is now spelled in three parts rather than
+    # two, which is stronger: the drain, the check that the drain SUCCEEDED,
+    # and only then the mirror commits.  A commit that happened before the
+    # failure check would describe bytes that may never have reached the
+    # device -- the exact "finite, plausible, wrong" shape this tree guards.
+    sync = source.find(
+        'rasbery::xfer::streamSync("CudaXsReconBackend.cu:NodalArena::launchBatch"')
+    guard = source.find(
+        'if (src != cudaSuccess) { fail("nodal arena drain", src); return false; }',
+        sync)
+    commit = source.find('sl.xsrf_mirror.commit', guard)
+    if sync < 0 or guard < sync or commit < guard:
         fail("mirror commit is not after a successful stream synchronize")
 
     for token in ('PendingXsMirror', 'pending_xs.reserve', 'pending_xs.push_back'):

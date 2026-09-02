@@ -17,6 +17,13 @@
 // ladder) and CTA vs the capture.  T defaults to flatxs::CTA_THREADS_DEFAULT;
 // run it at 64, 128 and 256, because a block size that changed the bytes would
 // mean the lane-ownership invariant (P1 in FlatXsCtaKernel.cuh) is broken.
+//
+// WP21-B2: RASBERY_GPU_FLATXS_CTA_TILE=<n> selects the same tile the backend
+// selects, THROUGH THE SAME LADDER HELPER, so this gate can certify the tiled
+// arm.  The tile permutes lane ownership exactly as the block size does, so
+// the pass condition is unchanged and stronger to read: run --cta at
+// tile = 1, 2, 4 (and 8 on the FP32 workspace) and every one of them must
+// report cta_vs_ref_mismatches = 0.
 
 #include "../src/FlatXsCtaKernel.cuh"
 #include "../src/FlatXsKernel.h"
@@ -190,6 +197,16 @@ int main(int argc, char** argv) {
     const bool cta_mode = argc > 2 && std::string(argv[2]) == "--cta";
     const int  cta_threads =
         (cta_mode && argc > 3) ? std::atoi(argv[3]) : fxs::CTA_THREADS_DEFAULT;
+    // WP21-B2.  Read from the environment rather than argv so the existing
+    // positional grammar (`--cta [T]`) is untouched and every caller that
+    // predates the tile keeps launching tile 1.  Resolved through the SAME
+    // helper the backend calls, so the gate cannot certify a tile production
+    // never runs.
+    const int cta_tile = [&] {
+        const char* e = std::getenv("RASBERY_GPU_FLATXS_CTA_TILE");
+        const int   n = (e == nullptr) ? 1 : std::atoi(e);
+        return fxs::flatxsCtaTileResolved(cta_threads, false, n > 0 ? n : 1);
+    }();
     if (one_mode && argc > 4) {
         const int maxd = std::atoi(argv[4]);
         if (cnt[static_cast<std::size_t>(one_idx)] > maxd)
@@ -344,7 +361,7 @@ int main(int argc, char** argv) {
         for (int xt = 0; xt < xsr::NXS; ++xt) c.xs[xt] = up(xsa[xt]);
         c.xs_ssm = up(xs_ssm);
         c.iden   = up(iden);
-        fxs::flatxsCtaLaunch(c, cta_threads, nullptr);
+        fxs::flatxsCtaLaunch(c, cta_threads, nullptr, false, cta_tile);
         TRY(cudaGetLastError());
         TRY(cudaDeviceSynchronize());
     }
@@ -419,11 +436,11 @@ int main(int argc, char** argv) {
                 " worst_ulp=%" PRIu64 " -> %s\n",
                 n_nodes, bad, worst, bad == 0 ? "PASS" : "FAIL");
     if (cta_mode) {
-        std::printf("[flatxs_device_replay --cta threads=%d] "
+        std::printf("[flatxs_device_replay --cta threads=%d tile=%d] "
                     "cta_vs_ref_mismatches=%" PRIu64 "  "
                     "cta_vs_capture_mismatches=%" PRIu64 " worst_ulp=%" PRIu64
                     " -> %s\n",
-                    cta_threads, ab_bad, cta_bad, cta_worst,
+                    cta_threads, cta_tile, ab_bad, cta_bad, cta_worst,
                     (ab_bad == 0 && cta_bad == 0) ? "PASS" : "FAIL");
         return (bad == 0 && ab_bad == 0 && cta_bad == 0) ? 0 : 1;
     }

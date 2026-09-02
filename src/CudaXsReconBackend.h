@@ -576,6 +576,28 @@ bool rasberyGpuFlatXsCtaEnabled();
 /// element's accumulation chain lives inside one lane whatever the block size.
 int rasberyGpuFlatXsCtaThreads();
 
+/// WP21-B2: nodes per CTA for that arm (RASBERY_GPU_FLATXS_CTA_TILE).
+/// Returned RAW and UNCLAMPED; 0 means "the arm's own default", which is
+/// flatxs::CTA_TILE_DEFAULT on the FP64 workspace and CTA_TILE_DEFAULT_F32 on
+/// the FP32 one -- the same 29,408 B of shared memory either way.  1 is the
+/// untiled, pre-WP21-B2 arm and the A/B reference.
+///
+/// PERFORMANCE ONLY, for the same reason the thread count is: the tile changes
+/// WHICH LANE stores a byte, never which byte -- every element's accumulation
+/// chain still lives inside one lane, so the ladder produces identical output.
+/// That is also why it is deliberately NOT in Driver.h's trajectory::kArmEnv
+/// (the RASBERY_GPU_MICX_RESIDENT precedent); tools/test_flatxs_cta_contract.py
+/// asserts the absence so the decision cannot be forgotten.
+int rasberyGpuFlatXsCtaTile();
+
+/// WP21-B2 receipt: the tile the launcher RESOLVED to on the last flat-XS
+/// launch (0 before any), the number of full tiles launched over the run, and
+/// the nodes that fell to the untiled tail kernel.  `tiles*tile + tail`
+/// reconstructs rasberyGpuFlatXsNodes().
+int                rasberyGpuFlatXsCtaTileRan();
+unsigned long long rasberyGpuFlatXsCtaTilesLaunched();
+unsigned long long rasberyGpuFlatXsCtaTailNodes();
+
 /// Receipt accessor mirroring XsReconBackend::nodesSolved for main.cpp.
 unsigned long long rasberyGpuXsReconNodes();
 

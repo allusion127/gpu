@@ -529,7 +529,7 @@ check(
     "the replay tool has a --cta mode",
 )
 check(
-    "fxs::flatxsCtaLaunch(c, cta_threads, nullptr);" in REPLAY,
+    "fxs::flatxsCtaLaunch(c, cta_threads, nullptr, false, cta_tile);" in REPLAY,
     "the replay tool launches through the SAME ladder helper the backend uses, "
     "so the gate cannot certify a block size production never runs",
 )
@@ -564,6 +564,274 @@ check(
     "the doc records that the 39.9 % share is the tracker's R1 figure and must "
     "be re-measured before adoption",
 )
+
+
+# ---------------------------------------------------------------------------
+# 11. WP21-B2 -- THE TILED ARM.
+#
+# The tiled body is a SECOND copy of the arithmetic, deliberately (the reason
+# is written at the top of the WP21-B2 block in src/FlatXsCtaKernel.cuh: the
+# untiled body has to stay the bisectable A/B reference, and two arms that are
+# one text cannot be bisected).  Duplicated arithmetic is a drift risk and this
+# section is the price paid for it: every structural rule sections 4-7 apply to
+# `flatxsSolveNodeCta` is applied AGAIN to `flatxsSolveTileCta`, against the
+# same reference `flatxsSolveNode`.  A site that changes in one body and not
+# the other fails the census here.
+#
+# The one rule that is NOT the same is lane ownership, because permuting lane
+# ownership is exactly what the tile does.  (P1) is preserved in the stronger
+# form: every phase walks a lane-owned space, but there are now TWO spaces --
+# the delta-stream phase walks ONE node's ordinals with `q = lane; q < Q_x;
+# q += T` (which is what keeps the coefficient reads stride-1), and every other
+# phase walks the (ordinal, node) product with `p = tid; p < Q_x * TILE;
+# p += NT` and node INNERMOST (which is what makes the store contiguous).
+# ---------------------------------------------------------------------------
+TILE_BODY = body_of(CTA, "flatxsSolveTileCta(const FlatXsView& v, int i0,",
+                    "/// The static-__shared__ ceiling")
+TILE_STREAM = body_of(TILE_BODY, "for (int s = s0; s < s1; ++s) {",
+                      "// --- 3. Densities")
+
+check(
+    rule_form_bits_match(REF_BODY, TILE_BODY),
+    "every FormBit appears the same number of times in flatxsSolveTileCta as in "
+    "flatxsSolveNode -- the tiled arm is the same sites in the same forms",
+)
+check(
+    rule_form_bits_match(CTA_BODY, TILE_BODY),
+    "the tiled body and the untiled body carry the SAME FormBit census -- the "
+    "duplication cannot drift in one direction only",
+)
+check(
+    rule_iso_fold_is_sequential(TILE_BODY),
+    "both macro-XS folds of the tiled body run `for (int iso = 0; iso < NISO; "
+    "++iso)` -- ascending, sequential, one lane per output chain (P2)",
+)
+check(
+    rule_no_bare_multiply_add(TILE_BODY),
+    "no bare `a * b + c` in the tiled body either",
+)
+check(
+    rule_stream_loop_has_no_barrier(TILE_STREAM),
+    "the tiled delta-stream loop contains NO __syncthreads(): the tile slots "
+    "have different stream lengths, so a barrier here would make every slot "
+    "wait for the longest one, once per delta (P3)",
+)
+check(
+    re.search(r"for\s*\(int\s+ige\s*=\s*0;\s*ige\s*<\s*NG;\s*\+\+ige\)\s*\n?\s*"
+              r"rf\s*\+=", TILE_BODY) is not None,
+    "the tiled XSRF sum stays a per-ig sequential `rf +=` chain",
+)
+
+# (P1), tiled form.  The delta-stream phase is group-owned over ONE node.
+TILE_LANE_LOOP = re.compile(
+    r"for\s*\(int\s+(\w+)\s*=\s*lane;\s*\1\s*<\s*(Q_LMP|Q_LSM|Q_MIC|Q_MSM);"
+    r"\s*\1\s*\+=\s*T\)")
+# Every other phase walks (ordinal, node) with the NODE INNERMOST.
+TILE_PROD_LOOP = re.compile(
+    r"for\s*\(int\s+(\w+)\s*=\s*tid;\s*\1\s*<\s*(Q_LMP|Q_LSM|Q_MIC|Q_MSM|NISO|NG)"
+    r"\s*\*\s*TILE;\s*\1\s*\+=\s*NT\)")
+ANY_TILE_LOOP = re.compile(r"for\s*\(int\s+(\w+)\s*=\s*[^;]+;\s*\1\s*<\s*"
+                           r"(Q_LMP|Q_LSM|Q_MIC|Q_MSM)")
+
+
+def rule_tile_loops_are_lane_owned(body: str) -> bool:
+    good = {m.start() for m in TILE_LANE_LOOP.finditer(body)}
+    good |= {m.start() for m in TILE_PROD_LOOP.finditer(body)}
+    every = {m.start() for m in ANY_TILE_LOOP.finditer(body)}
+    return every <= good and len(good) > 0
+
+
+check(
+    rule_tile_loops_are_lane_owned(TILE_BODY),
+    "every Q_* loop in flatxsSolveTileCta is lane-owned: `q = lane; q < Q_x; "
+    "q += T` in the delta-stream phase, `p = tid; p < Q_x * TILE; p += NT` "
+    "everywhere else (P1)",
+)
+check(
+    len(TILE_LANE_LOOP.findall(TILE_BODY)) == 4,
+    "the delta-stream phase keeps ALL FOUR of its ordinal walks group-owned -- "
+    "moving any of them to the node-innermost mapping would give each lane a "
+    "different `base` and scatter the stride-1 coefficient reads",
+)
+check(
+    len(TILE_PROD_LOOP.findall(TILE_BODY)) == 12,
+    "the twelve node-innermost walks are present (gather 4 + density 1 + "
+    "scatter 4 + macro 2 + XSDF/XSRF 1)",
+)
+
+
+def rule_tile_decomposes_node_innermost(body: str) -> bool:
+    """`q = p / TILE; j = p - q * TILE` and nothing else.
+
+    The transpose IS this decomposition.  `q = p % TILE` with `j = p / TILE`
+    compiles, runs, produces plausible cross sections -- and puts the ORDINAL
+    innermost, which is the layout the kernel already had.  The whole WP would
+    then be a barrier and a shared-memory copy for nothing, with no error
+    anywhere.
+    """
+    dec = re.findall(r"const int\s+(\w+)\s*=\s*p\s*/\s*TILE;", body)
+    off = re.findall(r"const int\s+(\w+)\s*=\s*p\s*-\s*\w+\s*\*\s*TILE;", body)
+    if len(dec) != len(off) or not dec:
+        return False
+    return all(o == "j" for o in off)
+
+
+check(
+    rule_tile_decomposes_node_innermost(TILE_BODY),
+    "every node-innermost phase decomposes `p` as (q = p / TILE, j = p % TILE) "
+    "-- the NODE is the fast axis, which is the entire point of the transpose",
+)
+check(
+    TILE_BODY.count("__syncthreads();") == 3,
+    "exactly three barriers in the tiled body: one publishing the transposed "
+    "gather, one publishing the workspace + iden, one publishing the macro "
+    "stores the XSDF/XSRF pass re-reads from global",
+)
+check(
+    "sh_l[j]" in TILE_BODY and "v.nodes[" not in TILE_BODY,
+    "the tile reads its node ids ONCE into __shared__ and indexes sh_l[] "
+    "afterwards -- a per-element `v.nodes[i0+j]` would be a node-strided load "
+    "reintroduced inside the phase that exists to remove one",
+)
+
+# --- the shared-memory budget ---------------------------------------------
+#
+# Recomputed from the SAME constants the workspace is sized from, so a change
+# to the isotope registry moves this budget instead of silently overflowing the
+# 48 KiB static ceiling (which is a compile error, but one that would appear
+# for the first time on the benchmark host).
+NISO_N = int(re.search(r"constexpr int NISO\s*=\s*(\d+)", XSR).group(1))
+NG_N = int(re.search(r"constexpr int NG\s*=\s*(\d+)", XSR).group(1))
+N_ACTIVE_N = int(re.search(r"constexpr int N_ACTIVE\s*=\s*(\d+)", REF).group(1))
+NMIC_N, NLSM_N, NMSM_N = NISO_N * NG_N, NG_N * NG_N, NISO_N * NG_N * NG_N
+WS_ELEMS = (N_ACTIVE_N * NG_N + NLSM_N + N_ACTIVE_N * NMIC_N + NMSM_N + NISO_N)
+SMEM_MAX = 48 * 1024
+TILE_D = int(re.search(r"constexpr int CTA_TILE_DEFAULT\s*=\s*(\d+)", CTA).group(1))
+TILE_F = int(re.search(r"constexpr int CTA_TILE_DEFAULT_F32\s*=\s*(\d+)",
+                       CTA).group(1))
+
+check(
+    "constexpr int CTA_SMEM_STATIC_MAX = 48 * 1024;" in CTA,
+    "the 48 KiB static-__shared__ ceiling is a named constant, not a literal at "
+    "the dispatch sites",
+)
+check(
+    TILE_D * WS_ELEMS * 8 <= SMEM_MAX,
+    "the FP64 default tile fits the static ceiling (%d x %d B = %d <= %d)"
+    % (TILE_D, WS_ELEMS * 8, TILE_D * WS_ELEMS * 8, SMEM_MAX),
+)
+check(
+    2 * TILE_D * WS_ELEMS * 8 > SMEM_MAX,
+    "the FP64 default tile is the LARGEST power of two that fits -- a smaller "
+    "one would leave sector count on the table for nothing",
+)
+check(
+    TILE_F * WS_ELEMS * 4 <= SMEM_MAX and 2 * TILE_F * WS_ELEMS * 4 > SMEM_MAX,
+    "the FP32 default tile is the largest power of two that fits (%d x %d B)"
+    % (TILE_F, WS_ELEMS * 4),
+)
+check(
+    TILE_D * WS_ELEMS * 8 == TILE_F * WS_ELEMS * 4,
+    "the two defaults spend the SAME shared budget (%d B/CTA) -- they differ "
+    "only because the FP32 slot is half the FP64 one, which is what keeps the "
+    "precision A/B and the tile A/B independent"
+    % (TILE_D * WS_ELEMS * 8),
+)
+check(
+    TILE_D * 128 <= 1024 and TILE_F * 128 <= 1024,
+    "both defaults keep blockDim.x = TILE * 128 inside the 1,024-thread block "
+    "cap at the default block size",
+)
+
+
+def rule_tile_dispatch_is_constexpr_guarded(cta: str) -> bool:
+    """Every tile instantiation is behind `if constexpr (ctaTileFits<...>)`.
+
+    `kernelFlatXsCtaTile<256, 8, CtaWorkspace>` is not a slow kernel, it is a
+    COMPILE ERROR (2,048 threads and 58 KiB of shared memory).  A runtime clamp
+    cannot prevent an instantiation; only `if constexpr` can.
+    """
+    disp = body_of(cta, "inline void flatxsCtaDispatchTile(",
+                   "/// The largest tile the ladder will actually run")
+    calls = re.findall(r"flatxsCtaTiledLaunch<T,\s*(\d+),\s*WS>", disp)
+    guards = re.findall(r"if constexpr \(ctaTileFits<T,\s*(\d+),\s*WS>\(\)\)", disp)
+    asserts = re.findall(r"static_assert\(ctaTileFits<T,\s*(\d+),\s*WS>\(\)", disp)
+    return bool(calls) and sorted(calls) == sorted(guards + asserts)
+
+
+check(
+    rule_tile_dispatch_is_constexpr_guarded(CTA),
+    "every tile on the ladder is instantiated only inside `if constexpr "
+    "(ctaTileFits<T, TILE, WS>())`",
+)
+check(
+    "__launch_bounds__(T * TILE) kernelFlatXsCtaTile" in CTA,
+    "the tiled kernel carries __launch_bounds__(T * TILE): the block scales with "
+    "the tile, which is what keeps shared bytes PER THREAD unchanged",
+)
+check(
+    "kernelFlatXsCtaAt<T, WS><<<tail, T, 0, stream>>>(v, n_tiles * TILE);" in CTA,
+    "the tail nodes go to the untiled body through kernelFlatXsCtaAt -- the "
+    "certified single-node path, offset, not a partially-masked tile",
+)
+check(
+    "flatxsSolveNodeCta<T>(v, i, StaticForms{}, w);" in
+    body_of(CTA, "kernelFlatXsCtaAt(FlatXsView v, int node_base)", "\n}\n"),
+    "kernelFlatXsCtaAt calls the SAME untiled body -- the tail is not a third "
+    "copy of the arithmetic",
+)
+
+# --- the knob, the receipt and the gate ------------------------------------
+check(
+    'std::getenv("RASBERY_GPU_FLATXS_CTA_TILE")' in BACKEND,
+    "RASBERY_GPU_FLATXS_CTA_TILE is read in the backend, once, into a cached int",
+)
+check(
+    "int rasberyGpuFlatXsCtaTile();" in BACKEND_H
+    and re.search(r"int\s+rasberyGpuFlatXsCtaTile\(\) \{ return 0; \}", STUB)
+    is not None,
+    "the tile accessor is declared beside the other arm flags and defined by the "
+    "no-CUDA stub (a call site must never need an #ifdef)",
+)
+check(
+    '"RASBERY_GPU_FLATXS_CTA_TILE"' not in DRIVER,
+    "RASBERY_GPU_FLATXS_CTA_TILE is deliberately NOT in trajectory::kArmEnv: it "
+    "changes WHICH LANE stores a byte, never which byte, so folding it into the "
+    "case key would split one arm's cache into a family (the "
+    "RASBERY_GPU_MICX_RESIDENT precedent).  If the 238 gate ever shows the tile "
+    "moving a trajectory, THIS is the line that has to change first",
+)
+check(
+    SOLVE.count("rasberyGpuFlatXsCtaTile()") == 1
+    and "fxs::flatxsCtaTileResolved(" in SOLVE,
+    "the tile is resolved ONCE at the same dispatch point the arm is, through "
+    "the launcher's own ladder helper, so the receipt states the tile that RAN",
+)
+MAIN = read("src", "main.cpp")
+for field in ('\\"tile\\":', '\\"tiles_launched\\":', '\\"tail_nodes\\":'):
+    check(
+        MAIN.count(field) == 3,
+        "the [RASBERY][FLATXS][GPU] receipt carries %s on all three arms "
+        "(batch, single, drive)" % field,
+    )
+check(
+    "g_flatxs_cta_tiles.fetch_add" in BACKEND
+    and "g_flatxs_cta_tail_nodes.fetch_add" in BACKEND,
+    "tiles_launched and tail_nodes are counted at the launch site, so "
+    "tiles*tile + tail reconstructs nodes_solved",
+)
+check(
+    'std::getenv("RASBERY_GPU_FLATXS_CTA_TILE")' in REPLAY
+    and "fxs::flatxsCtaTileResolved(" in REPLAY
+    and "fxs::flatxsCtaLaunch(c, cta_threads, nullptr, false, cta_tile);" in REPLAY,
+    "the replay gate selects the tile through the SAME resolver and the SAME "
+    "launcher the backend uses -- it cannot certify a tile production never runs",
+)
+DOC_B2 = read("docs", "WP21_B2C2_COALESCING_20260831_KO.md")
+for token in ("RASBERY_GPU_FLATXS_CTA_TILE", "1f36e75dc00ed2b4", "4377", "25.2",
+              "29,408", "h5diff", "1,321", "16.7"):
+    check(token in DOC_B2,
+          "docs/WP21_B2C2_COALESCING_20260831_KO.md names %s" % token)
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +878,29 @@ NEGATIVES: list[tuple[str, object]] = [
          "if (RASBERY_PTXAS_VERBOSE)\n"
          '    set(RASBERY_BITEXACT_CUDA_OPTS "--ptxas-options=-v")\n'
          "endif ()\n")),
+    ("a tile phase that puts the ORDINAL innermost -- the transpose undone",
+     lambda: rule_tile_decomposes_node_innermost(
+         "const int j = p / TILE;\n" "const int q = p - j * TILE;\n")),
+    ("a tiled ordinal loop that is not lane-owned",
+     lambda: rule_tile_loops_are_lane_owned(
+         "for (int p = 0; p < Q_MIC * TILE; ++p) { w[0].bm[p] = 0.0; }")),
+    ("the delta-stream phase moved to the node-innermost mapping",
+     lambda: rule_tile_loops_are_lane_owned(
+         "for (int q = tid; q < Q_MIC; q += NT) { w[0].bm[q] = 0.0; }")),
+    ("a contraction site dropped from the TILED body",
+     lambda: rule_form_bits_match(
+         REF_BODY, TILE_BODY.replace("pol.ma(F_ACC_MIC,", "fma("))),
+    ("the tiled isotope fold no longer sequential/ascending",
+     lambda: rule_iso_fold_is_sequential(
+         "for (int iso = NISO - 1; iso >= 0; --iso) val = f(val);")),
+    ("a barrier per delta in the tiled stream loop",
+     lambda: rule_stream_loop_has_no_barrier(
+         "for (int s = s0; s < s1; ++s) { apply(s); __syncthreads(); }")),
+    ("a tile instantiated without its if-constexpr fit guard",
+     lambda: rule_tile_dispatch_is_constexpr_guarded(
+         "inline void flatxsCtaDispatchTile(\n"
+         "    flatxsCtaTiledLaunch<T, 8, WS>(v, stream);\n"
+         "/// The largest tile the ladder will actually run")),
     ("replay that only scores against the capture",
      lambda: rule_replay_scores_cta_against_reference(
          'score(hc, want, tag_, cta_bad, cta_worst, "cta-vs-capture");')),

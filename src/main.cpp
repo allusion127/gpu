@@ -1225,7 +1225,12 @@ int main(int argc, char* argv[]) {
                       << rasbery::rasberyGpuXsReconNodes() << "}" << std::endl;
         if (rasbery::rasberyGpuFlatXsEnabled())
             std::cout << "[RASBERY][FLATXS][GPU] {\"nodes_solved\":"
-                      << rasbery::rasberyGpuFlatXsNodes() << "}" << std::endl;
+                      << rasbery::rasberyGpuFlatXsNodes()
+                      << ",\"tile\":" << rasbery::rasberyGpuFlatXsCtaTileRan()
+                      << ",\"tiles_launched\":"
+                      << rasbery::rasberyGpuFlatXsCtaTilesLaunched()
+                      << ",\"tail_nodes\":"
+                      << rasbery::rasberyGpuFlatXsCtaTailNodes() << "}" << std::endl;
         if (rasbery::xfer::receiptWanted()) {
             std::cout << "[RASBERY][XFER] {";
             rasbery::xfer::appendXferReceiptFields(std::cout);
@@ -1505,7 +1510,12 @@ int main(int argc, char* argv[]) {
                       << rasbery::rasberyGpuXsReconNodes() << "}" << std::endl;
         if (rasbery::rasberyGpuFlatXsEnabled())
             std::cout << "[RASBERY][FLATXS][GPU] {\"nodes_solved\":"
-                      << rasbery::rasberyGpuFlatXsNodes() << "}" << std::endl;
+                      << rasbery::rasberyGpuFlatXsNodes()
+                      << ",\"tile\":" << rasbery::rasberyGpuFlatXsCtaTileRan()
+                      << ",\"tiles_launched\":"
+                      << rasbery::rasberyGpuFlatXsCtaTilesLaunched()
+                      << ",\"tail_nodes\":"
+                      << rasbery::rasberyGpuFlatXsCtaTailNodes() << "}" << std::endl;
         if (rasbery::xfer::receiptWanted()) {
             std::cout << "[RASBERY][XFER] {";
             rasbery::xfer::appendXferReceiptFields(std::cout);
@@ -1653,7 +1663,12 @@ int main(int argc, char* argv[]) {
                   << rasbery::rasberyGpuXsReconNodes() << "}" << std::endl;
     if (rasbery::rasberyGpuFlatXsEnabled())
         std::cout << "[RASBERY][FLATXS][GPU] {\"nodes_solved\":"
-                  << rasbery::rasberyGpuFlatXsNodes() << "}" << std::endl;
+                  << rasbery::rasberyGpuFlatXsNodes()
+                  << ",\"tile\":" << rasbery::rasberyGpuFlatXsCtaTileRan()
+                  << ",\"tiles_launched\":"
+                  << rasbery::rasberyGpuFlatXsCtaTilesLaunched()
+                  << ",\"tail_nodes\":"
+                  << rasbery::rasberyGpuFlatXsCtaTailNodes() << "}" << std::endl;
     if (rasbery::xfer::receiptWanted()) {
         std::cout << "[RASBERY][XFER] {";
         rasbery::xfer::appendXferReceiptFields(std::cout);

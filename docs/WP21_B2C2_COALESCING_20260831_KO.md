@@ -1,0 +1,256 @@
+# WP21-B2 / C2 — flatxs 스토어 전치와 nodal stride 뷰: **주소를 옮기지 않고 레인을 옮긴다**
+
+## 문서 메타데이터
+
+| 항목 | 값 |
+|---|---|
+| 대상 | `kernelFlatXsCta`의 스토어 st 25.2 (B2) · `kNodalJnet<0>`의 로드 ld 16.7 (C2) |
+| 선행 | `docs/WP21_BC_FLATXS_NODAL_COALESCING_20260831_KO.md` (인벤토리·미변환 귀속), `docs/WP21_A_CMFD_COALESCING_20260831_KO.md` |
+| 근거 | 238 ncu, `E:\rasbery_runs\2026-08-30\238\pricing_388e8f2.md` **블록 39** |
+| 기준 덱 | KNGR `kngr_238.json`, `nxyz = 8,451`, `nsurf = 26,692`, `NG = 2` |
+| 게이트 등급 | **B0** — 값도 산술 순서도 안 바뀐다. 바뀌는 것은 **어느 스레드가 그 바이트를 쓰는가**뿐 |
+| 판정 | digest **`1f36e75dc00ed2b4` / `4377`** 불변 + `h5diff -c` 0 + 핀 CSV Δ = 0 |
+| 계약 테스트 | `tools/test_flatxs_cta_contract.py` (B2) · `tools/test_nodal_soa_contract.py` (C2) |
+| 소스 | `src/FlatXsCtaKernel.cuh` · `src/CudaXsReconBackend.cu/.h` · `src/CudaXsReconBackendStub.cpp` · `src/main.cpp` · `test/flatxs_device_replay.cu` |
+| 한 줄 | **WP21-B/C가 "제로섬"이라고 적은 것은 *배열 순열*이고, 이 WP가 바꾸는 것은 *병렬화 축*이다.** 그 둘은 같은 문제가 아니다 |
+
+> **선행 문서의 무엇을 뒤집고 무엇을 뒤집지 않는가.**
+> WP21-B는 `c*nxyz + l`을 `l*880 + c`로 **순열하는** 안을 계산해서 정확히 제로섬이라고
+> 결론지었다. **그 결론은 그대로 유효하고, 이 WP는 주소를 한 바이트도 옮기지 않는다.**
+> 뒤집는 것은 그 다음 문단, "CTA를 노드 V개로 타일링하는 안"의 기각 사유 (c)다 —
+> *"공유 워크스페이스가 V배가 되어 occupancy가 무너진다"*. 그 계산은 **스레드 수를 고정한
+> 채** 워크스페이스만 V배로 놓았다. 스레드 수도 같이 V배로 하면 **스레드당 공유 바이트가
+> 불변**이고, 공유 메모리가 제약하는 것은 블록 수가 아니라 상주 **스레드** 수다. §2.3이
+> 그 산수다.
+
+---
+
+## 1. 관측 — 다시 한 번, 블록 39
+
+| 커널 | ld sectors/req | st sectors/req | dram %peak | occupancy | 그리드 |
+|---|---:|---:|---:|---:|---|
+| `kernelFlatXsCta<128>` | 7.8 | **25.2** | **23.1** | 62.4 % | nxyz CTA × 128 스레드, 280 µs × 384 |
+| `kNodalJnet<0>` | **16.7** | 7.7 | — | — | nsurf 스레드, 58 µs × 2,352 |
+
+8바이트 접근의 이상값은 2다(8-스레드 wavefront × 8 B = 64 B = 2섹터).
+
+---
+
+## 2. WP21-B2 — flatxs CTA 스토어 전치
+
+### 2.1 25.2의 원인은 레이아웃이 아니라 축이다
+
+블록은 이미 컴포넌트-메이저·노드-최내측(`block_layout::elem`, `c*nxyz + l`)이고, 그 순서는
+**다른 모든 소비자에게 옳다**(`kernelFlatXs`, CRAM D2D fill, Xe commit, 호스트 접근자 —
+전부 `l`에 대해 병렬이다). 문제는 CTA arm만 `l`이 **블록-유니폼**이라는 것이다: 워프의
+32 레인이 32개의 서로 다른 컴포넌트 서수 `q`를 들고, `c*nxyz + l` 아래에서 인접 레인의
+주소는 `nxyz × elem_bytes`만큼 떨어진다. 노드당 880회의 스캐터가 **전부** 그 형태다.
+
+### 2.2 고치는 방법 — 공유 메모리 전치, 그리고 **두 개의 레인 매핑**
+
+CTA 하나가 `v.nodes`의 연속 `TILE`개를 맡고 슬롯마다 워크스페이스를 하나씩 든다. 한 커널
+안에서 매핑이 둘이다:
+
+| 단계 | 매핑 | 이유 |
+|---|---|---|
+| 델타 스트림 적용 | `q = lane; q < Q_x; q += T` (**오늘과 같음**, 그룹 `j`가 레인 `[j*T,(j+1)*T)`) | 계수 읽기 `cdata[(base+p)*NMIC + e]`는 `e == q`이므로 **레인 간 stride 1**이다. 이것이 CTA arm이 존재하는 이유이고 커널 로드의 대부분이다. 여기서 노드-최내측으로 가면 레인마다 `base`가 달라져 그 스트림이 흩어진다 |
+| 게더 · 스캐터 · 밀도 · 매크로 | `p = tid; p < Q_x * TILE; p += NT`, **`q = p / TILE`, `j = p % TILE`** | 인접 레인이 같은 서수에서 연속 `l`을 들어 주소가 `c*nxyz + l0 + j`로 **연속** |
+
+두 매핑이 만나는 경계 두 곳에만 `__syncthreads()`가 붙는다. **배리어는 값을 옮기지 않는다.**
+
+### 2.3 왜 occupancy가 무너지지 않는가 — 공유 예산표
+
+`blockDim.x = T * TILE`이므로 **스레드당** 공유 바이트가 불변이다.
+
+| arm | 슬롯 | TILE | 워크스페이스 | `sh_l` | CTA 합계 | blockDim | **B/thread** |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| FP64 (오늘) | 7,352 | 1 | 7,352 | — | 7,352 | 128 | **57.4** |
+| FP64 (기본) | 7,352 | **4** | 29,408 | 16 | **29,424** | 512 | **57.4** |
+| FP32 (오늘) | 3,676 | 1 | 3,676 | — | 3,676 | 128 | **28.7** |
+| FP32 (기본) | 3,676 | **8** | 29,408 | 32 | **29,440** | 1,024 | **28.7** |
+
+- 워크스페이스는 919 원소(`N_ACTIVE*NG + NLSM + N_ACTIVE*NMIC + NMSM + NISO
+  = 18 + 4 + 702 + 156 + 39`)다. 계약 테스트가 이 수를 소스의 상수에서 **재계산**한다.
+- 정적 `__shared__` 상한은 **48 KiB**다(`CTA_SMEM_STATIC_MAX`). `RASBERY_CUDA_ARCHITECTURES`
+  = 80/86/89/100/120 전부 그 이상을 **동적** 공유로만 준다 — 동적을 쓰려면 커널마다
+  `cudaFuncSetAttribute`가 필요하고 런처가 상태를 갖게 된다. 48 KiB 안에서 이미 이상 섹터
+  수에 도달하므로 사지 않는다.
+- 그래서 사다리 상한은 **FP64 6, FP32 13**이고, 2의 거듭제곱으로 내리면 **4와 8**이다.
+  두 기본값이 **같은 29,408 B**인 것은 우연이 아니라 이 계산의 결과다 — 정밀도 A/B와
+  타일 A/B가 서로 독립이라는 뜻이기도 하다.
+- sm_120(SM당 100 KiB, 2,048 스레드): FP64는 13블록×128 = 1,664 → 3블록×512 = **1,536**
+  (−7.7 %), FP32는 16블록×128 = 2,048 → 2블록×1,024 = **2,048** (불변). **FP64에서만
+  블록 granularity 손실이 있고, 그 값이 스토어 8배와 맞바꿔진다.**
+
+### 2.4 기대 섹터 수 — 정직하게
+
+| arm | wavefront | 커버 | 기대 st |
+|---|---|---|---:|
+| FP64 TILE=4 | 8 스레드 × 8 B | 4노드 × 2서수 = 32 B 덩어리 2개 | **2 (정렬 시) ~ 4 (걸칠 때)**, 평균 **~3** |
+| FP32 TILE=8 | 32 스레드 × 4 B | 8노드 × 4서수 = 32 B 덩어리 4개 | 이상값 4, 평균 **~5** |
+
+`nxyz = 8,451`은 4의 배수가 아니므로 `c*nxyz + l0`의 32 B 정렬이 `c`마다 흔들린다. 그래서
+**~2가 아니라 ~3**이라고 적는다. 게더도 같은 형태이므로 ld 7.8도 같이 내려간다(계수 읽기가
+이미 최적이라 하락 폭은 작다).
+
+**한 가지 단서.** 전치가 실제로 연속 주소를 만들려면 `v.nodes[i0..i0+TILE-1]`이 연속
+`l`이어야 한다. `XSSet::UpdateFlatXS`가 `unrodded`를 **오름차순으로** 만들고 로드된 노드에서만
+구멍이 난다(`XSSet.cpp:3376`). 구멍은 코얼레싱을 깎을 뿐 **정확성에는 무관하다** — 타일은
+주소를 계산하지 않고 `sh_l[j]`가 준 주소에 쓴다. 로드가 많은 덱에서 이득이 줄어드는 것이
+이 변환의 유일한 덱 의존성이다.
+
+### 2.5 왜 B0인가
+
+1. **(P1) 레인 소유권**이 살아 있다. 모든 원소의 누산 사슬은 여전히 한 레인 안에 통째로 있다.
+   레인의 **정체**가 단계 사이에서 바뀌고, 그 경계 두 곳에 배리어가 붙는다.
+2. **(P2) 동위원소 폴드**는 여전히 `iso = 0..NISO-1` 오름차순, 출력 사슬당 한 레인, 트리 없음.
+3. **(P3)** did/x/scale/xloc/base는 여전히 레인마다 재계산되고, 스트림 루프에 배리어가 **없다**.
+   타일 슬롯마다 스트림 길이가 다르므로 여기에 배리어가 있었다면 매 델타마다 가장 긴 슬롯을
+   기다렸을 것이다. `T ≥ 32`이므로 한 워프가 두 슬롯에 걸치는 일도 없다.
+4. **전송이 안 바뀐다** — `[RASBERY][XFER]` 총계 바이트/호출 불변.
+5. **꼬리**는 `n_nodes % TILE`개(≤ 3 또는 ≤ 7)이고 **인증된 미타일 본문**
+   (`kernelFlatXsCtaAt` → `flatxsSolveNodeCta`)이 계산한다. 세 번째 본문은 없다.
+
+### 2.6 두 개의 본문을 남긴 이유
+
+`flatxsSolveNodeCta`는 **한 글자도 건드리지 않았다.** 그것이
+`RASBERY_GPU_FLATXS_CTA_TILE=1`이 돌리는 arm이고 238이 인증한 arm이며, 이 변경의 A/B
+기준이다. 하나의 템플릿으로 합쳤다면 기준과 후보가 같은 텍스트가 되어 이분이 불가능해진다.
+대가는 **산술의 중복**이고, 그 대가는 계약 테스트가 지불한다: FormBit 센서스, 동위원소 폴드
+규칙, bare multiply-add 규칙, 배리어 규칙이 **두 본문 모두에 대해** 같은 참조
+(`flatxsSolveNode`)를 상대로 돌아간다. 한쪽만 드리프트하면 GPU에 닿기 전에 센서스가 깨진다.
+
+### 2.7 노브와 수신증
+
+```
+RASBERY_GPU_FLATXS_CTA_TILE=<n>     # 미설정 = arm 기본(FP64 4 / FP32 8), 1 = 미타일 arm
+[RASBERY][FLATXS][GPU] {"nodes_solved":N,"tile":4,"tiles_launched":T,"tail_nodes":R}
+```
+
+`tiles_launched * tile + tail_nodes == nodes_solved`가 덱을 몰라도 확인 가능한 항등식이다.
+`tile`은 **요청값이 아니라 해석된 값**이다(사다리가 공유 메모리와 1,024 스레드 상한으로
+클램프한다).
+
+**`Driver.h`의 `trajectory::kArmEnv`에 넣지 않았다.** 이 노브는 *어느 레인이* 바이트를
+쓰는지를 바꾸고 *어느 바이트를* 쓰는지는 바꾸지 않는다 — `RASBERY_GPU_MICX_RESIDENT`가
+같은 이유로 목록 밖에 있다. 넣으면 하나의 arm의 캐시가 타일 값마다 갈라진다. 계약 테스트가
+**부재를 강제**하므로 이 판정은 잊히지 않는다. (238 게이트가 타일이 궤적을 움직인다고
+말하면 그때 가장 먼저 바뀌어야 하는 줄이 바로 그 부재 규칙이다.)
+
+---
+
+## 3. WP21-C2 — nodal stride 뷰 (이 커밋에서는 미착수)
+
+§4 이후는 두 번째 커밋에서 채운다.
+
+---
+
+## 6. 238 runbook
+
+로컬에 nvcc가 없다. **첫 관문은 238 컴파일이다.** GPU0만 사용한다.
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+V6_ENV='RASBERY_PPR_MODE=master RASBERY_PC_MODE=decart RASBERY_GPU=1
+RASBERY_GPU_CMFD_SWEEP=1 RASBERY_GPU_CMFD_RESIDENT_SINGLE=1 RASBERY_GPU_NODAL=1
+RASBERY_GPU_NODAL_FULL=1 RASBERY_GPU_XSRECON=1 RASBERY_GPU_FLATXS=1
+RASBERY_GPU_OUTER=1 RASBERY_GPU_OUTER_SEGMENT_MAX=8 RASBERY_GPU_WIEL_FOLD=chunked
+RASBERY_GPU_XE=1 RASBERY_STAGED_FLUX_TOL=50 RASBERY_STAGED_XE_TOL=1000
+RASBERY_STAGED_LOOSE_SETTLE=1 RASBERY_OMP_THREADS=12 RASBERY_GPU_CRAM=1
+RASBERY_GPU_PPR=1 RASBERY_GPU_PPR_GRAPH=1 RASBERY_GPU_CMFD_FUSE=15
+RASBERY_GPU_XE_TXN=1 RASBERY_RESULT_ASYNC=1 RASBERY_GPU_FLATXS_CTA=1
+RASBERY_GPU_OUTER_GRAPH=1 RASBERY_GPU_MICX_RESIDENT=1 RASBERY_GPU_XFER_ELIDE=1
+RASBERY_GPU_OUTER_SEGMENT_V2=1 RASBERY_GPU_CMFD_BLOCK=64'
+```
+
+### 6.0 선행 — 계약 게이트 (로컬에서 통과)
+
+```bash
+python3 tools/test_flatxs_cta_contract.py
+python3 tools/test_nodal_soa_contract.py
+python3 tools/test_micx_layout_contract.py
+python3 tools/test_gpu_fp32_contract.py
+python3 tools/test_xfer_ledger_contract.py
+python3 tools/test_enum_alias_contract.py
+python3 tools/test_dependent_template_contract.py
+python3 tools/test_nodal_gpu_refactor_contract.py
+ctest
+```
+
+### 6.1 리플레이 게이트 — **이것이 B0의 실증이다**
+
+238에서 nvcc가 붙는 즉시, digest보다 먼저 돌린다.
+
+```bash
+for T in 64 128 256; do
+  for TILE in 1 2 4; do
+    RASBERY_GPU_FLATXS_CTA_TILE=$TILE ./build/rasbery_flatxs_device_replay \
+        <capture-base> --cta $T
+  done
+done
+```
+
+합격 조건: **모든 (T, TILE) 조합에서 `cta_vs_ref_mismatches = 0`**. 하나라도 0이 아니면
+(P1)이 깨진 것이고, 그 조합이 곧 이분점이다.
+
+### 6.2 digest 불변
+
+```bash
+env $V6_ENV <production arm> ... -o "$OUT/a_b2"      # 기본 타일 (FP64 4)
+env $V6_ENV RASBERY_GPU_FLATXS_CTA_TILE=1 <arm> ... -o "$OUT/a_tile1"   # 미타일 기준
+```
+
+합격 조건 — **전부**:
+
+- digest **`1f36e75dc00ed2b4` / `4377`** (두 arm 모두)
+- 두 arm 사이 `h5diff -c` **0 차이**, 직전 v6 산출물 대비도 0
+- `[RASBERY][FLATXS][GPU]`의 `tiles_launched * tile + tail_nodes == nodes_solved`
+- `[RASBERY][MICX][LAYOUT]`가 `"layout":"soa","layout_version":2` (불변)
+- `[RASBERY][XFER]` 총계 바이트/호출 **불변**
+- CSV(핀 파워/AO/keff) 전 항목 Δ = 0
+
+### 6.3 ncu 재측정 — 블록 39와 같은 디렉티브
+
+```bash
+for k in kernelFlatXsCtaTile kernelFlatXsCta kNodalJnet; do
+  ncu --kernel-name "regex:$k" --launch-skip 10 --launch-count 5 \
+      --metrics \
+l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld.ratio,\
+l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_st.ratio,\
+dram__throughput.avg.pct_of_peak_sustained_elapsed,\
+sm__warps_active.avg.pct_of_peak_sustained_active \
+      --csv env $V6_ENV <production arm> ... > "$OUT/ncu_$k.csv"
+done
+```
+
+| 커널 | ld 전 | **ld 후 기대** | st 전 | **st 후 기대** |
+|---|---:|---:|---:|---:|
+| `kernelFlatXsCtaTile<128,4>` | 7.8 | **~5** | 25.2 | **~3** |
+| `kNodalJnet<0>` (B2에서는) | 16.7 | 16.7 (불변) | 7.7 | 7.7 (불변) |
+
+`RASBERY_GPU_FLATXS_CTA_TILE=1`로 다시 재면 `kernelFlatXsCta`가 **25.2 그대로** 나와야 한다 —
+그것이 이 측정이 타일을 재고 있다는 증거다. occupancy는 62.4 % → **~58 %**(§2.3의 1,536/1,664)를
+기대한다. **occupancy가 오르면 계산이 틀린 것이고, 크게 내리면 register spill을 의심한다**
+(`tools/flatxs_resource_report.py`).
+
+### 6.4 단일덱 wall — 워밍업 1 + hot 3
+
+```bash
+for r in w 1 2 3; do env $V6_ENV <production arm> ... -o "$OUT/b_$r"; done
+```
+
+`kernelFlatXsCta`는 280 µs × 384 launch = **107 ms**이고 단일 wall 11.2 s의 약 1 %다. 스토어
+8배가 커널을 절반으로 줄여도 **wall은 ~50 ms(0.5 %)**다. 이 줄이 크게 움직이면 측정 노이즈이거나
+§6.2가 깨진 것이다. **이 WP의 값은 단일 wall이 아니라 배치의 메모리 압력에 있다.**
+
+### 6.5 배치 — 여기가 판정선
+
+```bash
+python3.11 tools/run_multi_gpu_batch.py --set "$V6_ENV" ...   # 8 procs x M16 + MPS
+```
+
+기준: **1,321 c/h**(블록 37/38의 클린 V2 baseline 1,320.8~1,326.7). MPS 아래 8 프로세스가
+같은 L2와 같은 DRAM을 나눠 쓰므로, dram 23 %를 먹던 유일한 커널의 스토어 트래픽이 8배 줄면
+**여기서 보인다**. 회귀(< 1,300)면 §2.3의 FP64 occupancy 손실(−7.7 %)이 이득을 삼킨 것이고,
+그때 다음 수는 `RASBERY_GPU_FLATXS_CTA_TILE=2`(14,704 B/CTA, 6블록/SM = 1,536 스레드, 스토어
+~4섹터)다.

@@ -160,6 +160,13 @@ bool rasberyGpuFlatXsCtaEnabled() { return false; }
 // arm at all, and rasberyGpuFlatXsCtaEnabled() already says so.
 int rasberyGpuFlatXsCtaThreads() { return 128; }
 
+// WP21-B2.  0 = "the arm's own default", and there is no arm here; the three
+// receipt counters read zero for the same reason nodes_solved does.
+int                rasberyGpuFlatXsCtaTile() { return 0; }
+int                rasberyGpuFlatXsCtaTileRan() { return 0; }
+unsigned long long rasberyGpuFlatXsCtaTilesLaunched() { return 0; }
+unsigned long long rasberyGpuFlatXsCtaTailNodes() { return 0; }
+
 bool rasberyGpuNodalEnabled() { return false; }
 
 bool rasberyGpuXeEnabled() { return false; }
