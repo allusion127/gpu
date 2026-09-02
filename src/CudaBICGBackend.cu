@@ -144,6 +144,18 @@ enum CounterSlot : int {
     kCounterSlots
 };
 
+/// WP20.2 receipt contract (ffd172f): `fp32_refine_rounds / _solves` are two
+/// UNREDUCED sums and their 0/0 is a MISSING measurement, not a mean of one.
+/// finalize_status transports `kRefineRounds + 1`, so every value it can send
+/// from a real counter is >= 1 and there is no in-band way to say "this slot
+/// entered no round at all".  This sentinel is that out-of-band value: it is
+/// stamped by initialize_solver_state on exactly the slots its participation
+/// mask turns away -- which return before the counter block is zeroed and so
+/// would otherwise report the previous outer's index, plus one -- and
+/// finalize_status turns it back into NaN.  0xFFFFFFFF cannot collide with a
+/// real round index: the index is bounded by the cached refinement cap.
+constexpr std::uint32_t kRefineRoundsAbsent = 0xFFFFFFFFu;
+
 void cuda_check(cudaError_t value, const char* expression) {
     if (value == cudaSuccess) return;
     std::ostringstream message;
@@ -1417,7 +1429,21 @@ __global__ void initialize_solver_state(double* scalars,
     // out of budget, or handed back to the host) masks the slot the same way
     // non-participation does; it is all-zero outside the sweep path.
     halt[m] = (active[m] != 0u && sweep_halt[m] == 0u) ? 0u : 1u;
-    if (halt[m] != 0u) return;
+    if (halt[m] != 0u) {
+        // WP20.2.  This return is ABOVE the counter block below, so a masked
+        // slot keeps the previous outer's counters -- kRefineRounds included --
+        // and never enters refinement round 0.  finalize_status is deliberately
+        // not halt-guarded (a masked slot still needs a status), so without
+        // this stamp it would transport `stale + 1` for a slot that ran no
+        // round at all and BatchCore::absorb would fold that into the receipt
+        // as one round and one solve.  A slot with active[m] != 0 and a raised
+        // sweep_halt is exactly that case.  One 4-byte write, not the whole
+        // kCounterSlots loop: the other slots are read only under the halt
+        // guard that is being raised right here.
+        counters[static_cast<long long>(m) * kCounterSlots + kRefineRounds] =
+            kRefineRoundsAbsent;
+        return;
+    }
 
     double*        sm = scalars + static_cast<long long>(m) * kScalarCount;
     std::uint32_t* cm = counters + static_cast<long long>(m) * kCounterSlots;
@@ -2414,8 +2440,17 @@ __global__ void finalize_status(const int refine_rounds,
     // count, which is the one number the receipt cannot get any other way (the
     // status packet is exactly one cache line and full).  It stays NaN when
     // there is no refinement loop, so the FP64 arm reports what it always did.
+    // The counter is the 0-based index of the last round ENTERED, so the round
+    // count is that plus one -- but only for a slot that entered round 0 at
+    // all.  kRefineRoundsAbsent says it did not (initialize_solver_state masked
+    // it), and that has to come back as NaN rather than as 1.0, so absorb's
+    // `rr > 0.0` filter means what its comment claims and the receipt's two
+    // sums stay unreduced.
+    const std::uint32_t rounds_index = cm[kRefineRounds];
     status[m].search_residual =
-        refine_rounds > 1 ? static_cast<double>(cm[kRefineRounds] + 1u) : unavailable;
+        (refine_rounds > 1 && rounds_index != kRefineRoundsAbsent)
+            ? static_cast<double>(rounds_index + 1u)
+            : unavailable;
     status[m].flags           = sticky;
     status[m].outer_iter      = cm[kOverrunCount];
     status[m].linear_iter     = cm[kSolveCount];

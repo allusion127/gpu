@@ -251,6 +251,124 @@ if "rnorm / r20 < sm[kEps]" not in test_body:
 if "cm[kRefineDone] = 1u;" not in test_body or "halt[m]         = 1u;" not in test_body:
     fail("a converged round does not halt the slot and mark it done")
 
+# ---------------------------------------------------------------------------
+# 4b. The ROUND-COUNT TRANSPORT, and the slot that enters no round at all.
+#
+# ffd172f states the receipt contract: fp32_refine_cap / _rounds / _solves are
+# the two sums and the denominator, UNREDUCED -- "0/0 is a missing measurement,
+# not a mean of one" -- and docs/WP20 Sec 9 makes the derived round MEAN the
+# decision variable ("Arm B's round mean at 1.0 falsifies Sec 2.4's diagnosis
+# and the instruction is to go back to the diagnosis rather than raise the
+# cap").  A slot that ran zero refinement rounds must therefore be incapable of
+# contributing a round of 1; if it can, the decision variable is read off a
+# denominator that includes non-participants.
+#
+# The three links that make that possible, and why only a SENTINEL closes them:
+#   * initialize_solver_state's participation mask (active && !sweep_halt)
+#     returns ABOVE the `for (i < kCounterSlots) cm[i] = 0` block, so a masked
+#     slot -- e.g. a batch participant whose device-resident CMFD sweep already
+#     converged, active[m]=1 and sweep_halt[m]=1 -- carries the PREVIOUS
+#     outer's kRefineRounds into this one and enters no round;
+#   * finalize_status is deliberately NOT halt-guarded (a masked slot still
+#     needs a status) and transports `count + 1`, which is >= 1.0 even from a
+#     freshly zeroed counter -- so merely zeroing the two slots would still
+#     fabricate exactly the 1.0 that Sec 9.2 reads as falsifying;
+#   * BatchCore::absorb folds in every finite positive value it sees.
+# ---------------------------------------------------------------------------
+SENTINEL = "kRefineRoundsAbsent"
+
+
+def code_only(text: str) -> str:
+    """The block with its `//` comments stripped.
+
+    Every check below runs on this: these kernels carry long rationale comments
+    that name the very identifiers being asserted, and a rule a COMMENT can
+    satisfy is not a rule.
+    """
+    return "\n".join(
+        line if line.find("//") < 0 else line[: line.find("//")]
+        for line in text.split("\n"))
+
+
+def masked_return(init_body: str) -> str:
+    """initialize_solver_state's masked early-return, brace-matched or not."""
+    head = init_body.find("if (halt[m] != 0u)")
+    tail = init_body.find("double*        sm", head)
+    if head < 0 or tail <= head:
+        return ""
+    return init_body[head:tail]
+
+
+def refine_transport_problems(text: str) -> list[str]:
+    """Every way the round-count transport can lie about a slot that ran none."""
+    bad: list[str] = []
+    if f"constexpr std::uint32_t {SENTINEL} = 0xFFFFFFFFu;" not in text:
+        bad.append(
+            "no kRefineRoundsAbsent sentinel is defined next to CounterSlot; "
+            "the transport is `count + 1` so every in-band value is >= 1 and "
+            "there is no way to say 'this slot entered no round'")
+
+    init_body = code_only(
+        body_after("__global__ void initialize_solver_state(", text=text))
+    masked = masked_return(init_body)
+    if not masked:
+        bad.append("initialize_solver_state's participation mask no longer has "
+                   "an early return this rule can inspect")
+    elif SENTINEL not in masked or "kRefineRounds" not in masked:
+        bad.append(
+            "initialize_solver_state's masked early return does not stamp "
+            "kRefineRounds with kRefineRoundsAbsent; the slot keeps the "
+            "previous outer's round index and finalize_status reports it + 1")
+    zero_at = init_body.find("for (int i = 0; i < kCounterSlots; ++i)")
+    stamp_at = init_body.find(SENTINEL)
+    if zero_at >= 0 and stamp_at >= 0 and stamp_at > zero_at:
+        bad.append("the sentinel is stamped BELOW the counter zero block, which "
+                   "the masked slot never reaches")
+
+    fin_body = code_only(body_after("__global__ void finalize_status(", text=text))
+    if "search_residual" not in fin_body:
+        bad.append("finalize_status no longer writes search_residual")
+    elif SENTINEL not in fin_body:
+        bad.append(
+            "finalize_status transports the round count without testing "
+            "kRefineRoundsAbsent, so a slot that entered no round still "
+            "reports count + 1 >= 1.0 instead of NaN")
+
+    absorb_body = code_only(
+        body_after("void absorb(const int* active_slots, int count)", text=text))
+    if "rr == rr && rr > 0.0" not in absorb_body:
+        bad.append("absorb no longer filters the round transport on finite and "
+                   "positive; that filter is what turns the NaN back into a "
+                   "missing measurement")
+    return bad
+
+
+problems = refine_transport_problems(CUDA)
+if problems:
+    fail("round-count transport: " + "; ".join(problems))
+
+# NEGATIVE CONTROLS.  A rule that still passes on the code it was written
+# against is not a rule, so both limbs are regressed to their pre-fix shape --
+# separately, and with the sentinel constant left in place so nothing is
+# rejected merely for the constant being gone -- and each must be caught.
+_masked_now = masked_return(body_after("__global__ void initialize_solver_state(",
+                                       text=CUDA))
+_pre_fix_mask = "if (halt[m] != 0u) return;" + chr(10) * 2 + "    "
+_regressed_init = CUDA.replace(_masked_now, _pre_fix_mask, 1)
+if _regressed_init == CUDA or not refine_transport_problems(_regressed_init):
+    fail("the round-count rule does not reject an initialize_solver_state that "
+         "returns on the participation mask without stamping the sentinel")
+
+_fin_now = body_after("__global__ void finalize_status(", text=CUDA)
+_fin_pre = _fin_now.replace(
+    "(refine_rounds > 1 && rounds_index != kRefineRoundsAbsent)",
+    "(refine_rounds > 1)",
+    1)
+_regressed_fin = CUDA.replace(_fin_now, _fin_pre, 1)
+if _regressed_fin == CUDA or not refine_transport_problems(_regressed_fin):
+    fail("the round-count rule does not reject a finalize_status that reports "
+         "count + 1 without testing the absent sentinel")
+
 reachable = guarded + fp32_arm
 for kernel in FP32_KERNELS:
     total = CUDA.count(f"{kernel}<<<")
