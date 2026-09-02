@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CUDA = (ROOT / "src" / "CudaBICGBackend.cu").read_text(encoding="utf-8-sig")
 CUDA_H = (ROOT / "src" / "CudaBICGBackend.h").read_text(encoding="utf-8-sig")
 SOLVER = (ROOT / "src" / "BICGSolver.cpp").read_text(encoding="utf-8-sig")
+ARM = (ROOT / "src" / "GpuFp32Arm.h").read_text(encoding="utf-8-sig")
 
 
 def fail(message: str) -> None:
@@ -76,17 +77,41 @@ def signature(kernel: str) -> str:
 # ---------------------------------------------------------------------------
 # 1. The env gate: opt-in, cached once, never consulted per launch.
 # ---------------------------------------------------------------------------
+#
+# WHERE THE KNOB LIVES, AND WHY IT MOVED.  RASBERY_GPU_CMFD_FP32 used to be
+# spelled in this .cu and OR-ed against rasbery::fp32::routes(Cmfd) at the gate
+# below.  That OR was invisible to src/GpuFp32Arm.h, whose receipt asked
+# `armed()` -- the DEVICE-WIDE knob -- and nothing else, so a run with
+# RASBERY_GPU_CMFD_FP32=1 and RASBERY_GPU_FP32 unset ran every kernel of the
+# inner BiCGSTAB in float and printed `"arm":"fp64","backends":{"cmfd":"fp64"}`.
+# The knob is now read once, in the arm header, by cmfdLegacyArm(), and folded
+# into armedFor(Cmfd); this gate is a plain routes() call, so the launch site and
+# the receipt read THE SAME predicate.
 gate = body_after("bool cmfdFp32InnerEnabled()")
-if "RASBERY_GPU_CMFD_FP32" not in gate:
-    fail("cmfdFp32InnerEnabled does not read RASBERY_GPU_CMFD_FP32")
+if "rasbery::fp32::routes(rasbery::fp32::Backend::Cmfd)" not in gate:
+    fail("cmfdFp32InnerEnabled does not route through the arm header")
 if "static const bool enabled" not in gate:
     fail("the FP32 env gate is not cached in a function-local static")
-if 'envFlagEnabled("RASBERY_GPU_CMFD_FP32")' not in gate:
-    fail("the FP32 gate must be opt-IN (envFlagEnabled), not opt-out")
-if CUDA.count('envFlagEnabled("RASBERY_GPU_CMFD_FP32")') != 1:
-    fail("RASBERY_GPU_CMFD_FP32 is read outside the single cached gate")
-if 'getenv("RASBERY_GPU_CMFD_FP32")' in CUDA:
-    fail("RASBERY_GPU_CMFD_FP32 is read raw somewhere, bypassing the cache")
+# NEGATIVE CONTROL: the gate reads no environment of its own and ORs nothing in.
+if "getenv" in gate or "envFlagEnabled(" in gate or "||" in gate:
+    fail("the FP32 gate arms from something routes() cannot see -- that is the "
+         "defect that made the receipt report cmfd:\"fp64\" over a float solve")
+arm_gate = body_after("inline bool cmfdLegacyArm()", text=ARM)
+if 'envFlagOn("RASBERY_GPU_CMFD_FP32")' not in arm_gate:
+    fail("the FP32 gate must be opt-IN (envFlagOn), not opt-out")
+if "static const bool on" not in arm_gate:
+    fail("RASBERY_GPU_CMFD_FP32 is not cached in a function-local static")
+if ARM.count('"RASBERY_GPU_CMFD_FP32"') != 1:
+    fail("RASBERY_GPU_CMFD_FP32 is read more than once in the arm header")
+if "cmfdLegacyArm()" not in body_after("inline bool armedFor(Backend which)",
+                                       text=ARM):
+    fail("armedFor(Cmfd) does not fold the historical RASBERY_GPU_CMFD_FP32 arm")
+for spelling in ('getenv("RASBERY_GPU_CMFD_FP32")',
+                 'envFlagEnabled("RASBERY_GPU_CMFD_FP32")'):
+    if spelling in CUDA:
+        fail(f"RASBERY_GPU_CMFD_FP32 is read in the CMFD TU as {spelling} -- "
+             "the knob belongs to the arm header, which is what the receipt "
+             "reads")
 if CUDA.count("cmfdFp32InnerEnabled()") != 2:  # the definition and one call
     fail("the cached FP32 gate is consulted more than once")
 if "fp32_inner    = cmfdFp32InnerEnabled();" not in CUDA:

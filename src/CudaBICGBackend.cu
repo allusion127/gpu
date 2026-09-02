@@ -401,31 +401,28 @@ unsigned cmfdFuseMask() {
     return mask;
 }
 
-/// Opt-IN counterpart of envFlagDisabled: unset means off.
-bool envFlagEnabled(const char* name) {
-    const char* value = std::getenv(name);
-    if (value == nullptr) return false;
-    const std::string s(value);
-    return !(s.empty() || s == "0" || s == "off" || s == "OFF" ||
-             s == "false" || s == "FALSE");
-}
-
 /// Mixed-precision inner BiCGSTAB (see the FP32 section below).  Read ONCE and
 /// cached: the choice fixes the captured graph topology, so it must not be able
 /// to change between two outers of the same run.
 ///
-/// WP20: TWO SPELLINGS, ONE PATH.  RASBERY_GPU_CMFD_FP32 is the historical
-/// per-backend knob and stays exactly what it was; RASBERY_GPU_FP32 is the
-/// device-wide arm (src/GpuFp32Arm.h), and CMFD is one of the two backends it
-/// actually routes.  They are OR-ed here rather than at the launch sites, so
-/// there is still ONE cached gate, ONE captured topology decision, and no
-/// launch-time predicate that could disagree with the graph it is inside.
-/// `rasbery::fp32::routes()` also folds in the arm's sticky non-finite latch,
-/// which is why the OR is evaluated once and frozen: latching after the fact is
-/// `fp32_latched_off`'s job, and it drops the cached graphs when it fires.
+/// WP20: TWO SPELLINGS, ONE PATH -- AND, SINCE THE RECEIPT FIX, ONE PREDICATE.
+/// RASBERY_GPU_CMFD_FP32 is the historical per-backend knob and arms exactly
+/// what it always did; RASBERY_GPU_FP32 is the device-wide arm.  The OR between
+/// them used to live HERE, which meant this gate could be true while
+/// `rasbery::fp32::armed()` -- the only thing the receipt asked -- was false, so
+/// a run whose entire inner solve was float printed `"arm":"fp64"` and
+/// `"cmfd":"fp64"`.  Both spellings are now folded into
+/// `rasbery::fp32::armedFor(Backend::Cmfd)` (src/GpuFp32Arm.h), so THIS is a
+/// plain `routes()` call and the receipt reads the same predicate the launch
+/// sites do.
+///
+/// `routes()` is still the whole gate: both spellings, the backend's scope, and
+/// the arm's sticky non-finite latch.  It is evaluated once and frozen --
+/// latching after the fact is `fp32_latched_off`'s job, and it drops the cached
+/// graphs when it fires.
 bool cmfdFp32InnerEnabled() {
-    static const bool enabled = envFlagEnabled("RASBERY_GPU_CMFD_FP32") ||
-                                rasbery::fp32::routes(rasbery::fp32::Backend::Cmfd);
+    static const bool enabled =
+        rasbery::fp32::routes(rasbery::fp32::Backend::Cmfd);
     return enabled;
 }
 
@@ -4417,10 +4414,11 @@ public:
             // WP20.2.  Cached with the arm for the same reason the arm is: the
             // round count is captured graph DEPTH and may not move between two
             // outers.  refineRounds() is 1 whenever RASBERY_GPU_FP32 is unset,
-            // so the historical RASBERY_GPU_CMFD_FP32 knob -- which can arm the
-            // inner solve without arming rasbery::fp32 -- keeps exactly the
-            // single-round topology it has always had, and this stays the ONE
-            // routes() call the contract allows the CMFD TU.
+            // so the historical RASBERY_GPU_CMFD_FP32 knob -- which arms this
+            // backend, and therefore routes(Cmfd), without arming the
+            // DEVICE-WIDE arm -- keeps exactly the single-round topology it has
+            // always had, and this stays the ONE routes() call the contract
+            // allows the CMFD TU.
             fp32_refine_cap = rasbery::fp32::refineRounds();
             // STRICT implies nothing on its own -- it only narrows the
             // accumulators of an arm that is already on -- so it is ANDed with

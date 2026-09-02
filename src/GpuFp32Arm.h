@@ -124,10 +124,16 @@
 // FEATURE-OFF BYTE IDENTITY
 // ---------------------------------------------------------------------------
 //
-// With RASBERY_GPU_FP32 unset, `armed()` is false, `routes()` is false for every
-// backend, and no float kernel is REACHABLE.  The FP64 enqueue paths are
-// textually untouched, so the trajectory digest stays 1f36e75dc00ed2b4 / 4377
-// outers.  The receipt line below prints unconditionally -- the same G0 rule the
+// THERE ARE TWO SPELLINGS OF THE CMFD ARM, and the byte-identity claim is over
+// BOTH of them being unset.  RASBERY_GPU_CMFD_FP32 predates this header and
+// still arms the CMFD inner BiCGSTAB by itself, so it is folded into
+// `armedFor(Cmfd)` below -- not OR-ed at the launch site, which is where it used
+// to live and where the receipt could not see it.  With RASBERY_GPU_FP32 AND
+// RASBERY_GPU_CMFD_FP32 unset, `armedFor()` is false for every backend,
+// `routes()` is false for every backend, and no float kernel is REACHABLE.  The
+// FP64 enqueue paths are textually untouched, so the trajectory digest stays
+// 1f36e75dc00ed2b4 / 4377 outers.  The receipt line below prints
+// unconditionally -- the same G0 rule the
 // [RASBERY][GPU_FULL] receipt exists for: "the arm was on and never engaged"
 // must not be able to look like "the arm was off".  The digest folds statepoints,
 // outers and the bit patterns of efpd / k_eff / boron; it does not fold stdout,
@@ -142,6 +148,11 @@
 // device iteration, which is the most trajectory-moving thing a knob in this
 // binary can do.  Listing them is also what folds them into the WP10.1 case key,
 // so an FP64 answer can never be served to an FP32 request.
+//
+// RASBERY_GPU_CMFD_FP32 is a FOURTH knob this header now reads, for the same
+// reason and with the same consequence -- it too is in kArmEnv, and it has been
+// since before this file existed.  It is not counted among "the three" because
+// it arms one backend rather than the device.
 //
 // tools/test_gpu_fp32_contract.py holds every claim above against the source.
 
@@ -220,6 +231,61 @@ inline bool envFlagOn(const char* name) {
 inline bool armed() {
     static const bool on = envFlagOn("RASBERY_GPU_FP32");
     return on;
+}
+
+/// THE SECOND SPELLING OF THE CMFD ARM, AND WHY THE KNOB LIVES HERE.
+///
+/// RASBERY_GPU_CMFD_FP32 predates this header: it is the WP20-era per-backend
+/// knob that narrows the CMFD inner BiCGSTAB, and src/CudaBICGBackend.cu's
+/// cached gate has honoured it since long before there was a device-wide arm.
+/// It used to be spelled THERE, OR-ed against `routes(Cmfd)` at the gate, and
+/// that OR was invisible to everything in this header.  So the ONE arm this
+/// file itself cites as worth measuring -- RASBERY_GPU_CMFD_FP32=1 with
+/// RASBERY_GPU_FP32 unset, the +2.6 % on M64 -- ran the whole inner BiCGSTAB in
+/// float (both matvecs, the colour sweeps, all eight Krylov vectors) while the
+/// receipt printed `"arm":"fp64"` and `"cmfd":"fp64"`, and every wall-clock and
+/// pcm number taken from that log was attributed to an FP64 device run that did
+/// not happen.  Worse, a non-finite would latch the CMFD backend off and the
+/// same receipt would carry `"nonfinite_fallbacks":1` beside an arm it said had
+/// never been engaged.
+///
+/// The knob therefore lives where the POLICY lives.  The launch site asks
+/// `routes()` and nothing else -- which is what the note on `routes()` has
+/// always claimed -- and the receipt reads the same predicate the launch site
+/// does, so the two agree BY CONSTRUCTION rather than by review.
+///
+/// Cached for the same reason `armed()` is: it fixes the captured graph
+/// topology and may not move between two outers of one run.
+inline bool cmfdLegacyArm() {
+    static const bool on = envFlagOn("RASBERY_GPU_CMFD_FP32");
+    return on;
+}
+
+/// IS THE ARM ENGAGED FOR THIS BACKEND, by any spelling a launch site honours.
+///
+/// `armed()` is the DEVICE-WIDE arm; this is the PER-BACKEND one, and the two
+/// differ for exactly one backend and exactly one knob.  Everything that has to
+/// agree with a LAUNCH asks this: `routes()`, `backendState()`, the receipt.
+///
+/// The two predicates that deliberately keep asking `armed()` are properties of
+/// the device-wide arm alone and neither is a routing decision:
+/// `strictActive()`, because STRICT narrows the accumulators of the device-wide
+/// arm and narrowing an FP64 solve's dot product would just be a worse FP64
+/// solve; and `refineRounds()`, because the refinement LOOP is captured graph
+/// DEPTH and the historical single-round CMFD topology must not acquire it.
+inline bool armedFor(Backend which) {
+    if (armed()) return true;
+    return which == Backend::Cmfd && cmfdLegacyArm();
+}
+
+/// Is ANY spelling armed?  This is what the receipt's `arm` field needs in
+/// order to say `"partial"` -- the device-wide arm is off, but a per-backend
+/// spelling turned one on -- instead of the flat `"fp64"` that used to be
+/// printed over a float inner solve.
+inline bool anyArmed() {
+    for (int i = 0; i < static_cast<int>(Backend::Count); ++i)
+        if (armedFor(static_cast<Backend>(i))) return true;
+    return false;
 }
 
 /// The pure-FP32 reduction arm.  Implies nothing on its own: it only narrows the
@@ -451,8 +517,16 @@ inline bool latched(Backend which) {
 
 /// THE SINGLE ROUTING PREDICATE.  Every FP32 launch site in the tree asks this
 /// and nothing else, so "which arm did this kernel run under" has one answer.
+///
+/// It asks `armedFor(which)` and NOT `armed()`, and that is the whole content of
+/// the sentence above.  While CMFD's gate was `RASBERY_GPU_CMFD_FP32 OR
+/// routes(Cmfd)` there were two routing predicates for one backend, only one of
+/// them was visible to `backendState()`, and the receipt could and did contradict
+/// the kernels that ran.  Folding the second spelling into `armedFor()` makes
+/// this function the whole gate again: both spellings, the backend's scope, and
+/// the arm's sticky non-finite latch.
 inline bool routes(Backend which) {
-    return armed() && inScope(which) && !latched(which);
+    return armedFor(which) && inScope(which) && !latched(which);
 }
 
 /// A site that was asked for FP32 and stayed FP64: a shape the narrow kernel
@@ -540,14 +614,20 @@ inline unsigned long long bytesSavedEst() {
 
 /// What a backend RESOLVED to, as one word, for the receipt.
 ///
-///   "fp64"     the arm is off; nothing was asked of anybody
+///   "fp64"     the arm is off FOR THIS BACKEND; nothing was asked of it
 ///   "deferred" the arm is on but this tree has no narrow path for the backend
 ///   "declined" the arm is on and the backend has one, but it is not enabled
 ///              (CRAM without RASBERY_GPU_FP32_CRAM)
 ///   "latched"  the arm was on and taken, and a non-finite pushed it to FP64
 ///   "fp32"     the arm is on, in scope, and nothing latched it off
+///
+/// THE FIRST TEST IS `armedFor(which)` AND NOT `armed()`, and it is the whole
+/// reason this receipt can be trusted: it is the SAME predicate `routes()` --
+/// and therefore the launch site -- asks.  Testing the device-wide knob alone is
+/// what let a run with RASBERY_GPU_CMFD_FP32=1 and RASBERY_GPU_FP32 unset print
+/// `"cmfd":"fp64"` while the whole inner BiCGSTAB ran in float.
 inline const char* backendState(Backend which) {
-    if (!armed()) return "fp64";
+    if (!armedFor(which)) return "fp64";
     if (!converted(which)) return "deferred";
     if (latched(which)) return "latched";
     if (!inScope(which)) return "declined";
@@ -556,8 +636,22 @@ inline const char* backendState(Backend which) {
 
 /// `[RASBERY][FP32] {...}` -- printed unconditionally from every branch of
 /// main.cpp, next to the other end-of-run receipts.
+///
+/// `arm` is THREE-VALUED, because there are two spellings and they do not have
+/// to be asked together:
+///
+///   "fp32"    the device-wide arm (RASBERY_GPU_FP32) is on
+///   "partial" it is off, but a per-backend spelling armed a backend anyway
+///             (today: RASBERY_GPU_CMFD_FP32).  Read `backends` for which one.
+///   "fp64"    nothing is armed, by any spelling
+///
+/// The two-valued form printed "fp64" over runs whose CMFD inner solve was
+/// entirely float, which made every wall-clock and pcm number harvested from
+/// such a log a mis-attribution.  `backends` carries the attribution and `arm`
+/// must not contradict it.
 inline void appendReceiptFields(std::ostream& out) {
-    out << "\"arm\":\"" << (armed() ? "fp32" : "fp64") << "\"";
+    out << "\"arm\":\""
+        << (armed() ? "fp32" : (anyArmed() ? "partial" : "fp64")) << "\"";
     out << ",\"strict\":" << (strictActive() ? "true" : "false");
     out << ",\"backends\":{";
     for (int i = 0; i < static_cast<int>(Backend::Count); ++i) {

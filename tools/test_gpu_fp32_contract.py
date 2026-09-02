@@ -7,10 +7,14 @@ the numbers are settled by Gate A (against the FP64 trajectory) and Gate B
 (against MASTER).  What a static gate CAN settle is everything a reviewer would
 otherwise have to take on trust, and that is this file:
 
-  1. ONE ARM, ONE PREDICATE.  Three env knobs, each read once into a cached
-     static; every narrow launch site in the tree asks `routes()` and nothing
-     else, so the captured graph topology and the kernels inside it can never
-     disagree about which precision this run is.
+  1. ONE ARM, ONE PREDICATE.  Four env knobs -- the three device-wide ones and
+     CMFD's historical per-backend spelling -- each read once into a cached
+     static IN THE ARM HEADER; every narrow launch site in the tree asks
+     `routes()` and nothing else, so the captured graph topology, the kernels
+     inside it and the receipt can never disagree about which precision this run
+     is.  A knob spelled at a launch site instead is invisible to the receipt,
+     which is exactly how `"cmfd":"fp64"` came to be printed over a run whose
+     whole inner BiCGSTAB was float.
   2. FEATURE-OFF IS UNREACHABLE, NOT MERELY UNTAKEN.  With the flag unset no
      float kernel is reachable: the narrow launch parameter defaults to false,
      every FP64 kernel and struct is textually intact, and the FP64 arm of every
@@ -117,10 +121,20 @@ BACKENDS = ("cmfd", "nodal", "flatxs", "xe", "cram", "ppr")
 # into the WP10.1 case key, so an FP64 answer can never be served to an FP32
 # request.
 # ---------------------------------------------------------------------------
+#
+# RASBERY_GPU_CMFD_FP32 is on this list even though it is not one of "the three
+# device-wide knobs".  It is the HISTORICAL per-backend spelling of the CMFD arm,
+# it still arms the FP32 inner BiCGSTAB by itself, and while it was spelled in
+# src/CudaBICGBackend.cu -- OR-ed against routes(Cmfd) at the gate -- nothing in
+# the arm header could see it.  A run with RASBERY_GPU_CMFD_FP32=1 and
+# RASBERY_GPU_FP32 unset therefore ran every kernel of the inner solve in float
+# and printed `"arm":"fp64","backends":{"cmfd":"fp64",...}`.  Same rule, same
+# reason: one reader, in the header that owns the policy.
 KNOBS = {
     "RASBERY_GPU_FP32": "armed",
     "RASBERY_GPU_FP32_STRICT": "strict",
     "RASBERY_GPU_FP32_CRAM": "cramExtended",
+    "RASBERY_GPU_CMFD_FP32": "cmfdLegacyArm",
 }
 
 
@@ -171,8 +185,35 @@ try:
     ROUTES = body_after(ARM, "inline bool routes(Backend which)")
 except LookupError:
     ROUTES = ""
-check("armed()" in ROUTES and "inScope(which)" in ROUTES and "!latched(which)" in ROUTES,
-      "routes() is (armed AND in scope AND NOT latched) and nothing else")
+check("armedFor(which)" in ROUTES and "inScope(which)" in ROUTES
+      and "!latched(which)" in ROUTES,
+      "routes() is (armed FOR THIS BACKEND AND in scope AND NOT latched) and "
+      "nothing else")
+# NEGATIVE CONTROL for the defect this rule exists for.  `armed()` alone is the
+# DEVICE-WIDE knob; CMFD has a second, historical spelling.  A routing predicate
+# that asks armed() cannot see it, which is how the CMFD launch site and the
+# receipt came to disagree in the first place.
+check("armed()" not in ROUTES,
+      "routes() does NOT ask armed() directly -- a backend whose arm has a "
+      "second spelling would route on one predicate and be reported on another")
+
+try:
+    ARMED_FOR = body_after(ARM, "inline bool armedFor(Backend which)")
+except LookupError:
+    ARMED_FOR = ""
+check("armed()" in ARMED_FOR and "cmfdLegacyArm()" in ARMED_FOR
+      and "Backend::Cmfd" in ARMED_FOR,
+      "armedFor() folds BOTH spellings of the CMFD arm -- the device-wide "
+      "RASBERY_GPU_FP32 and the historical RASBERY_GPU_CMFD_FP32 -- so the one "
+      "predicate the launch sites and the receipt share knows about both")
+
+try:
+    ANY_ARMED = body_after(ARM, "inline bool anyArmed()")
+except LookupError:
+    ANY_ARMED = ""
+check("armedFor(" in ANY_ARMED and "Backend::Count" in ANY_ARMED,
+      "anyArmed() sweeps the whole enum through armedFor(), so a per-backend "
+      "spelling added later cannot be omitted from the receipt's `arm` field")
 
 try:
     SCOPE = body_after(ARM, "inline bool inScope(Backend which)")
@@ -395,6 +436,27 @@ check(STATE.index('return "deferred"') < STATE.index('return "fp32"'),
       "a backend the tree does not narrow reports deferred BEFORE anything can "
       "report fp32 -- the receipt may never claim a conversion that is absent")
 
+# THE RECEIPT ASKS THE PREDICATE THE LAUNCH SITE ASKS.  This is the rule the
+# cmfd:"fp64"-over-a-float-solve defect violated: backendState() short-circuited
+# on the device-wide knob while the CMFD gate was (that knob OR the historical
+# RASBERY_GPU_CMFD_FP32), so the receipt was wrong in exactly the configuration
+# the header cites as worth +2.6 % on M64 -- and could print
+# "nonfinite_fallbacks":1 beside an arm it said was never engaged.
+check("armedFor(which)" in STATE,
+      "backendState() gates on armedFor(which) -- the same predicate routes() "
+      "and therefore every launch site asks")
+check("if (!armed())" not in STATE,
+      "NEGATIVE CONTROL: backendState() must NOT short-circuit on the "
+      "device-wide armed() knob; that is what reported cmfd:\"fp64\" over a "
+      "run whose whole inner BiCGSTAB was float")
+check('(armed() ? "fp32" : "fp64")' not in RECEIPT,
+      "NEGATIVE CONTROL: the receipt's `arm` field is not a bare armed() "
+      "ternary -- with RASBERY_GPU_CMFD_FP32 set and RASBERY_GPU_FP32 unset "
+      "that printed \"fp64\" over a float CMFD solve")
+check("anyArmed()" in RECEIPT and '"partial"' in RECEIPT,
+      "`arm` is three-valued: fp32 (device-wide), partial (a per-backend "
+      "spelling only), fp64 (nothing) -- so it can never contradict `backends`")
+
 check(MAIN.count('"[RASBERY][FP32] {"') == 3,
       "the receipt is printed from all three of main.cpp's exit branches")
 check(MAIN.count("rasbery::fp32::appendReceiptFields(std::cout);") == 3,
@@ -410,10 +472,13 @@ check(re.search(r"if\s*\([^)]*fp32[^)]*\)\s*\{?\s*std::cout << \"\[RASBERY\]\[FP
 # ---------------------------------------------------------------------------
 # 4. CMFD: THE WHOLE INNER SOLVE, THROUGH THE EXISTING KERNEL SET.
 #
-# The arm does not add a second CMFD precision path; it OR-s into the one that
+# The arm does not add a second CMFD precision path; it routes into the one that
 # already exists, at the one cached gate, so there is still one captured
-# topology decision.  tools/test_cmfd_fp32_contract.py owns the kernel-level
-# properties of that path; what belongs HERE is the join.
+# topology decision.  The historical RASBERY_GPU_CMFD_FP32 spelling is folded in
+# at armedFor() in the ARM HEADER and not OR-ed here, because a gate the receipt
+# cannot see is a gate that lets `"cmfd":"fp64"` be printed over a float solve.
+# tools/test_cmfd_fp32_contract.py owns the kernel-level properties of that
+# path; what belongs HERE is the join.
 # ---------------------------------------------------------------------------
 try:
     CMFD_GATE = body_after(BICG, "bool cmfdFp32InnerEnabled()")
@@ -421,10 +486,15 @@ except LookupError:
     CMFD_GATE = ""
 check("rasbery::fp32::routes(rasbery::fp32::Backend::Cmfd)" in CMFD_GATE,
       "RASBERY_GPU_FP32 routes CMFD through the existing cached inner-solve gate")
-check('envFlagEnabled("RASBERY_GPU_CMFD_FP32")' in CMFD_GATE,
-      "the historical per-backend knob still reaches the same path")
 check("static const bool enabled" in CMFD_GATE,
       "the joined gate is still resolved once and cached")
+# NEGATIVE CONTROL: no second predicate at the gate.  The OR that used to sit
+# here is the defect -- it armed the FP32 kernel set from a knob `armed()` never
+# saw, so the receipt reported an FP64 device run that did not happen.
+check("envFlagEnabled(" not in CMFD_GATE and "getenv" not in CMFD_GATE
+      and "||" not in CMFD_GATE,
+      "the CMFD gate reads NO environment of its own and ORs nothing: it is "
+      "routes(Cmfd) and nothing else, so the receipt reads the same predicate")
 check(BACKEND_CODE.count("rasbery::fp32::routes(") == 2,
       "the xsrecon/nodal TU asks the arm exactly twice -- once in "
       "flatxsNarrowBlocks(), once in nodalNarrowState() -- and both cache it")
