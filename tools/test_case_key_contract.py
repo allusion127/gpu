@@ -769,6 +769,237 @@ def exec_mode_forms_contract() -> None:
             fail(f"the trajectory receipt does not publish {field!r}")
 
 
+def xe_anderson_order_contract() -> None:
+    """The key's Xe arm is the SOLVER's, resolved after the mode is declared.
+
+    THE HOLE (238, 2026-09-04, second one).  A plain single run reported
+    `xe_anderson:"off"` with `xe_anderson_source:"default"` in [RASBERY][CASE]
+    while its own receipts showed the Anderson arm running (anderson_accepted
+    674 / txn_steps 1117).  `exec_mode` and the Xe state in one receipt can only
+    disagree that way when the MODE-DEPENDENT default (Driver.h xeAndersonGate)
+    resolved before main() declared the mode: the gate is a first-read latch, it
+    would then have cached the mode cell's INITIAL value, and
+    declareExecutionMode refuses a late change rather than pretending it took
+    effect -- so every later reader agrees on a state the run's own mode did not
+    choose.
+
+    So there are two properties, and this holds both.  ONE OBJECT: the key, the
+    receipts and the solve read the same xeAndersonGate(), never a second
+    getenv and never a second mode test.  ONE ORDER: main() declares the mode
+    before anything can read it, the gate records which mode it saw, and a run
+    where that is not the run's mode says so on stderr instead of folding it
+    silently into the case key.
+    """
+    # ---- ONE OBJECT ----------------------------------------------------
+    prov = DRIVER_H[DRIVER_H.index("static casekey::Provenance caseKeyProvenance("):]
+    prov = prov[:prov.index("\n    }")]
+    if "xeAnderson()" not in prov or "xeAndersonSourceName()" not in prov:
+        fail("caseKeyProvenance does not resolve the Xe Anderson state through the "
+             "gate the solve reads; a second resolution is a second answer")
+    for banned in ("executionMode() == ExecutionMode::Single",
+                   'getenv("RASBERY_XE_ANDERSON")'):
+        if banned in prov:
+            fail(f"caseKeyProvenance re-derives the Anderson state ({banned!r}); the "
+                 "adoption rule lives in xeAndersonGate() and nowhere else")
+    # The solve, the [PHYSICS_MODE] receipt and the trajectory's `resolved`
+    # object read the same two functions, so `resolved` cannot describe a state
+    # [PHYSICS_MODE] denies.
+    solve = DRIVER_H[DRIVER_H.index("const bool   xe_anderson    = "):]
+    if not solve.startswith("const bool   xe_anderson    = xeAnderson();"):
+        fail("the Xe cascade no longer caches xeAnderson() as its gate; the key "
+             "would then fold a state the arithmetic does not use")
+    traj = DRIVER_H[DRIVER_H.index('"[RASBERY][TRAJECTORY] {{'):]
+    traj = traj[:traj.index(");")]
+    if 'xeAnderson() ? "on" : "off"' not in traj or "xeAndersonSourceName()" not in traj:
+        fail("the trajectory receipt's `resolved` object does not read the gate; it "
+             "and [PHYSICS_MODE] could then disagree about one run")
+    physics_mode = MAIN_CPP[MAIN_CPP.index('"[RASBERY][PHYSICS_MODE] '):]
+    physics_mode = physics_mode[:physics_mode.index(";\n")]
+    if "rasbery::xeAnderson()" not in physics_mode or \
+            "rasbery::xeAndersonSourceName()" not in physics_mode:
+        fail("[PHYSICS_MODE] does not read the gate either; three receipts spelling "
+             "one fact three ways is how they start disagreeing")
+
+    # ---- ONE ORDER -----------------------------------------------------
+    if MAIN_CPP.index("declareExecutionMode(") > MAIN_CPP.index("[RASBERY][PHYSICS_MODE]"):
+        fail("main() declares the execution mode AFTER the first receipt that reads "
+             "the mode-dependent Anderson default; the default would cache the mode "
+             "cell's initial value and the declaration could not move it")
+    declare = DRIVER_H[DRIVER_H.index("inline void declareExecutionMode("):]
+    declare = declare[:declare.index("\n}")]
+    if declare.index("exec_detail::declared().store(true") > declare.index("observed()"):
+        fail("declareExecutionMode records the declaration only on the accepted "
+             "path; a REFUSED late declaration still happened, and the gate's "
+             "order check has to see it")
+    gate = DRIVER_H[DRIVER_H.index("inline const XeAndersonGate& xeAndersonGate()"):]
+    gate = gate[:gate.index("\n}")]
+    if "executionModeDeclared()" not in gate:
+        fail("xeAndersonGate() does not record whether the execution mode had been "
+             "declared when it resolved; a stale mode default is then unreadable")
+    if "resolved BEFORE the execution mode was declared" not in gate:
+        fail("xeAndersonGate() resolves a mode default against an undeclared mode "
+             "silently; that is the 238 receipt, and it has to be loud")
+    for member in ("ExecutionMode    mode;", "bool             mode_declared;"):
+        if member not in DRIVER_H:
+            fail(f"XeAndersonGate lost {member!r}; the verdict no longer carries the "
+                 "mode it was resolved against")
+    if "xeAndersonResolvedAgainstDeclaredMode()" not in prov:
+        fail("caseKeyProvenance folds the Anderson state without checking that the "
+             "gate saw this run's mode; a stale default would be keyed silently")
+
+    # ---- NEGATIVE CONTROLS: each rule above must be able to FAIL --------
+    controls = []
+    mutated = prov.replace("xeAndersonResolvedAgainstDeclaredMode()", "true")
+    if "xeAndersonResolvedAgainstDeclaredMode()" in mutated:
+        controls.append("the order-check rule reads a provenance with the check "
+                        "removed as still checking")
+    mutated_gate = gate.replace("executionModeDeclared()", "false")
+    if "executionModeDeclared()" in mutated_gate:
+        controls.append("the gate rule reads a gate with the declaration probe "
+                        "removed as still probing")
+    if "[RASBERY][PHYSICS_MODE]" not in MAIN_CPP or "declareExecutionMode(" not in MAIN_CPP:
+        controls.append("the ordering rule found neither anchor in main.cpp, so it "
+                        "would have passed on a file that declares nothing")
+    for message in controls:
+        fail("NEGATIVE CONTROL FAILED: " + message)
+
+    # ---- THE PYTHON MIRROR IMPLEMENTS THE SAME MODE-DEPENDENT DEFAULT ---
+    #
+    # `--exec-mode` is the tool's stand-in for the argv flag it cannot see, so
+    # the mirror's whole correctness is that these four rows match the gate.
+    for env, mode, want in ((dict(CLEAN_ENV), "single", ("on", "default")),
+                            (dict(CLEAN_ENV), "batch", ("off", "default")),
+                            ({**CLEAN_ENV, "RASBERY_XE_ANDERSON": "1"}, "batch",
+                             ("on", "env")),
+                            ({**CLEAN_ENV, "RASBERY_XE_ANDERSON": "0"}, "single",
+                             ("off", "env")),
+                            ({**CLEAN_ENV, "RASBERY_XE_ANDERSON": " ON\r"}, "batch",
+                             ("on", "env")),
+                            ({**CLEAN_ENV, "RASBERY_XE_ANDERSON": ""}, "single",
+                             ("on", "default"))):
+        got = case_key.xe_anderson(env, mode)
+        if got != want:
+            fail(f"tools/case_key.py xe_anderson({env.get('RASBERY_XE_ANDERSON')!r}, "
+                 f"{mode}) = {got}, not {want}; the mirror and the gate disagree "
+                 "about the adoption default")
+
+
+def xe_anderson_gate_compiled(build) -> None:
+    """The gate itself, compiled from Driver.h's own text and RUN.
+
+    A grep can say the gate consults executionMode() and that main() declares
+    the mode first.  It cannot say what a single run with RASBERY_XE_ANDERSON
+    unset actually resolves to -- which is the fact the 238 receipt contradicted
+    -- so the adoption block is sliced OUT OF THE HEADER (not copied) and run.
+    """
+    try:
+        start = DRIVER_H.index("enum class XeMode {")
+        end = DRIVER_H.index("inline bool xeAndersonResolvedAgainstDeclaredMode() {")
+        end = DRIVER_H.index("\n}\n", end) + 3
+    except ValueError:
+        fail("the Xe mode/Anderson adoption block could not be sliced out of "
+             "Driver.h; the compiled gate check cannot run")
+        return
+    source = ("#include <atomic>\n#include <cctype>\n#include <cstdlib>\n"
+              "#include <iostream>\n#include <string>\n"
+              "namespace rasbery {\n" + DRIVER_H[start:end] + "\n} // namespace rasbery\n"
+              + GATE_MAIN_CPP)
+    exe = build("xe_anderson_gate_harness", source)
+    if exe is None:
+        return
+
+    def run(order, mode, **env):
+        environ = {k: v for k, v in os.environ.items() if not k.startswith("RASBERY_")}
+        environ.update(env)
+        done = subprocess.run([str(exe), order, mode], capture_output=True,
+                              universal_newlines=True, env=environ)
+        if done.returncode != 0:
+            fail(f"the Anderson gate harness failed ({order}/{mode}/{env}): "
+                 f"{done.stdout}{done.stderr}")
+            return None
+        out = dict(line.split(" ", 1) for line in done.stdout.splitlines() if " " in line)
+        out["warn"] = done.stderr
+        return out
+
+    # THE PIN: a single run with nothing exported runs the Anderson arm, says
+    # so, and says the mode default is why.  This is the row the 238 receipt
+    # contradicted.
+    single = run("declare-first", "single")
+    if single is None:
+        return
+    if (single["xe_anderson"], single["source"], single["sound"]) != ("on", "default", "1"):
+        fail(f"a single run with RASBERY_XE_ANDERSON unset resolves "
+             f"{single['xe_anderson']}/{single['source']} (sound={single['sound']}), "
+             "not on/default; that is the 238 [CASE] receipt")
+    batch = run("declare-first", "batch")
+    if batch is None:
+        return
+    if (batch["xe_anderson"], batch["source"], batch["sound"]) != ("off", "default", "1"):
+        fail(f"a batch run with RASBERY_XE_ANDERSON unset resolves "
+             f"{batch['xe_anderson']}/{batch['source']}, not off/default")
+    for value, mode, want in (("1", "batch", ("on", "env")), ("0", "single", ("off", "env")),
+                              (" ON\r", "batch", ("on", "env")),
+                              ("", "single", ("on", "default"))):
+        got = run("declare-first", mode, RASBERY_XE_ANDERSON=value)
+        if got is None:
+            return
+        if (got["xe_anderson"], got["source"]) != want:
+            fail(f"RASBERY_XE_ANDERSON={value!r} under {mode} resolves "
+                 f"{got['xe_anderson']}/{got['source']}, not {want[0]}/{want[1]}")
+    frozen = run("declare-first", "single", RASBERY_XE_MODE="frozen")
+    if frozen is None:
+        return
+    if frozen["xe_anderson"] != "off":
+        fail("the mode default arms Anderson under RASBERY_XE_MODE=frozen, which has "
+             "no cascade to accelerate")
+
+    # NEGATIVE CONTROLS.
+    controls = []
+    typo = run("declare-first", "single", RASBERY_XE_ANDERSON="yess")
+    stale = run("resolve-first", "batch")
+    if typo is None or stale is None:
+        return
+    if (typo["xe_anderson"], typo["source"]) != ("on", "default") or \
+            "not a state" not in typo["warn"]:
+        controls.append("a typo'd RASBERY_XE_ANDERSON is read as a state or accepted "
+                        "silently instead of falling through to the mode default")
+    # THE DEFECT'S OWN SHAPE, reproduced deliberately: read the gate BEFORE the
+    # declaration and the batch declaration can no longer move anything.  The
+    # state must then be reported as unsound and warned about -- if this row
+    # ever reads sound=1, the order check is not checking anything.
+    if stale["sound"] != "0":
+        controls.append("a gate resolved before the mode was declared reports itself "
+                        "as sound; the case key would fold a stale default silently")
+    if "resolved BEFORE the execution mode was declared" not in stale["warn"]:
+        controls.append("a gate resolved before the mode was declared is not warned "
+                        "about on stderr")
+    for message in controls:
+        fail("NEGATIVE CONTROL FAILED: " + message)
+
+
+GATE_MAIN_CPP = r'''
+int main(int argc, char** argv) {
+    const std::string order = argc > 1 ? argv[1] : "declare-first";
+    const rasbery::ExecutionMode want =
+        (argc > 2 && std::string(argv[2]) == "batch") ? rasbery::ExecutionMode::Batch
+                                                      : rasbery::ExecutionMode::Single;
+    // "resolve-first" is the defect: something reads the mode-dependent default
+    // before main() declares the mode.
+    if (order == "resolve-first") (void)rasbery::xeAnderson();
+    rasbery::declareExecutionMode(want);
+    std::cout << "exec_mode " << rasbery::executionModeName() << "\n"
+              << "xe_anderson " << (rasbery::xeAnderson() ? "on" : "off") << "\n"
+              << "source " << rasbery::xeAndersonSourceName() << "\n"
+              << "resolved_mode "
+              << (rasbery::xeAndersonResolvedMode() == rasbery::ExecutionMode::Single
+                      ? "single" : "batch") << "\n"
+              << "sound " << (rasbery::xeAndersonResolvedAgainstDeclaredMode() ? "1" : "0")
+              << "\n";
+    return 0;
+}
+'''
+
+
 def exec_mode_key_behaviour() -> None:
     """The python mirror, on the property the hole was: keys must FORK."""
     with tempfile.TemporaryDirectory() as raw:
@@ -1228,6 +1459,8 @@ def compiled_contract() -> bool:
             return True
         # The registry half runs on the same toolchain, in the same temp dir.
         forms_registry_contract(build)
+        # So does the Anderson gate, sliced straight out of Driver.h.
+        xe_anderson_gate_compiled(build)
 
         payloads = {}
         for name, core, symang in (("base", QUARTER, 90), ("transpose", QUARTER_T, 90),
@@ -1413,6 +1646,7 @@ def main(argv: list[str]) -> int:
     one_builder_contract()
     receipt_component_contract()
     exec_mode_forms_contract()
+    xe_anderson_order_contract()
     exec_mode_key_behaviour()
     behaviour_contract()
     xslib_contract()

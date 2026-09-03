@@ -1248,6 +1248,14 @@ inline std::atomic<bool>& observed() {
     static std::atomic<bool> seen{false};
     return seen;
 }
+/// Latched by declareExecutionMode, so a MODE-DEPENDENT default can record
+/// whether it resolved against a mode somebody declared or against the cell's
+/// initial value.  `observed()` is the other side of the same fact and cannot
+/// answer this one: it says a read happened, not that a declaration had.
+inline std::atomic<bool>& declared() {
+    static std::atomic<bool> done{false};
+    return done;
+}
 } // namespace exec_detail
 
 /// The mode this process runs in.  Reading it latches it.
@@ -1262,9 +1270,23 @@ inline bool batchExecution() { return executionMode() == ExecutionMode::Batch; }
 /// The mode as the receipts publish it.
 inline const char* executionModeName() { return batchExecution() ? "batch" : "single"; }
 
+/// True once main() has declared the mode.  Read by the mode-dependent Anderson
+/// default so it can record -- and the case key can report -- whether the state
+/// it cached is the RUNTIME one or the cell's initial value.  Reading this does
+/// NOT latch `observed()`: a check that a declaration has happened must not
+/// itself be the read that forbids one.
+inline bool executionModeDeclared() {
+    return exec_detail::declared().load(std::memory_order_relaxed);
+}
+
 /// main() declares this once, from the batch-branch predicate, before anything
 /// reads it.
 inline void declareExecutionMode(ExecutionMode requested) {
+    // BEFORE the refusal check, and unconditionally: "a declaration happened"
+    // is true even when the declaration is refused, and the mode-dependent
+    // default's question is about ORDER -- did the gate resolve before main()
+    // got here -- not about whether the value it was handed was accepted.
+    exec_detail::declared().store(true, std::memory_order_relaxed);
     if (exec_detail::observed().load(std::memory_order_relaxed) &&
         exec_detail::modeCell().load(std::memory_order_relaxed) != requested) {
         // REFUSE the late change rather than record it.  A mode-dependent
@@ -1353,6 +1375,17 @@ enum class XeAndersonSource { Default, Env };
 struct XeAndersonGate {
     bool             on;
     XeAndersonSource source;
+    /// The execution mode this verdict was resolved AGAINST, and whether that
+    /// mode had been declared when it was.  The gate is a first-read latch over
+    /// a MODE-DEPENDENT default, so "what state did the run use" and "was the
+    /// mode known when that was decided" are two facts, and only the second one
+    /// can tell a correct default from a stale one.  Every later reader -- the
+    /// solve, the [PHYSICS_MODE] receipt, the case key and the trajectory's
+    /// `resolved` object -- reads THIS object, so they can never disagree with
+    /// each other; the only failure left is the latch being older than the
+    /// mode, and these two members are what makes it sayable.
+    ExecutionMode    mode;
+    bool             mode_declared;
 };
 
 inline const XeAndersonGate& xeAndersonGate() {
@@ -1399,10 +1432,32 @@ inline const XeAndersonGate& xeAndersonGate() {
                              "the mode default\n";
             }
         }
+        // THE MODE, READ ONCE, AND WHETHER IT WAS DECLARED.  Both are recorded
+        // in the verdict even when an env override made the mode irrelevant:
+        // the case key's consistency check compares the mode this latch saw
+        // against the mode the run reports, and it has to be able to do that on
+        // every run, not only on the ones that took the default.
+        const bool          mode_declared = executionModeDeclared();
+        const ExecutionMode mode          = executionMode();
         if (source == XeAndersonSource::Default) {
             // The adoption default: ON for a single run, OFF under --batch-mode
             // (arrival-width starvation -- see the block above).
-            want = (executionMode() == ExecutionMode::Single);
+            want = (mode == ExecutionMode::Single);
+            // RESOLVED BEFORE main() DECLARED THE MODE.  This is a programming
+            // error, not a runtime condition, and it is the exact shape of the
+            // 238 receipt that read `xe_anderson:"off"` beside an `exec_mode`
+            // of "single": the default cached against the cell's INITIAL value
+            // and the declaration that came afterwards could not move it (see
+            // declareExecutionMode, which refuses a late change rather than
+            // pretending it took effect).  Name it here, at the one place that
+            // still knows both halves.
+            if (!mode_declared)
+                std::cerr << "[RASBERY][WARN][xe] the Xe Anderson adoption default "
+                             "resolved BEFORE the execution mode was declared; it took "
+                             "the mode cell's initial value ("
+                          << (mode == ExecutionMode::Single ? "single" : "batch")
+                          << ") and a later declaration cannot move it -- the state, the "
+                             "receipts and the case key all describe that value\n";
         }
 
         // EQUILIBRIUM MODE ONLY, in both provenances.  frozen has no cascade to
@@ -1416,9 +1471,9 @@ inline const XeAndersonGate& xeAndersonGate() {
                           << xeModeName()
                           << "; Anderson accelerates the equilibrium cascade and has nothing "
                              "to accelerate in that mode -- staying off\n";
-            return XeAndersonGate{false, source};
+            return XeAndersonGate{false, source, mode, mode_declared};
         }
-        return XeAndersonGate{want, source};
+        return XeAndersonGate{want, source, mode, mode_declared};
     }();
     return resolved;
 }
@@ -1427,8 +1482,22 @@ inline const XeAndersonGate& xeAndersonGate() {
 inline bool xeAnderson() { return xeAndersonGate().on; }
 
 /// "default" or "env" -- the provenance of the state above.
+///
+/// "default" is the MODE-DEPENDENT adoption default (single ON / batch OFF),
+/// which is why xeAndersonResolvedAgainstDeclaredMode() exists beside it: the
+/// word says which rule decided, and that predicate says whether the rule had
+/// the run's real mode to decide from.
 inline const char* xeAndersonSourceName() {
     return xeAndersonGate().source == XeAndersonSource::Env ? "env" : "default";
+}
+
+/// The execution mode the gate above resolved AGAINST, and whether that mode
+/// had been declared at the time.  A run where these disagree with
+/// executionMode() reported one mode and solved the other mode's Xe arm.
+inline ExecutionMode xeAndersonResolvedMode() { return xeAndersonGate().mode; }
+inline bool xeAndersonResolvedAgainstDeclaredMode() {
+    const XeAndersonGate& gate = xeAndersonGate();
+    return gate.mode_declared && gate.mode == executionMode();
 }
 
 /// WHERE THE EFFECTIVE RASBERY_GPU_XE_TXN STATE CAME FROM.
@@ -5530,7 +5599,32 @@ private:
         // really do run the same Xe arm and should key as close to alike as the
         // truth allows.  A BARE `--batch-mode 1`, which takes the mode default,
         // differs in `xe_anderson` as well, which is the defect this closes.
+        //
+        // FROM THE SOLVER'S GATE, AND LOUD WHEN THAT GATE IS OLDER THAN THE
+        // MODE.  xeAnderson() is the SAME first-read latch UpdateEquilibriumXenon
+        // reads, so the key, the [CASE] receipt, the trajectory's `resolved`
+        // object and the arithmetic cannot disagree with each other by
+        // construction -- there is one object.  What they CAN do is all agree on
+        // a state that was decided before main() declared the execution mode
+        // (the mode-dependent default would then have cached the mode cell's
+        // initial value), which reads as `exec_mode:"single"` beside
+        // `xe_anderson:"off"` and is the 238 receipt this closes.  The gate now
+        // records the mode it saw; a disagreement is named here, at the point
+        // where the key is about to fold it, rather than being folded silently.
         p.exec_mode          = executionModeName();
+        // Only the MODE-DEPENDENT provenance can be stale this way: an explicit
+        // RASBERY_XE_ANDERSON decides the state without consulting the mode at
+        // all, so a latch older than the declaration changes nothing there.
+        if (xeAndersonGate().source == XeAndersonSource::Default &&
+            !xeAndersonResolvedAgainstDeclaredMode())
+            std::cerr << "[RASBERY][WARN][case-key] the Xe Anderson state folded into "
+                         "the case key was resolved against exec_mode="
+                      << (xeAndersonResolvedMode() == ExecutionMode::Single ? "single"
+                                                                           : "batch")
+                      << " while this run reports exec_mode=" << executionModeName()
+                      << "; the key and the receipts describe the state the SOLVE used "
+                         "(the gate is one latch), so the run is self-consistent, but "
+                         "the mode-dependent default did not see this run's mode\n";
         p.xe_anderson        = xeAnderson() ? "on" : "off";
         p.xe_anderson_source = xeAndersonSourceName();
         p.xe_txn             = rasberyGpuXeTxnEnabled() ? "on" : "off";

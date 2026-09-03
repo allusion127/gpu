@@ -248,13 +248,36 @@ if "source = XeAndersonSource::Env;" in GATE_FLAT[typo_at:]:
 # The mode default is the fallback for EVERY non-request, and the execution mode
 # is consulted at exactly one place.
 DEFAULT_ARM = ("if (source == XeAndersonSource::Default) { "
-               "want = (executionMode() == ExecutionMode::Single); }")
+               "want = (mode == ExecutionMode::Single);")
 if DEFAULT_ARM not in squash(code_lines(gate)):
     fail("the default is not 'ON for a single run, OFF under --batch-mode', applied to every "
          f"path that did not come from the env: {DEFAULT_ARM!r}")
+if "const ExecutionMode mode = executionMode();" not in squash(code_lines(gate)):
+    fail("the gate does not read the execution mode into the verdict it records; a stale "
+         "mode default would then be indistinguishable from a correct one")
 if gate.count("executionMode()") != 1:
     fail("the execution mode is consulted more than once in the gate; the default has one "
          "decision point")
+
+# THE ORDER, RECORDED (238, 2026-09-04).  The gate is a first-read latch over a
+# MODE-DEPENDENT default, so a reader that ran before main() declared the mode
+# caches the mode cell's INITIAL value -- and declareExecutionMode refuses the
+# late declaration rather than pretending it took effect.  Every later reader
+# then agrees on a state this run's mode did not choose, which is how a single
+# run published `exec_mode:"single"` beside `xe_anderson:"off"`.  The verdict
+# therefore carries the mode it saw and whether that mode had been declared, and
+# the case key checks it (tools/test_case_key_contract.py).
+if "executionModeDeclared()" not in squash(code_lines(gate)):
+    fail("the gate does not record whether the execution mode had been DECLARED when "
+         "the mode default resolved; a stale default is then unreadable")
+if "resolved BEFORE the execution mode was declared" not in gate:
+    fail("a mode default that resolved before the mode was declared is not reported; "
+         "that is a programming error and it has to be loud")
+DECLARE = region(DRIVER, "inline void declareExecutionMode(",
+                 "// Safeguarded Anderson acceleration", "declareExecutionMode")
+if DECLARE.index("exec_detail::declared().store(true") > DECLARE.index("observed()"):
+    fail("declareExecutionMode records the declaration only when it is accepted; a "
+         "REFUSED late declaration still happened and the order check has to see it")
 
 # EQUILIBRIUM ONLY, and said out loud when it was ASKED for.  frozen has no
 # cascade to accelerate and once is deliberately not converging one.
@@ -268,16 +291,20 @@ conflict = GATE_FLAT[GATE_FLAT.index("xeMode() != XeMode::EQUILIBRIUM"):]
 if "if (source == XeAndersonSource::Env)" not in conflict.split("return")[0]:
     fail("the mode-conflict warning fires for the DEFAULT too; nobody asked for Anderson in "
          "that run, so there is no misconfiguration to report")
-if "return XeAndersonGate{false, source};" not in conflict:
+if "return XeAndersonGate{false, source, mode, mode_declared};" not in conflict:
     fail("the mode conflict warns but still enables the arm")
 
 # PROVENANCE.  With a mode-dependent default, the state alone does not identify
 # a run: `on` plus "who decided it" is the fact a measurement needs.
 if "enum class XeAndersonSource { Default, Env };" not in DRIVER:
     fail("there is no provenance type; default-ON and env-ON would be indistinguishable")
-if not re.search(r"struct XeAndersonGate\s*\{\s*bool\s+on;\s*XeAndersonSource\s+source;\s*\};",
+if not re.search(r"struct XeAndersonGate\s*\{\s*bool\s+on;\s*XeAndersonSource\s+source;",
                  DRIVER):
     fail("XeAndersonGate does not carry BOTH the effective state and its provenance")
+if not re.search(r"struct XeAndersonGate\s*\{.*?ExecutionMode\s+mode;.*?bool\s+mode_declared;.*?\};",
+                 DRIVER, re.S):
+    fail("XeAndersonGate does not carry the execution mode it resolved against; the "
+         "case key cannot then tell a runtime default from a stale one")
 eff = region(DRIVER, "inline bool xeAnderson() {", "\n/// \"default\" or \"env\"", "xeAnderson")
 if "return xeAndersonGate().on;" not in eff:
     fail("xeAnderson() does not read through the single cached gate; two statics could "
