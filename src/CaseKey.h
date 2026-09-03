@@ -22,6 +22,13 @@
 //   the cross-section library's CONTENT digest, not its path
 //   the warm-start provenance, because a warm start can pick a root
 //   the code identity, as far as the process can know it (see kCodeShaEnv)
+//   the EXECUTION MODE (single / batch), which is an argv fact no env line
+//     carries and which selects the Xe Anderson default
+//   the EFFECTIVE Xe Anderson and Xe transaction states, which are resolved
+//     from the environment AND the execution mode, so the raw env strings
+//     under-describe them
+//   the RESOLVED CONTRACTION MASKS (`forms`), because the mask a host MINES
+//     selects the rounding of production arithmetic and no env string says so
 //
 // WHAT IT DELIBERATELY DOES NOT COVER.  The result mode (full / pin-off /
 // light) and the output paths.  The campaign measured all three output modes to
@@ -60,7 +67,16 @@ namespace rasbery::casekey {
 /// The payload's version.  Bump it when the FIELD SET changes: a key computed
 /// under a different field set is a different key and must not silently collide
 /// with, or miss against, one computed under this one.
-inline constexpr const char* kSchema = "rasbery-case-key/v1";
+/// v2 (2026-09-04) ADDED FOUR LINES -- `exec_mode`, `xe_anderson`, `xe_txn` and
+/// `forms`.  EVERY KEY IN THE CAMPAIGN MOVES ONCE, including a single run with
+/// the AA default and no forms channel resolved, because the payload gained
+/// lines rather than values.  That is the point: the v1 field set could not tell
+/// a `--batch-mode 1` run from a single run of the same deck and env, and on 238
+/// those two converged on different trajectories (1f36e75dc00ed2b4 / 4377 outers
+/// against 4c663ff538b28f82 / 7087) under ONE key -- the batch execution mode
+/// turns the Xe Anderson default off (Driver.h xeAndersonGate) and nothing in
+/// the key said so.  A cache built under v1 must be re-keyed, not merged.
+inline constexpr const char* kSchema = "rasbery-case-key/v2";
 
 /// The harness declares the build identity here.  It is not derivable inside
 /// the process -- there is no embedded commit -- and a key that pretended
@@ -308,6 +324,42 @@ struct Provenance {
     std::string xslib_digest;  ///< sha256 of the cross-section library CONTENT
     std::string warm_start;    ///< warm-start provenance token, or empty
     std::vector<std::pair<std::string, std::string>> env; ///< arm knobs, raw, in order
+
+    // ---- v2 -------------------------------------------------------------
+    //
+    // WHY THESE ARE NOT COVERED BY `env`.  The env half digests the RAW STRINGS
+    // a launcher exported, which is the right thing for a knob whose value IS
+    // its meaning.  These three are not that: their effective state is resolved
+    // from the environment AND from facts the environment does not carry.
+    //
+    //   exec_mode   `--batch-mode` is an ARGV flag, not a variable, and it
+    //               selects the Xe Anderson default (Driver.h xeAndersonGate).
+    //               No env line can see it.
+    //   xe_anderson the EFFECTIVE state.  Unset + single = ON, unset + batch =
+    //               OFF, and both spell `~` in the env half.  This is the field
+    //               that closes the 238 hole.
+    //   xe_txn      the EFFECTIVE state.  Default ON, `=0` off, and a stub
+    //               (CUDA=OFF) build resolves it OFF whatever the variable says.
+    //
+    // THE SOURCE NAMES ARE CARRIED BUT NOT FOLDED.  `RASBERY_XE_ANDERSON` is
+    // already on trajectory::kArmEnv, so "somebody asked for it" is already in
+    // the key through its raw value; folding the source again would give the
+    // batch harness (which exports RASBERY_XE_ANDERSON=1 --
+    // tools/run_single_gpu_batch.py DEFAULT_ENV) and a single run that takes
+    // the same state by default two keys for one arithmetic, which is a cache
+    // miss bought for nothing.  They are printed in [RASBERY][CASE] instead,
+    // because "AA was on" and "AA was on because somebody asked" are different
+    // facts about a measurement.
+    std::string exec_mode;          ///< "single" | "batch"
+    std::string xe_anderson;        ///< effective: "on" | "off"
+    std::string xe_anderson_source; ///< "default" | "env" -- REPORTED, not folded
+    std::string xe_txn;             ///< effective: "on" | "off"
+    std::string xe_txn_source;      ///< "default" | "env" -- REPORTED, not folded
+    /// sha256 of gpu::formsPayloadFrozen(), or empty when no contraction
+    /// channel had resolved by the time the key was computed.  The mask a host
+    /// MINES selects the rounding of production arithmetic and is not derivable
+    /// from any environment string, so it has to be measured and folded.
+    std::string forms_digest;
 };
 
 inline std::string tokenOrTilde(const std::string& text) {
@@ -407,6 +459,16 @@ inline std::string payloadOf(const Provenance& p) {
     out += tokenOrTilde(p.warm_start);
     out += "\ncode_sha\t";
     out += codeShaToken();
+    // ---- v2, appended AFTER code_sha so a v1 payload is a prefix of a v2 one
+    // and a diff of the two reads as four added lines rather than a reshuffle.
+    out += "\nexec_mode\t";
+    out += tokenOrTilde(p.exec_mode);
+    out += "\nxe_anderson\t";
+    out += tokenOrTilde(p.xe_anderson);
+    out += "\nxe_txn\t";
+    out += tokenOrTilde(p.xe_txn);
+    out += "\nforms\t";
+    out += tokenOrTilde(p.forms_digest);
     out += '\n';
     return out;
 }

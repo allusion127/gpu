@@ -899,7 +899,14 @@ def check_receipts(driver: str, server: str, light: str, main: str) -> list[str]
                         "five of its knobs are read from; a new field and a new meaning "
                         "on an unchanged version is a reader that cannot tell an old log "
                         "from a new one")
-    if '"schema_version":7' not in driver.replace('\\"', '"'):
+    # WP24 took this to 7 (fidelity_preset); case-key v2 (2026-09-04) took it to
+    # 8 (exec_mode, the effective Xe arms, forms_digest).  AT LEAST 7 is the
+    # contract: the preset fields this file owns arrived at 7 and every later
+    # bump keeps them, so pinning the exact number here would make any unrelated
+    # receipt field fail the preset contract.
+    _case_ver = re.search(r'\[RASBERY\]\[CASE\] \{\{"schema_version":(\d+)',
+                          driver.replace('\\"', '"'))
+    if _case_ver is None or int(_case_ver.group(1)) < 7:
         problems.append("the [RASBERY][CASE] line did not bump its schema_version; a new "
                         "field on an unchanged version is a reader that cannot tell an "
                         "old log from a new one")

@@ -125,11 +125,16 @@ def emitters_carry_every_audited_field() -> None:
 
 def driver_receipt_bumped_schema() -> None:
     block = driver_case_block()
-    # WP24 took this to 7 when the line gained `fidelity_preset`.
-    if block and '\\"schema_version\\":7' not in block:
-        fail("[RASBERY][CASE] gained fields without bumping schema_version to 7; "
-             "a reader cannot tell a receipt that carries them from one that "
-             "cannot")
+    # WP24 took this to 7 when the line gained `fidelity_preset`; case-key v2
+    # (2026-09-04) took it to 8 with exec_mode / the effective Xe arms /
+    # forms_digest.  AT LEAST 7 is the contract: the fields this file audits
+    # arrived at 7 and every later bump keeps them, so pinning an exact number
+    # here would turn any future receipt field into a failure of this file.
+    version = re.search(r'schema_version\\":(\d+)', block or "")
+    if block and (version is None or int(version.group(1)) < 7):
+        fail("[RASBERY][CASE] gained fields without bumping schema_version to 7 or "
+             "later; a reader cannot tell a receipt that carries them from one "
+             "that cannot")
 
 
 def emitters_carry_a_per_case_identifier() -> None:

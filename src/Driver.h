@@ -17,6 +17,9 @@
 #include "ThGpuReceipt.h"
 #include "WarmState.h"
 #include "XSTiming.h"
+#include "FlatXsStreamFormMask.h" // the resolved-mask registry: stream channel
+#include "GpuFormMask.h"          // gpu::formsPayloadFrozen / formsPinName
+#include "ThFormMask.h"           // the resolved-mask registry: T/H channel
 #include "XeFormAudit.h"
 #include "XeFormMask.h"
 #include "XeGpuReceipt.h"
@@ -1426,6 +1429,24 @@ inline bool xeAnderson() { return xeAndersonGate().on; }
 /// "default" or "env" -- the provenance of the state above.
 inline const char* xeAndersonSourceName() {
     return xeAndersonGate().source == XeAndersonSource::Env ? "env" : "default";
+}
+
+/// WHERE THE EFFECTIVE RASBERY_GPU_XE_TXN STATE CAME FROM.
+///
+/// The STATE itself is rasberyGpuXeTxnEnabled() and is read from there and
+/// nowhere else -- a second reading of the variable would be a second answer,
+/// and a stub (CUDA=OFF) build answers `false` whatever the variable says.  This
+/// says only whether a HUMAN asked, which the state cannot: the gate is
+/// default-ON, so "on" is the same word for "nobody typed anything" and for
+/// "somebody typed 1".  `env` means the variable is present and carries one of
+/// the recognised falsy spellings CudaXsReconBackend.cu::envFlagDisabled reads,
+/// or any other value (which that helper reads as an explicit on).
+inline const char* xeTxnSourceName() {
+    static const char* name = [] {
+        const char* raw = std::getenv("RASBERY_GPU_XE_TXN");
+        return (raw == nullptr) ? "default" : "env";
+    }();
+    return name;
 }
 
 /// Per-rejection reason trace for the Anderson arm (RASBERY_XE_ANDERSON_DEBUG).
@@ -5433,6 +5454,28 @@ private:
         return text;
     }
 
+    /// The resolved-mask registry as a JSON array, in INSERTION order, for the
+    /// [RASBERY][CASE] receipt.  `forms_digest` answers "is the arithmetic the
+    /// same"; when it is not, this is the line that says WHICH channel moved and
+    /// whether it moved because the host mined differently, because somebody
+    /// overrode it, or because RASBERY_FORMS_PIN forced the shipped default.
+    ///
+    /// The DIGEST is over a name-sorted copy (GpuFormMask.h) and this is not, on
+    /// purpose: a key may not depend on the order channels came up, and a reader
+    /// may want to know it.
+    static std::string FormMaskReceiptJson() {
+        std::string out   = "[";
+        bool        first = true;
+        for (const gpu::FormMaskRecord& r : gpu::formMaskSnapshot()) {
+            if (!first) out += ",";
+            first = false;
+            out += std::format(R"({{"mask":"{}","value":"0x{:x}","source":"{}","mined_sound":{}}})",
+                               r.name, r.value, r.source, r.mined_sound ? 1 : 0);
+        }
+        out += "]";
+        return out;
+    }
+
     static casekey::Provenance caseKeyProvenance(const IO& input_output,
                                                  const std::string& warm_provenance,
                                                  const CaseFidelity& fidelity) {
@@ -5468,7 +5511,68 @@ private:
             p.xslib_digest = XsLibraryContentDigest(input_output.xs_path());
         for (const char* name : trajectory::kArmEnv)
             p.env.emplace_back(name, armEnvValue(name, fidelity));
+
+        // ---- v2: the three facts the env half cannot carry ----------------
+        //
+        // THE 238 HOLE, STATED ONCE.  A single run and a `--batch-mode 1` run of
+        // the same deck under the same environment produced ONE case key and TWO
+        // trajectories (1f36e75dc00ed2b4 / 4377 outers against 4c663ff538b28f82
+        // / 7087), because `--batch-mode` is an argv flag that flips the Xe
+        // Anderson default (xeAndersonGate above) and neither the mode nor the
+        // resolved state was in the payload.  Both are now.
+        //
+        // THE EFFECTIVE STATE, NOT THE REQUEST.  xeAnderson() is what the solve
+        // path consults, so it is what the key folds; the harness batch runs
+        // export RASBERY_XE_ANDERSON=1 (tools/run_single_gpu_batch.py
+        // DEFAULT_ENV), which means a harness batch case and a single run of the
+        // same deck now differ in `exec_mode` and in nothing else -- the two
+        // really do run the same Xe arm and should key as close to alike as the
+        // truth allows.  A BARE `--batch-mode 1`, which takes the mode default,
+        // differs in `xe_anderson` as well, which is the defect this closes.
+        p.exec_mode          = executionModeName();
+        p.xe_anderson        = xeAnderson() ? "on" : "off";
+        p.xe_anderson_source = xeAndersonSourceName();
+        p.xe_txn             = rasberyGpuXeTxnEnabled() ? "on" : "off";
+        p.xe_txn_source      = xeTxnSourceName();
+
+        // THE CONTRACTION MASKS, PRIMED FIRST.  Every channel resolves lazily
+        // in a function-local static, and the key is computed before the solve,
+        // so an unprimed registry would be EMPTY here and full later -- which in
+        // the evaluator server (one process, sixty-four cases) would key case 1
+        // over an empty registry and case 2 over a full one.  Priming resolves
+        // all four calibrated channels here, once per process, so the frozen
+        // payload is the same for every case in the process AND actually
+        // describes the arithmetic.
+        //
+        // COST: four minings on fixtures of a few hundred nodes, once, and they
+        // are the same minings the armed run would have paid anyway.  They touch
+        // no solver state -- the reference bodies are separate TUs precisely so
+        // they cannot join the production ones (CmfdOuterReference.h).
+        primeFormMasks();
+        const std::string& forms = gpu::formsPayloadFrozen();
+        if (!forms.empty()) p.forms_digest = Sha256::hexOf(forms);
         return p;
+    }
+
+    /// Resolve every calibrated contraction channel, once, BEFORE the case key
+    /// reads the registry.  See caseKeyProvenance for why it has to happen here
+    /// rather than at each channel's first production use.
+    ///
+    /// The four are the calibrated ones -- the channels whose value is MINED and
+    /// therefore not derivable from any environment string.  `nodal_const` uses
+    /// resolveFormMask (build default plus an override, both already in the env
+    /// half) and registers itself when the nodal arm first asks for it; if it
+    /// resolves after the freeze the registry says so on stderr.
+    static void primeFormMasks() {
+        static const bool primed = [] {
+            (void)xe::xeFormMask();
+            (void)xe::xeHostFormMask();
+            (void)th::thFormMask();
+            (void)flatxs_stream::streamFormMask();
+            (void)cmfd::cmfdOuterFormsRuntime();
+            return true;
+        }();
+        (void)primed;
     }
 
     static std::string RestartPath(const IO& input_output, int step_number) {
@@ -6006,7 +6110,7 @@ public:
                 r_loose_keff, r_loose_flux, r_loose_xe);
         }
         std::cout << std::format(
-            "  [RASBERY][CASE] {{\"schema_version\":7,\"case_key\":\"{}\",\"key_schema\":\"{}\","
+            "  [RASBERY][CASE] {{\"schema_version\":8,\"case_key\":\"{}\",\"key_schema\":\"{}\","
             "\"core_op\":\"{}\",\"deck_digest\":\"{}\",\"env_digest\":\"{}\","
             "\"env_set\":\"{}\","
             "\"xslib_digest\":\"{}\",\"xslib_policy\":\"{}\",\"warm_start_token\":\"{}\","
@@ -6015,7 +6119,14 @@ public:
             "\"result_mode\":\"{}\",\"output\":\"{}\","
             "\"warm_start\":\"{}\",\"statepoint_grid\":\"{}\","
             "\"acceptance_eligible\":{},\"fidelity_declared\":{},\"fidelity_preset\":\"{}\","
-            "\"promoted_from\":{}}}\n",
+            "\"promoted_from\":{},"
+            // v2.  The four fields the key gained, plus the two source names it
+            // deliberately did not fold: a reader has to be able to see WHY the
+            // effective state is what it is without re-deriving the adoption
+            // rule from the mode and the environment.
+            "\"exec_mode\":\"{}\",\"xe_anderson\":\"{}\",\"xe_anderson_source\":\"{}\","
+            "\"xe_txn\":\"{}\",\"xe_txn_source\":\"{}\","
+            "\"forms_digest\":\"{}\",\"forms_pin\":\"{}\",\"forms\":{}}}\n",
             case_key, casekey::kSchema, input_output.deck_key_core_op(),
             input_output.deck_key_digest(), case_env_digest,
             casekey::envSetToken(case_provenance),
@@ -6034,7 +6145,12 @@ public:
             _case_receipt.fidelity_preset,
             _fidelity.promoted_from.empty()
                 ? std::string("null")
-                : "\"" + jsonString(_fidelity.promoted_from) + "\"");
+                : "\"" + jsonString(_fidelity.promoted_from) + "\"",
+            case_provenance.exec_mode, case_provenance.xe_anderson,
+            case_provenance.xe_anderson_source, case_provenance.xe_txn,
+            case_provenance.xe_txn_source,
+            casekey::tokenOrTilde(case_provenance.forms_digest),
+            gpu::formsPinName(), FormMaskReceiptJson());
 
         // Receipt keys (plan Rev.4 Sec 8.1).  result_stem() is empty until
         // OpenResult(), and light-result runs never call it, so fall back to the
@@ -7042,12 +7158,32 @@ public:
         // is on or off.  `telemetry` is printed and NOT folded into `digest`:
         // that separation is what makes "instrumentation moved the iteration" a
         // question two greps can answer.
+        // v2 of this line adds `resolved`, BESIDE `env` rather than inside it.
+        //
+        // `env` is and stays the RAW exported strings in kArmEnv order --
+        // tools/test_telemetry_neutrality.py holds armEnvJson() to reporting
+        // them unparsed, and a derived field inside that object would be exactly
+        // the drift it forbids.  `resolved` is the other half of the same
+        // question: what the process ACTUALLY ran, once the argv mode, the
+        // adoption defaults and the host's contraction mining are applied.  Two
+        // logs whose `env` agrees and whose `resolved` does not were configured
+        // alike and ran differently, which before this line was unreadable.
         std::cout << std::format(
-            "[RASBERY][TRAJECTORY] {{\"schema_version\":1,\"slot\":{},\"statepoints\":{},"
+            "[RASBERY][TRAJECTORY] {{\"schema_version\":2,\"slot\":{},\"statepoints\":{},"
             "\"outers\":{},\"th_updates\":{},\"digest\":\"{:016x}\",\"telemetry\":{},"
-            "\"env\":{}}}\n",
+            "\"env\":{},"
+            "\"resolved\":{{\"exec_mode\":\"{}\",\"xe_anderson\":\"{}\","
+            "\"xe_anderson_source\":\"{}\",\"xe_txn\":\"{}\",\"xe_txn_source\":\"{}\","
+            "\"forms_pin\":\"{}\",\"forms_digest\":\"{}\",\"forms\":{}}}}}\n",
             cmfd_solver.batchSlot(), sp_traj.statepoints, sp_traj.outers, sp_traj.th,
-            sp_traj.h, sp_telem ? 1 : 0, trajectory::armEnvJson());
+            sp_traj.h, sp_telem ? 1 : 0, trajectory::armEnvJson(),
+            executionModeName(), xeAnderson() ? "on" : "off", xeAndersonSourceName(),
+            rasberyGpuXeTxnEnabled() ? "on" : "off", xeTxnSourceName(),
+            gpu::formsPinName(),
+            gpu::formsPayload().empty()
+                ? std::string("~")
+                : Sha256::hexOf(gpu::formsPayload()),
+            FormMaskReceiptJson());
         return 0;
     }
 };

@@ -53,8 +53,71 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # importing it costs nothing until a preset is actually named.
 import exact_audit  # noqa: E402
 
-SCHEMA = "rasbery-case-key/v1"
+# v2 (2026-09-04): four lines appended after code_sha -- exec_mode,
+# xe_anderson, xe_txn and forms.  See src/CaseKey.h kSchema for why every key in
+# the campaign moves once.
+SCHEMA = "rasbery-case-key/v2"
 CODE_SHA_ENV = "RASBERY_CODE_SHA"
+
+# src/Driver.h xeAndersonGate()/xeMode(), mirrored.
+#
+# WHY THIS IS MODELLED HERE AND NOT READ FROM A RECEIPT.  The whole point of
+# the v2 field is that the EFFECTIVE Anderson state is not any environment
+# string: it is the mode-dependent adoption default (ON for a single run, OFF
+# under --batch-mode) unless RASBERY_XE_ANDERSON says otherwise.  A tool that
+# asked the environment would compute a single run's key for a batch run, which
+# is exactly the 238 collision this field closes.  So the tool takes the
+# EXECUTION MODE as an input (`--exec-mode`) and applies the same rule.
+AA_OFF_WORDS = {"0", "off", "false", "no"}
+AA_ON_WORDS = {"1", "on", "true", "yes"}
+
+
+def _folded(env, name):
+    """The trimmed, case-folded value, the way every RASBERY mode switch reads."""
+    return str(env.get(name, "")).strip(" \t\r\n\v\f").lower()
+
+
+def xe_mode(env) -> str:
+    """src/Driver.h xeMode(): equilibrium | frozen | once, unknown -> equilibrium."""
+    s = _folded(env, "RASBERY_XE_MODE")
+    return s if s in ("frozen", "once") else "equilibrium"
+
+
+def xe_anderson(env, exec_mode: str = "single") -> tuple[str, str]:
+    """(effective state, source) for RASBERY_XE_ANDERSON under `exec_mode`.
+
+    The empty/unset/whitespace value is NO REQUEST, not an explicit off -- the
+    2026-08-27 adoption changed that meaning and a mirror that kept the old one
+    would disagree with the solver on every inherited-empty launcher.
+    """
+    s = _folded(env, "RASBERY_XE_ANDERSON")
+    source = "default"
+    if s in AA_OFF_WORDS:
+        want, source = False, "env"
+    elif s in AA_ON_WORDS:
+        want, source = True, "env"
+    else:
+        # Unset, empty, or an unrecognised word: the solver warns and falls
+        # through to the mode default in all three cases.
+        want = (exec_mode == "single")
+    if want and xe_mode(env) != "equilibrium":
+        # Anderson accelerates the equilibrium cascade and declines in the other
+        # two modes, in BOTH provenances.
+        return "off", source
+    return ("on" if want else "off"), source
+
+
+def xe_txn(env) -> tuple[str, str]:
+    """(effective state, source) for RASBERY_GPU_XE_TXN.
+
+    src/CudaXsReconBackend.cu envFlagDisabled(): DEFAULT ON, and only the falsy
+    spellings turn it off.  A CUDA=OFF (stub) build answers `off` whatever the
+    variable says, which this cannot know -- pass `--xe-txn off` for a stub.
+    """
+    raw = env.get("RASBERY_GPU_XE_TXN")
+    if raw is None:
+        return "on", "default"
+    return ("off" if str(raw) in ("", "0", "off", "OFF", "false", "FALSE") else "on"), "env"
 
 # src/Driver.h trajectory::kArmEnv, IN ORDER -- READ FROM THE SOURCE, not copied.
 #
@@ -372,7 +435,20 @@ def env_set(env) -> str:
 
 
 def payload_of(deck_digest: str, fidelity: str, policy: str,
-               env, xslib_digest: str, warm_start: str) -> str:
+               env, xslib_digest: str, warm_start: str,
+               exec_mode: str = "single", forms_digest: str = "",
+               xe_anderson_state: str = "", xe_txn_state: str = "") -> str:
+    """src/CaseKey.h payloadOf(), byte for byte.
+
+    `forms_digest` CANNOT BE DERIVED HERE.  It is the digest of the contraction
+    masks THIS HOST MINED (src/GpuFormMask.h), which is a measurement of a
+    binary on a machine and not a function of any deck or environment.  So the
+    tool takes it as an input -- copy it out of the run's [RASBERY][CASE] line
+    -- and leaves it `~` when the caller has nothing, which reproduces the key
+    of a run in which no contraction channel had resolved.
+    """
+    aa = xe_anderson_state or xe_anderson(env, exec_mode)[0]
+    txn = xe_txn_state or xe_txn(env)[0]
     lines = [SCHEMA,
              f"deck\t{_token(deck_digest)}",
              f"fidelity\t{_token(fidelity)}",
@@ -382,10 +458,16 @@ def payload_of(deck_digest: str, fidelity: str, policy: str,
     lines.append(f"xslib\t{_token(xslib_digest)}")
     lines.append(f"warm_start\t{_token(warm_start)}")
     lines.append(f"code_sha\t{_token(env.get(CODE_SHA_ENV, ''))}")
+    lines.append(f"exec_mode\t{_token(exec_mode)}")
+    lines.append(f"xe_anderson\t{_token(aa)}")
+    lines.append(f"xe_txn\t{_token(txn)}")
+    lines.append(f"forms\t{_token(forms_digest)}")
     return "\n".join(lines) + "\n"
 
 
-def case_key(deck: Path, env=None, xslib: bool = True, warm_start: str = "") -> dict:
+def case_key(deck: Path, env=None, xslib: bool = True, warm_start: str = "",
+             exec_mode: str = "single", forms_digest: str = "",
+             xe_txn_state: str = "") -> dict:
     env = dict(os.environ if env is None else env)
     config = json.loads(deck.read_text(encoding="utf-8-sig"))
     dpayload, core_op = deck_payload(config)
@@ -417,8 +499,14 @@ def case_key(deck: Path, env=None, xslib: bool = True, warm_start: str = "") -> 
 
     rank = effective_fidelity(env)
     policy, fidelity = FIDELITY_TRAITS[rank]
+    aa_state, aa_source = xe_anderson(env, exec_mode)
+    txn_state, txn_source = xe_txn(env)
+    if xe_txn_state:
+        txn_state, txn_source = xe_txn_state, "declared"
     payload = payload_of(deck_digest, fidelity, policy, env,
-                         xslib_digest, warm_start)
+                         xslib_digest, warm_start, exec_mode=exec_mode,
+                         forms_digest=forms_digest,
+                         xe_anderson_state=aa_state, xe_txn_state=txn_state)
     return {
         "deck": str(deck),
         "key_schema": SCHEMA,
@@ -441,6 +529,12 @@ def case_key(deck: Path, env=None, xslib: bool = True, warm_start: str = "") -> 
         "xslib_source": xslib_source,
         "warm_start_token": _token(warm_start),
         "code_sha": _token(env.get(CODE_SHA_ENV, "")),
+        "exec_mode": exec_mode,
+        "xe_anderson": aa_state,
+        "xe_anderson_source": aa_source,
+        "xe_txn": txn_state,
+        "xe_txn_source": txn_source,
+        "forms_digest": _token(forms_digest),
         "warm_start": warm_start,
         "payload": payload,
         "deck_payload": dpayload,
@@ -452,7 +546,9 @@ def case_key(deck: Path, env=None, xslib: bool = True, warm_start: str = "") -> 
 # left to right.
 COMPONENT_FIELDS = ("case_key", "key_schema", "core_op", "deck_digest",
                     "env_digest", "env_set", "xslib_digest", "xslib_policy",
-                    "warm_start_token", "code_sha", "fidelity", "policy")
+                    "warm_start_token", "code_sha", "fidelity", "policy",
+                    "exec_mode", "xe_anderson", "xe_anderson_source",
+                    "xe_txn", "xe_txn_source", "forms_digest")
 
 
 def main(argv: list[str]) -> int:
@@ -473,6 +569,16 @@ def main(argv: list[str]) -> int:
                     help="warm-start provenance token to fold into the key")
     ap.add_argument("--env", action="append", default=[], metavar="NAME=VALUE",
                     help="override one environment variable for a what-if")
+    ap.add_argument("--exec-mode", choices=("single", "batch"), default="single",
+                    help="the run's execution mode: --batch-mode makes it 'batch', "
+                         "and it flips the Xe Anderson default (src/Driver.h)")
+    ap.add_argument("--forms-digest", default="",
+                    help="the run's resolved contraction-mask digest, copied from "
+                         "its [RASBERY][CASE] forms_digest; a host mines this and "
+                         "no tool can derive it")
+    ap.add_argument("--xe-txn", choices=("on", "off"), default="",
+                    help="force the effective RASBERY_GPU_XE_TXN state; a CUDA=OFF "
+                         "build resolves it 'off' whatever the variable says")
     args = ap.parse_args(argv)
 
     env = dict(os.environ)
@@ -481,7 +587,8 @@ def main(argv: list[str]) -> int:
         env[name] = value
 
     result = case_key(args.deck, env=env, xslib=not args.no_xslib,
-                      warm_start=args.warm_start)
+                      warm_start=args.warm_start, exec_mode=args.exec_mode,
+                      forms_digest=args.forms_digest, xe_txn_state=args.xe_txn)
     if args.components:
         for field in COMPONENT_FIELDS:
             print(f"{field}\t{result[field]}")

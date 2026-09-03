@@ -609,7 +609,10 @@ def receipt_component_contract() -> None:
     # this binary can run and A2 is a FAMILY (src/CaseFidelity.h), so a reader
     # holding a schema-6 line cannot tell "no preset" from "a preset this reader
     # has never heard of"; the version is what lets it tell.
-    if '\\"schema_version\\":7' not in block:
+    # v2 (2026-09-04) took it to 8 with the exec-mode / effective-AA / forms
+    # fields.  A schema-7 line cannot answer "was this batch", which is the
+    # question that made two 238 runs share a key and split a trajectory.
+    if '\\"schema_version\\":8' not in block:
         fail("the [RASBERY][CASE] receipt did not bump schema_version when it "
              "gained the component fields; a reader cannot tell the two apart")
     # WP10.4.  The Sec 6.2 spelling of the fidelity, BESIDE the campaign one.
@@ -646,6 +649,174 @@ def receipt_component_contract() -> None:
     if "codeShaToken()" not in CASEKEY_H[CASEKEY_H.index("inline std::string payloadOf("):]:
         fail("payloadOf reads RASBERY_CODE_SHA through its own getenv again; the "
              "receipt and the payload would then be able to disagree")
+
+
+def exec_mode_forms_contract() -> None:
+    """v2: the execution mode, the EFFECTIVE Xe arms and the resolved masks.
+
+    THE HOLE (238, 2026-09-04).  A single run and a `--batch-mode 1` run of one
+    deck under one environment published one case_key/env_digest and converged
+    on two trajectories (1f36e75dc00ed2b4 / 4377 outers against
+    4c663ff538b28f82 / 7087).  `--batch-mode` is an ARGV flag, it flips the Xe
+    Anderson adoption default (Driver.h xeAndersonGate), and nothing that the
+    key folded could see either fact.
+    """
+    forms_h = (ROOT / "src" / "GpuFormMask.h").read_text(encoding="utf-8-sig")
+
+    if 'kSchema = "rasbery-case-key/v2"' not in CASEKEY_H:
+        fail("CaseKey.h did not bump kSchema for the v2 field set; a v1 cache "
+             "would miss silently against a v2 key instead of being re-keyed")
+    if case_key.SCHEMA != "rasbery-case-key/v2":
+        fail(f"tools/case_key.py SCHEMA is {case_key.SCHEMA!r}, not the header's v2")
+
+    payload_fn = CASEKEY_H[CASEKEY_H.index("inline std::string payloadOf("):]
+    payload_fn = payload_fn[:payload_fn.index("\n}")]
+    for line in ("exec_mode", "xe_anderson", "xe_txn", "forms"):
+        if f'"\\n{line}\\t"' not in payload_fn:
+            fail(f"payloadOf does not emit a {line!r} line; the key cannot tell "
+                 f"two runs that differ only in it apart")
+    # The SOURCE names are carried and deliberately NOT folded: RASBERY_XE_ANDERSON
+    # is already an env line, so folding "somebody asked" again would give the
+    # batch harness (which exports it) and a single run that takes the same state
+    # by default two keys for one arithmetic.
+    for banned in ("xe_anderson_source", "xe_txn_source"):
+        if banned in payload_fn:
+            fail(f"payloadOf folds {banned!r}; the provenance of a state is not the "
+                 "state, and the raw request is already an env line")
+    for field in ("std::string exec_mode;", "std::string xe_anderson;",
+                  "std::string xe_txn;", "std::string forms_digest;"):
+        if field not in CASEKEY_H:
+            fail(f"casekey::Provenance lost {field!r}")
+
+    # The solver fills them from the ONE reader of each fact, not from a second
+    # spelling of the environment.
+    prov = DRIVER_H[DRIVER_H.index("static casekey::Provenance caseKeyProvenance("):]
+    prov = prov[:prov.index("\n    }")]
+    for want in ("p.exec_mode          = executionModeName();",
+                 "p.xe_anderson        = xeAnderson() ?",
+                 "p.xe_txn             = rasberyGpuXeTxnEnabled() ?",
+                 "primeFormMasks();",
+                 "gpu::formsPayloadFrozen()"):
+        if want not in prov:
+            fail(f"caseKeyProvenance does not carry {want!r}; a second reading of "
+                 "a resolved state is a second answer")
+    if 'std::getenv("RASBERY_XE_ANDERSON")' in prov:
+        fail("caseKeyProvenance re-reads RASBERY_XE_ANDERSON; the key must fold the "
+             "EFFECTIVE state xeAnderson() resolved, not the request")
+
+    # Priming: all four CALIBRATED channels, before the key reads the registry.
+    prime = DRIVER_H[DRIVER_H.index("static void primeFormMasks()"):]
+    prime = prime[:prime.index("\n    }")]
+    for channel in ("xe::xeFormMask()", "xe::xeHostFormMask()", "th::thFormMask()",
+                    "flatxs_stream::streamFormMask()", "cmfd::cmfdOuterFormsRuntime()"):
+        if channel not in prime:
+            fail(f"primeFormMasks does not resolve {channel}; that channel would "
+                 "register AFTER the key and forms_digest would under-describe the run")
+
+    # Both resolvers register, or a channel is invisible to the key.
+    for fn in ("inline unsigned long long resolveFormMask(",
+               "inline unsigned long long resolveCalibratedFormMask("):
+        body = forms_h[forms_h.index(fn):]
+        body = body[:body.index("\n}")]
+        if "registerFormMask(" not in body:
+            fail(f"{fn}...) does not register what it resolved; the case key cannot "
+                 "see that channel")
+    # The pin is ranked BELOW the per-mask override in the calibrated resolver:
+    # the pin assignment must come before the getenv of the per-mask name.
+    calib = forms_h[forms_h.index("inline unsigned long long resolveCalibratedFormMask("):]
+    calib = calib[:calib.index("\n}")]
+    if calib.index('source = "pinned_default"') > calib.index("std::getenv(env_name)"):
+        fail("RASBERY_FORMS_PIN is applied after the per-mask override; a blanket "
+             "pin must never overrule a channel somebody named explicitly")
+    if 'std::getenv("RASBERY_FORMS_PIN")' not in forms_h or \
+            forms_h.count('std::getenv("RASBERY_FORMS_PIN")') != 1:
+        fail("RASBERY_FORMS_PIN must be read through exactly one cached gate")
+
+    # The receipt half.
+    case_block = DRIVER_H[DRIVER_H.index('"  [RASBERY][CASE] {{'):]
+    case_block = case_block[:case_block.index(");")]
+    for field in ("exec_mode", "xe_anderson", "xe_anderson_source", "xe_txn",
+                  "xe_txn_source", "forms_digest", "forms_pin", "forms"):
+        if f'\\"{field}\\"' not in case_block:
+            fail(f"[RASBERY][CASE] does not publish {field!r}")
+    traj = DRIVER_H[DRIVER_H.index('"[RASBERY][TRAJECTORY] {{'):]
+    traj = traj[:traj.index(");")]
+    if '\\"schema_version\\":2' not in traj:
+        fail("the trajectory receipt gained `resolved` without bumping its "
+             "schema_version; a reader cannot tell the two shapes apart")
+    for field in ("exec_mode", "xe_anderson", "forms_digest"):
+        if f'\\"{field}\\"' not in traj:
+            fail(f"the trajectory receipt does not publish {field!r}")
+
+
+def exec_mode_key_behaviour() -> None:
+    """The python mirror, on the property the hole was: keys must FORK."""
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        base = write(tmp, "base.json", deck(QUARTER))
+        env = dict(CLEAN_ENV)
+
+        single = key_of(base, env=env, exec_mode="single")
+        batch = key_of(base, env=env, exec_mode="batch")
+        if single == batch:
+            fail("a single run and a bare `--batch-mode 1` run of one deck still "
+                 "share a case key; that is the 238 hole (4377 outers against "
+                 "7087 under one key)")
+
+        # ...and the reason they fork is the EFFECTIVE Anderson state, not the
+        # mode label alone.  Forcing the state equal on both sides must leave
+        # exactly one difference -- the mode -- and forcing the mode equal while
+        # flipping the state must fork too.
+        aa_on = dict(env, RASBERY_XE_ANDERSON="1")
+        aa_off = dict(env, RASBERY_XE_ANDERSON="0")
+        if key_of(base, env=aa_on, exec_mode="single") == \
+                key_of(base, env=aa_off, exec_mode="single"):
+            fail("Anderson on and Anderson off share a case key")
+        if key_of(base, env=aa_on, exec_mode="batch") == \
+                key_of(base, env=aa_off, exec_mode="batch"):
+            fail("Anderson on and Anderson off share a case key under --batch-mode")
+
+        # The HARNESS batch case (tools/run_single_gpu_batch.py DEFAULT_ENV
+        # exports RASBERY_XE_ANDERSON=1) really does run the same Xe arm as a
+        # single run: the two must differ in `exec_mode` and in nothing else.
+        harness = case_key.case_key(base, env=aa_on, xslib=False, exec_mode="batch")
+        solo = case_key.case_key(base, env=aa_on, xslib=False, exec_mode="single")
+        if harness["xe_anderson"] != "on" or solo["xe_anderson"] != "on":
+            fail("the mirror does not resolve an explicit RASBERY_XE_ANDERSON=1 to "
+                 "'on' in both modes; the adoption override is symmetric")
+        diff = [line for line in harness["payload"].splitlines()
+                if line not in solo["payload"].splitlines()]
+        if diff != ["exec_mode\tbatch"]:
+            fail(f"a harness batch case and a single run differ by {diff}; with the "
+                 "same effective Xe arm the only payload difference must be the mode")
+
+        # NEGATIVE CONTROLS.  The field set must not have made the key sensitive
+        # to things that cannot move a trajectory.
+        controls = []
+        if key_of(base, env=env, exec_mode="single") != \
+                key_of(base, env=env, exec_mode="single"):
+            controls.append("the key is not reproducible for one (deck, env, mode)")
+        # An unrecognised RASBERY_XE_ANDERSON falls through to the mode default,
+        # exactly as the solver's warning path does -- it must NOT be read as off.
+        typo = dict(env, RASBERY_XE_ANDERSON="yes-please")
+        if case_key.xe_anderson(typo, "single")[0] != "on":
+            controls.append("an unrecognised RASBERY_XE_ANDERSON is read as a state "
+                            "instead of falling through to the mode default")
+        # Anderson declines outside equilibrium mode, in both provenances.
+        frozen = dict(env, RASBERY_XE_ANDERSON="1", RASBERY_XE_MODE="frozen")
+        if case_key.xe_anderson(frozen, "single")[0] != "off":
+            controls.append("the mirror keeps Anderson on under RASBERY_XE_MODE=frozen; "
+                            "the solver declines and the key would then name an arm "
+                            "the run did not take")
+        # forms_digest is an INPUT, not a derivation: two runs on hosts that mined
+        # different masks must fork, and a caller with nothing must reproduce the
+        # unresolved-registry key.
+        if key_of(base, env=env, forms_digest="aa" * 32) == \
+                key_of(base, env=env, forms_digest="bb" * 32):
+            controls.append("two different resolved contraction-mask digests share a "
+                            "case key; the host's rounding is not in the key")
+        for message in controls:
+            fail("NEGATIVE CONTROL FAILED: " + message)
 
 
 def behaviour_contract() -> None:
@@ -805,6 +976,19 @@ int main(int argc, char** argv) {
         p.policy       = "strict";
         p.xslib_digest = "cafebabe";
         p.warm_start   = "";
+        // v2.  The four fields no env line can carry, injected from the
+        // harness's own variables so the byte comparison covers them without
+        // this process having to be a batch run or own a GPU.
+        auto pick = [](const char* name, const char* fallback) {
+            const char* v = std::getenv(name);
+            return (v != nullptr) ? std::string(v) : std::string(fallback);
+        };
+        p.exec_mode          = pick("HARNESS_EXEC_MODE", "single");
+        p.xe_anderson        = pick("HARNESS_XE_ANDERSON", "on");
+        p.xe_anderson_source = pick("HARNESS_XE_ANDERSON_SOURCE", "default");
+        p.xe_txn             = pick("HARNESS_XE_TXN", "on");
+        p.xe_txn_source      = pick("HARNESS_XE_TXN_SOURCE", "default");
+        p.forms_digest       = pick("HARNESS_FORMS_DIGEST", "");
         std::string name;
         while (std::getline(names, name)) {
             if (name.empty()) continue;
@@ -833,6 +1017,133 @@ int main(int argc, char** argv) {
 }
 '''
 
+# ---------------------------------------------------------------------------
+# THE RESOLVED-MASK REGISTRY, COMPILED
+# ---------------------------------------------------------------------------
+#
+# A source grep can say that both resolvers CALL registerFormMask.  It cannot
+# say that the registry ends up with the channel in it, that the precedence is
+# override > pin > mined > default, or that forms_digest actually MOVES when a
+# mask does -- which is the only property the case key needs from it.  So this
+# runs the real header on two synthetic channels.
+FORMS_CPP = r'''
+#include "GpuFormMask.h"
+#include "Sha256.h"
+
+#include <iostream>
+
+int main() {
+    using namespace rasbery::gpu;
+    // A calibrated channel whose host mines 0x7 where the build says 0x6 --
+    // the real CMFD_OUTER split between the dev box and 238.
+    resolveCalibratedFormMask("RASBERY_TEST_FORMS_A", 0x6ull, 0x7ull, true, "chan_a");
+    // An uncalibrated one, the shape nodal_const has.
+    resolveFormMask("RASBERY_TEST_FORMS_B", 0x55ull, "chan_b");
+    std::cout << "pin " << formsPinName() << "\n";
+    std::cout << formsPayload();
+    std::cout << "digest " << rasbery::Sha256::hexOf(formsPayloadFrozen()) << "\n";
+    // AFTER the freeze: recorded, warned about, and NOT in the latched payload.
+    resolveFormMask("RASBERY_TEST_FORMS_C", 0x9ull, "chan_late");
+    std::cout << "after " << rasbery::Sha256::hexOf(formsPayloadFrozen()) << "\n";
+    return 0;
+}
+'''
+
+
+def forms_registry_contract(build) -> None:
+    """Every armed channel registers, and forms_digest moves when a mask does."""
+    exe = build("forms_registry_harness", FORMS_CPP)
+    if exe is None:
+        return
+
+    def run(**env):
+        environ = {k: v for k, v in os.environ.items() if not k.startswith("RASBERY_")}
+        environ.update(env)
+        done = subprocess.run([str(exe)], capture_output=True, universal_newlines=True,
+                              env=environ)
+        if done.returncode != 0:
+            fail(f"the forms registry harness failed ({env}): {done.stdout}{done.stderr}")
+            return None
+        out = {"lines": [], "warn": done.stderr}
+        for line in done.stdout.splitlines():
+            if line.startswith("form\t"):
+                _, name, value, source, sound = line.split("\t")
+                out["lines"].append((name, value, source, sound))
+            elif line.startswith(("pin ", "digest ", "after ")):
+                key, _, value = line.partition(" ")
+                out[key] = value
+        return out
+
+    plain = run()
+    if plain is None:
+        return
+    names = [row[0] for row in plain["lines"]]
+    if names != sorted(names):
+        fail("the forms payload is not name-sorted; the order channels happen to "
+             "resolve in would then be able to move a case key")
+    if [n for n in names] != ["chan_a", "chan_b"]:
+        fail(f"the registry holds {names}, not both armed channels; a channel the "
+             "key cannot see is a rounding the key cannot see")
+    if plain["lines"][0] != ("chan_a", "0x7", "mined", "1"):
+        fail(f"the calibrated channel did not record its MINED value: "
+             f"{plain['lines'][0]}")
+    if plain["lines"][1] != ("chan_b", "0x55", "build_default", "0"):
+        fail(f"the uncalibrated channel did not record its build default: "
+             f"{plain['lines'][1]}")
+    if plain["digest"] != plain["after"]:
+        fail("a channel that resolved AFTER the freeze moved the latched payload; "
+             "two cases in one evaluator process would then key differently for "
+             "one deck, which is the nondeterminism the freeze exists to remove")
+    if "chan_late" not in plain["warn"]:
+        fail("a channel that resolved after the case key was computed is not warned "
+             "about; the key silently under-describes the run's arithmetic")
+
+    over = run(RASBERY_TEST_FORMS_A="0x1")
+    if over is None:
+        return
+    if over["lines"][0] != ("chan_a", "0x1", "env", "1"):
+        fail(f"a per-mask override is not recorded as such: {over['lines'][0]}")
+    if over["digest"] == plain["digest"]:
+        fail("overriding a contraction mask did not move forms_digest; the case key "
+             "cannot tell two roundings apart")
+
+    pinned = run(RASBERY_FORMS_PIN="default")
+    if pinned is None:
+        return
+    if pinned["pin"] != "default":
+        fail(f"RASBERY_FORMS_PIN=default reports pin {pinned['pin']!r}")
+    if pinned["lines"][0] != ("chan_a", "0x6", "pinned_default", "1"):
+        fail(f"RASBERY_FORMS_PIN=default did not force the BUILD default on the "
+             f"calibrated channel: {pinned['lines'][0]}")
+    if pinned["lines"][1] != ("chan_b", "0x55", "pinned_default", "0"):
+        fail(f"RASBERY_FORMS_PIN=default did not name its source on the "
+             f"uncalibrated channel: {pinned['lines'][1]}")
+    if pinned["digest"] == plain["digest"]:
+        fail("pinning the build defaults did not move forms_digest, although it "
+             "moved the arithmetic on a host whose mined mask differs")
+
+    both = run(RASBERY_FORMS_PIN="default", RASBERY_TEST_FORMS_A="0x1")
+    if both is None:
+        return
+    if both["lines"][0] != ("chan_a", "0x1", "env", "1"):
+        fail(f"the blanket pin overruled a per-mask override: {both['lines'][0]}; "
+             "the precedence is override > pin > mined > default")
+
+    # NEGATIVE CONTROLS.
+    controls = []
+    if run(RASBERY_FORMS_PIN="mined")["digest"] != plain["digest"]:
+        controls.append("RASBERY_FORMS_PIN=mined is not the unset behaviour")
+    typo = run(RASBERY_FORMS_PIN="defualt")
+    if typo["digest"] != plain["digest"] or "not a mode" not in typo["warn"]:
+        controls.append("a misspelled RASBERY_FORMS_PIN is honoured or accepted "
+                        "silently; a typo must not buy an arm")
+    junk = run(RASBERY_TEST_FORMS_A="seven")
+    if junk["lines"][0][1] != "0x7" or "not a number" not in junk["warn"]:
+        controls.append("an unparseable per-mask override is not refused loudly")
+    for message in controls:
+        fail("NEGATIVE CONTROL FAILED: " + message)
+
+
 # Values chosen to exercise every spelling the two languages could disagree on:
 # an integer, a plain decimal, a tiny exponent, a huge one, a negative, a value
 # with no exact binary representation, a bool and a null.
@@ -857,33 +1168,44 @@ def compiled_contract() -> bool:
     compiler, std_flag = toolchain.compiler, toolchain.std_flag
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
-        cpp = tmp / "case_key_harness.cpp"
-        cpp.write_text(HARNESS_CPP, encoding="utf-8")
-        exe = tmp / ("case_key_harness.exe" if os.name == "nt" else "case_key_harness")
         includes = [ROOT / "src", ROOT / "include", ROOT / "include" / "chiffon"]
-        try:
-            if toolchain.is_msvc:
-                # QUOTED include paths: this repository's own path contains an
-                # `&`, which cmd would otherwise read as a command separator.
-                script = tmp / "build_case_key_harness.bat"
-                script.write_text(
-                    "@echo off\r\n"
-                    + 'call "%s" >nul\r\n' % compiler
-                    + 'cd /d "%s"\r\n' % tmp
-                    + 'cl /nologo %s /EHsc /D_CRT_SECURE_NO_WARNINGS "%s" %s /Fe:"%s"\r\n'
-                      % (std_flag, cpp, " ".join('/I "%s"' % d for d in includes), exe),
-                    encoding="utf-8")
-                subprocess.run(["cmd", "/c", str(script)], check=True, cwd=str(tmp),
-                               capture_output=True, universal_newlines=True)
-            else:
-                subprocess.run(
-                    [compiler, std_flag, "-O0", str(cpp), "-o", str(exe)]
-                    + [arg for d in includes for arg in ("-I", str(d))],
-                    check=True, capture_output=True, universal_newlines=True)
-        except subprocess.CalledProcessError as failure:
-            fail("the case-key harness does not compile:\n"
-                 + (failure.stdout or "") + (failure.stderr or ""))
+
+        def build(name, source):
+            """Compile one harness; None (with a recorded failure) if it will not."""
+            cpp = tmp / f"{name}.cpp"
+            cpp.write_text(source, encoding="utf-8")
+            exe = tmp / (f"{name}.exe" if os.name == "nt" else name)
+            try:
+                if toolchain.is_msvc:
+                    # QUOTED include paths: this repository's own path contains
+                    # an `&`, which cmd would otherwise read as a command
+                    # separator.
+                    script = tmp / f"build_{name}.bat"
+                    script.write_text(
+                        "@echo off\r\n"
+                        + 'call "%s" >nul\r\n' % compiler
+                        + 'cd /d "%s"\r\n' % tmp
+                        + 'cl /nologo %s /EHsc /D_CRT_SECURE_NO_WARNINGS "%s" %s /Fe:"%s"\r\n'
+                          % (std_flag, cpp, " ".join('/I "%s"' % d for d in includes), exe),
+                        encoding="utf-8")
+                    subprocess.run(["cmd", "/c", str(script)], check=True, cwd=str(tmp),
+                                   capture_output=True, universal_newlines=True)
+                else:
+                    subprocess.run(
+                        [compiler, std_flag, "-O0", str(cpp), "-o", str(exe)]
+                        + [arg for d in includes for arg in ("-I", str(d))],
+                        check=True, capture_output=True, universal_newlines=True)
+            except subprocess.CalledProcessError as failure:
+                fail(f"the {name} harness does not compile:\n"
+                     + (failure.stdout or "") + (failure.stderr or ""))
+                return None
+            return exe
+
+        exe = build("case_key_harness", HARNESS_CPP)
+        if exe is None:
             return True
+        # The registry half runs on the same toolchain, in the same temp dir.
+        forms_registry_contract(build)
 
         payloads = {}
         for name, core, symang in (("base", QUARTER, 90), ("transpose", QUARTER_T, 90),
@@ -923,7 +1245,18 @@ def compiled_contract() -> bool:
                        "RASBERY_XE_FORMS": "0xd3d",
                        "RASBERY_STAGED_FLUX_TOL": "4.0",
                        "RASBERY_CODE_SHA": "a1b2c3d4"})
-        for label, environ in (("unset", base_env), ("loaded", loaded)):
+        # v2.  A THIRD environment, and it is the one the 238 hole lives in: a
+        # batch run whose Anderson state is the mode default (off) and whose
+        # contraction masks actually resolved.  Comparing only "unset" and
+        # "loaded" would compare the four new lines at their defaults twice.
+        batched = dict(base_env)
+        batched.update({"HARNESS_EXEC_MODE": "batch",
+                        "HARNESS_XE_ANDERSON": "off",
+                        "HARNESS_XE_TXN": "off",
+                        "HARNESS_XE_TXN_SOURCE": "env",
+                        "HARNESS_FORMS_DIGEST": "f0" * 32})
+        for label, environ in (("unset", base_env), ("loaded", loaded),
+                               ("batched", batched)):
             out = tmp / f"payload_{label}.bin"
             done = subprocess.run([str(exe), "--payload", str(names_file), str(out)],
                                   capture_output=True, universal_newlines=True,
@@ -934,8 +1267,12 @@ def compiled_contract() -> bool:
                 return True
             cpp_env_digest, cpp_key, cpp_code_sha = \
                 (done.stdout.splitlines() + ["", "", ""])[:3]
-            py_payload = case_key.payload_of("deadbeef", "full_exact", "strict",
-                                             environ, "cafebabe", "")
+            py_payload = case_key.payload_of(
+                "deadbeef", "full_exact", "strict", environ, "cafebabe", "",
+                exec_mode=environ.get("HARNESS_EXEC_MODE", "single"),
+                forms_digest=environ.get("HARNESS_FORMS_DIGEST", ""),
+                xe_anderson_state=environ.get("HARNESS_XE_ANDERSON", "on"),
+                xe_txn_state=environ.get("HARNESS_XE_TXN", "on"))
             cpp_payload = out.read_bytes()
             if cpp_payload != py_payload.encode("utf-8"):
                 where = next((i for i, (a, b) in enumerate(
@@ -1048,6 +1385,8 @@ def main(argv: list[str]) -> int:
     source_contract()
     one_builder_contract()
     receipt_component_contract()
+    exec_mode_forms_contract()
+    exec_mode_key_behaviour()
     behaviour_contract()
     xslib_contract()
     compiled = compiled_contract()
@@ -1057,8 +1396,8 @@ def main(argv: list[str]) -> int:
         for message in FAILED:
             print(f"case key contract: FAIL: {message}")
         return 1
-    print("case key contract: PASS (source + receipt components + behaviour + "
-          "external library"
+    print("case key contract: PASS (source + receipt components + exec mode/forms "
+          "+ behaviour + external library"
           + (" + compiled byte-for-byte)" if compiled
              else "; NO C++ COMPILER -- the byte-for-byte half did not run)"))
     return 0
