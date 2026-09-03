@@ -933,3 +933,38 @@ $PY "$W/tools/ismr_rod_reactivity.py" \
 정의한 것과 동일한 변수다(단일-실행 인자는 block54 §1의 `${SINGLE[@]}` GPU arm을 그대로
 쓴다 — 배치 arm이 아니다). `out_CY0N_gpu.h5`는 block54 §1이 이미 만든 원래 rod-search
 실행 산출물이므로, `--orig-h5`를 위해 다시 돌릴 필요가 없다.
+
+---
+
+## 9. 물리 집합체 출력/연소도 맵 비교 (§7 항목 1)
+
+`tools/compare_assembly_maps.py` (신규)가 §7 항목 1(중심선 쌍 평균이 비교 도구에
+없다)을 채운다. MASTER `.sum`의 SUMMARY EDIT 5 출력/연소도 맵을 파싱하고, RASBERY
+`.h5`의 `steps/*/assembly/{power,burn}`을 90도 회전 폴드(`ndivxy=2, symdiv=true`)로
+**물리 집합체** 단위로 접어(1/4맵 슬롯 (0,c)와 (c,0), c>0 는 한 물리 집합체의 두
+반쪽 — `docs/ROTATIONAL_SHUFFLE_FIX_20260904_KO.md`, `src/IO.cpp:2600`의 `gather`
+주석) 같은 물리 집합체끼리 대조한다. 중심(0,0)은 자신의 1/4을 그대로 쓰고
+(`src/IO.cpp:2603-2606`가 자기 자신을 3번 더 회전시켜 나머지를 채우므로 분할 불필요),
+`--mirror`(APR1400 KNGR)는 폴드를 끈다 — i-SMR 5개 덱은 `mirror: false`(§1)이므로
+기본값(폴드 ON)을 그대로 쓴다. 상태점마다 CSV 한 줄/물리 집합체(`master`, `rasbery`,
+`delta`, 두 반쪽 원값과 그 차이인 `sym_*` 정보 컬럼)와, 출력(%)·연소도(GWd/t) 맵 전체
+rms/max를 MD로 낸다. 검증은 `tools/test_assembly_map_fold_contract.py`(합성 3x3 맵
+및 실제 `depf_01.sum` F5=E6 스모크)와 `tools/test_ismr_tools_contract.py`의 fold
+계약이 맡는다. `.sum` 파서는 `tools/compare_master_rasbery.py`를 재사용한다
+(LAST-EFPD-WINS, `--efpd-offset auto` 재사용).
+
+238에서 block54 §1이 만든 `acc/out_CY0N_gpu.h5`에 대해 (CY02/03/04는 리스타트이므로
+`--efpd-offset auto`, CY01은 생략):
+
+```sh
+cd ~/gates/block54/acc
+for N in 01 02 03 04; do
+  OFF=auto; [ "$N" = "01" ] && OFF=0
+  python3.11 ~/gates/ismr/rasbery_gpu/tools/compare_assembly_maps.py \
+      ~/gates/ismr/test_7/Reference_output/depf_$N.sum \
+      out_CY${N}_gpu.h5 -o ~/gates/block54/amap_CY$N --efpd-offset $OFF
+done
+```
+
+이 도구는 §7 항목 1을 코드로는 닫지만, 238에서는 아직 실행하지 않았다(이 세션의
+스코프는 python 도구/테스트뿐 — 솔버도 컴파일러도 이 PC에서 돌리지 않는다).
