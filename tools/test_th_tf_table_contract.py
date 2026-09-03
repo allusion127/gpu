@@ -23,9 +23,12 @@ WHAT IS ASSERTED, AND WHY EACH ONE IS HERE.
   4. THE ENVIRONMENT, resolved by the real C++ function when a compiler is
      available: legacy | deck | wh | ce | <path>, with a REFUSAL rather than a
      guess when `deck` is asked for and the deck says nothing.
-  5. THE CE TABLE REFUSES.  include/Database/tf_ce.csv does not exist and this
-     tree ships no guess for it; asking for it must name tools/fit_tf_table.py,
-     not fall back to the WH grid.
+  5. THE CE REFUSAL IS STILL WIRED.  include/Database/tf_ce.csv now EXISTS --
+     regressed 2026-09-04 from the MASTER KNGR run; its content is
+     tools/test_tf_ce_table_contract.py's business.  What is asserted here is
+     that the refusal PATH survives: a MISSING CE table must still throw and
+     still name tools/fit_tf_table.py, because the failure it prevents (falling
+     back to the WH grid) is silent.
   6. THE CASE KEY folds the IDENTITY (name + content digest) and not the source.
   7. NEGATIVE CONTROLS: the fixture is table-independent, and a moved table
      moves the key.
@@ -48,6 +51,10 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 import _cxx_toolchain  # noqa: E402
 import case_key  # noqa: E402
+
+# The WH grid's bytes.  `legacy` IS this file, and the whole published campaign
+# was produced with it, so it is pinned here rather than merely described.
+WH_TABLE_SHA256 = "cb72254367cc84c299991f1becb229cdf61acf3106a9b3a8dc19e0a15552cdf3"
 
 FAILURES: list[str] = []
 
@@ -114,11 +121,17 @@ def default_is_legacy() -> None:
         fail("the legacy default does not resolve to the `wh` IDENTITY; legacy and "
              "an explicit wh would then key differently for one arithmetic")
 
-    if (ROOT / "include" / "Database" / "tf_ce.csv").exists():
-        fail("include/Database/tf_ce.csv exists.  If it was regressed, say so in "
-             "docs/TH_TF_TABLE_SELECTION_20260904_KO.md and update this test; if it "
-             "was guessed, delete it -- a guessed CE grid is a wrong fuel "
-             "temperature no receipt would flag")
+    # include/Database/tf_ce.csv NOW EXISTS -- regressed 2026-09-04 from the
+    # MASTER KNGR run, see docs/TH_TF_TABLE_SELECTION_20260904_KO.md and
+    # tools/test_tf_ce_table_contract.py, which owns everything about its
+    # content.  What still belongs HERE is only that its arrival did not move
+    # the default: legacy must still be the WH grid, byte for byte.
+    wh = (ROOT / "include" / "Database" / "tf.csv").read_bytes()
+    if hashlib.sha256(wh).hexdigest() != WH_TABLE_SHA256:
+        fail("include/Database/tf.csv changed.  The B0 baseline (trajectory digest "
+             "1f36e75dc00ed2b4 at 4377 outers) was produced with THESE bytes, and "
+             "`legacy` resolves to them; regressing the CE table must not have "
+             "touched the WH one.")
 
 
 # ---------------------------------------------------------------------------
@@ -264,19 +277,36 @@ def ce_refuses_loudly() -> None:
         fail("a missing CE table does not THROW; a silent fallback to the WH grid "
              "is exactly the defect this closes")
 
-    # And the python mirror refuses too, rather than keying a table it cannot read.
+    # The python mirror refuses on a MISSING table too.  tf_ce.csv now exists,
+    # so the refusal is exercised against a database directory that does not
+    # hold it -- the path that matters is "asked for a table that is not there",
+    # not "asked for `ce`".
     clean = {k: v for k, v in os.environ.items() if not k.startswith("RASBERY_")}
+    with tempfile.TemporaryDirectory() as raw:
+        deck = Path(raw) / "d.json"
+        deck.write_text(json.dumps(_deck_json()), encoding="utf-8")
+        missing = Path(raw) / "no_such_table.csv"
+        try:
+            case_key.case_key(deck,
+                              env=dict(clean, RASBERY_TH_TF_TABLE=str(missing)),
+                              xslib=False)
+        except SystemExit:
+            pass
+        else:
+            fail("tools/case_key.py keyed a fuel-temperature table that does not "
+                 "exist; the mirror must refuse where the solver refuses")
+
+    # And with the file present, `ce` must now RESOLVE -- a refusal that outlived
+    # the regression would send the operator back to a tool that already ran.
     with tempfile.TemporaryDirectory() as raw:
         deck = Path(raw) / "d.json"
         deck.write_text(json.dumps(_deck_json()), encoding="utf-8")
         try:
             case_key.case_key(deck, env=dict(clean, RASBERY_TH_TF_TABLE="ce"),
                               xslib=False)
-        except SystemExit:
-            pass
-        else:
-            fail("tools/case_key.py keyed a CE table that does not exist; the mirror "
-                 "must refuse where the solver refuses")
+        except SystemExit as exc:
+            fail(f"tools/case_key.py still refuses `ce` although "
+                 f"include/Database/tf_ce.csv exists: {exc}")
 
 
 # ---------------------------------------------------------------------------

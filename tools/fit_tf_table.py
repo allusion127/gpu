@@ -30,9 +30,20 @@ XSSet::GetTfuel's table holds.
 
     --lpd-from power,hz,rods
         Compute lpd = 1000 * P_node / (rods_per_node * hz) -- the SolveTH
-        spelling (src/XSSet.cpp), with P_node in MW so `1000 *` lands in W/cm.
-        The three names are the columns to read, in that order; `hz` and `rods`
-        may instead be constants (e.g. `--lpd-from power,15.24,59`).
+        spelling (src/XSSet.cpp:6394), with P_node in kW and hz in cm, so the
+        `1000 *` lands in W/cm.  The three names are the columns to read, in
+        that order; `hz` and `rods` may instead be constants (e.g.
+        `--lpd-from power,381,236`).
+
+RELATIVE FITTING (--relative-to TABLE).  MASTER's own edits do not cover the
+whole (LPD, burnup) rectangle -- a core flattens as it burns, so high LPD only
+ever happens at low burnup and vice versa, and the KNGR run leaves 41 of the 90
+shipped knots with no sample at all.  Extrapolating dT into those corners is a
+linear runaway.  Fitting the RATIO dT/TABLE(bu, lpd) instead is not: the ratio
+is O(1) and slowly varying, so the same curvature smoother carries it into an
+empty knot as "keep the reference table's shape here", which is the honest
+answer where there is no measurement.  The written table is ratio x TABLE, and
+the reported residual is always that PRODUCT against the original dT samples.
 
 THE FIT.  The unknowns are the nbu x nlpd grid values themselves, and each
 sample enters through the SAME bilinear weights milk::Table::Get would use
@@ -84,26 +95,66 @@ def read_table(path: Path):
     return lpd, bu, dt
 
 
-def write_table(path: Path, lpd, bu, dt) -> None:
+def write_table(path: Path, lpd, bu, dt, provenance: str | None = None) -> None:
+    """Write a table in tf.csv's exact shape.
+
+    PROVENANCE LIVES IN THE CORNER CELL.  milk::Table::ParseFromCSV
+    (include/milk.h) reads the FIRST line as the LPD axis and ignores only
+    cell 0 of it -- so a `# ...` comment line ahead of the header would be
+    eaten as the header and break the load.  The corner cell is the one place
+    a provenance string can sit and still be read by the solver, the fit and
+    tools/case_key.py alike.  It must not contain a comma.
+    """
     def num(x: float) -> str:
         # tf.csv is written to two decimals; keep the shape a human can diff.
         text = f"{x:.2f}".rstrip("0").rstrip(".")
         return text if text not in ("", "-0") else "0"
 
-    lines = ["Bu/LPD," + ",".join(num(x) for x in lpd)]
+    corner = "Bu/LPD"
+    if provenance:
+        if "," in provenance:
+            sys.exit("fit_tf_table: --provenance must not contain a comma; it goes "
+                     "in the table's corner CELL.")
+        corner = f"{corner} {provenance}"
+    lines = [corner + "," + ",".join(num(x) for x in lpd)]
     for j, b in enumerate(bu):
         lines.append(num(b) + "," + ",".join(num(v) for v in dt[j]))
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # LF, in BYTES.  Path.write_text would translate to CRLF on Windows, and
+    # the table's identity in [RASBERY][TH][TFTABLE] and tools/case_key.py is
+    # the sha256 of these bytes -- .gitattributes normalises the tree to LF, so
+    # a CRLF write here would produce a file whose digest nothing else can
+    # reproduce.
+    path.write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
 
 
 # --------------------------------------------------------------------------
 # milk::Table::Get's weights, transcribed.  The CLAMP matters: a sample outside
 # the knots constrains the edge, it does not extrapolate.
 # --------------------------------------------------------------------------
+ORIGIN_CONTINUATION = False
+"""Below the first LPD knot, follow GetTfuel instead of Table::Get.
+
+XSSet::GetTfuel (src/XSSet.h:516-526) does NOT hand a sub-50 W/cm node to
+Table::Get's clamp: it reads the table AT the first knot and scales the answer
+by lpd/50, because the conduction solution is linear to first order at low heat
+rate and the clamp would otherwise leave an ~80 K rise as local power tends to
+zero.  A fit that clamps where the solver scales puts the wrong constraint on
+the whole first column -- and the first column is what the axial ends of every
+assembly interpolate, which is where a plain node-average tfavg gets most of
+its samples.  Set from --origin-continuation; off by default so the self-test
+and every existing call keep Table::Get's exact weights.
+"""
+
+
 def bilinear_weights(lpd, bu, x: float, y: float):
     nx, ny = len(lpd), len(bu)
-    x = min(max(x, lpd[0]), lpd[-1])
     y = min(max(y, bu[0]), bu[-1])
+    if ORIGIN_CONTINUATION and 0.0 <= x < lpd[0]:
+        iy = max(0, min(ny - 2, _lower(bu, y)))
+        fy = (y - bu[iy]) / (bu[iy + 1] - bu[iy])
+        scale = x / lpd[0]
+        return (((iy, 0), (1 - fy) * scale), ((iy + 1, 0), fy * scale))
+    x = min(max(x, lpd[0]), lpd[-1])
     ix = max(0, min(nx - 2, _lower(lpd, x)))
     iy = max(0, min(ny - 2, _lower(bu, y)))
     fx = (x - lpd[ix]) / (lpd[ix + 1] - lpd[ix])
@@ -357,9 +408,22 @@ def main(argv: list[str]) -> int:
                     help="do not penalise a dT that falls with LPD")
     ap.add_argument("--extrapolate", action="store_true",
                     help="allow knots no sample touches to be carried by the smoother")
+    ap.add_argument("--relative-to", type=Path, metavar="TABLE",
+                    help="fit the RATIO dT/TABLE(bu,lpd) and multiply back, so a "
+                         "knot with no data relaxes to TABLE's shape instead of to "
+                         "a linear runaway (see RELATIVE FITTING in the docstring)")
+    ap.add_argument("--provenance", metavar="TEXT",
+                    help="one line of provenance written into the output table's "
+                         "unused corner cell (no commas)")
+    ap.add_argument("--origin-continuation", action="store_true",
+                    help="below the first LPD knot follow GetTfuel's linear "
+                         "continuation to the origin rather than Table::Get's clamp")
     ap.add_argument("--self-test", action="store_true",
                     help="fit a synthetic table and check it is recovered within 0.5 K")
     args = ap.parse_args(argv)
+
+    if args.origin_continuation:
+        globals()["ORIGIN_CONTINUATION"] = True
 
     if args.self_test:
         return self_test()
@@ -384,12 +448,41 @@ def main(argv: list[str]) -> int:
               "in the receipt.", file=sys.stderr)
         return 2
 
-    grid = fit(samples, lpd, bu, args.smooth, not args.no_monotone)
+    if args.relative_to:
+        ref_lpd, ref_bu, ref_dt = read_table(args.relative_to)
+        if ref_lpd != lpd or ref_bu != bu:
+            sys.exit(f"--relative-to {args.relative_to} is not on the same knots as "
+                     f"--knots {args.knots}; the ratio would be meaningless.")
+        # Fit the RATIO.  It is O(1) and slowly varying, so the curvature
+        # smoother carries it into an empty knot as "the reference's shape",
+        # which is the honest answer where there is no data -- rather than
+        # extrapolating dT itself, which runs away.  The monotone penalty is
+        # switched off here: it is a statement about dT, not about the ratio,
+        # and it is CHECKED on the product below instead.
+        ratio_samples = [(x, y, value / evaluate(lpd, bu, ref_dt, x, y))
+                         for x, y, value in samples]
+        ratio = fit(ratio_samples, lpd, bu, args.smooth, monotone=False)
+        grid = [[ratio[j][i] * ref_dt[j][i] for i in range(len(lpd))]
+                for j in range(len(bu))]
+        flat = [r for row in ratio for r in row]
+        print(f"  [FIT] relative to {args.relative_to.name}: ratio "
+              f"{min(flat):.4f} .. {max(flat):.4f}")
+        drops = [(bu[j], lpd[i]) for j in range(len(bu)) for i in range(len(lpd) - 1)
+                 if grid[j][i + 1] < grid[j][i]]
+        if drops:
+            print(f"  [FIT] WARNING: dT falls with LPD at {len(drops)} knot pair(s), "
+                  f"first at bu {drops[0][0]}, lpd {drops[0][1]}")
+    else:
+        grid = fit(samples, lpd, bu, args.smooth, not args.no_monotone)
+
+    # ALWAYS the residual of the table that gets WRITTEN, against the ORIGINAL
+    # dT samples -- a ratio fit's own residual is in ratio units and would
+    # flatter the result.
     rms, worst = residuals(samples, lpd, bu, grid)
     print(f"  [FIT] residual rms {rms:.4f} K, max {worst:.4f} K")
 
     if args.out:
-        write_table(args.out, lpd, bu, grid)
+        write_table(args.out, lpd, bu, grid, provenance=args.provenance)
         print(f"  [FIT] wrote {args.out}")
     else:
         print("Bu/LPD," + ",".join(f"{x:g}" for x in lpd))
