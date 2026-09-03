@@ -80,8 +80,17 @@ def numeric_row(line: str) -> list[float] | None:
         return None
 
 
-def parse_master_assembly(path: Path) -> dict[float, dict[tuple[int, int], dict]]:
-    """{efpd: {(array_row, array_col): {"label", "power", "burn"}}}, LAST run.
+def parse_master_assembly(path: Path) -> dict[float, list[dict]]:
+    """{efpd: [{"no", "cells"}, ...]}, LAST run.  See parse_master_assembly_from_text."""
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    return parse_master_assembly_from_text(text)
+
+
+def parse_master_assembly_from_text(text: str) -> dict[float, list[dict]]:
+    """{efpd: [{"no": int, "cells": {(array_row,array_col): {"label","power",
+    "burn"}}}, ...]}, LAST RUN.  Split from parse_master_assembly() so a
+    fixture string (tools/test_assembly_map_fold_contract.py) can be parsed
+    without a temp file.
 
     Row/column order is READING order, not the printed row NUMBER or column
     LETTER: the first block row parsed becomes array_row 0, the first token
@@ -95,25 +104,32 @@ def parse_master_assembly(path: Path) -> dict[float, dict[tuple[int, int], dict]
     power, burnup, k-infinite (in that order, per the block's own "FIRST
     LINE.. FOURTH LINE" legend).  Only the first three are read here.
 
-    LAST EFPD WINS, the same rule parse_master_summary/parse_master_rods
-    apply above: a MAS_SUM can print the SEARCH=1 unrodded pass and the
-    converged pass at the same EFPD 0.000, and only the converged one belongs
-    in a comparison.
+    ONE EFPD CAN CARRY SEVERAL BLOCKS, and "last wins" -- the rule
+    parse_master_summary()/parse_master_rods() apply -- is WRONG here in
+    general.  Ground truth (238, 2026-09-04): CY01's depf_01.sum prints FOUR
+    blocks at EFPD 0.000 -- NO.=1 is the SEARCH=1 ARO k-eff solve (anchor A,
+    k-eff 1.026494) and NO.=2-4 are a SEPARATE SEARCH=5 rod-critical
+    diagnostic (k-eff pinned to 1.000000, rods driven in) that RASBERY's own
+    CY01 deck never performs (its rods sit at 240 cm all cycle).  Taking the
+    last block there compares MASTER's rod-critical diagnostic against
+    RASBERY's ARO physics and reads as a ~43% power RMS / 131% max artefact
+    that is not physical at all.  On CY02-04 the SAME raw pattern (a SEARCH=1
+    block, then SEARCH=5 blocks at the same EFPD) needs the OPPOSITE pick:
+    those decks restart rod-critical, so the SEARCH=1 block is the throwaway
+    and a later SEARCH=5 block is the real state.  No rule over MASTER's own
+    print order can get both right, because the two deck families print the
+    identical shape for opposite reasons.  So candidates are returned here
+    UNRESOLVED, keyed by their own "no", and build_rows() resolves each one
+    against RASBERY's actual k-eff at the joined statepoint (see
+    select_master_candidate()) -- the one fact that is never ambiguous about
+    which physical state RASBERY actually computed.
     """
-    text = path.read_text(encoding="utf-8", errors="ignore")
-    return parse_master_assembly_from_text(text)
-
-
-def parse_master_assembly_from_text(text: str) -> dict[float, dict[tuple[int, int], dict]]:
-    """The text half of parse_master_assembly(), split out so a fixture string
-    (see tools/test_assembly_map_fold_contract.py) can be parsed without
-    writing a temp file."""
     last_run = text.rfind("SUMMARY EDIT 1 :")
     if last_run >= 0:
         text = text[last_run:]
     lines = text.splitlines()
 
-    states: dict[float, dict[tuple[int, int], dict]] = {}
+    states: dict[float, list[dict]] = {}
     in_assembly = False
     idx = 0
     while idx < len(lines):
@@ -133,6 +149,7 @@ def parse_master_assembly_from_text(text: str) -> dict[float, dict[tuple[int, in
             idx += 1
             continue
 
+        no = int(m.group(1))
         efpd = float(m.group(3))
         cells: dict[tuple[int, int], dict] = {}
         letters: list[str] = []
@@ -164,17 +181,83 @@ def parse_master_assembly_from_text(text: str) -> dict[float, dict[tuple[int, in
                     idx += 3
                     continue
             idx += 1
-        states[efpd] = cells
+        states.setdefault(efpd, []).append({"no": no, "cells": cells})
         idx += 1
     return states
 
 
+#: `NO.  DAY  EFPD  CYC-BU  TOT-BU  P(%)  PPM  K-EFF  ERRFLX  REACT.` -- SUMMARY
+#: EDIT 2's own numeric row, one per "no" (the SAME "no" ASSEMBLY_NO_RE reads
+#: off EDIT 5's block headers -- both blocks are printed by the same pass over
+#: the same statepoint list). parts[7] = K-EFF, the column that tells the two
+#: same-EFPD block families apart when nothing else does.
+EDIT2_ROW_RE = re.compile(r"^\s*(\d+)\s+[\d.]")
+
+
+def parse_master_keff_by_no(text: str) -> dict[int, float]:
+    """{no: k-eff} from SUMMARY EDIT 2, LAST run, every row (no EFPD
+    collapsing -- this is exactly the per-"no" data select_master_candidate()
+    needs to tell apart same-EFPD blocks parse_master_assembly_from_text()
+    deliberately leaves unresolved)."""
+    last_run = text.rfind("SUMMARY EDIT 1 :")
+    if last_run >= 0:
+        text = text[last_run:]
+    out: dict[int, float] = {}
+    section = False
+    for line in text.splitlines():
+        if "SUMMARY EDIT 2 : REACTIVITY" in line:
+            section = True
+            continue
+        if "SUMMARY EDIT" in line and "SUMMARY EDIT 2" not in line:
+            section = False
+            continue
+        if not section or not EDIT2_ROW_RE.match(line):
+            continue
+        parts = line.split()
+        if len(parts) >= 8:
+            try:
+                out[int(parts[0])] = float(parts[7])
+            except ValueError:
+                continue
+    return out
+
+
+def select_master_candidate(candidates: list[dict], keff_by_no: dict[int, float],
+                            target_keff: float | None) -> dict:
+    """Resolve parse_master_assembly_from_text()'s unresolved same-EFPD
+    candidate list to ONE block's cells, by k-eff proximity to
+    `target_keff` (RASBERY's own k-eff at the joined statepoint).
+
+    Falls back to the LAST candidate -- the previous, documented-wrong-on-
+    CY01 but harmless-elsewhere default -- only when there is nothing to
+    disambiguate with (a single candidate, no EDIT 2 k-eff for any of them,
+    or no RASBERY k-eff to compare against), so a .h5 without `summary/keff`
+    still gets an answer instead of a crash.
+    """
+    if len(candidates) == 1 or target_keff is None:
+        return candidates[-1]["cells"]
+    scored = [(abs(keff_by_no[c["no"]] - target_keff), c)
+              for c in candidates if c["no"] in keff_by_no]
+    if not scored:
+        return candidates[-1]["cells"]
+    scored.sort(key=lambda t: t[0])
+    return scored[0][1]["cells"]
+
+
 def parse_rasbery_assembly(
     path: Path,
-) -> tuple[dict[float, dict[tuple[int, int], dict]], int, int, int]:
-    """({efpd: {(row,col): {"power","burn"}}}, ndivxy, nya, nxa)."""
+) -> tuple[dict[float, dict[tuple[int, int], dict]], dict[float, float], int, int, int]:
+    """({efpd: {(row,col): {"power","burn"}}}, {efpd: keff}, ndivxy, nya, nxa).
+
+    `keff` is read from `summary/keff` when present; it feeds
+    select_master_candidate()'s disambiguation and is omitted from the ras
+    map's own EFPDs otherwise (an older .h5 without it just loses that
+    disambiguation and falls back to LAST-candidate, not to a crash).
+    """
     with h5py.File(path, "r") as f:
         efpd = [float(v) for v in f["summary"]["efpd"][()]]
+        keff = ([float(v) for v in f["summary"]["keff"][()]]
+                if "keff" in f["summary"] else [])
         geo = f["geometry"]
         nxa = int(geo["nxa"][()])
         nya = int(geo["nya"][()])
@@ -187,6 +270,7 @@ def parse_rasbery_assembly(
     ijtola = [[ijtola_flat[r * nxa + c] for c in range(nxa)] for r in range(nya)]
 
     states: dict[float, dict[tuple[int, int], dict]] = {}
+    ras_keff: dict[float, float] = {}
     n = min(len(efpd), len(power_by_step))
     for i in range(n):
         cells: dict[tuple[int, int], dict] = {}
@@ -200,7 +284,9 @@ def parse_rasbery_assembly(
                     "burn": float(burn_by_step[i][la]),
                 }
         states[efpd[i]] = cells
-    return states, ndivxy, nya, nxa
+        if i < len(keff):
+            ras_keff[efpd[i]] = keff[i]
+    return states, ras_keff, ndivxy, nya, nxa
 
 
 def visible_node_count(row: int, col: int, n: int) -> int:
@@ -305,7 +391,8 @@ def rms_max(values: list[float]) -> tuple[float, float]:
             max(abs(v) for v in values))
 
 
-def build_rows(master_states: dict[float, dict], ras_states: dict[float, dict],
+def build_rows(master_states: dict[float, list[dict]], ras_states: dict[float, dict],
+               ras_keff: dict[float, float], keff_by_no: dict[int, float],
                ndivxy: int, mirror: bool, efpd_tol: float
               ) -> list[dict]:
     rows: list[dict] = []
@@ -317,7 +404,8 @@ def build_rows(master_states: dict[float, dict], ras_states: dict[float, dict],
                 break
         if e_r is None:
             continue
-        mcells = master_states[e_m]
+        mcells = select_master_candidate(master_states[e_m], keff_by_no,
+                                         ras_keff.get(e_r))
         rcells = ras_states[e_r]
         for label, slot_a, slot_b, mpow, mburn in fold_master(mcells, mirror):
             rpow, pa, pb = ras_physical_value(rcells, slot_a, slot_b, "power", ndivxy)
@@ -375,14 +463,21 @@ def main() -> int:
                          "(default: read geometry/ndivxy from the .h5)")
     args = ap.parse_args()
 
-    master_states = parse_master_assembly(args.mas_sum)
+    mas_sum_text = args.mas_sum.read_text(encoding="utf-8", errors="ignore")
+    master_states = parse_master_assembly_from_text(mas_sum_text)
     if not master_states:
         raise SystemExit(f"{args.mas_sum}: no SUMMARY EDIT 5 assembly-map blocks")
-    ras_states, ndivxy, nya, nxa = parse_rasbery_assembly(args.h5)
+    keff_by_no = parse_master_keff_by_no(mas_sum_text)
+    ras_states, ras_keff, ndivxy, nya, nxa = parse_rasbery_assembly(args.h5)
     if not ras_states:
         raise SystemExit(f"{args.h5}: no steps/*/assembly data")
     if args.ndivxy is not None:
         ndivxy = args.ndivxy
+    if not ras_keff:
+        print("warning: .h5 has no summary/keff -- same-EFPD MASTER blocks "
+              "(e.g. an ARO anchor state vs a rod-critical diagnostic printed "
+              "at the same EFPD) cannot be disambiguated and fall back to the "
+              "LAST block, which is wrong on decks like i-SMR CY01")
 
     if str(args.efpd_offset).strip().lower() == "auto":
         offset = min(ras_states) - min(master_states)
@@ -397,11 +492,13 @@ def main() -> int:
                 f"`auto`") from None
     if offset:
         ras_states = {e - offset: cells for e, cells in ras_states.items()}
+        ras_keff = {e - offset: k for e, k in ras_keff.items()}
 
     fold_kind = "mirror (no fold)" if args.mirror else f"rotational (ndivxy={ndivxy})"
     print(f"fold: {fold_kind}, geometry {nya}x{nxa} assembly grid")
 
-    rows = build_rows(master_states, ras_states, ndivxy, args.mirror, args.efpd_tol)
+    rows = build_rows(master_states, ras_states, ras_keff, keff_by_no, ndivxy,
+                      args.mirror, args.efpd_tol)
     if not rows:
         raise SystemExit("no EFPD-matched statepoints between the two inputs")
 
