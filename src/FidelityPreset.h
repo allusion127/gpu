@@ -520,6 +520,85 @@ inline constexpr FidelityPresetSpec kFidelityPresets[] = {
         /*max_trials*/                   0,
         /*statepoint_grid*/              "",
     },
+    // WP24.2.  THE SECOND SWEEP ARM: screen100 WITH THE Xe POLISH TOLERANCE AT
+    // 1e-4.
+    //
+    // Byte-identical to the screen100 row but for the name and `xe_tol`, which
+    // moves 1e-5 -> 1e-4.  It is a SECOND arm off the same parent and not a
+    // successor to screen100e4: the two sweep different knobs, and stacking
+    // them would make the measured outer delta a sum over two changes, which is
+    // the one thing a sweep cannot be.
+    //
+    // WHY THIS KNOB, AND WHY THE DECADE IS STILL THERE TO TAKE.  The binding Xe
+    // predicate is `xe_change >= xe_tol_now` at src/Driver.h:4871, and
+    // `xe_tol_now` is the STAGED pair resolved at :4405 -- the loose leg
+    // `xe_tol * staged_xe_mult` while `polishing` is false, and `tol.xe_tol`
+    // itself once the loose legs agree and :5024 arms the polish stage.  So the
+    // 100x staging screen100 already carries relaxes the LOOSE leg only; the
+    // polish leg it hands the cascade is unchanged at 1e-5, one decade below
+    // the 1e-4 the profile measures the equilibrium cascade actually stopping
+    // at.  What that costs is not one extra step: after the loose stage exits at
+    // 1e-3 the cascade runs a SECOND serial descent to 1e-5, and the cascade is
+    // re-armed by every committed search trial and T/H update.  Taking the
+    // polish leg to 1e-4 removes that decade and leaves the loose leg where it
+    // was (1e-4 x 100 = 1e-2, still derived and not restated).
+    //
+    // WHAT IT DOES NOT REMOVE, and why the estimate is a range and not a
+    // number.  Two floors survive this row and both are structural.  (1) The
+    // `xe_count + xe_interim_count == 0` term of `xe_pending` at
+    // src/Driver.h:4654-4656 makes the FIRST Xe step of every cascade
+    // unconditional -- no tolerance can skip it, so 228 cascades cost at least
+    // 228 steps however loose xe_tol becomes.  (2) The `prev_inner` sentinel at
+    // src/Driver.h:4877: a Xe step that IS taken overwrites prev_inner with
+    // `eigv + 1.0`, forcing at least one full flux re-convergence after it, so
+    // the per-step outer cost has a floor of its own.  The estimate --
+    // xe outers 1847 -> ~1400, total 77 -> ~64 outers/sp -- is the profile's
+    // arithmetic with those two floors held fixed, and it is an ESTIMATE.  The
+    // measurement is what the arm exists to take.
+    //
+    // THE ACCURACY IT SPENDS.  1e-4 is the tolerance on the Xe number-density
+    // change between cascade steps, and the equilibrium-Xe worth over the
+    // cascade is the multiplier: ~0.3 pcm per statepoint at 1e-4 x that worth.
+    // That is inside the screen100 envelope's 100 pcm by three orders of
+    // magnitude, which is why this is a screening knob and not an acceptance
+    // one -- and why the row, like its parent, is NOT acceptance-eligible.
+    //
+    // THE INVARIANT IT STILL HOLDS.  `xe_oscillation_floor` stays at the
+    // production 1e-4 rather than floating with xe_tol, so
+    // `xe_tol <= xe_oscillation_floor` survives -- now with EQUALITY, which is
+    // the loosest legal setting of this knob.  A row that took xe_tol past the
+    // floor would declare the cascade converged inside the band the oscillation
+    // detector calls noise, and the two would then disagree about what a
+    // converged cascade is.  tools/test_fidelity_preset_contract.py's
+    // check_sweep_arm holds that line for this arm by name.
+    //
+    // EXACTNESS CLASS A2, with its own env and case-key split: armEnvValue()
+    // folds the preset NAME, so `screen100x` keys apart from `screen100` and
+    // from `screen100e4` and the three arms cannot share a cache entry.
+    // gate_b_envelope.py maps this name onto the screen100 ENVELOPE for
+    // screen100e4's reason -- what the arm is allowed to be wrong by is not one
+    // of the things the sweep moves.
+    {
+        /*name*/                         "screen100x",
+        /*staged_flux_mult*/             5.0,
+        /*staged_xe_mult*/               100.0,
+        /*loose_settle*/                 true,
+        /*keff_tol_mult*/                10.0,
+        /*search_tol_mult*/              10.0,
+        /*search_tol_cap*/               1.0e-4,
+        /*flux_l2_tol*/                  1.0e-4,
+        /*xe_tol*/                       1.0e-4,
+        /*xe_oscillation_floor*/         kProdXeOscillationFloor,
+        /*cmfd_sweep_epsl2*/             1.0e-5,
+        /*rodcrit_search_cap*/           kProdRodCritSearchCap,
+        /*rodcrit_search_floor_cusping*/ kProdRodCritFloorCusp,
+        /*staged_search_margin*/         2.0,
+        /*boron_bracket*/                PresetFlag::On,
+        /*carry_slope*/                  PresetFlag::Off,
+        /*warm_boron*/                   PresetFlag::Off,
+        /*max_trials*/                   0,
+        /*statepoint_grid*/              "",
+    },
 };
 
 inline constexpr int kFidelityPresetCount =

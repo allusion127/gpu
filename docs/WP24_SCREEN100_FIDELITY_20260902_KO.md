@@ -774,6 +774,108 @@ python tools/run_single_gpu_batch.py --gpu 0 --batch-width 1 \
 바꿔 그대로 돌린다. 스윕은 아암이 **얼마나 틀려도 되는지**를 바꾸지 않는다.
 `screen100`과 마찬가지로 승격 대상이 아니다(§5).
 
+### 7.5 두 번째 스윕 아암: `screen100x` — Xe **폴리시** 허용오차 1e-4 (WP24.2)
+
+`screen100e4`가 CMFD 스윕 종료값을 스윕한다면, `screen100x`는 **같은 부모에서**
+다른 노브 하나를 스윕한다: `xe_tol` 1e-5 → 1e-4. 두 아암은 **누적이 아니라 병렬**이다
+(둘을 겹치면 측정된 아우터 델타가 두 변경의 합이 되어 스윕이 아니게 된다).
+표 행은 `screen100`과 **이름과 `xe_tol` 외 모든 열이 문자 그대로 동일**하며,
+`check_sweep_arm`이 이제 `{아암: 스윕 열}` 맵으로 두 아암 모두에 대해 그것을 검사한다.
+
+**왜 아직 한 데케이드가 남아 있었는가.** Xe 술어는 `src/Driver.h:4871`의
+`xe_change >= xe_tol_now` 하나다. `xe_tol_now`는 `:4405`에서 결정되는 **스테이징 쌍**이다
+— `polishing`이 false인 동안은 느슨한 다리(`xe_tol × staged_xe_mult`), `:5024`에서
+느슨한 단계가 합의되어 폴리시가 무장되면 `tol.xe_tol` 그 자체. 즉 screen100의 100×
+스테이징이 푸는 것은 **느슨한 다리뿐**이고, 캐스케이드에 넘기는 폴리시 다리는 1e-5로
+그대로다 — 프로파일이 실측한 정지점(~1e-4)보다 한 데케이드 아래. 그 대가는 한 스텝이
+아니라, 느슨한 단계가 1e-3에서 빠져나온 뒤 **1e-5까지 두 번째 직렬 캐스케이드**를
+다시 도는 것이고, 캐스케이드는 커밋된 모든 검색 시행과 T/H 갱신이 재무장한다.
+폴리시 다리를 1e-4로 옮기면 그 데케이드가 사라지고, 느슨한 다리는 파생값 그대로
+1e-4 × 100 = 1e-2로 따라 움직인다(행에 다시 적지 않는다).
+
+**사라지지 않는 두 바닥 — 그래서 추정은 범위다.**
+
+1. `xe_pending`의 `xe_count + xe_interim_count == 0` 항 (`src/Driver.h:4654-4656`).
+   모든 캐스케이드의 **첫 Xe 스텝은 무조건** 취해진다. 허용오차가 아무리 느슨해져도
+   228 캐스케이드는 최소 228 스텝을 쓴다.
+2. `prev_inner` 센티널 (`src/Driver.h:4877`). 실제로 취해진 Xe 스텝은 `prev_inner`를
+   `eigv + 1.0`으로 덮어써서 그 뒤 **최소 한 번의 완전한 flux 재수렴**을 강제한다.
+   스텝당 아우터 비용에도 자체 바닥이 있다는 뜻이다.
+
+이 두 바닥을 고정한 채 프로파일 산술을 돌리면 **xe 아우터 1847 → ~1400**,
+**총 77 → ~64 outers/sp**. 이것은 **추정이며 측정이 아니다** — 측정이 이 아암의 존재 이유다.
+
+**정확도 비용.** 1e-4는 캐스케이드 스텝 간 Xe 수밀도 변화의 허용오차이고, 곱해지는
+것은 캐스케이드 구간의 평형-Xe 반응도 가치다: **statepoint당 ~0.3 pcm**. screen100
+봉투의 100 pcm 대비 세 자릿수 아래이므로 스크리닝 노브이지 합격 노브가 아니다
+(§5와 같이 승격 대상 아님).
+
+**유지되는 불변식.** `xe_oscillation_floor`는 프로덕션 1e-4에 그대로 두어
+`xe_tol <= xe_oscillation_floor`가 **등호로** 성립한다 — 이 노브의 **가장 느슨한
+합법값**. 이보다 위로 올리면 진동 검출기가 잡음이라고 부르는 대역 안에서 캐스케이드가
+수렴했다고 선언되어, 수렴 판정과 잡음 판정이 서로 다른 "수렴한 캐스케이드"를 갖게 된다.
+
+**정확성 등급 A2, 자체 env/케이스 키 분기.** `armEnvValue()`는 프리셋의 **이름만**
+접으므로 `screen100x`는 `screen100`·`screen100e4`와 키가 갈라지고 세 아암은 캐시가
+섞이지 않는다. Gate B 봉투는 **부모와 같다** — `tools/gate_b_envelope.py`가 이 이름을
+`screen100` 봉투로 **별칭** 매핑한다(두 번째 봉투가 아니다). 스윕은 아암이 **얼마나
+빨리** 수렴하는지를 바꿀 뿐, **얼마나 틀려도 되는지**를 바꾸지 않는다.
+
+#### 238 레시피 — KNGR 단일 warm 1회 + hot 3회, 네 아암
+
+네 아암을 **같은 레시피에서 프리셋 이름만 바꿔** 돌린다. `--set-unset` 세 줄은
+§7.1과 **같은 이유로** 모든 아암에서 필수다(그래야 아암 간 키가 비교된다).
+아암 D는 C와 같은 행에 `RASBERY_A2_PREV_INNER=carry`를 더한 것으로, 위 바닥 (2)를
+직접 겨냥한다 — 행이 아니라 **환경 노브**이므로 별도 이름 없이 케이스 키에 접힌다.
+
+```
+# A) strict
+python tools/run_single_gpu_batch.py --gpu 0 --batch-width 1     --set RASBERY_FIDELITY=strict     --set-unset RASBERY_STAGED_FLUX_TOL --set-unset RASBERY_STAGED_XE_TOL     --set-unset RASBERY_STAGED_LOOSE_SETTLE     -- RASBERY --rasi <kngr_238.json> --raso E:/run/wp24/strict --batch-mode 1
+
+# B) screen100          (RASBERY_FIDELITY=screen100,  --raso .../s100)
+# C) screen100x         (RASBERY_FIDELITY=screen100x, --raso .../s100x)
+# D) screen100x + carry (C에 --set RASBERY_A2_PREV_INNER=carry, --raso .../s100x_carry)
+```
+
+각 아암은 **warm 1회 + hot 3회**. warm은 버리고 hot 3회의 **중앙값**을 인용한다
+(cold 캐시 편차가 아우터 델타보다 크면 스윕이 측정하는 것은 캐시다).
+
+**읽을 영수증** (§7.1 표에 더해)
+
+| 항목 | 어디서 | 무엇을 말하는가 |
+|---|---|---|
+| `outers_by_phase.xe` | 아우터 예산 영수증 | 이 아암이 겨냥한 바로 그 덩어리. 1847 → ~1400이 기대치 |
+| `cascade.xe_steps_per_cascade` | 〃 | 캐스케이드당 스텝. 바닥 (1) 때문에 **1.0 아래로는 못 간다** |
+| `cascade.residual == 0` | 〃 | 캐스케이드 항등식. 0이 아니면 위 두 수치의 해석 자체가 무효 |
+| `settle.outers_loose` / `settle.outers_polish` | 〃 | 데케이드가 실제로 사라졌는지. polish 몫이 줄지 않으면 이 아암은 실패다 |
+| `xe.budget_exhausted == 0` | 〃 | 예산 소진으로 끝난 캐스케이드가 있으면 허용오차가 아니라 예산이 판정을 내린 것 |
+| `staged_relapses` | `SPTELEM SUMMARY` | 폴리시 진입 후 느슨한 단계로 되돌아간 횟수 |
+| `counterfactual.loose_hit_rate` | 아우터 예산 영수증 | 느슨한 다리가 실제로 걸린 비율 — 스테이징이 살아 있다는 증거 |
+
+**합격 판정**
+
+```
+python tools/compare_master_rasbery.py <MAS_SUM> E:/run/wp24/s100x/*.h5     -o E:/run/wp24/s100x_gateb --envelope screen100 --all-steps
+python tools/gate_b_pin_rms.py E:/run/wp24/s100x/*.h5 <kngr_mas_ppi_boc.txt>     --all-steps --envelope screen100
+```
+
+기준: **100 pcm 이내, 핀 1 %** (`--envelope screen100x`도 같은 봉투로 해석되지만,
+세 아암을 한 표로 비교할 때는 봉투 이름을 하나로 적어 두는 편이 읽기 쉽다).
+
+**처리량**: **8×M8 median-of-3**을 인용 수치(c/h)로 삼고, **8×M16은 보조**로만 적는다
+(§2.6의 boron_bracket 결함 때문에 M16은 인용 대상이 아니다).
+
+**즉시 중단 신호**
+
+- `flux_limit_retries != 0` — flux 한계 재시도가 발생하면 아우터 감소는 허용오차가
+  아니라 한계 도달의 결과다.
+- `staged_relapses > 0.2 × search_trials` — 폴리시 진입이 안정적이지 않다는 뜻이고,
+  이 아암이 옮긴 것이 바로 폴리시 다리다.
+- `cmfd.sweeps_per_outer > 4.4` — `_ncmfd = 5` 캡에 붙기 시작한 것이므로 아우터당
+  비용이 스윕 캡에 지배되어 outers/sp 비교가 무의미해진다.
+
+---
+
 ---
 
 ## 8. 예상 아우터 감소 — **추정이며, 측정이 아니다**
@@ -873,5 +975,5 @@ statepoint 하나의 오차가 아니라 **연소 사슬**이다. 모든 statepo
 | `tools/test_search_policy_contract.py` | 다섯 노브의 "한 자리"가 `environmentSearchPolicy()`로 이동한 것을 반영 |
 | `tools/run_single_gpu_batch.py` | 오타난 프리셋의 `ValueError`를 하네스 메시지로; `LaunchPlan.declared_preset` + `declared_preset_from_env()`; **`check_run_receipts()`가 요청한 프리셋과 자식이 출력한 프리셋의 일치를 요구**(필드 부재 = WP24 이전 바이너리 = 거부) |
 | `tools/fake_rasbery_child.py` | `RASBERY_FIDELITY`를 존중; `fidelity_preset` 출력; `[CASE]` schema 7 |
-| `tools/test_fidelity_preset_contract.py` | **신규.** 7부(+ polish-invariant) + 25개 네거티브 컨트롤 |
+| `tools/test_fidelity_preset_contract.py` | **신규.** 7부(+ polish-invariant) + 25개 네거티브 컨트롤; WP24.2에서 `check_sweep_arm`이 `{아암: 스윕 열}` 맵으로 일반화(`screen100e4`→`cmfd_sweep_epsl2`, `screen100x`→`xe_tol`)되고 아암별 불변식·네거티브 컨트롤 3종 추가 |
 | 기존 계약 테스트 9종 | WP24가 의도적으로 옮긴 핀을 이유와 함께 갱신 |

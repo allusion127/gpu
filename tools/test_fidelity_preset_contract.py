@@ -474,76 +474,117 @@ def check_screen100(presets: dict) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# 2a. THE SWEEP ARM: screen100e4 IS screen100 WITH EXACTLY ONE KNOB MOVED
+# 2a. THE SWEEP ARMS: EACH IS screen100 WITH EXACTLY ONE KNOB MOVED
 # ---------------------------------------------------------------------------
 #
 # WHY THIS IS A CHECK AND NOT A COMMENT.  check_screen100 above judges the row
 # it is handed BY NAME, so a sweep arm added beside screen100 inherits none of
-# those seventeen judgements.  Re-running them here against `screen100e4` would
-# be a second copy of the argument; asserting that the row IS screen100 in every
+# those seventeen judgements.  Re-running them here against each arm would be a
+# second copy of the argument; asserting that the row IS screen100 in every
 # column but the one being swept is the same statement made once -- every
 # invariant check_screen100 proves about the parent then holds for the arm by
-# construction, and the two rows cannot drift into two different presets inside
+# construction, and the rows cannot drift into several different presets inside
 # one campaign.
 #
-# So this check is exactly two claims: (1) nothing but the sweep knob moved, and
-# (2) the knob moved in the direction the row and docs/WP24 Sec 2.3 argue for,
-# to the value that satisfies the surviving invariant with equality.
+# So this check is exactly two claims per arm: (1) nothing but that arm's sweep
+# knob moved, and (2) the knob moved in the direction the row argues for, to a
+# value that still satisfies the invariant that survives the move.
+#
+# THE MAP, AND WHY IT IS A MAP.  WP24.1 hard-coded ONE arm and ONE column.  The
+# second arm (WP24.2, `screen100x`, the Xe POLISH tolerance) sweeps a different
+# knob off the SAME parent, so the arm-specific half is the column name and the
+# shared half is everything else.  Adding a row here is what makes a new arm
+# inherit the whole argument; an arm not listed is an arm nobody checked is an
+# arm at all.
+SWEEP_ARMS: dict[str, str] = {
+    "screen100e4": "cmfd_sweep_epsl2",  # WP24.1: the CMFD sweep exit, 1e-5 -> 1e-4
+    "screen100x":  "xe_tol",            # WP24.2: the Xe POLISH leg,   1e-5 -> 1e-4
+}
 
-SWEPT_COLUMN = "cmfd_sweep_epsl2"
+SWEEP_PARENT = "screen100"
 
 
 def check_sweep_arm(presets: dict) -> list[str]:
     problems: list[str] = []
-    row = presets.get("screen100e4")
-    base = presets.get("screen100")
-    if row is None:
-        return ["src/FidelityPreset.h has no `screen100e4` row"]
+    base = presets.get(SWEEP_PARENT)
     if base is None:
-        return ["src/FidelityPreset.h has no `screen100` row for the sweep arm to be "
-                "measured against"]
-
-    # (1) ONE KNOB.  Compared as the raw token TEXT the table is written in, so
-    # a column re-spelled to the same value (kProdXeTol against 1.0e-6) is still
-    # a divergence between the two rows and is still caught: the arm's claim is
-    # that it is the parent row, not that it is numerically equivalent to it.
-    for column in sorted(set(base) | set(row)):
-        if column in ("name", SWEPT_COLUMN, "_constants"):
+        return [f"src/FidelityPreset.h has no `{SWEEP_PARENT}` row for the sweep arms "
+                f"to be measured against"]
+    for arm, swept in sorted(SWEEP_ARMS.items()):
+        row = presets.get(arm)
+        if row is None:
+            problems.append(f"src/FidelityPreset.h has no `{arm}` row")
             continue
-        if base.get(column) != row.get(column):
+
+        # (1) ONE KNOB.  Compared as the raw token TEXT the table is written in,
+        # so a column re-spelled to the same value (kProdXeTol against 1.0e-6)
+        # is still a divergence between the two rows and is still caught: the
+        # arm's claim is that it is the parent row, not that it is numerically
+        # equivalent to it.
+        for column in sorted(set(base) | set(row)):
+            if column in ("name", swept, "_constants"):
+                continue
+            if base.get(column) != row.get(column):
+                problems.append(
+                    f"`{arm}` {column} is {row.get(column)!r} against "
+                    f"`{SWEEP_PARENT}`'s {base.get(column)!r}. The arm's entire meaning "
+                    f"is that it is {SWEEP_PARENT} with ONE knob ({swept}) moved -- a "
+                    f"second difference makes the measured outer delta a sum over two "
+                    f"changes, which is the unnamed-arm defect at row granularity, and "
+                    f"it silently voids every judgement check_screen100 makes about the "
+                    f"parent on the arm's behalf.")
+
+        # (2) THE SWEEP ACTUALLY HAPPENED, and in the direction the row argues
+        # for.  Every arm off this parent LOOSENS its knob -- the parent is the
+        # tighter row by construction -- so the direction test is shared even
+        # though the column is not.
+        if not (NUM(row, swept) > NUM(base, swept)):
             problems.append(
-                f"`screen100e4` {column} is {row.get(column)!r} against `screen100`'s "
-                f"{base.get(column)!r}. The arm's entire meaning is that it is screen100 "
-                f"with ONE knob moved -- a second difference makes the measured outer "
-                f"delta a sum over two changes, which is the unnamed-arm defect at row "
-                f"granularity, and it silently voids every judgement check_screen100 "
-                f"makes about the parent on the arm's behalf.")
+                f"`{arm}` does not LOOSEN {swept} ({row[swept]} against "
+                f"`{SWEEP_PARENT}`'s {base[swept]}). A sweep arm that did not move its "
+                f"knob is a duplicate row: two names, one physics, and a campaign that "
+                f"spends two cold runs to measure nothing.")
 
-    # (2) THE SWEEP ACTUALLY HAPPENED, and in the direction the row argues for.
-    if not (NUM(row, SWEPT_COLUMN) > NUM(base, SWEPT_COLUMN)):
-        problems.append(
-            f"`screen100e4` does not LOOSEN the CMFD sweep exit ({row[SWEPT_COLUMN]} "
-            f"against `screen100`'s {base[SWEPT_COLUMN]}). A sweep arm that did not move "
-            f"its knob is a duplicate row: two names, one physics, and a campaign that "
-            f"spends two cold runs to measure nothing.")
-
-    # ...to the value that makes the outer's L2 half EXACTLY "the sweep loop
-    # converged".  BICGCMFD::drive() breaks on `errl2 < _epsl2` and otherwise
-    # exhausts _ncmfd = 5, so at epsl2 == flux_tol a break implies the outer L2
-    # test passes and a cap-exhaust implies it fails -- the strictest reading
-    # available, and the shipped tree's own 1:1 kProdCmfdSweepEpsl2 ==
-    # kProdFluxL2Tol.  Looser than that and the sweep cap decides the published
-    # flux (check_screen100's surviving invariant); tighter and the arm is a
-    # smaller sweep than the one the doc asked for, at the price of a cold run.
-    flux_tol = max(NUM(row, "flux_l2_tol"), 1.0e-6 * NUM(row, "keff_tol_mult"))
-    if not approx(NUM(row, SWEPT_COLUMN), flux_tol):
-        problems.append(
-            f"`screen100e4`'s CMFD sweep exit is {row[SWEPT_COLUMN]} against an outer "
-            f"flux tolerance of {flux_tol:g}. The arm exists to take epsl2 to the 1:1 "
-            f"ratio the shipped tree carries, where the outer's L2 half is exactly "
-            f"`the sweep loop converged` (break -> pass, cap-exhaust -> fail); looser "
-            f"than that and the sweep cap decides the published flux, tighter and it is "
-            f"a different sweep than the one the row and docs/WP24 Sec 2.3 name.")
+        # (3) THE INVARIANT THAT SURVIVES THE MOVE, which is arm-specific
+        # because the knob is.
+        if swept == "cmfd_sweep_epsl2":
+            # ...to the value that makes the outer's L2 half EXACTLY "the sweep
+            # loop converged".  BICGCMFD::drive() breaks on `errl2 < _epsl2` and
+            # otherwise exhausts _ncmfd = 5, so at epsl2 == flux_tol a break
+            # implies the outer L2 test passes and a cap-exhaust implies it
+            # fails -- the strictest reading available, and the shipped tree's
+            # own 1:1 kProdCmfdSweepEpsl2 == kProdFluxL2Tol.  Looser than that
+            # and the sweep cap decides the published flux (check_screen100's
+            # surviving invariant); tighter and the arm is a smaller sweep than
+            # the one the doc asked for, at the price of a cold run.
+            flux_tol = max(NUM(row, "flux_l2_tol"), 1.0e-6 * NUM(row, "keff_tol_mult"))
+            if not approx(NUM(row, swept), flux_tol):
+                problems.append(
+                    f"`{arm}`'s CMFD sweep exit is {row[swept]} against an outer flux "
+                    f"tolerance of {flux_tol:g}. The arm exists to take epsl2 to the 1:1 "
+                    f"ratio the shipped tree carries, where the outer's L2 half is "
+                    f"exactly `the sweep loop converged` (break -> pass, cap-exhaust -> "
+                    f"fail); looser than that and the sweep cap decides the published "
+                    f"flux, tighter and it is a different sweep than the one the row and "
+                    f"docs/WP24 Sec 2.3 name.")
+        elif swept == "xe_tol":
+            # WP24.2.  The Xe arm moves the POLISH leg (Driver.h:4405 resolves
+            # `xe_tol_now` to tol.xe_tol once :5024 arms polishing; the loose leg
+            # xe_tol * staged_xe_mult stays DERIVED and moves with it).  The one
+            # invariant that has to survive is check_screen100's: the
+            # oscillation floor does not float with the tolerance, and the
+            # tolerance may not pass it.  A cascade declared converged inside the
+            # band the oscillation detector calls noise means the two halves
+            # disagree about what a converged cascade is -- and the detector is
+            # the half that cannot be re-read from a receipt.
+            if not (NUM(row, "xe_tol") <= NUM(row, "xe_oscillation_floor")):
+                problems.append(
+                    f"`{arm}` sets xe_tol {row['xe_tol']} ABOVE its oscillation floor "
+                    f"{row['xe_oscillation_floor']}. The equilibrium-Xe cascade would "
+                    f"then be called converged inside the band the oscillation detector "
+                    f"treats as noise, so the convergence test and the noise test "
+                    f"disagree about what a converged cascade is. 1e-4 is the loosest "
+                    f"legal setting of this knob and it is the floor itself.")
     return problems
 
 
@@ -588,6 +629,7 @@ ROW_DIGESTS = {
     "A2":          "bc939817f0910505",
     "screen100":   "d8c8d41e50c0272e",
     "screen100e4": "2031331549f82574",
+    "screen100x":  "ae2d182efbb54590",
 }
 
 
@@ -1220,11 +1262,13 @@ def check_envelopes() -> list[str]:
     # SAME object.  What the arm is allowed to be wrong by is not one of the
     # things the sweep moves, so a second Envelope carrying the same five
     # numbers would be two spellings of one bar and free to drift apart.
-    if gate_b_envelope.resolve("screen100e4") is not screen:
-        problems.append(
-            "`--envelope screen100e4` does not resolve to the screen100 Envelope "
-            "itself. The sweep arm is screen100 with one knob moved and none of the "
-            "five limits is that knob, so it has to be an ALIAS and not a copy.")
+    for arm in sorted(SWEEP_ARMS):
+        if gate_b_envelope.resolve(arm) is not screen:
+            problems.append(
+                f"`--envelope {arm}` does not resolve to the screen100 Envelope "
+                f"itself. The sweep arm is screen100 with one knob moved and none of "
+                f"the five limits is that knob, so it has to be an ALIAS and not a "
+                f"copy.")
 
     # THE VERDICT ITSELF.  Pass, fail, advisory, and absent.
     ok, _ = gate_b_envelope.verdict(screen, {"keff_pcm": 42.0, "pin_rms_pct": 0.3,
@@ -1502,6 +1546,15 @@ control("check_sweep_arm misses an arm whose swept knob never moved -- two names
 control("check_sweep_arm misses a sweep exit LOOSER than the outer flux tolerance, "
         "where the sweep cap and not the preset decides the published flux",
         check_sweep_arm, broken_preset("screen100e4", "cmfd_sweep_epsl2", "1.0e-3"))
+control("check_sweep_arm misses an Xe arm that moved a SECOND knob beside xe_tol",
+        check_sweep_arm, broken_preset("screen100x", "cmfd_sweep_epsl2", "1.0e-4"))
+control("check_sweep_arm misses an Xe arm whose polish tolerance never moved -- two "
+        "names for one physics",
+        check_sweep_arm, broken_preset("screen100x", "xe_tol", "1.0e-5"))
+control("check_sweep_arm misses an Xe polish tolerance taken ABOVE the oscillation "
+        "floor, where the convergence test and the noise test disagree about what a "
+        "converged cascade is",
+        check_sweep_arm, broken_preset("screen100x", "xe_tol", "1.0e-3"))
 control("check_row_digests misses a row retuned in place",
         check_row_digests, broken_preset("screen100", "xe_tol", "1.0e-4"))
 control("check_polish_invariant misses an acceptance-eligible row with moved polish "

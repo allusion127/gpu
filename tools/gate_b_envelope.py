@@ -220,8 +220,14 @@ ENVELOPES: dict[str, Envelope] = {
 #: name still has to RESOLVE, because the runbook's Gate B command for the arm
 #: spells `--envelope screen100e4`; without this it is an argparse error on the
 #: runner and the arm has no gate at all.
+#: WP24.2 adds a SECOND arm off the same parent -- `screen100x`, the Xe POLISH
+#: tolerance at 1e-4 (xe_tol 1e-5 -> 1e-4) -- and it is an alias for exactly the
+#: same reason: the sweep moves how FAST the arm converges, never how WRONG it
+#: is allowed to be, so both arms are judged by the parent's five numbers as the
+#: same object.
 ENVELOPE_ALIASES: dict[str, str] = {
     "screen100e4": "screen100",
+    "screen100x": "screen100",
 }
 
 #: Every spelling `--envelope` accepts, aliases included.
@@ -243,8 +249,9 @@ def add_envelope_argument(parser) -> None:
              "`screen100` is the GA screening envelope (100 pcm / 33.5 ppm / "
              "pin 1 %% RMS and 1 %% max, AO advisory); its limits are ABSOLUTE "
              "and already contain the production baseline, and it is NOT "
-             "acceptance-eligible. `screen100e4` is the SAME envelope under the "
-             "sweep arm's name (src/FidelityPreset.h), not a looser one.",
+             "acceptance-eligible. `screen100e4` and `screen100x` are the SAME "
+             "envelope under the sweep arms' names (src/FidelityPreset.h), not "
+             "looser ones.",
     )
 
 
