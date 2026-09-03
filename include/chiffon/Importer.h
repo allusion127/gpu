@@ -382,6 +382,33 @@ private:
         }
     }
 
+    // Resolve one HGC file reference from a --chiffoni JSON document. An absolute
+    // path (POSIX leading '/', a Windows drive letter like "C:\" or "C:/", or a
+    // leading '\\' UNC/drive-relative marker) is used exactly as given; anything
+    // else is resolved relative to the json's own directory (baseDir). Using
+    // std::filesystem::path::is_absolute() alone is not enough here because its
+    // notion of "absolute" is platform-dependent (a POSIX build does not treat
+    // "C:\foo" as absolute), so both conventions are checked explicitly -- the
+    // input json may reference paths from either OS regardless of what this
+    // binary is compiled for.
+    static bool IsAbsoluteHGCPath(const std::string& fileName) {
+        if (fileName.empty())
+            return false;
+        if (fileName[0] == '/' || fileName[0] == '\\')
+            return true;
+        if (fileName.size() >= 2 && std::isalpha(static_cast<unsigned char>(fileName[0])) &&
+            fileName[1] == ':')
+            return true;
+        return false;
+    }
+
+    static std::string ResolveHGCPath(const std::filesystem::path& baseDir,
+                                       const std::string& fileName) {
+        if (IsAbsoluteHGCPath(fileName))
+            return fileName;
+        return (baseDir / fileName).string();
+    }
+
     // Append one HGC file as spectral or rodded-history fitting data.
     void AppendHGCPoints(Model& targetModel, const std::filesystem::path& baseDir,
                          const std::string& fileName, ReflectorSolver& reflSolver,
@@ -390,12 +417,12 @@ private:
                          const std::string& adfReferenceFile = "",
                          bool invertCtype = false) {
         Model hgcModel(targetModel.name() + "#branch");
-        ReadHGC(hgcModel, baseDir.string() + "/" + fileName, invertCtype);
+        ReadHGC(hgcModel, ResolveHGCPath(baseDir, fileName), invertCtype);
         if (adfReferenceFile.empty()) {
             reflSolver.ApplyDF(hgcModel);
         } else {
             Model adfReference(targetModel.name() + "#adf_reference");
-            ReadHGC(adfReference, baseDir.string() + "/" + adfReferenceFile,
+            ReadHGC(adfReference, ResolveHGCPath(baseDir, adfReferenceFile),
                     invertCtype);
             std::map<int, std::pair<double, double>> referenceAdf;
             for (const auto& dpt : adfReference._dpts)
@@ -456,7 +483,7 @@ private:
     void AppendRodDepletionHGC(Model& targetModel, const std::filesystem::path& baseDir,
                                const std::string& fileName, ReflectorSolver& reflSolver) {
         Model hgcModel(targetModel.name() + "#rod_depletion");
-        ReadHGC(hgcModel, baseDir.string() + "/" + fileName);
+        ReadHGC(hgcModel, ResolveHGCPath(baseDir, fileName));
         reflSolver.ApplyDF(hgcModel);
 
         for (auto& dpt : hgcModel._dpts)
@@ -467,7 +494,7 @@ private:
                                    const std::string& referenceFile, const std::string& depletedFile,
                                    ReflectorSolver& reflSolver) {
         Model referenceModel(targetModel.name() + "#rod_depletion_reference");
-        ReadHGC(referenceModel, baseDir.string() + "/" + referenceFile);
+        ReadHGC(referenceModel, ResolveHGCPath(baseDir, referenceFile));
         reflSolver.ApplyDF(referenceModel);
 
         // Nondepleted reference: fresh absorber, so rod-material fluence is zero.
@@ -479,7 +506,7 @@ private:
         }
 
         Model depletedModel(targetModel.name() + "#rod_depletion_depleted");
-        ReadHGC(depletedModel, baseDir.string() + "/" + depletedFile);
+        ReadHGC(depletedModel, ResolveHGCPath(baseDir, depletedFile));
         // Common-gauge ADF for the pair: the aged deck's own thermal ADF drifts up to
         // -4% from the fresh deck's, which would pollute every channel of the pair delta
         // with O(full sigma x 4%) convention noise — larger than the physics it stores.
@@ -653,7 +680,7 @@ public:
                 fuelSpec.is_object() && fuelSpec.value("rodded base", false);
 
             Model model(fuelName);
-            ReadHGC(model, baseDir.string() + "/" + mainFile, roddedBase);
+            ReadHGC(model, ResolveHGCPath(baseDir, mainFile), roddedBase);
             reflSolver.ApplyDF(model);
 
             if (fuelSpec.is_object()) {
@@ -694,7 +721,7 @@ public:
             for (const auto& [reflName, reflFile] : input["reflectors"]["files"].items()) {
                 std::string filename = reflFile.get<std::string>();
                 Model       model(reflName);
-                ReadHGC(model, baseDir.string() + "/" + filename);
+                ReadHGC(model, ResolveHGCPath(baseDir, filename));
                 reflModels[reflName] = std::move(model);
             }
 
