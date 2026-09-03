@@ -55,7 +55,6 @@ import json
 import os
 import py_compile
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -65,6 +64,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 import case_key  # noqa: E402
+import _cxx_toolchain  # noqa: E402
 
 CASEKEY_H = (ROOT / "src" / "CaseKey.h").read_text(encoding="utf-8-sig")
 DRIVER_H = (ROOT / "src" / "Driver.h").read_text(encoding="utf-8-sig")
@@ -848,34 +848,13 @@ def deck_with_floats(core, symang):
     return deck(core, symang=symang, extra=dict(FLOAT_TRAPS))
 
 
-def find_compiler():
-    """MSVC's vcvars64.bat, or a g++/clang++ on PATH, or None."""
-    if os.name == "nt":
-        program_files = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
-        vswhere = Path(program_files) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
-        if vswhere.is_file():
-            done = subprocess.run(
-                [str(vswhere), "-latest", "-products", "*", "-requires",
-                 "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-                 "-property", "installationPath"],
-                capture_output=True, universal_newlines=True)
-            root = done.stdout.strip().splitlines()
-            if done.returncode == 0 and root:
-                bat = Path(root[0]) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
-                if bat.is_file():
-                    return str(bat)
-    for name in ("g++", "clang++"):
-        found = shutil.which(name)
-        if found:
-            return found
-    return None
-
-
 def compiled_contract() -> bool:
     """True when the compiled half actually ran."""
-    compiler = find_compiler()
-    if compiler is None:
+    toolchain, reason = _cxx_toolchain.discover(ROOT)
+    if toolchain is None:
+        print(f"case key compiled contract: SKIP -- {reason}", file=sys.stderr)
         return False
+    compiler, std_flag = toolchain.compiler, toolchain.std_flag
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
         cpp = tmp / "case_key_harness.cpp"
@@ -883,7 +862,7 @@ def compiled_contract() -> bool:
         exe = tmp / ("case_key_harness.exe" if os.name == "nt" else "case_key_harness")
         includes = [ROOT / "src", ROOT / "include", ROOT / "include" / "chiffon"]
         try:
-            if compiler.lower().endswith("vcvars64.bat"):
+            if toolchain.is_msvc:
                 # QUOTED include paths: this repository's own path contains an
                 # `&`, which cmd would otherwise read as a command separator.
                 script = tmp / "build_case_key_harness.bat"
@@ -891,14 +870,14 @@ def compiled_contract() -> bool:
                     "@echo off\r\n"
                     + 'call "%s" >nul\r\n' % compiler
                     + 'cd /d "%s"\r\n' % tmp
-                    + 'cl /nologo /std:c++20 /EHsc /D_CRT_SECURE_NO_WARNINGS "%s" %s /Fe:"%s"\r\n'
-                      % (cpp, " ".join('/I "%s"' % d for d in includes), exe),
+                    + 'cl /nologo %s /EHsc /D_CRT_SECURE_NO_WARNINGS "%s" %s /Fe:"%s"\r\n'
+                      % (std_flag, cpp, " ".join('/I "%s"' % d for d in includes), exe),
                     encoding="utf-8")
                 subprocess.run(["cmd", "/c", str(script)], check=True, cwd=str(tmp),
                                capture_output=True, universal_newlines=True)
             else:
                 subprocess.run(
-                    [compiler, "-std=c++20", "-O0", str(cpp), "-o", str(exe)]
+                    [compiler, std_flag, "-O0", str(cpp), "-o", str(exe)]
                     + [arg for d in includes for arg in ("-I", str(d))],
                     check=True, capture_output=True, universal_newlines=True)
         except subprocess.CalledProcessError as failure:

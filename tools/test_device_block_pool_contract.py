@@ -43,13 +43,15 @@ USE
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools"))
+
+import _cxx_toolchain  # noqa: E402
 
 failures: list[str] = []
 
@@ -407,26 +409,12 @@ ARMS = (
 )
 
 
-def find_compiler() -> "str | None":
-    """MSVC's vcvars64.bat, or a g++/clang++ on PATH, or None."""
-    if os.name == "nt":
-        for base in (r"C:\Program Files\Microsoft Visual Studio",
-                     r"C:\Program Files (x86)\Microsoft Visual Studio"):
-            if not os.path.isdir(base):
-                continue
-            for dirpath, _dirs, files in os.walk(base):
-                if "vcvars64.bat" in files:
-                    return os.path.join(dirpath, "vcvars64.bat")
-    for name in ("g++", "clang++"):
-        found = shutil.which(name)
-        if found:
-            return found
-    return None
-
-
 def run_compiled() -> bool:
-    """True when the compiled half ran.  False means no compiler, and SAYS so."""
-    compiler = find_compiler()
+    """True when the compiled half ran.  False means it did not: either no
+    compiler at all (a FAIL below -- see the policy note), or a compiler was
+    found but accepts neither -std=c++20 nor -std=c++2a (a SKIP -- that is a
+    fact about the host's toolchain, not evidence the pool's policy broke)."""
+    compiler = _cxx_toolchain.find_compiler(ROOT)
     if compiler is None:
         failures.append(
             "NO C++ COMPILER: the free list's bound, its eviction order and its "
@@ -435,6 +423,12 @@ def run_compiled() -> bool:
             "from a host that compiled nothing is the report that let the WP10.6 "
             "pool ship unbounded.")
         return False
+    std_flag = _cxx_toolchain.probe_std_flag(compiler)
+    if std_flag is None:
+        print(f"device block pool compiled contract: SKIP -- {compiler} accepts "
+              "neither -std=c++20 nor -std=c++2a", file=sys.stderr)
+        return False
+    is_msvc = _cxx_toolchain.is_msvc(compiler)
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         cpp = tmp / "device_block_pool_harness.cpp"
@@ -443,7 +437,7 @@ def run_compiled() -> bool:
                      else "device_block_pool_harness")
         includes = [ROOT / "src"]
         try:
-            if compiler.lower().endswith("vcvars64.bat"):
+            if is_msvc:
                 # QUOTED include paths: this repository's own path contains an
                 # `&`, which cmd would otherwise read as a command separator.
                 script = tmp / "build_device_block_pool_harness.bat"
@@ -451,15 +445,15 @@ def run_compiled() -> bool:
                     "@echo off\r\n"
                     + 'call "%s" >nul 2>&1\r\n' % compiler
                     + 'cd /d "%s"\r\n' % tmp
-                    + 'cl /nologo /std:c++20 /EHsc /D_CRT_SECURE_NO_WARNINGS "%s" %s '
+                    + 'cl /nologo %s /EHsc /D_CRT_SECURE_NO_WARNINGS "%s" %s '
                       '/Fe:"%s"\r\n'
-                      % (cpp, " ".join('/I "%s"' % d for d in includes), exe),
+                      % (std_flag, cpp, " ".join('/I "%s"' % d for d in includes), exe),
                     encoding="utf-8")
                 subprocess.run(["cmd", "/c", str(script)], check=True, cwd=str(tmp),
                                capture_output=True, universal_newlines=True)
             else:
                 subprocess.run(
-                    [compiler, "-std=c++20", "-O0", str(cpp), "-o", str(exe)]
+                    [compiler, std_flag, "-O0", str(cpp), "-o", str(exe)]
                     + [arg for d in includes for arg in ("-I", str(d))],
                     check=True, capture_output=True, universal_newlines=True)
         except subprocess.CalledProcessError as failure:

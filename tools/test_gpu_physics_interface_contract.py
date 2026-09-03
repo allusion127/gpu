@@ -38,7 +38,6 @@ from __future__ import annotations
 import os
 import py_compile
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -46,6 +45,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
+sys.path.insert(0, str(ROOT / "tools"))
+
+import _cxx_toolchain  # noqa: E402
 
 SLOT_CONTROL = (SRC / "GpuSlotControl.h").read_text(encoding="utf-8-sig")
 PHYSICS_TYPES = (SRC / "GpuPhysicsTypes.h").read_text(encoding="utf-8-sig")
@@ -645,46 +647,28 @@ int main() {
 '''
 
 
-def msvc_vcvars() -> str | None:
-    """vcvars64.bat of the newest MSVC install, or None off Windows."""
-    if os.name != "nt":
-        return None
-    program_files = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
-    vswhere = Path(program_files) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
-    if not vswhere.is_file():
-        return None
-    done = subprocess.run(
-        [str(vswhere), "-latest", "-products", "*", "-requires",
-         "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-         "-property", "installationPath"],
-        capture_output=True, universal_newlines=True)
-    root = done.stdout.strip().splitlines()
-    if done.returncode != 0 or not root:
-        return None
-    bat = Path(root[0]) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
-    return str(bat) if bat.is_file() else None
-
-
-def compile_harness(compiler: str, cpp: Path, exe: Path, stub: Path) -> None:
-    if compiler.lower().endswith("vcvars64.bat"):
+def compile_harness(toolchain: _cxx_toolchain.Toolchain, cpp: Path, exe: Path,
+                    stub: Path) -> None:
+    compiler, std_flag = toolchain.compiler, toolchain.std_flag
+    if toolchain.is_msvc:
         script = cpp.parent / "build_gpu_physics_types_test.bat"
         script.write_text(
             "@echo off\r\n"
             + 'call "%s" >nul\r\n' % compiler
-            + 'cl /nologo /std:c++20 /EHsc /W4 /WX "%s" "%s" /I "%s" /Fe:"%s"\r\n'
-              % (cpp, stub, SRC, exe),
+            + 'cl /nologo %s /EHsc /W4 /WX "%s" "%s" /I "%s" /Fe:"%s"\r\n'
+              % (std_flag, cpp, stub, SRC, exe),
             encoding="utf-8")
         subprocess.run(["cmd", "/c", str(script)], check=True, cwd=str(cpp.parent),
                        capture_output=True, universal_newlines=True)
         return
     subprocess.run(
-        [compiler, "-std=c++20", "-Wall", "-Wextra", "-Werror",
+        [compiler, std_flag, "-Wall", "-Wextra", "-Werror",
          "-I", str(SRC), str(cpp), str(stub), "-o", str(exe)],
         check=True, capture_output=True, universal_newlines=True,
     )
 
 
-def run_harness(compiler: str) -> list[str]:
+def run_harness(toolchain: _cxx_toolchain.Toolchain) -> list[str]:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         cpp = tmp_path / "gpu_physics_types_test.cpp"
@@ -692,7 +676,7 @@ def run_harness(compiler: str) -> list[str]:
                           else "gpu_physics_types_test")
         cpp.write_text(HARNESS, encoding="utf-8")
         try:
-            compile_harness(compiler, cpp, exe, SRC / "GpuPhysicsBackendStub.cpp")
+            compile_harness(toolchain, cpp, exe, SRC / "GpuPhysicsBackendStub.cpp")
         except subprocess.CalledProcessError as failure:
             output = (failure.stdout or "") + (failure.stderr or "")
             return ["harness did not compile: " + output.strip()[-2000:]]
@@ -703,21 +687,23 @@ def run_harness(compiler: str) -> list[str]:
 
 
 def main() -> int:
-    compiler = (shutil.which("c++") or shutil.which("g++") or shutil.which("clang++")
-                or msvc_vcvars())
-    if compiler is not None:
-        problems.extend(run_harness(compiler))
+    toolchain, reason = _cxx_toolchain.discover(ROOT)
+    skipped = False
+    if toolchain is not None:
+        problems.extend(run_harness(toolchain))
+    else:
+        skipped = True
     if problems:
         for problem in problems:
             print("gpu physics interface: FAIL " + problem, file=sys.stderr)
         return 1
     py_compile.compile(str(Path(__file__).resolve()), doraise=True)
-    if compiler is None:
+    if skipped:
         print("gpu physics interface: static contract PASS "
-              "(no C++ compiler here -- the compiled harness was skipped)")
+              f"(SKIP compiled harness -- {reason})")
     else:
         print("gpu physics interface: PASS (static contract + compiled harness, %s)"
-              % Path(compiler).name)
+              % Path(toolchain.compiler).name)
     return 0
 
 
