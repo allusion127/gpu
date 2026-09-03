@@ -108,6 +108,7 @@ struct Fixture {
     double norm                 = 0.0;
     double flow_per_channel     = 0.0;
     double fuel_temp_rise_scale = 0.0;
+    double fuel_rods_per_node   = 0.0; ///< set to th::kLegacyFuelRodsPerNode by buildFixture
     double th_relaxation        = 0.0;
 
     std::vector<double> xskf, phif, vol, hmesh_x, hmesh_y, hz;

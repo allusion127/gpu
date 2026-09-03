@@ -513,6 +513,7 @@ bool ThBackend::solveTh(const thgpu::TableView& tables, const thgpu::GeomView& g
     k.input_mass_flux      = v.input_mass_flux;
     k.use_input_mass_flux  = v.use_input_mass_flux;
     k.fuel_temp_rise_scale = v.fuel_temp_rise_scale;
+    k.fuel_rods_per_node   = v.fuel_rods_per_node;
     k.th_relaxation        = v.th_relaxation;
     k.h_table_max          = v.h_table_max;
     k.xskf = borrow ? static_cast<const double*>(v.xskf_device) : s.d_xskf;

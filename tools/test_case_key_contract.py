@@ -612,7 +612,10 @@ def receipt_component_contract() -> None:
     # v2 (2026-09-04) took it to 8 with the exec-mode / effective-AA / forms
     # fields.  A schema-7 line cannot answer "was this batch", which is the
     # question that made two 238 runs share a key and split a trajectory.
-    if '\\"schema_version\\":8' not in block:
+    # v3 (2026-09-04) took it to 9 with `th_fuel_rods`: a schema-8 line cannot
+    # say which fuel-rod divisor produced its fuel temperatures, and the answer
+    # was the wrong literal 62 for every run before this one.
+    if '\\"schema_version\\":9' not in block:
         fail("the [RASBERY][CASE] receipt did not bump schema_version when it "
              "gained the component fields; a reader cannot tell the two apart")
     # WP10.4.  The Sec 6.2 spelling of the fidelity, BESIDE the campaign one.
@@ -663,15 +666,15 @@ def exec_mode_forms_contract() -> None:
     """
     forms_h = (ROOT / "src" / "GpuFormMask.h").read_text(encoding="utf-8-sig")
 
-    if 'kSchema = "rasbery-case-key/v2"' not in CASEKEY_H:
-        fail("CaseKey.h did not bump kSchema for the v2 field set; a v1 cache "
-             "would miss silently against a v2 key instead of being re-keyed")
-    if case_key.SCHEMA != "rasbery-case-key/v2":
-        fail(f"tools/case_key.py SCHEMA is {case_key.SCHEMA!r}, not the header's v2")
+    if 'kSchema = "rasbery-case-key/v3"' not in CASEKEY_H:
+        fail("CaseKey.h did not bump kSchema for the current field set; an older "
+             "cache would miss silently instead of being re-keyed")
+    if case_key.SCHEMA != "rasbery-case-key/v3":
+        fail(f"tools/case_key.py SCHEMA is {case_key.SCHEMA!r}, not the header's v3")
 
     payload_fn = CASEKEY_H[CASEKEY_H.index("inline std::string payloadOf("):]
     payload_fn = payload_fn[:payload_fn.index("\n}")]
-    for line in ("exec_mode", "xe_anderson", "xe_txn", "forms"):
+    for line in ("exec_mode", "xe_anderson", "xe_txn", "forms", "th_fuel_rods"):
         if f'"\\n{line}\\t"' not in payload_fn:
             fail(f"payloadOf does not emit a {line!r} line; the key cannot tell "
                  f"two runs that differ only in it apart")
@@ -679,12 +682,13 @@ def exec_mode_forms_contract() -> None:
     # is already an env line, so folding "somebody asked" again would give the
     # batch harness (which exports it) and a single run that takes the same state
     # by default two keys for one arithmetic.
-    for banned in ("xe_anderson_source", "xe_txn_source"):
+    for banned in ("xe_anderson_source", "xe_txn_source", "th_fuel_rods_source"):
         if banned in payload_fn:
             fail(f"payloadOf folds {banned!r}; the provenance of a state is not the "
                  "state, and the raw request is already an env line")
     for field in ("std::string exec_mode;", "std::string xe_anderson;",
-                  "std::string xe_txn;", "std::string forms_digest;"):
+                  "std::string xe_txn;", "std::string forms_digest;",
+                  "std::string th_fuel_rods;", "std::string th_fuel_rods_source;"):
         if field not in CASEKEY_H:
             fail(f"casekey::Provenance lost {field!r}")
 
@@ -703,6 +707,17 @@ def exec_mode_forms_contract() -> None:
     if 'std::getenv("RASBERY_XE_ANDERSON")' in prov:
         fail("caseKeyProvenance re-reads RASBERY_XE_ANDERSON; the key must fold the "
              "EFFECTIVE state xeAnderson() resolved, not the request")
+    # v3.  The divisor comes from the object that resolved it ONCE
+    # (Geometry::Initialize, src/ThFuelRods.h).  A second getenv here would be a
+    # second resolution, and the two would disagree the first time a deck key
+    # and the variable said different things.
+    if "geometry.fuel_rods_per_node()" not in prov:
+        fail("caseKeyProvenance does not fold Geometry::fuel_rods_per_node(); the "
+             "fuel-temperature divisor moves every cross section and two runs that "
+             "differ only in it would share one cache entry")
+    if 'std::getenv("RASBERY_TH_FUEL_RODS")' in prov:
+        fail("caseKeyProvenance re-reads RASBERY_TH_FUEL_RODS; the key must fold the "
+             "value Geometry resolved, not the request")
 
     # Priming: all four CALIBRATED channels, before the key reads the registry.
     prime = DRIVER_H[DRIVER_H.index("static void primeFormMasks()"):]
@@ -736,7 +751,8 @@ def exec_mode_forms_contract() -> None:
     case_block = DRIVER_H[DRIVER_H.index('"  [RASBERY][CASE] {{'):]
     case_block = case_block[:case_block.index(");")]
     for field in ("exec_mode", "xe_anderson", "xe_anderson_source", "xe_txn",
-                  "xe_txn_source", "forms_digest", "forms_pin", "forms"):
+                  "xe_txn_source", "th_fuel_rods", "th_fuel_rods_source",
+                  "forms_digest", "forms_pin", "forms"):
         if f'\\"{field}\\"' not in case_block:
             fail(f"[RASBERY][CASE] does not publish {field!r}")
     traj = DRIVER_H[DRIVER_H.index('"[RASBERY][TRAJECTORY] {{'):]
@@ -989,6 +1005,8 @@ int main(int argc, char** argv) {
         p.xe_txn             = pick("HARNESS_XE_TXN", "on");
         p.xe_txn_source      = pick("HARNESS_XE_TXN_SOURCE", "default");
         p.forms_digest       = pick("HARNESS_FORMS_DIGEST", "");
+        p.th_fuel_rods        = pick("HARNESS_TH_FUEL_RODS", "62");
+        p.th_fuel_rods_source = pick("HARNESS_TH_FUEL_RODS_SOURCE", "legacy_62");
         std::string name;
         while (std::getline(names, name)) {
             if (name.empty()) continue;
@@ -1254,7 +1272,11 @@ def compiled_contract() -> bool:
                         "HARNESS_XE_ANDERSON": "off",
                         "HARNESS_XE_TXN": "off",
                         "HARNESS_XE_TXN_SOURCE": "env",
-                        "HARNESS_FORMS_DIGEST": "f0" * 32})
+                        "HARNESS_FORMS_DIGEST": "f0" * 32,
+                        # v3: a NON-legacy divisor, so the th_fuel_rods line is
+                        # compared at a value neither side can produce by default.
+                        "HARNESS_TH_FUEL_RODS": "65",
+                        "HARNESS_TH_FUEL_RODS_SOURCE": "deck"})
         for label, environ in (("unset", base_env), ("loaded", loaded),
                                ("batched", batched)):
             out = tmp / f"payload_{label}.bin"
@@ -1272,7 +1294,8 @@ def compiled_contract() -> bool:
                 exec_mode=environ.get("HARNESS_EXEC_MODE", "single"),
                 forms_digest=environ.get("HARNESS_FORMS_DIGEST", ""),
                 xe_anderson_state=environ.get("HARNESS_XE_ANDERSON", "on"),
-                xe_txn_state=environ.get("HARNESS_XE_TXN", "on"))
+                xe_txn_state=environ.get("HARNESS_XE_TXN", "on"),
+                th_fuel_rods_value=environ.get("HARNESS_TH_FUEL_RODS", "62"))
             cpp_payload = out.read_bytes()
             if cpp_payload != py_payload.encode("utf-8"):
                 where = next((i for i, (a, b) in enumerate(

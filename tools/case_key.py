@@ -56,7 +56,11 @@ import exact_audit  # noqa: E402
 # v2 (2026-09-04): four lines appended after code_sha -- exec_mode,
 # xe_anderson, xe_txn and forms.  See src/CaseKey.h kSchema for why every key in
 # the campaign moves once.
-SCHEMA = "rasbery-case-key/v2"
+# v3 (2026-09-04): one more, th_fuel_rods -- the EFFECTIVE fuel rods per node
+# that divides SolveTH's linear power density.  It was a hard-coded 62.0 and is
+# wrong for both campaign decks; a deck key or RASBERY_TH_FUEL_RODS moves it, and
+# moving it moves every fuel temperature and therefore every cross section.
+SCHEMA = "rasbery-case-key/v3"
 CODE_SHA_ENV = "RASBERY_CODE_SHA"
 
 # src/Driver.h xeAndersonGate()/xeMode(), mirrored.
@@ -118,6 +122,58 @@ def xe_txn(env) -> tuple[str, str]:
     if raw is None:
         return "on", "default"
     return ("off" if str(raw) in ("", "0", "off", "OFF", "false", "FALSE") else "on"), "env"
+
+# src/ThFuelRods.h, mirrored.  THE DIVISOR IS NOT AN ENV STRING AND NOT A DECK
+# VALUE: it is whichever of the two the solver resolved, which is why the key
+# folds the effective number and the receipt reports the source beside it.
+LEGACY_FUEL_RODS_PER_NODE = 62.0
+TH_FUEL_RODS_ENV = "RASBERY_TH_FUEL_RODS"
+FUEL_RODS_DECK_KEYS = ("nfrod", "fuel rods per assembly", "fuel_rods_per_assembly")
+
+
+def _rods_token(value: float) -> str:
+    """The payload's one float spelling, which src/CaseKey.h writes as {:.17g}."""
+    return f"{float(value):.17g}"
+
+
+def deck_fuel_rods_per_node(config) -> float:
+    """`geometry.dimensions.nfrod` folded by ndivxy^2, or 0.0 when absent.
+
+    NOTHING IS INFERRED.  npins^2 minus the guide tubes is not derivable from
+    the deck (src/ThFuelRods.h says why), so an absent count stays absent here
+    exactly as it does in the solver.
+    """
+    dims = ((config or {}).get("geometry") or {}).get("dimensions") or {}
+    nfrod = next((dims[k] for k in FUEL_RODS_DECK_KEYS if k in dims), 0)
+    ndivxy = dims.get("xydivision", 0)
+    try:
+        nfrod, ndivxy = int(nfrod), int(ndivxy)
+    except (TypeError, ValueError):
+        return 0.0
+    if nfrod <= 0 or ndivxy <= 0:
+        return 0.0
+    return nfrod / float(ndivxy * ndivxy)
+
+
+def th_fuel_rods(config, env) -> tuple[str, str]:
+    """(effective rods-per-node token, source) -- src/ThFuelRods.h resolveFuelRodsPerNode."""
+    want = str(env.get(TH_FUEL_RODS_ENV, "")).strip()
+    if want in ("", "legacy"):
+        return _rods_token(LEGACY_FUEL_RODS_PER_NODE), "legacy_62"
+    deck = deck_fuel_rods_per_node(config)
+    if want == "deck":
+        if deck <= 0.0:
+            sys.exit(f"{TH_FUEL_RODS_ENV}=deck, but the deck declares no "
+                     "geometry.dimensions.nfrod; the solver refuses this too.")
+        return _rods_token(deck), "deck"
+    try:
+        value = float(want)
+    except ValueError:
+        value = 0.0
+    if not value > 0.0:
+        sys.exit(f"{TH_FUEL_RODS_ENV} must be legacy|deck|<positive number>, got {want!r}")
+    return _rods_token(value), "env"
+
 
 # src/Driver.h trajectory::kArmEnv, IN ORDER -- READ FROM THE SOURCE, not copied.
 #
@@ -437,7 +493,8 @@ def env_set(env) -> str:
 def payload_of(deck_digest: str, fidelity: str, policy: str,
                env, xslib_digest: str, warm_start: str,
                exec_mode: str = "single", forms_digest: str = "",
-               xe_anderson_state: str = "", xe_txn_state: str = "") -> str:
+               xe_anderson_state: str = "", xe_txn_state: str = "",
+               th_fuel_rods_value: str = "") -> str:
     """src/CaseKey.h payloadOf(), byte for byte.
 
     `forms_digest` CANNOT BE DERIVED HERE.  It is the digest of the contraction
@@ -462,6 +519,7 @@ def payload_of(deck_digest: str, fidelity: str, policy: str,
     lines.append(f"xe_anderson\t{_token(aa)}")
     lines.append(f"xe_txn\t{_token(txn)}")
     lines.append(f"forms\t{_token(forms_digest)}")
+    lines.append(f"th_fuel_rods\t{_token(th_fuel_rods_value or _rods_token(LEGACY_FUEL_RODS_PER_NODE))}")
     return "\n".join(lines) + "\n"
 
 
@@ -503,10 +561,12 @@ def case_key(deck: Path, env=None, xslib: bool = True, warm_start: str = "",
     txn_state, txn_source = xe_txn(env)
     if xe_txn_state:
         txn_state, txn_source = xe_txn_state, "declared"
+    rods_value, rods_source = th_fuel_rods(config, env)
     payload = payload_of(deck_digest, fidelity, policy, env,
                          xslib_digest, warm_start, exec_mode=exec_mode,
                          forms_digest=forms_digest,
-                         xe_anderson_state=aa_state, xe_txn_state=txn_state)
+                         xe_anderson_state=aa_state, xe_txn_state=txn_state,
+                         th_fuel_rods_value=rods_value)
     return {
         "deck": str(deck),
         "key_schema": SCHEMA,
@@ -535,6 +595,8 @@ def case_key(deck: Path, env=None, xslib: bool = True, warm_start: str = "",
         "xe_txn": txn_state,
         "xe_txn_source": txn_source,
         "forms_digest": _token(forms_digest),
+        "th_fuel_rods": rods_value,
+        "th_fuel_rods_source": rods_source,
         "warm_start": warm_start,
         "payload": payload,
         "deck_payload": dpayload,
@@ -548,7 +610,8 @@ COMPONENT_FIELDS = ("case_key", "key_schema", "core_op", "deck_digest",
                     "env_digest", "env_set", "xslib_digest", "xslib_policy",
                     "warm_start_token", "code_sha", "fidelity", "policy",
                     "exec_mode", "xe_anderson", "xe_anderson_source",
-                    "xe_txn", "xe_txn_source", "forms_digest")
+                    "xe_txn", "xe_txn_source", "th_fuel_rods",
+                    "th_fuel_rods_source", "forms_digest")
 
 
 def main(argv: list[str]) -> int:

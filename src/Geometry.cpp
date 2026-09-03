@@ -1,5 +1,6 @@
 #include "Geometry.h"
 
+#include "CompatFormat.h"
 #include "HostPinRegistry.h"
 
 using namespace rasbery;
@@ -148,6 +149,28 @@ void Geometry::Initialize(const GeometryInput& in) {
     _ndivxy2 = _ndivxy * _ndivxy;
     _ng2     = _ng * _ng;
     _npins   = in.npins;
+
+    // THE FUEL-TEMPERATURE DIVISOR, RESOLVED ONCE, WITH A RECEIPT.  `nfrod` is
+    // rods per ASSEMBLY and the T/H bodies divide per NODE, so the deck value is
+    // folded by ndivxy^2 here -- the one place that knows both.  The default is
+    // the legacy literal (ThFuelRods.h says why), and the line below is printed
+    // unconditionally because a divisor nobody can see in a log is exactly how
+    // 62 survived from e76d40d to this campaign.
+    {
+        const double deck_rods = (in.nfrod > 0 && _ndivxy2 > 0)
+                                     ? static_cast<double>(in.nfrod) /
+                                           static_cast<double>(_ndivxy2)
+                                     : 0.0;
+        const th::FuelRods rods = th::resolveFuelRodsPerNode(deck_rods);
+        _fuel_rods_per_node     = rods.value;
+        _fuel_rods_source       = rods.source;
+        std::cout << std::format(
+            "  [RASBERY][TH][NFROD] {{\"schema_version\":1,\"rods_per_node\":{:.17g},"
+            "\"source\":\"{}\",\"deck_nfrod\":{},\"ndivxy\":{},"
+            "\"deck_rods_per_node\":{:.17g},\"legacy\":{:.17g}}}\n",
+            _fuel_rods_per_node, _fuel_rods_source, in.nfrod, _ndivxy, deck_rods,
+            th::kLegacyFuelRodsPerNode);
+    }
 
     // Store raw layout so XSSet can access it without re-receiving gin.
     _core  = in.core;

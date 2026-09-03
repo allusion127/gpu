@@ -5478,7 +5478,8 @@ private:
 
     static casekey::Provenance caseKeyProvenance(const IO& input_output,
                                                  const std::string& warm_provenance,
-                                                 const CaseFidelity& fidelity) {
+                                                 const CaseFidelity& fidelity,
+                                                 const Geometry&     geometry) {
         casekey::Provenance p;
         p.deck_digest = input_output.deck_key_digest();
         // WP10.2.  A warm start is N1 -- it can select a root where the
@@ -5551,6 +5552,16 @@ private:
         primeFormMasks();
         const std::string& forms = gpu::formsPayloadFrozen();
         if (!forms.empty()) p.forms_digest = Sha256::hexOf(forms);
+
+        // ---- v3: THE FUEL-TEMPERATURE DIVISOR -----------------------------
+        //
+        // FROM THE ONE OBJECT THAT RESOLVED IT.  Geometry folded the deck's
+        // `nfrod` by ndivxy^2 and applied RASBERY_TH_FUEL_RODS once, in
+        // Initialize; re-reading either here would be a second resolution and
+        // therefore a second answer.  `%.17g` is the payload's one float
+        // spelling, which tools/case_key.py mirrors.
+        p.th_fuel_rods        = std::format("{:.17g}", geometry.fuel_rods_per_node());
+        p.th_fuel_rods_source = geometry.fuel_rods_source();
         return p;
     }
 
@@ -5978,7 +5989,7 @@ public:
         // `tools/case_key.py --components` prints the same five keys with the
         // same spellings.  A mismatch is then one `diff` and not a bisect.
         const casekey::Provenance case_provenance =
-            caseKeyProvenance(input_output, warm_provenance, _fidelity);
+            caseKeyProvenance(input_output, warm_provenance, _fidelity, geometry);
         const std::string case_key         = casekey::keyOf(case_provenance);
         const std::string case_env_digest  = casekey::envDigest(case_provenance);
         _case_receipt.case_key            = case_key;
@@ -6110,7 +6121,7 @@ public:
                 r_loose_keff, r_loose_flux, r_loose_xe);
         }
         std::cout << std::format(
-            "  [RASBERY][CASE] {{\"schema_version\":8,\"case_key\":\"{}\",\"key_schema\":\"{}\","
+            "  [RASBERY][CASE] {{\"schema_version\":9,\"case_key\":\"{}\",\"key_schema\":\"{}\","
             "\"core_op\":\"{}\",\"deck_digest\":\"{}\",\"env_digest\":\"{}\","
             "\"env_set\":\"{}\","
             "\"xslib_digest\":\"{}\",\"xslib_policy\":\"{}\",\"warm_start_token\":\"{}\","
@@ -6126,6 +6137,9 @@ public:
             // rule from the mode and the environment.
             "\"exec_mode\":\"{}\",\"xe_anderson\":\"{}\",\"xe_anderson_source\":\"{}\","
             "\"xe_txn\":\"{}\",\"xe_txn_source\":\"{}\","
+            // v3.  The fuel-temperature divisor: the effective value the key folds,
+            // and the source it came from, which the key deliberately does not.
+            "\"th_fuel_rods\":\"{}\",\"th_fuel_rods_source\":\"{}\","
             "\"forms_digest\":\"{}\",\"forms_pin\":\"{}\",\"forms\":{}}}\n",
             case_key, casekey::kSchema, input_output.deck_key_core_op(),
             input_output.deck_key_digest(), case_env_digest,
@@ -6149,6 +6163,8 @@ public:
             case_provenance.exec_mode, case_provenance.xe_anderson,
             case_provenance.xe_anderson_source, case_provenance.xe_txn,
             case_provenance.xe_txn_source,
+            casekey::tokenOrTilde(case_provenance.th_fuel_rods),
+            casekey::tokenOrTilde(case_provenance.th_fuel_rods_source),
             casekey::tokenOrTilde(case_provenance.forms_digest),
             gpu::formsPinName(), FormMaskReceiptJson());
 

@@ -1,6 +1,8 @@
 #pragma once
 #include "pch.h"
 
+#include "ThFuelRods.h"
+
 #include <array>
 #include <string>
 #include <vector>
@@ -41,6 +43,11 @@ struct GeometryInput {
     int                                             nz;
     int                                             ndivxy;
     int                                             npins;
+    /// Fuel rods per ASSEMBLY, as the deck declares it (`geometry.dimensions.nfrod`).
+    /// 0 = the deck said nothing, which resolves to the legacy divisor.  It is
+    /// NOT part of the cohort key (CohortKey.h keys the topology the maps are
+    /// built from; this is a T/H divisor a case carries, not a mesh fact).
+    int                                             nfrod = 0;
     double                                          hx, hy; // assembly pitch [cm]
     std::vector<double>                             hz;     // axial mesh heights (bottom→top) [cm]
     int                                             symang; // symmetry angle (90 or 360)
@@ -113,6 +120,10 @@ private:
     double _mass_flow_rate     = 1.0;   // coolant mass flux [kg/s/m^2]
     double _rated_power        = 1.0;   // rated thermal power [MW]
     double _fuel_temp_rise_scale = 1.0; // multiplier on tabulated Tfuel-Tcoolant
+    /// Fuel rods per NODE -- the divisor of SolveTH's linear power density.
+    /// Resolved once in Initialize (deck / env / legacy); see ThFuelRods.h.
+    double      _fuel_rods_per_node = th::kLegacyFuelRodsPerNode;
+    std::string _fuel_rods_source   = "legacy_62";
     bool   _use_mass_flow_rate = false; // use input flow instead of outlet-derived flow
     double _part;                       // geometry fraction (1.0 full, 0.25 quarter)
     double _hzcore;                     // active core axial height [cm]
@@ -296,6 +307,9 @@ public:
     [[nodiscard]] inline const double& rated_power() const { return _rated_power; }
 
     /// @brief Scale applied to the tabulated fuel-to-coolant temperature rise
+    [[nodiscard]] inline double fuel_rods_per_node() const { return _fuel_rods_per_node; }
+    [[nodiscard]] inline const std::string& fuel_rods_source() const { return _fuel_rods_source; }
+
     inline double& fuel_temp_rise_scale() { return _fuel_temp_rise_scale; }
     [[nodiscard]] inline const double& fuel_temp_rise_scale() const { return _fuel_temp_rise_scale; }
 

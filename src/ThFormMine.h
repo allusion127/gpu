@@ -50,6 +50,7 @@ inline th::ThView viewOf(const thref::Fixture& f, std::vector<double>& node_powe
     v.inlet_h              = f.inlet_h;
     v.h_table_max          = f.h_table_max;
     v.fuel_temp_rise_scale = f.fuel_temp_rise_scale;
+    v.fuel_rods_per_node   = f.fuel_rods_per_node;
     v.th_relaxation        = f.th_relaxation;
 
     v.xskf    = f.xskf.data();

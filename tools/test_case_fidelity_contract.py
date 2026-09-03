@@ -223,7 +223,7 @@ def check_wiring(driver: str, server: str, light: str) -> list[str]:
                    "converges on whatever the context was default-constructed with")
     if "input_output.ReadInput(_input, _fidelity.statepoint_grid);" not in driver:
         bad.append("the deck is not loaded on the case's own burnup grid")
-    if "caseKeyProvenance(input_output, warm_provenance, _fidelity)" not in driver:
+    if "caseKeyProvenance(input_output, warm_provenance, _fidelity, geometry)" not in driver:
         bad.append("the case key is not computed from the case's own fidelity; a strict "
                    "promotion and the A2 screening result it replaces would collide")
     if "armEnvValue" not in driver:
@@ -381,8 +381,8 @@ control("check_wiring misses a fidelity that never reaches the solve",
         SERVER, LIGHT)
 control("check_wiring misses a case key that ignores the case's fidelity",
         check_wiring,
-        DRIVER.replace("caseKeyProvenance(input_output, warm_provenance, _fidelity)",
-                       "caseKeyProvenance(input_output, warm_provenance)"),
+        DRIVER.replace("caseKeyProvenance(input_output, warm_provenance, _fidelity, geometry)",
+                       "caseKeyProvenance(input_output, warm_provenance, geometry)"),
         SERVER, LIGHT)
 control("check_wiring misses a light JSONL with no fidelity",
         check_wiring, DRIVER, SERVER, LIGHT.replace('receipt["policy"]', 'receipt["p"]'))

@@ -692,6 +692,20 @@ void IO::ReadInput(const std::string& filepath, const std::string& statepoint_gr
         geometry_input.ng     = geom["dimensions"]["ng"];
         geometry_input.ndivxy = geom["dimensions"]["xydivision"];
         geometry_input.npins  = geom["dimensions"]["npins"];
+        // The fuel-rod count per ASSEMBLY, optional.  Absent (0) resolves to the
+        // legacy 62 rods/node divisor; see src/ThFuelRods.h for why the default
+        // is the wrong number and why it is still the default.  Spelled `nfrod`
+        // like MASTER's depf card ("npin, nfrod"), with the long form accepted
+        // the way every other deck key here accepts one.
+        if (const auto* v = FirstPresentKey(geom["dimensions"],
+                                            {"nfrod", "fuel rods per assembly",
+                                             "fuel_rods_per_assembly"})) {
+            geometry_input.nfrod = v->get<int>();
+            if (geometry_input.nfrod <= 0)
+                throw std::runtime_error(
+                    "IO::ReadInput: geometry.dimensions.nfrod must be a positive fuel-rod "
+                    "count per assembly.");
+        }
         geometry_input.hx     = geom["size"]["hx"];
         geometry_input.hy     = geom["size"]["hy"];
 
@@ -2294,6 +2308,10 @@ void IO::SaveRestart(const std::string& filepath,
         geo.createDataSet("nz", _gin.nz);
         geo.createDataSet("ndivxy", _gin.ndivxy);
         geo.createDataSet("npins", _gin.npins);
+        // Written since 2026-09-04.  A restart file older than that has no
+        // `nfrod`, and LoadGeometryFromRestart reads it back as 0 -- the legacy
+        // divisor, which is what such a run was computed with.
+        geo.createDataSet("nfrod", _gin.nfrod);
         geo.createDataSet("hx", _gin.hx);
         geo.createDataSet("hy", _gin.hy);
         geo.createDataSet("hz", _gin.hz);
@@ -2734,6 +2752,10 @@ GeometryInput IO::LoadGeometryFromRestart(const std::string& filepath) {
     geo.getDataSet("nz").read(gin.nz);
     geo.getDataSet("ndivxy").read(gin.ndivxy);
     geo.getDataSet("npins").read(gin.npins);
+    // Optional: restart files written before 2026-09-04 carry no fuel-rod count,
+    // and 0 is the honest answer for one -- it resolves to the legacy divisor
+    // those runs actually used.
+    if (geo.exist("nfrod")) geo.getDataSet("nfrod").read(gin.nfrod);
     geo.getDataSet("hx").read(gin.hx);
     geo.getDataSet("hy").read(gin.hy);
     geo.getDataSet("hz").read(gin.hz);

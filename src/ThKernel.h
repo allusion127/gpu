@@ -308,6 +308,11 @@ struct ThView {
     double input_mass_flux     = 0.0;
     int    use_input_mass_flux = 0;
     double fuel_temp_rise_scale = 1.0;
+    /// Fuel rods per node -- SolveTH's linear-power-density divisor.  NO
+    /// DEFAULT VALUE ON PURPOSE: it is a deck fact (Geometry::fuel_rods_per_node,
+    /// src/ThFuelRods.h), every filler sets it, and a zero here divides by zero
+    /// loudly rather than quietly reinstating the wrong literal.
+    double fuel_rods_per_node   = 0.0;
     double th_relaxation        = 1.0;
     double h_table_max          = 0.0; ///< mod_t.y_axis.back()
 
@@ -433,7 +438,7 @@ RASBERY_TH_HD inline ThChannelOverflow thChannelSweep(const ThView& v, int l, do
         }
         v.tmod[lk]       = thTableGet(v.mod_t, v.pressure, h_avg, forms);
         v.dmod[lk]       = thTableGet(v.mod_rho, v.pressure, h_avg, forms);
-        const double lpd = 1000.0 * P_node / (62.0 * v.hz[k]);
+        const double lpd = 1000.0 * P_node / (v.fuel_rods_per_node * v.hz[k]);
         const double bu  = v.burn[lk] / 1000.0;
         v.tful[lk]       = thMulAdd(forms, TH_TFUEL, v.fuel_temp_rise_scale,
                                     thGetTfuel(v.tf, bu, lpd, forms), v.tmod[lk]);

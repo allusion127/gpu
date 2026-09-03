@@ -76,7 +76,17 @@ namespace rasbery::casekey {
 /// against 4c663ff538b28f82 / 7087) under ONE key -- the batch execution mode
 /// turns the Xe Anderson default off (Driver.h xeAndersonGate) and nothing in
 /// the key said so.  A cache built under v1 must be re-keyed, not merged.
-inline constexpr const char* kSchema = "rasbery-case-key/v2";
+/// v3 (2026-09-04) ADDED ONE LINE -- `th_fuel_rods`, the EFFECTIVE fuel-rod
+/// count per node that divides SolveTH's linear power density
+/// (src/ThFuelRods.h).  It was the literal 62.0 in three bodies, it is wrong for
+/// both campaign decks (i-SMR 65, APR1400 59), and it is now a resolved value a
+/// deck key or RASBERY_TH_FUEL_RODS can move.  Moving it moves every fuel
+/// temperature and therefore every cross section, so two runs that differ only
+/// in it are two physics and must not share a cache entry.  EVERY KEY MOVES
+/// ONCE AGAIN: the payload gained a LINE, and the legacy default is now spelled
+/// out rather than assumed.  The VALUE is folded and the SOURCE is not -- a deck
+/// that declares 62 and a legacy default are one arithmetic and key alike.
+inline constexpr const char* kSchema = "rasbery-case-key/v3";
 
 /// The harness declares the build identity here.  It is not derivable inside
 /// the process -- there is no embedded commit -- and a key that pretended
@@ -360,6 +370,18 @@ struct Provenance {
     /// MINES selects the rounding of production arithmetic and is not derivable
     /// from any environment string, so it has to be measured and folded.
     std::string forms_digest;
+
+    // ---- v3 -------------------------------------------------------------
+    //
+    // THE FUEL-TEMPERATURE DIVISOR.  `%.17g` of Geometry::fuel_rods_per_node(),
+    // the rods-per-node that SolveTH divides the linear power density by.  It
+    // is not an env line because it can come from the DECK, and it is not a
+    // deck line either because RASBERY_TH_FUEL_RODS can override the deck --
+    // the EFFECTIVE value is the only thing that describes the arithmetic.
+    // The source is carried for the receipt and deliberately NOT folded, for
+    // the same reason `xe_anderson_source` is not.
+    std::string th_fuel_rods;        ///< effective rods per node, "%.17g"
+    std::string th_fuel_rods_source; ///< "legacy_62" | "deck" | "env" -- REPORTED
 };
 
 inline std::string tokenOrTilde(const std::string& text) {
@@ -469,6 +491,9 @@ inline std::string payloadOf(const Provenance& p) {
     out += tokenOrTilde(p.xe_txn);
     out += "\nforms\t";
     out += tokenOrTilde(p.forms_digest);
+    // ---- v3, appended after forms for the same reason ------------------
+    out += "\nth_fuel_rods\t";
+    out += tokenOrTilde(p.th_fuel_rods);
     out += '\n';
     return out;
 }

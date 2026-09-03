@@ -6375,7 +6375,7 @@ void XSSet::SolveTH(const double* node_power, const int* burnup, double power_ra
             }
             _g.tmod(lk)        = GetTmod(h_avg, pressure);
             _g.dmod(lk)        = GetDmod(h_avg, pressure);
-            const double lpd   = 1000.0 * P_node / (62.0 * _g.hz(k));
+            const double lpd   = 1000.0 * P_node / (_g.fuel_rods_per_node() * _g.hz(k));
             const double bu    = burnup[lk] / 1000.0;
             _g.tful(lk)        = _g.tmod(lk) +
                                  _g.fuel_temp_rise_scale() * GetTfuel(bu, lpd);
@@ -6584,6 +6584,7 @@ bool XSSet::TryUpdateTHGpu(double power_rate, double& delta_dop) {
     v.input_mass_flux      = input_mass_flux;
     v.use_input_mass_flux  = use_input_mass_flux ? 1 : 0;
     v.fuel_temp_rise_scale = _g.fuel_temp_rise_scale();
+    v.fuel_rods_per_node   = _g.fuel_rods_per_node();
     v.th_relaxation        = _th_relaxation;
     v.h_table_max          = _mod_t_table.y_axis[_mod_t_table.y_axis.size() - 1];
 

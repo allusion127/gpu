@@ -6,6 +6,8 @@
 
 #include "ThReference.h"
 
+#include "ThFuelRods.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -206,7 +208,7 @@ Overflow refSolveTH(const Fixture& f, const double* node_power, double* tmod, do
             }
             tmod[lk]         = getTmod(f, h_avg, pressure);
             dmod[lk]         = getDmod(f, h_avg, pressure);
-            const double lpd = 1000.0 * P_node / (62.0 * f.hz[static_cast<std::size_t>(k)]);
+            const double lpd = 1000.0 * P_node / (f.fuel_rods_per_node * f.hz[static_cast<std::size_t>(k)]);
             const double bu  = f.burn[static_cast<std::size_t>(lk)] / 1000.0;
             tful[lk]         = tmod[lk] + f.fuel_temp_rise_scale * getTfuel(f.tf, bu, lpd);
             h_cur            = h_out;
@@ -336,6 +338,9 @@ Fixture buildFixture(int nxy, int nz, int kbc, int kec) {
     // seed started from.
     f.norm                 = 50.0;
     f.flow_per_channel     = 0.37;
+    // The LEGACY divisor, deliberately: the mined form mask must not move
+    // when a deck changes the rod count, and the fixture is the norm.
+    f.fuel_rods_per_node   = rasbery::th::kLegacyFuelRodsPerNode;
     f.fuel_temp_rise_scale = 1.03;
     f.th_relaxation        = 0.85;
 

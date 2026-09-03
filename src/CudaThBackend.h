@@ -155,6 +155,7 @@ struct UpdateView {
     double input_mass_flux      = 0.0;
     int    use_input_mass_flux  = 0;
     double fuel_temp_rise_scale = 1.0;
+    double fuel_rods_per_node   = 0.0; ///< Geometry::fuel_rods_per_node(); see ThFuelRods.h
     double th_relaxation        = 1.0;
     double h_table_max          = 0.0;
 
