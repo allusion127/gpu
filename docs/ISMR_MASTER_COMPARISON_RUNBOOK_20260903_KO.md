@@ -877,3 +877,59 @@ W16 웨이브 요약 cases/h.
 - 검증: CY01 24스텝 완주, step-1 K-EFF 1.032934 vs 기준 1.032935(0.1 pcm), MAS_SUM 크기 84,387 B 기준과 동일, 10회 MAS_SUM sha256 전부 동일.
 - **단일 wall(warm 1 + 10회, affinity 0x1): median 26.26 s** (min 25.55 / max 26.51).
 - W16 cases/h: 미측정(16 동시 프로세스 기동이 로컬 권한 분류기에 차단 — 사용자 허용 후 재시도). 수신증: `E:\rasbery_runs\2026-09-03\ismr_master\181\receipt.txt`.
+
+---
+
+## 8. Anchor B reactivity protocol (block54c)
+
+§3.2 §2의 앵커 B는 `delta_rod_cm_*` (bank cm 차이)로만 보고된다 — CY02/03/04는 양쪽 다
+rod-critical(MASTER K-EFF == 1.000000, 양쪽 0.00 ppm)이라 `delta_pcm`/`delta_ppm`은 물리
+정보가 없다(§3의 `compare_master_rasbery.py` 모듈 docstring 참고). 이 rod cm 격차를
+**pcm 반응도**로 바꾸는 절차가 block54c다: RASBERY 쪽 로드-탐색을 끄고 MASTER가 수렴한
+정확한 cm에 봉을 고정한 뒤 그 형상에서 RASBERY의 keff를 그대로 읽는다 — 붕소가 양쪽 다
+0 ppm이므로 그 keff의 (k-1)/k × 1e5는 순수하게 봉 위치 격차가 가진 반응도다.
+
+새 도구 둘 (둘 다 `tools/compare_master_rasbery.py`의 `.sum`/`.h5` 파서를 재사용하며,
+`.sum` 파싱을 다시 구현하지 않는다):
+
+* `tools/make_ismr_fixed_rod_deck.py <deck.json> <depf_0N.sum> -o <out.json>` — 스케줄의
+  선두 `"standard"` 엔트리 `"search"`를 `"rod"` → `"keff"`로 강제하고(src/IO.cpp:34,487),
+  통계점마다 `{"type": "rod insertion", "<BANK>": <insertion_cm>, ...}` 엔트리를
+  (src/IO.cpp:502-528, 실사용 예시 `test/3-1_Colinear/Base_Rasbery.json:69`) 그 통계점
+  바로 앞에 끼워 넣는다. `insertion = 240 − cm`. 덱의 통계점 전개 순서(선두 standard +
+  각 depletion 엔트리의 `steps`번)와 `.sum` EDIT 1의 EFPD 오름차순 행 개수가 정확히
+  같아야 하며(CY02 21==21, CY03 22==22, CY04 22==22, 2026-09-03 확인), 다르면 즉시
+  거부한다 — 통계점을 하나씩 밀어서 잘못 짝짓는 것보다 낫다. R2/R4가 `.sum`에 없는
+  경우에만 `apply_overlap(r3_cm)`(R2=R3+120, R4=R3-120, [0, 240] 클램프)로 대체한다;
+  `.sum`이 직접 준 값이 항상 이 공식보다 우선한다.
+* `tools/ismr_rod_reactivity.py <depf_0N.sum> <out_fixedrod.h5> [--orig-h5 <원래 rod-search h5>]`
+  — 고정-로드 실행의 `summary/keff`를 읽어 통계점마다 `delta_rho_pcm = (k-1)/k × 1e5`를
+  찍고 전체 rms/max를 낸다. `--orig-h5`를 주면 원래 rod-search 실행의 `rods/insertions`
+  (`pos_cm = 240 − insertion`)와 MASTER cm의 차이도 `delta_rod_cm_<BANK>`로 같이 낸다.
+
+로컬에서는 파이썬 도구만 돈다(`tools/test_ismr_fixed_rod_contract.py`) — 아래 GPU 실행
+명령은 238에서만 돌리며, 이 세션에서는 실행하지 않았다.
+
+```bash
+# block54c: anchor B rod-position gap -> pcm, CY02 (CY03/CY04는 0N만 바꿔 그대로 반복)
+cd "$AW"   # block54 §3.2의 acc 작업 디렉터리, i-SMR_CY0N.json + Reference_output/이 이미 있음
+
+$PY "$W/tools/make_ismr_fixed_rod_deck.py" \
+    "$D7/i-SMR_CY02.json" "$D7/Reference_output/depf_02.sum" \
+    -o i-SMR_CY02_fixedrod.json
+
+env -i "${BASE[@]}" "${SINGLE[@]}" RASBERY_STATEPOINT_TELEMETRY=1 "$B" \
+    --rasi i-SMR_CY02_fixedrod.json --raso out_CY02_fixedrod.h5
+
+$PY "$W/tools/ismr_rod_reactivity.py" \
+    "$D7/Reference_output/depf_02.sum" out_CY02_fixedrod.h5 \
+    --orig-h5 out_CY02_gpu.h5 -o "$G/rho_CY02" | tee "$G/rho_CY02.log"
+
+# CY03: i-SMR_CY02 -> i-SMR_CY03, depf_02.sum -> depf_03.sum, out_CY02_* -> out_CY03_*, rho_CY02 -> rho_CY03
+# CY04: 위와 동일하게 04로 치환
+```
+
+`$W`, `$D7`, `$G`, `$B`, `$PY`, `${BASE[@]}`, `${SINGLE[@]}`는 §3.2 block54.sh가 이미
+정의한 것과 동일한 변수다(단일-실행 인자는 block54 §1의 `${SINGLE[@]}` GPU arm을 그대로
+쓴다 — 배치 arm이 아니다). `out_CY0N_gpu.h5`는 block54 §1이 이미 만든 원래 rod-search
+실행 산출물이므로, `--orig-h5`를 위해 다시 돌릴 필요가 없다.
