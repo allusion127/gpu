@@ -2713,10 +2713,35 @@ struct XsReconBackend::Impl {
     /// A word that is not readable yet is simply read at the next drive or at
     /// the segment exit, both of which ask, and the word is sticky, so a late
     /// read is still a read.
+    ///
+    /// fix(review-2): "the next drive asks" and "this drive's own deferred
+    /// event" are BOTH inside the host-free segment's own stream capture --
+    /// every drive of a host-free segment defers (that is the state this
+    /// query exists to poll), and the segment that owns it is captured as one
+    /// graph from its first drive onward.  cudaEventQuery is on the CUDA
+    /// runtime's list of calls that are illegal while the calling thread is
+    /// capturing (it inspects real device progress, which a capture is
+    /// recording rather than running); issuing it here poisoned the capture
+    /// with cudaErrorStreamCaptureUnsupported, and the segment's very next
+    /// captured call (the cross-stream cudaStreamWaitEvent for this same
+    /// drive, CudaOuterGraph.cu) then failed with
+    /// cudaErrorStreamCaptureInvalidated ("operation failed due to a previous
+    /// error during capture"), which is the OUTER_GPU WARN this fix removes.
+    /// cudaStreamIsCapturing is the one status call the runtime explicitly
+    /// permits during capture; an active capture on this stream means the
+    /// word cannot be asked yet, so the pending flag is left set and the
+    /// answer waits for resolveNarrowVerdict() at the segment exit, which
+    /// runs after cudaStreamEndCapture -- a normal, non-captured host point.
     [[nodiscard]] bool narrowNonFinite(bool settled) {
         if (nodal_nfin_host == nullptr) return false;
         if (!settled) {
             if (nodal_done_event == nullptr) return false;
+            cudaStreamCaptureStatus capStatus = cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(stream, &capStatus) != cudaSuccess) {
+                cudaGetLastError();
+                return false; // can't even ask -- treat as not yet answerable
+            }
+            if (capStatus != cudaStreamCaptureStatusNone) return false;
             const cudaError_t q = cudaEventQuery(nodal_done_event);
             cudaGetLastError(); // cudaErrorNotReady is a question, not a fault
             if (q != cudaSuccess) return false;

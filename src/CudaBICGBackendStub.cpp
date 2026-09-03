@@ -88,11 +88,20 @@ void CudaBatchArena::solveSweeps(int, double*, CmfdSweepIO&) {
 /// on a false and has no other use for an exception.
 void* CudaBatchArena::sweepStream() const { return nullptr; }
 bool  CudaBatchArena::enqueueSweeps(int, double*, const CmfdSweepIO&,
-                                    const CmfdSweepProbeSink&) {
+                                    const CmfdSweepProbeSink&, void*) {
     return false;
 }
 void CudaBatchArena::readSweepObservation(int, CmfdSweepIO&) const {}
 bool CudaBatchArena::finishSweeps(int, CmfdSweepIO&) { return false; }
+/// Rev.7.1 Task 10 part 3, no-device arm: no enqueueSweeps ever returned true,
+/// so no deferred drain can be outstanding -- the same refusal finishSweeps
+/// gives.
+bool CudaBatchArena::finishSweepsDeferred(int, int) { return false; }
+/// The accumulator this unpacks is filled only by a masked device launch,
+/// which never happens without a device; a stub build never calls this with
+/// data worth reading, so it is a no-op rather than a throw (it is `static`,
+/// with no `_impl->status` to raise).
+void CudaBatchArena::unpackSavedSweepBlock(const CmfdSweepProbeSink::Accum&, CmfdSweepIO&) {}
 void CudaBatchArena::syncSweepStream() {}
 void CudaBatchArena::solveCommon(int, double*, int) {
     throw std::runtime_error(_impl->status);

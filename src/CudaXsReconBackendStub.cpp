@@ -157,6 +157,15 @@ std::uint32_t XsReconBackend::materializeMask() const { return 0u; }
 void*              XsReconBackend::nodalCompletionEvent() { return nullptr; }
 void*              XsReconBackend::nodalReigvDeviceSlot() const { return nullptr; }
 void               XsReconBackend::setNodalReigvDeviceResident(bool) {}
+/// Rev.7.1 Task 10 part 3: no device, no captured nodal graph to bake a halt
+/// gate into -- solveNodal() above already refuses unconditionally, so the
+/// gate this would arm is never consulted.
+void               XsReconBackend::setNodalHaltGate(const void*, int) {}
+/// No stream to wait on without a device; `available()` is false, so the
+/// caller's host-free path is never taken and this is never asked to order
+/// real work. Matches setCanonicalNodalSegmentMode's no-op rather than
+/// throwing, since main.cpp's Driver hooks call it unconditionally.
+bool               XsReconBackend::waitOnSegmentEvent(void*) { return true; }
 unsigned long long XsReconBackend::canonicalUploadsElided() const { return 0; }
 
 unsigned long long XsReconBackend::canonicalDownloadsElided() const { return 0; }
