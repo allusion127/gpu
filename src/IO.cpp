@@ -56,6 +56,60 @@ const nlohmann::ordered_json* FirstPresentKey(const nlohmann::ordered_json&     
     return nullptr;
 }
 
+// The fuel-temperature-table deck key, parsed from wherever it was declared.
+//
+// TWO PLACES ARE ACCEPTED and exactly one may be USED: `geometry.dimensions`,
+// beside `nfrod`, because the table is a property of the fuel the geometry
+// describes; and "default parameters", because that is where a deck author
+// looks for a physics default.  A deck that says it in BOTH is refused rather
+// than silently resolved by precedence -- two declarations are two intents and
+// the loser would be invisible.  See src/ThTfTable.h for the WH/CE finding.
+const char* const kTfTableKeys[] = {"tf table", "tf_table", "tfuel table", "tfuel_table"};
+
+rasbery::th::TfTableSpec ParseTfTableSpec(const nlohmann::ordered_json& value,
+                                          const std::string&            whence) {
+    if (value.is_string())
+        return [&] {
+            const auto c = rasbery::th::tfChoiceOfString(value.get<std::string>(),
+                                                         whence.c_str());
+            rasbery::th::TfTableSpec spec;
+            spec.name = c.name;
+            spec.path = c.path;
+            return spec;
+        }();
+
+    if (!value.is_object())
+        throw std::runtime_error("IO::ReadInput: " + whence +
+                                 " must be \"wh\", \"ce\", \"file:<path>\" or an "
+                                 "inline object {\"lpd\": [...], \"bu\": [...], "
+                                 "\"dt\": [[...]]}.");
+
+    rasbery::th::TfTableSpec spec;
+    spec.name = "inline";
+    const auto* lpd = FirstPresentKey(value, {"lpd", "LPD", "power", "linear power density"});
+    const auto* bu  = FirstPresentKey(value, {"bu", "burnup", "BU"});
+    const auto* dt  = FirstPresentKey(value, {"dt", "dT", "deltat", "delta_t", "tf"});
+    if (lpd == nullptr || bu == nullptr || dt == nullptr)
+        throw std::runtime_error("IO::ReadInput: an inline " + whence +
+                                 " needs \"lpd\", \"bu\" and \"dt\" -- the %DEF_TFT "
+                                 "shape: an LPD axis, a burnup axis and one dT row per "
+                                 "burnup.");
+    spec.lpd = lpd->get<std::vector<double>>();
+    spec.bu  = bu->get<std::vector<double>>();
+    for (const auto& row : *dt) {
+        const auto values = row.is_array() ? row.get<std::vector<double>>()
+                                           : std::vector<double>{row.get<double>()};
+        if (values.size() != spec.lpd.size())
+            throw std::runtime_error("IO::ReadInput: every dT row of " + whence +
+                                     " must have one entry per LPD knot.");
+        spec.dt.insert(spec.dt.end(), values.begin(), values.end());
+    }
+    if (spec.dt.size() != spec.lpd.size() * spec.bu.size())
+        throw std::runtime_error("IO::ReadInput: " + whence +
+                                 " needs exactly one dT row per burnup knot.");
+    return spec;
+}
+
 // True if any listed key is present and truthy; stops at the first truthy key.
 bool AnyKeyTrue(const nlohmann::ordered_json& obj, std::initializer_list<const char*> keys) {
     for (const char* key : keys)
@@ -705,6 +759,31 @@ void IO::ReadInput(const std::string& filepath, const std::string& statepoint_gr
                 throw std::runtime_error(
                     "IO::ReadInput: geometry.dimensions.nfrod must be a positive fuel-rod "
                     "count per assembly.");
+        }
+        // WHICH FUEL-TEMPERATURE TABLE.  Optional; absent resolves to the
+        // shipped WH grid (tf.csv), which is what every published number in
+        // this campaign was produced with.  Declaring it here does NOT move
+        // the run: RASBERY_TH_TF_TABLE=deck does.  src/ThTfTable.h says why.
+        {
+            const auto* from_geom = FirstPresentKey(
+                geom["dimensions"], {kTfTableKeys[0], kTfTableKeys[1], kTfTableKeys[2],
+                                     kTfTableKeys[3]});
+            const nlohmann::ordered_json* from_defaults = nullptr;
+            if (config.contains("default parameters"))
+                from_defaults = FirstPresentKey(
+                    config["default parameters"],
+                    {kTfTableKeys[0], kTfTableKeys[1], kTfTableKeys[2], kTfTableKeys[3]});
+            if (from_geom != nullptr && from_defaults != nullptr)
+                throw std::runtime_error(
+                    "IO::ReadInput: \"tf table\" is declared BOTH under "
+                    "geometry.dimensions and under \"default parameters\".  Two "
+                    "declarations are two intents; delete one.");
+            if (from_geom != nullptr)
+                geometry_input.tf_table =
+                    ParseTfTableSpec(*from_geom, "geometry.dimensions.\"tf table\"");
+            else if (from_defaults != nullptr)
+                geometry_input.tf_table =
+                    ParseTfTableSpec(*from_defaults, "\"default parameters\".\"tf table\"");
         }
         geometry_input.hx     = geom["size"]["hx"];
         geometry_input.hy     = geom["size"]["hy"];
@@ -2312,6 +2391,24 @@ void IO::SaveRestart(const std::string& filepath,
         // `nfrod`, and LoadGeometryFromRestart reads it back as 0 -- the legacy
         // divisor, which is what such a run was computed with.
         geo.createDataSet("nfrod", _gin.nfrod);
+        // Written since 2026-09-04 too: WHICH fuel-temperature table.  A restart
+        // older than that carries none and reads back empty -- the shipped WH
+        // grid, which is what such a run was computed with.
+        // Only when the deck DECLARED one: a zero-length HDF5 dataset is a
+        // portability question nobody needs answered, and "absent" already means
+        // exactly what an undeclared table means.
+        if (_gin.tf_table.declared()) {
+            geo.createDataSet("tf_table_name", std::vector<std::string>{_gin.tf_table.name});
+            geo.createDataSet("tf_table_path",
+                              std::vector<std::string>{_gin.tf_table.path.empty()
+                                                           ? std::string("-")
+                                                           : _gin.tf_table.path});
+            if (!_gin.tf_table.lpd.empty()) {
+                geo.createDataSet("tf_table_lpd", _gin.tf_table.lpd);
+                geo.createDataSet("tf_table_bu", _gin.tf_table.bu);
+                geo.createDataSet("tf_table_dt", _gin.tf_table.dt);
+            }
+        }
         geo.createDataSet("hx", _gin.hx);
         geo.createDataSet("hy", _gin.hy);
         geo.createDataSet("hz", _gin.hz);
@@ -2756,6 +2853,19 @@ GeometryInput IO::LoadGeometryFromRestart(const std::string& filepath) {
     // and 0 is the honest answer for one -- it resolves to the legacy divisor
     // those runs actually used.
     if (geo.exist("nfrod")) geo.getDataSet("nfrod").read(gin.nfrod);
+    if (geo.exist("tf_table_name")) {
+        std::vector<std::string> name, path;
+        geo.getDataSet("tf_table_name").read(name);
+        geo.getDataSet("tf_table_path").read(path);
+        gin.tf_table.name = name.empty() ? std::string() : name.front();
+        gin.tf_table.path = (path.empty() || path.front() == "-") ? std::string()
+                                                                  : path.front();
+        if (geo.exist("tf_table_lpd")) {
+            geo.getDataSet("tf_table_lpd").read(gin.tf_table.lpd);
+            geo.getDataSet("tf_table_bu").read(gin.tf_table.bu);
+            geo.getDataSet("tf_table_dt").read(gin.tf_table.dt);
+        }
+    }
     geo.getDataSet("hx").read(gin.hx);
     geo.getDataSet("hy").read(gin.hy);
     geo.getDataSet("hz").read(gin.hz);

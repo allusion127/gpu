@@ -86,7 +86,19 @@ namespace rasbery::casekey {
 /// ONCE AGAIN: the payload gained a LINE, and the legacy default is now spelled
 /// out rather than assumed.  The VALUE is folded and the SOURCE is not -- a deck
 /// that declares 62 and a legacy default are one arithmetic and key alike.
-inline constexpr const char* kSchema = "rasbery-case-key/v3";
+/// v4 (2026-09-04) ADDED ONE MORE LINE -- `th_tf_table`, the IDENTITY of the
+/// fuel-temperature dT(LPD, burnup) grid GetTfuel interpolates, spelled
+/// `<name>:<sha256>` (src/ThTfTable.h).  The shipped include/Database/tf.csv is
+/// MASTER's WH table (isolth 11); the APR1400/KNGR decks are isolth 12 (ABB-CE),
+/// whose burnup slope is ~5x steeper -- about -14.6 K on tfavg at BOC and +71 K
+/// at EOC.  A deck key or RASBERY_TH_TF_TABLE can now move it, and moving it
+/// moves every fuel temperature and therefore every cross section, so two runs
+/// that differ only in it are two physics and must not share a cache entry.
+/// EVERY KEY MOVES ONCE AGAIN: the payload gained a LINE, and the shipped table
+/// is now named and digested rather than assumed.  The IDENTITY is folded and
+/// the SOURCE is not -- a deck that names `wh` and the legacy default are one
+/// table and key alike.
+inline constexpr const char* kSchema = "rasbery-case-key/v4";
 
 /// The harness declares the build identity here.  It is not derivable inside
 /// the process -- there is no embedded commit -- and a key that pretended
@@ -382,6 +394,16 @@ struct Provenance {
     // the same reason `xe_anderson_source` is not.
     std::string th_fuel_rods;        ///< effective rods per node, "%.17g"
     std::string th_fuel_rods_source; ///< "legacy_62" | "deck" | "env" -- REPORTED
+
+    // ---- v4 -------------------------------------------------------------
+    //
+    // THE FUEL-TEMPERATURE TABLE.  `<name>:<sha256>` of the grid actually
+    // interpolated -- the CONTENT, so a re-fitted tf_ce.csv is a different case
+    // even under the same name, and the same table read from another path is
+    // still one case.  The source is carried for the receipt and deliberately
+    // NOT folded, for the same reason `th_fuel_rods_source` is not.
+    std::string th_tf_table;        ///< "<name>:<sha256>"
+    std::string th_tf_table_source; ///< "legacy" | "deck" | "env" -- REPORTED
 };
 
 inline std::string tokenOrTilde(const std::string& text) {
@@ -494,6 +516,9 @@ inline std::string payloadOf(const Provenance& p) {
     // ---- v3, appended after forms for the same reason ------------------
     out += "\nth_fuel_rods\t";
     out += tokenOrTilde(p.th_fuel_rods);
+    // ---- v4, appended after th_fuel_rods for the same reason -----------
+    out += "\nth_tf_table\t";
+    out += tokenOrTilde(p.th_tf_table);
     out += '\n';
     return out;
 }

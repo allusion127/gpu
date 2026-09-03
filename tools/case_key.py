@@ -60,7 +60,11 @@ import exact_audit  # noqa: E402
 # that divides SolveTH's linear power density.  It was a hard-coded 62.0 and is
 # wrong for both campaign decks; a deck key or RASBERY_TH_FUEL_RODS moves it, and
 # moving it moves every fuel temperature and therefore every cross section.
-SCHEMA = "rasbery-case-key/v3"
+# v4 (2026-09-04): one more, th_tf_table -- the IDENTITY (<name>:<sha256>) of
+# the fuel-temperature dT(LPD, bu) grid GetTfuel interpolates.  The shipped
+# tf.csv is MASTER's WH table (isolth 11) and the KNGR decks are ABB-CE
+# (isolth 12); see src/ThTfTable.h.
+SCHEMA = "rasbery-case-key/v4"
 CODE_SHA_ENV = "RASBERY_CODE_SHA"
 
 # src/Driver.h xeAndersonGate()/xeMode(), mirrored.
@@ -173,6 +177,97 @@ def th_fuel_rods(config, env) -> tuple[str, str]:
     if not value > 0.0:
         sys.exit(f"{TH_FUEL_RODS_ENV} must be legacy|deck|<positive number>, got {want!r}")
     return _rods_token(value), "env"
+
+
+# src/ThTfTable.h, mirrored.  THE TABLE IS AN IDENTITY, NOT A PATH: the key
+# folds `<name>:<sha256>` so a table moved between directories is one case and a
+# re-fitted table under the same name is two.
+TH_TF_TABLE_ENV = "RASBERY_TH_TF_TABLE"
+TF_TABLE_DECK_KEYS = ("tf table", "tf_table", "tfuel table", "tfuel_table")
+TF_TABLE_FILES = {"wh": "tf.csv", "ce": "tf_ce.csv"}
+TF_DATABASE_DIR = Path(__file__).resolve().parents[1] / "include" / "Database"
+
+
+def _tf_inline_payload(lpd, bu, dt) -> str:
+    """src/ThTfTable.cpp tfInlinePayload(), byte for byte."""
+    rows = ["rasbery-tf-inline/v1"]
+    for tag, values in (("lpd", lpd), ("bu", bu), ("dt", dt)):
+        rows.append(tag + "".join("\t" + f"{float(x):.17g}" for x in values))
+    return "\n".join(rows) + "\n"
+
+
+def _tf_spec_of_string(text: str, whence: str):
+    """src/ThTfTable.h tfChoiceOfString()."""
+    want = str(text).strip()
+    if want in ("wh", "legacy"):
+        return {"name": "wh"}
+    if want == "ce":
+        return {"name": "ce"}
+    path = want[5:] if want.startswith("file:") else want
+    if not path:
+        sys.exit(f"{whence} names no fuel-temperature table.")
+    return {"name": "file", "path": path}
+
+
+def deck_tf_table(config):
+    """The deck's `tf table`, from geometry.dimensions or "default parameters".
+
+    TWO PLACES, ONE DECLARATION.  src/IO.cpp refuses a deck that says it in both
+    rather than picking a winner, and so does this.
+    """
+    geom = ((config or {}).get("geometry") or {}).get("dimensions") or {}
+    defaults = (config or {}).get("default parameters") or {}
+    hits = [(where, scope[k])
+            for where, scope in (("geometry.dimensions", geom),
+                                 ('"default parameters"', defaults))
+            for k in TF_TABLE_DECK_KEYS if k in scope]
+    if len(hits) > 1:
+        sys.exit('"tf table" is declared in more than one place; the solver '
+                 "refuses this too.")
+    if not hits:
+        return None
+    whence, value = hits[0]
+    if isinstance(value, str):
+        return _tf_spec_of_string(value, whence)
+    lpd = next((value[k] for k in ("lpd", "LPD", "power", "linear power density")
+                if k in value), None)
+    bu = next((value[k] for k in ("bu", "burnup", "BU") if k in value), None)
+    dt = next((value[k] for k in ("dt", "dT", "deltat", "delta_t", "tf")
+               if k in value), None)
+    if lpd is None or bu is None or dt is None:
+        sys.exit(f"an inline {whence} table needs lpd, bu and dt.")
+    flat = [x for row in dt for x in (row if isinstance(row, list) else [row])]
+    return {"name": "inline", "lpd": lpd, "bu": bu, "dt": flat}
+
+
+def th_tf_table(config, env) -> tuple[str, str]:
+    """(identity token, source) -- src/ThTfTable.h resolveTfTable + loadTfTable."""
+    want = str(env.get(TH_TF_TABLE_ENV, "")).strip()
+    if want in ("", "legacy"):
+        spec, source = {"name": "wh"}, "legacy"
+    elif want == "deck":
+        spec = deck_tf_table(config)
+        if spec is None:
+            sys.exit(f"{TH_TF_TABLE_ENV}=deck, but the deck declares no "
+                     '"tf table"; the solver refuses this too.')
+        source = "deck"
+    else:
+        spec, source = _tf_spec_of_string(want, TH_TF_TABLE_ENV), "env"
+
+    name = spec["name"]
+    if name == "inline":
+        digest = hashlib.sha256(
+            _tf_inline_payload(spec["lpd"], spec["bu"],
+                               spec["dt"]).encode()).hexdigest()
+        return f"{name}:{digest}", source
+    path = (Path(spec["path"]) if name == "file"
+            else TF_DATABASE_DIR / TF_TABLE_FILES[name])
+    if not path.is_file():
+        if name == "ce":
+            sys.exit(f"the ABB-CE fuel-temperature table ({path}) is not yet "
+                     "regressed; run tools/fit_tf_table.py.  The solver refuses too.")
+        sys.exit(f"fuel-temperature table not found: {path}")
+    return f"{name}:{hashlib.sha256(path.read_bytes()).hexdigest()}", source
 
 
 # src/Driver.h trajectory::kArmEnv, IN ORDER -- READ FROM THE SOURCE, not copied.
@@ -494,7 +589,8 @@ def payload_of(deck_digest: str, fidelity: str, policy: str,
                env, xslib_digest: str, warm_start: str,
                exec_mode: str = "single", forms_digest: str = "",
                xe_anderson_state: str = "", xe_txn_state: str = "",
-               th_fuel_rods_value: str = "") -> str:
+               th_fuel_rods_value: str = "",
+               th_tf_table_value: str = "") -> str:
     """src/CaseKey.h payloadOf(), byte for byte.
 
     `forms_digest` CANNOT BE DERIVED HERE.  It is the digest of the contraction
@@ -520,6 +616,7 @@ def payload_of(deck_digest: str, fidelity: str, policy: str,
     lines.append(f"xe_txn\t{_token(txn)}")
     lines.append(f"forms\t{_token(forms_digest)}")
     lines.append(f"th_fuel_rods\t{_token(th_fuel_rods_value or _rods_token(LEGACY_FUEL_RODS_PER_NODE))}")
+    lines.append(f"th_tf_table\t{_token(th_tf_table_value)}")
     return "\n".join(lines) + "\n"
 
 
@@ -562,11 +659,13 @@ def case_key(deck: Path, env=None, xslib: bool = True, warm_start: str = "",
     if xe_txn_state:
         txn_state, txn_source = xe_txn_state, "declared"
     rods_value, rods_source = th_fuel_rods(config, env)
+    tf_table_value, tf_table_source = th_tf_table(config, env)
     payload = payload_of(deck_digest, fidelity, policy, env,
                          xslib_digest, warm_start, exec_mode=exec_mode,
                          forms_digest=forms_digest,
                          xe_anderson_state=aa_state, xe_txn_state=txn_state,
-                         th_fuel_rods_value=rods_value)
+                         th_fuel_rods_value=rods_value,
+                         th_tf_table_value=tf_table_value)
     return {
         "deck": str(deck),
         "key_schema": SCHEMA,
@@ -597,6 +696,8 @@ def case_key(deck: Path, env=None, xslib: bool = True, warm_start: str = "",
         "forms_digest": _token(forms_digest),
         "th_fuel_rods": rods_value,
         "th_fuel_rods_source": rods_source,
+        "th_tf_table": tf_table_value,
+        "th_tf_table_source": tf_table_source,
         "warm_start": warm_start,
         "payload": payload,
         "deck_payload": dpayload,
@@ -611,7 +712,8 @@ COMPONENT_FIELDS = ("case_key", "key_schema", "core_op", "deck_digest",
                     "warm_start_token", "code_sha", "fidelity", "policy",
                     "exec_mode", "xe_anderson", "xe_anderson_source",
                     "xe_txn", "xe_txn_source", "th_fuel_rods",
-                    "th_fuel_rods_source", "forms_digest")
+                    "th_fuel_rods_source", "th_tf_table", "th_tf_table_source",
+                    "forms_digest")
 
 
 def main(argv: list[str]) -> int:

@@ -2,6 +2,7 @@
 #include "pch.h"
 
 #include "ThFuelRods.h"
+#include "ThTfTable.h"
 
 #include <array>
 #include <string>
@@ -48,6 +49,12 @@ struct GeometryInput {
     /// NOT part of the cohort key (CohortKey.h keys the topology the maps are
     /// built from; this is a T/H divisor a case carries, not a mesh fact).
     int                                             nfrod = 0;
+    /// Which fuel-temperature table the deck asks for (`"tf table"` under
+    /// geometry.dimensions or "default parameters").  Empty = the deck said
+    /// nothing, which resolves to the shipped WH grid.  Like `nfrod` it is NOT
+    /// part of the cohort key: it is a T/H property a case carries, not a mesh
+    /// fact the maps are built from.
+    th::TfTableSpec                                 tf_table;
     double                                          hx, hy; // assembly pitch [cm]
     std::vector<double>                             hz;     // axial mesh heights (bottom→top) [cm]
     int                                             symang; // symmetry angle (90 or 360)
@@ -124,6 +131,10 @@ private:
     /// Resolved once in Initialize (deck / env / legacy); see ThFuelRods.h.
     double      _fuel_rods_per_node = th::kLegacyFuelRodsPerNode;
     std::string _fuel_rods_source   = "legacy_62";
+    /// Which dT(LPD, burnup) grid GetTfuel interpolates.  Resolved once in
+    /// Initialize (deck / env / legacy); the BYTES are loaded lazily and cached
+    /// per identity by th::loadTfTable.  See ThTfTable.h.
+    th::TfChoice _tf_choice;
     bool   _use_mass_flow_rate = false; // use input flow instead of outlet-derived flow
     double _part;                       // geometry fraction (1.0 full, 0.25 quarter)
     double _hzcore;                     // active core axial height [cm]
@@ -309,6 +320,10 @@ public:
     /// @brief Scale applied to the tabulated fuel-to-coolant temperature rise
     [[nodiscard]] inline double fuel_rods_per_node() const { return _fuel_rods_per_node; }
     [[nodiscard]] inline const std::string& fuel_rods_source() const { return _fuel_rods_source; }
+
+    /// The resolved fuel-temperature-table request.  th::loadTfTable(choice)
+    /// turns it into bytes + a digest, once per process per identity.
+    [[nodiscard]] inline const th::TfChoice& tf_table_choice() const { return _tf_choice; }
 
     inline double& fuel_temp_rise_scale() { return _fuel_temp_rise_scale; }
     [[nodiscard]] inline const double& fuel_temp_rise_scale() const { return _fuel_temp_rise_scale; }

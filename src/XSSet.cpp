@@ -556,7 +556,7 @@ void XSSet::LoadTHTables() {
     // T/H sweep -- a shared_ptr indirection there buys nothing and a shared
     // mutable table would be the bug the XSLIB cache had to design around.
     struct ThTables {
-        milk::Table cp, rho, h, t, tf;
+        milk::Table cp, rho, h, t;
     };
     static const ThTables tables = [&base] {
         ThTables loaded;
@@ -564,7 +564,6 @@ void XSSet::LoadTHTables() {
         loaded.rho = milk::Table::ParseFromCSV(base / "mod_rho.csv");
         loaded.h   = milk::Table::ParseFromCSV(base / "mod_h.csv");
         loaded.t   = milk::Table::ParseFromCSV(base / "mod_t.csv");
-        loaded.tf  = milk::Table::ParseFromCSV(base / "tf.csv");
         return loaded;
     }();
 
@@ -572,7 +571,24 @@ void XSSet::LoadTHTables() {
     _mod_rho_table = tables.rho;
     _mod_h_table   = tables.h;
     _mod_t_table   = tables.t;
-    _tf_table      = tables.tf;
+
+    // THE FUEL-TEMPERATURE TABLE IS THE ONE THE DECK CAN MOVE, so it does not
+    // live in the build-scoped cache above: it comes from Geometry's resolved
+    // choice through th::loadTfTable, which caches per IDENTITY (name + digest)
+    // and prints the receipt.  Under the default -- source `legacy`, name `wh` --
+    // this is `ParseFromCSV(base / "tf.csv")` with the axes and values copied
+    // through verbatim, so the arithmetic is bit-identical to the B0 baseline.
+    {
+        const th::TfTableData& tf = th::loadTfTable(_g.tf_table_choice());
+        _tf_table.x_axis.assign(tf.lpd.size(), 0.0);
+        _tf_table.y_axis.assign(tf.bu.size(), 0.0);
+        _tf_table.values.assign(tf.bu.size(), tf.lpd.size(), 0.0);
+        for (size_t i = 0; i < tf.lpd.size(); ++i) _tf_table.x_axis[i] = tf.lpd[i];
+        for (size_t j = 0; j < tf.bu.size(); ++j) _tf_table.y_axis[j] = tf.bu[j];
+        for (size_t j = 0; j < tf.bu.size(); ++j)
+            for (size_t i = 0; i < tf.lpd.size(); ++i)
+                _tf_table.values(j, i) = tf.dt[j * tf.lpd.size() + i];
+    }
 }
 
 void DepletionWorkspace::ensure(size_t n) {

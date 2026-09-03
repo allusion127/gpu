@@ -5562,6 +5562,17 @@ private:
         // spelling, which tools/case_key.py mirrors.
         p.th_fuel_rods        = std::format("{:.17g}", geometry.fuel_rods_per_node());
         p.th_fuel_rods_source = geometry.fuel_rods_source();
+
+        // ---- v4: THE FUEL-TEMPERATURE TABLE -------------------------------
+        //
+        // FROM THE ONE LOADER.  Geometry resolved the REQUEST in Initialize and
+        // th::loadTfTable turned it into bytes exactly once per process per
+        // identity; asking it again here returns the same cached object, so the
+        // key digests the grid XSSet actually interpolated rather than a second
+        // opinion about which file that was.
+        const th::TfTableData& tf = th::loadTfTable(geometry.tf_table_choice());
+        p.th_tf_table             = tf.identity();
+        p.th_tf_table_source      = tf.source;
         return p;
     }
 
@@ -6121,7 +6132,7 @@ public:
                 r_loose_keff, r_loose_flux, r_loose_xe);
         }
         std::cout << std::format(
-            "  [RASBERY][CASE] {{\"schema_version\":9,\"case_key\":\"{}\",\"key_schema\":\"{}\","
+            "  [RASBERY][CASE] {{\"schema_version\":10,\"case_key\":\"{}\",\"key_schema\":\"{}\","
             "\"core_op\":\"{}\",\"deck_digest\":\"{}\",\"env_digest\":\"{}\","
             "\"env_set\":\"{}\","
             "\"xslib_digest\":\"{}\",\"xslib_policy\":\"{}\",\"warm_start_token\":\"{}\","
@@ -6140,6 +6151,10 @@ public:
             // v3.  The fuel-temperature divisor: the effective value the key folds,
             // and the source it came from, which the key deliberately does not.
             "\"th_fuel_rods\":\"{}\",\"th_fuel_rods_source\":\"{}\","
+            // v4.  The fuel-temperature TABLE: the identity the key folds
+            // (name + content digest), and the source it came from, which the
+            // key deliberately does not.
+            "\"th_tf_table\":\"{}\",\"th_tf_table_source\":\"{}\","
             "\"forms_digest\":\"{}\",\"forms_pin\":\"{}\",\"forms\":{}}}\n",
             case_key, casekey::kSchema, input_output.deck_key_core_op(),
             input_output.deck_key_digest(), case_env_digest,
@@ -6165,6 +6180,8 @@ public:
             case_provenance.xe_txn_source,
             casekey::tokenOrTilde(case_provenance.th_fuel_rods),
             casekey::tokenOrTilde(case_provenance.th_fuel_rods_source),
+            casekey::tokenOrTilde(case_provenance.th_tf_table),
+            casekey::tokenOrTilde(case_provenance.th_tf_table_source),
             casekey::tokenOrTilde(case_provenance.forms_digest),
             gpu::formsPinName(), FormMaskReceiptJson());
 

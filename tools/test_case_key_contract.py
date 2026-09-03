@@ -615,7 +615,10 @@ def receipt_component_contract() -> None:
     # v3 (2026-09-04) took it to 9 with `th_fuel_rods`: a schema-8 line cannot
     # say which fuel-rod divisor produced its fuel temperatures, and the answer
     # was the wrong literal 62 for every run before this one.
-    if '\\"schema_version\\":9' not in block:
+    # v4 (2026-09-04) took it to 10 with `th_tf_table`: a schema-9 line cannot say
+    # WHICH dT(LPD, bu) grid produced its fuel temperatures, and the shipped one
+    # is MASTER's WH table on decks that are ABB-CE (src/ThTfTable.h).
+    if '\\"schema_version\\":10' not in block:
         fail("the [RASBERY][CASE] receipt did not bump schema_version when it "
              "gained the component fields; a reader cannot tell the two apart")
     # WP10.4.  The Sec 6.2 spelling of the fidelity, BESIDE the campaign one.
@@ -666,15 +669,16 @@ def exec_mode_forms_contract() -> None:
     """
     forms_h = (ROOT / "src" / "GpuFormMask.h").read_text(encoding="utf-8-sig")
 
-    if 'kSchema = "rasbery-case-key/v3"' not in CASEKEY_H:
+    if 'kSchema = "rasbery-case-key/v4"' not in CASEKEY_H:
         fail("CaseKey.h did not bump kSchema for the current field set; an older "
              "cache would miss silently instead of being re-keyed")
-    if case_key.SCHEMA != "rasbery-case-key/v3":
-        fail(f"tools/case_key.py SCHEMA is {case_key.SCHEMA!r}, not the header's v3")
+    if case_key.SCHEMA != "rasbery-case-key/v4":
+        fail(f"tools/case_key.py SCHEMA is {case_key.SCHEMA!r}, not the header's v4")
 
     payload_fn = CASEKEY_H[CASEKEY_H.index("inline std::string payloadOf("):]
     payload_fn = payload_fn[:payload_fn.index("\n}")]
-    for line in ("exec_mode", "xe_anderson", "xe_txn", "forms", "th_fuel_rods"):
+    for line in ("exec_mode", "xe_anderson", "xe_txn", "forms", "th_fuel_rods",
+                 "th_tf_table"):
         if f'"\\n{line}\\t"' not in payload_fn:
             fail(f"payloadOf does not emit a {line!r} line; the key cannot tell "
                  f"two runs that differ only in it apart")

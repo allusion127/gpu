@@ -172,6 +172,14 @@ void Geometry::Initialize(const GeometryInput& in) {
             th::kLegacyFuelRodsPerNode);
     }
 
+    // WHICH FUEL-TEMPERATURE TABLE, RESOLVED ONCE.  Only the REQUEST is settled
+    // here -- no file is opened, because Geometry has no business owning a CSV
+    // and the digest belongs beside the bytes.  th::loadTfTable turns the choice
+    // into a table exactly once per process per identity, prints
+    // [RASBERY][TH][TFTABLE] there, and hands the same object to XSSet and to the
+    // case key so the two can never disagree about what was interpolated.
+    _tf_choice = th::resolveTfTable(in.tf_table);
+
     // Store raw layout so XSSet can access it without re-receiving gin.
     _core  = in.core;
     _batch = in.batch;
