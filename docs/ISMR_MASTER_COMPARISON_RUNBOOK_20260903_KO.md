@@ -869,3 +869,11 @@ W16 웨이브 요약 cases/h.
    표현하지 못해 절단선 근처 핀 재구성이 근사로 남는다. HIGA 앵커에는 영향 없음(대각 대칭).
 4. **반사체 인접 핀 잔차 6.7–8.1 %** — §5.5의 PROMARX i-SMR 반사체 XS가 최우선 가설.
 5. **181 유휴 대기** — §2.3-1. 유휴 확인 전 MASTER 타이밍 측정은 무효다.
+
+## 부록 A. 181 MASTER 실측 (2026-09-03)
+
+- 스테이징된 `ISMR_CY01_PROLOG1/MAS_XSL`(450,088 B, 3/25 수정)은 1/6 기준 출력보다 나중에 덮어써진 **절단 파일**이라 `SCANING MASTER INPUT`에서 unit 2 EOF로 중단됨(exe·입력 해시는 로컬과 동일, 줄바꿈·ssh 환경·런처 패턴 무관 — APR1400 대조 덱은 같은 세션에서 111.5 s 정상 완료).
+- 복구: `xsgen.bat` 레시피 그대로 재조립(MAS_REF + A1..A8,AC `PRO_FA_*.XSD` → MAS_XSL 3,721,440 B; `.FFL` → MAS_HFF 6,358,635 B). 원본은 `.broken_*`로 보존.
+- 검증: CY01 24스텝 완주, step-1 K-EFF 1.032934 vs 기준 1.032935(0.1 pcm), MAS_SUM 크기 84,387 B 기준과 동일, 10회 MAS_SUM sha256 전부 동일.
+- **단일 wall(warm 1 + 10회, affinity 0x1): median 26.26 s** (min 25.55 / max 26.51).
+- W16 cases/h: 미측정(16 동시 프로세스 기동이 로컬 권한 분류기에 차단 — 사용자 허용 후 재시도). 수신증: `E:\rasbery_runs\2026-09-03\ismr_master\181\receipt.txt`.
