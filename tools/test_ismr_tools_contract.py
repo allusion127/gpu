@@ -296,6 +296,166 @@ def half_pin_contract() -> None:
           "frozen production figures")
 
 
+def pin_normalisation_contract() -> None:
+    """Gate B audit fix: matched-mask, area-weighted normalisation.
+
+    A synthetic i-SMR-shaped odd lattice (npin=5, a 3x3 quarter, `center
+    assembly divided` folding) where MASTER prints an analytic field WHOLE at
+    every seat and RASBERY prints the same field restricted to the fold, with
+    the cut row/column at half power and the corner at a quarter -- the exact
+    shape real i-SMR .h5/PPI pairs have.  This is the fixture the two gate_b
+    audit defects were found against: (1) the mean each side normalises by
+    used a DIFFERENT, unbounded, unweighted seat population from the
+    quadrant-bounded, `mp > 0.05`-masked one the error loop scored; (2) the
+    nxa/nya guard checked only one axis.
+    """
+    import numpy as np
+    import gate_b_pin_rms as pin
+
+    npin, mid = 5, 2
+    ii, jj = np.meshgrid(np.arange(npin), np.arange(npin), indexing="ij")
+    field = 1.0 + 0.1 * ii + 0.2 * jj  # all well above 0.05, deliberately not
+                                        # row/column symmetric
+
+    def fold(cut_row: bool, cut_col: bool) -> np.ndarray:
+        out = np.full((npin, npin), np.nan)
+        r0 = mid if cut_row else 0
+        c0 = mid if cut_col else 0
+        out[r0:, c0:] = field[r0:, c0:]
+        if cut_row:
+            out[mid, c0:] *= 0.5
+        if cut_col:
+            out[r0:, mid] *= 0.5
+        return out
+
+    grid = [(r, c) for r in range(3) for c in range(3)]
+    ras_map = {seat: i for i, seat in enumerate(grid)}
+    mas_pin = {seat: field.copy() for seat in grid}
+    ras_pin = np.stack([fold(r == 0, c == 0) for r, c in grid])
+
+    cuts = pin.half_pin_cuts(ras_map, ras_pin, npin)
+    check(set(cuts) == {(0, 0), (0, 1), (0, 2), (1, 0), (2, 0)},
+          f"3x3 fold cut-line seats detected as {sorted(cuts)}, not the top "
+          f"row and left column the centre-assembly fold cuts")
+    check(cuts.get((0, 0)) == (True, True),
+          "the corner seat of the fold must be cut both ways")
+
+    # UNCORRECTED: the tool's own docstring says a `center assembly divided`
+    # deck reads its cut-line pins as ~50 % low without --half-pin-correct.
+    raw_rms, raw_max = pin.pin_err_stats(ras_map, mas_pin, ras_pin,
+                                         nya=3, nxa=3, cuts=cuts, npin=npin)
+    check(raw_rms > 5.0 and 30.0 < raw_max < 80.0,
+          f"an uncorrected fold read rms {raw_rms:.3f}%% max {raw_max:.3f}%%; "
+          f"expected the ~50 %% cut-line-pin / ~75 %% corner-pin artefact the "
+          f"docstring describes, not something this small or this large")
+
+    # CORRECTED: MASTER and RASBERY are now the exact same field on every
+    # matched, weighted pin -- the shape error must be exactly zero.
+    fixed = pin.apply_half_pin_correction(ras_pin, ras_map, cuts, npin)
+    rms, mx = pin.pin_err_stats(ras_map, mas_pin, fixed, nya=3, nxa=3,
+                                cuts=cuts, npin=npin)
+    check(rms == 0.0 and mx == 0.0,
+          f"a corrected fold against its own exact field read rms {rms} max "
+          f"{mx}, not exactly 0 -- MASTER and RASBERY are the identical "
+          f"field on every matched pin")
+
+    # A PER-SEAT BIAS is recovered as exactly the bias the matched, weighted
+    # formula predicts -- checked against an INDEPENDENT computation of that
+    # same formula here, not against the module under test.
+    eps = 0.01
+    biased = fixed.copy()
+    target_seat = (1, 1)  # a full, uncut assembly: weight 1 on every pin
+    biased[ras_map[target_seat]] *= (1.0 + eps)
+
+    mas_wsum = ras_wsum = wsum = 0.0
+    for (r, c), mp in mas_pin.items():
+        rp = biased[ras_map[(r, c)]]
+        mask = (mp > 0.05) & (rp > 0)
+        w = np.ones((npin, npin))
+        cut_row, cut_col = cuts.get((r, c), (False, False))
+        if cut_row:
+            w[mid, :] *= 0.5
+        if cut_col:
+            w[:, mid] *= 0.5
+        mas_wsum += (mp[mask] * w[mask]).sum()
+        ras_wsum += (rp[mask] * w[mask]).sum()
+        wsum += w[mask].sum()
+    mnorm_x, rnorm_x = mas_wsum / wsum, ras_wsum / wsum
+    # The error POOLS every matched seat, not just the biased one -- eight
+    # exact seats read 0 and pull the pooled rms below the biased seat's own
+    # per-pin ~eps reading, which is exactly what pin_err_stats must also do.
+    all_errs = []
+    for (r, c), mp in mas_pin.items():
+        rp = biased[ras_map[(r, c)]]
+        e = np.where((mp > 0.05) & (rp > 0),
+                     (rp / rnorm_x) / (mp / mnorm_x) - 1.0, np.nan) * 100
+        all_errs.append(e[np.isfinite(e)])
+    expected = np.concatenate(all_errs)
+    # The biased seat has weight 1 on every pin (it is not on a cut line), so
+    # its OWN per-pin errors must all read the SAME single number -- the
+    # weighting must not smear a seat's uniform scale into a shape error
+    # across its own pins, only the population's normalisation shifts.
+    tp, tr = mas_pin[target_seat], biased[ras_map[target_seat]]
+    tmask = (tp > 0.05) & (tr > 0)
+    target_err = ((tr[tmask] / rnorm_x) / (tp[tmask] / mnorm_x) - 1.0) * 100
+    check(np.allclose(target_err, target_err[0], atol=1e-9),
+          f"the biased seat's own per-pin errors are {target_err}, not a "
+          f"single uniform number -- an equal-weight seat's own scale must "
+          f"not smear across its own pins")
+    # And that one number is recovered EXACTLY where an independent
+    # rederivation of the matched, weighted formula puts it -- not just
+    # close, since both sides run the identical arithmetic on the identical
+    # data.
+    check(abs(float(target_err[0]) -
+              float(((1.0 + eps) / (rnorm_x / mnorm_x) - 1.0) * 100)) < 1e-9,
+          f"the biased seat's recovered bias {target_err[0]} does not match "
+          f"(1+eps)/(rnorm/mnorm) - 1 -- the seat-bias closed form the "
+          f"matched, weighted normalisation predicts")
+
+    rms_b, mx_b = pin.pin_err_stats(ras_map, mas_pin, biased, nya=3, nxa=3,
+                                    cuts=cuts, npin=npin)
+    check(abs(mx_b - float(np.max(np.abs(expected)))) < 1e-9,
+          f"the biased-seat max read {mx_b}, not the independently computed "
+          f"{float(np.max(np.abs(expected)))}")
+    check(abs(rms_b - float(np.sqrt(np.mean(expected ** 2)))) < 1e-9,
+          f"the biased-seat rms read {rms_b}, not the independently computed "
+          f"{float(np.sqrt(np.mean(expected ** 2)))}")
+
+    # EVEN-LATTICE TWIN: the identical construction on a 4x4 lattice must
+    # return NO cuts -- there is no centre pin row on an even lattice to cut
+    # -- and the reading must not depend on npin/cuts being passed at all,
+    # because every pre-existing (KNGR) call site omits both.
+    npin_e = 4
+    ii_e, jj_e = np.meshgrid(np.arange(npin_e), np.arange(npin_e), indexing="ij")
+    field_e = 1.0 + 0.1 * ii_e + 0.2 * jj_e
+    ras_pin_e = np.stack([field_e.copy() for _ in grid])
+    mas_pin_e = {seat: field_e.copy() for seat in grid}
+    cuts_e = pin.half_pin_cuts(ras_map, ras_pin_e, npin_e)
+    check(cuts_e == {}, f"an even lattice reported cuts {cuts_e}")
+    rms_e, mx_e = pin.pin_err_stats(ras_map, mas_pin_e, ras_pin_e, nya=3,
+                                    nxa=3, cuts=cuts_e, npin=npin_e)
+    check(rms_e == 0.0 and mx_e == 0.0,
+          f"an identical even-lattice field read rms {rms_e} max {mx_e}, not "
+          f"exactly 0")
+    rms_e2, mx_e2 = pin.pin_err_stats(ras_map, mas_pin_e, ras_pin_e, nya=3,
+                                      nxa=3)
+    check(rms_e2 == rms_e and mx_e2 == mx_e,
+          "the even-lattice reading changed when npin/cuts were omitted, "
+          "which every pre-existing KNGR call site does")
+
+    # THE nxa/nya GUARD is a clear refusal, not a TypeError, when only one
+    # axis is given.
+    try:
+        pin.pin_err_stats(ras_map, mas_pin, fixed, nya=9)
+        check(False, "pin_err_stats(nya=9) with no nxa did not refuse")
+    except SystemExit as exc:
+        check("nxa" in str(exc) and "nya" in str(exc),
+              f"the one-axis refusal must name both axes: {exc}")
+    except TypeError as exc:
+        check(False, f"pin_err_stats(nya=9) with no nxa raised a TypeError "
+                     f"instead of a clear refusal: {exc}")
+
+
 def pin_reference_contract() -> None:
     """Against a real i-SMR MAS_PPI, when one is staged.
 
@@ -440,6 +600,7 @@ def main() -> int:
     rod_reference_contract()
     pin_parser_contract()
     half_pin_contract()
+    pin_normalisation_contract()
     pin_reference_contract()
     screening_set_contract()
     fold_contract()

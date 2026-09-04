@@ -259,8 +259,50 @@ def apply_half_pin_correction(ras_pin, ras_map, cuts, npin):
     return out
 
 
-def pin_err_stats(ras_map, mas_pin, ras_pin, nya=None, nxa=None):
-    mas_all, ras_all = [], []
+def pin_err_stats(ras_map, mas_pin, ras_pin, nya=None, nxa=None, cuts=None, npin=None):
+    """rms%%/max%% of the RASBERY-vs-MASTER pin power shape error.
+
+    Both sides are normalised by their own mean over positive pins (shape,
+    not power level).  For an EVEN lattice -- `half_pin_cuts` can never find a
+    cut-line pin on one, there being no centre pin row to cut -- that mean is
+    taken exactly as it always was: the average across seats of each seat's
+    own mean over its OWN positive pins, unbounded, MASTER and RASBERY
+    independently.  This branch is BYTE IDENTICAL to the pre-fix reading, on
+    purpose: it is what KNGR's frozen production figures were measured
+    against.
+
+    For an ODD lattice with `center assembly divided` folding (i-SMR), the
+    old single formula normalised each side over a DIFFERENT population from
+    the one the error loop scored: an unbounded pass over every MASTER/
+    RASBERY seat pair with any positive pin, weighted one seat one vote,
+    against a quadrant-bounded error loop that additionally required
+    `mp > 0.05`.  A cut-line pin also counted at full weight in that mean
+    despite representing only half of a whole assembly pin's area (a corner
+    pin a quarter) -- MASTER prints the whole assembly, RASBERY only the
+    fold.  Both defects push the same direction and were worth ~0.06 %% rms /
+    0.25 %% max on the i-SMR HIGA anchor.  So here the mean is taken over the
+    SAME matched population the error loop scores -- `(mp > 0.05) & (rp > 0)`,
+    inside the same (nya, nxa) quadrant bound -- and each pin is weighted by
+    the fraction of a whole assembly pin it represents: 0.5 on a cut row or
+    column, 0.25 at the corner where both cuts meet.
+    """
+    # THE QUADRANT BOUND COMES FROM THE .h5, not from KNGR's 9x9 quarter.  The
+    # old literal `r > 8 or c > 8` was a restatement of one deck's nya/nxa, and
+    # on a core with a larger quarter map it would have silently dropped real
+    # seats from the population while looking like a symmetry guard.
+    if (nya is None) != (nxa is None):
+        raise SystemExit(
+            "pin_err_stats: nya and nxa must both be given or both omitted "
+            "-- a quadrant bound on one axis alone is not a quadrant bound.")
+    rmax = (nya - 1) if nya is not None else None
+    cmax = (nxa - 1) if nxa is not None else None
+    cuts = cuts or {}
+    even_lattice = npin is None or npin % 2 == 0
+
+    # ONE seat list, shared by the normalisation and the error loop below --
+    # this is what "matched" means: a seat scored only if BOTH sides have it
+    # and RASBERY has at least one live pin there.
+    matched = []
     for (r, c), mp in mas_pin.items():
         la = ras_map.get((r, c))
         if la is None:
@@ -274,30 +316,45 @@ def pin_err_stats(ras_map, mas_pin, ras_pin, nya=None, nxa=None):
                 f"{mp.shape[0]}x{mp.shape[1]} and the RASBERY one is "
                 f"{rp.shape[0]}x{rp.shape[1]}. These are different lattices; "
                 f"pass --lattice {rp.shape[0]}.")
-        mas_all.append(mp)
-        ras_all.append(rp)
-    if not mas_all:
+        matched.append((r, c, mp, rp))
+    if not matched:
         raise SystemExit(
             "no MASTER seat maps onto a RASBERY assembly. The quarter-core "
             "origin is almost certainly wrong for this PPI -- pass --origin "
             "(the seat that is quarter index (0,0)).")
-    mnorm = np.mean([a[a > 0].mean() for a in mas_all])
-    rnorm = np.mean([a[a > 0].mean() for a in ras_all])
-    # THE QUADRANT BOUND COMES FROM THE .h5, not from KNGR's 9x9 quarter.  The
-    # old literal `r > 8 or c > 8` was a restatement of one deck's nya/nxa, and
-    # on a core with a larger quarter map it would have silently dropped real
-    # seats from the population while looking like a symmetry guard.
-    rmax = (nya - 1) if nya else None
-    cmax = (nxa - 1) if nxa else None
+
+    if even_lattice:
+        mnorm = np.mean([mp[mp > 0].mean() for _, _, mp, _ in matched])
+        rnorm = np.mean([rp[rp > 0].mean() for _, _, _, rp in matched])
+    else:
+        mid = (npin - 1) // 2
+        mas_wsum = ras_wsum = wsum = 0.0
+        for r, c, mp, rp in matched:
+            if rmax is not None and (r > rmax or c > cmax):
+                continue
+            mask = (mp > 0.05) & (rp > 0)
+            if not mask.any():
+                continue
+            w = np.ones(mp.shape)
+            cut_row, cut_col = cuts.get((r, c), (False, False))
+            if cut_row:
+                w[mid, :] *= 0.5
+            if cut_col:
+                w[:, mid] *= 0.5
+            wm = w[mask]
+            mas_wsum += float((mp[mask] * wm).sum())
+            ras_wsum += float((rp[mask] * wm).sum())
+            wsum += float(wm.sum())
+        if wsum == 0.0:
+            raise SystemExit(
+                "no MASTER/RASBERY pin pair exceeds the 0.05 threshold inside "
+                "the scored quadrant; nothing to normalise the shape by.")
+        mnorm = mas_wsum / wsum
+        rnorm = ras_wsum / wsum
+
     errs = []
-    for (r, c), mp in mas_pin.items():
-        la = ras_map.get((r, c))
-        if la is None:
-            continue
+    for r, c, mp, rp in matched:
         if rmax is not None and (r > rmax or c > cmax):
-            continue
-        rp = ras_pin[la]
-        if not np.any(rp > 0):
             continue
         e = np.where((mp > 0.05) & (rp > 0), (rp / rnorm) / (mp / mnorm) - 1.0, np.nan) * 100
         errs.append(e[np.isfinite(e)])
@@ -440,7 +497,8 @@ def main() -> int:
                 warned = True
             is_scored = step in references
             mas = parsed[step] if is_scored else drift_reference
-            rms, mx = pin_err_stats(ras_map, mas, ras, nya=nya_g, nxa=nxa_g)
+            rms, mx = pin_err_stats(ras_map, mas, ras, nya=nya_g, nxa=nxa_g,
+                                    cuts=cuts, npin=args.lattice)
             rows.append((step, rms, mx, is_scored))
 
     for step, rms, mx, is_scored in rows:
