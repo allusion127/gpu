@@ -32,7 +32,17 @@ WHAT IS ASSERTED, AND WHY EACH ONE IS HERE.
      a measurement from a guess.  It lives in the header's CORNER CELL because
      that is the only place milk::Table::ParseFromCSV ignores -- a `#` comment
      line ahead of the header would be eaten AS the header.
-  6. THE SOLVER AND THE MIRROR AGREE.  tools/case_key.py must now KEY the CE
+  6. THE RISE SCALE IS DIVIDED OUT, asserted as "at zero burnup the CE and WH
+     rises agree over 100-250 W/cm".  SolveTH writes
+     `tful = tmod + fuel_temp_rise_scale * GetTfuel(bu, lpd)`, and the KNGR deck
+     carries that scale at ~1.32 -- an empirical stand-in for this very table,
+     fitted so tf.csv's WH rise reproduces MASTER's BOC fuel temperature.  The
+     first tf_ce.csv was regressed from MASTER's dT WITHOUT dividing it out, so
+     the correction was counted twice and block 59 arm (c) ran +79.3 K hot at
+     BOC where arm (b) (same run, WH table) was +0.9 K.  The two tables must
+     therefore MEET at BOC -- the CE table's job is the burnup SLOPE (assertion
+     8) and the LPD shape, not a 32 % offset at zero burnup.
+  7. THE SOLVER AND THE MIRROR AGREE.  tools/case_key.py must now KEY the CE
      table (it refused while the file was absent) and must digest the same
      bytes src/ThTfTable.cpp does -- the sha256 of the file, CRLF included,
      which is why the file must be LF.
@@ -156,6 +166,11 @@ def provenance() -> None:
              "is that this is the CE table and not the WH one")
     if "fit_tf_table" not in corner:
         fail("tf_ce.csv's provenance does not name the tool that produced it")
+    if not re.search(r"rise_scale=[0-9.]+", corner):
+        fail("tf_ce.csv's provenance does not record the deck `fuel temperature "
+             "rise scale` divided out of the samples (rise_scale=...).  Without "
+             "it a reader cannot tell this table from the v1 one that counted "
+             "the deck's ~1.32 calibration twice.")
 
     # And the corner cell must stay a corner cell: one line, no comma.
     if CE.read_bytes().count(b"\r\n"):
@@ -231,12 +246,45 @@ def ce_burnup_slope_is_the_steep_one(lpd, bu, dt) -> None:
              "flat is the WH grid wearing a CE name")
 
 
+# ---------------------------------------------------------------------------
+# 6. The rise scale is divided out: CE and WH MEET at zero burnup.
+# ---------------------------------------------------------------------------
+BOC_AGREE_LPD = (100.0, 150.0, 200.0, 250.0)
+BOC_AGREE_LIMIT = 0.06
+
+
+def boc_agrees_with_wh(lpd, bu, dt) -> None:
+    """A CE table that is 30 % hotter than WH at BOC has the deck's rise scale
+    baked in twice -- see assertion 6 in the module docstring."""
+    _wl, _wb, wh_dt = parse_like_milk(WH)
+    if bu[0] != 0.0:
+        fail("tf_ce.csv's first burnup knot is not 0; the BOC check cannot run")
+        return
+    worst = 0.0
+    worst_x = None
+    for x in BOC_AGREE_LPD:
+        i = lpd.index(x)
+        dev = dt[0][i] / wh_dt[0][i] - 1.0
+        if abs(dev) > abs(worst):
+            worst, worst_x = dev, x
+    print(f"  at zero burnup the CE rise is within {100*abs(worst):.1f} % of WH "
+          f"over {BOC_AGREE_LPD[0]:g}-{BOC_AGREE_LPD[-1]:g} W/cm "
+          f"(worst at {worst_x:g} W/cm)")
+    if abs(worst) > BOC_AGREE_LIMIT:
+        fail(f"at zero burnup and {worst_x:g} W/cm the CE rise is "
+             f"{100*worst:+.1f} % off WH's (limit {100*BOC_AGREE_LIMIT:.0f} %).  "
+             "The two tables must MEET at BOC; a ~32 % offset is the deck's "
+             "`fuel temperature rise scale` counted twice -- regress with "
+             "tools/fit_tf_table.py --rise-scale/--rise-scale-first.")
+
+
 def main() -> int:
     parsed = loads_and_has_the_wh_knots()
     if parsed is not None:
         lpd, bu, dt = parsed
         monotone_in_lpd(lpd, bu, dt)
         provenance()
+        boc_agrees_with_wh(lpd, bu, dt)
         case_key_keys_it()
         ce_burnup_slope_is_the_steep_one(lpd, bu, dt)
 
@@ -246,7 +294,7 @@ def main() -> int:
         print(f"tf_ce table contract: FAIL ({len(FAILURES)})", file=sys.stderr)
         return 1
     print("tf_ce table contract: PASS (loads + knots + monotone + provenance "
-          "+ case key + CE slope)")
+          "+ BOC agreement + case key + CE slope)")
     return 0
 
 

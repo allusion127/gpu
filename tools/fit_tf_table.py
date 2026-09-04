@@ -25,8 +25,34 @@ names are matched case-insensitively and by alias; unknown columns are ignored.
     hz              node axial height [cm] (with --lpd-from)
     rods            fuel rods per node (with --lpd-from)
 
-The fitted quantity is dT = tfuel - tmod, which is exactly what
-XSSet::GetTfuel's table holds.
+The fitted quantity is dT = tfuel - tmod DIVIDED BY the deck's fuel
+temperature rise scale -- see THE RISE SCALE below.
+
+THE RISE SCALE (--rise-scale, --rise-scale-first).  SolveTH does NOT write the
+table's number into tful.  It writes (src/XSSet.cpp:6396, mirrored in
+src/ThKernel.h:443)
+
+    tful = tmod + fuel_temp_rise_scale * GetTfuel(bu, lpd)
+
+and the APR1400 / KNGR decks carry `"fuel temperature rise scale"` per schedule
+entry -- 1.3197891964119348 on the `standard` statepoint and 1.3045377488004624
+on every depletion statepoint.  That multiplier was an EMPIRICAL stand-in for
+the missing CE table: with it, tf.csv's WH rise reproduces MASTER's KNGR fuel
+temperature at BOC to under a kelvin.  So a table regressed from MASTER's edits
+WITHOUT dividing the samples by that same scale is the correction counted
+TWICE, and the solver runs 1.32x too hot.  That is exactly what the first
+tf_ce.csv did: block 59 arm (c) came out +79.3 K at BOC where arm (b), the same
+run on the WH table, was +0.9 K.  Verified to the third decimal: arm (b)'s
+volume-averaged rise 394.256 K = 1.3197891964119348 x 298.73 K (tf.csv over the
+run's own node LPDs), arm (c)'s 504.905 K = 1.3197891964119348 x 382.50 K
+(tf_ce.csv v1 over the same LPDs).
+
+    --rise-scale S         divide every sample's dT by S
+    --rise-scale-first S0  ... except the LOWEST-efpd statepoint, by S0
+
+Pass the deck's own numbers.  The table then holds the UNSCALED rise, which is
+what tf.csv holds and what GetTfuel returns, and the deck's calibration keeps
+doing its own job on top of it, unchanged, in every arm.
 
     --lpd-from power,hz,rods
         Compute lpd = 1000 * P_node / (rods_per_node * hz) -- the SolveTH
@@ -300,7 +326,8 @@ def _pick(header, aliases):
     return None
 
 
-def read_samples(path: Path, lpd_from: str | None):
+def read_samples(path: Path, lpd_from: str | None, rise_scale: float = 1.0,
+                 rise_scale_first: float | None = None):
     with path.open(encoding="utf-8-sig", newline="") as handle:
         rows = list(csv.DictReader(handle))
     if not rows:
@@ -340,11 +367,39 @@ def read_samples(path: Path, lpd_from: str | None):
         hz_const, hz_col = constant_or_column(hz_spec)
         rods_const, rods_col = constant_or_column(rods_spec)
 
+    # The rise scale of the LOWEST-efpd statepoint may differ (the deck's
+    # `standard` entry vs its `depletion` entries).  Resolve which efpd that is
+    # ONCE, from the data, so the caller passes two plain numbers and not a map.
+    col_efpd = _pick(header, EFPD_ALIASES)
+    first_efpd = None
+    if rise_scale_first is not None:
+        if col_efpd is None:
+            sys.exit(f"{path}: --rise-scale-first needs an efpd column to know "
+                     "which statepoint is the first one")
+        efpds = []
+        for row in rows:
+            try:
+                efpds.append(float(row[col_efpd]))
+            except (TypeError, ValueError):
+                continue
+        if not efpds:
+            sys.exit(f"{path}: --rise-scale-first given but no efpd parses")
+        first_efpd = min(efpds)
+
     samples = []
     for row in rows:
         try:
             bu = float(row[col_bu])
             dt = float(row[col_tf]) - float(row[col_tm])
+            # SolveTH writes tmod + scale * GetTfuel(...), so the TABLE holds
+            # dT / scale.  Dividing here rather than after the fit keeps the
+            # residual report in the units the samples were measured in.
+            scale = rise_scale
+            if first_efpd is not None and float(row[col_efpd]) == first_efpd:
+                scale = rise_scale_first
+            if scale <= 0.0:
+                sys.exit("fit_tf_table: --rise-scale must be positive")
+            dt /= scale
             if lpd_from:
                 hz = hz_const if hz_const is not None else float(row[hz_col])
                 rods = rods_const if rods_const is not None else float(row[rods_col])
@@ -412,6 +467,13 @@ def main(argv: list[str]) -> int:
                     help="fit the RATIO dT/TABLE(bu,lpd) and multiply back, so a "
                          "knot with no data relaxes to TABLE's shape instead of to "
                          "a linear runaway (see RELATIVE FITTING in the docstring)")
+    ap.add_argument("--rise-scale", type=float, default=1.0, metavar="S",
+                    help="the deck's `fuel temperature rise scale`, which SolveTH "
+                         "multiplies this table by; sample dT is DIVIDED by it so "
+                         "the table holds the unscaled rise (default 1.0)")
+    ap.add_argument("--rise-scale-first", type=float, metavar="S0",
+                    help="rise scale of the LOWEST-efpd statepoint, when the deck's "
+                         "`standard` entry differs from its `depletion` entries")
     ap.add_argument("--provenance", metavar="TEXT",
                     help="one line of provenance written into the output table's "
                          "unused corner cell (no commas)")
@@ -431,7 +493,13 @@ def main(argv: list[str]) -> int:
         ap.error("an edits CSV is required unless --self-test")
 
     lpd, bu, _ = read_table(args.knots)
-    samples = read_samples(args.edits, args.lpd_from)
+    samples = read_samples(args.edits, args.lpd_from, args.rise_scale,
+                           args.rise_scale_first)
+    if args.rise_scale != 1.0 or args.rise_scale_first is not None:
+        print(f"  [FIT] rise scale {args.rise_scale}"
+              + (f" (first statepoint {args.rise_scale_first})"
+                 if args.rise_scale_first is not None else "")
+              + " divided out of every sample dT")
     counts = coverage(samples, lpd, bu)
 
     print(f"  [FIT] {len(samples)} samples on a {len(lpd)} LPD x {len(bu)} burnup grid")

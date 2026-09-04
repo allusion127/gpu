@@ -120,16 +120,20 @@ tools/build_tf_dataset.py MAS_OUT --restart MAS_RST.APRQ_01_0360.00 -o edits.csv
 tools/fit_tf_table.py edits.csv --lpd-from power,381,236 \
     --relative-to include/Database/tf.csv --smooth 1e-1 \
     --origin-continuation --extrapolate \
-    --provenance "regressed-from=... mas_sum_sha256=<64hex> ..." \
+    --rise-scale 1.3045377488004624 --rise-scale-first 1.3197891964119348 \
+    --provenance "regressed-from=... mas_sum_sha256=<64hex> rise_scale=... ..." \
     -o include/Database/tf_ce.csv
 ```
+
+> `--rise-scale`/`--rise-scale-first`는 **v2에서 추가**되었다. 근거는 아래
+> §"v2 정정 — 덱의 상승분 배율을 두 번 세고 있었다".
 
 - **`--relative-to` = 커버리지 밖에서 WH 형상으로 고정.** 노심은 타면서 평탄해지므로 고 LPD는
   저연소도에서만, 고연소도는 중간 LPD에서만 일어난다 → 90 격자점 중 **41개가 표본 0**.
   dT를 직접 외삽하면 선형 폭주다. 대신 **비 `dT / tf.csv(bu,lpd)`를 적합**하고 다시 곱한다:
   비는 O(1)이고 완만해서 같은 곡률 평활자가 빈 격자점을 "여기서는 WH 형상을 유지"로 옮긴다.
   측정이 없는 곳에서 정직한 답이며, 요청된 *clamp to the WH table's shape*를 후처리가 아니라
-  **추정량 자체**로 구현한 것이다. 적합된 비 범위 **0.664 – 1.580**.
+  **추정량 자체**로 구현한 것이다. 적합된 비 범위 **0.5095 – 1.2082** (v1: 0.664 – 1.580).
 - **`--origin-continuation`.** `GetTfuel`(`src/XSSet.h:516-526`)은 50 W/cm 미만을 Table::Get의
   클램프가 아니라 `rise·lpd/50`으로 잇는다. 적합이 클램프하면 첫 열에 틀린 구속이 걸리는데,
   첫 열이 바로 모든 집합체의 축방향 끝단이 읽는 열(= 노드 평균 tfavg의 주 기여)이다.
@@ -153,23 +157,24 @@ tools/fit_tf_table.py edits.csv --lpd-from power,381,236 \
 최고 LPD**. 이들은 전부 *WH 형상 × 이웃에서 이어진 비*이지 독립적인 주장이 아니다.
 (bu 60 행과 LPD 400 열은 클램프 덕에 bu 50.19 · lpd 353.9 표본이 약한 가중치로 닿는다.)
 
-**잔차: RMS 2.2252 K, max 11.8870 K** (표본 dT 87–686 K 대비 RMS 0.4 %). LPD 단조성 위반 **0건**.
+**잔차(v2): RMS 1.6722 K, max 9.4947 K** (배율을 나눈 표본 dT 66–526 K 대비 RMS 0.4 %).
+LPD 단조성 위반 **0건**. (v1: RMS 2.2252 K, max 11.8870 K.)
 최대 잔차는 최저출력 집합체(38–55 W/cm)에 몰린다 — 자료는 원점을 지나는 직선에 가까운데
 표에는 50 W/cm 마디가 있어 생기는 꺾임이다.
 
 ### CE vs WH (200 W/cm, 연소도 방향) — 예측과 일치
 
-| bu [MWd/kgU] | CE (tf_ce.csv) | WH (tf.csv) |
-|---|---|---|
-| 0         | 417.36 | 324.19 |
-| 5.66      | 382.65 | 332.87 |
-| 12.86     | 334.03 | 317.34 |
-| 16 (보간) | 293.7  | 306.1  |
-| 17.15     | 278.94 | 302.01 |
-| 24.06     | 258.37 | 279.70 |
-| 36.66     | 249.20 | 247.86 |
+| bu [MWd/kgU] | CE v2 (tf_ce.csv) | WH (tf.csv) | CE v1 (철회) |
+|---|---|---|---|
+| 0         | 318.90 | 324.19 | 417.36 |
+| 5.66      | 293.63 | 332.87 | 382.65 |
+| 12.86     | 256.07 | 317.34 | 334.03 |
+| 16 (보간) | 225.2  | 306.1  | 293.7  |
+| 17.15     | 213.82 | 302.01 | 278.94 |
+| 24.06     | 198.06 | 279.70 | 258.37 |
+| 36.66     | 191.02 | 247.86 | 249.20 |
 
-**16 MWd/kgU 구간에서 CE는 −29.6 %, WH는 −5.6 %** — `src/ThTfTable.h`가 적어둔 "약 5배 가파른
+**16 MWd/kgU 구간에서 CE는 −29.4 %, WH는 −5.6 %** — `src/ThTfTable.h`가 적어둔 "약 5배 가파른
 연소도 기울기"(29.6 % vs 5.8 %)를 **독립적으로 재현**했다. 원자료로도 같다: 200 W/cm 근방
 표본의 dT/WH 비가 bu 0에서 1.296 → bu 16.6에서 0.954다. LPD 방향의 구조도 다르다 — CE는
 dT/LPD 기울기가 2.28(38 W/cm) → 1.94(354 W/cm)로 **떨어지고**(오목), WH는 1.60 → 1.66으로
@@ -181,7 +186,7 @@ dT/LPD 기울기가 2.28(38 W/cm) → 1.94(354 W/cm)로 **떨어지고**(오목)
 셀에 넣는 수밖에 없고(콤마 금지), `fit_tf_table.write_table`이 이를 강제한다:
 
 ```
-Bu/LPD regressed-from=MASTER/APRQ_01 run=kngr_tf_edit_20260904 isolth=12 mas_sum_sha256=665f3a… tool=tools/fit_tf_table.py,50,100,…
+Bu/LPD regressed-from=MASTER/APRQ_01 run=kngr_tf_edit_20260904 isolth=12 mas_sum_sha256=665f3a… rise_scale=1.3045377488004624 rise_scale_first=1.3197891964119348 tool=tools/fit_tf_table.py,50,100,…
 ```
 
 `write_table`은 **바이트로 LF**를 쓴다(`Path.write_text`는 Windows에서 CRLF로 번역한다).
@@ -209,6 +214,93 @@ CRLF 사본은 다른 키가 된다.
 3. Gate A(keff/ppm) · Gate B(핀 RMS) + `docs/kngr_v2_vs_master.csv` 대비 tfavg 사다리.
 4. 합격 기준: 전 statepoint **|Δtfavg| ≤ 5 K**, **max|Δppm| ≤ 5**, **|Δfqp| ≤ 0.02**.
 5. 덱팔은 궤적을 바꾸므로 **N1**(새 기준선), 기본팔은 산술 불변 **A2** — 위 §정확성 분류대로.
+
+---
+
+## v2 정정 — 덱의 상승분 배율을 두 번 세고 있었다 (2026-09-04, 블록 59 이후)
+
+### 증상
+238 블록 59, KNGR `ndivxy=2`(노드당 쿼터 집합체) 3팔:
+
+| 팔 | 구성 | Δtfavg BOC | Δtfavg EOC | Gate B ppm |
+|---|---|---|---|---|
+| (a) legacy | 62 rods, tf.csv | −18.3 K | +71.1 K | 15.3 |
+| (b) deck rods | 59 rods, tf.csv | **+0.9 K** | +88.9 K | — |
+| (c) deck rods + CE v1 | 59 rods, tf_ce.csv v1 | **+79.3 K** | +115.6 K | 25.7 |
+
+(b)가 BOC에서 0.9 K로 맞는데 (c)가 +79.3 K로 벌어지면, 표가 BOC에서 **약 32 %
+과열**이라는 뜻이다.
+
+### 원인 — `fuel temperature rise scale`
+`SolveTH`는 표의 값을 그대로 쓰지 않는다(`src/XSSet.cpp:6396`, GPU 거울
+`src/ThKernel.h:443`):
+
+```
+tful = tmod + fuel_temp_rise_scale * GetTfuel(bu, lpd)
+```
+
+KNGR 덱(`kngr_238*.json`)은 스케줄 항목마다 `"fuel temperature rise scale"`를
+싣고 있다 — `standard` 문에서 **1.3197891964119348**, 모든 `depletion` 문에서
+**1.3045377488004624**. 이 배율은 **없는 CE 표를 대신한 경험적 보정**이었다:
+이것을 곱해야 WH 표가 MASTER의 KNGR BOC 연료온도를 1 K 안쪽으로 재현한다.
+
+CE v1은 MASTER의 `$FB2D` dT를 **이 배율로 나누지 않고** 회귀했다 → 보정이 두 번
+곱해진다. 소수점 셋째 자리까지 닫힌 검증(블록 59 실행의 자체 노드 LPD 분포 위에서
+표를 평균):
+
+```
+arm (b) 관측 부피평균 상승분 394.256 K = 1.3197891964119348 x 298.73 K (tf.csv)
+arm (c) 관측 부피평균 상승분 504.905 K = 1.3197891964119348 x 382.50 K (tf_ce v1)
+```
+
+LPD는 무죄다. 블록 59 덱은 쿼터노심 `rated power = 995.75 MW`, 25 x 15.24 cm,
+`nfrod 236 → 59/node`이고, 노드 평균 LPD = 1000·(995750/6025)/(59·15.24) =
+**183.80 W/cm** — 적합 데이터셋의 노심평균 183.80과 **정확히 같다**.
+
+### 수정
+`tools/fit_tf_table.py`에 `--rise-scale S` / `--rise-scale-first S0` 추가:
+표본 dT를 해당 statepoint의 배율로 **나눈다**(최저 efpd statepoint만 `S0`).
+표는 **배율이 곱해지기 전의 상승분**을 담게 되고, 이는 tf.csv가 담고 있는 것 ·
+`GetTfuel`이 돌려주는 것과 같은 양이다. 덱의 보정은 모든 팔에서 그대로 유지된다.
+
+`include/Database/tf_ce.csv` sha256:
+`20b7c85d…6e009e`(v1) → **`4f794df5484be763087c157f4169c5721f2752b4941f788d81aa9e2396cc769e`**(v2).
+케이스 키가 다시 한 번 이동한다(`th_tf_table = ce:<sha256>`).
+
+### 결과 (bu 0에서 CE와 WH가 만난다)
+
+| LPD | WH | CE v1 (비) | CE v2 (비) |
+|---|---|---|---|
+| 100 | 160.53 | 211.69 (1.319) | 161.92 (**1.009**) |
+| 150 | 242.19 | 328.49 (1.356) | 251.07 (**1.037**) |
+| 200 | 324.19 | 417.36 (1.287) | 318.90 (**0.984**) |
+| 250 | 408.02 | 510.55 (1.251) | 389.96 (**0.956**) |
+
+100–250 W/cm에서 **최대 4.4 %**(v1은 25–36 %). 200 W/cm · 16 GWd/t 연소도
+기울기는 **−29.4 %**로 유지된다(WH −5.6 %) — 표의 존재 이유인 형상은 그대로다.
+
+`tools/test_tf_ce_table_contract.py`에 주장 6 추가: **bu 0에서 100–250 W/cm의
+CE/WH 편차 ≤ 6 %**, 그리고 출처 줄에 `rise_scale=` 필수.
+
+### 238 재실행 레시피 (팔 (c)만)
+```
+cd ~/gpu_dispatch_test_<sha> && git fetch && git checkout <이 커밋>
+# 덱·환경은 블록 59 그대로: RASBERY_TH_FUEL_RODS=deck RASBERY_TH_TF_TABLE=deck,
+#   decks/kngr_238_ce.json ("nfrod": 236, "tf table": "ce")
+#   → 덱의 "fuel temperature rise scale"는 손대지 않는다 (그것이 요점이다)
+<runner> -i decks/kngr_238_ce.json -o ~/gates/block59b/c_rods_tf_deck_v3_1.h5 --result full
+# 먼저 [RASBERY][TH][TFTABLE].sha256 == 4f794df5…c769e 확인 (아니면 옛 표다)
+tools/gate_a_compare.py ~/gates/block59b/c_rods_tf_deck_v3_1.h5 ~/gates/block59/a_legacy_v2_1.h5
+tools/gate_b_pin_rms.py ...   # 블록 59와 동일 인자
+```
+예측: BOC 부피평균 상승분 **385.7 K**(= 1.31979 × 292.26) — 팔 (b)의 394.26 K보다
+8.5 K 낮다. Gate B ppm은 25.7에서 legacy 수준으로 돌아와야 하고, EOC 쪽이
+CE 기울기의 실제 시험대다.
+
+**주의(미해결)**: 적합에 쓴 MASTER `kngr_tf_edit` 실행의 BOC TFAVG는 686.49 °C인데
+벤치마크 기준 MASTER(`docs/kngr_v2_vs_master.csv`)는 697.86 °C다. 두 MASTER 실행이
+BOC에서 약 11 K 다르다 — 표가 재현하는 것은 **전자**다. 팔 (c)의 잔여 Δtfavg는
+이 차이를 넘어설 수 없다.
 
 ### 미해결로 남기는 것
 - **Jensen 편향**: 축방향 평균에서 온다. 없애려면 3-D 노드 온도가 필요하고, 그러려면 MASTER를
